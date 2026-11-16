@@ -980,3 +980,23 @@ fn note_audio_stand_in(auds: &[Option<Aud>], reels: &mut Vec<SourceId>, r: &mut 
     }
     r.stand_in_audio = reels.len() as u32;
 }
+
+// ---- STRIAINFOREEL (LEDGER SR743): a reel's one-line summary for a person (named tail block) ----
+/// STRIAINFOREEL (LEDGER SR743): the editor's reels say what they are, as the Player's open does (SR734's `summary_line`).
+impl Sources {
+    /// Source `id`'s person's line: its video track's codec, size, profile tokens (`dsp::video::profile_level`) and bit rate
+    /// (`media::bitrate_of` over the track's btrt, its SPS HRD rate and the file's bytes over its duration), through
+    /// `media::summary_parts` — the SAME `Track` facts and fns `Player::open_from` fills `MediaInfo` from. `None` for an
+    /// unknown id or a reel with nothing to say. Reads the open demuxer only (no survey walk, no lock). STRIAINFOREELAUDIO (SR761):
+    /// then ` | <audio decoder> <rate>` from the reel's audio Track (`media::track_audio_decoder` / `media::track_audio_bitrate`).
+    pub fn summary(&self, id: SourceId) -> Option<String> {
+        let m = self.get(id).ok()?;
+        let v = m.video.map(|i| &m.demux.tracks()[i]);
+        let (codec, w, h) = v.map_or(("", 0, 0), |t| (t.codec_name.as_str(), t.width, t.height));
+        let profile = v.and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default();
+        let rate = crate::media::bitrate_of(v.and_then(|t| t.btrt), v.and_then(gneiss_pal::dsp::video::hrd_bit_rate), m.demux.bytes().len() as u64, m.demux.duration_ns());
+        let a = m.audio.map(|i| &m.demux.tracks()[i]); // STRIAINFOREELAUDIO (SR761): the reel's audio track, as the Player's first audio track
+        let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
+        Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
+    }
+}

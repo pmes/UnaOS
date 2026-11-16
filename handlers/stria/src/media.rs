@@ -130,6 +130,9 @@ pub struct MediaInfo {
     /// STRIAINFOBITRATE (SR728): the stream's bit rate as a person reads it ([`bitrate_of`]: the MP4 btrt's avg, the H.264
     /// SPS HRD rate in parentheses, else `~` the file's bytes over its duration; "" when none is known).
     pub bitrate: String,
+    /// STRIAINFOAUDIOBITRATE (SR742): the audio's own bit rate ([`bitrate_of`] given the audio's facts: PCM's exact channels x rate x
+    /// bits, the track's btrt / esds DecoderConfigDescriptor avg, else `~` the track's bytes over its span; "" without decodable audio).
+    pub audio_bitrate: String,
 }
 
 #[derive(Debug)]
@@ -433,6 +436,7 @@ impl Player {
             channels: if audio.is_some() { channels } else { 0 },
             audio_start_ns,
             bitrate: bitrate_of(vtrack.as_ref().and_then(|t| t.btrt), vtrack.as_ref().and_then(gneiss_pal::dsp::video::hrd_bit_rate), file_bytes, duration_ns),
+            audio_bitrate: audio_bitrate_of(audio.as_ref(), demux.as_ref(), file_bytes, duration_ns), // STRIAINFOAUDIOBITRATE (SR742): the audio's own rate
         };
         log::info!("{}", open_line(&info)); // STRIAINFOBITRATE (SR728): the open wire
         let early = 500_000_000 / display_hz.max(1) as u64;
@@ -1236,10 +1240,10 @@ pub fn bitrate_of(btrt: Option<(u32, u32, u32)>, hrd_bps: Option<u64>, file_byte
     }
 }
 
-/// The open wire: `[STRIA] :: open: video=<codec|-> audio=<codec|-> size=<w>x<h> duration_ns=<d> bitrate="<s>"`.
+/// The open wire: `[STRIA] :: open: video=<codec|-> audio=<codec|-> size=<w>x<h> duration_ns=<d> bitrate="<s>" audio_bitrate="<s>"` (SR742's token last).
 pub fn open_line(i: &MediaInfo) -> String {
     let or_dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
-    format!("[STRIA] :: open: video={} audio={} size={}x{} duration_ns={} bitrate=\"{}\"", or_dash(&i.video), or_dash(&i.audio), i.width, i.height, i.duration_ns, i.bitrate)
+    format!("[STRIA] :: open: video={} audio={} size={}x{} duration_ns={} bitrate=\"{}\" audio_bitrate=\"{}\"", or_dash(&i.video), or_dash(&i.audio), i.width, i.height, i.duration_ns, i.bitrate, i.audio_bitrate)
 }
 
 // ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened's one-line summary for a person (named tail block) ----
@@ -1249,6 +1253,72 @@ pub fn open_line(i: &MediaInfo) -> String {
 
 /// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (an audio-only file: its `~` rate alone; none: "").
 pub fn summary_line(i: &MediaInfo) -> String {
-    let size = if i.width > 0 && i.height > 0 { format!("{}x{}", i.width, i.height) } else { String::new() };
-    [i.video.as_str(), size.as_str(), i.video_profile.as_str(), i.bitrate.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ")
+    summary_parts(&i.video, i.width, i.height, &i.video_profile, &i.bitrate, &i.audio_decoder, &i.audio_bitrate) // STRIAINFOREEL (SR743) / STRIAINFOREELAUDIO (SR761): the ONE formatter (file tail)
+}
+
+// ---- STRIAINFOAUDIOBITRATE (LEDGER SR742): MediaInfo's audio bit rate (named tail block) ----
+// The audio's own rate through THE rule (`bitrate_of`): PCM's exact channels x rate x bits enters as the btrt avg (no `~`), else the
+// track's btrt or, for an mp4a without one, its esds DecoderConfigDescriptor (demux_core `parse_esds` into `Track::btrt`), else `~` the
+// track's own sample bytes over its span (an audio file: the file's bytes, the file being the audio). `summary_line` gains
+// ` | <audio decoder> <rate>` after the video part (the audio part alone without video). Owed: STRIA-INFO-AUDIO-BITRATE-MKVTAGS
+// (mkvmerge's BPS statistics tag), STRIA-INFO-AUDIO-BITRATE-INDEXED (a lazily indexed / live demuxer sums only its window).
+
+/// PCM's exact bit rate in bits per second: channels x sample rate x bits per sample; `None` when any is unknown (0).
+pub fn pcm_bitrate(channels: u16, rate: u32, bits: u16) -> Option<u64> {
+    Some(channels as u64 * rate as u64 * bits as u64).filter(|&b| b > 0)
+}
+
+/// [`MediaInfo::audio_bitrate`] from the audio source the open holds (a container track, or an audio file's decoder).
+fn audio_bitrate_of(audio: Option<&AudioSrc>, demux: Option<&Demuxer>, file_bytes: u64, duration_ns: u64) -> String {
+    let exact = |bps: Option<u64>| bps.map(|b| (0u32, 0u32, b.min(u32::MAX as u64) as u32));
+    match audio {
+        Some(AudioSrc::Track { track, .. }) => track_audio_bitrate(track, demux), // STRIAINFOREELAUDIO (SR761): the lifted Track arm (file tail)
+        Some(AudioSrc::File { dec, .. }) => {
+            let i = dec.info();
+            let pcm = if i.codec == ac::Codec::Pcm { pcm_bitrate(i.channels, i.rate, i.bits) } else { None };
+            bitrate_of(exact(pcm), None, file_bytes, duration_ns)
+        }
+        None => String::new(),
+    }
+}
+
+// ---- STRIAINFOREEL (LEDGER SR743): the person's media line from its parts (named tail block) ----
+// THE one formatter of the person's line: `summary_line` (the Player's MediaInfo, SR734) and `nle::Sources::summary` (an editor
+// reel, from the same `Track` facts the Player reads) both call it. STRIA-INFO-REEL-AUDIO BUILT by SR761 (the audio pair and SR742's ` | ` join, below).
+
+/// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (the size only when both sides are > 0); then
+/// STRIAINFOREELAUDIO (SR761, SR742's rule): ` | <audio decoder> <audio bit rate>` when the audio's rate is known, the audio part
+/// alone with no video codec (it says the audio's rate better than the file's `~`); no audio rate: the video part unchanged.
+pub fn summary_parts(video: &str, width: u32, height: u32, profile: &str, bitrate: &str, audio: &str, audio_bitrate: &str) -> String {
+    let size = if width > 0 && height > 0 { format!("{width}x{height}") } else { String::new() };
+    let video_part = [video, size.as_str(), profile, bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
+    if audio_bitrate.is_empty() {
+        return video_part;
+    }
+    let audio_part = [audio, audio_bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
+    if video.is_empty() || video_part.is_empty() { audio_part } else { format!("{video_part} | {audio_part}") }
+}
+
+// ---- STRIAINFOREELAUDIO (LEDGER SR761): a reel's audio decoder token and rate from its Track (named tail block) ----
+// Both roads' audio part from the same facts: the Player (`audio_bitrate_of`'s Track arm, `MediaInfo::audio_decoder` from the decoder
+// it opened) and the editor (`nle::Sources::summary` over the reel's audio Track). Owed: STRIA-INFO-REEL-AUDIO-KERNEL (the kernel
+// NLE's reel line), STRIA-INFO-REEL-AUDIO-CACHE (name the decoder once per reel at `Sources::add`, not per summary).
+
+/// A container audio track's rate through THE rule (`bitrate_of`): PCM exact (channels x rate x bits), else the track's btrt / esds
+/// avg, else `~` the track's own sample bytes (from `demux`) over its span.
+pub fn track_audio_bitrate(track: &Track, demux: Option<&Demuxer>) -> String {
+    let pcm = match &track.codec {
+        gneiss_pal::dsp::demux::Codec::Pcm { bits, .. } => pcm_bitrate(track.channels, track.sample_rate, *bits),
+        _ => None,
+    };
+    let exact = pcm.map(|b| (0u32, 0u32, b.min(u32::MAX as u64) as u32));
+    let bytes = demux.and_then(|d| Some(d.track_samples(d.track_index(track.id)?).map(|s| s.size as u64).sum::<u64>())).unwrap_or(0);
+    bitrate_of(exact.or(track.btrt), None, bytes, track.duration_ns)
+}
+
+/// The decoder token a person reads for a container audio track: the registry's own decoder name (`audio_decoder_for`, the decoder
+/// `AudioSwap::open` wraps: "pcm", "aac-lc", "opus", ...), else AudioSwap's "stand-in" when no decoder fits. Builds and drops the
+/// decoder; logs nothing.
+pub fn track_audio_decoder(track: &Track, demux: &Demuxer) -> &'static str {
+    audio_decoder_for(track, Timing::of(demux, track)).map_or("stand-in", |d| d.name())
 }
