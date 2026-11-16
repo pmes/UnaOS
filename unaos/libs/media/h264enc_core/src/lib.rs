@@ -730,20 +730,20 @@ impl Encoder {
         let hdr = w.bits();
         // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P / B with cabac_init_idc 0.
         let mut cw = is_cabac.then(|| cabac::Writer::new(&mut w, if idr { 0 } else { 1 }, slice_qp, self.mb_w * self.mb_h));
-        let mut run = 0u32;
+        let mut run = 0u32; let mut intra = 0u32;
         for mby in 0..self.mb_h {
             self.rc_row(mby, w.bits() + cw.as_ref().map_or(0, cabac::Writer::pending) - hdr);
             for mbx in 0..self.mb_w { self.aq_mb(mbx, mby);
                 if idr {
                     let code = self.intra_mb(mbx, mby);
-                    self.note_mb(mbx, mby, &code);
+                    self.note_mb(mbx, mby, &code); intra += matches!(code.kind, Kind::I4 | Kind::I16) as u32;
                     match &mut cw {
                         Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic),
-                        None => self.write_mb(&mut w, mbx, mby, &code, false),
+                        None => self.write_mb(&mut w, mbx, mby, &code, 0),
                     }
                 } else {
                     let code = if bpic { self.b_mb(mbx, mby) } else { self.inter_mb(mbx, mby) };
-                    self.note_mb(mbx, mby, &code);
+                    self.note_mb(mbx, mby, &code); intra += matches!(code.kind, Kind::I4 | Kind::I16) as u32;
                     if let Some(c) = &mut cw {
                         self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic);
                     } else if matches!(code.kind, Kind::PSkip | Kind::BSkip) {
@@ -751,7 +751,7 @@ impl Encoder {
                     } else {
                         w.ue(run); // mb_skip_run
                         run = 0;
-                        self.write_mb(&mut w, mbx, mby, &code, true);
+                        self.write_mb(&mut w, mbx, mby, &code, if bpic { 23 } else { 5 });
                     }
                 }
             }
@@ -767,7 +767,7 @@ impl Encoder {
         // A B picture is not a reference (nal_ref_idc 0) unless it is the pyramid's middle (1, SR349).
         let slice = nal::nal_unit(if !bpic { 3 } else { reference as u8 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let mut nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] }; self.hrd_au(&mut nals, idr, display);
-        self.rc_update(nals.iter().filter(|n| n[0] & 0x1f != h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum()); self.note_stat(pic, slice_qp, &nals); // H264ENCTWOPASS (SR698): the picture's record
+        self.rc_update(nals.iter().filter(|n| n[0] & 0x1f != h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum()); self.note_stat(pic, slice_qp, intra, &nals); // H264ENCTWOPASS (SR698): the picture's record
         self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
@@ -904,8 +904,8 @@ impl Encoder {
     // macroblock_layer (7.3.5) and residual (7.3.5.3), CAVLC
     // -----------------------------------------------------------------------------------------
 
-    fn write_mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize, code: &MbCode, p_slice: bool) {
-        let off = if p_slice { 5 } else { 0 }; // intra mb_type follows the 5 P types in a P slice
+    fn write_mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize, code: &MbCode, intra_off: u32) {
+        let off = intra_off; // intra mb_type follows the 5 P types in a P slice, the 23 B types in a B slice (Table 7-14; H264ENCPINTRA SR759)
         match code.kind {
             Kind::I4 => {
                 w.ue(off);
@@ -929,8 +929,7 @@ impl Encoder {
                 w.ue(cbp_code(&CBP_INTRA, code.cbp));
             }
             Kind::I16 => {
-                let luma = if code.cbp & 15 != 0 { 12 } else { 0 };
-                w.ue(off + 1 + code.i16_mode as u32 + 4 * (code.cbp >> 4) as u32 + luma);
+                w.ue(off + code.i_type()); // Table 7-11 through MbCode::i_type (H264ENCPINTRA SR759: the P / B intra cost reads it too)
                 w.ue(code.chroma_mode as u32);
             }
             Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi => {

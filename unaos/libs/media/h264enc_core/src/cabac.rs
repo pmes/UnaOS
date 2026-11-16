@@ -412,8 +412,8 @@ impl Encoder {
         match code.kind {
             Kind::I4 | Kind::I16 => {
                 if p_slice {
-                    c.decision(w, 14, 1); // the intra prefix of a P slice's mb_type
-                    self.cabac_mb_type_i(w, c, mbx, mby, code, 17, true);
+                    self.cabac_intra_prefix(w, c, ma, mb, slice); // the intra prefix of a P / B slice's mb_type (Table 9-37; H264ENCPINTRA SR759)
+                    self.cabac_mb_type_i(w, c, mbx, mby, code, if slice == Pic::B { 32 } else { 17 }, true);
                 } else {
                     self.cabac_mb_type_i(w, c, mbx, mby, code, 3, false);
                 }
@@ -466,8 +466,8 @@ impl Encoder {
                 // B mb_type (Table 9-37, h264_core `cabac_mb_type`): bin 0 at 27 + (A / B available and not
                 // B_Skip / B_Direct_16x16): B_Direct_16x16 `0`; B_L0_16x16 `1 0 0`, B_L1_16x16 `1 0 1` (bins at 30,
                 // 32); B_Bi_16x16 `1 1 0 0 0 0` (bins at 30, 31, 32, 32, 32). ref_idx absent (one per list).
-                let cond = |m: Option<usize>| m.is_some_and(|m| !matches!(self.dinfo[m].kind, MbKind::BSkip | MbKind::BDirect)) as usize;
-                c.decision(w, 27 + cond(ma) + cond(mb), (code.kind != Kind::BDirect) as u32);
+                let inc0 = self.cabac_b_type_inc(ma, mb); // H264ENCPINTRA (SR759): the one bin-0 ctxIdxInc, shared with the B intra prefix
+                c.decision(w, 27 + inc0, (code.kind != Kind::BDirect) as u32);
                 match code.kind {
                     Kind::BL0 | Kind::BL1 => {
                         c.decision(w, 30, 0);
@@ -626,5 +626,31 @@ impl Encoder {
                 }
             }
         }
+    }
+}
+
+// ---- H264ENCPINTRA (LEDGER SR759): the intra prefix of a P / B slice's mb_type (named tail block) ----
+impl Encoder {
+    /// ctxIdxInc of a B slice's mb_type bin 0 (9.3.3.1.1.3): A / B available and neither B_Skip nor B_Direct_16x16,
+    /// h264_core `cabac_mb_type`'s B arm.
+    fn cabac_b_type_inc(&self, ma: Option<usize>, mb: Option<usize>) -> usize {
+        let cond = |m: Option<usize>| m.is_some_and(|m| !matches!(self.dinfo[m].kind, MbKind::BSkip | MbKind::BDirect)) as usize;
+        cond(ma) + cond(mb)
+    }
+
+    /// The prefix of an intra mb_type in a P / B slice (Table 9-37, h264_core `cabac_mb_type`): P `1` at ctxIdx 14; B
+    /// `1 1 1 1 0 1` at 27 + [`Encoder::cabac_b_type_inc`], 30, 31, 32, 32, 32 (the decoder's bits 13). The suffix follows
+    /// as the I mb_type at ctxIdxOffset 17 (P) / 32 (B).
+    fn cabac_intra_prefix(&self, w: &mut BitWriter, c: &mut Writer, ma: Option<usize>, mb: Option<usize>, slice: Pic) {
+        if slice != Pic::B {
+            c.decision(w, 14, 1);
+            return;
+        }
+        c.decision(w, 27 + self.cabac_b_type_inc(ma, mb), 1);
+        c.decision(w, 30, 1);
+        c.decision(w, 31, 1);
+        c.decision(w, 32, 1);
+        c.decision(w, 32, 0);
+        c.decision(w, 32, 1);
     }
 }

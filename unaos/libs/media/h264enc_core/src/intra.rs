@@ -137,8 +137,8 @@ fn allowed_chroma(mode: u8, e: &Edges) -> bool {
 }
 
 impl Encoder {
-    /// Decide, code and reconstruct the intra macroblock (mbx, mby).
-    pub(crate) fn intra_mb(&mut self, mbx: usize, mby: usize) -> MbCode {
+    /// Decide, code and reconstruct the intra macroblock (mbx, mby), and its score (the SAD + bias its I16 / NxN choice compared).
+    pub(crate) fn intra_scored(&mut self, mbx: usize, mby: usize) -> (MbCode, u32) {
         let qp = self.qp;
         let q6 = (qp % 6) as usize;
         let (mb_w, w4) = (self.mb_w, self.mb_w * 4);
@@ -257,7 +257,7 @@ impl Encoder {
             pred_chroma(best.1, &e[c], &mut preds[c]);
         }
         self.chroma_mb(mbx, mby, &preds, true, &mut code);
-        code
+        (code, best16.0.min(nxn))
     }
 
     /// H264ENC8X8 (SR322): the Intra_8x8 candidate of macroblock (mbx, mby), coded over the Intra_4x4
@@ -321,5 +321,52 @@ impl Encoder {
             self.modes[(mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk]] = code4.modes[blk];
         }
         None
+    }
+}
+
+// ---- H264ENCPINTRA (LEDGER SR759): the intra candidate of a P / B macroblock (named tail block) ----
+impl Encoder {
+    /// Decide, code and reconstruct the intra macroblock (mbx, mby) (an IDR's): [`Encoder::intra_scored`] without its score.
+    pub(crate) fn intra_mb(&mut self, mbx: usize, mby: usize) -> MbCode {
+        self.intra_scored(mbx, mby).0
+    }
+
+    /// x264 `x264_macroblock_analyse`'s intra test in a P / B picture (analyse.c: `COPY2_IF_LT( i_cost, analysis.i_satd_i16x16,
+    /// i_type, I_16x16 )` after the inter candidates): the intra candidate of macroblock (mbx, mby) through THE one search
+    /// ([`Encoder::intra_scored`]), its score + lambda x the mb_type bits (`off` + [`MbCode::i_type`]; `off` 5 in a P slice, 23
+    /// in a B slice, Table 7-11 / 7-14) against `inter_cost`, the chosen inter candidate's SAD + lambda x bits (b_mb's unit).
+    /// Strictly cheaper: the intra code is returned with its reconstruction written and the macroblock's motion in both lists
+    /// MbMotion::NONE (8.4.1.3.2: an intra neighbour is available with refIdx -1 and a zero vector). Else the 16
+    /// Intra4x4PredMode entries it wrote are restored and None is returned: the caller's `inter_recon` then overwrites every
+    /// luma / chroma sample the search wrote (it must run before that commit).
+    pub(crate) fn intra_over(&mut self, mbx: usize, mby: usize, inter_cost: u32, off: u32) -> Option<MbCode> {
+        let w4 = self.mb_w * 4;
+        let at = |blk: usize| (mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk];
+        let mut saved = [2u8; 16];
+        for blk in 0..16 {
+            saved[blk] = self.modes[at(blk)];
+        }
+        let (code, score) = self.intra_scored(mbx, mby);
+        if score.saturating_add(lambda(self.qp) * crate::nal::ue_bits(off + code.i_type())) < inter_cost {
+            let i = mby * self.mb_w + mbx;
+            self.motion[i] = crate::me::MbMotion::NONE;
+            self.motion1[i] = crate::me::MbMotion::NONE;
+            return Some(code);
+        }
+        for blk in 0..16 {
+            self.modes[at(blk)] = saved[blk];
+        }
+        None
+    }
+}
+
+impl MbCode {
+    /// mb_type's I-slice number (Table 7-11): 0 for I_NxN; I_16x16 1 + Intra16x16PredMode + 4 x CodedBlockPatternChroma + 12
+    /// when the luma AC codes. A P slice writes it after 5, a B slice after 23.
+    pub(crate) fn i_type(&self) -> u32 {
+        if self.kind != Kind::I16 {
+            return 0;
+        }
+        1 + self.i16_mode as u32 + 4 * (self.cbp >> 4) as u32 + if self.cbp & 15 != 0 { 12 } else { 0 }
     }
 }
