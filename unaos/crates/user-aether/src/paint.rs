@@ -84,7 +84,7 @@ pub struct Ink {
     pub sel: FontSel,
     underline: bool,
     /// list-style-type code (css-lists-3; 1 disc, 2 circle, 3 square, 4 decimal …), inherited.
-    list: u8,
+    list: u8, lh: f32, tt: u8, // AETHERIMGALTELF (SR695): inherited line-height multiplier (0 = normal) and text-transform, the host Inherited's pair the alt text paints with
 }
 
 /// Inherited paint for every box, root down (also the hit test's font for a text box's caret).
@@ -108,7 +108,7 @@ pub fn inks(tree: &Tree) -> NodeMap<Ink> {
                     .unwrap_or_else(|| layout_core::default_weight(tag, inh.sel.weight));
                 me.sel.italic = p.and_then(|p| p.italic).unwrap_or_else(|| layout_core::default_italic(tag, inh.sel.italic));
                 me.sel.family = p.and_then(|p| p.family).unwrap_or_else(|| layout_core::default_family::<ImgHost>(tag, inh.sel.family));
-                me.underline = p.and_then(|p| p.underline).unwrap_or(inh.underline || matches!(tag, "u" | "ins") || (tag == "a" && n.has_attr("href")));
+                me.underline = p.and_then(|p| p.underline).unwrap_or(inh.underline || matches!(tag, "u" | "ins") || (tag == "a" && n.has_attr("href"))); if let Some(v) = p.and_then(|p| p.line_height) { me.lh = v; } if let Some(v) = p.and_then(|p| p.text_transform) { me.tt = v; } // AETHERIMGALTELF (SR695): layout_core's inheritance of the pair (the node's value, else the parent's)
                 match tag {
                     "ul" => me.list = 1,
                     "ol" => me.list = 4,
@@ -125,7 +125,7 @@ pub fn inks(tree: &Tree) -> NodeMap<Ink> {
         }
     }
     let mut out = NodeMap::new();
-    let root = Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1 };
+    let root = Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1, lh: 0.0, tt: 0 };
     walk(tree, tree.root_node, root, &mut out);
     out
 }
@@ -330,7 +330,7 @@ fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
     }
     let p = tree.paint_map.get(&id);
     let hidden = p.and_then(|p| p.hidden).unwrap_or(false);
-    let ink = cx.inks.get(&id).copied().unwrap_or(Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1 });
+    let ink = cx.inks.get(&id).copied().unwrap_or(Ink { color: crate::theme::PAGE_INK, size: 16.0, sel: FontSel::default(), underline: false, list: 1, lh: 0.0, tt: 0 });
     let node = tree.node_map.get(&id);
     let (w, h) = (l.size.width, l.size.height);
     if !hidden && y + h >= 0.0 {
@@ -483,7 +483,7 @@ pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
 fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     let tree = cx.tree;
     let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
-    if n.tag().as_deref() != Some("input") { if crate::style::img_like(n) { image_blit(cv, cx, id, x, y); } // AETHERIMGELF (SR685): an img's bitmap through the image input's blit; a failed img paints nothing (AETHER-IMG-ALT-ELF owed)
+    if n.tag().as_deref() != Some("input") { if crate::style::img_like(n) && !image_blit(cv, cx, id, x, y) { image_alt(cv, cx, id, ink, x, y); } // AETHERIMGELF (SR685): an img's bitmap through the image input's blit; AETHERIMGALTELF (SR695): else layout_core's alt fallback
         return;
     }
     let ty = n.attr("type").unwrap_or_default();
@@ -606,4 +606,54 @@ fn image_blit(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) -> bool {
         }
     });
     drawn.is_some()
+}
+
+// ---- AETHERIMGALTELF (LEDGER SR695): a failed img's alt text, the host's paint_img_alt (named tail block) ----
+
+/// AETHERIMGALTELF (SR695): the alt fallback's frame colour, 1px solid silver. layout_core exports no constant; the source
+/// is the host's `paint_img_alt` (handlers/aether render/mod.rs, AETHERIMGALT SR681) literal (AETHER-IMG-ALT-FRAME-CONST owed).
+const ALT_FRAME: (u8, u8, u8) = (192, 192, 192);
+
+/// AETHERIMGALTELF (SR695): the host render's `paint_img_alt` on this ring, for the `<img>` box `id` whose border box's
+/// top-left is (`x`, `y`) and whose bitmap `image_blit` did not draw: what layout_core's ONE rule `img_fallback_of` says
+/// (its state from `ImgHost::img_state`), over the content box (cx, cy, cw, ch). InlineAlt: the alt as the one line
+/// `img_alt_extent` sized the box by, at (cx, cy). BoxedAlt with `frame`: the 1px silver border on the content box's edges
+/// (when it is at least 2 x 2), the text after the 16px icon's empty slot at (cx + 2 + 16, cy + 2), clipped 1px in;
+/// without `frame` the text at (cx, cy). The text is text-transformed (`ink.tt`) and drawn in the element's font and
+/// inherited colour, its baseline the half-leading rule `Fonts::baseline_offset` under the inherited line height (`ink.lh`)
+/// as the host's `draw_lines`, clipped to the (inset) content box; one line, never wrapped (AETHER-IMG-ALT-INLINE-WRAP owed).
+fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
+    let Ok(l) = cx.tree.taffy.layout(id) else { return };
+    let (bx, by) = (x + l.border.left + l.padding.left, y + l.border.top + l.padding.top);
+    let bw = (l.size.width - l.border.left - l.padding.left - l.border.right - l.padding.right).max(0.0);
+    let bh = (l.size.height - l.border.top - l.padding.top - l.border.bottom - l.padding.bottom).max(0.0);
+    let (alt, tx, ty, inset) = match layout_core::img_fallback_of(cx.tree, id) {
+        layout_core::ImgFallback::None => return,
+        layout_core::ImgFallback::InlineAlt(t) => (t, bx, by, 0.0),
+        layout_core::ImgFallback::BoxedAlt { text, frame } => {
+            if frame && bw >= 2.0 && bh >= 2.0 {
+                let c = rgb(ALT_FRAME);
+                let (x0, y0, x1, y1) = (fl(bx), fl(by), fl(bx + bw), fl(by + bh));
+                cv.fill(x0, y0, x1 - x0, 1, c);
+                cv.fill(x0, y1 - 1, x1 - x0, 1, c);
+                cv.fill(x0, y0 + 1, 1, y1 - y0 - 2, c);
+                cv.fill(x1 - 1, y0 + 1, 1, y1 - y0 - 2, c);
+            }
+            if frame { (text, bx + 2.0 + 16.0, by + 2.0, 1.0) } else { (text, bx, by, 0.0) }
+        }
+    };
+    if alt.is_empty() {
+        return;
+    }
+    let text = <ImgHost as layout_core::Host>::transform_text(&alt, ink.tt);
+    let (px0, py0, px1, py1) = (bx + inset, by + inset, bx + bw - inset, by + bh - inset);
+    let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, ink.lh);
+    let base = font_core::fmath::round(ty + lead);
+    let color = ink.color;
+    cx.fonts.0.borrow_mut().draw(tx, base, &text, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+        let (fx, fy) = (gx as f32, gy as f32);
+        if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
+            cv.blend(gx, gy, color, cov);
+        }
+    });
 }

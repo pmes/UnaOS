@@ -116,7 +116,7 @@ fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
     b
 }
 
-type LoadedMap = HashMap<(PathBuf, u32, bool, bool), &'static Face>;
+type LoadedMap = HashMap<(PathBuf, u32, bool, bool, Vec<i16>), &'static Face>;
 
 fn faces_loaded() -> &'static Mutex<LoadedMap> {
     static F: OnceLock<Mutex<LoadedMap>> = OnceLock::new();
@@ -141,7 +141,7 @@ pub fn load_face(info: &FaceInfo) -> Option<&'static Face> {
 }
 
 pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'static Face> {
-    let key = (info.path.clone(), info.index, bold, oblique);
+    let key = (info.path.clone(), info.index, bold, oblique, Vec::new());
     if let Some(f) = faces_loaded().lock().ok()?.get(&key) {
         return Some(*f);
     }
@@ -198,4 +198,136 @@ pub fn line_metrics(font: &Face, size: f32) -> (f32, f32, f32) {
     let m = font.metrics();
     let scale = size / m.units_per_em as f32;
     ((m.ascent * scale).round(), (-m.descent * scale).round(), (m.line_gap * scale).round())
+}
+
+// ---- AETHERHOSTWGHT (LEDGER SR690): a variable face instanced at the asked weight / width / optical size (named tail block) ----
+
+/// AETHERHOSTWGHT (SR690): the user axis values a face is instanced at for `want` — `wght` from the weight, `wdth`
+/// from the stretch, `opsz` from `size_px` when given — one entry per axis the face HAS, each clamped to the axis
+/// range (the ELF's `Engine::instance` rule, font_core ui.rs; Chrome clamps the asked weight to the face's range).
+/// Empty for a static face. font_core normalizes (`Font::with_variations`).
+pub fn axes_for(font: &Font, want: Style, size_px: Option<f32>) -> Vec<([u8; 4], f32)> {
+    font.axes()
+        .iter()
+        .filter_map(|a| {
+            let v = match &a.tag {
+                b"wght" => want.weight,
+                b"wdth" => want.stretch,
+                b"opsz" => size_px?,
+                _ => return None,
+            };
+            v.is_finite().then(|| (a.tag, v.max(a.min).min(a.max)))
+        })
+        .collect()
+}
+
+/// AETHERHOSTWGHT (SR690): a discovered face at the instance `axes` (user values by tag), with the given synthesis.
+/// A static face, or axes that land on the default instance, return the plain [`load_face_synth`] object itself;
+/// otherwise one leaked [`Face`] per (file, index, synthesis, F2Dot14 coords as font_core normalized them), in the
+/// ONE loaded-face cache, so two requests for the same weight share it and the raster caches (keyed on the id) see
+/// a distinct face per instance.
+pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([u8; 4], f32)]) -> Option<&'static Face> {
+    let base = load_face_synth(info, bold, oblique)?;
+    let font = base.font.with_variations(axes);
+    if !font.is_instanced() {
+        return Some(base);
+    }
+    let coords: Vec<i16> = font.coords().iter().map(|c| (c * 16384.0).round() as i16).collect();
+    let key = (info.path.clone(), info.index, bold, oblique, coords);
+    let mut m = faces_loaded().lock().ok()?;
+    if let Some(f) = m.get(&key) {
+        return Some(*f);
+    }
+    let face: &'static Face = Box::leak(Box::new(Face {
+        id: next_face_id(),
+        font,
+        synth_bold: bold,
+        synth_oblique: oblique,
+        family: base.family.clone(),
+        style: base.style,
+    }));
+    m.insert(key, face);
+    Some(face)
+}
+
+/// AETHERHOSTWGHT (SR690): the face a selection draws `want` with: `bold` / `oblique` are [`db::FontDb::select`]'s
+/// synthesis flags; a variable face is instanced through [`axes_for`] and its synthetic bold re-decided by
+/// [`db::synthesis`] against the INSTANCED weight (bold only where the `wght` axis cannot reach the asked weight).
+pub fn load_face_styled(info: &FaceInfo, bold: bool, oblique: bool, want: Style, size_px: Option<f32>) -> Option<&'static Face> {
+    let axes = axes_for(&load_face(info)?.font, want, size_px);
+    let bold = match axes.iter().find(|a| &a.0 == b"wght") {
+        Some(&(_, w)) => db::synthesis(Style { weight: w, ..info.style }, want).0,
+        None => bold,
+    };
+    load_face_instance(info, bold, oblique, &axes)
+}
+
+#[cfg(test)]
+mod hostwght_tests {
+    use super::*;
+
+    fn tree_face(rel: &str) -> FaceInfo {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel);
+        db::faces_in_file(&p).into_iter().next().unwrap_or_else(|| panic!("{rel}: the tree's fixture face"))
+    }
+
+    fn want(weight: f32) -> Style {
+        Style { weight, ..Style::default() }
+    }
+
+    /// Inter at wght 700 is a distinct face whose `H` differs from the default instance's and equals, bit for bit,
+    /// font_core's own `instance(&[opsz 14, wght 700])` rasterized through the same raster (same id: same hinting).
+    #[test]
+    fn hostwght_instances_the_weight() {
+        let info = tree_face("fonts/inter/InterVariable.ttf");
+        let base = load_face(&info).unwrap();
+        let inst = load_face_instance(&info, false, false, &[(*b"wght", 700.0)]).unwrap();
+        assert_ne!(inst.id, base.id);
+        assert!(std::ptr::eq(inst, load_face_instance(&info, false, false, &[(*b"wght", 700.0)]).unwrap()), "one Face per instance");
+        let own = base.font.instance(&[14.0, 700.0]);
+        assert_eq!(inst.font.coords(), own.coords());
+        let reference = Face { id: inst.id, font: own, synth_bold: false, synth_oblique: false, family: inst.family.clone(), style: inst.style };
+        let gid = base.font.glyph_index('H');
+        let m = raster::rasterize(inst, gid, 32.0, 0).unwrap();
+        let r = raster::rasterize(&reference, gid, 32.0, 0).unwrap();
+        let d = raster::rasterize(base, gid, 32.0, 0).unwrap();
+        assert_eq!((m.left, m.top, m.w, m.h, &m.data), (r.left, r.top, r.w, r.h, &r.data), "the instance is font_core's");
+        assert_ne!((m.w, &m.data), (d.w, &d.data), "wght 700 is not the default instance");
+    }
+
+    /// A static face (and a variable face asked for its default) returns the very object `load_face_synth` gives.
+    #[test]
+    fn hostwght_static_face_unchanged() {
+        let s = tree_face("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let plain = load_face(&s).unwrap();
+        assert!(std::ptr::eq(plain, load_face_instance(&s, false, false, &[(*b"wght", 700.0)]).unwrap()));
+        assert!(std::ptr::eq(plain, load_face_styled(&s, false, false, want(700.0), Some(40.0)).unwrap()));
+        let bold = load_face_synth(&s, true, false).unwrap();
+        assert!(std::ptr::eq(bold, load_face_styled(&s, true, false, want(700.0), None).unwrap()), "a static face keeps select's embolden");
+        let inter = tree_face("fonts/inter/InterVariable.ttf");
+        assert!(std::ptr::eq(load_face(&inter).unwrap(), load_face_styled(&inter, false, false, want(400.0), None).unwrap()));
+    }
+
+    /// Blink's rule would embolden Inter (OS/2 400) at 700; the wght axis reaches 700, so the instance is not emboldened.
+    #[test]
+    fn hostwght_no_synthetic_bold_when_axis_reaches() {
+        let inter = tree_face("fonts/inter/InterVariable.ttf");
+        assert_eq!(db::synthesis(inter.style, want(700.0)), (true, false));
+        let f = load_face_styled(&inter, true, false, want(700.0), None).unwrap();
+        assert!(!f.synth_bold);
+        assert_eq!(axes_for(&f.font, want(700.0), None), vec![(*b"wght", 700.0)]);
+        let noto = tree_face("fonts/noto-sans/NotoSans-Variable.ttf");
+        assert!(!load_face_styled(&noto, true, false, want(900.0), None).unwrap().synth_bold, "900 is within 200 of the axis max 700");
+    }
+
+    /// The asked values clamp to the axis range; opsz only when a size is given.
+    #[test]
+    fn hostwght_clamps_to_axis_range() {
+        let inter = tree_face("fonts/inter/InterVariable.ttf");
+        let font = load_face(&inter).unwrap().font;
+        assert_eq!(axes_for(&font, want(950.0), None), vec![(*b"wght", 900.0)]);
+        assert_eq!(axes_for(&font, want(50.0), None), vec![(*b"wght", 100.0)]);
+        assert_eq!(axes_for(&font, want(400.0), Some(40.0)), vec![(*b"opsz", 32.0), (*b"wght", 400.0)]);
+        assert!(axes_for(&font, want(400.0), Some(10.0)).contains(&(*b"opsz", 14.0)));
+    }
 }
