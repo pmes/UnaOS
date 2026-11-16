@@ -475,3 +475,25 @@ fn inter_residual_through_rqt_root_cbf() {
     }
     assert_frame(by_poc(&f, 1), &want, "inter residual");
 }
+
+// ---- HEVCINTERCIP (LEDGER SR688): a missing reference picture is generated (named tail block) ----
+
+/// 8.3.3.2: a stream whose first picture is the skip-only P1 (its IDR lost) names POC 0, which the DPB does not hold:
+/// POC 0 is generated (grey 128, intra), P1 copies it, P2 (references POC 1 and POC 0) finds both without a second
+/// generation, and only P1 and P2 are output.
+#[test]
+fn missing_reference_is_generated_and_decoding_continues() {
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(picture(&p_slice(1, vec![(-1, true)]), skip_picture));
+    s.extend(picture(&p_slice(2, vec![(-1, true), (-2, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the missing reference");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![0]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1, 2]);
+    let grey = Img::new(|_, _| 128, |_, _| 128, |_, _| 128);
+    for fr in &f {
+        assert_frame(fr, &grey, "P from the generated reference");
+    }
+}

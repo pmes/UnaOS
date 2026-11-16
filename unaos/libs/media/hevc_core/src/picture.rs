@@ -253,3 +253,12 @@ impl Picture {
         }
     }
 }
+
+// ---- HEVCINTERCIP (LEDGER SR688): CuPredMode from the motion field (named tail block) ----
+impl Picture {
+    /// CuPredMode[x][y] == MODE_INTRA of the 4x4 block holding luma sample (x, y): an inter prediction unit (intra
+    /// block copy included) writes `motion` with predFlagL0 / L1 set; intra, pcm and palette coding units keep `pred` 0.
+    pub fn is_intra_at(&self, x: usize, y: usize) -> bool {
+        self.motion[self.idx4(x, y)].pred == 0
+    }
+}
