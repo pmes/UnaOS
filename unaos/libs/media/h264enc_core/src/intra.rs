@@ -116,7 +116,7 @@ fn allowed4(mode: u8, e: &Edges) -> bool {
 }
 
 /// The Intra_16x16 modes (Table 8-4) whose samples are all available.
-fn allowed16(mode: u8, e: &Edges) -> bool {
+pub(crate) fn allowed16(mode: u8, e: &Edges) -> bool {
     match mode {
         0 => e.has_top,
         1 => e.has_left,
