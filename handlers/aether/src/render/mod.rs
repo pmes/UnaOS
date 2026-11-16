@@ -4458,8 +4458,8 @@ mod presentrects_tests {
 /// font, line height and colour, over its content box (cx, cy, cw, ch). InlineAlt: the alt text as the one line
 /// `img_alt_extent` measured the box by. BoxedAlt (Chromium's alttext-container: overflow hidden, border-box):
 /// with `frame` the 1px solid silver (#c0c0c0) border on the box's edges, its 1px padding, and the text after the
-/// 16px broken-image icon's slot (the icon floats left at the padding box's corner; its pixels are owed,
-/// AETHER-IMG-BROKENICON), so at (cx + 2 + 16, cy + 2); without `frame` the text at (cx, cy). The text clips to the
+/// 16px broken-image icon's slot (the icon floats left at the padding box's corner; with `icon` its pixels are
+/// layout_core's `BROKEN_ICON`, `paint_broken_icon` SR702), so at (cx + 2 + 16, cy + 2); without `frame` the text at (cx, cy). The text clips to the
 /// container's padding box met with the running clip. One line, never wrapped (AETHER-IMG-ALT-INLINE-WRAP owed).
 #[allow(clippy::too_many_arguments)]
 fn paint_img_alt(
@@ -4473,8 +4473,8 @@ fn paint_img_alt(
     let ch = (layout_box.size.height - bord.top - pad.top - bord.bottom - pad.bottom).max(0.0);
     let (text, tx, ty, inset) = match layout_core::img_fallback_of(layout, node_id) {
         layout_core::ImgFallback::None => return,
-        layout_core::ImgFallback::InlineAlt(t) => (t, cx, cy, 0.0),
-        layout_core::ImgFallback::BoxedAlt { text, frame } => {
+        layout_core::ImgFallback::InlineAlt(t) => return paint_img_alt_lines(layout, node_id, &t, cx, cy, cw, ch, layout_box, inherited, surface, width, height, damage_rects, clip),
+        layout_core::ImgFallback::BoxedAlt { text, frame, icon } => {
             if frame && cw >= 2.0 && ch >= 2.0 {
                 let silver = (192, 192, 192);
                 fill_rect(cx, cy, cx + cw, cy + 1.0, silver, 255, surface, width, height, damage_rects, clip);
@@ -4482,6 +4482,7 @@ fn paint_img_alt(
                 fill_rect(cx, cy + 1.0, cx + 1.0, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
                 fill_rect(cx + cw - 1.0, cy + 1.0, cx + cw, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
             }
+            if icon && !inherited.text_hidden { paint_broken_icon(cx, cy, cw, ch, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, cx + 2.0 + 16.0, cy + 2.0, 1.0) } else { (text, cx, cy, 0.0) }
         }
     };
@@ -4496,8 +4497,9 @@ fn paint_img_alt(
 // ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status from its value, ellipsized to the box (named tail block) ----
 
 /// AETHERFILECHOSEN (SR682): the status text `paint_file_color` draws after a file input's button: layout_core's ONE
-/// rule `file_status` over the element's `multiple` and `value` attributes (one name: Chromium ignores the attribute, the
-/// stand-in until a picker or the JS FileList feeds it, AETHER-FILEPICKER / AETHER-FILECHOSEN-JSFILES owed), fitted to
+/// rule `file_status` over the element's FileList set by script (AETHERFILECHOSENJSFILES SR706: `js::controls::file_names`,
+/// one name or `N files` by the list's length, Blink's FileStatusText) else its `multiple` and `value` attributes (one
+/// name: Chromium ignores the attribute, the stand-in until a picker feeds it, AETHER-FILEPICKER owed), fitted to
 /// `avail` px (the input's content right edge less the status origin) by the render's existing ellipsis,
 /// `pdf::thumbs::ellipsize` (whole when it fits, else cut with a trailing `…`).
 fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -> String {
@@ -4508,6 +4510,50 @@ fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -
             (a.get("multiple").is_some(), a.get("value").map(str::to_string))
         })
         .unwrap_or((false, None));
-    let status = layout_core::file_status(value.as_deref(), multiple, 1);
+    let names = crate::js::controls::file_names(dom_node); let status = if names.is_empty() { layout_core::file_status(value.as_deref(), multiple, 1) } else { layout_core::file_status(Some(&names[0]), multiple || names.len() > 1, names.len()) };
     crate::pdf::thumbs::ellipsize(adv, &status, avail.max(0.0) as f64).into_owned()
+}
+
+// ---- AETHERIMGBROKENICON (LEDGER SR702): the broken-image icon in a boxed alt's slot (named tail block) ----
+
+/// AETHERIMGBROKENICON (SR702): Chromium's broken-image icon for `paint_img_alt`'s BoxedAlt with `icon`: layout_core's
+/// ONE description `BROKEN_ICON`, each rect through `fill_rect` (opaque, in order), at the content box (cx, cy, cw, ch)
+/// plus 2, 2 (the padding box's corner plus the 1px padding), clipped as the alt text is: the container's padding box
+/// (the content box inset 1, overflow hidden) met with the running clip.
+#[allow(clippy::too_many_arguments)]
+fn paint_broken_icon(
+    cx: f32, cy: f32, cw: f32, ch: f32, surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let clip = (clip.0.max(cx + 1.0), clip.1.max(cy + 1.0), clip.2.min(cx + cw - 1.0), clip.3.min(cy + ch - 1.0));
+    let (ox, oy) = (cx + 2.0, cy + 2.0);
+    for r in layout_core::BROKEN_ICON {
+        let (x0, y0) = (ox + r.x as f32, oy + r.y as f32);
+        fill_rect(x0, y0, x0 + r.w as f32, y0 + r.h as f32, r.fill, 255, surface, width, height, damage_rects, clip);
+    }
+}
+
+// ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's alt text wrapped at its box width (named tail block) ----
+
+/// AETHERIMGALTINLINEWRAP (SR707): `paint_img_alt`'s InlineAlt arm: the alt text, text-transformed, in the element's
+/// font, line height and colour, from the content box's origin (cx, cy), broken by `draw_text` (`draw_lines`: the
+/// text-leaf painter's `break_lines`) at the width layout_core's `run_pass` measured the img's run into: the UNROUNDED
+/// content width + 0.01, the flow text leaf's rule (f32::MAX under `nowrap`, as `measure_text_run`'s white-space 1),
+/// so the lines are the ones the box was sized by (`img_alt_cap`: the containing block's width); clipped to the content
+/// box met with the running clip.
+#[allow(clippy::too_many_arguments)]
+fn paint_img_alt_lines(
+    layout: &LayoutTree, node_id: NodeId, text: &str, cx: f32, cy: f32, cw: f32, ch: f32, layout_box: &taffy::Layout,
+    inherited: &Inherited, surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    if text.is_empty() || inherited.text_hidden {
+        return;
+    }
+    let text = transform_text(text, inherited.text_transform);
+    let (bord, pad) = (layout_box.border, layout_box.padding);
+    let edges = bord.left + pad.left + bord.right + pad.right;
+    let wrap_w = (layout.taffy.unrounded_layout(node_id).size.width.max(layout_box.size.width) - edges).max(0.0) + 0.01;
+    let max_w = if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) };
+    let clip = (clip.0.max(cx), clip.1.max(cy), clip.2.min(cx + cw), clip.3.min(cy + ch));
+    draw_text(&text, cx, cy, max_w, &inherited.advancer(), inherited.line_height, inherited.color, false, surface, width, height, damage_rects, clip);
 }

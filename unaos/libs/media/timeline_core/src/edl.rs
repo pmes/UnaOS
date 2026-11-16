@@ -210,7 +210,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
-            if let Some(r) = l.strip_prefix("* UNA EASE ") {
+            want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
@@ -243,7 +243,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             let dur = edl_frames(w[4]).ok_or(EdlError::Transition { line })?;
             match from.take() {
                 Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && !(reel == "BL" && w[1] == "BL") => {
-                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL", ease: Ease::Linear };
+                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL", ease: Ease::Linear, want: None };
                     xq = Some(trans.len());
                     trans.push((kind, num, x, reel, o.src_in, line));
                     last_trans = Some(trans.len() - 1); // NLEWIPES (SR679)
@@ -437,7 +437,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.at, fps),
             timecode(c.end(), fps)
         ));
-        s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
+        s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
         if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
@@ -484,7 +484,7 @@ fn to_black_lines(tl: &Timeline, ti: usize, x: &Transition, num: usize, ch: &str
     let (z, d, e) = (timecode(0, fps), timecode(x.dur, fps), timecode(x.at + x.dur, fps));
     let mut s = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
     s.push_str(&format!("{:03}  {:<8} {:<5} {:<8} {z} {d} {r} {e}\n", num, "BL", ch, code_field(x)));
-    s.push_str(&ease_line(Some(x))); // NLEWIPES (SR679)
+    s.push_str(&ease_line(Some(x))); s.push_str(&want_line(Some(x))); // NLEWIPES (SR679)
     Ok(s)
 }
 
@@ -562,4 +562,32 @@ fn audio_xfade_lines(tl: &Timeline, ti: usize, c: &Clip, num: usize, ch: &str, f
 /// `* UNA XFADE EQUAL\n` under the incoming line of an equal-power explicit audio crossfade at `(ti, at)`; else nothing.
 fn xfade_line(tl: &Timeline, ti: usize, at: i64) -> &'static str {
     if tl.audio_xfades.iter().any(|x| x.track == ti && x.at == at && x.curve == crate::Curve::EqualPower) { "* UNA XFADE EQUAL\n" } else { "" }
+}
+
+// ---- NLE3ETRIMGROW (LEDGER SR712): the `* UNA WANT` line (named tail block) ----
+// `* UNA WANT <n>` is the asked length (ticks) of a transition a trim fitted below it ([`crate::Transition::want`]),
+// written right after its incoming line's EASE line and only when the transition is a fit, so an EDL with no fitted
+// transition writes as before and an older EDL reads unchanged. One with no video transition's incoming line above it,
+// a word that is not an integer, a second WANT for one transition, or a length not above the transition's own is a
+// syntax error.
+
+/// NLE3ETRIMGROW: a `* UNA WANT <n>` line applied to the video transition whose incoming line is just above (`None`: no
+/// such line); any other line is left alone.
+fn want_comment(l: &str, line: usize, x: Option<&mut Transition>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA WANT ") else { return Ok(()) };
+    let x = x.ok_or(EdlError::Syntax { line })?;
+    let w: i64 = r.trim().parse().map_err(|_| EdlError::Syntax { line })?;
+    if x.want.is_some() || w <= x.dur {
+        return Err(EdlError::Syntax { line });
+    }
+    x.want = Some(w);
+    Ok(())
+}
+
+/// NLE3ETRIMGROW: the `* UNA WANT` line of the transition on an incoming line (empty for none or one at its ask).
+fn want_line(x: Option<&Transition>) -> String {
+    match x.and_then(|x| x.want.filter(|&w| w != x.dur)) {
+        Some(w) => format!("* UNA WANT {w}\n"),
+        None => String::new(),
+    }
 }

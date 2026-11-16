@@ -94,3 +94,63 @@ fn caption_side_property_beats_align() {
     let (below, _) = placed(&lay_styled(&doc, &sheet, VW, 400.0), &doc);
     assert!(below, "an author rule table {{ caption-side: bottom }} is inherited: the caption sits below the row");
 }
+
+// ---- AETHERCAPTIONCSSOM (LEDGER SR686): top captions first, in DOM order (named tail block) ----
+
+/// AETHERCAPTIONCSSOM (SR686): a top caption the parser left AFTER the rows (a late `<caption>` start tag) lays out
+/// above them, as Chromium's table layout places captions by side whatever their DOM position; a bottom caption after
+/// the rows stays below.
+#[test]
+fn top_caption_after_rows_moves_first() {
+    let doc = page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![
+            el("tr", &[], vec![el("td", &[("id", "cell")], vec![text("row")])]),
+            el("caption", &[("id", "cap")], vec![text("Quarterly results")]),
+            el("caption", &[("id", "low"), ("align", "bottom")], vec![text("Footnote")]),
+        ],
+    )]);
+    let tree = lay(&doc, VW, 400.0);
+    let (_, cy, _, ch) = box_of(&tree, &doc.by_id("cap"));
+    let (_, ty, _, th) = box_of(&tree, &doc.by_id("cell"));
+    let (_, ly, _, lh) = box_of(&tree, &doc.by_id("low"));
+    assert!(ch > 0.0 && th > 0.0 && lh > 0.0, "every box has height (caption {ch}, cell {th}, bottom caption {lh})");
+    assert!(cy + ch <= ty + 0.5, "the top caption after the row sits above it (caption y {cy} + {ch}, cell y {ty})");
+    assert!(ly >= ty + th - 0.5, "the bottom caption stays below the row (caption y {ly}, cell y {ty} + {th})");
+}
+
+/// AETHERCAPTIONCSSOM (SR686): captions keep their DOM order on each side, and a re-fold of the SAME tree (anim's
+/// `apply_specs` on the live tree an earlier fold reordered) that flips a bottom caption to top puts it back above the
+/// rows at its DOM rank.
+#[test]
+fn caption_order_is_stable_among_captions() {
+    let doc = page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![
+            el("caption", &[("id", "b"), ("align", "bottom")], vec![text("Bottom")]),
+            el("tr", &[], vec![el("td", &[("id", "cell")], vec![text("row")])]),
+            el("caption", &[("id", "t1")], vec![text("First")]),
+            el("caption", &[("id", "t2")], vec![text("Second")]),
+        ],
+    )]);
+    let mut tree = lay(&doc, VW, 400.0);
+    let y = |tree: &Tree, id: &str| box_of(tree, &doc.by_id(id)).1;
+    let (_, ty, _, th) = box_of(&tree, &doc.by_id("cell"));
+    assert!(y(&tree, "t1") < y(&tree, "t2") && y(&tree, "t2") < ty, "the top captions sit above the row in DOM order");
+    assert!(y(&tree, "b") >= ty + th - 0.5, "the bottom caption sits below the row");
+
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("caption-side", "top", &mut s, &cx);
+    let b = id_of(&tree, &doc.by_id("b"));
+    layout_core::apply_specs(&mut tree, &[(b, std::rc::Rc::new(s))]);
+    let table = tree.taffy.parent(b).expect("the caption's table");
+    let order: Vec<layout_core::taffy::NodeId> = tree.taffy.children(table).unwrap();
+    let want = [id_of(&tree, &doc.by_id("b")), id_of(&tree, &doc.by_id("t1")), id_of(&tree, &doc.by_id("t2"))];
+    assert_eq!(&order[..3], &want[..], "the flipped caption goes back above the rows at its DOM rank (first)");
+    layout_core::remeasure(&mut tree, &F);
+    let ty = box_of(&tree, &doc.by_id("cell")).1;
+    assert!(y(&tree, "b") < y(&tree, "t1") && y(&tree, "t2") < ty, "laid out again: b, t1, t2 above the row");
+}

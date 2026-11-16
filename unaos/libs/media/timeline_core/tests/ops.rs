@@ -170,3 +170,70 @@ fn exportcolourprim_reels_colour_is_the_one_pair() {
     audio.tracks[0].clips.clear();
     assert_eq!(audio.reels_colour(by(Some(col(1, 1, 1)), Some(col(1, 1, 1)))), (2, 2), "no video clip");
 }
+
+// ---- NLE3ETRIMSTRETCH (LEDGER SR692): the ripple trims on plain clips (named tail block) ----
+#[test]
+fn nle3etrimstretch_ripple_trims_shift_the_rest_of_the_track() {
+    let (mut tl, a, b) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 55, 25)); // V1: A[0,10)@0 B[20,30)@10 A[50,55)@25
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    tl.validate().unwrap();
+    let before = tl.clone();
+    // out 5 earlier: the clip keeps its start, the later clip of its track moves 5 earlier, the other track stays
+    let r = tl.ripple_trim_out(0, 1, 25).unwrap();
+    assert_eq!(r.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 25, 10), Clip::new(a, 50, 55, 20)]);
+    assert_eq!(r.tracks[1], tl.tracks[1]);
+    // in 2 earlier: the clip is 2 longer from the same start, the later clip moves 2 later
+    let r = tl.ripple_trim_in(0, 1, 18).unwrap();
+    assert_eq!((r.tracks[0].clips[1], r.tracks[0].clips[2].at), (Clip::new(b, 18, 30, 10), 27));
+    // refused by name, the input untouched
+    assert_eq!(tl.ripple_trim_in(0, 1, 30), Err(EditError::Empty));
+    assert_eq!(tl.ripple_trim_in(0, 1, -1), Err(EditError::Negative));
+    assert_eq!(tl.ripple_trim_out(0, 1, 61), Err(EditError::OutOfSource));
+    assert_eq!(tl.ripple_trim_out(0, 5, 1), Err(EditError::NoClip));
+    assert_eq!(tl.ripple_trim_out(9, 0, 1), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide on plain clips (named tail block) ----
+#[test]
+fn nle3eslip_slip_slides_the_source_window() {
+    let (tl, a, b) = base(); // V1: A[0,10)@0 B[20,30)@10 (B is 60 ticks)
+    let before = tl.clone();
+    // +3: the source window moves, the timeline start and length stay
+    let s = tl.slip(0, 1, 3).unwrap();
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 23, 33, 10)]);
+    assert_eq!((s.tracks[0].clips[1].at, s.tracks[0].clips[1].len(), s.end()), (10, 10, tl.end()));
+    // up to the source's end exactly
+    assert_eq!(tl.slip(0, 1, 30).unwrap().tracks[0].clips[1], Clip::new(b, 50, 60, 10));
+    // past the source's start or end: refused by name, the input untouched
+    assert_eq!(tl.slip(0, 1, -21), Err(EditError::OutOfSource));
+    assert_eq!(tl.slip(0, 1, 31), Err(EditError::OutOfSource));
+    assert_eq!(tl.slip(0, 2, 1), Err(EditError::NoClip));
+    assert_eq!(tl.slip(5, 0, 1), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
+
+#[test]
+fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
+    let (mut tl, a, b) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 60, 20)); // V1: A[0,10)@0 B[20,30)@10 A[50,60)@20
+    tl.validate().unwrap();
+    let before = tl.clone();
+    // +5: B moves 5 later with its content, A ends 5 later, the next A starts 5 later, the track's length stays
+    let s = tl.slide(0, 1, 5).unwrap();
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 15, 0), Clip::new(b, 20, 30, 15), Clip::new(a, 55, 60, 25)]);
+    assert_eq!(s.end(), tl.end());
+    let text = timeline_core::edl::write(&s, "SLIDE").unwrap();
+    let back = timeline_core::edl::parse(&text, 25).unwrap();
+    let video = |t: &Timeline| t.tracks.iter().find(|k| k.kind == Kind::Video).map(|k| k.clips.clone());
+    assert_eq!((video(&back), timeline_core::edl::write(&back, "SLIDE").unwrap()), (video(&s), text));
+    // a neighbour slid to nothing, a neighbour past its source, the neighbour-less side before zero: refused by name
+    assert_eq!(tl.slide(0, 1, -10), Err(EditError::Empty));
+    assert_eq!(tl.slide(0, 1, 10), Err(EditError::Empty));
+    assert_eq!(tl.slide(0, 1, 91), Err(EditError::OutOfSource));
+    assert_eq!(tl.slide(0, 0, -1), Err(EditError::Negative));
+    assert_eq!(tl.slide(0, 3, 1), Err(EditError::NoClip));
+    assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}

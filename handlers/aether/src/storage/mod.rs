@@ -430,3 +430,23 @@ fn data_dir() -> PathBuf {
 pub(crate) fn reset_local_areas_for_test() {
     local_areas().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
+
+// ---- AETHERTESTROOTS (LEDGER SR696): one process-wide storage root for the integration binaries (named tail block) ----
+
+/// AETHER-TESTROOT-INTEG: re-roots this process's storage once, at `<tmp>/aether-<name>-<pid>` (an integration
+/// binary passes `env!("CARGO_TARGET_TMPDIR")`), and returns the root. ONE root per process: the first call wins
+/// and every later call, under any name, returns that same root (cargo runs a binary's tests on parallel threads).
+/// Order: call it before the binary's first `AetherEngine::new` and its first fetch — text_host's font index dir is
+/// set once (`db::set_cache_dir`) and the HTTP cache binds [`http_cache_dir`] at its first request — so it registers
+/// the font index dir ([`crate::fonts::register_db_cache`]) itself, right after re-rooting.
+pub fn init_root(tmp: impl AsRef<Path>, name: &str) -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = tmp.as_ref().join(format!("aether-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        set_root_dir(Some(dir.clone()));
+        crate::fonts::register_db_cache();
+        dir
+    })
+    .clone()
+}

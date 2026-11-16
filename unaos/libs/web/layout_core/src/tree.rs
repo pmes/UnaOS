@@ -60,6 +60,8 @@ pub struct LayoutTree<H: Host> {
     /// horizontal margins, align-self); [`apply_specs`] and the in-place [`remeasure`] put them back before
     /// they fold or lay out again.
     bw_pending: blockwidth::Saved,
+    /// AETHERCAPTIONCSSOM (SR686): the boxes whose align-self `place_narrow_blocks` wrote, with the value (undone and re-derived by `rule_align_undo` at each `propagate_text_align`).
+    rule_align: NodeMap<taffy::style::AlignSelf>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -297,7 +299,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         measure_epoch: 0,
         kept_token: 0,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(),
     }
 }
 
@@ -528,8 +530,8 @@ pub fn build_taffy_tree<H: Host>(
         }
     }
     // AETHERFILEFACE (SR463): html.css gives `input[type="file" i]` no background (initial): Chromium paints ButtonFace on
-    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`).
-    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) {
+    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`). AETHERIMAGEINPUTFACE (SR701): `input[type="image" i]` gets none either (`is_image_input`).
+    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) && !is_image_input(dom_node) {
         // Chromium's ButtonFace.
         paint.background = Some(BUTTON_FACE);
     }
@@ -647,23 +649,14 @@ pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
 /// AETHERCAPTIONSIDECSS (SR462): run once the cascade is folded (`apply_specs`), reading `PaintStyle::caption_side`
 /// (align= under style="" under the author cascade); the property inherits, so a caption's used value is the first
 /// one specified on itself or an ancestor box, top when none is. Idempotent: a second fold moves nothing.
+/// AETHERCAPTIONCSSOM (SR686): every caption is placed by side (`caption_sides_around`): top ones before the rows, bottom ones after, each in DOM order.
 fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
-    if !tree.paint_map.values().any(|p| p.caption_side == Some(true)) {
+    if !tree.node_map.values().any(|n| n.tag().as_deref() == Some("caption")) {
         return;
     }
-    let used_bottom = |tree: &LayoutTree<H>, id: taffy::NodeId| {
-        let mut cur = Some(id);
-        while let Some(b) = cur {
-            if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
-                return side;
-            }
-            cur = tree.taffy.parent(b);
-        }
-        false
-    };
     let mut below: BTreeMap<u64, Vec<taffy::NodeId>> = BTreeMap::new();
     for (id, n) in &tree.node_map {
-        if n.tag().as_deref() != Some("caption") || !used_bottom(tree, *id) {
+        if n.tag().as_deref() != Some("caption") {
             continue;
         }
         let Some(table) = tree.taffy.parent(*id) else { continue };
@@ -674,8 +667,8 @@ fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
     for (table, caps) in below {
         let table = taffy::NodeId::from(table);
         let kids = tree.taffy.children(table).unwrap_or_default();
-        let (moved, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
-        rest.extend(moved);
+        let (moved, rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
+        let rest = caption_sides_around(tree, table, moved, rest);
         if rest != kids {
             let _ = tree.taffy.set_children(table, &rest);
         }
@@ -1190,7 +1183,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 /// anywhere down the tree still wins.
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
-        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited);
+        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
         if let Some(align) = effective.filter(|&a| a != 0 && a != 4) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
@@ -1225,7 +1218,7 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
             walk(tree, k, effective);
         }
     }
-    let root = tree.root_node;
+    rule_align_undo(tree); let root = tree.root_node;
     walk(tree, root, None);
 }
 
@@ -1239,7 +1232,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
     let to = match align {
         5 => taffy::style::AlignSelf::CENTER,
         6 => taffy::style::AlignSelf::END,
-        _ => taffy::style::AlignSelf::START,
+        _ => if is_rtl(tree, id) { taffy::style::AlignSelf::END } else { taffy::style::AlignSelf::START },
     };
     for k in tree.taffy.children(id).unwrap_or_default() {
         let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
@@ -1252,7 +1245,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
             continue;
         }
         let mut n = kst;
-        n.align_self = Some(to);
+        n.align_self = Some(to); tree.rule_align.insert(k, to);
         let _ = tree.taffy.set_style(k, n);
     }
 }
@@ -1712,7 +1705,7 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         let node_id = *node_id;
         if let Ok(node_style_ref) = tree.taffy.style(node_id) {
             let mut node_style = node_style_ref.clone();
-            spec.fold_into(&mut node_style);
+            spec.fold_into(&mut node_style); if spec.align_self.is_some() { tree.rule_align.remove(&node_id); }
             let _ = tree.taffy.set_style(node_id, node_style);
         }
         match spec.position {
@@ -1939,7 +1932,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
                     let h = attr_px("height").or(intrinsic.map(|(_, h)| h));
-                    if let Some(wh) = img_alt_extent::<H, F>(tree, node_id, &size, fonts) { out.imgs.insert(node_id, wh); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
+                    if let Some(run) = img_alt_extent::<H>(tree, node_id, &size) { out.text.insert(node_id, run); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
                         out.imgs.insert(node_id, (w, h));
                     }
                 }
@@ -2167,7 +2160,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
     let is_cell = |tree: &LayoutTree<H>, id: taffy::NodeId| {
         tree.node_map.get(&id).and_then(|n| n.tag().map(|t| matches!(t.as_str(), "td" | "th"))).unwrap_or(false)
     };
-    let mut saved_widths: Vec<(taffy::NodeId, Dimension)> = Vec::new();
+    let mut saved_widths: Vec<(taffy::NodeId, Dimension)> = Vec::new(); let alt_caps = img_alt_cap(tree, &text_info); if !alt_caps.is_empty() { run_pass(tree); }
     for _ in 0..4 {
         let heights = inline::layout_all(tree, &text_info, &elem_info, fonts);
         let mut changed = false;
@@ -2301,7 +2294,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
             let _ = tree.taffy.set_style(f.id, st);
         }
     }
-    for (id, d) in mc_heights {
+    img_alt_uncap(tree, alt_caps); for (id, d) in mc_heights {
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
             st.size.height = d;
@@ -2546,7 +2539,7 @@ pub fn retarget<H: Host>(fresh: LayoutTree<H>, kept: &LayoutTree<H>, token: u64,
         measure_epoch: 0,
         kept_token: token,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(),
     }
 }
 
@@ -2637,7 +2630,7 @@ fn sync<H: Host>(twin: &mut LayoutTree<H>, kept: &mut LayoutTree<H>, prep: &Prep
     kept.col_frags = core::mem::take(&mut twin.col_frags);
     kept.fixed_at = core::mem::take(&mut twin.fixed_at);
     kept.measured = now;
-    kept.bw_pending = Vec::new();
+    kept.bw_pending = Vec::new(); kept.rule_align = core::mem::take(&mut twin.rule_align);
     kept.kept_token = 0;
     true
 }
@@ -3075,13 +3068,13 @@ pub enum ImgState {
 /// `InlineAlt`: an inline non-replaced element whose content is the text (its width / height dropped), sized by
 /// [`img_alt_extent`] as one text run. `BoxedAlt`: the img keeps its size as a clipped box holding the text; with
 /// `frame` it carries the 1px solid silver border and 1px padding and the 16px broken-image icon floats at its
-/// top-left (the host leaves the icon's slot empty: AETHER-IMG-BROKENICON owed), without `frame` (a fixed side
+/// top-left (`icon`, the same rule, painted from [`BROKEN_ICON`] by both rings, SR702), without `frame` (a fixed side
 /// under 18 px) neither.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImgFallback {
     None,
     InlineAlt(String),
-    BoxedAlt { text: String, frame: bool },
+    BoxedAlt { text: String, frame: bool, icon: bool },
 }
 
 /// AETHERIMGALT (SR681): Chromium's rule for a failed img, pure. `alt` / `title` are the raw attributes (the text
@@ -3108,7 +3101,7 @@ pub fn img_fallback(
     let dims = (w.is_some() && h.is_some()) || (aspect && (w.is_some() || h.is_some()));
     if dims && (quirks || alt.is_none_or(|a| a.is_empty())) {
         let small = h.flatten().is_some_and(|v| v < 18.0) || w.flatten().is_some_and(|v| v < 18.0);
-        return ImgFallback::BoxedAlt { text: text.to_string(), frame: !small };
+        return ImgFallback::BoxedAlt { text: text.to_string(), frame: !small, icon: !small };
     }
     if text.is_empty() { ImgFallback::None } else { ImgFallback::InlineAlt(text.to_string()) }
 }
@@ -3140,14 +3133,15 @@ pub fn img_fallback_of<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> ImgF
     img_fallback(alt.as_deref(), title.as_deref(), state, w, h, aspect, is_quirks(node))
 }
 
-/// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) measured as ONE
-/// line in the element's own run by `measure_text_run`, the measurer the painter's line breaker matches; None for
-/// every other img (today's sizing).
-fn img_alt_extent<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, id: taffy::NodeId, run: &TextRun, fonts: &F) -> Option<(f32, f32)> {
+/// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) in the element's
+/// own run, the img node's measured text run (AETHERIMGALTINLINEWRAP SR707: `run_pass`'s text branch measures it by
+/// `measure_text_run` at the width taffy settles, capped at the containing block by `img_alt_cap`, so it wraps); None
+/// for every other img (today's sizing).
+fn img_alt_extent<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, run: &TextRun) -> Option<TextRun> {
     match img_fallback_of(tree, id) {
         ImgFallback::InlineAlt(alt) => {
             let text = H::transform_text(&alt, run.text_transform);
-            Some(measure_text_run(&TextRun { text, ..run.clone() }, f32::MAX, fonts))
+            Some(TextRun { text, ..run.clone() })
         }
         _ => None,
     }
@@ -3170,9 +3164,9 @@ mod img_alt_kat {
     fn imgalt_sized_standards_vs_quirks_kat() {
         let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
         assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, false), ImgFallback::InlineAlt("Logo".into()));
-        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true });
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true, icon: true });
         // One side and an aspect ratio count as sized.
-        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, true, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, true, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true, icon: true });
         // One side alone does not.
         assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, false, false), ImgFallback::InlineAlt("T".into()));
     }
@@ -3182,14 +3176,14 @@ mod img_alt_kat {
     #[test]
     fn imgalt_empty_alt_and_small_kat() {
         let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
-        assert_eq!(img_fallback(Some(""), Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
-        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        assert_eq!(img_fallback(Some(""), Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true, icon: true });
         assert_eq!(img_fallback(Some(""), None, ImgState::Failed, None, None, false, false), ImgFallback::None);
         assert_eq!(img_fallback(None, None, ImgState::Failed, None, None, false, false), ImgFallback::None);
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(Some(16.0)), h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(Some(16.0)), h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false, icon: false });
         // A percentage side is set but not fixed: never "small".
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(Some(10.0)), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(Some(10.0)), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false, icon: false });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
     }
 }
 
@@ -3213,5 +3207,309 @@ pub fn file_status<'a>(value: Option<&'a str>, multiple: bool, count: usize) -> 
         Cow::Borrowed(file_label(multiple).1)
     } else {
         Cow::Borrowed(name)
+    }
+}
+
+// ---- AETHERCAPTIONCSSOM (LEDGER SR686): caption-side's used value, top captions first, the centring mark (named tail block) ----
+
+/// AETHERCAPTIONCSSOM (SR686): a box's used caption-side, true for bottom: the first `PaintStyle::caption_side` specified
+/// on the box itself or a box ancestor (align= under style="" under the author cascade; the property inherits), top
+/// when none is. The ONE walk `caption_side_order` and the host's `getComputedStyle` read.
+pub fn caption_side_used<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(b) = cur {
+        if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
+            return side;
+        }
+        cur = tree.taffy.parent(b);
+    }
+    false
+}
+
+/// AETHERCAPTIONCSSOM (SR686): a table's children as CSS 2.2 §17.4 places its captions: the top captions, the other
+/// children (in their order), the bottom captions. The captions keep their DOM order (their rank among the table
+/// node's own children), so a re-fold of a tree an earlier fold already reordered (anim's `apply_specs`) puts a caption
+/// whose side changed back where Chromium has it.
+fn caption_sides_around<H: Host>(tree: &LayoutTree<H>, table: taffy::NodeId, mut caps: Vec<taffy::NodeId>, rest: Vec<taffy::NodeId>) -> Vec<taffy::NodeId> {
+    if let Some(t) = tree.node_map.get(&table) {
+        let dom = t.children();
+        let rank = |c: &taffy::NodeId| tree.node_map.get(c).and_then(|n| dom.iter().position(|d| d.same(n))).unwrap_or(usize::MAX);
+        caps.sort_by_key(rank);
+    }
+    let (bottom, mut out): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = caps.into_iter().partition(|c| caption_side_used(tree, *c));
+    out.extend(rest);
+    out.extend(bottom);
+    out
+}
+
+/// AETHERCAPTIONCSSOM (SR686): undoes the align-self `place_narrow_blocks` wrote on the last run, so the walk that
+/// follows re-derives it from the text-align in force now (Chromium recomputes the centring on every style recalc):
+/// a box still holding the value the rule wrote goes back to none; one whose align-self moved since (an author value)
+/// keeps it. Every mark is dropped; the walk marks again what it writes.
+fn rule_align_undo<H: Host>(tree: &mut LayoutTree<H>) {
+    if tree.rule_align.is_empty() {
+        return;
+    }
+    let marked: Vec<(taffy::NodeId, taffy::style::AlignSelf)> = tree.rule_align.iter().map(|(k, v)| (*k, *v)).collect();
+    tree.rule_align.clear();
+    for (k, wrote) in marked {
+        let Ok(st) = tree.taffy.style(k) else { continue };
+        if st.align_self != Some(wrote) {
+            continue;
+        }
+        let mut st = st.clone();
+        st.align_self = None;
+        let _ = tree.taffy.set_style(k, st);
+    }
+}
+
+// ---- AETHERIMAGEINPUTFACE (LEDGER SR701): the column's direction before pass 1 (named tail block) ----------------
+
+/// AETHERIMAGEINPUTFACE (SR701): whether box `id`'s used `direction` is rtl, by the precedence pass 1 resolves `mode.rtl`
+/// with (an author / style="" `direction` on `PaintStyle::rtl`, else `default_rtl`'s `dir` attribute, else the parent
+/// box's), read before pass 1 runs so `place_narrow_blocks` can keep a narrow block at an rtl column's inline start (the
+/// right edge, CSS 2.2 §10.3.3; taffy's START is always the physical left). A `dir` counts as set when `default_rtl`
+/// ignores the inherited value; anonymous boxes and text pass through to the parent.
+fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(b) = cur {
+        if let Some(r) = tree.paint_map.get(&b).and_then(|p| p.rtl) {
+            return r;
+        }
+        if let Some(n) = tree.node_map.get(&b) {
+            let own = default_rtl(n, false);
+            if own == default_rtl(n, true) {
+                return own;
+            }
+        }
+        cur = tree.taffy.parent(b);
+    }
+    false
+}
+
+// ---- AETHERIMGBROKENICON (LEDGER SR702): the broken-image icon, one rect list both rings paint (named tail block) ----
+
+/// AETHERIMGBROKENICON (SR702): one opaque rect of [`BROKEN_ICON`] in the icon's own 16x16 space (x, y its top-left,
+/// w x h its size, `fill` its colour). Both rings fill these in order (a later rect overdraws an earlier one) through
+/// their own rect primitive; neither has a line primitive, so the glyph is rects only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IconRect {
+    pub x: u8,
+    pub y: u8,
+    pub w: u8,
+    pub h: u8,
+    pub fill: (u8, u8, u8),
+}
+
+const ICON_GREY: (u8, u8, u8) = (0x80, 0x80, 0x80);
+const ICON_WHITE: (u8, u8, u8) = (0xff, 0xff, 0xff);
+
+const fn icon_rect(x: u8, y: u8, w: u8, h: u8, fill: (u8, u8, u8)) -> IconRect {
+    IconRect { x, y, w, h, fill }
+}
+
+/// AETHERIMGBROKENICON (SR702): Chromium's broken-image icon (IDR_BROKENIMAGE) as ONE vector description, drawn by
+/// the host's `paint_img_alt` and AETHER.ELF's `image_alt` at the alt container's padding-box corner plus 1 (the
+/// content box plus 2, 2) when `ImgFallback::BoxedAlt::icon`: a 12x14 white page (x 1..12, y 1..14) outlined in #808080 with a 4px
+/// folded top-right corner, torn across its lower half by a 2-riser staircase with a 1px gap (the lower piece 2px
+/// lower), and a #3A8EE6 / #65B35B square as the picture hint. No bitmap, no dependency.
+pub const BROKEN_ICON: &[IconRect] = &[
+    // white fill: the upper piece, the fold flap, the lower piece
+    icon_rect(2, 2, 6, 7, ICON_WHITE),
+    icon_rect(8, 6, 4, 1, ICON_WHITE),
+    icon_rect(9, 3, 1, 1, ICON_WHITE),
+    icon_rect(9, 4, 2, 1, ICON_WHITE),
+    icon_rect(2, 12, 10, 2, ICON_WHITE),
+    icon_rect(5, 11, 7, 1, ICON_WHITE),
+    icon_rect(9, 10, 3, 1, ICON_WHITE),
+    // upper piece outline: top, left, the fold (vertical, horizontal, diagonal), right, the tear staircase
+    icon_rect(1, 1, 8, 1, ICON_GREY),
+    icon_rect(1, 1, 1, 9, ICON_GREY),
+    icon_rect(8, 1, 1, 5, ICON_GREY),
+    icon_rect(8, 5, 5, 1, ICON_GREY),
+    icon_rect(9, 2, 1, 1, ICON_GREY),
+    icon_rect(10, 3, 1, 1, ICON_GREY),
+    icon_rect(11, 4, 1, 1, ICON_GREY),
+    icon_rect(12, 5, 1, 3, ICON_GREY),
+    icon_rect(1, 9, 4, 1, ICON_GREY),
+    icon_rect(4, 8, 5, 1, ICON_GREY),
+    icon_rect(8, 7, 5, 1, ICON_GREY),
+    // lower piece outline: the tear staircase, left, bottom, right
+    icon_rect(1, 11, 4, 1, ICON_GREY),
+    icon_rect(4, 10, 5, 1, ICON_GREY),
+    icon_rect(8, 9, 5, 1, ICON_GREY),
+    icon_rect(1, 11, 1, 4, ICON_GREY),
+    icon_rect(1, 14, 12, 1, ICON_GREY),
+    icon_rect(12, 9, 1, 6, ICON_GREY),
+    // the picture hint
+    icon_rect(3, 3, 2, 2, (0x3a, 0x8e, 0xe6)),
+    icon_rect(7, 12, 3, 2, (0x65, 0xb3, 0x5b)),
+];
+
+#[cfg(test)]
+mod img_broken_icon_kat {
+    use super::{img_fallback, ImgFallback, ImgState, BROKEN_ICON};
+
+    /// The icon shows exactly when the frame does (Chromium's ImageSmallerThanAltImage, 16 + 2 px); inline alt has none.
+    #[test]
+    fn broken_icon_rule_kat() {
+        let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true, icon: true });
+        let s = Some(Some(10.0));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, s, s, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: false, icon: false });
+        assert!(matches!(img_fallback(Some("Logo"), None, ImgState::Failed, None, None, false, false), ImgFallback::InlineAlt(_)));
+        // A percentage side is never "small": icon as frame.
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
+    }
+
+    /// Every rect is non-empty and inside the 16x16 icon space; the pinned pixel (1, 5) is the page outline grey.
+    #[test]
+    fn broken_icon_bounds_kat() {
+        for r in BROKEN_ICON {
+            assert!(r.w > 0 && r.h > 0 && r.x as u32 + r.w as u32 <= 16 && r.y as u32 + r.h as u32 <= 16, "{r:?}");
+        }
+        let at = |x: u8, y: u8| BROKEN_ICON.iter().rev().find(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|r| r.fill);
+        assert_eq!(at(1, 5), Some((128, 128, 128)));
+        assert_eq!(at(0, 0), None);
+    }
+}
+
+// ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's text wraps at its containing block (named tail block) ----
+
+/// AETHERIMGALTINLINEWRAP (SR707): caps every in-flow inline-level InlineAlt img (an ELEMENT key of `text`: `resolve`
+/// files text nodes and, through `img_alt_extent`, those imgs only) at its containing block: the content width of its
+/// nearest ancestor that is not inline-level, less the img's own horizontal margins (and border / padding under
+/// content-box sizing), as `max_size.width` (`img_alt_cap_of` meets an author value). taffy measures an inline item's
+/// flex basis at max-content and never shrinks it (`flex_shrink` 0), so without the cap a long alt is one line as wide
+/// as the viewport; with it the main size clamps and `run_pass` measures the run at that width, over lines. Returns
+/// the saved values for `img_alt_uncap` (the `mc_saved` shape).
+fn img_alt_cap<H: Host>(tree: &mut LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<(taffy::NodeId, LengthPercentageAuto)> {
+    let mut saved = Vec::new();
+    let alts: Vec<taffy::NodeId> = text.keys().copied().filter(|id| tree.node_map.get(id).is_some_and(|n| n.is_element())).collect();
+    for id in alts {
+        let placed = tree.paint_map.get(&id).is_some_and(|p| matches!(p.position_kind, Some(2 | 3)) || p.float.is_some_and(|f| f != 0));
+        if placed || !is_inline_level(tree, id) {
+            continue;
+        }
+        let mut cb = tree.taffy.parent(id);
+        while let Some(p) = cb {
+            if !is_inline_level(tree, p) {
+                break;
+            }
+            cb = tree.taffy.parent(p);
+        }
+        let Some(cb) = cb else { continue };
+        let Ok(l) = tree.taffy.layout(cb) else { continue };
+        let cw = l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
+        let Ok(il) = tree.taffy.layout(id) else { continue };
+        let Ok(st) = tree.taffy.style(id) else { continue };
+        let mut own = il.margin.left + il.margin.right;
+        if st.box_sizing == taffy::style::BoxSizing::ContentBox {
+            own += il.border.left + il.border.right + il.padding.left + il.padding.right;
+        }
+        let Some(cap) = img_alt_cap_of(st.max_size.width, (cw - own).max(0.0)) else { continue };
+        if cap == st.max_size.width {
+            continue;
+        }
+        saved.push((id, st.max_size.width));
+        let mut st = st.clone();
+        st.max_size.width = cap;
+        let _ = tree.taffy.set_style(id, st);
+    }
+    saved
+}
+
+/// AETHERIMGALTINLINEWRAP (SR707): the cap `img_alt_cap` writes over an author `max-width`: `auto` -> the containing
+/// block's width `cw`; a px length -> the smaller of the two; anything else (a percentage, calc) -> None, the author's
+/// value kept.
+fn img_alt_cap_of(author: LengthPercentageAuto, cw: f32) -> Option<LengthPercentageAuto> {
+    let raw = author.into_raw();
+    if author == LengthPercentageAuto::auto() {
+        Some(LengthPercentageAuto::length(cw))
+    } else if raw.tag() == taffy::style::CompactLength::LENGTH_TAG {
+        Some(LengthPercentageAuto::length(raw.value().min(cw)))
+    } else {
+        None
+    }
+}
+
+/// AETHERIMGALTINLINEWRAP (SR707): puts back the `max-width`s `img_alt_cap` replaced, last saved first.
+fn img_alt_uncap<H: Host>(tree: &mut LayoutTree<H>, saved: Vec<(taffy::NodeId, LengthPercentageAuto)>) {
+    for (id, mw) in saved.into_iter().rev() {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.max_size.width = mw;
+            let _ = tree.taffy.set_style(id, st);
+        }
+    }
+}
+
+#[cfg(test)]
+mod img_alt_wrap_kat {
+    use super::{img_alt_cap_of, measure_text_run, TextRun};
+    use crate::prelude::*;
+    use crate::{Adv, FontSel, Fonts};
+    use taffy::style::LengthPercentageAuto;
+
+    /// 8 px per char, ascent 12 / descent 4 / no gap: a 16 px line.
+    struct Mono;
+    impl Fonts for Mono {
+        fn has_face(&self, _sel: FontSel) -> bool {
+            true
+        }
+        fn measure(&self, run: &str, _adv: &Adv) -> f32 {
+            run.chars().count() as f32 * 8.0
+        }
+        fn line_metrics(&self, _sel: FontSel, _size: f32) -> (f32, f32, f32) {
+            (12.0, 4.0, 0.0)
+        }
+        fn x_height(&self, _sel: FontSel, _size: f32) -> f32 {
+            8.0
+        }
+    }
+
+    fn run(text: &str) -> TextRun {
+        TextRun { text: text.to_string(), font_size: 16.0, ..Default::default() }
+    }
+
+    /// A 20-word alt measured at a 120 px column is several lines no wider than it; at f32::MAX (and a short alt at
+    /// 120 px) it is the one line SR681 sized.
+    #[test]
+    fn imgalt_wraps_at_the_column_kat() {
+        let long = run("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty");
+        let (w, h) = measure_text_run(&long, 120.0, &Mono);
+        assert!(w <= 120.0 && w > 0.0, "wrapped width {w}");
+        assert!(h > 16.0 * 2.0, "several 16 px lines: {h}");
+        let (_, h1) = measure_text_run(&long, f32::MAX, &Mono);
+        assert_eq!(h1, 16.0, "unbounded: one line");
+        assert_eq!(measure_text_run(&run("Logo"), 120.0, &Mono), (32.0, 16.0), "a short alt is unchanged");
+    }
+
+    /// The cap over an author max-width: auto -> the column, a length -> the smaller, a percentage -> kept.
+    #[test]
+    fn imgalt_cap_of_kat() {
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::auto(), 120.0), Some(LengthPercentageAuto::length(120.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::length(80.0), 120.0), Some(LengthPercentageAuto::length(80.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::length(300.0), 120.0), Some(LengthPercentageAuto::length(120.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::percent(0.5), 120.0), None);
+    }
+}
+
+// ---- AETHERRTLBLOCKSTART (LEDGER SR711): an rtl column's narrow blocks at its inline start with no / start text-align (named tail block) ----
+
+/// AETHERRTLBLOCKSTART (SR711): an rtl block container whose text-align is none or `start` (code 0) puts its in-flow
+/// narrow blocks at its inline start, the RIGHT edge (CSS 2.2 §10.3.3: in rtl margin-left is the over-constrained one;
+/// taffy's default START is always the physical left). The filter in `propagate_text_align` admits no such code (and
+/// `Option::filter` never sees None), so this runs beside it: `place_narrow_blocks`' `_` arm gives END through `is_rtl`
+/// and records the write in `rule_align`, which SR686's `rule_align_undo` clears before the next prepass. The column's
+/// `justify_content` / `align_items` are never touched. Code 4 (`text-align: left`) is not admitted: it is also
+/// `align=left`, which Chromium keeps at the physical left (AETHER-RTL-BLOCK-LEFT owed, the 4 / 7 code split).
+fn rtl_start_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, effective: Option<u8>) {
+    if !matches!(effective, None | Some(0)) {
+        return;
+    }
+    let Ok(st) = tree.taffy.style(id).cloned() else { return };
+    if (crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st)) && is_rtl(tree, id) {
+        place_narrow_blocks(tree, id, 0);
     }
 }

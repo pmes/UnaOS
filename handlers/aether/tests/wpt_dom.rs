@@ -365,7 +365,7 @@ fn run_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
             return out;
         }
     };
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
     if engine.js_engine.is_none() {
         out.harness = "no engine".into();
@@ -616,7 +616,7 @@ fn run_net_file(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResul
             return out;
         }
     };
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
     if engine.js_engine.is_none() {
         out.harness = "no engine".into();
@@ -1152,4 +1152,11 @@ fn wpt2_directory_table_is_complete() {
         assert!(!needs.is_empty(), "{d} names what it needs");
     }
     assert_eq!(WPT2_DIRS.len(), 27);
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "wpt-dom");
 }

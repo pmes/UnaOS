@@ -28,7 +28,7 @@ fn settle(e: &mut AetherEngine) {
 }
 
 fn load(url: &str, html: &str) -> AetherEngine {
-    let mut e = AetherEngine::new();
+    init(); let mut e = AetherEngine::new();
     e.load_html(url, html, true);
     settle(&mut e);
     e
@@ -317,4 +317,11 @@ fn rate_range_video_frame_callback_and_refusals() {
     eval(&mut e, "v.requestPictureInPicture().catch(function (x) { log.push('pip:' + x.name); }); try { v.captureStream(); } catch (x) { log.push('capture:' + x.name); } log.push('enabled:' + document.pictureInPictureEnabled);");
     settle(&mut e);
     assert_eq!(eval(&mut e, "log.slice(1).sort().join(' ')"), "capture:NotSupportedError enabled:false pip:NotSupportedError");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "media2");
 }

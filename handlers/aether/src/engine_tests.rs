@@ -4440,7 +4440,7 @@ mod tests {
     }
 
     /// AETHERIMGALT (SR681): in quirks mode a sized failed img is a box of its size (TreatImageAsReplaced) with the 1px
-    /// solid silver border, 1px padding, the 16px icon slot left empty, and the alt text after it on the first line.
+    /// solid silver border, 1px padding, the 16px broken-image icon (SR702), and the alt text after it on the first line.
     #[test]
     fn img_alt_boxed_when_sized() {
         let html = r#"<html><body style="margin:0;font:16px sans-serif">
@@ -4460,7 +4460,8 @@ mod tests {
         assert_eq!(imgalt_px(&engine, l + 100, t + 99), silver, "b: the bottom border");
         assert_eq!(imgalt_px(&engine, l + 100, t + 70), (255, 255, 255), "b: the inside is not filled");
         assert!(imgalt_ink(&engine, l + 18, l + 199, t + 2, t + 30) > 0, "b: the alt text paints after the icon slot");
-        assert_eq!(imgalt_ink(&engine, l + 1, l + 17, t + 1, t + 99), 0, "b: the icon slot stays empty (icon owed)");
+        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "b: the broken-image icon paints in its slot");
+        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "b: the icon's page outline");
     }
 
     /// AETHERIMGALT (SR681): a failed, unsized img with alt="" represents nothing: no box, no ink.
@@ -4494,5 +4495,176 @@ mod tests {
         let (l, t) = (l.round() as usize, t.round() as usize);
         assert_eq!(imgalt_px(&engine, l, t + 50), (255, 255, 255), "p: no border");
         assert_eq!(imgalt_ink(&engine, l, l + 200, t, t + 100), 0, "p: no alt text yet");
+    }
+
+    // ---- AETHERHOSTWGHT (LEDGER SR690): font-weight on a variable face paints its instance (named tail block) ----
+
+    /// AETHERHOSTWGHT (SR690): the face the installed-family roads give (`fonts::styled_face`, what `db_face` loads)
+    /// for the tree's Inter variable face at 600 is the wght 600 instance, not the 400 one: a distinct face, no
+    /// synthetic bold, more ink in `H`; at 700 (where `select` asks for synthetic bold) the axis reaches the weight and
+    /// no embolden path is taken. Through `styled_face` rather than a page: the process-wide font database holds no
+    /// installed variable face on the seat.
+    #[test]
+    fn font_weight_600_paints_the_instance() {
+        use crate::fonts::{db, raster};
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fonts/inter/InterVariable.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter variable face");
+        let at = |w: f32, bold: bool| {
+            let want = db::Style { weight: w, ..db::Style::default() };
+            crate::fonts::styled_face(&info, bold, false, want).expect("Inter loads")
+        };
+        let (regular, semibold, bold) = (at(400.0, false), at(600.0, false), at(700.0, true));
+        assert_ne!(regular.id, semibold.id, "600 is its own instance");
+        assert!(!regular.synth_bold && !semibold.synth_bold && !bold.synth_bold, "no embolden path on a wght face");
+        let gid = regular.font.glyph_index('H');
+        let ink = |f: &crate::fonts::Face| raster::glyph(f, gid, 32.0, 0).map_or(0u64, |m| m.data.iter().map(|&v| v as u64).sum());
+        let (r, s, b) = (ink(regular), ink(semibold), ink(bold));
+        assert!(r < s && s < b, "ink grows with the instanced weight: 400 {r}, 600 {s}, 700 {b}");
+    }
+
+    // ---- AETHERCAPTIONCSSOM (LEDGER SR686): getComputedStyle(caption).captionSide (named tail block) ----
+
+    /// AETHERCAPTIONCSSOM (SR686): `getComputedStyle(el).captionSide` reports the used value layout_core folded, as
+    /// Chromium does: style="caption-side: bottom" and the align=bottom presentation hint read bottom, a bare caption
+    /// reads the initial top, and an author rule on the table is inherited by its bare caption.
+    #[test]
+    fn computed_caption_side_reports_used_value() {
+        let html = r#"<!doctype html><html><head><style>#t2 { caption-side: bottom }</style></head><body>
+            <table><caption id="s" style="caption-side: bottom">S</caption><tr><td>1</td></tr></table>
+            <table><caption id="a" align="bottom">A</caption><tr><td>2</td></tr></table>
+            <table><caption id="n">N</caption><tr><td>3</td></tr></table>
+            <table id="t2"><caption id="i">I</caption><tr><td>4</td></tr></table>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (id, want) in [("s", "bottom"), ("a", "bottom"), ("n", "top"), ("i", "bottom")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).captionSide"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed caption-side");
+        }
+    }
+
+    /// AETHERIMGBROKENICON (SR702): the broken-image icon shows only when the box has room for it (Chromium's
+    /// ImageSmallerThanAltImage, 16 + 2 px): a 40x40 failed img with alt="" paints the icon (layout_core's
+    /// `BROKEN_ICON`) in its slot; a 12x12 one paints nothing (no frame, no icon, no text).
+    #[test]
+    fn img_alt_broken_icon_only_when_room() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="r" src="missing.png" alt="" width="40" height="40"></div>
+            <div><img id="n" src="missing.png" alt="" width="12" height="12"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "r");
+        assert!((w - 40.0).abs() <= 0.5 && (h - 40.0).abs() <= 0.5, "r: the box keeps its 40x40 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "r: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "r: the icon's page outline");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "n");
+        assert!((w - 12.0).abs() <= 0.5 && (h - 12.0).abs() <= 0.5, "n: the box keeps its 12x12 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_painted(&engine, l, l + 12, t, t + 12), 0, "n: too small for the icon: nothing paints");
+    }
+
+    /// AETHERIMGBROKENICON (SR702): the pixels in (x0..x1, y0..y1) that are not the white page (`imgalt_ink` counts
+    /// only dark text ink; the icon's grey, blue and green are not dark).
+    fn imgalt_painted(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        (y0..y1).map(|y| (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count()).sum()
+    }
+
+    // ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's text wraps in a narrow column (named tail block) ----
+
+    /// AETHERIMGALTINLINEWRAP (SR707): a failed, unsized img whose 20-word alt is far wider than its 120px column wraps
+    /// as text does: its box is no wider than the column and several lines tall, the second line carries ink, and nothing
+    /// paints right of the column. (SR681's short alt keeps its one line: `img_alt_inline_when_unsized_and_failed`.)
+    #[test]
+    fn img_alt_inline_wraps_in_a_narrow_column() {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div style="width:120px"><img id="w" src="missing.png" alt="{alt}"></div>
+            <div><span id="s">Hello</span></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let (_, _, _, sh) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "w");
+        assert!(w > 20.0 && w <= 120.5, "w: the box is no wider than the column ({w})");
+        assert!(sh > 8.0 && h > sh * 1.5, "w: more than one line tall ({h} vs a line's {sh})");
+        let (x0, x1) = (l.floor() as usize, (l + w).ceil() as usize);
+        let ink2 = imgalt_ink(&engine, x0, x1, (t + sh).floor() as usize, (t + 2.0 * sh).ceil() as usize);
+        assert!(ink2 > 0, "w: the second line paints");
+        assert_eq!(imgalt_ink(&engine, 122, 400, t.floor() as usize, (t + h).ceil() as usize), 0, "w: nothing paints right of the column");
+    }
+
+    // ---- AETHERFILECHOSENJSFILES (LEDGER SR706): the script-set FileList feeds the file status and value (named tail block) ----
+
+    /// AETHERFILECHOSENJSFILES (SR706): a page that sets `input.files` from a DataTransfer (SR93's setter).
+    fn file_chosen_jsfiles_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="m2" multiple></div>
+            <div><input type="file" id="v2" multiple value="2 files"></div>
+            <div><input type="file" id="s2"></div>
+            <div><input type="file" id="v2s" value="2 files"></div>
+            <div><input type="file" id="o" value="old-name.txt"></div>
+            <div><input type="file" id="r" value="report.pdf"></div>
+            <div><input type="file" id="on" value="old-name.txt"></div>
+            <div><input type="file" id="n"></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("m2").files = list(["a.txt", "b.txt"]);
+              document.getElementById("s2").files = list(["a.txt", "b.txt"]);
+              document.getElementById("o").files = list(["report.pdf"]);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILECHOSENJSFILES (SR706): the painted status reads the FileList first: two Files paint `2 files` (the same
+    /// status ink extent as the stand-in `value="2 files"` beside the same button) on a multiple input and on a non-multiple one (Blink's
+    /// FileStatusText goes by the list's length), one File `report.pdf` over `value="old-name.txt"` paints report.pdf's
+    /// extent, and an input with no FileList keeps SR682's attribute stand-in (old-name.txt, not No file chosen).
+    #[test]
+    fn file_chosen_jsfiles_paints_filelist() {
+        let mut engine = file_chosen_jsfiles_page();
+        let extent = |e: &mut crate::AetherEngine, id: &str| -> (usize, usize) {
+            let (_, end, cols) = file_status_ink(e, id);
+            assert!(!cols.is_empty(), "{id}: the status paints ink");
+            (cols[0] - end, cols[cols.len() - 1] - end)
+        };
+        let (m2, v2, s2, v2s) = (extent(&mut engine, "m2"), extent(&mut engine, "v2"), extent(&mut engine, "s2"), extent(&mut engine, "v2s"));
+        let (o, r, on, n) = (extent(&mut engine, "o"), extent(&mut engine, "r"), extent(&mut engine, "on"), extent(&mut engine, "n"));
+        assert_eq!(m2, v2, "two Files on a multiple input paint `2 files`");
+        assert_eq!(s2, v2s, "two Files on a non-multiple input paint `2 files` (beside the same Choose File button)");
+        assert_eq!(o, r, "the FileList's one name paints over the value attribute");
+        assert_ne!(o, on, "the value attribute is not painted once a FileList is set");
+        assert_ne!(on, n, "an input with no FileList keeps the attribute stand-in");
+    }
+
+    /// AETHERFILECHOSENJSFILES (SR706): `input.value` of a file input reads `C:\fakepath\` and the first selected file's
+    /// name (HTML filename mode, as Chromium), and the empty string with no FileList (the attribute is not the value).
+    #[test]
+    fn file_chosen_jsfiles_value_fakepath() {
+        let mut engine = file_chosen_jsfiles_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("document.getElementById('o').value").unwrap(), "C:\\fakepath\\report.pdf");
+        assert_eq!(js.eval_string("document.getElementById('m2').value").unwrap(), "C:\\fakepath\\a.txt");
+        assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
+        assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
     }
 }

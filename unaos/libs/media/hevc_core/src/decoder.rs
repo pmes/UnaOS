@@ -343,9 +343,6 @@ impl Decoder {
             if self.strict_levels {
                 crate::level::check_level(&sps, &pps)?;
             }
-            if sh.slice_type != SliceType::I && pps.constrained_intra_pred_flag {
-                return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
-            }
             check_supported(&sps, &pps)?;
             if self.chroma_420_only && sps.chroma_format_idc > 1 {
                 return Err(Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
@@ -371,10 +368,6 @@ impl Decoder {
                 return Err(e);
             }
         };
-        if sh.slice_type != SliceType::I && cur.pps.constrained_intra_pred_flag {
-            self.cur = None;
-            return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
-        }
         self.decode_segment(sh, rbsp)
     }
 
@@ -440,7 +433,7 @@ impl Decoder {
         let latency = if o.max_latency_increase_plus1 != 0 { o.max_num_reorder_pics + o.max_latency_increase_plus1 - 1 } else { 0 };
         self.bump = (o.max_num_reorder_pics, latency, o.max_dec_pic_buffering_minus1 + 1);
         // 8.3.2 (an IRAP with NoRaslOutputFlag 1 marks every picture unused), then C.5.2.2: make room in the DPB.
-        let rps = self.dpb.apply_rps(sh, &sps, poc, nal.is_irap() && self.skip_rasl)?.with_curr(pps.scc.curr_pic_ref_enabled_flag, poc);
+        let rps = self.dpb.apply_rps(sh, &sps, &geo, poc, nal.is_irap() && self.skip_rasl)?.with_curr(pps.scc.curr_pic_ref_enabled_flag, poc);
         let (reorder, latency, max_dec) = self.bump;
         // HEVCSCCTAIL (SR365, HEVCREXT-SCC-DPB; SPEC-CHECK): C.5.2.2 with the current picture's own slot when it is a
         // reference of its own slices (pps_curr_pic_ref_enabled_flag).
@@ -527,5 +520,20 @@ impl Decoder {
     pub fn profile_tier_level(&self) -> Option<crate::ps::Ptl> {
         let sps = self.cur.as_ref().map(|c| &c.sps).or_else(|| self.sps.iter().flatten().next())?;
         Some(sps.ptl.names())
+    }
+
+    // ---- HEVCINTERCIP (LEDGER SR688): the generated-reference note (named tail block) ----
+    /// HEVCINTERCIP (SR688): the PicOrderCntVal of every reference picture generated (8.3.3.2) because the reference
+    /// picture set named a picture the DPB did not hold, since the last call, in generation order.
+    pub fn take_generated_refs(&mut self) -> Vec<i32> {
+        core::mem::take(&mut self.dpb.generated)
+    }
+
+    // ---- HEVCERRORCONCEAL (LEDGER SR700): the concealment note (named tail block) ----
+    /// HEVCERRORCONCEAL (SR700): the [`crate::dpb::Concealed`] note (generated / source PicOrderCntVal, projected: SR710) of every generated reference picture
+    /// concealed from the DPB's nearest held picture since the last call, in generation order (a generated picture
+    /// absent here stayed grey: the DPB was empty or the nearest picture did not fit).
+    pub fn take_concealed(&mut self) -> Vec<crate::dpb::Concealed> {
+        core::mem::take(&mut self.dpb.concealed)
     }
 }

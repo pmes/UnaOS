@@ -58,7 +58,7 @@ fn submissions_match_chromium_byte_for_byte() {
     for (name, sha) in PINNED {
         let want = expect(name, sha);
         let html = std::fs::read_to_string(format!("{DIR}/{name}.html")).unwrap();
-        let mut engine = aether::AetherEngine::new();
+        init(); let mut engine = aether::AetherEngine::new();
         engine.load_html(&format!("http://oracle.test/{name}.html"), &html, true);
         let doc = engine.document.clone().unwrap();
         let go = doc
@@ -93,4 +93,11 @@ fn submissions_match_chromium_byte_for_byte() {
             assert!(b.starts_with("----WebKitFormBoundary") && b.len() == 38, "{name}: boundary shape {b}");
         }
     }
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "forms-oracle");
 }

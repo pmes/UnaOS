@@ -65,6 +65,11 @@ pub trait RenderSink {
     fn taps_tracks(&self) -> bool {
         false
     }
+    /// NLE5DEXPORTSTOP (SR705): true when the sink wants no more output: [`render`] reads it once per step, before the
+    /// step's decode, and ends there ([`RenderReport::stopped`]). A cancelled export ends its decode, not only its encode.
+    fn stop(&self) -> bool {
+        false
+    }
     /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
     fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
 }
@@ -82,6 +87,9 @@ pub struct RenderReport {
     pub height: u32,
     pub rate: u32,
     pub channels: u16,
+    /// NLE5DEXPORTSTOP (SR705): the output tick of the step at which the sink's [`RenderSink::stop`] ended the render
+    /// (that step not rendered); `None` when the range ran to its end.
+    pub stopped: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -514,6 +522,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
     let mut run_of = runs.iter();
     for s in &steps {
+        if sink.stop() { r.stopped = Some(s.out_t); break; } // NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
         match (s.kind, s.src) {
             (Kind::Video, None) => {
                 vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it

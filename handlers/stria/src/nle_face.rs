@@ -154,12 +154,12 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 18] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "kind", "ease"];
+pub const VERBS: [&str; 19] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "kind", "ease"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
     pub state: EditorState,
-    sources: Sources,
+    sources: std::sync::Arc<Sources>, // NLEFACEEXPORT (SR694): shared by the preview and a running export
     pub canvas: (u32, u32),
     pub order: PixelOrder,
     pub playing: bool,
@@ -189,13 +189,15 @@ pub struct Face {
     clean: Timeline,
     /// NLEPLAYAUDIO (SR676): the play path (the device, the played still, where the last played render ended).
     play: PlayAudio,
+    /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
+    export: Option<ExportJob>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -230,7 +232,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -314,8 +316,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing => {
-                if face.tick() {
+            _ = clock.tick(), if face.playing || face.exporting() => { // NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -490,7 +492,7 @@ impl Face {
                 Ok(())
             }
             "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch
-            "cancel" => return self.drag.take().is_some(),
+            "cancel" => return self.drag.take().is_some() || self.cancel_export(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
         if let Err(e) = r {
@@ -1579,7 +1581,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
-        paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels())
+        paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()) // NLEFACEEXPORT (SR694): the progress band over the ruler's foot
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -1799,7 +1801,7 @@ impl Face {
     /// (`Sources::set_audio_rate`), the device starts paused and is released while playing at rate 1.
     pub fn with_audio(mut self, mut out: Box<dyn crate::media::AudioOut>, rate: u32) -> Face {
         out.set_paused(true);
-        self.sources.set_audio_rate(rate);
+        std::sync::Arc::get_mut(&mut self.sources).expect("with_audio is a builder: no export shares the sources yet").set_audio_rate(rate);
         self.play.rate = rate;
         self.play.out = Some(out);
         self.play.live = false;
@@ -2040,6 +2042,178 @@ mod playaudio_tests {
         let _ = f.frames();
         assert_eq!(TestPattern::read_counter(&f.still().unwrap().rgba, 64, 48), Some(28));
     }
+}
+
+// ---- NLEFACEEXPORT (LEDGER SR694): the export verb, its job off the face's thread, the progress band (named tail block) ----
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, VIDEO_NAMES, export_as_with, video_named};
+
+/// NLE5d (SR694): the export band's height (px), painted over the ruler's foot while an export runs.
+pub const EXPORT_BAND_H: u32 = 2;
+
+/// NLE5d (SR694): one export running off the face's thread: `nle_export::export_as_with` (the one door) over the face's
+/// timeline (cloned at the verb) and its sources (the `Arc` the preview reads too). The thread stores the reading in
+/// `done` / `total`; the face stores `cancel`, which the progress closure reads and refuses with the existing
+/// `ExportError::Io(Interrupted, "cancelled")`. The result is the thread's return, joined once it has finished.
+pub struct ExportJob {
+    dir: std::path::PathBuf,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<ExportReport, ExportError>>>,
+    /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
+    shown: u64,
+}
+
+impl Face {
+    /// The `export` verb: `export [<dir>] [h264|png|i420|y4m|raw]` (default h264; a lone format word is the format, a lone
+    /// other word the directory; no directory = `<document's dir>/<stem>-export`). Every outcome is the face's one message
+    /// line `last_error`: a refusal (`export: busy (d/t)`, `export: no directory (no document path)`, `export: <dir>: <io>`,
+    /// `export: unknown format ..`) at once; the result (a report, not an error) when [`Face::export_tick`] sees it finish.
+    fn export_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("export") {
+            return None;
+        }
+        let args: Vec<&str> = words.collect();
+        if let Some((d, t)) = self.export_progress() {
+            self.last_error = Some(format!("export: busy ({d}/{t})"));
+            return Some(true);
+        }
+        let (dir, fmt) = match args.as_slice() {
+            [] => (None, "h264"),
+            [f] if VIDEO_NAMES.contains(f) => (None, *f),
+            [d] => (Some(*d), "h264"),
+            [d, f] => (Some(*d), *f),
+            _ => {
+                self.last_error = Some(format!("export: usage: export [<dir>] [{}]", VIDEO_NAMES.join("|")));
+                return Some(true);
+            }
+        };
+        let dir = match (dir, &self.doc_path) {
+            (Some(d), _) => std::path::PathBuf::from(d),
+            (None, Some(p)) => p.with_file_name(format!("{}-export", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
+            (None, None) => {
+                self.last_error = Some("export: no directory (no document path)".into());
+                return Some(true);
+            }
+        };
+        if let Err(e) = self.start_export(&dir, fmt, None) {
+            self.last_error = Some(format!("export: {e}"));
+        }
+        Some(true)
+    }
+    /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
+    /// (encoders are not `Send`), the whole timeline, `AudioOut::Wav` into `Container::Mp4` (`nle export`'s defaults).
+    /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
+    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>) -> Result<(), String> {
+        if let Some((d, t)) = self.export_progress() {
+            return Err(format!("busy ({d}/{t})"));
+        }
+        if !VIDEO_NAMES.contains(&fmt) {
+            return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+        let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
+        let (tl, sources, path, fmt) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string());
+        let handle = std::thread::Builder::new()
+            .name("nle-export".into())
+            .spawn(move || {
+                let video = video_named(&fmt, tl.tb).expect("a VIDEO_NAMES word");
+                let mut progress = |n: u64, of: u64| -> Result<(), ExportError> {
+                    d.store(n, Relaxed);
+                    t.store(of, Relaxed);
+                    if pause_at == Some(n) {
+                        while !c.load(Relaxed) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    if c.load(Relaxed) {
+                        return Err(ExportError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")));
+                    }
+                    Ok(())
+                };
+                export_as_with(&tl, 0..tl.end(), &sources, &path, video, AudioOut::Wav, Container::Mp4, &mut progress)
+            })
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0 });
+        Ok(())
+    }
+    /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
+    /// [`Face::cancel_export`]). The verb's own job is this with no hold.
+    pub fn export_paused_at(&mut self, dir: &std::path::Path, fmt: &str, k: u64) -> Result<(), String> {
+        self.start_export(dir, fmt, Some(k))
+    }
+    /// True while an export's result has not been reported.
+    pub fn exporting(&self) -> bool {
+        self.export.is_some()
+    }
+    /// The running export's reading `(frames done, frames total)` (total 0 until the first frame).
+    pub fn export_progress(&self) -> Option<(u64, u64)> {
+        self.export.as_ref().map(|j| (j.done.load(Relaxed), j.total.load(Relaxed)))
+    }
+    /// What the band shows: the done fraction while an export runs, `None` otherwise.
+    fn export_frac(&self) -> Option<f64> {
+        self.export_progress().map(|(d, t)| if t == 0 { 0.0 } else { (d as f64 / t as f64).min(1.0) })
+    }
+    /// One clock tick for the export: a finished job's result goes to the message line and the job is cleared; true when
+    /// that happened or the reading moved (the band repaints).
+    pub fn export_tick(&mut self) -> bool {
+        let Some(j) = self.export.as_mut() else { return false };
+        if j.handle.as_ref().is_some_and(|h| h.is_finished()) {
+            self.finish_export();
+            return true;
+        }
+        let d = j.done.load(Relaxed);
+        let moved = d != j.shown;
+        j.shown = d;
+        moved
+    }
+    /// Esc's export arm: ask the running job to stop (its next frame refuses); false when none runs.
+    pub fn cancel_export(&mut self) -> bool {
+        let Some(j) = self.export.as_ref() else { return false };
+        j.cancel.store(true, Relaxed);
+        true
+    }
+    /// Block until the running export ends and report it as [`Face::export_tick`] would; false when none runs.
+    pub fn wait_export(&mut self) -> bool {
+        if self.export.is_none() {
+            return false;
+        }
+        self.finish_export();
+        true
+    }
+    /// Join the job and put its outcome on the message line: `export: <n> frames, <bytes> bytes -> <dir>`, the cancel
+    /// `export: cancelled at d/t frames; partial files left in <dir>`, or the refusal `export: <ExportError>`.
+    fn finish_export(&mut self) {
+        let Some(mut j) = self.export.take() else { return };
+        let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
+        let line = match j.handle.take().map(|h| h.join()) {
+            Some(Ok(Ok(r))) => format!("export: {} frames, {} bytes -> {}", r.frames, r.bytes, j.dir.display()),
+            Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
+                format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
+            }
+            Some(Ok(Err(e))) => format!("export: {e}"),
+            _ => "export: the export thread panicked".to_string(),
+        };
+        self.last_error = Some(line);
+    }
+}
+
+/// The export band over a painted canvas: rows `tracks_y - EXPORT_BAND_H .. tracks_y` (the ruler's foot), x `0 .. w * frac`,
+/// in timeline_core view's `GUIDE` (the drag guide's token, the editor table's; NLE6VIEW-TOKENS owes palette_core).
+/// `None` paints nothing.
+fn paint_export(px: Vec<u8>, l: Layout, order: PixelOrder, frac: Option<f64>) -> Vec<u8> {
+    let Some(f) = frac else { return px };
+    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
+    let y1 = l.tracks_y as i64;
+    let x1 = (l.w as f64 * f.clamp(0.0, 1.0)).round() as i64;
+    c.rect(0, y1 - EXPORT_BAND_H as i64, x1, y1, view::GUIDE);
+    c.px
 }
 
 // ---- NLETRANSITIONFACE (LEDGER SR691): the transition widget's edge drag and kind / ease (named tail block) ----

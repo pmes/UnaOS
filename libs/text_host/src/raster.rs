@@ -222,7 +222,7 @@ pub fn rasterize(face: &Face, gid: u16, size: f32, sub: u8) -> Option<GlyphMask>
     // outline comes back in pixels. Skia drops hinting for skewed (synthetic oblique) text.
     // Faces fontconfig marks `hintnone` / `hinting=false` (WenQuanYi Zen Hei's 44-wqy-zenhei.conf) stay unhinted.
     let fc = super::db::db().config.hint_mode(&face.family, size as f64);
-    let hinted = if super::is_installed(face) && !face.synth_oblique && fc.hinting && fc.hintstyle > 0 {
+    let hinted = if super::is_installed(face) && !face.synth_oblique && fc.hinting && fc.hintstyle > 0 && !face.font.is_instanced() {
         hinted_path(face, gid, size)
     } else {
         None

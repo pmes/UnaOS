@@ -253,9 +253,9 @@ pub fn family_list(id: u16) -> Vec<Family> {
 
 type FaceKey = (usize, bool, bool);
 
-fn db_face(k: FaceKey) -> Option<&'static Face> {
+fn db_face(k: FaceKey, want: Style) -> Option<&'static Face> {
     let d = db::db();
-    load_face_synth(d.faces.get(k.0)?, k.1, k.2)
+    styled_face(d.faces.get(k.0)?, k.1, k.2, want)
 }
 
 /// The face a family NAME gives for `want`: an `@font-face` family first (css-fonts-4 §4.1: author faces
@@ -266,7 +266,7 @@ fn named_face(name: &str, want: Style) -> Option<&'static Face> {
     }
     let d = db::db();
     let fam = d.resolve_family(name)?;
-    db_face(d.select(&fam, want)?)
+    db_face(d.select(&fam, want)?, want)
 }
 
 type StackCache = (u64, HashMap<FontSel, std::rc::Rc<Vec<&'static Face>>>);
@@ -358,7 +358,7 @@ pub fn fallback_for(c: char, sel: &FontSel) -> Option<&'static Face> {
         }
         let Some(f) = load_face(info) else { continue };
         let fam = info.families[0].clone();
-        found = d.select(&fam, sel.style()).and_then(db_face).filter(|g| g.font.glyph_index(c) != 0).or(Some(f));
+        found = d.select(&fam, sel.style()).and_then(|k| db_face(k, sel.style())).filter(|g| g.font.glyph_index(c) != 0).or(Some(f));
         break;
     }
     // FONTHINT (SR62): Chromium draws a platform-fallback face with the default render params (hinting off
@@ -537,15 +537,48 @@ mod tests {
 
 // ---- AETHERFONTDBCACHE (LEDGER SR684): the installed-font index persisted under Aether's data dir (named tail block) ----
 
-/// Hands text_host's process font database Aether's cache directory (`<platform data dir>/fonts`), so a second
+/// Hands text_host's process font database Aether's cache directory (`<storage root>/fonts`), so a second
 /// launch with an unchanged font set reads the index instead of every face's tables (`text_host::db_cache`).
 /// Call before the first font use; later calls have no effect.
-#[cfg(not(test))]
 pub fn register_db_cache() {
-    db::set_cache_dir(crate::storage::platform_data_dir().join("fonts"));
+    db::set_cache_dir(db_cache_dir());
 }
 
-/// A lib-test build registers no cache dir, so no `cargo test -p aether --lib` reaches the person's data
-/// directory (AETHER-TESTROOT).
+// ---- AETHERTESTROOTS (LEDGER SR696): the font index dir under the one storage root (named tail block) ----
+
+/// The directory [`register_db_cache`] hands text_host: `fonts/` under [`crate::storage::root_dir`] — the platform
+/// data directory in production, the process's test root in a re-rooted test (`storage::init_root`, a lib
+/// `TestRoot`, or a lib-test build's own process dir), so no test writes the index into the person's data dir.
+pub fn db_cache_dir() -> std::path::PathBuf {
+    crate::storage::root_dir().join("fonts")
+}
+
+// ---- AETHERHOSTWGHT (LEDGER SR690): the installed-family face at the selection's weight / width instance (named tail block) ----
+
+/// AETHERHOSTWGHT (SR690): the face both installed-family roads ([`named_face`], [`fallback_for`], through `db_face`)
+/// draw `want` with — text_host's [`text_host::load_face_styled`]: a variable face instanced at the weight / stretch
+/// (clamped to its axes; synthetic bold only where `wght` cannot reach), a static face the same object as before.
+/// No size: a [`FontSel`] carries none, so `opsz` stays the face's default (owed AETHER-HOSTWGHT-OPSZ-AUTO).
+pub(crate) fn styled_face(info: &db::FaceInfo, bold: bool, oblique: bool, want: Style) -> Option<&'static Face> {
+    text_host::load_face_styled(info, bold, oblique, want, None)
+}
+
 #[cfg(test)]
-pub fn register_db_cache() {}
+mod testroot_tests {
+    use super::*;
+    use crate::storage::test_root::{process_dir, TestRoot};
+
+    /// AETHERTESTROOTS: under a TestRoot the font index dir is the guard's `fonts/`, never the platform data
+    /// directory; registering it there is harmless (set once); after the drop it is under the process's own dir.
+    #[test]
+    fn db_cache_dir_follows_the_root() {
+        let platform = crate::storage::platform_data_dir();
+        let root = TestRoot::new("aether_fontcache_kat");
+        assert_eq!(db_cache_dir(), root.dir().join("fonts"));
+        assert!(!db_cache_dir().starts_with(&platform), "never the platform data directory");
+        register_db_cache();
+        drop(root);
+        assert!(db_cache_dir().starts_with(process_dir()), "a lib-test build's default root is its process dir");
+        assert!(!db_cache_dir().starts_with(&platform));
+    }
+}

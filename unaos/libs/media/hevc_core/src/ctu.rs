@@ -1138,7 +1138,7 @@ impl<'a> SliceDecoder<'a> {
         let rx = self.sps.range_ext;
         // HEVCREXTSCC (SR357): or intra_boundary_filtering_disabled_flag.
         let off = (rx.implicit_rdpcm_enabled_flag && self.cu_bypass) || self.sps.scc.intra_boundary_filtering_disabled_flag;
-        IntraRext { smoothing_disabled: rx.intra_smoothing_disabled_flag, boundary_filter_disabled: off }
+        IntraRext { smoothing_disabled: rx.intra_smoothing_disabled_flag, boundary_filter_disabled: off, constrained: self.pps.constrained_intra_pred_flag }
     }
 
     /// HEVCREXTTOOLS (SR345): the residual of a transform-skip or transquant-bypass block after its residual array is
