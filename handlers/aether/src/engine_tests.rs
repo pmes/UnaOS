@@ -4440,7 +4440,7 @@ mod tests {
     }
 
     /// AETHERIMGALT (SR681): in quirks mode a sized failed img is a box of its size (TreatImageAsReplaced) with the 1px
-    /// solid silver border, 1px padding, the 16px icon slot left empty, and the alt text after it on the first line.
+    /// solid silver border, 1px padding, the 16px broken-image icon (SR702), and the alt text after it on the first line.
     #[test]
     fn img_alt_boxed_when_sized() {
         let html = r#"<html><body style="margin:0;font:16px sans-serif">
@@ -4460,7 +4460,8 @@ mod tests {
         assert_eq!(imgalt_px(&engine, l + 100, t + 99), silver, "b: the bottom border");
         assert_eq!(imgalt_px(&engine, l + 100, t + 70), (255, 255, 255), "b: the inside is not filled");
         assert!(imgalt_ink(&engine, l + 18, l + 199, t + 2, t + 30) > 0, "b: the alt text paints after the icon slot");
-        assert_eq!(imgalt_ink(&engine, l + 1, l + 17, t + 1, t + 99), 0, "b: the icon slot stays empty (icon owed)");
+        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "b: the broken-image icon paints in its slot");
+        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "b: the icon's page outline");
     }
 
     /// AETHERIMGALT (SR681): a failed, unsized img with alt="" represents nothing: no box, no ink.
@@ -4494,5 +4495,35 @@ mod tests {
         let (l, t) = (l.round() as usize, t.round() as usize);
         assert_eq!(imgalt_px(&engine, l, t + 50), (255, 255, 255), "p: no border");
         assert_eq!(imgalt_ink(&engine, l, l + 200, t, t + 100), 0, "p: no alt text yet");
+    }
+
+    /// AETHERIMGBROKENICON (SR702): the broken-image icon shows only when the box has room for it (Chromium's
+    /// ImageSmallerThanAltImage, 16 + 2 px): a 40x40 failed img with alt="" paints the icon (layout_core's
+    /// `BROKEN_ICON`) in its slot; a 12x12 one paints nothing (no frame, no icon, no text).
+    #[test]
+    fn img_alt_broken_icon_only_when_room() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="r" src="missing.png" alt="" width="40" height="40"></div>
+            <div><img id="n" src="missing.png" alt="" width="12" height="12"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "r");
+        assert!((w - 40.0).abs() <= 0.5 && (h - 40.0).abs() <= 0.5, "r: the box keeps its 40x40 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "r: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "r: the icon's page outline");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "n");
+        assert!((w - 12.0).abs() <= 0.5 && (h - 12.0).abs() <= 0.5, "n: the box keeps its 12x12 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_painted(&engine, l, l + 12, t, t + 12), 0, "n: too small for the icon: nothing paints");
+    }
+
+    /// AETHERIMGBROKENICON (SR702): the pixels in (x0..x1, y0..y1) that are not the white page (`imgalt_ink` counts
+    /// only dark text ink; the icon's grey, blue and green are not dark).
+    fn imgalt_painted(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        (y0..y1).map(|y| (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count()).sum()
     }
 }

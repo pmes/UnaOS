@@ -3075,13 +3075,13 @@ pub enum ImgState {
 /// `InlineAlt`: an inline non-replaced element whose content is the text (its width / height dropped), sized by
 /// [`img_alt_extent`] as one text run. `BoxedAlt`: the img keeps its size as a clipped box holding the text; with
 /// `frame` it carries the 1px solid silver border and 1px padding and the 16px broken-image icon floats at its
-/// top-left (the host leaves the icon's slot empty: AETHER-IMG-BROKENICON owed), without `frame` (a fixed side
+/// top-left (`icon`, the same rule, painted from [`BROKEN_ICON`] by both rings, SR702), without `frame` (a fixed side
 /// under 18 px) neither.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImgFallback {
     None,
     InlineAlt(String),
-    BoxedAlt { text: String, frame: bool },
+    BoxedAlt { text: String, frame: bool, icon: bool },
 }
 
 /// AETHERIMGALT (SR681): Chromium's rule for a failed img, pure. `alt` / `title` are the raw attributes (the text
@@ -3108,7 +3108,7 @@ pub fn img_fallback(
     let dims = (w.is_some() && h.is_some()) || (aspect && (w.is_some() || h.is_some()));
     if dims && (quirks || alt.is_none_or(|a| a.is_empty())) {
         let small = h.flatten().is_some_and(|v| v < 18.0) || w.flatten().is_some_and(|v| v < 18.0);
-        return ImgFallback::BoxedAlt { text: text.to_string(), frame: !small };
+        return ImgFallback::BoxedAlt { text: text.to_string(), frame: !small, icon: !small };
     }
     if text.is_empty() { ImgFallback::None } else { ImgFallback::InlineAlt(text.to_string()) }
 }
@@ -3170,9 +3170,9 @@ mod img_alt_kat {
     fn imgalt_sized_standards_vs_quirks_kat() {
         let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
         assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, false), ImgFallback::InlineAlt("Logo".into()));
-        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true });
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true, icon: true });
         // One side and an aspect ratio count as sized.
-        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, true, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, true, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true, icon: true });
         // One side alone does not.
         assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, false, false), ImgFallback::InlineAlt("T".into()));
     }
@@ -3182,14 +3182,14 @@ mod img_alt_kat {
     #[test]
     fn imgalt_empty_alt_and_small_kat() {
         let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
-        assert_eq!(img_fallback(Some(""), Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
-        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        assert_eq!(img_fallback(Some(""), Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true, icon: true });
         assert_eq!(img_fallback(Some(""), None, ImgState::Failed, None, None, false, false), ImgFallback::None);
         assert_eq!(img_fallback(None, None, ImgState::Failed, None, None, false, false), ImgFallback::None);
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(Some(16.0)), h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(Some(16.0)), h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false, icon: false });
         // A percentage side is set but not fixed: never "small".
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(Some(10.0)), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
-        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(Some(10.0)), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false, icon: false });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
     }
 }
 
@@ -3213,5 +3213,92 @@ pub fn file_status<'a>(value: Option<&'a str>, multiple: bool, count: usize) -> 
         Cow::Borrowed(file_label(multiple).1)
     } else {
         Cow::Borrowed(name)
+    }
+}
+
+// ---- AETHERIMGBROKENICON (LEDGER SR702): the broken-image icon, one rect list both rings paint (named tail block) ----
+
+/// AETHERIMGBROKENICON (SR702): one opaque rect of [`BROKEN_ICON`] in the icon's own 16x16 space (x, y its top-left,
+/// w x h its size, `fill` its colour). Both rings fill these in order (a later rect overdraws an earlier one) through
+/// their own rect primitive; neither has a line primitive, so the glyph is rects only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IconRect {
+    pub x: u8,
+    pub y: u8,
+    pub w: u8,
+    pub h: u8,
+    pub fill: (u8, u8, u8),
+}
+
+const ICON_GREY: (u8, u8, u8) = (0x80, 0x80, 0x80);
+const ICON_WHITE: (u8, u8, u8) = (0xff, 0xff, 0xff);
+
+const fn icon_rect(x: u8, y: u8, w: u8, h: u8, fill: (u8, u8, u8)) -> IconRect {
+    IconRect { x, y, w, h, fill }
+}
+
+/// AETHERIMGBROKENICON (SR702): Chromium's broken-image icon (IDR_BROKENIMAGE) as ONE vector description, drawn by
+/// the host's `paint_img_alt` and AETHER.ELF's `image_alt` at the alt container's padding-box corner plus 1 (the
+/// content box plus 2, 2) when `ImgFallback::BoxedAlt::icon`: a 12x14 white page (x 1..12, y 1..14) outlined in #808080 with a 4px
+/// folded top-right corner, torn across its lower half by a 2-riser staircase with a 1px gap (the lower piece 2px
+/// lower), and a #3A8EE6 / #65B35B square as the picture hint. No bitmap, no dependency.
+pub const BROKEN_ICON: &[IconRect] = &[
+    // white fill: the upper piece, the fold flap, the lower piece
+    icon_rect(2, 2, 6, 7, ICON_WHITE),
+    icon_rect(8, 6, 4, 1, ICON_WHITE),
+    icon_rect(9, 3, 1, 1, ICON_WHITE),
+    icon_rect(9, 4, 2, 1, ICON_WHITE),
+    icon_rect(2, 12, 10, 2, ICON_WHITE),
+    icon_rect(5, 11, 7, 1, ICON_WHITE),
+    icon_rect(9, 10, 3, 1, ICON_WHITE),
+    // upper piece outline: top, left, the fold (vertical, horizontal, diagonal), right, the tear staircase
+    icon_rect(1, 1, 8, 1, ICON_GREY),
+    icon_rect(1, 1, 1, 9, ICON_GREY),
+    icon_rect(8, 1, 1, 5, ICON_GREY),
+    icon_rect(8, 5, 5, 1, ICON_GREY),
+    icon_rect(9, 2, 1, 1, ICON_GREY),
+    icon_rect(10, 3, 1, 1, ICON_GREY),
+    icon_rect(11, 4, 1, 1, ICON_GREY),
+    icon_rect(12, 5, 1, 3, ICON_GREY),
+    icon_rect(1, 9, 4, 1, ICON_GREY),
+    icon_rect(4, 8, 5, 1, ICON_GREY),
+    icon_rect(8, 7, 5, 1, ICON_GREY),
+    // lower piece outline: the tear staircase, left, bottom, right
+    icon_rect(1, 11, 4, 1, ICON_GREY),
+    icon_rect(4, 10, 5, 1, ICON_GREY),
+    icon_rect(8, 9, 5, 1, ICON_GREY),
+    icon_rect(1, 11, 1, 4, ICON_GREY),
+    icon_rect(1, 14, 12, 1, ICON_GREY),
+    icon_rect(12, 9, 1, 6, ICON_GREY),
+    // the picture hint
+    icon_rect(3, 3, 2, 2, (0x3a, 0x8e, 0xe6)),
+    icon_rect(7, 12, 3, 2, (0x65, 0xb3, 0x5b)),
+];
+
+#[cfg(test)]
+mod img_broken_icon_kat {
+    use super::{img_fallback, ImgFallback, ImgState, BROKEN_ICON};
+
+    /// The icon shows exactly when the frame does (Chromium's ImageSmallerThanAltImage, 16 + 2 px); inline alt has none.
+    #[test]
+    fn broken_icon_rule_kat() {
+        let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true, icon: true });
+        let s = Some(Some(10.0));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, s, s, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: false, icon: false });
+        assert!(matches!(img_fallback(Some("Logo"), None, ImgState::Failed, None, None, false, false), ImgFallback::InlineAlt(_)));
+        // A percentage side is never "small": icon as frame.
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
+    }
+
+    /// Every rect is non-empty and inside the 16x16 icon space; the pinned pixel (1, 5) is the page outline grey.
+    #[test]
+    fn broken_icon_bounds_kat() {
+        for r in BROKEN_ICON {
+            assert!(r.w > 0 && r.h > 0 && r.x as u32 + r.w as u32 <= 16 && r.y as u32 + r.h as u32 <= 16, "{r:?}");
+        }
+        let at = |x: u8, y: u8| BROKEN_ICON.iter().rev().find(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|r| r.fill);
+        assert_eq!(at(1, 5), Some((128, 128, 128)));
+        assert_eq!(at(0, 0), None);
     }
 }
