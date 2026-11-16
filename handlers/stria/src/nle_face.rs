@@ -365,6 +365,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("\u{f703}", "nudge+"),
     ("[", "["),
     ("]", "]"),
+    ("I", "mark in"), // NLE5DRANGEKEYS (SR735): Shift+i / Shift+o / Shift+x (text) bind the editor's export-mark words
+    ("O", "mark out"),
+    ("X", "mark clear"),
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -491,7 +494,7 @@ impl Face {
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
-            "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch
+            "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" | "mark in" | "mark out" | "mark clear" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch; NLE5DRANGEKEYS (SR735): the export marks
             "cancel" => return self.drag.take().is_some() || self.cancel_export(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
