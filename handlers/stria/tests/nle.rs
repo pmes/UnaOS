@@ -2156,3 +2156,50 @@ fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
     assert_eq!(plain.paint(), a, "labels off: no overlay");
     println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
 }
+
+// ---- NLE5DKEYSHELPBUTTON (LEDGER SR765): the keys help word on the transport — `help` the last VERBS word (named tail block) ----
+
+/// The button's message: `Input { target: SURFACE, text: "help" }`, what stria-view's `?` transport button fires.
+fn nle5dkeyshelpbutton_press(f: &mut Face) -> bool {
+    f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "help".into() })
+}
+
+/// `help` is a transport word, the LAST in VERBS (the button row's order); the button's message toggles the help through
+/// `Face::verb`'s one arm: shown, then hidden; the keys help's own row for it (`?`, its phrase) is the KEYS-driven one.
+#[test]
+fn nle5dkeyshelpbutton_help_is_the_last_verb_and_the_button_toggles() {
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert!(VERBS.contains(&"help"));
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(!f.help_shown());
+    assert!(nle5dkeyshelpbutton_press(&mut f));
+    assert!(f.help_shown());
+    assert!(nle5dkeyshelpbutton_press(&mut f));
+    assert!(!f.help_shown());
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    let rows = help_rows();
+    let row = rows.iter().find(|(_, p)| *p == help_phrase("help")).expect("the help row");
+    assert_eq!(row.1, "show / hide this help");
+    assert!(row.0.split(" / ").any(|k| k == "?"), "{:?}", row.0);
+    println!("nle5dkeyshelpbutton: VERBS[{}] = help; button shows then hides; row {:?}", VERBS.len() - 1, row);
+}
+
+/// A labelled face paints differently while the button shows the help and byte-identical after the second press; a
+/// labels-off face is byte-identical across the toggle (the help paints through the Labels hook).
+#[test]
+fn nle5dkeyshelpbutton_paint_toggles_back_byte_identical() {
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    let before = f.paint();
+    assert!(nle5dkeyshelpbutton_press(&mut f));
+    let shown = f.paint();
+    assert_ne!(shown, before, "the button shows the help");
+    assert!(nle5dkeyshelpbutton_press(&mut f));
+    assert_eq!(f.paint(), before, "the second press restores the frame");
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let a = plain.paint();
+    assert!(nle5dkeyshelpbutton_press(&mut plain));
+    assert_eq!(plain.paint(), a, "labels off: no overlay");
+    assert!(nle5dkeyshelpbutton_press(&mut plain));
+    assert_eq!(plain.paint(), a);
+    println!("nle5dkeyshelpbutton: fnv {:016x} -> {:016x} -> back", stria::nle_face::fnv1a(&before), stria::nle_face::fnv1a(&shown));
+}
