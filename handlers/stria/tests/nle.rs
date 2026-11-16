@@ -1687,3 +1687,15 @@ fn nlestandinaudioeditor_an_ac3_reel_renders_on_the_silent_stand_in() {
     assert_eq!(normal.stand_in_audio, 0);
     println!("nlestandinaudioeditor: {} | stand_in_audio={} frames={} pcm={}", lines[0], r.stand_in_audio, r.frames, sink.pcm.len());
 }
+
+// ---- NLE6UTP1SYNTH (LEDGER SR749): the host's synthetic reel is demux_core's (named tail block) ----
+/// NLE6UTP1SYNTH (SR749): `synth_source` is demux_core's `build::synth_reel` (the reel both rings build): the same bytes
+/// by both roads, pinned by FNV-1a 64 (read on the pre-move `synth_source`; demux_core's `synth_reel_kats` pins the same u64).
+#[test]
+fn nle6utp1synth_host_reel_is_demux_cores() {
+    let host = stria::nle_face::fnv1a(&synth_source(1000, 30, 25));
+    let core = stria::nle_face::fnv1a(&gneiss_pal::dsp::demux::build::synth_reel(1000, 30, 25, &Default::default()));
+    assert_eq!(host, 0xbabb_167e_432a_5e6b, "the pre-move synth_source bytes");
+    assert_eq!(host, core, "both roads build one reel");
+    println!("nle6utp1synth: synth_source(1000,30,25) fnv {host:#018x} == demux_core build::synth_reel");
+}
