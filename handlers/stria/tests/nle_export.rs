@@ -724,7 +724,7 @@ fn nle5dclitable_h264_table_is_the_cli_chain() {
         let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = *s;
         let chain = nle5dclitable_fnv(Box::new(nle5dclitable_chain(*s, stats.clone())), &refr.frames);
         assert_eq!(chain, NLE5DCLITABLE_BEFORE[i], "set {i}: the old match's stream, pinned before SR718");
-        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()), qcomp: None, cplxblur: None };
+        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint: None, hrd, two_pass_stats: two_pass.then(|| stats.clone()), qcomp: None, cplxblur: None };
         let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
         assert_eq!(table, chain, "set {i}: the table is the CLI's chain");
     }
@@ -770,7 +770,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
     let refr = reference(&tl, &src);
     let stats = nle5dclitable_pass1(&refr.frames);
     let (qp, gop, bitrate, crf, scenecut, aq, hrd, _) = NLE5DCLITABLE_SETS[7];
-    let opts = |qcomp, cplxblur| H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: Some(stats.clone()), qcomp, cplxblur };
+    let opts = |qcomp, cplxblur| H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint: None, hrd, two_pass_stats: Some(stats.clone()), qcomp, cplxblur };
     let chain = |p: Pass2Opts| H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_pass2_opts(p).with_two_pass(40, 25, 1, stats.clone());
     let ninth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((3, 5)), Some(20))).unwrap(), &refr.frames);
     assert_eq!(ninth, NLE5DCLITABLE_BEFORE[7], "set 9: qcomp 0.6 + cplxblur 20 are x264's defaults, set 8's bytes");
@@ -890,3 +890,18 @@ fn nle6utp1_nle_export_fixture_pin() {
 
 /// The fnv [`nle6utp1_nle_export_fixture_pin`] reads, measured on the copies before SR729.
 const NLE6UTP1_NLE_EXPORT_PIN: u64 = 0xe149_8435_238b_ff8e;
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the audio table's inverse round-trips (named tail block) ----
+
+#[test]
+fn nle5dexportmessageaudio_audio_word_is_the_table_inverse() {
+    use stria::nle_export::audio_word;
+    for w in AUDIO_NAMES.iter().copied().chain(["aac:96"]) {
+        let a = audio_named(w).expect(w);
+        assert_eq!(audio_word(&a), w, "{w}");
+        assert_eq!(audio_named(&audio_word(&a)), Some(a), "{w}");
+    }
+    assert_eq!(audio_word(&audio_named("aac:128").unwrap()), "aac", "the default rate spells as the bare word");
+    assert_eq!(audio_word(&AudioOut::Aac(DEFAULT_AAC_KBPS)), "aac");
+    println!("nle5dexportmessageaudio: {} words and aac:96 round-trip", AUDIO_NAMES.len());
+}
