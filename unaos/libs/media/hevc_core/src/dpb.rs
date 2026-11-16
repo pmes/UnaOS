@@ -401,7 +401,8 @@ impl Dpb {
     /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
     /// intra block copy (ref_poc == s); HEVCCONCEALBIDIR (SR721): each usable list projects (`project_lists`), two are averaged by
     /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
-    /// later picture's TMVP reads the projected vector. True when any block was projected.
+    /// later picture's TMVP reads the projected vector. HEVCCONCEALWEIGHTED (SR741): a source coded with explicit weights (its kept
+    /// `Picture::weights`) weights each fetch by the source block's (w, o, log2WD) for that list and ref_idx. True when any block was projected.
     fn conceal_motion(&self, pic: &mut Picture, src: usize) -> bool {
         let s = &self.pics[src].pic;
         if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
@@ -433,7 +434,7 @@ impl Dpb {
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, &mut out);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().map(|(pw, high)| [0, 1].map(|l| crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high))), &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
@@ -471,8 +472,9 @@ fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Optio
 /// HEVCCONCEALBIDIR (SR721): the cw x ch samples of component `c` at (cx, cy) fetched from the source plane `r` along each
 /// candidate of [`project_lists`] (quarter-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub` as `predict_pu`) through
 /// `luma_mc` / `chroma_mc`'s fractional filters (HEVCCONCEALSUBPEL SR733), written to `out` at sample depth, clipped: two candidates averaged by inter.rs
-/// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261). A block is at most 8x8 in every plane (the stack buffer).
-fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, out: &mut [i32]) {
+/// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261); HEVCCONCEALWEIGHTED (SR741): with `wp` (the source's explicit
+/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead. A block is at most 8x8 in every plane (the stack buffer).
+fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, out: &mut [i32]) {
     let n = (cw * ch) as usize;
     let max = (1i32 << bd) - 1;
     let mut second = [0i32; 64];
@@ -489,11 +491,11 @@ fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32,
     }
     if got == 2 {
         for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
-            *a = crate::inter::bi_default(*a, b, bd).clamp(0, max);
+            *a = match wp { Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
         }
     } else {
         for a in out[..n].iter_mut() {
-            *a = crate::inter::uni_default(*a, bd).clamp(0, max);
+            *a = match wp { Some(w) => crate::inter::uni_explicit(*a, w[cand[0].is_none() as usize]), None => crate::inter::uni_default(*a, bd) }.clamp(0, max);
         }
     }
 }
@@ -546,5 +548,16 @@ mod hevcconcealbidir_tests {
     #[test]
     fn an_intra_block_copy_list_falls_back_to_the_other() {
         assert_eq!(project_lists(&bi(false, 2), 2, 3), [Some([16, 8]), None]);
+    }
+}
+
+// ---- HEVCCONCEALWEIGHTED (LEDGER SR741): the source picture's explicit weights kept for concealment (named tail block) ----
+/// HEVCCONCEALWEIGHTED (SR741): keep the pred_weight_table of picture `pic`'s first independent slice segment that carries
+/// one (slice.rs parses it only under weighted_pred_flag for P / weighted_bipred_flag for B, the gate `predict_pu` reads),
+/// with the SPS's high_precision_offsets_enabled_flag, so `conceal_motion` weights a projection from `pic` as its own PUs
+/// were weighted. A later segment's table does not replace it (HEVC-CONCEAL-WEIGHTED-SLICES, owed).
+pub(crate) fn keep_weights(pic: &mut Picture, sh: &SliceHeader, sps: &Sps) {
+    if pic.weights.is_none() {
+        pic.weights = sh.pred_weights.clone().map(|w| (w, sps.range_ext.high_precision_offsets_enabled_flag));
     }
 }

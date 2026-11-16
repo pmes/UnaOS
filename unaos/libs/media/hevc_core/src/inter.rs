@@ -457,22 +457,7 @@ pub fn chroma_mc_ref(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, 
 /// HEVCREXTTOOLS (SR345): `high` is high_precision_offsets_enabled_flag — WpOffsetBdShift 0 instead of BitDepth - 8 and
 /// WpOffsetHalfRangeC 1 << (BitDepthC - 1) instead of 128; shift1 is Max(2, 14 - bitDepth) (the 16-bit profiles).
 fn explicit_weight(sh: &SliceHeader, c: usize, l: usize, ref_idx: i8, bd: u32, high: bool) -> (i32, i32, u32) {
-    let shift1 = (14 - bd as i32).max(2) as u32;
-    let off_shift = if high { 0 } else { bd - 8 };
-    let Some(pw) = sh.pred_weights.as_ref() else { return (1, 0, shift1) };
-    let wl = if l == 0 { &pw.l0 } else { &pw.l1 };
-    let r = usize::try_from(ref_idx).unwrap_or(0);
-    if c == 0 {
-        let d = pw.luma_log2_weight_denom;
-        let (w, o) = wl.luma.get(r).copied().unwrap_or((1 << d, 0));
-        (w, o << off_shift, d + shift1)
-    } else {
-        let d = pw.chroma_log2_weight_denom;
-        let (w, delta) = wl.chroma.get(r).map(|e| e[c - 1]).unwrap_or((1 << d, 0));
-        let half = if high { 1i32 << (bd - 1) } else { 128 };
-        let o = (half + delta - ((half * w) >> d)).clamp(-half, half - 1);
-        (w, o << off_shift, d + shift1)
-    }
+    explicit_weight_of(sh.pred_weights.as_ref(), c, l, ref_idx, bd, high)
 }
 
 /// 8.5.3.3: predict the samples of prediction block (x, y, w, h) with motion `m` into the current picture's planes
@@ -514,7 +499,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
                 if weighted {
                     let (w0, o0, lwd) = explicit_weight(sh, c, 0, m.ref_idx[0], bd, high);
                     let (w1, o1, _) = explicit_weight(sh, c, 1, m.ref_idx[1], bd, high);
-                    a.iter().zip(b.iter()).map(|(&p0, &p1)| (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)).collect()
+                    a.iter().zip(b.iter()).map(|(&p0, &p1)| bi_explicit(p0, p1, (w0, o0, lwd), (w1, o1, lwd))).collect()
                 } else {
                     a.iter().zip(b.iter()).map(|(&p0, &p1)| bi_default(p0, p1, bd)).collect()
                 }
@@ -524,7 +509,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
                 if weighted {
                     let (w0, o0, lwd) = explicit_weight(sh, c, l, m.ref_idx[l], bd, high);
                     a.iter()
-                        .map(|&p| if lwd >= 1 { ((p * w0 + (1 << (lwd - 1))) >> lwd) + o0 } else { p * w0 + o0 })
+                        .map(|&p| uni_explicit(p, (w0, o0, lwd)))
                         .collect()
                 } else {
                     a.iter().map(|&p| uni_default(p, bd)).collect()
@@ -646,4 +631,43 @@ pub(crate) fn bi_default(p0: i32, p1: i32, bd: u32) -> i32 {
 pub(crate) fn uni_default(p: i32, bd: u32) -> i32 {
     let shift1 = (14 - bd as i32).max(2);
     (p + (1 << (shift1 - 1))) >> shift1
+}
+
+// ---- HEVCCONCEALWEIGHTED (LEDGER SR741): the ONE explicit weight rule and 8.5.3.3.4.3 formulas (named tail block) ----
+/// HEVCCONCEALWEIGHTED (SR741): the explicit weight, offset and log2WD of list `l`, reference index `ref_idx`, component
+/// `c` (7-56, 8.5.3.3.4.3) from pred_weight_table `pw` (`None`: weight 1, offset 0, log2WD shift1). HEVCREXTTOOLS (SR345):
+/// `high` is high_precision_offsets_enabled_flag — WpOffsetBdShift 0 instead of BitDepth - 8 and WpOffsetHalfRangeC
+/// 1 << (BitDepthC - 1) instead of 128; shift1 is Max(2, 14 - bitDepth). `explicit_weight` (predict_pu) and dpb.rs's
+/// weighted concealment (`conceal_motion`, from the source picture's kept table) both read it.
+pub(crate) fn explicit_weight_of(pw: Option<&crate::slice::PredWeights>, c: usize, l: usize, ref_idx: i8, bd: u32, high: bool) -> (i32, i32, u32) {
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let off_shift = if high { 0 } else { bd - 8 };
+    let Some(pw) = pw else { return (1, 0, shift1) };
+    let wl = if l == 0 { &pw.l0 } else { &pw.l1 };
+    let r = usize::try_from(ref_idx).unwrap_or(0);
+    if c == 0 {
+        let d = pw.luma_log2_weight_denom;
+        let (w, o) = wl.luma.get(r).copied().unwrap_or((1 << d, 0));
+        (w, o << off_shift, d + shift1)
+    } else {
+        let d = pw.chroma_log2_weight_denom;
+        let (w, delta) = wl.chroma.get(r).map(|e| e[c - 1]).unwrap_or((1 << d, 0));
+        let half = if high { 1i32 << (bd - 1) } else { 128 };
+        let o = (half + delta - ((half * w) >> d)).clamp(-half, half - 1);
+        (w, o << off_shift, d + shift1)
+    }
+}
+
+/// HEVCCONCEALWEIGHTED (SR741): 8.5.3.3.4.3 uni-prediction, one 14-bit intermediate `p` with (w0, o0, log2WD):
+/// ((p * w0 + 2^(log2WD - 1)) >> log2WD) + o0 (log2WD >= 1), else p * w0 + o0; the caller clips. `predict_pu`'s weighted
+/// uni arm and dpb.rs's weighted concealment (`conceal_fetch`) both weight through it.
+pub(crate) fn uni_explicit(p: i32, (w0, o0, lwd): (i32, i32, u32)) -> i32 {
+    if lwd >= 1 { ((p * w0 + (1 << (lwd - 1))) >> lwd) + o0 } else { p * w0 + o0 }
+}
+
+/// HEVCCONCEALWEIGHTED (SR741): 8.5.3.3.4.3 bi-prediction, two 14-bit intermediates with (w0, o0, log2WD) and (w1, o1, _):
+/// (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << log2WD)) >> (log2WD + 1); the caller clips. `predict_pu`'s weighted bi arm and
+/// dpb.rs's weighted bi-directional concealment (`conceal_fetch`) both weight through it.
+pub(crate) fn bi_explicit(p0: i32, p1: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32)) -> i32 {
+    (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)
 }
