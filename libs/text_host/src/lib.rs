@@ -421,11 +421,11 @@ mod hostwghtquartzite_tests {
 /// AETHERHOSTWGHTCOVERFACE (SR725): the face a covering road draws `want` with — the face [`platform_fallback_in`] and
 /// Aether's `fallback_for` fall back to when the style-matched face lacks the character, and the last resort of
 /// [`line::TextStyle::stack`] / Aether's `stack`. AETHERFALLBACKSYNTH (SR731): synthesis is decided against the covering
-/// face's own style through [`db::synthesis`] (Chromium's fallback emboldens / obliques a face lacking the asked weight /
+/// face's own style through [`db::synthesis_threshold`] at [`db::FC_BOLD_WEIGHT`] (SR745: Chromium's fallback emboldens at 600 or more a face below fontconfig bold / obliques a face lacking the asked weight /
 /// slant); a variable face is instanced at the asked weight / stretch first, synthetic bold only where its `wght` axis
 /// cannot reach ([`load_face_styled`]'s rule).
 pub fn cover_face(info: &FaceInfo, want: Style) -> Option<&'static Face> {
-    let (b, o) = db::synthesis(info.style, want); load_face_styled(info, b, o, want, None)
+    let (b, o) = db::synthesis_threshold(info.style, want, db::FC_BOLD_WEIGHT); load_face_styled(info, b, o, want, None)
 }
 
 #[cfg(test)]
@@ -460,16 +460,17 @@ mod hostwghtcoverface_tests {
         assert!(std::ptr::eq(platform_fallback_in(&d, 'Ж', want(400.0)).unwrap(), load_face(&inter).unwrap()));
     }
 
-    /// A static covering face is the very `load_face` object up to 600 and synthetic bold / oblique past it (SR731 flipped this pin); a variable one asked for its
+    /// A static covering face is the very `load_face` object below 600 and synthetic bold / oblique from 600 (SR731 flipped this pin; SR745 moved 600: Blink's fallback road emboldens >= 600 on a face below fontconfig bold); a variable one asked for its
     /// default weight is too. This is the face line.rs `stack`'s last resort loads (that road reads the process
     /// `db::db()`, so the KAT is on the one fn it calls).
     #[test]
     fn hostwghtcoverface_static_and_default_unchanged() {
         let s = tree_face("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
         let plain = load_face(&s).unwrap();
-        for w in [400.0, 500.0, 600.0] {
+        for w in [400.0, 500.0] {
             assert!(std::ptr::eq(plain, cover_face(&s, want(w)).unwrap()), "{w}");
         }
+        assert!(std::ptr::eq(load_face_synth(&s, true, false).unwrap(), cover_face(&s, want(600.0)).unwrap()), "600 on a 400 cover: synthetic bold (SR745, Blink's fallback threshold)");
         let italic = Style { slant: db::Slant::Italic, ..want(700.0) };
         assert!(std::ptr::eq(load_face_synth(&s, true, true).unwrap(), cover_face(&s, italic).unwrap()), "synthetic bold and oblique on a static covering face (SR731)");
         let inter = tree_face("fonts/inter/InterVariable.ttf");
@@ -495,19 +496,19 @@ mod fallbacksynth_tests {
     const STATIC: &str = "unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf";
     const INTER: &str = "fonts/inter/InterVariable.ttf";
 
-    /// The static regular fixture (usWeightClass 400) as a covering face: at 700 and 900 the synthetic-bold object
-    /// (`db::synthesis`: more than 200 over the face), at 400 and 600 the plain `load_face` object.
+    /// The static regular fixture (usWeightClass 400) as a covering face: at 600, 700 and 900 the synthetic-bold object
+    /// (SR745 `db::synthesis_threshold`: >= 600 on a face below fontconfig bold; 600 moved from the plain set), at 400 and 500 the plain `load_face` object.
     #[test]
     fn fallbacksynth_static_cover_bold() {
         let s = tree_face(STATIC);
         let plain = load_face(&s).unwrap();
-        for w in [700.0, 900.0] {
+        for w in [600.0, 700.0, 900.0] {
             let f = cover_face(&s, want(w)).unwrap();
             assert!(f.synth_bold && !f.synth_oblique, "{w}");
             assert_ne!(f.id, plain.id, "{w}");
             assert!(std::ptr::eq(f, load_face_synth(&s, true, false).unwrap()), "{w}");
         }
-        for w in [400.0, 600.0] {
+        for w in [400.0, 500.0] {
             assert!(std::ptr::eq(plain, cover_face(&s, want(w)).unwrap()), "{w}");
         }
     }
