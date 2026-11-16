@@ -770,3 +770,69 @@ fn conceal_bidir_one_list_falls_back() {
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
     assert_frame(by_poc(&f, 6), &shifted(&img_of(by_poc(&f, 2)), 8, 0), "P from the picture concealed along L1 of B2");
 }
+
+// ---- HEVCCONCEALSUBPEL (LEDGER SR733): the concealed picture projected through the interpolation filters (named tail block) ----
+
+/// IDR0 (the gradient), P2 (references POC 0 with the quarter-sample mv (6, 2)), P4 (skip-only, references the lost POC
+/// 3 and keeps POC 2 unused), P5 (references POC 2 with mv (3, 1)): POC 3 is concealed from POC 2, whose vector (6, 2)
+/// rescales by td 2, tb 1 to (3, 1) quarter samples = (0.75, 0.25), kept fractional and fetched through the 8-tap /
+/// 4-tap filters, so P4 (the concealed picture's skip copy) is exactly P5, the decoder's own uni-predicted PU of P2 with
+/// the same vector, and the hand-written 8.5.3.3.3 equations; it is not SR710's whole-sample projection (1, 0).
+#[test]
+fn conceal_subpel_projects_through_the_interpolation() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&p_slice(4, vec![(-1, true), (-2, false)]), skip_picture));
+    s.extend(picture(&p_slice(5, vec![(-3, true)]), |e| amvp_then_merge(e, [3, 1])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
+    assert_frame(by_poc(&f, 2), &hand_mc(&i0, [6, 2]), "P2 at the quarter-sample mv (6, 2)");
+    let p2 = img_of(by_poc(&f, 2));
+    let p5 = img_of(by_poc(&f, 5));
+    assert_frame(by_poc(&f, 4), &p5, "P from the concealed picture equals the decoder's own MC of P2 at (3, 1)");
+    assert_frame(by_poc(&f, 4), &hand_mc(&p2, [3, 1]), "P from the concealed picture follows 8.5.3.3.3 at (3, 1)");
+    assert_ne!(by_poc(&f, 4).planes[0], shifted(&p2, 1, 0).y, "not SR710's whole-sample rounding of (3, 1)");
+}
+
+// ---- HEVCCONCEALWEIGHTED (LEDGER SR741): the concealed picture weighted as its source's PUs were (named tail block) ----
+
+/// The PPS carries weighted_pred_flag; IDR0 (the gradient), P2 (references POC 0 with mv (32, 16), pred_weight_table
+/// luma_log2_weight_denom 6, LumaWeightL0[0] 32, luma_offset 10: a fade halving luma and lifting it by 10; chroma
+/// weights default), P4 (skip-only, references the lost POC 3 and keeps POC 2 unused; its table's one entry has the
+/// default weight: a copy), P5 (references POC 2 with mv (16, 8) and P2's weights). POC 3 is concealed from POC 2,
+/// whose vector rescales by td 2, tb 1 to (16, 8) = (4, 2) samples and whose block was weighted (32, 10) against its
+/// reference: the projection is weighted the same way through 8.5.3.3.4.3, so P4 (the concealed picture's copy) is
+/// exactly P5, the decoder's own weighted MC of P2 with the same vector and weights, and the hand equation
+/// ((P2(x + 4, y + 2) + 1) >> 1) + 10 (chroma P2's shifted samples); it is not the unit-weight projection.
+#[test]
+fn conceal_weighted_applies_the_source_weights() {
+    let i0 = gradient();
+    let fade = Some((6, vec![Some((-32, 10))]));
+    let mut s = headers(false, true, &PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(idr(&i0, true));
+    s.extend(picture(&SliceCfg { weights: fade.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+    s.extend(picture(&SliceCfg { weights: fade, ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [16, 8])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
+    let faded = |r: &Img| Img { y: r.y.iter().map(|&v| ((v as u32 + 1) / 2 + 10) as u8).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
+    assert_frame(by_poc(&f, 2), &faded(&shifted(&i0, 8, 4)), "P2: the gradient moved by (8, 4) and weighted (32, 10)");
+    let p2 = img_of(by_poc(&f, 2));
+    let p5 = img_of(by_poc(&f, 5));
+    assert_frame(by_poc(&f, 4), &p5, "P from the concealed picture equals the decoder's own weighted MC of P2 at (16, 8)");
+    assert_frame(by_poc(&f, 4), &faded(&shifted(&p2, 4, 2)), "P from the concealed picture follows 8.5.3.3.4.3 with P2's weights");
+    assert_ne!(by_poc(&f, 4).planes[0], shifted(&p2, 4, 2).y, "not the unit-weight projection");
+}
+
