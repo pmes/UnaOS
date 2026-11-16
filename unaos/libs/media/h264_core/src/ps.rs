@@ -134,6 +134,8 @@ pub struct Sps {
     pub video_signal_type: bool,
     pub colour_primaries: u8,
     pub transfer_characteristics: u8,
+    /// H264COREHRD (SR708): VUI timing_info (num_units_in_tick, time_scale, fixed_frame_rate_flag), nal / vcl hrd_parameters (E.1.2), low_delay_hrd_flag.
+    pub timing_info: Option<(u32, u32, bool)>, pub nal_hrd: Option<Hrd>, pub vcl_hrd: Option<Hrd>, pub low_delay_hrd: bool,
 }
 
 impl Sps {
@@ -187,21 +189,6 @@ impl Sps {
 
 const HIGH_PROFILES: [u8; 13] = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
 
-fn hrd(r: &mut BitReader) {
-    let cpb_cnt = r.ue() + 1;
-    r.u(4);
-    r.u(4);
-    for _ in 0..cpb_cnt.min(32) {
-        r.ue();
-        r.ue();
-        r.bit();
-    }
-    r.u(5);
-    r.u(5);
-    r.u(5);
-    r.u(5);
-}
-
 /// seq_parameter_set_rbsp (7.3.2.1.1), the RBSP after the NAL header byte.
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     let mut r = BitReader::new(rbsp);
@@ -241,7 +228,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         max_num_reorder: None,
         max_dec_frame_buffering: None,
         full_range: false,
-        matrix_coefficients: 2, video_signal_type: false, colour_primaries: 2, transfer_characteristics: 2,
+        matrix_coefficients: 2, video_signal_type: false, colour_primaries: 2, transfer_characteristics: 2, timing_info: None, nal_hrd: None, vcl_hrd: None, low_delay_hrd: false,
     };
     if HIGH_PROFILES.contains(&profile_idc) {
         s.chroma_format_idc = r.ue();
@@ -357,20 +344,20 @@ fn vui(r: &mut BitReader, s: &mut Sps) {
         r.ue();
     }
     if r.flag() {
-        r.u(32);
-        r.u(32);
-        r.bit();
+        let nut = r.u(32);
+        let ts = r.u(32);
+        s.timing_info = Some((nut, ts, r.flag()));
     }
     let nal_hrd = r.flag();
     if nal_hrd {
-        hrd(r);
+        s.nal_hrd = Some(hrd(r));
     }
     let vcl_hrd = r.flag();
     if vcl_hrd {
-        hrd(r);
+        s.vcl_hrd = Some(hrd(r));
     }
     if nal_hrd || vcl_hrd {
-        r.bit();
+        s.low_delay_hrd = r.flag();
     }
     r.bit(); // pic_struct_present_flag
     if r.flag() {
@@ -845,4 +832,43 @@ pub fn avcc_sps(avcc: &[u8]) -> Option<Sps> {
     let mut rbsp = Vec::new();
     crate::nal::unescape(nal.get(1..)?, &mut rbsp);
     parse_sps(&rbsp).ok()
+}
+
+// ---- H264COREHRD (LEDGER SR708): hrd_parameters kept (named tail block) ----
+
+/// hrd_parameters (E.1.2) as read: BitRate / CpbSize / cbr_flag of SchedSelIdx 0 (E.2.2: BitRate = (bit_rate_value_minus1 + 1)
+/// x 2^(6 + bit_rate_scale), CpbSize = (cpb_size_value_minus1 + 1) x 2^(4 + cpb_size_scale)), cpb_cnt (the buffering_period
+/// SEI's loop count) and the SEI field lengths in bits (the `_minus1` fields + 1; time_offset_length as coded).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hrd {
+    pub cpb_cnt: u32,
+    pub bit_rate: u64,
+    pub cpb_size: u64,
+    pub cbr: bool,
+    pub initial_cpb_removal_delay_len: u32,
+    pub cpb_removal_delay_len: u32,
+    pub dpb_output_delay_len: u32,
+    pub time_offset_len: u32,
+}
+
+fn hrd(r: &mut BitReader) -> Hrd {
+    let cpb_cnt = r.ue() + 1;
+    let bit_rate_scale = r.u(4);
+    let cpb_size_scale = r.u(4);
+    let mut h = Hrd { cpb_cnt, ..Hrd::default() };
+    for i in 0..cpb_cnt.min(32) {
+        let br = r.ue() as u64 + 1;
+        let cs = r.ue() as u64 + 1;
+        let cbr = r.flag();
+        if i == 0 {
+            h.bit_rate = br << (6 + bit_rate_scale);
+            h.cpb_size = cs << (4 + cpb_size_scale);
+            h.cbr = cbr;
+        }
+    }
+    h.initial_cpb_removal_delay_len = r.u(5) + 1;
+    h.cpb_removal_delay_len = r.u(5) + 1;
+    h.dpb_output_delay_len = r.u(5) + 1;
+    h.time_offset_len = r.u(5);
+    h
 }
