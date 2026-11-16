@@ -340,7 +340,7 @@ impl FontDb {
     pub fn select(&self, family: &str, want: Style) -> Option<(usize, bool, bool)> {
         let idx = self.family_faces(family);
         let styles: Vec<Style> = idx.iter().map(|&i| self.faces[i].style).collect();
-        let k = match_style(&styles, want)?;
+        let k = fc_match_style(&styles, want)?; // AETHERFALLBACKFCPATTERN (SR780): fontconfig's slant / weight / width distance (Chromium Linux matchFamilyName and the fallback FcFontSort); webfont.rs keeps match_style (css-fonts-4 §5.2)
         let (b, o) = synthesis(styles[k], want);
         Some((idx[k], b, o))
     }
@@ -1123,5 +1123,228 @@ mod synththreshold_tests {
             assert!(!ob(Slant::Italic, Slant::Oblique) && !ob(Slant::Oblique, Slant::Italic), "slanted face: none ({at})");
             assert_eq!(synthesis_threshold(st(400.0, n), st(400.0, Slant::Italic), at).1, synthesis(st(400.0, n), st(400.0, Slant::Italic)).1);
         }
+    }
+}
+
+// ---- AETHERFALLBACKFCPATTERN (LEDGER SR780): fontconfig's style distance for the installed-family pick (named tail block) ----
+
+/// fontconfig's `FcWeightFromOpenTypeDouble` (fcweight.c): an OS/2 / CSS weight in FC_WEIGHT units, piecewise linear
+/// over fontconfig's table (fontconfig.h: THIN 0, EXTRALIGHT 40, LIGHT 50, DEMILIGHT 55, BOOK 75, REGULAR 80, MEDIUM 100,
+/// DEMIBOLD 180, BOLD 200, EXTRABOLD 205, BLACK 210, EXTRABLACK 215), clamped to 0..1000.
+pub fn fc_weight(css: f32) -> f32 {
+    const MAP: [(f32, f32); 13] = [
+        (0.0, 0.0),
+        (100.0, 0.0),
+        (200.0, 40.0),
+        (300.0, 50.0),
+        (350.0, 55.0),
+        (380.0, 75.0),
+        (400.0, 80.0),
+        (500.0, 100.0),
+        (600.0, 180.0),
+        (700.0, 200.0),
+        (800.0, 205.0),
+        (900.0, 210.0),
+        (1000.0, 215.0),
+    ];
+    let w = css.clamp(0.0, 1000.0);
+    let mut i = 1;
+    while w > MAP[i].0 {
+        i += 1;
+    }
+    let ((o0, f0), (o1, f1)) = (MAP[i - 1], MAP[i]);
+    if w == o1 {
+        return f1;
+    }
+    f0 + (w - o0) * (f1 - f0) / (o1 - o0)
+}
+
+/// fontconfig's FC_SLANT: ROMAN 0, ITALIC 100, OBLIQUE 110.
+pub fn fc_slant(s: Slant) -> f32 {
+    match s {
+        Slant::Normal => 0.0,
+        Slant::Italic => 100.0,
+        Slant::Oblique => 110.0,
+    }
+}
+
+/// fontconfig's FC_WIDTH for a stretch percentage: the usWidthClass percents map to FC_WIDTH_* (62.5 → EXTRACONDENSED
+/// 63, 87.5 → SEMICONDENSED 87, 112.5 → SEMIEXPANDED 113; 50 / 75 / 100 / 125 / 150 / 200 are their own); any other
+/// percentage is unchanged.
+pub fn fc_width(stretch: f32) -> f32 {
+    if stretch == 62.5 {
+        63.0
+    } else if stretch == 87.5 {
+        87.0
+    } else if stretch == 112.5 {
+        113.0
+    } else {
+        stretch
+    }
+}
+
+/// fontconfig's style terms for one face against a request (fcmatch.c `FcCompare`, its priority order within the style
+/// terms: SLANT, then WEIGHT, then WIDTH), each |face - want| in FC units (FcCompareNumber / FcCompareRange on a static
+/// face). Compared lexicographically.
+pub fn fc_style_distance(face: Style, want: Style) -> (f32, f32, f32) {
+    (
+        (fc_slant(face.slant) - fc_slant(want.slant)).abs(),
+        (fc_weight(face.weight) - fc_weight(want.weight)).abs(),
+        (fc_width(face.stretch) - fc_width(want.stretch)).abs(),
+    )
+}
+
+/// The index of the face fontconfig would pick for `want` within one family (the family term equal for all): the first
+/// least [`fc_style_distance`] (FcFontMatch keeps the first best on a tie); None when `cands` is empty.
+pub fn fc_match_style(cands: &[Style], want: Style) -> Option<usize> {
+    let mut best: Option<(usize, (f32, f32, f32))> = None;
+    for (i, c) in cands.iter().enumerate() {
+        let d = fc_style_distance(*c, want);
+        let better = match best {
+            None => true,
+            Some((_, b)) => d.0.total_cmp(&b.0).then(d.1.total_cmp(&b.1)).then(d.2.total_cmp(&b.2)).is_lt(),
+        };
+        if better {
+            best = Some((i, d));
+        }
+    }
+    best.map(|b| b.0)
+}
+
+#[cfg(test)]
+mod fcpattern_tests {
+    use super::*;
+
+    fn st(weight: f32, slant: Slant, stretch: f32) -> Style {
+        Style { weight, slant, stretch }
+    }
+
+    /// AETHERFALLBACKFCPATTERN (SR780): fontconfig's weight table (FcWeightFromOpenTypeDouble), the lerp between rows.
+    #[test]
+    fn fc_weight_kat() {
+        for (css, fc) in [
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (200.0, 40.0),
+            (300.0, 50.0),
+            (350.0, 55.0),
+            (380.0, 75.0),
+            (400.0, 80.0),
+            (450.0, 90.0),
+            (500.0, 100.0),
+            (600.0, 180.0),
+            (700.0, 200.0),
+            (800.0, 205.0),
+            (900.0, 210.0),
+            (1000.0, 215.0),
+            (1100.0, 215.0),
+        ] {
+            assert_eq!(fc_weight(css), fc, "{css}");
+        }
+    }
+
+    /// FC_SLANT and FC_WIDTH (fontconfig.h).
+    #[test]
+    fn fc_slant_width_kat() {
+        assert_eq!((fc_slant(Slant::Normal), fc_slant(Slant::Italic), fc_slant(Slant::Oblique)), (0.0, 100.0, 110.0));
+        for (p, fc) in [
+            (50.0, 50.0),
+            (62.5, 63.0),
+            (75.0, 75.0),
+            (87.5, 87.0),
+            (100.0, 100.0),
+            (112.5, 113.0),
+            (125.0, 125.0),
+            (150.0, 150.0),
+            (200.0, 200.0),
+            (90.0, 90.0),
+        ] {
+            assert_eq!(fc_width(p), fc, "{p}");
+        }
+    }
+
+    /// The fontconfig pick within one family: slant, then weight (FC units), then width; the first least on a tie.
+    #[test]
+    fn fc_match_style_kat() {
+        let (n, i, o) = (Slant::Normal, Slant::Italic, Slant::Oblique);
+        let pick = |c: &[Style], w: Style| fc_match_style(c, w).unwrap();
+        // italic wanted: an oblique face (10) before a roman one (100)
+        assert_eq!(pick(&[st(400.0, n, 100.0), st(400.0, o, 100.0)], st(400.0, i, 100.0)), 1);
+        // upright wanted over {oblique, italic}: italic (100 < 110; css-fonts-4 §5.2 would take the oblique)
+        assert_eq!(pick(&[st(400.0, o, 100.0), st(400.0, i, 100.0)], st(400.0, n, 100.0)), 1);
+        // slant before weight
+        assert_eq!(pick(&[st(700.0, n, 100.0), st(400.0, i, 100.0)], st(700.0, i, 100.0)), 1);
+        // weight before width (§5.2 decides stretch first and would take the 400 at 75%)
+        assert_eq!(pick(&[st(400.0, n, 75.0), st(700.0, n, 100.0)], st(700.0, n, 75.0)), 1);
+        // weight in FC units: 200 (40) is nearer 300 (50) than 100 (0) (§5.2 would go lighter)
+        assert_eq!(pick(&[st(100.0, n, 100.0), st(300.0, n, 100.0)], st(200.0, n, 100.0)), 1);
+        // a tie keeps the first: 300 (50) is 50 from both 100 (0) and 500 (100)
+        assert_eq!(pick(&[st(100.0, n, 100.0), st(500.0, n, 100.0)], st(300.0, n, 100.0)), 0);
+        // SR755's pins stand: {400, 700} at 500 / 600 / 900, {400, 600} at 700
+        let two = [st(400.0, n, 100.0), st(700.0, n, 100.0)];
+        for (w, k) in [(500.0, 0), (600.0, 1), (900.0, 1)] {
+            assert_eq!(pick(&two, st(w, n, 100.0)), k, "{w}");
+        }
+        assert_eq!(pick(&[st(400.0, n, 100.0), st(600.0, n, 100.0)], st(700.0, n, 100.0)), 1);
+        assert_eq!(fc_match_style(&[], st(400.0, n, 100.0)), None);
+    }
+
+    /// The installed-family pick against `fc-match` on this host: the fallback walk's first covering family, then
+    /// `select` (the covering face if select's pick lacks the char), against `fc-match sans-serif:weight:slant:width:charset`.
+    /// A case is skipped when fc-match's face is not indexed or not in our family (the family order is
+    /// `resolution_and_fallback_vs_fontconfig`'s); skipped whole without faces or fontconfig's tools.
+    #[test]
+    fn fc_style_oracle_vs_fc_match() {
+        let db = db();
+        if db.faces.is_empty() {
+            return;
+        }
+        let (n, i, o) = (Slant::Normal, Slant::Italic, Slant::Oblique);
+        let wants = [
+            st(400.0, n, 100.0),
+            st(700.0, n, 100.0),
+            st(400.0, i, 100.0),
+            st(700.0, i, 100.0),
+            st(300.0, n, 100.0),
+            st(600.0, n, 100.0),
+            st(400.0, o, 100.0),
+            st(700.0, n, 75.0),
+        ];
+        let chars = ['a', '\u{416}', '\u{4e2d}', '\u{e01}', '\u{5d0}', '\u{2603}'];
+        let key = |f: &FaceInfo| format!("{}#{}", f.path.display(), f.index & 0xffff);
+        let (mut compared, mut skipped) = (0usize, 0usize);
+        for c in chars {
+            let Some(&walk) = db.fallback_order().iter().find(|&&k| db.covers(k, c) == Some(true)) else { continue };
+            let fam = db.faces[walk].families[0].clone();
+            for want in wants {
+                let pattern = format!(
+                    "sans-serif:weight={}:slant={}:width={}:charset={:x}",
+                    fc_weight(want.weight),
+                    fc_slant(want.slant),
+                    fc_width(want.stretch),
+                    c as u32
+                );
+                let Ok(out) = std::process::Command::new("fc-match").args(["--format", "%{file}#%{index}", &pattern]).output() else {
+                    return;
+                };
+                let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let Some((file, idx)) = line.rsplit_once('#') else { skipped += 1; continue };
+                let Ok(idx) = idx.parse::<u32>() else { skipped += 1; continue };
+                let fc_key = format!("{file}#{}", idx & 0xffff);
+                let in_family = db.family_faces(&fam);
+                if !in_family.iter().any(|&k| key(&db.faces[k]) == fc_key) {
+                    skipped += 1;
+                    continue;
+                }
+                let ours = db
+                    .select(&fam, want)
+                    .map(|p| p.0)
+                    .filter(|&k| db.covers(k, c) == Some(true))
+                    .unwrap_or(walk);
+                assert_eq!(key(&db.faces[ours]), fc_key, "U+{:04X} {pattern}", c as u32);
+                compared += 1;
+            }
+        }
+        eprintln!("[fcpattern] style oracle compared={compared} skipped={skipped}");
     }
 }
