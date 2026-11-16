@@ -3,7 +3,7 @@
 //! expected values are the specification's (section cited per test), the same ones Chromium answers.
 
 fn load(html: &str) -> aether::AetherEngine {
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_html("http://127.0.0.1:8000/wpt2.html", html, true);
     if let Some(js) = engine.js_engine.as_mut() {
         aether::event_loop::settle(js, 2_000);
@@ -278,4 +278,11 @@ Promise.all([
          |SyntaxError\
          |SyntaxError"
     );
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "wpt2-gaps");
 }

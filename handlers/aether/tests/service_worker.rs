@@ -109,12 +109,7 @@ fn server(route: impl Fn(&str, &State) -> Reply + Send + Sync + 'static) -> (u16
 
 /// Every test process keeps its storage (registrations, caches) in its own directory under the target dir.
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-sw-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "sw");
 }
 
 fn rt() -> &'static tokio::runtime::Runtime {

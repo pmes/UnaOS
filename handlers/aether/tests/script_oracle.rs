@@ -96,7 +96,7 @@ fn chromium_dump(url: &str) -> Option<String> {
 /// Loads one page in Aether and returns its document element's outerHTML after the event loop idles.
 fn aether_dump(rt: &tokio::runtime::Runtime, url: &str) -> String {
     let page = rt.block_on(aether::net::fetch_page(url)).expect("page fetch");
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
     if let Some(js) = engine.js_engine.as_mut() {
         aether::event_loop::settle(js, 10_000);
@@ -184,4 +184,11 @@ fn script_pages_serialize_like_chromium() {
     }
     println!("script-oracle: {equal}/{} byte-equal", equal + fails.len());
     assert!(fails.is_empty(), "serialized DOM differs from Chromium on {fails:?}");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "script-oracle");
 }
