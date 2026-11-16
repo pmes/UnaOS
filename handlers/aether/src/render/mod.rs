@@ -4482,7 +4482,7 @@ fn paint_img_alt(
                 fill_rect(cx, cy + 1.0, cx + 1.0, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
                 fill_rect(cx + cw - 1.0, cy + 1.0, cx + cw, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
             }
-            if icon && !inherited.text_hidden { paint_broken_icon(cx, cy, cw, ch, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
+            if icon && !inherited.text_hidden { let o = if frame { 0.0 } else { 2.0 }; paint_broken_icon(cx - o, cy - o, cw + 2.0 * o, ch + 2.0 * o, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, cx + 2.0 + 16.0, cy + 2.0, 1.0) } else { (text, cx, cy, 0.0) }
         }
     };
@@ -4553,7 +4553,28 @@ fn paint_img_alt_lines(
     let (bord, pad) = (layout_box.border, layout_box.padding);
     let edges = bord.left + pad.left + bord.right + pad.right;
     let wrap_w = (layout.taffy.unrounded_layout(node_id).size.width.max(layout_box.size.width) - edges).max(0.0) + 0.01;
-    let max_w = if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) };
+    let max_w = if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) }; paint_broken_icon(cx - 2.0, cy - 2.0, 20.0, 20.0, surface, width, height, damage_rects, clip);
     let clip = (clip.0.max(cx), clip.1.max(cy), clip.2.min(cx + cw), clip.3.min(cy + ch));
-    draw_text(&text, cx, cy, max_w, &inherited.advancer(), inherited.line_height, inherited.color, false, surface, width, height, damage_rects, clip);
+    draw_text_from(&text, cx, cy, max_w, layout_core::INLINE_ICON_ADVANCE, &inherited.advancer(), inherited.line_height, inherited.color, surface, width, height, damage_rects, clip);
+}
+
+// ---- AETHERIMGALTINLINEICON (LEDGER SR726): an InlineAlt img's text after the broken-image icon (named tail block) ----
+
+/// AETHERIMGALTINLINEICON (SR726): `draw_text` with the breaker's `start_x`: `text` broken by `fonts::lines::break_lines_from`
+/// at `max_width` as if its first line already held `start_x` px (layout_core's `img_alt_measure` sized the InlineAlt box
+/// with the same start, `INLINE_ICON_ADVANCE`, the icon `paint_img_alt_lines` draws at the box's origin), the first line
+/// drawn at (x + start_x, y) and line i at (x, y + i x the line height), each through `draw_text` as `draw_lines` draws
+/// its lines.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_from(
+    text: &str, x: f32, y: f32, max_width: f32, start_x: f32, adv: &Advancer, line_height_mult: f32, color: (u8, u8, u8),
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let Some(font) = crate::fonts::face(&adv.sel) else { return };
+    let line_height = crate::fonts::line_height(font, adv.size, line_height_mult);
+    let lines = crate::fonts::lines::break_lines_from(adv, text, &crate::fonts::lines::TextMode::default(), max_width, start_x, false);
+    for (i, line) in lines.iter().enumerate() {
+        let lx = if i == 0 { x + start_x } else { x };
+        draw_text(&line.text, lx, y + i as f32 * line_height, f32::MAX, adv, line_height_mult, color, false, surface, width, height, damage_rects, clip);
+    }
 }
