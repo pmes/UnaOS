@@ -610,7 +610,7 @@ fn lost_picture_is_concealed_from_the_nearest_held_picture() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![2]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3]);
     assert_frame(by_poc(&f, 3), &shifted(&shifted(&i0, 8, 4), 8, 4), "P from the picture concealed from POC 1, advanced by its motion");
@@ -629,7 +629,7 @@ fn conceal_tie_takes_the_lower_poc() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![1]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -670,7 +670,7 @@ fn conceal_projection_scales_by_poc_distance() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -748,7 +748,7 @@ fn img_of(f: &Frame) -> Img {
 fn conceal_bidir_averages_both_projections() {
     let mut d = bidir_conceal_stream(false);
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
     let b2 = img_of(by_poc(&f, 2));
@@ -765,7 +765,7 @@ fn conceal_bidir_averages_both_projections() {
 fn conceal_bidir_one_list_falls_back() {
     let mut d = bidir_conceal_stream(true);
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
     assert_frame(by_poc(&f, 6), &shifted(&img_of(by_poc(&f, 2)), 8, 0), "P from the picture concealed along L1 of B2");
@@ -790,7 +790,7 @@ fn conceal_subpel_projects_through_the_interpolation() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
     assert_frame(by_poc(&f, 2), &hand_mc(&i0, [6, 2]), "P2 at the quarter-sample mv (6, 2)");
@@ -824,7 +824,7 @@ fn conceal_weighted_applies_the_source_weights() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
     let faded = |r: &Img| Img { y: r.y.iter().map(|&v| ((v as u32 + 1) / 2 + 10) as u8).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
@@ -836,3 +836,222 @@ fn conceal_weighted_applies_the_source_weights() {
     assert_ne!(by_poc(&f, 4).planes[0], shifted(&p2, 4, 2).y, "not the unit-weight projection");
 }
 
+// ---- HEVCCONCEALFORWARD (LEDGER SR754): the concealed picture refined from its first referencer's motion (named tail block) ----
+
+/// IDR0 (the gradient), P2 (references POC 0 with mv (6, 2)), P4 (references the lost POC 3 with mv (32, 16) on every
+/// block, keeps POC 2 unused), P5 (references POC 2 with mv (3, 1), keeps POC 3 unused), P6 (skip-only, references POC 3
+/// alone). POC 3 is concealed from POC 2 (SR733: P5 is that projection); P4 reads it moved by (8, 4); when P4 ends, POC 3
+/// is re-projected from P4's motion (td 1, tb -1: mv' = -mv = (-32, -16), (-8, -4) samples, edges clamped), so P6 (its
+/// skip copy) is P4 moved back, not the source projection, while P4 and P5 keep their samples (C is never written).
+#[test]
+fn conceal_forward_refines_from_the_first_referencer() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&p_slice(4, vec![(-1, true), (-2, false)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(5, vec![(-2, false), (-3, true)]), |e| amvp_then_merge(e, [3, 1])));
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5, 6]);
+    let p2 = img_of(by_poc(&f, 2));
+    let p5 = img_of(by_poc(&f, 5));
+    assert_frame(by_poc(&f, 5), &hand_mc(&p2, [3, 1]), "P5 reads P2, not the refined picture");
+    assert_frame(by_poc(&f, 4), &shifted(&p5, 8, 4), "P4 read the source projection of POC 3 and is never rewritten");
+    let p4 = img_of(by_poc(&f, 4));
+    assert_frame(by_poc(&f, 6), &shifted(&p4, -8, -4), "P from the picture refined from P4 at -mv");
+    assert_ne!(by_poc(&f, 6).planes[0], p5.y, "not the source projection alone");
+}
+
+// ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): a bi source's two lists weighted with their own weights and one log2WD (named tail block) ----
+
+/// B2's pred_weight_table (B7 carries its first entries) (luma_log2_weight_denom 6): L0[0] LumaWeight 64 - 16 = 48, offset 5; L1[0]
+/// 64 - 48 = 16, offset -3 (the second entries default; chroma weights default).
+fn bi_mixed_weights() -> (Option<(u32, Vec<Option<(i32, i32)>>)>, Option<Vec<Option<(i32, i32)>>>) {
+    (Some((6, vec![Some((-16, 5)), None])), Some(vec![Some((-48, -3)), None]))
+}
+
+/// One B picture's slice data: CTB 0 a 2Nx2N AMVP unit, PRED_BI, ref_idx 0 in both lists of `n` active references, L0 mvd
+/// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion.
+fn bi_body(mut e: CabacEnc, n: u32, m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
+    e.split_cu(0, false);
+    e.cu_skip(0, false);
+    e.pred_inter();
+    e.part_mode_2nx2n();
+    e.merge_flag(false);
+    e.pred_bi(0);
+    for mv in [m0, m1] {
+        e.ref_idx(0, n);
+        e.mvd(mv);
+        e.mvp_flag(0);
+    }
+    e.rqt_root_cbf(false);
+    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+        e.terminate(0);
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+        if last {
+            break;
+        }
+    }
+    e.finish().out
+}
+
+/// The PPS carries weighted_bipred_flag (not weighted_pred_flag: the P pictures carry no table). IDR0 (the gradient), P4
+/// (skip-only: I0), B2 (StCurrBefore {0}, StCurrAfter {4}, two references per list, the mixed table of
+/// [`bi_mixed_weights`]; PRED_BI L0 (32, 16) to POC 0, L1 (-64, 0) to POC 4), P6 (skip-only, references the lost POC 3 and
+/// keeps POC 2 unused), B7 (both lists [POC 2], one reference each, the first entries of that table; PRED_BI L0 (16, 8), L1 (32, 0): B2's
+/// vectors rescaled to POC 3 by td 2, tb 1 and td -2, tb 1). POC 3 is concealed from POC 2 along both lists, each fetch
+/// weighted by its own list's (w, o) and the ONE log2WD 6 + 6 = 12 (8.5.3.3.4.3): (64a * 48 + 64b * 16 + ((5 - 3 + 1) << 12))
+/// >> 13 = (3a + b + 12) >> 3; chroma (default weights) (a + b + 1) >> 1. So P6 (the concealed picture's skip copy) is
+/// exactly B7, the decoder's own weighted bi MC of B2 at the projected vectors, and the hand equation; it is neither the
+/// unweighted average nor the blend with the lists' weights swapped.
+#[test]
+fn conceal_weighted_bi_mixed_lists_use_one_log2wd() {
+    let i0 = gradient();
+    let (w0, w1) = bi_mixed_weights();
+    let mut s = headers(false, true, &PpsInter { weighted_bipred: true, ..Default::default() });
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(4, vec![(-4, true)]), skip_picture));
+    let b2 = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 2,
+        neg: vec![(-2, true)],
+        pos: vec![(2, true)],
+        num_ref: Some((2, 2)),
+        weights: w0.clone(),
+        weights_l1: w1.clone(),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    s.extend(picture(&b2, |e| bi_body(e, 2, [32, 16], [-64, 0])));
+    s.extend(picture(&p_slice(6, vec![(-3, true), (-4, false)]), skip_picture));
+    // B7's one reference per list carries the first entry of each table (7.3.6.3 writes num_ref_idx_lX_active entries).
+    let b7 = SliceCfg { poc_lsb: 7, neg: vec![(-5, true)], pos: vec![], num_ref: Some((1, 1)), weights: Some((6, vec![Some((-16, 5))])), weights_l1: Some(vec![Some((-48, -3))]), ..b2.clone() };
+    s.extend(picture(&b7, |e| bi_body(e, 1, [16, 8], [32, 0])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6, 7], "output in decoding order (no reordering in the SPS)");
+    let blend = |p: &Img, q: &Img, w0: u32, w1: u32| {
+        let luma = p.y.iter().zip(q.y.iter()).map(|(&a, &b)| ((w0 * a as u32 + w1 * b as u32 + 12) >> 3) as u8).collect();
+        let avg = |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u8).collect::<Vec<u8>>();
+        Img { y: luma, cb: avg(&p.cb, &q.cb), cr: avg(&p.cr, &q.cr) }
+    };
+    assert_frame(by_poc(&f, 2), &blend(&shifted(&i0, 8, 4), &shifted(&i0, -16, 0), 3, 1), "B2: L0 weighted (48, 5), L1 (16, -3)");
+    let src = img_of(by_poc(&f, 2));
+    let (p, q) = (shifted(&src, 4, 2), shifted(&src, 8, 0));
+    assert_ne!(p.y, q.y, "the fixture's two projections must differ");
+    let b7f = img_of(by_poc(&f, 7));
+    assert_frame(by_poc(&f, 6), &b7f, "P from the concealed picture equals the decoder's own weighted bi MC of B2 at the projected vectors");
+    assert_frame(by_poc(&f, 6), &blend(&p, &q, 3, 1), "P from the concealed picture follows 8.5.3.3.4.3 with each list's weights");
+    let unweighted = p.y.iter().zip(q.y.iter()).map(|(&a, &b)| ((a as u32 + b as u32 + 1) >> 1) as u8).collect::<Vec<u8>>();
+    assert_ne!(by_poc(&f, 6).planes[0], unweighted, "not the unweighted 8-262 average");
+    assert_ne!(by_poc(&f, 6).planes[0], blend(&p, &q, 1, 3).y, "not the blend with the lists' weights swapped");
+}
+
+// ---- HEVCCONCEALWEIGHTEDBIDIRECT (LEDGER SR774): a bi source block with one long-term list conceals uni with the surviving list's weights (named tail block) ----
+
+/// [`bi_body`] with ref_idx `refs` (L0, L1) of `n` active references per list: CTB 0 a 2Nx2N AMVP unit, PRED_BI, L0 mvd
+/// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion.
+fn bi_ref_body(mut e: CabacEnc, n: u32, refs: [u32; 2], m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
+    e.split_cu(0, false);
+    e.cu_skip(0, false);
+    e.pred_inter();
+    e.part_mode_2nx2n();
+    e.merge_flag(false);
+    e.pred_bi(0);
+    for (r, mv) in refs.into_iter().zip([m0, m1]) {
+        e.ref_idx(r, n);
+        e.mvd(mv);
+        e.mvp_flag(0);
+    }
+    e.rqt_root_cbf(false);
+    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+        e.terminate(0);
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+        if last {
+            break;
+        }
+    }
+    e.finish().out
+}
+
+/// The SPS carries long_term_ref_pics_present_flag; the PPS weighted_pred_flag and weighted_bipred_flag. IDR0 (the
+/// gradient), P4 (I0, default table: a copy), B2 (StCurrAfter {4}, LtCurr {POC 0 by PocLsbLt 0}: L0 = L1 = [POC 4,
+/// POC 0 long-term], two references per list; luma_log2_weight_denom 6, every L0 entry (48, 5), every L1 entry (16, -3);
+/// PRED_BI with one list to the long-term POC 0 (ref_idx 1, mvd (32, 16)) and the other to POC 4 (ref_idx 0, mvd
+/// (-64, 0))), P6 (skip-only, references the lost POC 3, keeps POC 2 unused), P7 (references POC 2 with mv (32, 0) and
+/// the SURVIVING list's weights). `project_lists` drops the long-term list (`ref_lt`), so POC 3 is concealed from POC 2
+/// along the other list alone: (-64, 0) rescaled by td -2, tb 1 to (32, 0) = (8, 0) samples, weighted uni (8-252) by
+/// THAT list's (w, o) through `conceal_fetch`'s `w[cand[0].is_none() as usize]`: (A) L0 long-term -> L1 (16, -3):
+/// ((a + 2) >> 2) - 3; (B) L1 long-term -> L0 (48, 5): ((3a + 2) >> 2) + 5; chroma (default weights) the shifted
+/// samples. So P6 (the concealed picture's skip copy) is exactly P7, the decoder's own uni weighted MC of B2, and the
+/// hand equation; it is neither uni through the OTHER list's weights nor the bi blend with the long-term list
+/// projected; every block is uni (bidir_blocks 0).
+#[test]
+fn conceal_weighted_bi_direct_falls_to_the_surviving_list() {
+    let i0 = gradient();
+    let (lt, st) = ([32, 16], [-64, 0]);
+    // (w, o) of each list: L0 (64 - 16, 5), L1 (64 - 48, -3).
+    let wo = [(48, 5), (16, -3)];
+    for l1_lt in [false, true] {
+        let mut s = vps(false);
+        s.extend(nal(33, &sps_rbsp_ext(&sps_cfg(), &InterSps { long_term_refs: true, ..inter_sps(false) })));
+        s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, &PpsInter { weighted_pred: true, weighted_bipred: true, ..Default::default() })));
+        s.extend(idr(&i0, true));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(4, vec![(-4, true)]) }, skip_picture));
+        let b2 = SliceCfg {
+            nal_type: 1,
+            slice_type: 0,
+            poc_lsb: 2,
+            neg: vec![],
+            pos: vec![(2, true)],
+            lt_pocs: Some(vec![0]),
+            num_ref: Some((2, 2)),
+            weights: Some((6, vec![Some((-16, 5)), Some((-16, 5))])),
+            weights_l1: Some(vec![Some((-48, -3)), Some((-48, -3))]),
+            five_minus_max_num_merge_cand: 4,
+            deblocking_disabled: true,
+            ..Default::default()
+        };
+        let (refs, m0, m1) = if l1_lt { ([0, 1], st, lt) } else { ([1, 0], lt, st) };
+        s.extend(picture(&b2, |e| bi_ref_body(e, 2, refs, m0, m1)));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(6, vec![(-3, true), (-4, false)]) }, skip_picture));
+        let (live, dead) = if l1_lt { (wo[0], wo[1]) } else { (wo[1], wo[0]) };
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![Some((live.0 - 64, live.1))])), lt_pocs: Some(vec![]), ..p_slice(7, vec![(-5, true)]) }, |e| amvp_then_merge(e, [32, 0])));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        let what = if l1_lt { "L1 long-term, L0 survives" } else { "L0 long-term, L1 survives" };
+        assert_eq!(d.take_generated_refs(), vec![3], "{what}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "{what}: every block uni");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6, 7], "{what}: output in decoding order");
+        let src = img_of(by_poc(&f, 2));
+        let (p, q) = (shifted(&src, 4, 2), shifted(&src, 8, 0));
+        // 8-252 with log2WD 6 + 6 = 12: ((64a * w + 2048) >> 12) + o, clipped.
+        let uni = |r: &Img, (w, o): (i32, i32)| r.y.iter().map(|&a| (((64 * a as i32 * w + 2048) >> 12) + o).clamp(0, 255) as u8).collect::<Vec<u8>>();
+        let want = Img { y: uni(&q, live), cb: q.cb.clone(), cr: q.cr.clone() };
+        assert_ne!(uni(&q, live), uni(&q, dead), "{what}: the fixture's two lists' weights must differ");
+        let p7 = img_of(by_poc(&f, 7));
+        assert_frame(by_poc(&f, 6), &p7, &format!("{what}: P from the concealed picture equals the decoder's own uni weighted MC of B2 at (32, 0)"));
+        assert_frame(by_poc(&f, 6), &want, &format!("{what}: P from the concealed picture follows 8-252 with the surviving list's weights"));
+        assert_ne!(by_poc(&f, 6).planes[0], uni(&q, dead), "{what}: not uni through the other list's weights");
+        // 8.5.3.3.4.3 with the long-term list projected as if usable (td 2, tb 1: (16, 8) = (4, 2) samples), in list order.
+        let (a0, a1) = if l1_lt { (&q, &p) } else { (&p, &q) };
+        let blend = a0.y.iter().zip(a1.y.iter()).map(|(&x, &y)| ((64 * x as i32 * wo[0].0 + 64 * y as i32 * wo[1].0 + ((wo[0].1 + wo[1].1 + 1) << 12)) >> 13).clamp(0, 255) as u8).collect::<Vec<u8>>();
+        assert_ne!(by_poc(&f, 6).planes[0], blend, "{what}: not the bi blend");
+    }
+}
