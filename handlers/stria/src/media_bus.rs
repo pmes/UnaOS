@@ -191,7 +191,7 @@ fn open(synapse: &Synapse, url: &str, display_hz: u32, with_audio: bool) -> Opti
     };
     match Player::open(bytes, Arc::new(SystemTime::new()), out, display_hz) {
         Ok(player) => {
-            let i = player.info().clone();
+            let i = player.info().clone(); let info = crate::media::summary_line(&i); // STRIAINFOBITRATEFACE (SR734): the one-line summary, taken before the literal moves i.video
             synapse.fire(SMessage::MediaOpened {
                 url: url.to_string(),
                 duration_ns: i.duration_ns,
@@ -200,7 +200,7 @@ fn open(synapse: &Synapse, url: &str, display_hz: u32, with_audio: bool) -> Opti
                 video: i.video,
                 audio: i.audio,
                 real_video: i.real_video,
-                audio_clock: i.audio_clock,
+                audio_clock: i.audio_clock, info,
             });
             Some(Session { player, _engine: engine, playing: false, ended: false, levels: Vec::new(), feed: None })
         }
@@ -275,7 +275,7 @@ fn poll_feeds(synapse: &Synapse, sessions: &mut HashMap<String, Session>, feeds:
         match Player::open_live(demux, Arc::new(SystemTime::new()), out, hz) {
             Ok(mut player) => {
                 player.refresh_live(demux_again(&p.feed), p.feed.duration_ns(), p.feed.ended());
-                let i = player.info().clone();
+                let i = player.info().clone(); let info = crate::media::summary_line(&i); // STRIAINFOBITRATEFACE (SR734): the one-line summary, taken before the literal moves i.video
                 synapse.fire(SMessage::MediaOpened {
                     url: url.clone(),
                     duration_ns: p.feed.duration_ns(),
@@ -284,7 +284,7 @@ fn poll_feeds(synapse: &Synapse, sessions: &mut HashMap<String, Session>, feeds:
                     video: i.video,
                     audio: i.audio,
                     real_video: i.real_video,
-                    audio_clock: i.audio_clock,
+                    audio_clock: i.audio_clock, info,
                 });
                 if p.play {
                     player.play();

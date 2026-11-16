@@ -4282,7 +4282,7 @@ mod device_damage_tests {
             video: "vp8".into(),
             audio: String::new(),
             real_video: true,
-            audio_clock: false,
+            audio_clock: false, info: String::new(),
         });
         let frame = |n: i64| SMessage::MediaFrame { url: url.into(), pts_ns: n * 40_000_000, width: 160, height: 120, rgba: vec![n as u8; 160 * 120 * 4], levels: vec![] };
         e.on_media_message(&frame(0));
