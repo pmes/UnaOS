@@ -3,19 +3,12 @@
 //! body preview, and the Elements panel's box model. No network: every fixture is loaded with
 //! `load_html_styled` and has no `<script src>`.
 
-use std::sync::OnceLock;
-
 use aether::chrome::devtools::{self, network::Preview, Panel};
 
 const URL: &str = "https://devtools3.test/app/index.html";
 
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-devtools3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "devtools3");
 }
 
 fn load(html: &str) -> aether::AetherEngine {

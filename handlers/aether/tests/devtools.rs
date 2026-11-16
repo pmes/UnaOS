@@ -2,8 +2,6 @@
 //! toggle and dock. No network: the fixture is loaded with `load_html_styled`, whose references
 //! (stylesheet, image) are listed by the Network panel without being fetched.
 
-use std::sync::OnceLock;
-
 use aether::chrome::devtools::{self, console::Level, network::Initiator, Panel};
 use aether::chrome::{is_devtools_toggle, DevtoolsChrome, DevtoolsDock};
 
@@ -30,12 +28,7 @@ const FIXTURE: &str = r#"<!doctype html>
 
 /// Every test process keeps its storage buckets in its own directory under the target dir.
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-devtools-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "devtools");
 }
 
 fn fixture() -> aether::AetherEngine {

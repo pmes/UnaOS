@@ -43,16 +43,10 @@
 //! No WPT: the seat runs the suites. Storage lives under CARGO_TARGET_TMPDIR.
 
 use std::io::{Read, Write};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-workers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "workers");
 }
 
 /// A `data:` URL carrying `src` (every byte but [A-Za-z0-9] percent-encoded, so it nests in a JS string).

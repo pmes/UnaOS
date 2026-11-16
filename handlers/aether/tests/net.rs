@@ -304,7 +304,7 @@ fn server() -> (u16, Arc<State>) {
 }
 
 fn page(port: u16, script: &str) -> aether::AetherEngine {
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     let html = format!("<!doctype html><html><body><div id=x></div><script>{script}</script></body></html>");
     engine.load_html_styled(&format!("http://127.0.0.1:{port}/page"), &html, &[], true);
     engine
@@ -703,7 +703,7 @@ fn storage_event_reaches_the_other_documents_of_the_origin() {
     // Document B: listens.
     let o2 = origin.clone();
     let b = std::thread::spawn(move || {
-        let mut e = aether::AetherEngine::new();
+        init(); let mut e = aether::AetherEngine::new();
         e.load_html_styled(
             &format!("{o2}/b"),
             r#"<!doctype html><body><script>
@@ -727,7 +727,7 @@ fn storage_event_reaches_the_other_documents_of_the_origin() {
     });
     // Document C: another origin, must hear nothing.
     let c = std::thread::spawn(move || {
-        let mut e = aether::AetherEngine::new();
+        init(); let mut e = aether::AetherEngine::new();
         e.load_html_styled(
             "http://other.invalid/c",
             "<!doctype html><body><script>var heard = 0; window.addEventListener('storage', function () { heard++; });</script></body>",
@@ -744,7 +744,7 @@ fn storage_event_reaches_the_other_documents_of_the_origin() {
     });
     ready_rx.recv().unwrap();
     // Document A: writes.
-    let mut a = aether::AetherEngine::new();
+    init(); let mut a = aether::AetherEngine::new();
     a.load_html_styled(
         &format!("{origin}/a"),
         r#"<!doctype html><body><script>
@@ -795,4 +795,11 @@ fn storage_event_reaches_the_other_documents_of_the_origin() {
     assert_eq!(rest, "final#1", "one localStorage area per origin, shared by the process's documents");
     let c_res = c.join().unwrap();
     assert_eq!(c_res, "0:0", "another origin hears nothing and sees an empty area");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "net");
 }
