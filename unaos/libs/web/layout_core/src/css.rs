@@ -3490,6 +3490,20 @@ fn hex_color(hex: &str) -> Option<(u8, u8, u8)> {
 /// value, `inherit` and `unset` change nothing (the property inherits). `font` does not reset it (css-fonts-4 §2.8's
 /// reset list omits it; Chromium's `font` longhands too).
 fn apply_font_synthesis<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
+    let Some((w, s)) = parse_font_synthesis(prop, value) else { return };
+    if w.is_some() {
+        paint.synth_weight = w;
+    }
+    if s.is_some() {
+        paint.synth_style = s;
+    }
+}
+
+/// AETHERFONTSYNTHESISCSSOM (SR764): the ONE `font-synthesis` keyword parse, shared by the setter above and Aether's
+/// CSSOM (`expand`): the shorthand gives both halves (`initial` both auto, `none` both none, a keyword it omits none,
+/// `small-caps` parsed and dropped), a longhand `auto | none | initial` its own half (Some(true) = auto). None for an
+/// invalid value and for `inherit` / `unset` (the values the setter ignores: the property inherits).
+pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Option<bool>)> {
     let v = value.trim().to_ascii_lowercase();
     let auto = |s: &str| match s {
         "auto" | "initial" => Some(true),
@@ -3497,8 +3511,8 @@ fn apply_font_synthesis<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle
         _ => None,
     };
     let (w, s) = match prop {
-        "font-synthesis-weight" => (auto(&v), None),
-        "font-synthesis-style" => (None, auto(&v)),
+        "font-synthesis-weight" => (Some(auto(&v)?), None),
+        "font-synthesis-style" => (None, Some(auto(&v)?)),
         _ => match v.as_str() {
             "initial" => (Some(true), Some(true)),
             "none" => (Some(false), Some(false)),
@@ -3509,24 +3523,19 @@ fn apply_font_synthesis<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle
                         "weight" => &mut w,
                         "style" => &mut s,
                         "small-caps" => &mut c,
-                        _ => return,
+                        _ => return None,
                     };
                     if *seen {
-                        return;
+                        return None;
                     }
                     *seen = true;
                 }
                 if !(w || s || c) {
-                    return;
+                    return None;
                 }
                 (Some(w), Some(s))
             }
         },
     };
-    if w.is_some() {
-        paint.synth_weight = w;
-    }
-    if s.is_some() {
-        paint.synth_style = s;
-    }
+    Some((w, s))
 }
