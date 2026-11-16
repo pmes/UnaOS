@@ -185,6 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
+        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744): the keys help word (no button: not a VERBS word)
         _ => return None,
     };
     Some(vec![one])
@@ -250,7 +251,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face);
+    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -641,5 +642,41 @@ mod exportrange_tests {
         assert_eq!((face.marks(), range_json(&face)), ((Some(5), None), String::new()));
         assert!(drive(&mut face, "ruler:15,out").is_empty());
         assert_eq!(range_json(&face), r#","range":[5,15]"#);
+    }
+}
+
+// ---- NLE5DKEYSHELP (LEDGER SR744): the witness's keys help reading (named tail block) ----
+/// The witness's `"help"` field, only while the keys help shows (`Face::help_shown`); the default line is unchanged.
+fn help_json(face: &Face) -> String {
+    if face.help_shown() { ",\"help\":true".into() } else { String::new() }
+}
+
+#[cfg(test)]
+mod nle5dkeyshelp_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = nle_face::synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// NLE5DKEYSHELP M3: `--do help` shows the help and the line carries `"help":true`; a second `help` hides it (the field
+    /// absent); `key:?` shows it; a following `key:j` only dismisses it (no shuttle: not playing, rate 1).
+    #[test]
+    fn help_field_while_the_help_shows() {
+        let mut f = face();
+        assert_eq!(help_json(&f), "");
+        let errors = drive(&mut f, "help");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(help_json(&f), ",\"help\":true");
+        drive(&mut f, "help");
+        assert_eq!(help_json(&f), "");
+        let errors = drive(&mut f, "key:?");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(f.help_shown());
+        let errors = drive(&mut f, "key:j");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.help_shown(), f.playing, f.rate), (false, false, 1));
+        println!("nle5dkeyshelp witness: help -> ,\"help\":true; key:? shows; key:j dismisses unapplied");
     }
 }
