@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use gneiss_pal::dsp::audio::meter::Meter;
 use gneiss_pal::dsp::audio::resample;
-use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
+use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing};
 use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
 use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth, colour_of};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
@@ -82,6 +82,8 @@ pub struct RenderReport {
     pub height: u32,
     pub rate: u32,
     pub channels: u16,
+    /// NLESTANDINAUDIOEDITOR (SR713): the reels whose audio played media.rs's silent stand-in (`AudioSwap`: no decoder, or parked after a refused packet), each counted once.
+    pub stand_in_audio: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -395,7 +397,7 @@ impl Aud {
     fn open(m: &Media, src: SourceId, key_ns: i64, channels: u16) -> Result<Aud, RenderError> {
         let (i, origin) = m.stream(Kind::Audio).ok_or(RenderError::NoStream(src, Kind::Audio))?;
         let track = &m.demux.tracks()[i];
-        let dec = audio_decoder_for(track, Timing::of(&m.demux, track)).map_err(|e| RenderError::Decode(e.to_string()))?;
+        let dec = crate::media::AudioSwap::open(track, Timing::of(&m.demux, track), true).map_err(|e| RenderError::Decode(e.to_string()))?; // NLESTANDINAUDIOEDITOR (SR713): the one decoder-or-silent-stand-in (media.rs AudioSwap)
         if dec.channels() != channels {
             return Err(RenderError::Format { src, rate: dec.sample_rate(), channels: dec.channels() });
         }
@@ -512,7 +514,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut vid: Option<Vid> = None;
     // NLE4: one audio decoder per track; the k-th audio step is the k-th mix run.
     let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
-    let mut run_of = runs.iter();
+    let mut run_of = runs.iter(); let mut stand_in_audio: Vec<SourceId> = Vec::new(); // NLESTANDINAUDIOEDITOR (SR713): the reels whose audio drew the silent stand-in
     for s in &steps {
         match (s.kind, s.src) {
             (Kind::Video, None) => {
@@ -536,7 +538,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 let s0 = samples(tl.tb.to_ns(s.out_t), rate);
                 let n = samples(tl.tb.to_ns(s.out_t + s.len), rate) - s0;
                 let mut taps = sink.taps_tracks().then(Vec::new); // NLE4C: the per-track sums, when the sink meters them
-                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks, taps.as_mut())?;
+                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks, taps.as_mut())?; note_audio_stand_in(&auds, &mut stand_in_audio, &mut r); // NLESTANDINAUDIOEDITOR (SR713)
                 sink.pcm(s.out_t, rate, ch, &pcm);
                 if let Some(t) = taps {
                     tap_tracks(tl, sink, s.out_t, rate, ch, t);
@@ -954,4 +956,18 @@ impl Drop for Vid {
             *slot = Some((std::mem::take(&mut self.swap), dec));
         }
     }
+}
+
+// ---- NLESTANDINAUDIOEDITOR (LEDGER SR713): the editor's audio reels on media.rs's silent stand-in (named tail block) ----
+/// NLESTANDINAUDIOEDITOR (LEDGER SR713): the editor's audio reel opens through [`crate::media::AudioSwap::open`] (`Aud::open`),
+/// so a reel whose audio no decoder takes, or whose decoder refuses a packet, renders silence instead of failing the render.
+/// After each mix run, a live slot whose decoder reads "stand-in" (the open-time stand-in, or a refused decoder parked at the
+/// run's end) adds its reel once; [`RenderReport::stand_in_audio`] is their count. Local to one [`render`]: no lock.
+fn note_audio_stand_in(auds: &[Option<Aud>], reels: &mut Vec<SourceId>, r: &mut RenderReport) {
+    for a in auds.iter().flatten() {
+        if a.dec.name() == "stand-in" && !reels.contains(&a.src) {
+            reels.push(a.src);
+        }
+    }
+    r.stand_in_audio = reels.len() as u32;
 }

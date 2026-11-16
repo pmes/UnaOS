@@ -222,6 +222,8 @@ pub struct ExportReport {
     /// FNV-1a 64 over the rendered RGBA stream (`nle render`'s fnv).
     pub fnv: u64,
     pub pcm_frames: u64,
+    /// NLESTANDINAUDIOEDITOR (SR713): the render's [`crate::nle::RenderReport::stand_in_audio`] (reels on the silent audio stand-in).
+    pub stand_in_audio: u32,
 }
 
 #[derive(Debug)]
@@ -694,8 +696,8 @@ pub fn export_as_with(
     let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     sink.container = container;
     let total = if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 };
-    render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?;
-    sink.finish(tl.tb)
+    let rr = render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?; // NLESTANDINAUDIOEDITOR (SR713): the render report kept for its stand-in count
+    sink.finish(tl.tb).map(|e| ExportReport { stand_in_audio: rr.stand_in_audio, ..e }) // NLESTANDINAUDIOEDITOR (SR713)
 }
 
 /// The progress wrapper over [`ExportSink`]: every [`RenderSink`] call forwarded unchanged, then the reading.
