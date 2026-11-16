@@ -1229,3 +1229,123 @@ fn adoptpng_refused_dir_by_name() {
     assert_eq!(std::fs::read(&file).unwrap(), b"not a directory", "nothing written");
     println!("adoptpng: refused {text}");
 }
+
+// ── NLEHOSTSAVE (LEDGER SR677): the host face saves through timeline_core's ONE writer (handlers.md §5 NLEPROBE-HDR) ──────
+// `save` (verb, button, Ctrl+s / Meta+s) writes `edl::write(timeline, <file stem>)` to the path the face was opened from;
+// `dirty()` is the timeline differing from the one opened / saved; no path is a refusal by name.
+
+fn nlehostsave_dir(name: &str) -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlehostsave").join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+#[test]
+fn nlehostsave_round_trip_through_the_one_writer() {
+    let (tl0, src) = synth_fixture();
+    let path = nlehostsave_dir("round").join("cut.edl");
+    std::fs::write(&path, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let opened = edl::parse(&std::fs::read_to_string(&path).unwrap(), 25).unwrap();
+    assert_eq!(opened, tl0, "the fixture round-trips before any edit");
+    let mut face = Face::new(EditorState::new(opened), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    assert_eq!(face.doc_path(), Some(path.as_path()));
+    assert!(!face.dirty(), "clean at open");
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl0.split(0, 15).unwrap());
+    assert!(face.dirty(), "dirty after split");
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!face.dirty(), "clean after save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("TITLE: cut\n"), "titled by the file stem: {text}");
+    assert_eq!(text, edl::write(&face.state.timeline, "cut").unwrap());
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline);
+    assert!(face.verb("undo"));
+    assert!(face.dirty(), "an undo past the save is dirty");
+    assert!(face.verb("redo"));
+    assert!(!face.dirty(), "back at the saved timeline reads clean");
+    println!("nlehostsave: saved {} bytes to {}", text.len(), path.display());
+}
+
+#[test]
+fn nlehostsave_refuses_without_a_document_path() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(VERBS.contains(&"save"));
+    assert!(face.doc_path().is_none());
+    assert!(face.verb("save"), "a verb the face takes");
+    assert_eq!(face.last_error.take().as_deref(), Some("save: no document path"));
+    assert_eq!(face.state.timeline, tl0);
+    assert_eq!(face.save(), Err("no document path".to_string()));
+}
+
+#[test]
+fn nlehostsave_ctrl_s_and_meta_s_save() {
+    let (tl0, src) = synth_fixture();
+    let dir = nlehostsave_dir("keys");
+    for chord in ["Ctrl+s", "Meta+s"] {
+        let path = dir.join(format!("{}.edl", chord.replace('+', "-")));
+        let (_, src2) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl0.clone()), src2, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+        face.state.select_at(0, 12).unwrap();
+        face.state.seek(15);
+        assert!(face.verb("split"));
+        assert!(face.dirty());
+        assert!(face.on(&bandy::SMessage::BrowserKey(chord.to_string())), "{chord}");
+        assert!(face.last_error.is_none(), "{chord}: {:?}", face.last_error);
+        assert!(!face.dirty(), "{chord} saved");
+        assert_eq!(edl::parse(&std::fs::read_to_string(&path).unwrap(), 25).unwrap(), face.state.timeline);
+    }
+    drop(src);
+}
+
+/// NLEXFADEPOWER (SR678): an audio-only crossfade (no video transition) A[0,20)@0 -> B[0,20)@20 over 8 ticks. Around its
+/// midpoint (samples `24 PER +- 96`) the rendered power under EqualPower is twice the Linear one (the weights sin(pi/4)
+/// against 1/2, both sources at their own level), within 1%; the per-tick equal-power runs CONTINUE their decoders (the
+/// same seeks as the linear span); and the explicit linear crossfade renders sample for sample as the one a video
+/// dissolve implies (NLE3b).
+#[test]
+fn nlexfadepower_equal_power_doubles_the_midpoint_power() {
+    use timeline_core::{Curve, TransitionKind};
+    let base = |video: bool| {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 50), tl.add_source("B", 50));
+        if video {
+            tl.add_track(Kind::Video);
+        }
+        let ti = tl.add_track(Kind::Audio);
+        tl.tracks[ti].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+        if video {
+            tl.tracks[0].clips = tl.tracks[ti].clips.clone();
+        }
+        tl
+    };
+    let run = |tl: &Timeline| {
+        let mut src = Sources::new(tl);
+        for (i, b) in BASE.iter().enumerate() {
+            src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
+        }
+        let mut sink = Collect::default();
+        let r = render(tl, 0..40, &src, &mut sink).unwrap();
+        assert_eq!(sink.pcm.len(), 40 * PER);
+        (r.seeks, sink.pcm.iter().map(|x| (*x * 32768.0).round() as i64).collect::<Vec<i64>>())
+    };
+    let (eq_seeks, eq) = run(&base(false).add_audio_xfade(0, 20, 8, Curve::EqualPower).unwrap());
+    let (lin_seeks, lin) = run(&base(false).add_audio_xfade(0, 20, 8, Curve::Linear).unwrap());
+    let mid = 24 * PER;
+    let power = |s: &[i64]| s[mid - 96..mid + 96].iter().map(|&x| (x * x) as f64).sum::<f64>();
+    let ratio = power(&eq) / power(&lin);
+    assert!((ratio - 2.0).abs() <= 0.02, "equal-power / linear midpoint power {ratio}");
+    // A, A's handle (the under layer's own seek), B: the per-tick runs reopen nothing
+    assert_eq!((eq_seeks, lin_seeks), (3, 3));
+    // outside the span the two curves are the same cut
+    assert_eq!((&eq[..20 * PER], &eq[28 * PER..]), (&lin[..20 * PER], &lin[28 * PER..]));
+    // the explicit linear crossfade is the derived one's sound
+    let (_, derived) = run(&base(true).add_transition(0, 20, TransitionKind::Dissolve, 8).unwrap());
+    assert_eq!(derived, lin);
+    println!("nlexfadepower: midpoint power eq/lin={ratio:.4} seeks={eq_seeks}");
+}

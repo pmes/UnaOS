@@ -128,3 +128,21 @@ fn overlap_and_bad_ranges_are_refused() {
     // the index knows the media is shorter than the timeline claims
     assert_eq!(schedule(&tl, 0..10, &Gop { dur: 30 }), Err(ScheduleError::OutOfSource(SourceId(0))));
 }
+
+// ---- NLEXFADEPOWER (SR678): the ONE crossfade weight against the curve it tabulates.
+
+#[test]
+fn nlexfadepower_xfade_weight_tracks_sine_and_cosine() {
+    use timeline_core::Curve;
+    use timeline_core::schedule::{ENV_ONE, xfade_weight};
+    let mut prev = 0;
+    for p in (0..=ENV_ONE).step_by(97).chain([ENV_ONE]) {
+        let w = xfade_weight(Curve::EqualPower, p);
+        let want = (core::f64::consts::FRAC_PI_2 * p as f64 / ENV_ONE as f64).sin() * ENV_ONE as f64;
+        assert!((w as f64 - want).abs() <= 2.0, "p {p}: {w} vs {want}");
+        assert!(w >= prev, "p {p}: not rising");
+        prev = w;
+    }
+    // clamped past the end; linear the identity
+    assert_eq!((xfade_weight(Curve::EqualPower, ENV_ONE + 9), xfade_weight(Curve::Linear, ENV_ONE + 9)), (ENV_ONE, ENV_ONE));
+}

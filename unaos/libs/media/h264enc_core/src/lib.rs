@@ -177,6 +177,11 @@ pub struct Config {
     /// H264ENCVBRCRF (LEDGER SR383): the floor of every rate-controlled picture and row QP, 16..=51 (else [`Error::Rate`]);
     /// None = [`rc::QP_MIN`] (16). Read through [`Config::qp_floor`]; unread without [`Config::rate`].
     pub qp_min: Option<u8>,
+    /// H264ENCSCENECUT (LEDGER SR680): scene-cut IDRs. None (the default) keeps every pinned byte; Some(k), k the threshold in
+    /// percent (40 the documented default, above 100 read as 100), codes an IDR where a picture's inter cost against the previous
+    /// source frame exceeds (1 - k/100) x its intra cost, and the GOP count restarts there (within `gop / 4` of the last IDR only
+    /// when inter exceeds intra outright); the detector is the file tail's H264ENCSCENECUT block.
+    pub scenecut: Option<u8>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -460,6 +465,8 @@ pub struct Encoder {
     pub(crate) bipred_idc: u32,
     /// VUI max_num_reorder_frames: the pts delay.
     depth: u64,
+    /// The previous frame's padded source luma (H264ENCSCENECUT SR680; empty until [`Config::scenecut`] runs).
+    scene_prev: Plane,
 }
 
 impl Encoder {
@@ -546,6 +553,7 @@ impl Encoder {
             bw: None,
             bipred_idc,
             depth: num_reorder as u64,
+            scene_prev: Plane::new(0, 0, 0),
         })
     }
 
@@ -592,7 +600,7 @@ impl Encoder {
             return Err(Error::Reorder);
         }
         self.load(f)?;
-        let idr = self.frames.is_multiple_of(self.cfg.gop as u64);
+        let idr = self.scenecut_key(self.frames, (self.frames - self.idr_display).is_multiple_of(self.cfg.gop as u64));
         let au = self.code(if idr { Pic::Idr } else { Pic::P }, self.frames);
         self.frames += 1;
         Ok(au)
@@ -612,8 +620,9 @@ impl Encoder {
         }
         self.load(f)?;
         let (b, gop) = (self.cfg.bframes.min(4) as u64, self.cfg.gop as u64);
-        let (display, k) = (self.frames, self.frames % gop);
+        let (display, k) = (self.frames, (self.frames - self.idr_display) % gop);
         self.frames += 1;
+        if self.scenecut_key(display, k == 0) && k != 0 { return Ok(self.scenecut_group(display)); }
         if k != 0 && k % (b + 1) != 0 && k + 1 != gop {
             self.ahead.push((self.src.clone(), display));
             return Ok(Vec::new());
@@ -1061,5 +1070,72 @@ impl Encoder {
         let sum = |p: &Plane| p.data.iter().map(|&v| v as i64).sum::<i64>();
         let (s, n) = (sum(&self.src[0]), self.src[0].data.len() as i64);
         [&self.refp[0], &self.fwd[0]].map(|r| (2 * (s - sum(r)) + n).div_euclid(2 * n).clamp(-128, 127) as i32)
+    }
+}
+
+// ---- H264ENCSCENECUT (LEDGER SR680): scene-cut IDRs (named tail block) ----
+// x264's rule (encoder/slicetype.c `scenecut_internal`: a cut where pcost >= (1 - bias) x icost over lookahead source frames)
+// in the cheap form the encoder's own numbers allow: both costs are luma SADs over SOURCE pictures, per macroblock, summed.
+// The cut picture is coded through the one `code(Pic::Idr, ..)` path, which sets `idr_display`, from which the GOP count restarts.
+impl Encoder {
+    /// Is the picture now in `src` (display index `display`) an IDR: `scheduled` (the GOP count), or under
+    /// [`Config::scenecut`] a detected cut. None returns `scheduled` and does no work. Under Some the costs are skipped on a
+    /// scheduled IDR, and `src`'s luma becomes the next picture's previous frame either way. A cut: inter x 100 >
+    /// (100 - k) x intra, or within min_keyint = gop / 4 of the last IDR, inter > intra.
+    pub(crate) fn scenecut_key(&mut self, display: u64, scheduled: bool) -> bool {
+        let Some(k) = self.cfg.scenecut else { return scheduled };
+        let mut cut = false;
+        if !scheduled && !self.scene_prev.data.is_empty() {
+            let (inter, intra) = self.scenecut_costs();
+            let k = k.min(100) as u64;
+            cut = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { inter * 100 > (100 - k) * intra };
+        }
+        self.scene_prev.clone_from(&self.src[0]);
+        scheduled || cut
+    }
+
+    /// (inter, intra) of the picture in `src`: per macroblock, the SAD against the previous source frame at the vector
+    /// `me::search` finds (lam 0: pure SAD), and the cheapest Intra_16x16 SAD over the source's own neighbours (the intra
+    /// decision's 16x16 half; its 4x4 half writes the reconstruction).
+    fn scenecut_costs(&self) -> (u64, u64) {
+        let (mut inter, mut intra) = (0u64, 0u64);
+        let mut pred = [0i32; 256];
+        for mby in 0..self.mb_h {
+            for mbx in 0..self.mb_w {
+                let (px, py) = (mbx * 16, mby * 16);
+                let mv = me::search(&self.src[0], &self.scene_prev, px, py, h264_core::picture::Mv::ZERO, 0);
+                let (dx, dy) = (mv.x as i32 / 4, mv.y as i32 / 4);
+                for y in 0..16 {
+                    for x in 0..16 {
+                        pred[y * 16 + x] = self.scene_prev.at((px + x) as i32 + dx, (py + y) as i32 + dy) as i32;
+                    }
+                }
+                inter += self.sad(0, px, py, 16, &pred) as u64;
+                let e = intra::luma_edges(&self.src[0], mbx, mby, self.mb_w, 0, 0, 16, 0, 16);
+                let mut best = u32::MAX;
+                for mode in 0..4u8 {
+                    if intra::allowed16(mode, &e) {
+                        h264_core::intra::pred_16x16(mode, &e, &mut pred);
+                        best = best.min(self.sad(0, px, py, 16, &pred));
+                    }
+                }
+                intra += best as u64;
+            }
+        }
+        (inter, intra)
+    }
+
+    /// Under `bframes`, the cut at `display` (its planes in `src`) closes the open group by [`Encoder::flush`]'s rule (the
+    /// last held frame becomes the P anchor, the rest B pictures), then codes the cut picture as the IDR.
+    fn scenecut_group(&mut self, display: u64) -> Vec<Access> {
+        let cut = self.src.clone();
+        let mut out = Vec::new();
+        if let Some((planes, d)) = self.ahead.pop() {
+            self.src = planes;
+            out = self.group(Pic::P, d);
+        }
+        self.src = cut;
+        out.extend(self.group(Pic::Idr, display));
+        out
     }
 }
