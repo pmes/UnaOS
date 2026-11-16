@@ -22,9 +22,12 @@
 //! not asserted, measured corrections of the design's bit-spread check; (m) qcomp 1 one QP for every P, qcomp 0 equal bits (at
 //! floor 0: at QP_MIN the decade of complexity clamps, a measured correction), an invalid qcomp refused; (n) an I picture planned
 //! from its GOP's P pictures less 3, one with no P after it from its own complexity.
+//! H264ENCTWOPASSBLURINTRA (LEDGER SR751): (o) the coder's intra counts (an IDR all of its mbs, a P / B none); (p) x264's chain weight
+//! 1 - (intra / mbs)^2 cuts the blur at a mostly-intra P (a record: the coder has no intra-in-P decision); (q) the v2 text round-trips
+//! the counts, a v1 text and a bad count refuse by name. Test f's tampered line keeps the v2 count token.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, pass2_qps, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -80,7 +83,7 @@ fn a_pass2_qps_spends_where_the_complexity_is() {
         .map(|i| {
             let kind = if i % 30 == 0 { Pic::Idr } else { Pic::P };
             let bits = if kind == Pic::Idr { 60_000 } else { 2_000 + (i * 7919 % 61) * 300 };
-            PicStat { kind, bits, qp: 26, complexity: bits * step16(26) }
+            PicStat { kind, bits, qp: 26, complexity: bits * step16(26), intra_mbs: if kind == Pic::Idr { 48 } else { 0 }, mbs: 48 }
         })
         .collect();
     let first: u64 = stats.iter().map(|p| p.bits).sum();
@@ -184,7 +187,7 @@ fn c_stats_one_record_per_picture() {
         assert_eq!(r.kind == Pic::Idr, a.keyframe);
     }
     // A plan needs TwoPass; an empty plan changes nothing (TwoPass without a plan is CBR byte for byte).
-    let one = [PicStat { kind: Pic::Idr, bits: 1000, qp: 26, complexity: 1000 * step16(26) }];
+    let one = [PicStat { kind: Pic::Idr, bits: 1000, qp: 26, complexity: 1000 * step16(26), intra_mbs: 48, mbs: 48 }];
     assert!(matches!(Encoder::new(base(Some(RateControl::cbr(60, (FPS, 1))))).unwrap().planned(&one), Err(Error::Rate)));
     let bytes = |rate| {
         let mut enc = Encoder::new(base(Some(rate))).unwrap().planned(&[]).unwrap();
@@ -267,8 +270,8 @@ fn f_stats_refusals_by_name() {
     assert_eq!(e, StatsError::Line(2));
     assert!(e.to_string().contains("bad line 2"), "{e}");
     let mut c = owned.clone();
-    let f: Vec<u64> = c[2].split(' ').skip(1).map(|x| x.parse().unwrap()).collect();
-    c[2] = format!("{} {} {} {}", &owned[2][..1], f[0], f[1], f[2] + 1);
+    let f: Vec<u64> = c[2].split(' ').skip(1).take(3).map(|x| x.parse().unwrap()).collect();
+    c[2] = format!("{} {} {} {} {}", &owned[2][..1], f[0], f[1], f[2] + 1, owned[2].split(' ').nth(4).unwrap());
     assert_eq!(read_stats(&join(&c)), Err(StatsError::Line(3)));
     let mut x = owned.clone();
     x[3].push_str(" 7");
@@ -362,13 +365,13 @@ fn synthetic() -> Vec<PicStat> {
         .map(|i| {
             let kind = if i % 30 == 0 { Pic::Idr } else { Pic::P };
             let bits = if kind == Pic::Idr { 60_000 } else { 2_000 + (i * 7919 % 61) * 300 };
-            PicStat { kind, bits, qp: 26, complexity: bits * step16(26) }
+            PicStat { kind, bits, qp: 26, complexity: bits * step16(26), intra_mbs: if kind == Pic::Idr { 48 } else { 0 }, mbs: 48 }
         })
         .collect()
 }
 
 fn pic(kind: Pic, bits: u64) -> PicStat {
-    PicStat { kind, bits, qp: 26, complexity: bits * step16(26) }
+    PicStat { kind, bits, qp: 26, complexity: bits * step16(26), intra_mbs: if kind == Pic::Idr { 48 } else { 0 }, mbs: 48 }
 }
 
 #[test]
@@ -507,3 +510,69 @@ fn n_i_picture_from_its_gop() {
     assert_ne!(pass2_qps(&stats, total, QP_MIN, &RAW)[20], q[20], "RAW takes the previous P's less 3");
 }
 
+// ---- H264ENCTWOPASSBLURINTRA (LEDGER SR751): x264's intra weight of the complexity blur's chain (named tail block) ----
+
+#[test]
+fn o_intra_counts_from_the_coder() {
+    // The CBR first pass (one IDR, 29 P) and a constant-QP stream with B pictures: an IDR codes all 48 macroblocks intra, a P / B
+    // none (the coder has no intra-in-P decision: H264ENC-P-INTRA owed; the SR680 cut frame with scenecut off is such a P).
+    let mut enc = Encoder::new(Config { bframes: 2, gop: 8, ..base(None) }).unwrap();
+    for t in 0..10 {
+        enc.push(&frame(&scene(t))).unwrap();
+    }
+    enc.flush().unwrap();
+    for pics in [first_pass(60), enc.stats().to_vec()] {
+        let counts: Vec<String> = pics.iter().map(|p| format!("{:?}:{}/{}", p.kind, p.intra_mbs, p.mbs)).collect();
+        println!("twopassblurintra counts {}", counts.join(" "));
+        for p in &pics {
+            assert_eq!(p.mbs, ((W / 16) * (H / 16)) as u32);
+            assert_eq!(p.intra_mbs, if p.kind == Pic::Idr { p.mbs } else { 0 }, "{p:?}");
+        }
+    }
+}
+
+#[test]
+fn p_intra_weight_cuts_the_chain() {
+    let marked = |kind: Pic, bits: u64, intra: u32| PicStat { intra_mbs: intra, ..pic(kind, bits) };
+    let mostly = marked(Pic::P, 1000, 44);
+    let keep = intra_keep_q16(&mostly);
+    println!("twopassblurintra keep 44/48={keep} 48/48={} 0/48={}", intra_keep_q16(&marked(Pic::P, 1000, 48)), intra_keep_q16(&marked(Pic::P, 1000, 0)));
+    assert_eq!(keep, 65536 - (44 * 44 * 65536) / (48 * 48));
+    assert!(keep < 65536 / 4, "a 44/48 P's link weight {keep} not below 1/4");
+    assert_eq!(intra_keep_q16(&marked(Pic::P, 1000, 48)), 0);
+    assert_eq!(intra_keep_q16(&marked(Pic::P, 1000, 0)), 65536);
+    assert_eq!(intra_keep_q16(&marked(Pic::P, 1000, 60)), 0, "intra clamped to mbs");
+    assert_eq!(intra_keep_q16(&PicStat { mbs: 0, intra_mbs: 0, ..pic(Pic::P, 1000) }), 65536, "mbs 0 keeps the link");
+    // Test (j)'s stream (IDR at 0 and 45, P pictures of complexity c) with a 10c P at 20 marked 0/48, 44/48, 48/48.
+    let c = 1000 * step16(26);
+    let stream = |intra: u32| -> Vec<PicStat> {
+        (0..60).map(|i| if i % 45 == 0 { pic(Pic::Idr, 30_000) } else if i == 20 { marked(Pic::P, 10_000, intra) } else { pic(Pic::P, 1000) }).collect()
+    };
+    let (plain, part, full) = (blur_complexity(&stream(0), 2), blur_complexity(&stream(44), 2), blur_complexity(&stream(48), 2));
+    println!("twopassblurintra picture 19 at cplxblur 2: 0/48={} 44/48={} 48/48={} c={c}", plain[19], part[19], full[19]);
+    assert_eq!(plain, blur_complexity(&stream(0), 2));
+    assert_eq!(&plain[16..=24], &J_IMPULSE_2[..], "intra 0: SR736's pins");
+    assert!(part[19] < plain[19] && part[19] > c, "x264's partial cut: {} between c {c} and {}", part[19], plain[19]);
+    assert_eq!(full[19], c, "an all-intra P cuts the forward walk as an IDR does");
+}
+
+#[test]
+fn q_stats_v2_text_carries_the_counts() {
+    let pics = vec![pic(Pic::Idr, 30_000), PicStat { intra_mbs: 44, ..pic(Pic::P, 1000) }, pic(Pic::P, 1200)];
+    let text = text_of(&pics);
+    println!("twopassblurintra text {text:?}");
+    assert_eq!(STATS_VERSION, 2);
+    assert!(text.starts_with("h264enc-stats v2 frames=3 "));
+    assert!(text.lines().nth(2).unwrap().ends_with(" 44/48"), "{text}");
+    assert_eq!(read_stats(&text).unwrap().pics, pics, "v2 round-trips the counts");
+    // A v1 text (its header and four-token lines): refused as Header, as any other version is.
+    let v1: String = text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { l.replacen("v2", "v1", 1) + "\n" } else { l.rsplit_once(' ').unwrap().0.to_string() + "\n" })
+        .collect();
+    assert_eq!(read_stats(&v1), Err(StatsError::Header));
+    // A count above mbs, and a line without the count: refused by line.
+    assert_eq!(read_stats(&text.replace(" 44/48", " 49/48")), Err(StatsError::Line(3)));
+    assert_eq!(read_stats(&text.replace(" 44/48", "")), Err(StatsError::Line(3)));
+}

@@ -610,7 +610,7 @@ fn lost_picture_is_concealed_from_the_nearest_held_picture() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![2]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3]);
     assert_frame(by_poc(&f, 3), &shifted(&shifted(&i0, 8, 4), 8, 4), "P from the picture concealed from POC 1, advanced by its motion");
@@ -629,7 +629,7 @@ fn conceal_tie_takes_the_lower_poc() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![1]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -670,7 +670,7 @@ fn conceal_projection_scales_by_poc_distance() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -748,7 +748,7 @@ fn img_of(f: &Frame) -> Img {
 fn conceal_bidir_averages_both_projections() {
     let mut d = bidir_conceal_stream(false);
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
     let b2 = img_of(by_poc(&f, 2));
@@ -765,7 +765,7 @@ fn conceal_bidir_averages_both_projections() {
 fn conceal_bidir_one_list_falls_back() {
     let mut d = bidir_conceal_stream(true);
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
     assert_frame(by_poc(&f, 6), &shifted(&img_of(by_poc(&f, 2)), 8, 0), "P from the picture concealed along L1 of B2");
@@ -790,7 +790,7 @@ fn conceal_subpel_projects_through_the_interpolation() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
     assert_frame(by_poc(&f, 2), &hand_mc(&i0, [6, 2]), "P2 at the quarter-sample mv (6, 2)");
@@ -824,7 +824,7 @@ fn conceal_weighted_applies_the_source_weights() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![3]);
-    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
     let faded = |r: &Img| Img { y: r.y.iter().map(|&v| ((v as u32 + 1) / 2 + 10) as u8).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
@@ -836,3 +836,34 @@ fn conceal_weighted_applies_the_source_weights() {
     assert_ne!(by_poc(&f, 4).planes[0], shifted(&p2, 4, 2).y, "not the unit-weight projection");
 }
 
+// ---- HEVCCONCEALFORWARD (LEDGER SR754): the concealed picture refined from its first referencer's motion (named tail block) ----
+
+/// IDR0 (the gradient), P2 (references POC 0 with mv (6, 2)), P4 (references the lost POC 3 with mv (32, 16) on every
+/// block, keeps POC 2 unused), P5 (references POC 2 with mv (3, 1), keeps POC 3 unused), P6 (skip-only, references POC 3
+/// alone). POC 3 is concealed from POC 2 (SR733: P5 is that projection); P4 reads it moved by (8, 4); when P4 ends, POC 3
+/// is re-projected from P4's motion (td 1, tb -1: mv' = -mv = (-32, -16), (-8, -4) samples, edges clamped), so P6 (its
+/// skip copy) is P4 moved back, not the source projection, while P4 and P5 keep their samples (C is never written).
+#[test]
+fn conceal_forward_refines_from_the_first_referencer() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&p_slice(4, vec![(-1, true), (-2, false)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(5, vec![(-2, false), (-3, true)]), |e| amvp_then_merge(e, [3, 1])));
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5, 6]);
+    let p2 = img_of(by_poc(&f, 2));
+    let p5 = img_of(by_poc(&f, 5));
+    assert_frame(by_poc(&f, 5), &hand_mc(&p2, [3, 1]), "P5 reads P2, not the refined picture");
+    assert_frame(by_poc(&f, 4), &shifted(&p5, 8, 4), "P4 read the source projection of POC 3 and is never rewritten");
+    let p4 = img_of(by_poc(&f, 4));
+    assert_frame(by_poc(&f, 6), &shifted(&p4, -8, -4), "P from the picture refined from P4 at -mv");
+    assert_ne!(by_poc(&f, 6).planes[0], p5.y, "not the source projection alone");
+}

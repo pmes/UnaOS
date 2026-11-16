@@ -4859,4 +4859,77 @@ mod tests {
         let (inn, fresh) = (file_value_clear_extent(&mut engine, "in"), file_value_clear_extent(&mut engine, "fresh"));
         assert_eq!(inn, fresh, "the reset input paints a fresh input's status");
     }
+
+    // ---- AETHERIMGALTVALIGN (LEDGER SR748): an InlineAlt img's vertical-align reads its alt run's line box (named tail block) ----
+
+    /// AETHERIMGALTVALIGN (SR748): the (top, bottom) dark-ink rows in columns x0..x1 above row y1; None when nothing paints.
+    fn imgalt_ink_rows(e: &crate::AetherEngine, x0: usize, x1: usize, y1: usize) -> Option<(usize, usize)> {
+        let top = (0..y1).find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0)?;
+        let bottom = (0..y1).rev().find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0)?;
+        Some((top, bottom))
+    }
+
+    /// AETHERIMGALTVALIGN (SR748): Chromium lays an InlineAlt img's alt inside a non-replaced inline box, so its
+    /// `vertical-align` places the alt text exactly as the same keyword places a span "Hello" (blink ApplyBaselineShift:
+    /// middle / text-top / text-bottom read the box's own font metrics plus leading, sub / super the parent's size, a
+    /// length is a length). The img carries `padding: 8px 0 16px`, which the replaced-box arms read (middle 4 px, text-top
+    /// 8 px, text-bottom 16 px off), so only the alt-run line box passes: each target's ink rows minus its own line's
+    /// reference span's are the span engine's within 1, and `5px` lifts the alt 5 rows above its baseline placement.
+    #[test]
+    fn img_alt_valign_as_a_span() {
+        let rows = |target: &str| -> (i64, i64) {
+            let html = format!(
+                r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><span id="r">Hello</span> {target}</div>
+        </body></html>"#
+            );
+            let mut engine = crate::AetherEngine::new();
+            engine.handle_event(crate::api::events::Event::Resize(400, 300));
+            engine.load_html("https://example.com/", &html, true);
+            engine.render_frame();
+            let (rl, _, rw, _) = imgalt_rect(&mut engine, "r");
+            let (tl, _, tw, _) = imgalt_rect(&mut engine, "t");
+            let skip = if target.starts_with("<img") { layout_core::INLINE_ICON_ADVANCE as f64 + 1.0 } else { 0.0 };
+            let (rt, rb) = imgalt_ink_rows(&engine, rl.floor() as usize, (rl + rw).ceil() as usize, 300).expect("the reference span paints");
+            let (tt, tb) = imgalt_ink_rows(&engine, (tl + skip).ceil() as usize, (tl + tw).ceil() as usize, 300).expect("the target paints");
+            (tt as i64 - rt as i64, tb as i64 - rb as i64)
+        };
+        let mut img_baseline = (0, 0);
+        for kw in ["baseline", "middle", "text-top", "text-bottom", "sub", "5px"] {
+            let img = rows(&format!(r#"<img id="t" src="missing.png" alt="Hello" style="vertical-align:{kw};padding:8px 0 16px">"#));
+            let span = rows(&format!(r#"<span id="t" style="vertical-align:{kw}">Hello</span>"#));
+            assert!(
+                (img.0 - span.0).abs() <= 1 && (img.1 - span.1).abs() <= 1,
+                "{kw}: the alt's ink rows sit where a span's do (img top/bottom {:?} vs span {:?}, each from its reference span)",
+                img,
+                span
+            );
+            if kw == "baseline" {
+                img_baseline = img;
+            }
+            if kw == "5px" {
+                assert!((img.1 - (img_baseline.1 - 5)).abs() <= 1, "5px lifts the alt 5 rows ({:?} vs baseline {:?})", img, img_baseline);
+            }
+        }
+    }
+
+    /// AETHERIMGALTVALIGN (SR748): a quirks-mode sized failed img stays a replaced box (BoxedAlt, SR681), so `middle`
+    /// keeps the margin-box rule: the 200x100 box's vertical centre is half the x-height above the line's text baseline
+    /// (the reference "Hello"'s bottom ink row + 1), within [bottom ink row - 8, bottom ink row + 1].
+    #[test]
+    fn img_alt_valign_boxed_middle_keeps_the_replaced_rule() {
+        let html = r#"<html><body style="margin:0;font:16px sans-serif">
+            <div><span id="r">Hello</span> <img id="b" src="missing.png" alt="Hi" width="200" height="100" style="vertical-align:middle"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (rl, _, rw, _) = imgalt_rect(&mut engine, "r");
+        let (_, bt, _, bh) = imgalt_rect(&mut engine, "b");
+        assert!((bh - 100.0).abs() <= 0.5, "b: the box keeps its 100 px ({bh})");
+        let (_, rb) = imgalt_ink_rows(&engine, rl.floor() as usize, (rl + rw).ceil() as usize, 300).expect("the reference span paints");
+        let mid = bt + bh / 2.0;
+        assert!(mid >= rb as f64 - 8.0 && mid <= rb as f64 + 1.0, "b: centred half an x-height above the baseline (centre {mid}, reference bottom ink row {rb})");
+    }
 }
