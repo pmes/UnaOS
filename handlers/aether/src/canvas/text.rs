@@ -248,6 +248,7 @@ impl FontSpec {
             weight: self.weight,
             italic: self.style != 0,
             stretch: stretch_override.unwrap_or(self.stretch),
+            no_synth: 0,
         }
     }
 }

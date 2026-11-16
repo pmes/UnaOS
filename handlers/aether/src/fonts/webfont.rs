@@ -9,11 +9,11 @@
 //! - Font data: sfnt (TrueType/OpenType/collections) as is; WOFF 1.0 (W3C WOFF File Format 1.0) unpacked
 //!   here, zlib tables inflated by UnaOS's own `pixel_core::inflate`. WOFF 2.0 needs Brotli and the glyf
 //!   transform — not implemented, so such a face is ledgered and the next source is tried.
-//! - Selection inside an author family is css-fonts-4 §5.2 over the descriptor ranges, with synthesis as
-//!   for installed faces; a face whose `unicode-range` excludes every character of the text is still the
+//! - Selection inside an author family is css-fonts-4 §5.2 over the descriptor ranges, with synthesis by Blink's webfont
+//!   road (`synthesis_threshold` at 600: css_segmented_font_face.cc, SR745); a face whose `unicode-range` excludes every character of the text is still the
 //!   family's face for metrics (Blink keeps the first face of the segmented family as primary).
 
-use super::db::{match_style, synthesis, Slant, Style};
+use super::db::{match_style, synthesis_threshold, Slant, Style, BOLD_THRESHOLD};
 use super::Face;
 use font_core::Font;
 use std::collections::HashMap;
@@ -106,7 +106,7 @@ pub fn select_all(family: &str, want: Style) -> Vec<&'static Face> {
             continue;
         }
         let face = c.face;
-        let (b, o) = synthesis(Style { weight: styles[i].weight, ..face.style }, want);
+        let (b, o) = synthesis_threshold(Style { weight: styles[i].weight, ..face.style }, want, BOLD_THRESHOLD);
         out.push(if b == face.synth_bold && o == face.synth_oblique { face } else { synth_variant(face, b, o) });
     }
     out
@@ -117,7 +117,7 @@ pub fn select(family: &str, want: Style) -> Option<&'static Face> {
     select_all(family, want).into_iter().next()
 }
 
-fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Face {
+pub(super) fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Face {
     static V: OnceLock<Mutex<HashMap<(u32, bool, bool), &'static Face>>> = OnceLock::new();
     let m = V.get_or_init(|| Mutex::new(HashMap::new()));
     let mut m = m.lock().unwrap();
