@@ -79,6 +79,13 @@ pub struct Dpb {
     pub pics: Vec<DpbPic>,
     /// HEVCINTERCIP (SR688): the PicOrderCntVal of every picture [`Dpb::generate_missing`] made, until taken.
     pub generated: Vec<i32>,
+    // ---- HEVCERRORCONCEAL (LEDGER SR700): the concealment note (named struct-tail block) ----
+    /// HEVCERRORCONCEAL (SR700): (generated PicOrderCntVal, source PicOrderCntVal) of every generated picture whose
+    /// samples [`Dpb::conceal_from`] copied from the nearest held picture, until taken.
+    pub concealed: Vec<(i32, i32)>,
+    /// HEVCERRORCONCEAL (SR700): generated pictures left grey because the nearest held picture's planes or bit depths
+    /// differed from theirs.
+    pub conceal_misfit: u32,
 }
 
 impl Dpb {
@@ -327,10 +334,47 @@ impl Dpb {
         pic.poc = poc;
         pic.bit_depth = sps.bit_depth_luma;
         pic.bit_depth_c = sps.bit_depth_chroma;
-        pic.output = false;
+        pic.output = false; if let Some(s) = self.nearest_held(poc) { self.conceal_from(&mut pic, s); }
         let marking = if long_term { Marking::Long } else { Marking::Short };
         self.pics.push(DpbPic { pic, output_needed: false, latency: 0, marking });
         self.generated.push(poc);
         self.pics.len() - 1
+    }
+}
+
+// ---- HEVCERRORCONCEAL (LEDGER SR700): a generated reference concealed from the nearest held picture (named tail block) ----
+impl Dpb {
+    /// HEVCERRORCONCEAL (SR700): the DPB index of the held picture nearest PicOrderCntVal `poc` (the smallest
+    /// |PicOrderCntVal - poc|, the lower PicOrderCntVal on a tie), among the decoded pictures when any is held, else
+    /// among the generated ones (a picture no slice was decoded into: only 8.3.3.2 stores one); `None` when the DPB is
+    /// empty.
+    pub fn nearest_held(&self, poc: i32) -> Option<usize> {
+        let decoded = self.pics.iter().any(|d| !d.pic.slices.is_empty());
+        (0..self.pics.len())
+            .filter(|&i| !decoded || !self.pics[i].pic.slices.is_empty())
+            .min_by_key(|&i| {
+                let p = self.pics[i].pic.poc;
+                ((p as i64 - poc as i64).abs(), p)
+            })
+    }
+
+    /// HEVCERRORCONCEAL (SR700): conceal the generated picture `pic` from the held picture `src`: its three sample
+    /// planes are copied when their geometry and both bit depths equal `pic`'s, and (`pic.poc`, the source's
+    /// PicOrderCntVal) is noted in `concealed`; else the grey fill stays and `conceal_misfit` counts it. The motion
+    /// (MODE_INTRA, no vector), the marking and PicOutputFlag 0 are untouched.
+    fn conceal_from(&mut self, pic: &mut Picture, src: usize) {
+        let s = &self.pics[src].pic;
+        let fits = s.bit_depth == pic.bit_depth
+            && s.bit_depth_c == pic.bit_depth_c
+            && s.planes.iter().zip(pic.planes.iter()).all(|(a, b)| a.w == b.w && a.h == b.h && a.data.len() == b.data.len());
+        if !fits {
+            self.conceal_misfit += 1;
+            return;
+        }
+        for (dst, from) in pic.planes.iter_mut().zip(s.planes.iter()) {
+            dst.data.copy_from_slice(&from.data);
+        }
+        let src_poc = s.poc;
+        self.concealed.push((pic.poc, src_poc));
     }
 }

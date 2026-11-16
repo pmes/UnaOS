@@ -594,3 +594,60 @@ fn missing_reference_is_generated_and_decoding_continues() {
         assert_frame(fr, &grey, "P from the generated reference");
     }
 }
+
+// ---- HEVCERRORCONCEAL (LEDGER SR700): a generated reference concealed from the nearest held picture (named tail block) ----
+
+/// IDR0 (the gradient), P1 (the gradient moved by (8, 4)), P2 lost, P3 (skip-only, references POC 2 alone): POC 2 is
+/// generated and concealed from the nearest held picture, POC 1 (not POC 0, not grey), so P3 is P1's samples.
+#[test]
+fn lost_picture_is_concealed_from_the_nearest_held_picture() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(1, vec![(-1, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(3, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![2]);
+    assert_eq!(d.take_concealed(), vec![(2, 1)]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3]);
+    assert_frame(by_poc(&f, 3), &shifted(&i0, 8, 4), "P from the picture concealed from POC 1");
+}
+
+/// IDR0 (the gradient), P2 (the gradient moved by (8, 4), references POC 0), P4 (skip-only, references the lost POC 1):
+/// POC 0 and POC 2 are both one away from POC 1, and the lower POC conceals it, so P4 is the gradient.
+#[test]
+fn conceal_tie_takes_the_lower_poc() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(4, vec![(-3, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![1]);
+    assert_eq!(d.take_concealed(), vec![(1, 0)]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
+    assert_frame(by_poc(&f, 4), &i0, "P from the picture concealed from POC 0");
+}
+
+/// With the DPB empty (the stream starts at P1, its IDR lost) there is nothing to conceal from: POC 0 is generated grey
+/// and nothing is noted as concealed.
+#[test]
+fn empty_dpb_keeps_the_generated_picture_grey() {
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(picture(&p_slice(1, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the missing reference");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![0]);
+    assert!(d.take_concealed().is_empty(), "an empty DPB conceals nothing");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1]);
+    assert_frame(&f[0], &Img::new(|_, _| 128, |_, _| 128, |_, _| 128), "P from the grey generated reference");
+}
