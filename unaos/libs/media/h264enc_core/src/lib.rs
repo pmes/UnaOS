@@ -182,6 +182,11 @@ pub struct Config {
     /// source frame exceeds (1 - k/100) x its intra cost, and the GOP count restarts there (within `gop / 4` of the last IDR only
     /// when inter exceeds intra outright); the detector is the file tail's H264ENCSCENECUT block.
     pub scenecut: Option<u8>,
+    /// H264ENCAQ (LEDGER SR693): adaptive quantisation per macroblock (x264's aq-mode 1). None (the default) keeps every pinned
+    /// byte; Some(k), k the strength in tenths (10 = x264's 1.0), offsets each macroblock's QP from its row's by the log2 of its
+    /// source-luma AC energy, re-centred to mean zero over the picture and clamped +-6 (then to [`Config::qp_floor`]..=51), under
+    /// every rate mode (constant QP too); the rule is the file tail's H264ENCAQ block.
+    pub aq: Option<u8>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -467,6 +472,8 @@ pub struct Encoder {
     depth: u64,
     /// The previous frame's padded source luma (H264ENCSCENECUT SR680; empty until [`Config::scenecut`] runs).
     scene_prev: Plane,
+    /// The adaptive-quantisation state of the picture being coded (H264ENCAQ SR693; empty without [`Config::aq`]).
+    pub(crate) aq: Aq,
 }
 
 impl Encoder {
@@ -554,6 +561,7 @@ impl Encoder {
             bipred_idc,
             depth: num_reorder as u64,
             scene_prev: Plane::new(0, 0, 0),
+            aq: Aq::default(),
         })
     }
 
@@ -711,7 +719,7 @@ impl Encoder {
         let mut run = 0u32;
         for mby in 0..self.mb_h {
             self.rc_row(mby, w.bits() + cw.as_ref().map_or(0, cabac::Writer::pending) - hdr);
-            for mbx in 0..self.mb_w {
+            for mbx in 0..self.mb_w { self.aq_mb(mbx, mby);
                 if idr {
                     let code = self.intra_mb(mbx, mby);
                     self.note_mb(mbx, mby, &code);
@@ -1137,5 +1145,103 @@ impl Encoder {
         self.src = cut;
         out.extend(self.group(Pic::Idr, display));
         out
+    }
+}
+
+// ---- H264ENCAQ (LEDGER SR693): adaptive quantisation per macroblock (named tail block) ----
+// x264's aq-mode 1 (encoder/ratecontrol.c `x264_adaptive_quant_frame`: qp_adj = strength x (log2(max(energy, 1)) - 14.427) for 8-bit
+// luma, 14.427 x264's published mean log2 energy, cited not derived) in integers: the energy of a macroblock is the sum over its four
+// 8x8 source-luma blocks of (sum of squares - sum^2 / 64); log2 in Q4 (`log2_q4`), the constant 231 = round(14.427 x 16); the offsets
+// are re-centred to mean zero over the picture (the row's bit budget is kept) and clamped +-6. A flat macroblock (low energy) gets a
+// NEGATIVE offset (a finer QP: no banding), a textured one a positive offset. The MB's QP is its row's QP (`rc_row`'s, else SliceQPY)
+// plus its offset, clamped to [`Config::qp_floor`]..=51, set through `set_qp` before the MB is coded and written through the existing
+// mb_qp_delta / QPY,pred path (`write_mb`, `write_mb_cabac`, `note_mb`): no new syntax. Applied under constant QP too (x264 skips
+// AQ there; here it is an explicit opt-in and `nle export` defaults to constant QP). Owed: H264ENC-AQ-VARIANCE-MODE, H264ENC-AQ-CHROMA.
+
+/// The C of x264's aq-mode 1 in Q4: round(14.427 x 16).
+const AQ_C_Q4: i64 = 231;
+/// The largest adaptive-quantisation offset of a macroblock's QP from its row's.
+pub const AQ_STEP: i32 = 6;
+
+/// The adaptive-quantisation state of the picture being coded: one offset per macroblock and the current row's QP.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Aq {
+    off: Vec<i8>,
+    row: i32,
+}
+
+/// log2(max(e, 1)) with 4 fractional bits: the integer part by `ilog2`, the fraction by repeated squaring of the mantissa (Q16).
+fn log2_q4(e: u32) -> i64 {
+    let e = e.max(1);
+    let n = e.ilog2();
+    let mut y: u64 = ((e as u64) << 16) >> n;
+    let mut r = (n as i64) << 4;
+    for b in (0..4).rev() {
+        y = (y * y) >> 16;
+        if y >= 2 << 16 {
+            y >>= 1;
+            r |= 1 << b;
+        }
+    }
+    r
+}
+
+/// The adaptive-quantisation offsets of a picture (H264ENCAQ SR693): one per macroblock in raster order over the luma plane `y`
+/// (`stride` samples per row, at least `mb_w` x 16 wide and `mb_h` x 16 high), strength `strength` in tenths (10 = x264's 1.0):
+/// x264's aq-mode 1 energy rule, re-centred to mean zero and clamped to +-[`AQ_STEP`].
+pub fn aq_offsets(y: &[u8], stride: usize, mb_w: usize, mb_h: usize, strength: u8) -> Vec<i8> {
+    let n = mb_w * mb_h;
+    let mut raw = Vec::with_capacity(n);
+    for mby in 0..mb_h {
+        for mbx in 0..mb_w {
+            let mut energy = 0u32;
+            for blk in 0..4 {
+                let (x0, y0) = (mbx * 16 + (blk & 1) * 8, mby * 16 + (blk >> 1) * 8);
+                let (mut sum, mut ssq) = (0u32, 0u32);
+                for yy in y0..y0 + 8 {
+                    for xx in x0..x0 + 8 {
+                        let v = y[yy * stride + xx] as u32;
+                        sum += v;
+                        ssq += v * v;
+                    }
+                }
+                energy += ssq - ((sum * sum) >> 6);
+            }
+            // qp_adj x 256 = (k / 10) x (L - C) / 16 x 256.
+            raw.push(strength as i64 * (log2_q4(energy) - AQ_C_Q4) * 256 / 160);
+        }
+    }
+    let mean = if n == 0 { 0 } else { raw.iter().sum::<i64>().div_euclid(n as i64) };
+    raw.iter().map(|&r| ((r - mean + 128).div_euclid(256)).clamp(-AQ_STEP as i64, AQ_STEP as i64) as i8).collect()
+}
+
+impl Encoder {
+    /// Before macroblock (mbx, mby) is coded: under [`Config::aq`] its QP = the row's QP + its offset, clamped to
+    /// [`Config::qp_floor`]..=51 (the offsets are taken from the source luma at the picture's first macroblock). None does nothing.
+    pub(crate) fn aq_mb(&mut self, mbx: usize, mby: usize) {
+        let Some(k) = self.cfg.aq else { return };
+        if mbx == 0 {
+            if mby == 0 {
+                self.aq.off = aq_offsets(&self.src[0].data, self.src[0].w, self.mb_w, self.mb_h, k);
+            }
+            // The row's QP: `rc_row` set it (a rate-controlled row > 0), else SliceQPY (row 0, or rate None).
+            if mby == 0 || self.rc.is_some() {
+                self.aq.row = self.qp;
+            }
+        }
+        let qp = (self.aq.row + self.aq.off[mby * self.mb_w + mbx] as i32).clamp(self.cfg.qp_floor(), rc::QP_MAX);
+        self.set_qp(qp);
+    }
+
+    /// The adaptive-quantisation offsets of the last coded picture (H264ENCAQ SR693; empty without [`Config::aq`]).
+    pub fn aq_picture(&self) -> &[i8] {
+        &self.aq.off
+    }
+
+    /// The QPY of each macroblock of the last coded picture as the decoder tracks it (H264ENCAQ SR693): the QP it was coded at when
+    /// it carries mb_qp_delta, else QPY,pred (the deblocking record's rule). Recorded only under [`Config::deblock`] or
+    /// [`Entropy::Cabac`] (otherwise the record is not kept and the values are stale).
+    pub fn mb_qps(&self) -> Vec<u8> {
+        self.dinfo.iter().map(|i| i.qp).collect()
     }
 }
