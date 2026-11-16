@@ -907,9 +907,7 @@ fn nlesizeswitch_two_size_reel_runs_and_exports_at_the_first_size() {
 
     // The host export: the encoder sees the first size only.
     use stria::nle_export::{AudioOut, H264Encoder, export};
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizeswitch");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::fresh_dir("nle", "nlesizeswitch"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let rep = export(&tl, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
     assert_eq!(rep.frames, 4);
     let out = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
@@ -1016,9 +1014,7 @@ fn nlesizepolicy_two_size_reel_under_each_policy() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("nle size switch reel=0 1280x720 adopted"), "{}", lines[0]);
     use stria::nle_export::{AudioOut, ExportError, H264Encoder, export};
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizepolicy");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::fresh_dir("nle", "nlesizepolicy"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let e = export(&adopt, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap_err();
     assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{e}");
     println!("nlesizepolicy: fill/stretch 768x512 x4 pinned, adopt 1280x720 frames 2-3, export refused: {e}");
@@ -1128,8 +1124,7 @@ fn adoptpng_two_size_reel_exports_png_frames_at_their_own_size() {
     let Some(file) = nlesizeswitch_reel() else { return };
     let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
     let native = nlesizepolicy_native(&file, &src);
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = common::scratch_dir("nle", "adoptpng"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, removed, not created
 
     let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
     let dir = root.join("adopt");
@@ -1179,9 +1174,7 @@ fn adoptpng_refused_dir_by_name() {
     let mut src = Sources::new(&tl);
     src.add(a, synth_source(0, 4, 25)).unwrap();
     // A path under a regular file: no directory can be made there, root or not (a mode bit would not stop root).
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng-refused");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let root = common::fresh_dir("nle", "adoptpng-refused"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let file = root.join("plain");
     std::fs::write(&file, b"not a directory").unwrap();
     let dir = file.join("frames");
@@ -1321,8 +1314,7 @@ fn nlerawexport_adopt_reel_refused_raw_planar() {
     let _ = nlesizeswitch_lines("");
     let Some(file) = nlesizeswitch_reel() else { return };
     let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlerawexport");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = common::scratch_dir("nle", "nlerawexport"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, removed, not created
 
     let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
     let encs: [(&str, Box<dyn VideoEncoder>); 2] = [("i420", Box::new(I420Raw::default())), ("y4m", Box::new(Y4m::new(25, 1)))];
@@ -2194,4 +2186,28 @@ fn striainforeelhover_labels_off_is_unchanged() {
 fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String {
     let (_, src) = stria::nle_face::synth_fixture();
     src.summary(face.state.timeline.tracks[0].clips[i].src).unwrap()
+}
+
+// ---- STRIATESTTMPDIRREST (LEDGER SR739): nle.rs's scratch dirs are tests/common's per-pid dirs (named tail block) ----
+/// STRIA-TEST-TMPDIR (SR729, SR739): `scratch_dir(g, n)` is `<target tmpdir>/<g>-<pid>/<n>`, removed and absent; `fresh_dir`
+/// is the same dir created empty; and no test binary but tests/common reads the target tmpdir itself, so the next inline
+/// fixed-path dir (the shared-target race SR729 fixed) reds here.
+#[test]
+fn nle_tests_scratch_under_the_pid_dir() {
+    let d = common::scratch_dir("x", "y");
+    let pid = format!("x-{}", std::process::id());
+    assert!(d.ends_with(std::path::Path::new(&pid).join("y")), "{}", d.display());
+    assert!(!d.exists(), "{}", d.display());
+    assert!(d.parent().and_then(|p| p.parent()).is_some_and(|t| t.is_dir()), "{}", d.display());
+    let f = common::fresh_dir("x", "z");
+    assert_eq!(f.parent(), d.parent());
+    assert!(f.is_dir() && std::fs::read_dir(&f).unwrap().next().is_none(), "{}", f.display());
+    let token = concat!("CARGO_TARGET", "_TMPDIR");
+    let bins = [("nle.rs", include_str!("nle.rs")), ("nle_export.rs", include_str!("nle_export.rs")), ("media.rs", include_str!("media.rs")), ("audio.rs", include_str!("audio.rs"))];
+    let inline: usize = bins.iter().map(|(_, s)| s.matches(token).count()).sum();
+    for (name, src) in bins {
+        assert_eq!(src.matches(token).count(), 0, "{name} reads the target tmpdir inline: use common::scratch_dir / fresh_dir");
+    }
+    assert!(include_str!("common/mod.rs").contains(token), "tests/common is the one reader");
+    println!("striatesttmpdirrest: scratch {} fresh {} inline reads {inline}", d.display(), f.display());
 }
