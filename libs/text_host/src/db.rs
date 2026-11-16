@@ -393,7 +393,7 @@ fn latin_rank(db: &FontDb, i: usize) -> usize {
 /// The process-wide database, discovered on first use.
 pub fn db() -> &'static FontDb {
     static DB: OnceLock<FontDb> = OnceLock::new();
-    DB.get_or_init(|| FontDb::discover(Config { cache_dir: CACHE_DIR.get().cloned(), ..Config::system() })) // AETHERFONTDBCACHE (SR684)
+    DB.get_or_init(|| FontDb::discover(Config { cache_dir: CACHE_DIR.get().cloned().or_else(default_cache_dir), ..Config::system() })) // AETHERFONTDBCACHE (SR684); AETHERFONTDBCACHESHARED (SR738): the XDG default when unset
 }
 
 // AETHER-FONTDB-LAZY (SR419): discovery from the headers. A face file is indexed from its table directory and the
@@ -1000,7 +1000,7 @@ mod tests {
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Sets the directory the process database persists its index in ([`crate::db_cache`]). Takes effect only when
-/// called before the first [`db`] call; a second call, or one after discovery, has no effect.
+/// called before the first [`db`] call; a second call, or one after discovery, has no effect. Unset, [`db`] uses [`default_cache_dir`].
 pub fn set_cache_dir(dir: PathBuf) {
     let _ = CACHE_DIR.set(dir);
 }
@@ -1009,5 +1009,65 @@ impl FontDb {
     /// What the persisted index answered for this discovery: `off`, `hit`, `miss` or `stale`.
     pub fn discover_cache(&self) -> &'static str {
         self.cache.as_str()
+    }
+}
+
+// ---- AETHERFONTDBCACHESHARED (LEDGER SR738): the default index dir every cold caller shares (named tail block) ----
+
+/// The index directory [`db`] uses when no caller set one ([`set_cache_dir`]): `$XDG_CACHE_HOME/unaos/fonts`, else
+/// `$HOME/.cache/unaos/fonts`, else None (no index). Quartzite and every caller that never sets a dir share it.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    let (xdg, home) = (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"));
+    default_cache_dir_from(xdg.as_deref().map(Path::new), home.as_deref().map(Path::new))
+}
+
+/// The pure core of [`default_cache_dir`] (the XDG base-directory rule): an absolute `XDG_CACHE_HOME` wins (a relative
+/// or empty one is ignored, as the spec says), else an absolute `HOME`'s `.cache`; a relative HOME is refused too.
+pub fn default_cache_dir_from(xdg: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    let base = match xdg.filter(|p| p.is_absolute()) {
+        Some(x) => x.to_path_buf(),
+        None => home.filter(|p| p.is_absolute())?.join(".cache"),
+    };
+    Some(base.join("unaos").join("fonts"))
+}
+
+#[cfg(test)]
+mod default_cache_tests {
+    use super::*;
+
+    /// The XDG rule's known answers.
+    #[test]
+    fn default_cache_dir_rule_kat() {
+        let f = |x: Option<&str>, h: Option<&str>| default_cache_dir_from(x.map(Path::new), h.map(Path::new));
+        assert_eq!(f(Some("/x"), Some("/h")), Some(PathBuf::from("/x/unaos/fonts")));
+        assert_eq!(f(Some("rel"), Some("/h")), Some(PathBuf::from("/h/.cache/unaos/fonts")), "a relative XDG is ignored");
+        assert_eq!(f(Some(""), Some("/h")), Some(PathBuf::from("/h/.cache/unaos/fonts")), "an empty XDG is ignored");
+        assert_eq!(f(None, Some("/h")), Some(PathBuf::from("/h/.cache/unaos/fonts")));
+        assert_eq!(f(None, Some("rel")), None, "a relative HOME is refused");
+        assert_eq!(f(None, None), None);
+    }
+
+    /// Discover twice into the default dir under a not-yet-existing XDG root: the first is a miss that creates the
+    /// dir and writes the index, the second a hit that reads no font byte. The directory is SR684's `Tmp` rule
+    /// (db_cache.rs tests: `temp_dir()/text_host_fontdb_cache_<pid>_<case>`), mirrored here because `Tmp` is private.
+    #[test]
+    fn default_cache_dir_discover_miss_then_hit() {
+        let dir = std::env::temp_dir().join(format!("text_host_fontdb_cache_{}_default", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("fonts")).unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts/inter/InterVariable.ttf");
+        std::fs::copy(&src, dir.join("fonts/InterVariable.ttf")).expect("fixture font");
+        let xdg = dir.join("xdg");
+        let cache_dir = default_cache_dir_from(Some(xdg.as_path()), None);
+        assert_eq!(cache_dir, Some(xdg.join("unaos/fonts")));
+        let cfg = || Config { dirs: vec![dir.join("fonts")], cache_dir: cache_dir.clone(), ..Config::default() };
+        let a = FontDb::discover(cfg());
+        assert_eq!(a.discover_cache(), "miss");
+        assert!(xdg.join("unaos/fonts").join(crate::db_cache::INDEX_FILE).is_file(), "store creates the dir and the index");
+        let b = FontDb::discover(cfg());
+        assert_eq!(b.discover_cache(), "hit");
+        assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
+        assert_eq!(a.faces.len(), b.faces.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
