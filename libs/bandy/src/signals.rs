@@ -328,7 +328,7 @@ pub enum SMessage {
     /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
     /// track is absent); `real_video` is false when the frames are the labelled test-pattern
     /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and
-    /// is the master clock.
+    /// is the master clock. STRIAINFOBITRATEFACE (SR734): `info` is Stria's one-line summary for a person (`<codec> <WxH> <profile> <bitrate>`, empty parts dropped, then STRIAINFOAUDIOBITRATE (SR742) ` | <audio decoder> <audio bitrate>`, the audio part alone without video; stria `media::summary_line`), omitted from the wire when empty.
     MediaOpened {
         url: String,
         duration_ns: u64,
@@ -338,6 +338,7 @@ pub enum SMessage {
         audio: String,
         real_video: bool,
         audio_clock: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")] info: String,
     },
     /// Stria → requester: a frame went on glass at `pts_ns`; tightly packed 8-bit RGBA.
     /// AUDIOTRACK (SR45): `levels` carries the audio meters that came due — peak |sample| of

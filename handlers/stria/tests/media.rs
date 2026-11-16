@@ -1877,14 +1877,14 @@ fn striainfobitrate_cbr_hrd_and_wav() {
     let lines = my_log_lines("[STRIA] :: open:");
     let line = lines.last().expect("the open line");
     assert!(line.starts_with("[STRIA] :: open: video="), "{line}");
-    assert!(line.ends_with(&format!("bitrate=\"{cbr}\"")), "{line}");
+    assert!(line.ends_with(&format!("bitrate=\"{cbr}\" audio_bitrate=\"\"")), "{line}"); // STRIAINFOAUDIOBITRATE (SR742): the token appended after bitrate
     let len = wav.len() as u128;
     let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
     let dur = p.info().duration_ns as u128;
     assert!(dur > 0);
     let wav_rate = p.info().bitrate.clone();
     assert_eq!(wav_rate, format!("~{} kb/s", (len * 8 * 1_000_000_000 / dur + 500) / 1000));
-    assert!(my_log_lines("[STRIA] :: open:").last().unwrap().ends_with(&format!("bitrate=\"{wav_rate}\"")));
+    assert!(my_log_lines("[STRIA] :: open:").last().unwrap().ends_with(&format!("bitrate=\"{wav_rate}\" audio_bitrate=\"{}\"", p.info().audio_bitrate))); // STRIAINFOAUDIOBITRATE (SR742)
     println!("striainfobitrate: cbr={cbr} wav={wav_rate}");
 }
 
@@ -1911,4 +1911,176 @@ fn striainfobitrate_forms() {
     assert_eq!(bitrate_of(Some((0, 0, 0)), None, 125_000, 1_000_000_000), "~1000 kb/s", "avg 0, no HRD: measured");
     assert_eq!(bitrate_of(None, None, 0, 1_000_000_000), "");
     assert_eq!(bitrate_of(None, None, 125_000, 0), "");
+}
+
+// ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened carries the one-line summary (named tail block) ----
+/// Open `file` through the bus (`MediaPoster`) and return its `MediaOpened.info`.
+fn striainfobitrateface_bus_info(name: &str, file: &[u8]) -> String {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrateface");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, file).unwrap();
+    let url = format!("file://{}", path.display());
+    let synapse = Synapse::new();
+    let mut rx = synapse.subscribe();
+    let svc = MediaService::spawn(synapse.clone(), 120, false);
+    synapse.fire(SMessage::MediaPoster { url: url.clone() });
+    let t0 = Instant::now();
+    let mut info = None;
+    while info.is_none() && t0.elapsed() < Duration::from_secs(20) {
+        match rx.try_recv() {
+            Ok(SMessage::MediaOpened { url: u, info: s, .. }) if u == url => info = Some(s),
+            Ok(SMessage::MediaError { url: u, error }) if u == url => panic!("{name}: {error}"),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    drop(svc);
+    info.unwrap_or_else(|| panic!("{name}: no MediaOpened"))
+}
+
+/// STRIAINFOBITRATEFACE (SR734): SR728's CBR 400 + HRD export, opened through the bus, fires MediaOpened whose `info` is the
+/// codec, the size, the SPS's profile tokens and the bit rate (`summary_line` of the Player's own MediaInfo); its PCM WAV's is the
+/// exact PCM audio part alone (STRIAINFOAUDIOBITRATE SR742: `pcm <ch x rate x bits> kb/s`; no video codec, no size).
+#[test]
+fn striainfobitrateface_bus_cbr_hrd_and_wav() {
+    let enc = stria::nle_export::H264Encoder::new(26, 10).with_bitrate(400, 25, 1).with_hrd(true);
+    let (mp4, wav) = striainfobitrate_export("face_cbr_hrd", enc);
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    let mp4_info = striainfobitrateface_bus_info("cbr_hrd.mp4", &mp4);
+    assert_eq!(mp4_info, format!("avc1 64x48 profile=Baseline level=1 {} kb/s (HRD 400)", (avg + 500) / 1000));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(mp4_info, stria::media::summary_line(p.info()));
+    let wav_info = striainfobitrateface_bus_info("audio.wav", &wav);
+    let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert!(wav_info.starts_with("pcm ") && wav_info.ends_with(" kb/s") && !wav_info.contains('~'), "{wav_info}"); // STRIAINFOAUDIOBITRATE (SR742)
+    assert_eq!(wav_info, format!("pcm {}", p.info().audio_bitrate)); // STRIAINFOAUDIOBITRATE (SR742): the audio part replaces the file's `~`
+    println!("striainfobitrateface: mp4=\"{mp4_info}\" wav=\"{wav_info}\"");
+}
+
+/// STRIAINFOBITRATEFACE (SR734): `summary_line` drops each empty part (from the Player's own MediaInfo, not a literal).
+#[test]
+fn striainfobitrateface_summary_drops_empty_parts() {
+    let (mp4, _) = striainfobitrate_export("face_parts", stria::nle_export::H264Encoder::new(26, 10));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let mut i = p.info().clone();
+    i.bitrate.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48 profile=Baseline level=1");
+    i.video_profile.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48");
+    i.width = 0;
+    assert_eq!(stria::media::summary_line(&i), "avc1");
+    i.video.clear();
+    assert_eq!(stria::media::summary_line(&i), "");
+}
+
+// ---- STRIAINFOAUDIOBITRATE (LEDGER SR742): MediaInfo's audio bit rate, the open line's token, summary_line's audio part (named tail block) ----
+/// bits per second as `bitrate_of` prints them (nearest kb/s).
+fn striainfoaudiobitrate_kbps(bps: u64) -> String {
+    format!("{} kb/s", (bps + 500) / 1000)
+}
+
+/// An AAC-LC track (48 kHz mono, the encoder at 128 kb/s) whose esds DecoderConfigDescriptor states `avg` (no btrt child).
+fn striainfoaudiobitrate_aac(avg: u32) -> build::MediaTrack {
+    use gneiss_pal::dsp::audio::aac::enc::Encoder;
+    let mut enc = Encoder::new(48_000, 1, 128_000).unwrap();
+    let mut units = enc.encode(&tone(96_000));
+    units.extend(enc.flush());
+    build::mp4a_track(2, 48_000, 1, &enc.asc(), units.into_iter().map(|u| u.data).collect(), avg)
+}
+
+/// STRIAINFOAUDIOBITRATE (SR742): SR728's export WAV states its rate exactly (channels x rate x bits from its own header, no `~`);
+/// its `bitrate` keeps SR728's measured `~` form; its summary is the audio part alone.
+#[test]
+fn striainfoaudiobitrate_wav_is_exact_from_its_header() {
+    let (_, wav) = striainfobitrate_export("audiobitrate_wav", stria::nle_export::H264Encoder::new(26, 10));
+    let ch = u16::from_le_bytes([wav[22], wav[23]]) as u64;
+    let rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) as u64;
+    let bits = u16::from_le_bytes([wav[34], wav[35]]) as u64;
+    assert_eq!(bits, 16, "the export writes PCM16");
+    let want = striainfoaudiobitrate_kbps(ch * rate * bits);
+    let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().audio_bitrate, want);
+    assert!(p.info().bitrate.starts_with('~'), "{}", p.info().bitrate);
+    assert_eq!(stria::media::summary_line(p.info()), format!("pcm {want}"));
+    println!("striainfoaudiobitrate: wav ch={ch} rate={rate} bits={bits} audio_bitrate={want}");
+}
+
+/// STRIAINFOAUDIOBITRATE (SR742): a 48 kHz mono PCM16 track beside the test pattern, in MP4 (`sowt`) and Matroska (A_PCM): exactly
+/// 768 kb/s; the summary is SR734's video part, ` | `, the audio part; the open line is SR728's tokens byte for byte, then the token.
+#[test]
+fn striainfoaudiobitrate_pcm_track_mp4_and_mkv() {
+    capture_logs();
+    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
+    let audio = build::pcm16_track(2, 48_000, 1, &tone(96_000), 960);
+    for (name, file) in [("mp4", build::mp4(&[video.clone(), audio.clone()], &Mp4Options::default())), ("mkv", build::mkv(&[video.clone(), audio.clone()], &MkvOptions::default()))] {
+        let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+        let i = p.info();
+        assert_eq!(i.audio_bitrate, "768 kb/s", "{name}");
+        assert_eq!(i.audio_decoder, "pcm", "{name}");
+        let mut v = i.clone();
+        v.audio_bitrate.clear();
+        let video_part = stria::media::summary_line(&v);
+        assert!(video_part.starts_with(&format!("{} 320x240 ", i.video)) && video_part.ends_with(&i.bitrate), "{name}: {video_part}");
+        assert_eq!(stria::media::summary_line(i), format!("{video_part} | pcm 768 kb/s"), "{name}");
+        let sr728 = format!("[STRIA] :: open: video={} audio={} size=320x240 duration_ns={} bitrate=\"{}\"", i.video, i.audio, i.duration_ns, i.bitrate);
+        let line = stria::media::open_line(i);
+        assert_eq!(line, format!("{sr728} audio_bitrate=\"768 kb/s\""), "{name}");
+        assert_eq!(my_log_lines("[STRIA] :: open:").last(), Some(&line), "{name}");
+        println!("striainfoaudiobitrate: {name} summary=\"{}\"", stria::media::summary_line(i));
+    }
+}
+
+/// STRIAINFOAUDIOBITRATE (SR742): an AAC track's esds avgBitrate (no btrt child) reads back as its `Track::btrt` and shows as
+/// `aac-lc 128 kb/s` (audio-only: the file's `~` dropped; beside video: after ` | `); avg 0: `~` its own sample bytes over its span.
+#[test]
+fn striainfoaudiobitrate_aac_esds() {
+    let alone = build::mp4(&[striainfoaudiobitrate_aac(128_000)], &Mp4Options::default());
+    let d = gneiss_pal::dsp::demux::Demuxer::open(alone.clone()).unwrap();
+    assert_eq!(d.audio_track().unwrap().btrt.map(|b| b.2), Some(128_000), "the esds avg as the track's btrt");
+    let p = Player::open(alone, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().audio_decoder, "aac-lc");
+    assert_eq!(p.info().audio_bitrate, "128 kb/s");
+    assert_eq!(stria::media::summary_line(p.info()), "aac-lc 128 kb/s");
+    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
+    let av = build::mp4(&[video, striainfoaudiobitrate_aac(128_000)], &Mp4Options::default());
+    let p = Player::open(av, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let mut v = p.info().clone();
+    v.audio_bitrate.clear();
+    let video_part = stria::media::summary_line(&v);
+    assert!(video_part.starts_with("utp1 320x240 "), "{video_part}");
+    assert_eq!(stria::media::summary_line(p.info()), format!("{video_part} | aac-lc 128 kb/s"));
+    println!("striainfoaudiobitrate: av summary=\"{}\"", stria::media::summary_line(p.info()));
+    let zero = build::mp4(&[striainfoaudiobitrate_aac(0)], &Mp4Options::default());
+    let d = gneiss_pal::dsp::demux::Demuxer::open(zero.clone()).unwrap();
+    let t = d.audio_track().unwrap().clone();
+    assert_eq!(t.btrt.map(|b| b.2), Some(0), "maxBitrate kept, avg 0");
+    let bytes: u64 = d.track_samples(d.track_index(t.id).unwrap()).map(|s| s.size as u64).sum();
+    assert!(bytes > 0 && t.duration_ns > 0);
+    let want = format!("~{} kb/s", (bytes as u128 * 8 * 1_000_000_000 / t.duration_ns as u128 + 500) / 1000);
+    let p = Player::open(zero, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().audio_bitrate, want);
+    println!("striainfoaudiobitrate: aac avg0 audio_bitrate={want}");
+}
+
+/// STRIAINFOAUDIOBITRATE (SR742): an audio-less file (SR728's CQP export): `audio_bitrate` "", SR734's summary unchanged, the open
+/// line's token empty.
+#[test]
+fn striainfoaudiobitrate_audio_less_keeps_the_summary() {
+    let (mp4, _) = striainfobitrate_export("audiobitrate_none", stria::nle_export::H264Encoder::new(26, 10));
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().audio_bitrate, "");
+    assert_eq!(stria::media::summary_line(p.info()), format!("avc1 64x48 profile=Baseline level=1 {} kb/s", (avg + 500) / 1000));
+    assert!(stria::media::open_line(p.info()).ends_with(" audio_bitrate=\"\""));
+}
+
+/// STRIAINFOAUDIOBITRATE (SR742): `pcm_bitrate` is channels x rate x bits, `None` when any is 0.
+#[test]
+fn striainfoaudiobitrate_pcm_forms() {
+    use stria::media::pcm_bitrate;
+    assert_eq!(pcm_bitrate(2, 48_000, 16), Some(1_536_000));
+    assert_eq!(pcm_bitrate(1, 44_100, 24), Some(1_058_400));
+    assert_eq!(pcm_bitrate(1, 0, 16), None);
+    assert_eq!(pcm_bitrate(0, 48_000, 16), None);
 }
