@@ -328,7 +328,7 @@ pub enum SMessage {
     /// Stria → requester: the stream is open. `video` / `audio` name the codecs ("" when the
     /// track is absent); `real_video` is false when the frames are the labelled test-pattern
     /// stand-in (no decoder for the codec yet); `audio_clock` is true when audio is playing and
-    /// is the master clock. STRIAINFOBITRATEFACE (SR734): `info` is Stria's one-line summary for a person (`<codec> <WxH> <profile> <bitrate>`, empty parts dropped; stria `media::summary_line`), omitted from the wire when empty.
+    /// is the master clock. STRIAINFOBITRATEFACE (SR734): `info` is Stria's one-line summary for a person (`<codec> <WxH> <profile> <bitrate>`, empty parts dropped, then STRIAINFOAUDIOBITRATE (SR742) ` | <audio decoder> <audio bitrate>`, the audio part alone without video; stria `media::summary_line`), omitted from the wire when empty.
     MediaOpened {
         url: String,
         duration_ns: u64,
