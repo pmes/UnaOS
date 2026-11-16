@@ -273,7 +273,7 @@ fn run_page(rt: &tokio::runtime::Runtime, port: u16, rel: &str) -> FileResult {
             return out;
         }
     };
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_page(page, true);
     let Some(js) = engine.js_engine.as_mut() else {
         out.harness = "no engine".into();
@@ -522,4 +522,11 @@ fn apis_exclusions_are_infrastructure_only() {
     assert_eq!(apis_excluded(root, "fullscreen/x.html", "test_driver.bless()").as_deref(), Some("testdriver (WebDriver input automation)"));
     assert_eq!(apis_excluded(root, "clipboard-apis/x.https.html", "").as_deref(), Some("needs a TLS server (https)"));
     assert!(apis_excluded(root, "web-animations/x.html", "fetch('resources/xhr-doc.py')").unwrap().contains("xhr-doc.py"));
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "wpt-apis");
 }

@@ -4,8 +4,6 @@
 //! the shell's reading verbs, the accessibility media features and the devtools panel. No network, no
 //! WPT (R107): every page is loaded with `load_html`.
 
-use std::sync::OnceLock;
-
 use aether::api::events::Event;
 use aether::chrome::devtools::{self, Panel};
 use aether::dom::a11y::{self, focus, keyboard, name::NameFrom, nav, prefs::A11yPrefs, AxNode, AxTree, Tristate};
@@ -15,12 +13,7 @@ use aether::AetherEngine;
 const URL: &str = "https://a11y.test/page.html";
 
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-a11y-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "a11y");
 }
 
 fn page(html: &str) -> AetherEngine {

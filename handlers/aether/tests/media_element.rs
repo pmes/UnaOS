@@ -15,7 +15,7 @@ use bandy::SMessage;
 const PAGE: &str = "file:///page/index.html";
 
 fn engine_with(html: &str) -> AetherEngine {
-    let mut e = AetherEngine::new();
+    init(); let mut e = AetherEngine::new();
     e.load_html_styled(PAGE, html, &[], true);
     e
 }
@@ -240,4 +240,11 @@ fn img_srcset_sizes_picture_and_lazy() {
     assert!(aether::images::is_lazy(&lazy.as_element().unwrap().attributes.borrow()));
     assert!(aether::images::lazy_should_load(1800.0, 100.0, 0.0, 600.0));
     assert!(!aether::images::lazy_should_load(1900.0, 100.0, 0.0, 600.0));
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "media-element");
 }

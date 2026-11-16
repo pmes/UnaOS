@@ -2,19 +2,12 @@
 //! error's frames (`    at fn (url:line:col)`) and the source excerpt under its line, and the window's
 //! ErrorEvent carries `filename` / `lineno` / `colno` from the throw site.
 
-use std::sync::OnceLock;
-
 use aether::chrome::devtools;
 
 const URL: &str = "https://positions.test/index.html";
 
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-positions-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "positions");
 }
 
 fn load(html: &str) -> aether::AetherEngine {

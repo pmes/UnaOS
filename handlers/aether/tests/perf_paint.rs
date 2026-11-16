@@ -26,7 +26,7 @@ const URL: &str = "http://paintperf.test/";
 
 fn load(html: &str, scoped: bool) -> AetherEngine {
     perf::set_scoped(scoped);
-    let mut e = AetherEngine::new();
+    init(); let mut e = AetherEngine::new();
     e.load_html(URL, html, true);
     if let Some(js) = e.js_engine.as_mut() {
         aether::event_loop::settle(js, 1000);
@@ -260,4 +260,11 @@ fn twenty_keystrokes() {
 fn wire_line_shape() {
     let c = perf::Counters { cascaded: 1, laid_out: 2, painted: 3, glyph_hits: 4, ..Default::default() };
     assert_eq!(perf::wire_line(&c), ":: paintperf: cascaded=1 laid_out=2 painted=3 glyph_hits=4 ::");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "perf-paint");
 }

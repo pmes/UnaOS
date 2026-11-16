@@ -9,8 +9,6 @@
 //!    layer built from a 0xRRGGBB canvas exactly as user-aether paint.rs `filter_group` builds it) — the ring-3
 //!    crate has no test harness, so the shared call is witnessed here.
 
-use std::sync::OnceLock;
-
 use aether::api::events::Event;
 use aether::dom::NodeRef;
 use aether::AetherEngine;
@@ -18,12 +16,7 @@ use aether::AetherEngine;
 const URL: &str = "https://render.test/page.html";
 
 fn init() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("aether-render-frags-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        aether::storage::set_root_dir(Some(dir));
-    });
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "render-frags");
 }
 
 fn page(html: &str) -> AetherEngine {
