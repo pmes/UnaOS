@@ -40,7 +40,7 @@
 //!   bit budget, no row modulation); the floor of every rate-controlled QP is [`crate::Config::qp_min`] (None = [`QP_MIN`]),
 //!   read through [`crate::Config::qp_floor`].
 //!
-//! Owed (handlers.md §5 H264ENC-RC): HRD signalling (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; two-pass: [`RcMode::TwoPass`], this file's H264ENCTWOPASS tail block, SR698).
+//! Owed (handlers.md §5 H264ENC-RC): none of its own (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; two-pass: [`RcMode::TwoPass`], this file's H264ENCTWOPASS tail block, SR698; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699).
 
 use alloc::vec::Vec;
 
@@ -802,4 +802,64 @@ fn parse_stats_line(l: &str) -> Option<PicStat> {
         return None;
     }
     Some(PicStat { kind, bits, qp, complexity })
+}
+
+// ---- H264ENCHRD (LEDGER SR699): the bucket's HRD view (named tail block) ----
+// The HRD the stream signals IS this file's bucket: CBR `buf` / `full` drained at the mean rate (cbr_flag 1), VBR `bmax` / `fmax`
+// drained at the max rate (cbr_flag 0); two-pass (SR698) keeps the CBR bucket and is signalled as it. The one correction: `r` is floor(bps x den / num), while a decoder drains the exact
+// rate, so after n pictures the CBR model is fuller than the decoder's mirror by floor(n X) - n r bits; `hrd_bucket` removes it.
+impl Rc {
+    /// The bucket as hrd_parameters + timing_info (None under CRF: no bucket).
+    pub(crate) fn hrd_params(&self) -> Option<crate::sps::Hrd> {
+        let (bit_rate, cpb_size, cbr) = match self.rate.mode {
+            RcMode::Cbr | RcMode::TwoPass => (self.rate.bits_per_second, self.buf as u32, true),
+            RcMode::Vbr { max_bits_per_second } => (max_bits_per_second, self.bmax as u32, false),
+            RcMode::Crf(_) => return None,
+        };
+        Some(crate::sps::Hrd { bit_rate, cpb_size, cbr, num_units_in_tick: self.rate.fps_den, time_scale: self.rate.fps_num.saturating_mul(2) })
+    }
+
+    /// Before picture `n` (pictures coded so far): (cbr, BitRate, CpbSize, the fullness in bits, the next picture's drain).
+    /// CBR: the exact-rate fullness and drain floor((n + 1) X) - floor(n X), X = bps x den / num; VBR: the max bucket's own.
+    pub(crate) fn hrd_bucket(&self, n: u64) -> Option<(bool, i64, i64, i64, i64)> {
+        match self.rate.mode {
+            RcMode::Cbr | RcMode::TwoPass => {
+                let (bps, den, num) = (self.rate.bits_per_second as i128, self.rate.fps_den as i128, self.rate.fps_num as i128);
+                let drained = |k: i128| k * bps * den / num;
+                let n = n as i128;
+                let full = self.full as i128 - (drained(n) - n * self.r as i128);
+                Some((true, bps as i64, self.buf, full as i64, (drained(n + 1) - drained(n)) as i64))
+            }
+            RcMode::Vbr { max_bits_per_second } => Some((false, max_bits_per_second as i64, self.bmax, self.fmax, self.rmax)),
+            RcMode::Crf(_) => None,
+        }
+    }
+
+    /// Filler bits (CBR) into the bucket before `update` (which never sees them: the R-Q model fits the coded bits only).
+    pub(crate) fn hrd_pad(&mut self, bits: u64) {
+        self.full += bits as i64;
+        self.err += bits as i64;
+    }
+}
+
+impl RateControl {
+    /// Under the HRD (`on`, CBR / VBR) the rates rounded down to a multiple of 64 (BitRate's finest unit, E.2.2), so the
+    /// signalled BitRate and CpbSize are the bucket's exactly; zero after rounding or a time_scale (2 fps_num) past u32 is
+    /// [`Error::Rate`]. Off, or CRF, unchanged.
+    pub(crate) fn for_hrd(self, on: bool) -> Result<RateControl> {
+        let q = |v: u32| v & !63;
+        match (on, self.mode) {
+            (false, _) | (_, RcMode::Crf(_)) => Ok(self),
+            (true, mode) => {
+                let mode = match mode {
+                    RcMode::Vbr { max_bits_per_second } => RcMode::Vbr { max_bits_per_second: q(max_bits_per_second) },
+                    m => m,
+                };
+                if q(self.bits_per_second) == 0 || self.fps_num > u32::MAX / 2 {
+                    return Err(Error::Rate);
+                }
+                Ok(RateControl { bits_per_second: q(self.bits_per_second), mode, ..self })
+            }
+        }
+    }
 }
