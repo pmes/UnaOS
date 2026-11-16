@@ -17,31 +17,9 @@ use stria::nle::{RenderSink, SYNTH_RATE, Sources, render, synth_sample, synth_so
 use stria::nle_export::{AudioOut, H264Encoder, PngSequence, RawSequence, export, pcm16, wav_header};
 use timeline_core::schedule::schedule;
 use timeline_core::{Clip, Kind, SourceId, Timeline};
+mod common; use common::*; // NLE6-UTP1 (LEDGER SR729): tests/common, the ONE fixture / log / feed helper set the four binaries share
 
-const BASE: [u32; 2] = [0, 1000];
-const PER: usize = (SYNTH_RATE / 25) as usize; // samples per tick
 const TICKS: i64 = 35; // H264ENCCOLOURHOST (SR377): HOST_VUI, the export's VUI colour, the fresh encoders' too (test tail)
-
-/// NLE1's timeline: A[13,23)@0, B[0,10)@10 split at 15, a gap 20..25, A[23,33)@25 (video and audio alike).
-fn timeline() -> Timeline {
-    let mut tl = Timeline::new(25);
-    let a = tl.add_source("A", 50);
-    let b = tl.add_source("B", 50);
-    tl.add_track(Kind::Video);
-    tl.add_track(Kind::Audio);
-    for t in 0..2 {
-        tl.tracks[t].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
-    }
-    tl.split(0, 15).unwrap().split(1, 15).unwrap()
-}
-
-fn sources(tl: &Timeline) -> Sources {
-    let mut src = Sources::new(tl);
-    for (i, b) in BASE.iter().enumerate() {
-        src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
-    }
-    src
-}
 
 #[derive(Default)]
 struct Collect {
@@ -69,10 +47,7 @@ fn reference(tl: &Timeline, src: &Sources) -> Collect {
 }
 
 fn fresh(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nle_export").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::fresh_dir("nle_export", name) // STRIA-TEST-TMPDIR (SR729): a per-process subdir
 }
 
 /// The schedule's synthetic sample for every output sample.
@@ -670,3 +645,175 @@ fn nlerawexport_second_size_refused_by_name() {
         assert!(e.to_string().contains("frame does not match"), "{e}");
     }
 }
+
+// ---- NLE5DCLITABLE (LEDGER SR718): the one encoder table against tools/nle's old match (named tail block) ----
+use stria::nle_export::{H264Opts, VIDEO_NAMES, video_named, video_named_with};
+
+/// FNV-1a over everything an export takes from a video encoder: the colour call, every access unit (keyframe, time, data)
+/// of every frame and of the flush, then the config (fourcc, config bytes) and the layout.
+fn nle5dclitable_fnv(mut e: Box<dyn stria::nle_export::VideoEncoder>, frames: &[Vec<u8>]) -> u64 {
+    fn eat(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h = (*h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let _ = e.colour((2, 2));
+    let mut units = Vec::new();
+    for f in frames {
+        units.extend(e.encode(64, 48, f).unwrap());
+    }
+    units.extend(e.flush().unwrap());
+    for a in &units {
+        eat(&mut h, &[a.keyframe as u8]);
+        if let Some((d, p)) = a.time {
+            eat(&mut h, &d.to_le_bytes());
+            eat(&mut h, &p.to_le_bytes());
+        }
+        eat(&mut h, &a.data);
+    }
+    let c = e.config();
+    eat(&mut h, &c.fourcc);
+    eat(&mut h, &c.config);
+    eat(&mut h, format!("{:?}", e.layout()).as_bytes());
+    h
+}
+
+/// A first pass (`nle export --two-pass`'s `pass1_stats` chain: CBR 40 kbit/s at 25 fps) and its per-picture records.
+fn nle5dclitable_pass1(frames: &[Vec<u8>]) -> Vec<stria::nle_export::PicStat> {
+    let enc = H264Encoder::new(26, 10).with_bitrate(40, 25, 1);
+    let stats = enc.stats();
+    nle5dclitable_fnv(Box::new(enc), frames);
+    let v = stats.borrow().clone();
+    v
+}
+
+/// One `nle export` h264 option set: (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass).
+type Nle5dSet = (u8, u32, Option<u32>, Option<u8>, Option<u8>, Option<u8>, bool, bool);
+
+/// The option sets the tool accepts (and bitrate + crf, which the tool refuses before the table: the bitrate arm wins).
+const NLE5DCLITABLE_SETS: [Nle5dSet; 8] = [
+    (26, 10, None, None, None, None, false, false),
+    (30, 5, None, None, Some(40), Some(10), false, false),
+    (26, 10, Some(40), None, None, None, false, false),
+    (26, 10, Some(40), None, None, None, true, false),
+    (26, 10, None, Some(28), None, None, false, false),
+    (26, 10, None, Some(28), None, None, true, false),
+    (26, 10, Some(40), Some(28), None, None, false, false),
+    (26, 10, Some(40), None, None, None, false, true),
+];
+
+/// tools/nle's encoder match before SR718 (main.rs `export_verb`), written out at the fixture's 25 fps: the oracle.
+fn nle5dclitable_chain(s: Nle5dSet, stats: Vec<stria::nle_export::PicStat>) -> H264Encoder {
+    let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = s;
+    match (bitrate, crf) {
+        (Some(k), _) if two_pass => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_two_pass(k, 25, 1, stats),
+        (Some(k), _) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, 25, 1),
+        (None, Some(c)) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_quality(c, 25, 1),
+        (None, None) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq),
+    }
+}
+
+#[test]
+fn nle5dclitable_h264_table_is_the_cli_chain() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let stats = nle5dclitable_pass1(&refr.frames);
+    for (i, s) in NLE5DCLITABLE_SETS.iter().enumerate() {
+        let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = *s;
+        let chain = nle5dclitable_fnv(Box::new(nle5dclitable_chain(*s, stats.clone())), &refr.frames);
+        assert_eq!(chain, NLE5DCLITABLE_BEFORE[i], "set {i}: the old match's stream, pinned before SR718");
+        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()) };
+        let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
+        assert_eq!(table, chain, "set {i}: the table is the CLI's chain");
+    }
+}
+
+/// The fnvs of [`nle5dclitable_chain`] over [`NLE5DCLITABLE_SETS`], measured on the tree before SR718 (the old match in place).
+const NLE5DCLITABLE_BEFORE: [u64; 8] = [
+    0xb3c1_26d2_643f_7976,
+    0xd4a7_27d4_5b5d_78c5,
+    0x050f_27c6_7cc3_2beb,
+    0x7265_0fd7_6ad4_126c,
+    0x3657_59b8_8c60_a4d0,
+    0x3657_59b8_8c60_a4d0,
+    0x050f_27c6_7cc3_2beb,
+    0x7aca_82b3_ce88_470a,
+];
+
+#[test]
+fn nle5dclitable_video_named_is_the_default_options() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    for name in VIDEO_NAMES {
+        let a = nle5dclitable_fnv(video_named(name, tl.tb).unwrap(), &refr.frames);
+        let b = nle5dclitable_fnv(video_named_with(name, tl.tb, H264Opts::default()).unwrap(), &refr.frames);
+        assert_eq!(a, b, "{name}");
+    }
+    let face = nle5dclitable_fnv(video_named("h264", tl.tb).unwrap(), &refr.frames);
+    assert_eq!(face, 0x8318_f822_3505_f96b, "the face's h264 (SR694), pinned before SR718");
+    assert_eq!(face, nle5dclitable_fnv(Box::new(H264Encoder::new(26, 25)), &refr.frames), "QP 26, a one-second GOP");
+    assert!(video_named_with("vp9", tl.tb, H264Opts::default()).is_none());
+}
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the H.264 movie's btrt, read back through demux_core (named tail block) ----
+/// ffmpeg movenc's avgBitrate: floor(coded bits x 25 / frames) at the test timeline's 25 fps, over the demuxed samples.
+fn h264enchrdmp4_avg(d: &Demuxer) -> (u32, u64) {
+    let bytes: u64 = d.track_samples(0).map(|s| d.packet_at(s).data.len() as u64).sum();
+    let frames = d.track_samples(0).count() as u64;
+    ((bytes * 8 * 25 / frames) as u32, frames)
+}
+
+/// H264ENCHRDMP4 (SR720): a CBR 400 kbit/s export with the HRD signalled carries the bucket in the avc1's `btrt`: bufferSizeDB
+/// 50000 (the one-second CPB / 8), maxBitrate 400000 (the HRD rate), avgBitrate the floored coded rate, the coded bits within one
+/// CpbSize of rate x duration (the HRD's bound: the 1.4 s clip's bucket transient is about half the CPB).
+#[test]
+fn h264enchrdmp4_cbr_export_carries_the_hrd_btrt() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264enchrdmp4_cbr");
+    let enc = H264Encoder::new(26, 10).with_bitrate(400, tl.tb.den as u32, tl.tb.num as u32).with_hrd(true);
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!(r.frames, 35);
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let (avg, frames) = h264enchrdmp4_avg(&d);
+    assert_eq!(frames, 35);
+    let (buffer, max, got_avg) = d.tracks()[0].btrt.expect("a CBR export carries a btrt");
+    assert_eq!((buffer, max, got_avg), (50_000, 400_000, avg), "the HRD CPB / 8, the HRD rate, the floored coded rate");
+    let coded: u64 = d.track_samples(0).map(|s| d.packet_at(s).data.len() as u64 * 8).sum(); assert!(coded.abs_diff(400_000 * frames / 25) <= 400_000, "coded {coded} bits (avgBitrate {avg}) within one CpbSize of 400000 x {frames} / 25 (the HRD bound; 258360 measured on this 1.4 s clip)");
+}
+
+/// H264ENCHRDMP4 (SR720): a constant-QP export has no bucket: the btrt is ffmpeg's CRF form (buffer 0, max = avg); an
+/// audio-only `audio.mp4` (no video hint) carries none.
+#[test]
+fn h264enchrdmp4_cqp_export_carries_avg_only() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264enchrdmp4_cqp");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let (avg, _) = h264enchrdmp4_avg(&d);
+    assert!(avg > 0);
+    assert_eq!(d.tracks()[0].btrt, Some((0, avg, avg)));
+    let dir = fresh("h264enchrdmp4_audio");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Mp4).unwrap();
+    let a = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
+    assert_eq!(a.tracks()[0].btrt, None, "no video encoder hint, no btrt");
+}
+
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's NLE1 fixture is the one this file built (named tail block) ----
+/// NLE6-UTP1 (SR729): FNV-1a of NLE1's timeline as CMX text and of the plain render's frame fnv over its two reels, pinned on
+/// this file's own `timeline()` / `sources()` before they moved into tests/common (the test now reads tests/common's).
+#[test]
+fn nle6utp1_nle_export_fixture_pin() {
+    let tl = timeline();
+    let mut bytes = timeline_core::edl::write(&tl, "NLE1").unwrap().into_bytes();
+    bytes.extend(reference(&tl, &sources(&tl)).fnv.to_le_bytes());
+    let got = stria::nle_face::fnv1a(&bytes);
+    assert_eq!(got, NLE6UTP1_NLE_EXPORT_PIN, "{got:#018x}");
+}
+
+/// The fnv [`nle6utp1_nle_export_fixture_pin`] reads, measured on the copies before SR729.
+const NLE6UTP1_NLE_EXPORT_PIN: u64 = 0xe149_8435_238b_ff8e;
