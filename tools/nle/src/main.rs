@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -36,18 +36,19 @@
 //! `--png` (ADOPTPNG, LEDGER SR405) is `--video png`: the PNG sequence (`stria::nle_export::export_png`) read back per
 //! frame, `nle: frame <n> <w>x<h> <path>` on stderr per frame and `nle: export png frames=<n> sizes=<k>` last (a reel under
 //! Adopt keeps each frame's own size); the stdout JSON line is unchanged.
+//! `--video i420|y4m` (NLERAWEXPORT, LEDGER SR689) writes `video.i420` (raw planar 4:2:0) or `video.y4m` (YUV4MPEG2) + `video.json` over h264enc_core's ONE converter (`planar_export`, file tail): `nle: export <fmt> frames=<n> <w>x<h>` on stderr; a second size is refused (`frame does not match`).
 
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, PngSequence, RawSequence, VideoEncoder, export_as, export_png};
+use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, I420Raw, PngSequence, RawSequence, VideoEncoder, Y4m, export_as, export_png};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -188,6 +189,8 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
     let enc: Box<dyn VideoEncoder> = match video {
         "png" => Box::new(PngSequence),
         "raw" => Box::new(RawSequence),
+        "i420" => Box::new(I420Raw::default()),
+        "y4m" => Box::new(Y4m::new(tl.tb.den as u32, tl.tb.num as u32)),
         "h264" => match (bitrate, crf) {
             (Some(k), _) => Box::new(H264Encoder::new(qp, gop).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
             (None, Some(c)) => Box::new(H264Encoder::new(qp, gop).with_quality(c, tl.tb.den as u32, tl.tb.num as u32)),
@@ -203,7 +206,7 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
         _ => usage(),
     };
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
-    let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
+    let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else if matches!(video, "i420" | "y4m") { planar_export(tl, range, sources, dir, video, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
     println!(
         "{{\"codec\":\"{video}\",\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
         r.frames, r.files, r.bytes, r.fnv, r.pcm_frames
@@ -246,5 +249,25 @@ fn png_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir
         }
     }
     eprintln!("nle: export png frames={} sizes={}", frames.len(), sizes.len());
+    r
+}
+
+// ---- NLERAWEXPORT (LEDGER SR689): the raw planar arms of `export` (named tail block) ----
+/// NLERAWEXPORT (SR689): the `i420` / `y4m` arms of `export` — plumbing only: `stria::nle_export::I420Raw` / `Y4m` through
+/// `export_as`, then `nle: export <fmt> frames=<n> <w>x<h>` on stderr (the size the encoder latched); the report goes back to
+/// `export_verb`, which prints the one JSON line. A refusal (a second size: `frame does not match`) is printed, exit 1.
+fn planar_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, aud: AudioOut, container: Container) -> ExportReport {
+    let (enc, size): (Box<dyn VideoEncoder>, _) = if video == "y4m" {
+        let e = Y4m::new(tl.tb.den as u32, tl.tb.num as u32);
+        let size = e.size();
+        (Box::new(e), size)
+    } else {
+        let e = I420Raw::default();
+        let size = e.size();
+        (Box::new(e), size)
+    };
+    let r = export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string()));
+    let (w, h) = size.get().unwrap_or((0, 0));
+    eprintln!("nle: export {video} frames={} {w}x{h}", r.frames);
     r
 }

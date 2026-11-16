@@ -564,3 +564,96 @@ pub fn export_png(
     }
     Ok((r, frames))
 }
+
+// ---- NLERAWEXPORT (LEDGER SR689): the raw planar exports over the ONE RGBA -> I420 converter (named tail block) ----
+/// Raw planar 4:2:0 (handlers.md §5 NLE5b's NLE5-I420): each frame through `h264enc_core::yuv::I420::from_rgba` (the tree's ONE
+/// RGBA -> I420 converter: BT.601 limited range, chroma the 2x2 block average), its Y, Cb, Cr planes appended to one
+/// `video.i420` (`w*h + 2*ceil(w/2)*ceil(h/2)` bytes per frame, no padding) beside the `video.json` sidecar ([`Layout::OneFile`]).
+/// The size is latched at the first frame; a later frame of another size is refused by the converter crate's own
+/// `h264enc_core::Error::FrameSize` (the value [`H264Encoder`] refuses it with), so the sidecar's one size is true.
+#[derive(Debug, Default, Clone)]
+pub struct I420Raw {
+    size: std::rc::Rc<std::cell::Cell<Option<(u32, u32)>>>,
+}
+
+impl I420Raw {
+    /// The latched size (None before the first frame), readable after the encoder moved into [`export_as`].
+    pub fn size(&self) -> std::rc::Rc<std::cell::Cell<Option<(u32, u32)>>> {
+        std::rc::Rc::clone(&self.size)
+    }
+
+    /// One frame's planes, Y then Cb then Cr, through the ONE converter; a second size refused (`FrameSize`).
+    fn planes(&self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, ExportError> {
+        match self.size.get() {
+            Some(s) if s != (width, height) => return Err(ExportError::H264(h264enc_core::Error::FrameSize)),
+            Some(_) => {}
+            None => self.size.set(Some((width, height))),
+        }
+        let f = h264enc_core::yuv::I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;
+        let mut out = Vec::with_capacity(f.y.len() + f.u.len() + f.v.len());
+        out.extend_from_slice(&f.y);
+        out.extend_from_slice(&f.u);
+        out.extend_from_slice(&f.v);
+        Ok(out)
+    }
+}
+
+impl VideoEncoder for I420Raw {
+    fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
+        Ok(vec![Access { keyframe: true, data: self.planes(width, height, rgba)?, time: None }])
+    }
+    fn config(&self) -> VideoConfig {
+        VideoConfig { fourcc: *b"I420", config_box: None, config: Vec::new() }
+    }
+    fn layout(&self) -> Layout {
+        Layout::OneFile("i420")
+    }
+}
+
+/// YUV4MPEG2 (handlers.md §5 NLEPROBE-HDR's RAW-EXPORT): [`I420Raw`]'s planes (one plane path, one size latch) in the stream
+/// ffmpeg / x264 / mpv read directly, one `video.y4m`: the header `YUV4MPEG2 W<w> H<h> F<num>:<den> Ip A1:1 C420jpeg` once
+/// (the first frame's size; the frame rate reduced; `C420jpeg` = the converter's 2x2 block average, centred chroma), then
+/// `FRAME` + the planes per picture. Progressive only; no `XCOLORRANGE` tag (the planes are BT.601 limited).
+#[derive(Debug, Clone)]
+pub struct Y4m {
+    raw: I420Raw,
+    fps: (u32, u32),
+    header: bool,
+}
+
+impl Y4m {
+    /// `fps_num / fps_den` frames per second (the timeline's `tb.den / tb.num`), reduced by their gcd.
+    pub fn new(fps_num: u32, fps_den: u32) -> Y4m {
+        let (mut a, mut b) = (fps_num, fps_den);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let g = a.max(1);
+        Y4m { raw: I420Raw::default(), fps: (fps_num / g, fps_den / g), header: false }
+    }
+
+    /// The latched size ([`I420Raw::size`]).
+    pub fn size(&self) -> std::rc::Rc<std::cell::Cell<Option<(u32, u32)>>> {
+        self.raw.size()
+    }
+}
+
+impl VideoEncoder for Y4m {
+    fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
+        let planes = self.raw.planes(width, height, rgba)?;
+        let mut data = Vec::with_capacity(planes.len() + 64);
+        if !self.header {
+            data.extend_from_slice(format!("YUV4MPEG2 W{width} H{height} F{}:{} Ip A1:1 C420jpeg\n", self.fps.0, self.fps.1).as_bytes());
+            self.header = true;
+        }
+        data.extend_from_slice(b"FRAME\n");
+        data.extend_from_slice(&planes);
+        Ok(vec![Access { keyframe: true, data, time: None }])
+    }
+    fn config(&self) -> VideoConfig {
+        VideoConfig { fourcc: *b"I420", config_box: None, config: Vec::new() }
+    }
+    fn layout(&self) -> Layout {
+        Layout::OneFile("y4m")
+    }
+}
