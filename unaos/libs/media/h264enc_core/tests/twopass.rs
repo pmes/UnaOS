@@ -13,9 +13,18 @@
 //! H264ENCTWOPASSRESCALE (LEDGER SR727): (g) `rc::rescale_stats` 30 -> 15 means each pair, keeps the first I and the record invariant;
 //! (h) a 15-frame pass 2 planned from the 30-frame pass 1 lands within 3% of its target, equal counts byte-identical; (i)
 //! `Encoder::stats` leaves the HRD's filler NAL units out of a picture's bits, as the rc_update line does.
+//! H264ENCTWOPASSBLUR (LEDGER SR736): (a) runs on `RAW` (SR698's rule: no blur, the next-P I rule); (j) `rc::blur_complexity` on an
+//! impulse spreads it over its neighbours and stops at an IDR (the falling-from-the-peak check at cplxblur 2: at 20 the window
+//! reaches the IDR at 0 too, a measured correction), `rc::exp_neg_q16` within 1 of round(65536 e^-t); (k) `RAW` plans SR698's exact
+//! QPs (literals captured before the change); (l) the default (x264's blurs) 30-frame second pass within 2% of its target, its
+//! PLANNED P QP range (`pass2_qps` at the export's target) no wider than RAW's; the bit spread (the flatter QP curve widens it) and
+//! the coded QP range (`pass2_pick`'s runtime budget correction and the bucket's step move each picture off its plan) are printed,
+//! not asserted, measured corrections of the design's bit-spread check; (m) qcomp 1 one QP for every P, qcomp 0 equal bits (at
+//! floor 0: at QP_MIN the decade of complexity clamps, a measured correction), an invalid qcomp refused; (n) an I picture planned
+//! from its GOP's P pictures less 3, one with no P after it from its own complexity.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, pass2_qps, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, pass2_qps, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -76,7 +85,7 @@ fn a_pass2_qps_spends_where_the_complexity_is() {
         .collect();
     let first: u64 = stats.iter().map(|p| p.bits).sum();
     for target in [first / 2, first, first * 2] {
-        let qps = pass2_qps(&stats, target, QP_MIN);
+        let qps = pass2_qps(&stats, target, QP_MIN, &RAW);
         assert_eq!(qps.len(), stats.len());
         assert!(qps.iter().all(|q| (QP_MIN..=QP_MAX).contains(q)));
         let got = predicted(&stats, &qps);
@@ -90,8 +99,8 @@ fn a_pass2_qps_spends_where_the_complexity_is() {
         assert!(stats[hi].complexity / step16(qps[hi]) > stats[lo].complexity / step16(qps[lo]));
     }
     // Unreachable targets: every QP at 51, or every QP at the floor.
-    assert!(pass2_qps(&stats, 1, QP_MIN).iter().all(|&q| q == QP_MAX));
-    assert!(pass2_qps(&stats, u64::MAX / 2, 20).iter().all(|&q| q == 20));
+    assert!(pass2_qps(&stats, 1, QP_MIN, &RAW).iter().all(|&q| q == QP_MAX));
+    assert!(pass2_qps(&stats, u64::MAX / 2, 20, &RAW).iter().all(|&q| q == 20));
 }
 
 /// Encode N frames under `cfg` (planned from `plan`), decoding each through h264_core against the reconstruction.
@@ -341,3 +350,160 @@ fn i_note_stat_skips_filler() {
         assert_eq!(r.complexity, r.bits * step16(r.qp));
     }
 }
+
+// ---- H264ENCTWOPASSBLUR (LEDGER SR736): x264's complexity blur, qblur and GOP-mean I rule, the qcomp knob (named tail block) ----
+
+/// SR698's plan: no complexity blur, no QP blur, an I picture from its next P's complexity.
+const RAW: Pass2Opts = Pass2Opts { qcomp: (3, 5), cplxblur: 0, qblur_q8: 0, i_from_gop: false };
+
+/// Test (a)'s first pass: 60 pictures, an IDR every 30, P complexities spread over a decade.
+fn synthetic() -> Vec<PicStat> {
+    (0..60u64)
+        .map(|i| {
+            let kind = if i % 30 == 0 { Pic::Idr } else { Pic::P };
+            let bits = if kind == Pic::Idr { 60_000 } else { 2_000 + (i * 7919 % 61) * 300 };
+            PicStat { kind, bits, qp: 26, complexity: bits * step16(26) }
+        })
+        .collect()
+}
+
+fn pic(kind: Pic, bits: u64) -> PicStat {
+    PicStat { kind, bits, qp: 26, complexity: bits * step16(26) }
+}
+
+#[test]
+fn j_blur_complexity_spreads_an_impulse_and_stops_at_an_idr() {
+    assert_eq!(exp_neg_q16(0), 65536);
+    assert_eq!(exp_neg_q16(12 << 16), 0);
+    for t in [327u64, 1 << 15, 65536, 4 << 16, 8 << 16, (11 << 16) + 5000] {
+        let e = (65536.0 * (-(t as f64) / 65536.0).exp()).round() as i64;
+        let got = exp_neg_q16(t) as i64;
+        assert!((got - e).abs() <= 1, "exp_neg_q16({t}) = {got} vs {e}");
+    }
+    // An IDR at 0 and 45, P pictures of complexity c, one 10c P at 20.
+    let c = 1000 * step16(26);
+    let stats: Vec<PicStat> = (0..60).map(|i| if i % 45 == 0 { pic(Pic::Idr, 30_000) } else if i == 20 { pic(Pic::P, 10_000) } else { pic(Pic::P, 1000) }).collect();
+    assert_eq!(blur_complexity(&stats, 0), stats.iter().map(|p| p.complexity).collect::<Vec<_>>(), "cplxblur 0: each its own");
+    for blur in [2u32, 20] {
+        let b = blur_complexity(&stats, blur);
+        println!("twopassblur impulse cplxblur={blur} 16..=24 {:?} 43..=46 {:?}", &b[16..=24], &b[43..=46]);
+        assert!(b[20] < 10 * c && b[20] > c, "the peak spread");
+        assert!(b[19] > c && b[21] > c, "its neighbours raised");
+    }
+    // cplxblur 2 (at 20 the window reaches the IDR at 0 too, so 16..=24 fall with the distance from it).
+    let b = blur_complexity(&stats, 2);
+    assert!(b[18] <= b[19] && b[22] <= b[21] && b[19] <= b[20] && b[21] <= b[20], "falling away from the peak");
+    // cplxblur 2: past j = 0..=4, future j = 1..=3; the impulse at 20 reaches 17..=24 only, and the picture before the IDR at 45
+    // does not see past it (44: its own and four before, all c).
+    assert_eq!(b[16], c);
+    assert_eq!(b[25], c);
+    assert_eq!(b[44], c, "the future walk stops before the next IDR");
+    assert!(b[17] > c && b[24] > c);
+    assert_eq!(&b[16..=24], &J_IMPULSE_2[..], "cplxblur 2 pinned");
+}
+
+/// blur_complexity(cplxblur 2) of test (j)'s impulse, pictures 16..=24 (measured on this tree).
+const J_IMPULSE_2: [u64; 9] = [208000, 437863, 443685, 447248, 448444, 447248, 443685, 437863, 429960];
+
+#[test]
+fn k_raw_reproduces_sr698() {
+    let stats = synthetic();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    for (target, want) in [(first / 2, &K_SR698[0]), (first, &K_SR698[1]), (first * 2, &K_SR698[2])] {
+        assert_eq!(&pass2_qps(&stats, target, QP_MIN, &RAW)[..], &want[..], "RAW at target {target} is SR698's plan");
+    }
+}
+
+/// SR698's plans of `synthetic()` at first / 2, first, first x 2 (test (a)'s printed `qps=`, captured on the tree before SR736).
+const K_SR698: [[i32; 60]; 3] = [
+    [31, 34, 33, 32, 31, 29, 34, 34, 33, 32, 30, 27, 34, 33, 32, 31, 29, 34, 34, 33, 32, 30, 27, 34, 33, 32, 31, 29, 34, 34, 29, 32, 30, 28, 34, 33, 33, 31, 30, 34, 34, 33, 32, 31, 28, 34, 34, 33, 31, 30, 35, 34, 33, 32, 31, 28, 34, 34, 33, 32],
+    [25, 28, 27, 26, 25, 23, 28, 28, 27, 26, 24, 21, 28, 27, 26, 25, 23, 28, 28, 27, 26, 24, 21, 28, 27, 26, 25, 23, 28, 28, 23, 26, 24, 22, 28, 27, 27, 25, 24, 28, 28, 27, 26, 25, 22, 28, 28, 27, 25, 24, 29, 28, 27, 26, 25, 22, 28, 28, 27, 26],
+    [19, 22, 21, 20, 19, 17, 22, 22, 21, 20, 18, 16, 22, 21, 20, 19, 17, 22, 22, 21, 20, 18, 16, 22, 21, 20, 19, 17, 22, 22, 17, 20, 18, 16, 22, 21, 21, 19, 18, 22, 22, 21, 20, 19, 16, 22, 22, 21, 19, 18, 23, 22, 21, 20, 19, 16, 22, 22, 21, 20],
+];
+
+#[test]
+fn l_default_blur_lands_within_two_percent() {
+    // (bits per picture, SliceQPY per picture) of a second pass planned with `opts`.
+    let encode = |kbps: u32, plan: &[PicStat], opts: &Pass2Opts| -> (Vec<u64>, Vec<i32>) {
+        let mut enc = Encoder::new(base(Some(RateControl::two_pass(kbps, (FPS, 1))))).unwrap().planned_with(plan, opts).unwrap();
+        let bits = (0..N).map(|t| au_bits(&enc.encode(&frame(&scene(t))).unwrap())).collect();
+        (bits, enc.stats().iter().map(|p| p.qp).collect())
+    };
+    // The P pictures' QP range (the first picture is the IDR).
+    let qrange = |q: &[i32]| q[1..].iter().max().unwrap() - q[1..].iter().min().unwrap();
+    for kbps in [60u32, 100] {
+        let stats = first_pass(kbps);
+        let ((raw, rq), (blur, bq)) = (encode(kbps, &stats, &RAW), encode(kbps, &stats, &Pass2Opts::default()));
+        let target = kbps as f64 * 1000.0 * N as f64 / FPS as f64;
+        // The plans themselves at the export's target (`Encoder::planned_with`'s target, floor QP_MIN).
+        let tb = kbps as u64 * 1000 * N as u64 / FPS as u64;
+        let (pr, pb) = (pass2_qps(&stats, tb, QP_MIN, &RAW), pass2_qps(&stats, tb, QP_MIN, &Pass2Opts::default()));
+        let (r, b) = (raw.iter().sum::<u64>() as f64, blur.iter().sum::<u64>() as f64);
+        println!(
+            "twopassblur kbps={kbps} raw={:+.2}% blur={:+.2}% planned P qp range raw={} blur={}; coded P qp range raw={} blur={}; bit spread raw={:.2} blur={:.2}",
+            (r / target - 1.0) * 100.0,
+            (b / target - 1.0) * 100.0,
+            qrange(&pr),
+            qrange(&pb),
+            qrange(&rq),
+            qrange(&bq),
+            spread(&raw),
+            spread(&blur)
+        );
+        println!("  planned raw {pr:?}\n  planned blur {pb:?}\n  coded raw {rq:?}\n  coded blur {bq:?}");
+        assert!((b - target).abs() <= target * 0.02, "blurred two-pass {b} bits vs target {target}");
+        assert!(qrange(&pb) <= qrange(&pr), "blurred planned P QP range {} wider than RAW's {}", qrange(&pb), qrange(&pr));
+        let mut via_planned = Encoder::new(base(Some(RateControl::two_pass(kbps, (FPS, 1))))).unwrap().planned(&stats).unwrap();
+        let p: Vec<u64> = (0..N).map(|t| au_bits(&via_planned.encode(&frame(&scene(t))).unwrap())).collect();
+        assert_eq!(p, blur, "planned is planned_with(Default)");
+    }
+}
+
+#[test]
+fn m_qcomp_bounds_and_refusals() {
+    let stats = synthetic();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    let ps: Vec<usize> = (0..stats.len()).filter(|&i| stats[i].kind == Pic::P).collect();
+    // qcomp 1: one QP for every P (the default blurs too).
+    for opts in [Pass2Opts { qcomp: (1, 1), ..RAW }, Pass2Opts { qcomp: (1, 1), ..Pass2Opts::default() }] {
+        let q = pass2_qps(&stats, first, QP_MIN, &opts);
+        assert!(ps.iter().all(|&i| q[i] == q[ps[0]]), "qcomp 1 {opts:?}: {q:?}");
+    }
+    // qcomp 0: qscale ~ complexity, every P's predicted bits within the step16 rounding of equal (one QP step); floor 0 so the
+    // decade of complexity (20 QP) is not clamped at QP_MIN.
+    let bits = |opts: &Pass2Opts| -> f64 {
+        let q = pass2_qps(&stats, first, 0, opts);
+        let b: Vec<u64> = ps.iter().map(|&i| stats[i].complexity / step16(q[i])).collect();
+        *b.iter().max().unwrap() as f64 / *b.iter().min().unwrap() as f64
+    };
+    let (flat, raw) = (bits(&Pass2Opts { qcomp: (0, 1), ..RAW }), bits(&RAW));
+    println!("twopassblur qcomp=0 P bits max/min={flat:.3} qcomp=0.6 {raw:.3}");
+    assert!(flat <= 1.25 && flat < raw, "qcomp 0 P bits spread {flat:.3} (qcomp 0.6: {raw:.3})");
+    // Invalid qcomp: refused by name.
+    let plan = first_pass(60);
+    for qcomp in [(6, 5), (1, 0), (-1, 5)] {
+        let e = Encoder::new(base(Some(RateControl::two_pass(60, (FPS, 1))))).unwrap().planned_with(&plan, &Pass2Opts { qcomp, ..Pass2Opts::default() });
+        assert!(matches!(e, Err(Error::Rate)), "qcomp {qcomp:?}");
+    }
+}
+
+#[test]
+fn n_i_picture_from_its_gop() {
+    // GOP 1: equal P pictures; GOP 2: varied; a last IDR with no P after it, its complexity the P at 13's.
+    let mut stats: Vec<PicStat> = Vec::new();
+    stats.push(pic(Pic::Idr, 40_000));
+    stats.extend((1..10).map(|_| pic(Pic::P, 3000)));
+    stats.push(pic(Pic::Idr, 40_000));
+    stats.extend((11..20u64).map(|i| pic(Pic::P, 1000 + i * 400)));
+    stats.push(pic(Pic::Idr, 1000 + 13 * 400));
+    let gop = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: true, ..RAW };
+    let total: u64 = stats.iter().map(|p| p.bits).sum();
+    let q = pass2_qps(&stats, total, QP_MIN, &gop);
+    println!("twopassblur i rule qps={q:?}");
+    assert_eq!(q[0], q[1] - 3, "an I at its GOP's (equal) P QP less 3");
+    let mean = q[11..20].iter().sum::<i32>() as f64 / 9.0;
+    assert!((q[10] as f64 - (mean - 3.0)).abs() <= 1.0, "an I {} at its GOP's mean P QP {mean:.2} less 3", q[10]);
+    assert_eq!(q[20], q[13], "an I with no P after it: its own complexity, no offset");
+    assert_ne!(pass2_qps(&stats, total, QP_MIN, &RAW)[20], q[20], "RAW takes the previous P's less 3");
+}
+

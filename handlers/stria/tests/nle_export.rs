@@ -739,7 +739,7 @@ const NLE5DCLITABLE_BEFORE: [u64; 8] = [
     0x3657_59b8_8c60_a4d0,
     0x3657_59b8_8c60_a4d0,
     0x050f_27c6_7cc3_2beb,
-    0x7aca_82b3_ce88_470a,
+    0xaae5_c049_c971_23c3, // H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x7aca_82b3_ce88_470a)
 ];
 
 #[test]
