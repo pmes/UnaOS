@@ -4607,4 +4607,26 @@ mod tests {
         assert!(ink2 > 0, "w: the second line paints");
         assert_eq!(imgalt_ink(&engine, 122, 400, t.floor() as usize, (t + h).ceil() as usize), 0, "w: nothing paints right of the column");
     }
+
+    // ---- AETHERHOSTWGHTCOVERFACE (LEDGER SR725): the covering face draws a variable fallback at the asked weight (named tail block) ----
+
+    /// AETHERHOSTWGHTCOVERFACE (SR725): the face `fonts::fallback_for` returns when the style-matched face lacks the
+    /// character, and `fonts::stack`'s last resort, load through `text_host::cover_face`: for the tree's Inter variable
+    /// face at 700 that is the wght 700 instance (the pre-SR725 roads loaded the default one), a distinct face with no
+    /// synthetic bold and more ink in `H`; at 400 it is the `load_face` object itself. Through the helper rather than a
+    /// page: the process-wide font database holds no installed variable face on the seat (SR690's reason).
+    #[test]
+    fn fallback_cover_face_instances() {
+        use crate::fonts::{db, raster};
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fonts/inter/InterVariable.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter variable face");
+        let at = |w: f32| text_host::cover_face(&info, db::Style { weight: w, ..db::Style::default() }).expect("Inter loads");
+        let (regular, bold) = (at(400.0), at(700.0));
+        assert!(std::ptr::eq(regular, crate::fonts::load_face(&info).unwrap()), "400 is today's object");
+        assert_ne!(regular.id, bold.id, "700 is its own instance");
+        assert!(bold.font.is_instanced() && !bold.synth_bold, "the axis reaches 700: no embolden path");
+        let gid = regular.font.glyph_index('H');
+        let ink = |f: &crate::fonts::Face| raster::glyph(f, gid, 32.0, 0).map_or(0u64, |m| m.data.iter().map(|&v| v as u64).sum());
+        assert!(ink(regular) < ink(bold), "the covering face inks at the asked weight");
+    }
 }
