@@ -15,6 +15,7 @@ use gneiss_pal::dsp::video::{Frame, TestPattern};
 use resonance::{AudioGraph, BLOCK_SIZE, stream_pair_channels};
 use stria::media::{AudioOut, FrameSink, Player, Tick};
 use stria::media_bus::MediaService;
+mod common; use common::*; // NLE6-UTP1 (LEDGER SR729): tests/common, the ONE fixture / log / feed helper set the four binaries share
 
 #[derive(Default)]
 struct Rec {
@@ -31,23 +32,6 @@ impl FrameSink for RecSink<'_> {
     }
 }
 
-/// A resonance StreamFeed shared with the test's "device" loop.
-struct SharedFeed(Arc<Mutex<resonance::StreamFeed>>);
-impl AudioOut for SharedFeed {
-    fn push(&mut self, stereo: &[f32]) -> usize {
-        self.0.lock().unwrap().push(stereo)
-    }
-    fn consumed(&self) -> u64 {
-        self.0.lock().unwrap().consumed()
-    }
-    fn flush(&mut self) {
-        self.0.lock().unwrap().flush()
-    }
-    fn set_paused(&mut self, paused: bool) {
-        self.0.lock().unwrap().set_paused(paused)
-    }
-}
-
 fn tone(n: usize) -> Vec<i16> {
     (0..n).map(|i| ((i as f64 * 0.05).sin() * 12000.0) as i16).collect()
 }
@@ -55,10 +39,9 @@ fn tone(n: usize) -> Vec<i16> {
 #[test]
 fn utp1_with_pcm_audio_plays_through_resonance_on_the_audio_clock() {
     // 2 s: 25 fps test pattern + 48 kHz mono PCM, in both containers.
-    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
     let pcm = tone(96_000);
-    let audio = build::pcm16_track(2, 48_000, 1, &pcm, 960);
-    for file in [build::mp4(&[video.clone(), audio.clone()], &Mp4Options::default()), build::mkv(&[video.clone(), audio.clone()], &MkvOptions::default())] {
+    let f = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &pcm); // NLE6-UTP1 (SR729): tests/common's Fixture
+    for file in [f.mp4(), f.mkv()] {
         let time = ManualTime::new();
         let (src, feed) = stream_pair_channels(48_000, 2, 24_000);
         let feed = Arc::new(Mutex::new(feed));
@@ -110,7 +93,7 @@ fn utp1_with_pcm_audio_plays_through_resonance_on_the_audio_clock() {
 
 #[test]
 fn seek_lands_on_the_frame_and_ordinal() {
-    let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 100, 10)], &Mp4Options::default());
+    let file = pattern_mp4(160, 120, 25, 100, 10);
     let time = ManualTime::new();
     let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
     assert!(!p.info().audio_clock);
@@ -411,7 +394,7 @@ fn coded_frame_processing_offset_sequence_and_remove() {
 #[test]
 fn playback_rate_scales_the_clock_and_the_frames() {
     for (rate, want_ns) in [(2.0, 2_000_000_000i64), (0.5, 500_000_000)] {
-        let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 100, 25)], &Mp4Options::default());
+        let file = pattern_mp4(160, 120, 25, 100, 25);
         let time = ManualTime::new();
         let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
         assert!(p.set_rate(rate));
@@ -423,7 +406,7 @@ fn playback_rate_scales_the_clock_and_the_frames() {
         let last = rec.shown.last().unwrap();
         assert!((last.1 - c).abs() <= 80_000_000, "rate {rate}: the frame on glass follows the rated clock");
     }
-    let file = build::mp4(&[build::test_pattern_track(1, 160, 120, 25, 10, 10)], &Mp4Options::default());
+    let file = pattern_mp4(160, 120, 25, 10, 10);
     let mut p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
     assert!(!p.set_rate(8.0), "outside 0.25..4 is clamped");
     assert_eq!(p.rate(), 4.0);
@@ -539,30 +522,8 @@ fn hevcpal_editor_derives_hevc_dts() {
     println!("hevcpal: editor {r}");
 }
 
-// HEVCPAL-SWAP (LEDGER SR304): the Player's log lines, captured per thread (the tests of this binary run in parallel and
-// log through the one global logger; a test counts only the lines its own thread wrote).
-struct LogCapture;
-static CAPTURED: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
-impl log::Log for LogCapture {
-    fn enabled(&self, _: &log::Metadata) -> bool {
-        true
-    }
-    fn log(&self, r: &log::Record) {
-        CAPTURED.lock().unwrap().push((std::thread::current().id(), r.args().to_string()));
-    }
-    fn flush(&self) {}
-}
-fn capture_logs() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        log::set_logger(&LogCapture).expect("no other logger in this test binary");
-        log::set_max_level(log::LevelFilter::Info);
-    });
-}
-fn my_log_lines(containing: &str) -> Vec<String> {
-    let me = std::thread::current().id();
-    CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
-}
+// HEVCPAL-SWAP (LEDGER SR304): the Player's log lines, captured per thread: tests/common's `capture_logs` / `log_lines` (NLE6-UTP1 SR729).
+use common::log_lines as my_log_lines;
 
 /// HEVC_SPS re-packed as a stream hevc_core refuses by name. COLOURONE422 (SR359): luma and chroma depths that differ now
 /// decode (was this fixture's trigger, luma 13 / chroma 12), so chroma_format_idc becomes 3 (ue `010` -> `00100`) with
@@ -1776,10 +1737,8 @@ fn nlestandinaudio_open(file: Vec<u8>, time: &ManualTime) -> (Player, AudioGraph
 #[test]
 fn nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in() {
     capture_logs();
-    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
-    let mut audio = build::pcm16_track(2, 48_000, 1, &tone(96_000), 960);
-    audio.spec.fourcc = *b"ac-3";
-    let file = build::mp4(&[video, audio.clone()], &Mp4Options::default());
+    let f = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000)).relabel_audio(*b"ac-3"); // NLE6-UTP1 (SR729)
+    let file = f.mp4();
     let time = ManualTime::new();
     let (mut p, mut graph, pushed) = nlestandinaudio_open(file, &time);
     assert_eq!(p.info().audio_decoder, "stand-in", "{:?}", p.info());
@@ -1796,7 +1755,7 @@ fn nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in() {
     let lines = my_log_lines("[STRIA] :: audio decode:");
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].starts_with("[STRIA] :: audio decode: swapped to stand-in: no decoder: ") && lines[0].contains("ac-3"), "{}", lines[0]);
-    let alone = build::mp4(&[audio], &Mp4Options::default());
+    let alone = build::mp4(&f.tracks[1..], &Mp4Options::default());
     assert!(Player::open(alone, Arc::new(ManualTime::new()), None, 60).is_err(), "a pure-audio stream with no decoder has nothing to play");
     println!("nlestandinaudio: {} | frames={} samples={}", lines[0], rec.shown.len(), out.len() / 2);
 }
@@ -1911,4 +1870,81 @@ fn striainfobitrate_forms() {
     assert_eq!(bitrate_of(Some((0, 0, 0)), None, 125_000, 1_000_000_000), "~1000 kb/s", "avg 0, no HRD: measured");
     assert_eq!(bitrate_of(None, None, 0, 1_000_000_000), "");
     assert_eq!(bitrate_of(None, None, 125_000, 0), "");
+}
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's fixtures return the bytes the copies built (named tail block) ----
+/// NLE6-UTP1 (SR729): FNV-1a of SR703's ac-3 reel, the utp1 test pattern + PCM16 pair (the mp4 then the mkv) and the 160x120
+/// pattern mp4, built by tests/common's `Fixture` / `pattern_mp4`; the pins were read on this file's own copies before they moved.
+#[test]
+fn nle6utp1_media_fixtures_pin() {
+    let ac3 = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000)).relabel_audio(*b"ac-3").mp4();
+    let f = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000));
+    let mut pair = f.mp4();
+    pair.extend(f.mkv());
+    let pattern = pattern_mp4(160, 120, 25, 100, 10);
+    let got = [ac3, pair, pattern].map(|b| stria::nle_face::fnv1a(&b));
+    assert_eq!(got, NLE6UTP1_MEDIA_PINS, "{got:#018x?}");
+}
+
+/// The fnvs [`nle6utp1_media_fixtures_pin`] reads, measured on the copies before SR729.
+const NLE6UTP1_MEDIA_PINS: [u64; 3] = [0x2e6e_eac9_e618_ef1c, 0x0c88_24d8_868e_6f16, 0x6ad1_ca03_875a_632c];
+
+// ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened carries the one-line summary (named tail block) ----
+/// Open `file` through the bus (`MediaPoster`) and return its `MediaOpened.info`.
+fn striainfobitrateface_bus_info(name: &str, file: &[u8]) -> String {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrateface");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, file).unwrap();
+    let url = format!("file://{}", path.display());
+    let synapse = Synapse::new();
+    let mut rx = synapse.subscribe();
+    let svc = MediaService::spawn(synapse.clone(), 120, false);
+    synapse.fire(SMessage::MediaPoster { url: url.clone() });
+    let t0 = Instant::now();
+    let mut info = None;
+    while info.is_none() && t0.elapsed() < Duration::from_secs(20) {
+        match rx.try_recv() {
+            Ok(SMessage::MediaOpened { url: u, info: s, .. }) if u == url => info = Some(s),
+            Ok(SMessage::MediaError { url: u, error }) if u == url => panic!("{name}: {error}"),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    drop(svc);
+    info.unwrap_or_else(|| panic!("{name}: no MediaOpened"))
+}
+
+/// STRIAINFOBITRATEFACE (SR734): SR728's CBR 400 + HRD export, opened through the bus, fires MediaOpened whose `info` is the
+/// codec, the size, the SPS's profile tokens and the bit rate (`summary_line` of the Player's own MediaInfo); its PCM WAV's is the
+/// measured `~` rate alone (no video codec, no size).
+#[test]
+fn striainfobitrateface_bus_cbr_hrd_and_wav() {
+    let enc = stria::nle_export::H264Encoder::new(26, 10).with_bitrate(400, 25, 1).with_hrd(true);
+    let (mp4, wav) = striainfobitrate_export("face_cbr_hrd", enc);
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    let mp4_info = striainfobitrateface_bus_info("cbr_hrd.mp4", &mp4);
+    assert_eq!(mp4_info, format!("avc1 64x48 profile=Baseline level=1.2 {} kb/s (HRD 400)", (avg + 500) / 1000));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(mp4_info, stria::media::summary_line(p.info()));
+    let wav_info = striainfobitrateface_bus_info("audio.wav", &wav);
+    let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert!(wav_info.starts_with('~') && wav_info.ends_with(" kb/s"), "{wav_info}");
+    assert_eq!(wav_info, p.info().bitrate);
+    println!("striainfobitrateface: mp4=\"{mp4_info}\" wav=\"{wav_info}\"");
+}
+
+/// STRIAINFOBITRATEFACE (SR734): `summary_line` drops each empty part (from the Player's own MediaInfo, not a literal).
+#[test]
+fn striainfobitrateface_summary_drops_empty_parts() {
+    let (mp4, _) = striainfobitrate_export("face_parts", stria::nle_export::H264Encoder::new(26, 10));
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let mut i = p.info().clone();
+    i.bitrate.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48 profile=Baseline level=1");
+    i.video_profile.clear();
+    assert_eq!(stria::media::summary_line(&i), "avc1 64x48");
+    i.width = 0;
+    assert_eq!(stria::media::summary_line(&i), "avc1");
+    i.video.clear();
+    assert_eq!(stria::media::summary_line(&i), "");
 }

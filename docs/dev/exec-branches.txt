@@ -178,6 +178,7 @@ exec-rmbp-h264corehrd de5c110a0 wave36 cut75h
 exec-rmbp-h264encaq edf0bd25a wave36 cut72h
 exec-rmbp-h264enchrd 173b47bc3 wave36 cut73h
 exec-rmbp-h264enchrdmp4 c03931d8a wave36 cut76h
+exec-rmbp-h264encpintra b6fa8e9a7 wave36 cut86h
 exec-rmbp-h264encscenecut 5cccda556 wave36 cut70h
 exec-rmbp-h264encscenecutbias b822dcdf8 wave36 cut80h
 exec-rmbp-h264encscenecutfade de5c110a0 wave36 cut75h
@@ -200,6 +201,7 @@ exec-rmbp-hevcintercip 0971bc01c wave36 cut71h
 exec-rmbp-hevcperf 0971bc01c wave36 cut71h
 exec-rmbp-holdstage 339b65319 wave36 cut47
 exec-rmbp-nle3eslip 7d19d4628 wave36 cut74h
+exec-rmbp-nle3eslipdrag b6fa8e9a7 wave36 cut86h
 exec-rmbp-nle3eslipface d9ec9b656 wave36 cut79h
 exec-rmbp-nle3eslipstep 5d84d7ac7 wave36 cut83h
 exec-rmbp-nle3etrimgrow de5c110a0 wave36 cut75h
@@ -230,6 +232,7 @@ exec-rmbp-striainfoaudiobitrate b822dcdf8 wave36 cut80h
 exec-rmbp-striainfobitrate df4ca757d wave36 cut77h
 exec-rmbp-striainfobitrateface 9dbb320a8 wave36 cut78h
 exec-rmbp-striainforeel b822dcdf8 wave36 cut80h
+exec-rmbp-striainforeelaudio b6fa8e9a7 wave36 cut86h
 exec-rmbp-striainforeelstrip d9876e461 wave36 cut82h
 exec-rmbp-striatesttmpdirrest d9ec9b656 wave36 cut79h
 exec-rmbp-unlockstack 339b65319 wave36 cut47

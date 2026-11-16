@@ -577,6 +577,10 @@ pub enum DragKind {
     TrimIn,
     /// The selected clip's out handle (`EditorState::trim(Edge::Out, ..)`).
     TrimOut,
+    /// NLETRANSITIONFACE (SR691): the selected transition's left (outgoing) edge (`EditorState::set_transition_dur`, `dur - delta`).
+    TransitionIn,
+    /// NLETRANSITIONFACE (SR691): the selected transition's right (incoming) edge (`EditorState::set_transition_dur`, `dur + delta`).
+    TransitionOut,
     /// A clip body (`EditorState::move_selected`; NLE2c: `EditorState::move_set` for a set of more than one).
     Move,
     /// NLE2c: a rubber band from an empty track spot (`EditorState::select_many` of the clips it crosses).
@@ -702,7 +706,7 @@ impl Drag {
                 st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
                 return Ok(());
             }
-            DragKind::Scrub => return Ok(()),
+            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st),
             _ => {}
         }
         if st.selection != Some((self.track, self.idx)) {
@@ -779,7 +783,7 @@ impl Drag {
         let dx = x - self.origin.0;
         let one = [(self.track, self.idx)];
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee => return,
+            DragKind::Marquee => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
             DragKind::Scrub => {
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -935,5 +939,63 @@ mod snap_tests {
         assert_eq!(at(&px, l.x_of(30), yi), GUIDE, "the guide line");
         assert_eq!(at(&px, l.x_of(30), l.ruler_y as i64), GUIDE, "the guide from the ruler down");
         assert_eq!(paint_drag(before.clone(), l, Order::Rgba, None), before, "no drag: unchanged");
+    }
+}
+
+// ---- NLETRANSITIONFACE (LEDGER SR691): the transition widget's edge drag (named tail block) ----
+// NLE3d (SR302) owed dragging a transition's edges. The gesture is THE drag model's (both faces call it): a press within
+// `HANDLE_W` of the DRAWN left / right edge of `Layout::transition_rect` begins `TransitionIn` / `TransitionOut` (the
+// transition selected); `update` snaps the moving edge (`at` / `at + dur`) through the same `snap_to` / `snap_targets` the
+// trims use; `finish` commits ONE `EditorState::set_transition_dur`. CMX pins `at` to the cut, so the right edge gives
+// `dur + delta` and the left `dur - delta` (dragging it left lengthens the transition, re-anchored at the cut), at least 1.
+
+impl Drag {
+    /// A press at `(x, y)` on the edge zone of a transition's widget: the edge drag (the transition selected); `None`
+    /// anywhere else (the widget's middle stays the NLE3d click). The left zone wins where a narrow widget's zones overlap.
+    pub fn begin_transition_edge(st: &mut EditorState, l: Layout, x: f64, y: f64, nosnap: bool) -> Option<Drag> {
+        let (row, i) = l.transition_at(&st.timeline, x, y)?;
+        let tr = *st.timeline.tracks.get(row)?.transitions.get(i)?;
+        let (x0, _, x1, _) = l.transition_rect(row, &tr);
+        let hw = HANDLE_W as f64;
+        let kind = if x < x0 as f64 + hw {
+            DragKind::TransitionIn
+        } else if x >= x1 as f64 - hw {
+            DragKind::TransitionOut
+        } else {
+            return None;
+        };
+        st.select_transition(row, i).ok()?;
+        Some(Drag {
+            kind,
+            track: row,
+            idx: i,
+            origin_tick: l.tick_at(x),
+            layout: l,
+            delta: 0,
+            to_track: row,
+            origin: (x, y),
+            at: (x, y),
+            snap: !nosnap,
+            additive: false,
+            guide: None,
+        })
+    }
+    /// The edge drag's ONE commit: the transition `(track, idx)` selected, then `set_transition_dur` of the pointer's length.
+    fn finish_transition(&self, st: &mut EditorState) -> Result<(), EditError> {
+        let x = st.timeline.tracks.get(self.track).and_then(|t| t.transitions.get(self.idx)).copied().ok_or(EditError::Transition)?;
+        st.select_transition(self.track, self.idx)?;
+        let dur = if self.kind == DragKind::TransitionIn { x.dur - self.delta } else { x.dur + self.delta };
+        st.set_transition_dur(dur.max(1))
+    }
+    /// Snap the moving edge (`at` for the left, `at + dur` for the right) to the nearest clip edge or the playhead within
+    /// [`SNAP_PX`], as a trim snaps its edge.
+    fn snap_transition(&mut self, st: &EditorState, x: f64) {
+        let Some(tr) = st.timeline.tracks.get(self.track).and_then(|t| t.transitions.get(self.idx)) else { return };
+        let e = if self.kind == DragKind::TransitionIn { tr.at } else { tr.at + tr.dur };
+        let ex = self.layout.x_of(e) as f64 + (x - self.origin.0);
+        if let Some(t) = snap_to(&self.layout, &snap_targets(st, &[], true), ex) {
+            self.delta = t - e;
+            self.guide = Some(t);
+        }
     }
 }
