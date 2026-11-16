@@ -150,7 +150,7 @@ fn main() {
             let steps = schedule(&tl, range, &sources).unwrap_or_else(|e| die(e.to_string()));
             for s in &tl.sources {
                 if let Some(r) = sources.open_report(s.id) {
-                    println!("reel={} {r}", s.reel);
+                    println!("reel={} {r}{}", s.reel, sources.summary(s.id).map(|x| format!(" summary=\"{x}\"")).unwrap_or_default());
                 }
             }
             for s in steps {
