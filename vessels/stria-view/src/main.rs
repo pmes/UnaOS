@@ -251,7 +251,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face);
-    let presses = presses_json(c, &presses); let export = export_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -512,6 +512,8 @@ fn transport() -> TetraNode {
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
         button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
         button("export", "Export"), // NLEFACEEXPORT (SR694): exports beside the document (`<stem>-export/`, H.264), off the face's thread
+        button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
+        button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
     ])
 }
 
@@ -611,4 +613,33 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
     face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t}}}")).unwrap_or_default()
+}
+
+// ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
+/// The witness's `"range"` field, only when both marks are set (`Face::marks`); the default line is unchanged.
+fn range_json(face: &Face) -> String {
+    match face.marks() {
+        (Some(a), Some(b)) => format!(",\"range\":[{a},{b}]"),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod exportrange_tests {
+    use super::*;
+
+    /// NLE5DEXPORTRANGE (SR717): `in` / `out` ride the verb road; the ruler-seek script sets the marks and the witness line
+    /// carries them; a face with no marks (or one) adds nothing.
+    #[test]
+    fn nle5dexportrange_witness_range_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&face, "in").as_deref(), Some([SMessage::Input { text, .. }]) if text == "in"));
+        assert!(matches!(token(&face, "out").as_deref(), Some([SMessage::Input { text, .. }]) if text == "out"));
+        assert_eq!(range_json(&face), "");
+        assert!(drive(&mut face, "ruler:5,in").is_empty());
+        assert_eq!((face.marks(), range_json(&face)), ((Some(5), None), String::new()));
+        assert!(drive(&mut face, "ruler:15,out").is_empty());
+        assert_eq!(range_json(&face), r#","range":[5,15]"#);
+    }
 }

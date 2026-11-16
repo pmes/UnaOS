@@ -363,6 +363,7 @@ impl EditorState {
             "nudge+" => self.move_set(1),
             _ if rtrim_words(v).is_some() => self.rtrim_verb(v),
             _ if slipslide_words(v).is_some() => self.slipslide_verb(v),
+            _ if mark_words(v).is_some() => self.marks_verb(v),
             _ => return None,
         })
     }
@@ -543,4 +544,47 @@ fn slipslide_words(v: &str) -> Option<(bool, i64)> {
     };
     let delta = w.next()?.parse::<i64>().ok()?;
     w.next().is_none().then_some((slip, delta))
+}
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the export range's marks from the editor through the one commit (named tail block) ----
+// The marks live on the `Timeline` (`Timeline::marks`), so setting one is ONE commit (undo-able, it dirties the document,
+// `edl::write` saves it as `* UNA MARK`). `mark in` / `mark out` set that mark at the playhead keeping the other, `mark
+// clear` clears both; they ride THE verb dispatch both faces call. The host face's `in` / `out` toggles (SR717) call
+// `set_marks` too. Refused by name through `Timeline::set_marks`: `EditError::Marks`, `EditError::Negative`.
+impl EditorState {
+    /// The export marks set to `m` (one commit; the same marks again commit nothing).
+    pub fn set_marks(&mut self, m: (Option<i64>, Option<i64>)) -> Result<(), EditError> {
+        if self.timeline.marks == m {
+            return Ok(());
+        }
+        let tl = self.timeline.set_marks(m)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `mark` words of [`EditorState::verb`].
+    fn marks_verb(&mut self, v: &str) -> Result<(), EditError> {
+        let (ph, (a, b)) = (self.playhead, self.timeline.marks);
+        match mark_words(v) {
+            Some(Some(Edge::In)) => self.set_marks((Some(ph), b)),
+            Some(Some(Edge::Out)) => self.set_marks((a, Some(ph))),
+            Some(None) => self.set_marks((None, None)),
+            None => Err(EditError::Marks),
+        }
+    }
+}
+
+/// `mark in` -> `Some(Some(Edge::In))`, `mark out` -> `Some(Some(Edge::Out))`, `mark clear` -> `Some(None)`; any other
+/// shape is not this verb.
+fn mark_words(v: &str) -> Option<Option<Edge>> {
+    let mut w = v.split_ascii_whitespace();
+    if w.next() != Some("mark") {
+        return None;
+    }
+    let m = match w.next()? {
+        "in" => Some(Edge::In),
+        "out" => Some(Edge::Out),
+        "clear" => None,
+        _ => return None,
+    };
+    w.next().is_none().then_some(m)
 }
