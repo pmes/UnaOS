@@ -2229,3 +2229,63 @@ mod btrt_kats {
         assert_eq!(d.tracks()[0].colour.as_ref().map(|c| c.primaries), Some(1));
     }
 }
+
+// ---- NLE6UTP1SYNTH (LEDGER SR749): the synthetic reel both rings build (named tail block) ----
+/// NLE6UTP1SYNTH (SR749): the synthetic reel's audio rate (Stria's `nle::SYNTH_RATE` re-exports it).
+pub const SYNTH_RATE: u32 = 48_000;
+
+/// NLE6UTP1SYNTH (SR749): sample `i` of the synthetic reel whose frame ordinals start at `base`:
+/// `(base / 1000 mod 3) * 10000 + i mod 10000` (so a sample names its reel and its index).
+pub fn synth_sample(base: u32, i: u64) -> i16 {
+    ((base / 1000 % 3) as i32 * 10_000 + (i % 10_000) as i32) as i16
+}
+
+/// NLE6UTP1SYNTH (SR749): the codec-free synthetic reel (MP4) both rings build — `frames` `utp1` test-pattern frames, 64x48
+/// at `fps`, ordinals `base..`, a keyframe every 10 frames (track 1); mono 16-bit PCM at [`SYNTH_RATE`] of [`synth_sample`]s
+/// as long as the video (track 2); written with `x` (whole edit lists, colour). Stria's `nle::synth_source_with` calls it.
+pub fn synth_reel(base: u32, frames: u32, fps: u32, x: &Mp4Extras) -> Vec<u8> {
+    let fps = fps.max(1);
+    let mut video = test_pattern_track(1, 64, 48, fps, frames, 10);
+    for (i, s) in video.samples.iter_mut().enumerate() {
+        s.data = TestPatternPacket { frame: base + i as u32, width: 64, height: 48 }.encode();
+    }
+    let n = frames as u64 * SYNTH_RATE as u64 / fps as u64;
+    let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
+    let audio = pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
+    mp4_with(&[video, audio], &Mp4Options::default(), x)
+}
+
+#[cfg(test)]
+mod synth_reel_kats {
+    use super::*;
+
+    /// NLE6UTP1SYNTH (SR749): FNV-1a 64 of `synth_reel(1000, 30, 25)`, read on Stria's pre-move `synth_source` (the host
+    /// test `nle6utp1synth_host_reel_is_demux_cores` pins the same u64): the kernel's build is the host's bytes.
+    #[test]
+    fn synth_reel_pin() {
+        let fnv = |b: &[u8]| b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        assert_eq!(fnv(&synth_reel(1000, 30, 25, &Mp4Extras::default())), 0xbabb_167e_432a_5e6b);
+    }
+
+    /// NLE6UTP1SYNTH (SR749): the reel reads back — 30 `utp1` packets with ordinals 1000.., a keyframe every 10, and
+    /// 30 x 1920 mono 48 kHz samples, each [`synth_sample`]`(1000, i)`.
+    #[test]
+    fn synth_reel_decodes() {
+        let d = crate::Demuxer::open(synth_reel(1000, 30, 25, &Mp4Extras::default())).unwrap();
+        assert_eq!(d.tracks().len(), 2);
+        assert_eq!((d.tracks()[0].kind, d.tracks()[0].width, d.tracks()[0].height), (TrackKind::Video, 64, 48));
+        let vid: Vec<_> = d.track_samples(0).map(|s| (s.keyframe, d.packet_at(s).data)).collect();
+        assert_eq!(vid.len(), 30);
+        for (i, (key, data)) in vid.into_iter().enumerate() {
+            let t = TestPatternPacket::decode(&data).expect("a utp1 packet");
+            assert_eq!((t.frame, t.width, t.height, key), (1000 + i as u32, 64, 48, i % 10 == 0), "frame {i}");
+        }
+        let a = &d.tracks()[1];
+        assert_eq!((a.kind, a.sample_rate, a.channels), (TrackKind::Audio, SYNTH_RATE, 1));
+        let pcm: Vec<i16> = d.track_samples(1).flat_map(|s| d.packet_at(s).data).collect::<Vec<u8>>().chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(pcm.len(), 30 * 1920);
+        for (i, &v) in pcm.iter().enumerate() {
+            assert_eq!(v, synth_sample(1000, i as u64), "sample {i}");
+        }
+    }
+}

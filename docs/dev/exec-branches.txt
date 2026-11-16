@@ -1651,3 +1651,7 @@ h264enctwopassqpstepruntime|exec-rmbp-h264enctwopassqpstepruntime|/home/user/exe
 aetherfontdbcachesweep|exec-rmbp-aetherfontdbcachesweep|/home/user/exec/aetherfontdbcachesweep|cut 1a5748ebc|wave36 cut89h
 h264encpintrachroma|exec-rmbp-h264encpintrachroma|/home/user/exec/h264encpintrachroma|cut 1a5748ebc|wave36 cut89h
 aetherfontsynthesissmallcaps|exec-rmbp-aetherfontsynthesissmallcaps|/home/user/exec/aetherfontsynthesissmallcaps|cut 1a5748ebc|wave36 cut89h
+h264enctwopassqpstepcli|exec-rmbp-h264enctwopassqpstepcli|/home/user/exec/h264enctwopassqpstepcli|cut fb90fa5fa|wave36 cut90h
+hevcconcealweightedbidirect|exec-rmbp-hevcconcealweightedbidirect|/home/user/exec/hevcconcealweightedbidirect|cut fb90fa5fa|wave36 cut90h
+nle5dexportmessageduration|exec-rmbp-nle5dexportmessageduration|/home/user/exec/nle5dexportmessageduration|cut fb90fa5fa|wave36 cut90h
+hevcconcealweightedchroma|exec-rmbp-hevcconcealweightedchroma|/home/user/exec/hevcconcealweightedchroma|cut fb90fa5fa|wave36 cut90h

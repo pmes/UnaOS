@@ -649,14 +649,10 @@ fn to_i16(x: f32) -> i64 {
     (x as f64 * 32768.0).round().clamp(-32768.0, 32767.0) as i64
 }
 
-/// The synthetic sources' audio rate.
-pub const SYNTH_RATE: u32 = 48_000;
-
-/// Sample `i` of the synthetic source whose frame ordinals start at `base`: `(base / 1000 mod 3) * 10000 + i mod 10000`
-/// (so a sample names its source and its index).
-pub fn synth_sample(base: u32, i: u64) -> i16 {
-    ((base / 1000 % 3) as i32 * 10_000 + (i % 10_000) as i32) as i16
-}
+/// The synthetic sources' audio rate, and sample `i` of the synthetic source whose frame ordinals start at `base`:
+/// `(base / 1000 mod 3) * 10000 + i mod 10000` (so a sample names its source and its index). NLE6UTP1SYNTH (SR749): both
+/// live in demux_core's `build` beside `synth_reel`, the reel both rings build.
+pub use gneiss_pal::dsp::demux::build::{SYNTH_RATE, synth_sample};
 
 /// A codec-free test source (MP4): `frames` `utp1` test-pattern frames, 64x48 at `fps`, ordinals `base..`, a keyframe
 /// every 10 frames; plus mono 16-bit PCM at [`SYNTH_RATE`] of [`synth_sample`]s, as long as the video.
@@ -667,15 +663,7 @@ pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
 /// EDITMAP (SR223): [`synth_source`] written with DEMUXSEEK's [`build::Mp4Extras`] (whole edit lists: track 1 is the video,
 /// track 2 the audio).
 pub fn synth_source_with(base: u32, frames: u32, fps: u32, x: &build::Mp4Extras) -> Vec<u8> {
-    let fps = fps.max(1);
-    let mut video = build::test_pattern_track(1, 64, 48, fps, frames, 10);
-    for (i, s) in video.samples.iter_mut().enumerate() {
-        s.data = build::TestPatternPacket { frame: base + i as u32, width: 64, height: 48 }.encode();
-    }
-    let n = frames as u64 * SYNTH_RATE as u64 / fps as u64;
-    let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
-    let audio = build::pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
-    build::mp4_with(&[video, audio], &build::Mp4Options::default(), x)
+    build::synth_reel(base, frames, fps, x) // NLE6UTP1SYNTH (SR749): the body moved to demux_core's build (ONE source)
 }
 
 /// The frame at source tick `src_t` of `src` from the decode run `run`: a step with `seek`, or a run on another
@@ -987,13 +975,16 @@ impl Sources {
     /// Source `id`'s person's line: its video track's codec, size, profile tokens (`dsp::video::profile_level`) and bit rate
     /// (`media::bitrate_of` over the track's btrt, its SPS HRD rate and the file's bytes over its duration), through
     /// `media::summary_parts` — the SAME `Track` facts and fns `Player::open_from` fills `MediaInfo` from. `None` for an
-    /// unknown id or a reel with nothing to say. Reads the open demuxer only (no survey walk, no lock).
+    /// unknown id or a reel with nothing to say. Reads the open demuxer only (no survey walk, no lock). STRIAINFOREELAUDIO (SR761):
+    /// then ` | <audio decoder> <rate>` from the reel's audio Track (`media::track_audio_decoder` / `media::track_audio_bitrate`).
     pub fn summary(&self, id: SourceId) -> Option<String> {
         let m = self.get(id).ok()?;
         let v = m.video.map(|i| &m.demux.tracks()[i]);
         let (codec, w, h) = v.map_or(("", 0, 0), |t| (t.codec_name.as_str(), t.width, t.height));
         let profile = v.and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default();
         let rate = crate::media::bitrate_of(v.and_then(|t| t.btrt), v.and_then(gneiss_pal::dsp::video::hrd_bit_rate), m.demux.bytes().len() as u64, m.demux.duration_ns());
-        Some(crate::media::summary_parts(codec, w, h, &profile, &rate)).filter(|s| !s.is_empty())
+        let a = m.audio.map(|i| &m.demux.tracks()[i]); // STRIAINFOREELAUDIO (SR761): the reel's audio track, as the Player's first audio track
+        let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
+        Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
 }
