@@ -4473,7 +4473,7 @@ fn paint_img_alt(
     let ch = (layout_box.size.height - bord.top - pad.top - bord.bottom - pad.bottom).max(0.0);
     let (text, tx, ty, inset) = match layout_core::img_fallback_of(layout, node_id) {
         layout_core::ImgFallback::None => return,
-        layout_core::ImgFallback::InlineAlt(t) => (t, cx, cy, 0.0),
+        layout_core::ImgFallback::InlineAlt(t) => return paint_img_alt_lines(layout, node_id, &t, cx, cy, cw, ch, layout_box, inherited, surface, width, height, damage_rects, clip),
         layout_core::ImgFallback::BoxedAlt { text, frame } => {
             if frame && cw >= 2.0 && ch >= 2.0 {
                 let silver = (192, 192, 192);
@@ -4510,4 +4510,29 @@ fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -
         .unwrap_or((false, None));
     let status = layout_core::file_status(value.as_deref(), multiple, 1);
     crate::pdf::thumbs::ellipsize(adv, &status, avail.max(0.0) as f64).into_owned()
+}
+
+// ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's alt text wrapped at its box width (named tail block) ----
+
+/// AETHERIMGALTINLINEWRAP (SR707): `paint_img_alt`'s InlineAlt arm: the alt text, text-transformed, in the element's
+/// font, line height and colour, from the content box's origin (cx, cy), broken by `draw_text` (`draw_lines`: the
+/// text-leaf painter's `break_lines`) at the width layout_core's `run_pass` measured the img's run into: the UNROUNDED
+/// content width + 0.01, the flow text leaf's rule (f32::MAX under `nowrap`, as `measure_text_run`'s white-space 1),
+/// so the lines are the ones the box was sized by (`img_alt_cap`: the containing block's width); clipped to the content
+/// box met with the running clip.
+#[allow(clippy::too_many_arguments)]
+fn paint_img_alt_lines(
+    layout: &LayoutTree, node_id: NodeId, text: &str, cx: f32, cy: f32, cw: f32, ch: f32, layout_box: &taffy::Layout,
+    inherited: &Inherited, surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    if text.is_empty() || inherited.text_hidden {
+        return;
+    }
+    let text = transform_text(text, inherited.text_transform);
+    let (bord, pad) = (layout_box.border, layout_box.padding);
+    let edges = bord.left + pad.left + bord.right + pad.right;
+    let wrap_w = (layout.taffy.unrounded_layout(node_id).size.width.max(layout_box.size.width) - edges).max(0.0) + 0.01;
+    let max_w = if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) };
+    let clip = (clip.0.max(cx), clip.1.max(cy), clip.2.min(cx + cw), clip.3.min(cy + ch));
+    draw_text(&text, cx, cy, max_w, &inherited.advancer(), inherited.line_height, inherited.color, false, surface, width, height, damage_rects, clip);
 }

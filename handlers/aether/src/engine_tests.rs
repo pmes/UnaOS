@@ -4548,4 +4548,32 @@ mod tests {
             assert_eq!(got, want, "#{id}: computed caption-side");
         }
     }
+
+    // ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's text wraps in a narrow column (named tail block) ----
+
+    /// AETHERIMGALTINLINEWRAP (SR707): a failed, unsized img whose 20-word alt is far wider than its 120px column wraps
+    /// as text does: its box is no wider than the column and several lines tall, the second line carries ink, and nothing
+    /// paints right of the column. (SR681's short alt keeps its one line: `img_alt_inline_when_unsized_and_failed`.)
+    #[test]
+    fn img_alt_inline_wraps_in_a_narrow_column() {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div style="width:120px"><img id="w" src="missing.png" alt="{alt}"></div>
+            <div><span id="s">Hello</span></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let (_, _, _, sh) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "w");
+        assert!(w > 20.0 && w <= 120.5, "w: the box is no wider than the column ({w})");
+        assert!(sh > 8.0 && h > sh * 1.5, "w: more than one line tall ({h} vs a line's {sh})");
+        let (x0, x1) = (l.floor() as usize, (l + w).ceil() as usize);
+        let ink2 = imgalt_ink(&engine, x0, x1, (t + sh).floor() as usize, (t + 2.0 * sh).ceil() as usize);
+        assert!(ink2 > 0, "w: the second line paints");
+        assert_eq!(imgalt_ink(&engine, 122, 400, t.floor() as usize, (t + h).ceil() as usize), 0, "w: nothing paints right of the column");
+    }
 }
