@@ -810,10 +810,10 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                 // edges (ua_control's file arm), so this is the whole border box and the inner button's own edges
                 // (`push_button_edges`) are inside it, the height the button's border box (line + 6).
                 "file" => {
-                    let (button, status) = file_label(attr("multiple").is_some());
+                    let (button, value) = (file_label(attr("multiple").is_some()).0, attr("value"));
                     let (b, p) = push_button_edges();
                     let (ew, eh) = (b.left + p.left + p.right + b.right, b.top + p.top + p.bottom + b.bottom);
-                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(status))), line + eh))
+                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(&*file_status(value.as_deref(), attr("multiple").is_some(), 1)))), line + eh))
                 }
                 // html.css: a fixed 50 x 27 swatch border box, font-independent. AETHERCOLORUAEDGES (SR458): over the color
                 // arm's own edges in ua_control (border 1px + padding 1px 2px = 6 x 4), so the content is html.css's 44 x 23.
@@ -3056,4 +3056,27 @@ fn abs_containing_block<H: Host>(tree: &LayoutTree<H>, parent: taffy::NodeId) ->
     }
     let (vw, vh) = tree.viewport;
     Some((0.0, 0.0, vw, vh))
+}
+
+// ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status text from its value (named tail block) ----
+
+/// AETHERFILECHOSEN (SR682): the status text a file input shows after its Choose-File button (Chromium's
+/// LayoutFileUploadControl / FileInputType status): `"N files"` when `multiple` and `count` > 1 files are chosen, else the
+/// chosen file's name (the basename after the last `\` or `/`, so `C:\fakepath\report.pdf` shows `report.pdf`), else
+/// `file_label`'s "No file chosen" (an absent or empty value, an empty basename, or `count` 0). The ONE rule
+/// `control_intrinsic`'s file arm sizes the box by and both rings paint (render `paint_file_color`, AETHER.ELF
+/// `file_color`). Chromium ignores a file input's `value` attribute; with no picker the attribute is the stand-in source,
+/// one name (callers pass `count` 1), until a picker or the JS FileList feeds the status (AETHER-FILEPICKER,
+/// AETHER-FILECHOSEN-JSFILES owed).
+pub fn file_status<'a>(value: Option<&'a str>, multiple: bool, count: usize) -> alloc::borrow::Cow<'a, str> {
+    use alloc::borrow::Cow;
+    if multiple && count > 1 {
+        return Cow::Owned(alloc::format!("{count} files"));
+    }
+    let name = value.map(|v| v.rsplit(|c: char| c == '\\' || c == '/').next().unwrap_or(v)).unwrap_or("");
+    if name.is_empty() || count == 0 {
+        Cow::Borrowed(file_label(multiple).1)
+    } else {
+        Cow::Borrowed(name)
+    }
 }

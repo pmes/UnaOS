@@ -531,7 +531,7 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
     let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
     let ty = ty.trim();
     if ty.eq_ignore_ascii_case("file") {
-        let (button, status) = layout_core::file_label(n.attr("multiple").is_some());
+        let (button, status) = (layout_core::file_label(n.attr("multiple").is_some()).0, layout_core::file_status(n.attr("value").as_deref(), n.attr("multiple").is_some(), 1).into_owned());
         let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
         let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
         let mut t = cx.fonts.0.borrow_mut();
@@ -549,7 +549,7 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
         let (px0, py0, px1, py1) = whole.clip;
         // AETHERFILEFACE (SR463): ButtonFace on the button sub-box only (the input paints none), this ring's push rule: no UA frame.
         cv.fill(fl(ox), fl(oy), fl(ox + btn_bw) - fl(ox), fl(oy + oh) - fl(oy), rgb(layout_core::BUTTON_FACE));
-        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status)] {
+        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status.as_str())] {
             t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
                 let (fx, fy) = (gx as f32, gy as f32);
                 if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {

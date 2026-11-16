@@ -54,13 +54,19 @@
 //! so an EDL with no policy writes as before. A SIZE line may sit anywhere (it applies once every reel exists); one naming a
 //! reel nothing cites, an unknown policy, or a second SIZE line for one reel is a syntax error.
 //!
+//! NLEWIPES (LEDGER SR679): `* UNA EASE <in|out|inout>` is the transition's [`crate::Ease`], written right after its
+//! INCOMING line (the `D` / `W` line, or a to-black's `BL` line) and only when not linear, so an EDL with no ease writes as
+//! before. One with no transition's incoming line above it, an unknown word, or a second EASE for one transition is a
+//! syntax error. Wipe codes gain W007, W023-W026, W043-W047, W102, W119, W205-W207, W211-W214; the rest of the SMPTE table
+//! is refused, each by name in [`WipeDir::REFUSED`].
+//!
 //! [`write`] produces exactly what [`parse`] reads back: `write(parse(write(tl)))` is byte-identical.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Clip, EditError, Kind, SizePolicy, Timeline, Transition, TransitionKind, WipeDir};
+use crate::{Clip, Ease, EditError, Kind, SizePolicy, Timeline, Transition, TransitionKind, WipeDir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdlError {
@@ -168,6 +174,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     let mut trans: Vec<(Kind, usize, Transition, &str, i64, usize)> = Vec::new();
     // NLESIZEPOLICY (SR394): each `* UNA SIZE` read: (reel, policy, line), applied once every source exists.
     let mut sizes: Vec<(&str, SizePolicy, usize)> = Vec::new();
+    // NLEWIPES (SR679): the transition (index into `trans`) whose incoming line is the event line just above.
+    let mut last_trans: Option<usize> = None;
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let l = raw.trim();
@@ -195,6 +203,9 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
+            if let Some(r) = l.strip_prefix("* UNA EASE ") {
+                ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
+            }
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
@@ -215,13 +226,15 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             return Err(EdlError::Duration { line });
         }
         let clip = Clip::new(crate::SourceId(0), tc[0], tc[1], tc[2]);
+        last_trans = None; // NLEWIPES (SR679): set again below by a transition's incoming line
         if let Some(tk) = tk {
             // The incoming line of a transition: it needs its outgoing line (same number, channel and record point).
             let dur = edl_frames(w[4]).ok_or(EdlError::Transition { line })?;
             match from.take() {
                 Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && !(reel == "BL" && w[1] == "BL") => {
-                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL" };
+                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL", ease: Ease::Linear };
                     trans.push((kind, num, x, reel, o.src_in, line));
+                    last_trans = Some(trans.len() - 1); // NLEWIPES (SR679)
                 }
                 _ => return Err(EdlError::Transition { line }),
             }
@@ -404,6 +417,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.at, fps),
             timecode(c.end(), fps)
         ));
+        s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
         if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
@@ -449,6 +463,7 @@ fn to_black_lines(tl: &Timeline, ti: usize, x: &Transition, num: usize, ch: &str
     let (z, d, e) = (timecode(0, fps), timecode(x.dur, fps), timecode(x.at + x.dur, fps));
     let mut s = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
     s.push_str(&format!("{:03}  {:<8} {:<5} {:<8} {z} {d} {r} {e}\n", num, "BL", ch, code_field(x)));
+    s.push_str(&ease_line(Some(x))); // NLEWIPES (SR679)
     Ok(s)
 }
 
@@ -460,4 +475,26 @@ fn size_comment(r: &str, line: usize) -> Result<(&str, SizePolicy, usize), EdlEr
     }
     let p = SizePolicy::from_name(w[1]).ok_or(EdlError::Syntax { line })?;
     Ok((w[0], p, line))
+}
+
+// ---- NLEWIPES (LEDGER SR679): the `* UNA EASE` line (named tail block) ----
+
+/// NLEWIPES: the words after `* UNA EASE ` applied to the transition whose incoming line is just above (`None`: no such
+/// line). `in` / `out` / `inout` only (linear is the absence of the line); a second EASE for one transition is refused.
+fn ease_comment(r: &str, line: usize, x: Option<&mut Transition>) -> Result<(), EdlError> {
+    let x = x.ok_or(EdlError::Syntax { line })?;
+    let e = Ease::from_name(r.trim()).filter(|e| *e != Ease::Linear).ok_or(EdlError::Syntax { line })?;
+    if x.ease != Ease::Linear {
+        return Err(EdlError::Syntax { line });
+    }
+    x.ease = e;
+    Ok(())
+}
+
+/// NLEWIPES: the `* UNA EASE` line of the transition on an incoming line (empty for none or a linear one).
+fn ease_line(x: Option<&Transition>) -> String {
+    match x.map(|x| x.ease) {
+        Some(e) if e != Ease::Linear => format!("* UNA EASE {}\n", e.name()),
+        _ => String::new(),
+    }
 }

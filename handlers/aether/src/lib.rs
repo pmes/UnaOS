@@ -136,7 +136,7 @@ const LINE_STEP: f64 = 40.0;
 const PAGE_FRACTION: f64 = 0.875;
 
 impl AetherEngine {
-    pub fn new() -> Self {
+    pub fn new() -> Self { crate::fonts::register_db_cache(); // AETHERFONTDBCACHE (SR684): before any font use
         Self {
             document: None,
             layout_tree: None,

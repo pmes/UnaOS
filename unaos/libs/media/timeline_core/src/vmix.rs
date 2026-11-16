@@ -9,7 +9,8 @@
 //!   incoming's weight `t` (NLE3, LEDGER SR202): a dissolve is pixel_core's `blend_nonpremult` of the incoming at alpha
 //!   `round(255 t)` over the outgoing; a wipe copies the incoming where its SMPTE mask holds (W001 / W002 at
 //!   `round(w t)` / `round(h t)`; NLE3c W041 / W101 exact fractions, W201 the clock hand; NLE3cBLACK W003-W006, W021 /
-//!   W022, W042, W202-W204). The clock angle is `libm::atan2` (no_std: `core` has none).
+//!   W022, W042, W202-W204; NLEWIPES SR679 the SMPTE families below the tail comment: W007, W023-W026, W043-W047,
+//!   W102, W119, W205-W207, W211-W214). The clock angle is `libm::atan2` (no_std: `core` has none).
 //! * [`take_outgoing`]: at a transition tick whose outgoing source continues the live decode run (`seek` none) and is
 //!   not already the mix run, that run becomes the mix run; outside a transition the mix run is dropped.
 
@@ -52,6 +53,19 @@ pub fn mix_step(kind: TransitionKind, t: Frac, out: &mut [u8], b: &[u8], w: u32,
                         WipeDir::BarnDoorVertical => (2 * xi + 1 - wi).abs() * den < wi * num,
                         WipeDir::BarnDoorHorizontal => (2 * yi + 1 - hi).abs() * den < hi * num,
                         WipeDir::DiagonalTopRight => (wi - 1 - xi + yi) * den < (wi + hi) * num,
+                        // NLEWIPES (SR679): one arm per SMPTE family, the family fns at the file tail.
+                        WipeDir::FourBoxCornersIn => four_box(xi, yi, wi, hi, num, den),
+                        WipeDir::EdgeBoxTop | WipeDir::EdgeBoxRight | WipeDir::EdgeBoxBottom | WipeDir::EdgeBoxLeft => edge_box(dir, xi, yi, wi, hi, num, den),
+                        WipeDir::BowTieVertical | WipeDir::BowTieHorizontal => bow_tie(dir, xi, yi, wi, hi, num, den),
+                        WipeDir::BarnDoorDiagonalBottomLeft | WipeDir::BarnDoorDiagonalTopLeft | WipeDir::DoubleBarnDoor => diagonal_doors(dir, xi, yi, wi, hi, num, den),
+                        WipeDir::Diamond | WipeDir::Circle => iris(dir, xi, yi, wi, hi, num, den),
+                        WipeDir::PinWheelTwoVertical
+                        | WipeDir::PinWheelTwoHorizontal
+                        | WipeDir::PinWheelFour
+                        | WipeDir::FanCenterTop
+                        | WipeDir::FanCenterRight
+                        | WipeDir::DoubleFanVertical
+                        | WipeDir::DoubleFanHorizontal => sweep(dir, x, y, w, h, num, den),
                     };
                     if incoming {
                         let i = (y * w + x) * 4;
@@ -174,4 +188,83 @@ mod tests {
         assert!(!take_outgoing(&step(None), &mut live, &mut mix, |r| *r));
         assert_eq!(mix, None);
     }
+}
+
+// ---- NLEWIPES (LEDGER SR679): the SMPTE wipe families (named tail block) ----
+//
+// The codes and names are the W3C SMIL 3.0 Transition Effects Table 1 (SMPTE 258M-1993 governs); it publishes the shapes as
+// illustrations, so each fn states the geometry it draws. Centred doubled coordinates: X = 2x + 1 - w, Y = 2y + 1 - h
+// (|X| < w, |Y| < h), so u = X / w and v = Y / h lie in (-1, 1); f = num / den is the (eased) incoming weight. Every
+// test is an exact integer comparison except `sweep`, which reads the clock arms' `clock_angle`.
+
+/// W007 fourBoxWipe cornersIn: a box from each corner, `f` of its quadrant's width and height (a pixel's distance from
+/// its nearest vertical / horizontal frame edge against `f w / 2` / `f h / 2`).
+fn four_box(x: i64, y: i64, w: i64, h: i64, num: i64, den: i64) -> bool {
+    2 * x.min(w - 1 - x) * den < w * num && 2 * y.min(h - 1 - y) * den < h * num
+}
+
+/// W023-W026 boxWipe topCenter / rightCenter / bottomCenter / leftCenter: a box from an edge's midpoint, centred on the
+/// edge's axis as W101 (`|X| < f w`) and anchored on the edge as W003 (`y < f h`).
+fn edge_box(dir: WipeDir, x: i64, y: i64, w: i64, h: i64, num: i64, den: i64) -> bool {
+    let (cx, cy) = ((2 * x + 1 - w).abs() * den < w * num, (2 * y + 1 - h).abs() * den < h * num);
+    match dir {
+        WipeDir::EdgeBoxTop => cx && y * den < h * num,
+        WipeDir::EdgeBoxRight => cy && (w - 1 - x) * den < w * num,
+        WipeDir::EdgeBoxBottom => cx && (h - 1 - y) * den < h * num,
+        _ => cy && x * den < w * num,
+    }
+}
+
+/// W043 / W044 bowTieWipe vertical / horizontal: `|v| - |u| > 1 - 2 f` (vertical: triangles on the top and bottom edges
+/// whose apexes meet at the centre at f = 1/2, the hourglass `|v| > |u|`, then widen to the sides); horizontal swaps u, v.
+fn bow_tie(dir: WipeDir, x: i64, y: i64, w: i64, h: i64, num: i64, den: i64) -> bool {
+    let (ax, ay) = ((2 * x + 1 - w).abs(), (2 * y + 1 - h).abs());
+    let lead = if dir == WipeDir::BowTieVertical { ay * w - ax * h } else { ax * h - ay * w };
+    lead * den > w * h * (den - 2 * num)
+}
+
+/// W045 / W046 barnDoorWipe diagonalBottomLeft / diagonalTopLeft: a band opening about the bottom-left to top-right
+/// diagonal (`|u + v| < 2 f`) / the top-left to bottom-right diagonal (`|u - v| < 2 f`); W047 miscDiagonalWipe
+/// doubleBarnDoor: both bands.
+fn diagonal_doors(dir: WipeDir, x: i64, y: i64, w: i64, h: i64, num: i64, den: i64) -> bool {
+    let (xx, yy) = (2 * x + 1 - w, 2 * y + 1 - h);
+    let bl = (xx * h + yy * w).abs() * den < 2 * w * h * num;
+    let tl = (xx * h - yy * w).abs() * den < 2 * w * h * num;
+    match dir {
+        WipeDir::BarnDoorDiagonalBottomLeft => bl,
+        WipeDir::BarnDoorDiagonalTopLeft => tl,
+        _ => bl || tl,
+    }
+}
+
+/// W102 irisWipe diamond: `|u| + |v| < 2 f`; W119 ellipseWipe circle: `X^2 + Y^2 < f^2 (w^2 + h^2)` (the radius
+/// reaches the corners at f = 1), in i128 (an eased `den` reaches `(dur + 1)^3`, its square past i64).
+fn iris(dir: WipeDir, x: i64, y: i64, w: i64, h: i64, num: i64, den: i64) -> bool {
+    let (xx, yy) = (2 * x + 1 - w, 2 * y + 1 - h);
+    if dir == WipeDir::Diamond {
+        return (xx.abs() * h + yy.abs() * w) * den < 2 * w * h * num;
+    }
+    let (xx, yy, w, h, num, den) = (xx as i128, yy as i128, w as i128, h as i128, num as i128, den as i128);
+    (xx * xx + yy * yy) * den * den < (w * w + h * h) * num * num
+}
+
+/// W205-W207 pinWheelWipe, W211 / W212 fanWipe centerTop / centerRight, W213 / W214 doubleFanWipe fanOutVertical /
+/// fanOutHorizontal: ONE angular family over `n` blades starting at clock angle `q` (`clock_angle`, clockwise from
+/// twelve): with `p = 2 pi / n` and `r = (a - q) mod p`, a pinwheel's hands sweep one way (`r < p f`), a fan opens both
+/// ways from its start (`min(r, p - r) < p f / 2`).
+fn sweep(dir: WipeDir, x: usize, y: usize, w: usize, h: usize, num: i64, den: i64) -> bool {
+    let quarter = core::f64::consts::TAU / 4.0;
+    let (n, q, fan) = match dir {
+        WipeDir::PinWheelTwoVertical => (2.0, 0.0, false),
+        WipeDir::PinWheelTwoHorizontal => (2.0, quarter, false),
+        WipeDir::PinWheelFour => (4.0, 0.0, false),
+        WipeDir::FanCenterTop => (1.0, 0.0, true),
+        WipeDir::FanCenterRight => (1.0, quarter, true),
+        WipeDir::DoubleFanVertical => (2.0, 0.0, true),
+        _ => (2.0, quarter, true),
+    };
+    let p = core::f64::consts::TAU / n;
+    let r = rem_tau(clock_angle(x, y, w, h) - q) % p;
+    let f = num as f64 / den as f64;
+    if fan { r.min(p - r) < p * f / 2.0 } else { r < p * f }
 }
