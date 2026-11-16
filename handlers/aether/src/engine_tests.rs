@@ -3937,6 +3937,8 @@ mod tests {
         assert!(qw > 0.0 && (ql + qw / 2.0 - (cl + cw / 2.0)).abs() <= 2.0, "the search field is centred in its align=center cell (field {ql} + {qw}, cell {cl} + {cw})");
         let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
         assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
+        // AETHERTEXTALIGNCODES (SR724): align=left is Blink's -webkit-left (code 7), not CSS left.
+        assert_eq!(engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.querySelector('td[align=left]')).textAlign").unwrap(), "-webkit-left", "align=left's computed text-align is -webkit-left");
     }
 
     /// ABSSHRINK (LEDGER SR420): CSS 2.2 §10.3.7 — a `right: 8px` absolutely positioned pill with an auto width is
