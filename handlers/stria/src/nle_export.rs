@@ -713,6 +713,10 @@ impl RenderSink for Ticked<'_> {
     fn track_pcm(&mut self, out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
         self.sink.track_pcm(out_t, track, rate, channels, interleaved);
     }
+    /// NLE5DEXPORTSTOP (SR705): a latched error (the face's cancel, or an encode failure) ends the render at its next step.
+    fn stop(&self) -> bool {
+        self.sink.err.is_some()
+    }
 }
 
 /// The video names [`video_named`] takes (`nle export --video`'s words).
