@@ -2242,3 +2242,101 @@ fn nle3eslipstep_help_and_the_one_frame_keys() {
     assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(SourceId(1), 1, 11, 10), "one frame, unchanged");
     println!("nle3eslipstep: help rows={} keys={}", rows.len(), KEYS.len());
 }
+
+// ---- NLE3ESLIPDRAG (LEDGER SR760): a Ctrl / Cmd drag slips on the clip body, slides on its trim handle (named tail block) ----
+use stria::nle_face::DragKind;
+
+/// A press / release as the surface sends it, carrying modifier bits (bandy's `MOD_*`).
+fn nle3eslipdrag_btn(down: bool, x: f64, y: f64, mods: u8) -> bandy::SMessage {
+    bandy::SMessage::BrowserButton { down, x, y, mods, surface: 0 }
+}
+
+/// Ctrl-press `(x, y)`, move 40 px by `dx`, release (Ctrl or Meta by `mods`).
+fn nle3eslipdrag_drag(face: &mut Face, x: f64, y: f64, dx: f64, mods: u8) {
+    face.on(&nle3eslipdrag_btn(true, x, y, mods));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + dx, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x + dx, y, mods));
+}
+
+/// Rule: a Ctrl-press on B's body (SR737's pair: V1 A[13,23)@0 B[0,10)@10 A[23,33)@25, 8 px a tick) dragged 40 px is a
+/// Slip of 5 ticks: during the drag the preview (`Drag::shown`) holds B's window at [5,15) while the committed timeline is
+/// unchanged; the release equals a twin editor's `slip 5` (THE op, one commit); undo restores; the Meta (Cmd) press is the same.
+#[test]
+fn nle3eslipdrag_ctrl_drag_on_the_body_slips() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    assert_eq!(l.tick_at(x + 40.0) - l.tick_at(x), 5, "40 px is 5 ticks at the face's zoom");
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx)), Some((DragKind::Slip, 1)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    let shown = face.dragging().and_then(|d| d.shown(&face.state)).map(|s| s.timeline.tracks[0].clips[1]);
+    assert_eq!(shown, Some(Clip::new(b, 5, 15, 10)), "the preview shows the slipped source window");
+    assert_eq!(face.state.timeline, tl, "nothing committed during the drag");
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(twin.verb("slip 5"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_SUPER);
+    assert_eq!(face.state.timeline, twin.timeline, "Cmd is Ctrl's twin");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipdrag: Ctrl-drag 40 px on B's body = slip 5");
+}
+
+/// Rule: a Ctrl-press on the selected B's in handle dragged 40 px is a Slide of 5 ticks (A's out edge follows), snapped
+/// as Move snaps: B's out edge lands on A@25 (the guide) — a twin's `slide 5`.
+#[test]
+fn nle3eslipdrag_ctrl_drag_on_the_handle_slides() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (a, b) = (SourceId(0), SourceId(1));
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 + 1.0, l.point(0, 15).1);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx)), Some((DragKind::Slide, 1)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((5, Some(25))));
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(twin.verb("slide 5"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(&face.state.timeline.tracks[0].clips[..2], &[Clip::new(a, 13, 28, 0), Clip::new(b, 0, 10, 15)], "the neighbour follows");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipdrag: Ctrl-drag 40 px on B's in handle = slide 5");
+}
+
+/// Rule: a slip past the source (B[0,10) dragged 40 px left: src_in -5) is refused by name on the message line through
+/// the drag's `{e}` road; the preview is None during it, and the timeline and undo depth do not move.
+#[test]
+fn nle3eslipdrag_slip_past_the_source_is_refused_by_name() {
+    let (mut face, _twin, tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    face.on(&bandy::SMessage::BrowserMouseMove(x - 40.0, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.delta)), Some((DragKind::Slip, -5)));
+    assert!(face.dragging().and_then(|d| d.shown(&face.state)).is_none(), "a refused slip previews nothing");
+    face.on(&nle3eslipdrag_btn(false, x - 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(face.last_error.take(), Some(format!("drag: {}", EditError::OutOfSource)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("nle3eslipdrag: slip -5 at [0,10) -> {}", EditError::OutOfSource);
+}
+
+/// Rule: without Ctrl / Cmd the presses are today's: the body a Move (Alt alone the unsnapped Move, SR306), the handle a TrimIn.
+#[test]
+fn nle3eslipdrag_plain_presses_keep_move_and_trim() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::Move, true)));
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::Move, false)));
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(true, l.x_of(10) as f64 + 1.0, y, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TrimIn));
+    println!("nle3eslipdrag: plain body = Move, Alt body = unsnapped Move, plain handle = TrimIn");
+}
