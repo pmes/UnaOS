@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -30,7 +30,7 @@
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
 //! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP); `--crf` (0..=51,
 //! H264ENCVBRCRF SR383) a constant quality instead (h264enc_core's `RcMode::Crf`), exclusive with `--bitrate`. `--scenecut [K]`
-//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0). `--audio aac` (or
+//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--pass 1 --stats <f>` / `--pass 2 --stats <f>` (H264ENCTWOPASSFILE SR719, with `--bitrate` and `--video h264`, x264's two-process form) split the two: pass 1 is the CBR export, its records written to `<f>` in h264enc_core's ONE stats text (`rc::write_stats`; `nle: two-pass pass1 pictures=<n> bytes=<b> stats=<f>`), pass 2 reads `<f>` (`rc::read_stats`, refused by name, and on an fps or picture count other than the timeline's) and plans the export from it (`nle: two-pass pass2 stats=<f> pictures=<n>`); `two_pass_of` / `pass2_stats` / `write_pass1`, file tail. `--hrd` (H264ENCHRD SR699, with `--bitrate`) signals the CBR bucket as the NAL HRD (VUI nal_hrd_parameters, buffering-period / pic-timing SEI, filler). `--audio aac` (or
 //! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
@@ -49,7 +49,7 @@ use timeline_core::{Kind, Timeline, edl};
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -115,7 +115,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
-    let mut scenecut = None::<u8>; let mut aq = None::<u8>; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
+    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -132,7 +132,11 @@ fn main() {
             "--mkv" => container = Container::Mkv,
             "--crf" => crf = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--scenecut" => scenecut = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 40 }),
+            "--two-pass" => two_pass = TwoPass::InProcess, // H264ENCTWOPASS (SR698): two exports, the second planned from the first
+            "--pass" => pass = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())), // H264ENCTWOPASSFILE (SR719): x264's --pass 1|2
+            "--stats" => stats = Some(it.next().unwrap_or_else(|| usage()).clone()), // H264ENCTWOPASSFILE (SR719): the first pass's records on disk
             "--aq" => aq = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 10 }), // H264ENCAQ (SR693): h264enc_core's `Config::aq`
+            "--hrd" => hrd = true, // H264ENCHRD (SR699): h264enc_core's `Config::hrd`
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -180,8 +184,9 @@ fn main() {
             if bitrate.is_some() && crf.is_some() {
                 die("--bitrate and --crf are exclusive".into());
             }
+            let two_pass = two_pass_of(two_pass, pass, stats, bitrate.is_some(), &video); // H264ENCTWOPASS (SR698) / H264ENCTWOPASSFILE (SR719): the mode and its refusals (file tail)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, aq, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, aq, two_pass, hrd, container)
         }
         _ => usage(),
     }
@@ -189,14 +194,15 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, container: Container) {
-    let enc: Box<dyn VideoEncoder> = match video {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, container: Container) {
+    let mut kept = None; let enc: Box<dyn VideoEncoder> = match video {
         "png" => Box::new(PngSequence),
         "raw" => Box::new(RawSequence),
         "i420" => Box::new(I420Raw::default()),
         "y4m" => Box::new(Y4m::new(tl.tb.den as u32, tl.tb.num as u32)),
         "h264" => match (bitrate, crf) {
-            (Some(k), _) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
+            (Some(k), _) if two_pass.plans() => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_two_pass(k, tl.tb.den as u32, tl.tb.num as u32, pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container))),
+            (Some(k), _) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } // H264ENCTWOPASSFILE (SR719): the records' handle, written by `--pass 1`
             (None, Some(c)) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_quality(c, tl.tb.den as u32, tl.tb.num as u32)),
             (None, None) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq)),
         },
@@ -211,6 +217,8 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
     };
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
     let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else if matches!(video, "i420" | "y4m") { planar_export(tl, range, sources, dir, video, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
+    if r.stand_in_audio > 0 { eprintln!("nle: audio stand-in reels={}", r.stand_in_audio); } // NLESTANDINAUDIOEDITOR (SR713): reels whose audio rendered as the silent stand-in
+    if let (TwoPass::Pass1(f), Some(s)) = (&two_pass, &kept) { write_pass1(f, &s.borrow(), tl); } // H264ENCTWOPASSFILE (SR719): pass 1's records to `--stats` (file tail)
     println!(
         "{{\"codec\":\"{video}\",\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
         r.frames, r.files, r.bytes, r.fnv, r.pcm_frames
@@ -274,4 +282,87 @@ fn planar_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, 
     let (w, h) = size.get().unwrap_or((0, 0));
     eprintln!("nle: export {video} frames={} {w}x{h}", r.frames);
     r
+}
+
+// ---- H264ENCTWOPASS (LEDGER SR698): the first pass of `export --two-pass` (named tail block) ----
+/// H264ENCTWOPASS (SR698): the first pass — plumbing only: the same timeline exported once more through `stria::nle_export::export_as`
+/// as a CBR H.264 stream at `kbps` into `<dir>/pass1/` (no audio), its per-picture records read through `H264Encoder::stats`, the
+/// directory removed; `nle: two-pass pass1 pictures=<n> bytes=<b>` on stderr. A refusal is printed, exit 1.
+#[allow(clippy::too_many_arguments)]
+fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Vec<stria::nle_export::PicStat> {
+    let pass1 = std::path::Path::new(dir).join("pass1");
+    std::fs::create_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
+    let enc = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(kbps, tl.tb.den as u32, tl.tb.num as u32);
+    let stats = enc.stats();
+    export_as(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container).unwrap_or_else(|e| die(e.to_string()));
+    std::fs::remove_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
+    let v = stats.borrow().clone();
+    eprintln!("nle: two-pass pass1 pictures={} bytes={}", v.len(), v.iter().map(|p| p.bits).sum::<u64>() / 8);
+    v
+}
+
+// ---- H264ENCTWOPASSFILE (LEDGER SR719): export --pass 1|2 --stats <file> (named tail block) ----
+/// H264ENCTWOPASSFILE (SR719): where the two-pass export's first-pass records come from. `InProcess` is `--two-pass` (SR698,
+/// `pass1_stats`); `Pass1(f)` is the CBR export with its records written to `f`; `Pass2(f)` the export planned from `f`.
+enum TwoPass {
+    Off,
+    InProcess,
+    Pass1(String),
+    Pass2(String),
+}
+
+impl TwoPass {
+    /// The export is planned from a first pass (the `with_two_pass` arm).
+    fn plans(&self) -> bool {
+        matches!(self, TwoPass::InProcess | TwoPass::Pass2(_))
+    }
+}
+
+/// H264ENCTWOPASSFILE (SR719): the mode from `--two-pass`, `--pass N` and `--stats <f>` — plumbing only; each refusal by name, exit 1.
+fn two_pass_of(two_pass: TwoPass, pass: Option<u8>, stats: Option<String>, bitrate: bool, video: &str) -> TwoPass {
+    let mode = match (two_pass, pass, stats) {
+        (TwoPass::InProcess, Some(_), _) => die("--two-pass and --pass are exclusive".into()),
+        (TwoPass::InProcess, None, Some(_)) => die("--stats needs --pass 1|2".into()),
+        (m, None, None) => m,
+        (_, None, Some(_)) => die("--stats needs --pass 1|2".into()),
+        (_, Some(_), None) => die("--pass needs --stats <file>".into()),
+        (_, Some(1), Some(f)) => TwoPass::Pass1(f),
+        (_, Some(2), Some(f)) => TwoPass::Pass2(f),
+        (_, Some(_), Some(_)) => die("--pass takes 1 or 2".into()),
+    };
+    match mode {
+        TwoPass::InProcess if !bitrate => die("--two-pass needs --bitrate".into()),
+        TwoPass::Pass1(_) | TwoPass::Pass2(_) if !bitrate => die("--pass needs --bitrate".into()),
+        TwoPass::Pass1(_) | TwoPass::Pass2(_) if video != "h264" => die("--pass needs --video h264".into()),
+        m => m,
+    }
+}
+
+/// H264ENCTWOPASSFILE (SR719): the first-pass records the planned export takes — `--two-pass`: `pass1_stats` unchanged; `--pass 2`:
+/// `<f>` read through `rc::read_stats`, refused when its fps or picture count is not the timeline's (the count is the range in
+/// ticks, the export's frames), then `nle: two-pass pass2 stats=<f> pictures=<n>` on stderr. A refusal is printed, exit 1.
+#[allow(clippy::too_many_arguments)]
+fn pass2_stats(two_pass: &TwoPass, tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Vec<stria::nle_export::PicStat> {
+    let TwoPass::Pass2(f) = two_pass else { return pass1_stats(tl, range, sources, dir, qp, gop, kbps, scenecut, aq, container) };
+    let text = std::fs::read_to_string(f).unwrap_or_else(|e| die(format!("{f}: {e}")));
+    let s = stria::nle_export::read_stats(&text).unwrap_or_else(|e| die(format!("{f}: {e}")));
+    let fps = (tl.tb.den as u32, tl.tb.num as u32);
+    if s.fps != fps {
+        die(format!("{f}: fps {}/{}, the timeline {}/{}", s.fps.0, s.fps.1, fps.0, fps.1));
+    }
+    let frames = (range.end - range.start).max(0) as usize;
+    if s.pics.len() != frames {
+        die(format!("{f}: {} pictures, the export range {frames} frames", s.pics.len()));
+    }
+    eprintln!("nle: two-pass pass2 stats={f} pictures={}", s.pics.len());
+    s.pics
+}
+
+/// H264ENCTWOPASSFILE (SR719): pass 1's records (the CBR export's `H264Encoder::stats`) written to `f` in h264enc_core's ONE stats
+/// text (`rc::write_stats`) at the timeline's fps; `nle: two-pass pass1 pictures=<n> bytes=<b> stats=<f>` on stderr.
+fn write_pass1(f: &str, pics: &[stria::nle_export::PicStat], tl: &Timeline) {
+    let mut text = String::new();
+    stria::nle_export::write_stats(pics, (tl.tb.den as u32, tl.tb.num as u32), &mut text).unwrap_or_else(|e| die(format!("{f}: {e}")));
+    std::fs::write(f, &text).unwrap_or_else(|e| die(format!("{f}: {e}")));
+    eprintln!("nle: two-pass pass1 pictures={} bytes={} stats={f}", pics.len(), pics.iter().map(|p| p.bits).sum::<u64>() / 8);
 }

@@ -4550,6 +4550,64 @@ mod tests {
         }
     }
 
+    /// AETHERIMGBROKENICON (SR702): the broken-image icon shows only when the box has room for it (Chromium's
+    /// ImageSmallerThanAltImage, 16 + 2 px): a 40x40 failed img with alt="" paints the icon (layout_core's
+    /// `BROKEN_ICON`) in its slot; a 12x12 one paints nothing (no frame, no icon, no text).
+    #[test]
+    fn img_alt_broken_icon_only_when_room() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="r" src="missing.png" alt="" width="40" height="40"></div>
+            <div><img id="n" src="missing.png" alt="" width="12" height="12"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "r");
+        assert!((w - 40.0).abs() <= 0.5 && (h - 40.0).abs() <= 0.5, "r: the box keeps its 40x40 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "r: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "r: the icon's page outline");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "n");
+        assert!((w - 12.0).abs() <= 0.5 && (h - 12.0).abs() <= 0.5, "n: the box keeps its 12x12 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_painted(&engine, l, l + 12, t, t + 12), 0, "n: too small for the icon: nothing paints");
+    }
+
+    /// AETHERIMGBROKENICON (SR702): the pixels in (x0..x1, y0..y1) that are not the white page (`imgalt_ink` counts
+    /// only dark text ink; the icon's grey, blue and green are not dark).
+    fn imgalt_painted(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        (y0..y1).map(|y| (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count()).sum()
+    }
+
+    // ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's text wraps in a narrow column (named tail block) ----
+
+    /// AETHERIMGALTINLINEWRAP (SR707): a failed, unsized img whose 20-word alt is far wider than its 120px column wraps
+    /// as text does: its box is no wider than the column and several lines tall, the second line carries ink, and nothing
+    /// paints right of the column. (SR681's short alt keeps its one line: `img_alt_inline_when_unsized_and_failed`.)
+    #[test]
+    fn img_alt_inline_wraps_in_a_narrow_column() {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div style="width:120px"><img id="w" src="missing.png" alt="{alt}"></div>
+            <div><span id="s">Hello</span></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let (_, _, _, sh) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "w");
+        assert!(w > 20.0 && w <= 120.5, "w: the box is no wider than the column ({w})");
+        assert!(sh > 8.0 && h > sh * 1.5, "w: more than one line tall ({h} vs a line's {sh})");
+        let (x0, x1) = (l.floor() as usize, (l + w).ceil() as usize);
+        let ink2 = imgalt_ink(&engine, x0, x1, (t + sh).floor() as usize, (t + 2.0 * sh).ceil() as usize);
+        assert!(ink2 > 0, "w: the second line paints");
+        assert_eq!(imgalt_ink(&engine, 122, 400, t.floor() as usize, (t + h).ceil() as usize), 0, "w: nothing paints right of the column");
+    }
+
     // ---- AETHERFILECHOSENJSFILES (LEDGER SR706): the script-set FileList feeds the file status and value (named tail block) ----
 
     /// AETHERFILECHOSENJSFILES (SR706): a page that sets `input.files` from a DataTransfer (SR93's setter).
@@ -4608,36 +4666,6 @@ mod tests {
         assert_eq!(js.eval_string("document.getElementById('m2').value").unwrap(), "C:\\fakepath\\a.txt");
         assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
         assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
-    }
-
-    /// AETHERIMGBROKENICON (SR702): the broken-image icon shows only when the box has room for it (Chromium's
-    /// ImageSmallerThanAltImage, 16 + 2 px): a 40x40 failed img with alt="" paints the icon (layout_core's
-    /// `BROKEN_ICON`) in its slot; a 12x12 one paints nothing (no frame, no icon, no text).
-    #[test]
-    fn img_alt_broken_icon_only_when_room() {
-        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
-            <div><img id="r" src="missing.png" alt="" width="40" height="40"></div>
-            <div><img id="n" src="missing.png" alt="" width="12" height="12"></div>
-        </body></html>"#;
-        let mut engine = crate::AetherEngine::new();
-        engine.handle_event(crate::api::events::Event::Resize(400, 300));
-        engine.load_html("https://example.com/", html, true);
-        engine.render_frame();
-        let (l, t, w, h) = imgalt_rect(&mut engine, "r");
-        assert!((w - 40.0).abs() <= 0.5 && (h - 40.0).abs() <= 0.5, "r: the box keeps its 40x40 ({w}x{h})");
-        let (l, t) = (l.round() as usize, t.round() as usize);
-        assert!(imgalt_painted(&engine, l + 2, l + 18, t + 2, t + 18) > 0, "r: the icon paints");
-        assert_eq!(imgalt_px(&engine, l + 3, t + 7), (128, 128, 128), "r: the icon's page outline");
-        let (l, t, w, h) = imgalt_rect(&mut engine, "n");
-        assert!((w - 12.0).abs() <= 0.5 && (h - 12.0).abs() <= 0.5, "n: the box keeps its 12x12 ({w}x{h})");
-        let (l, t) = (l.round() as usize, t.round() as usize);
-        assert_eq!(imgalt_painted(&engine, l, l + 12, t, t + 12), 0, "n: too small for the icon: nothing paints");
-    }
-
-    /// AETHERIMGBROKENICON (SR702): the pixels in (x0..x1, y0..y1) that are not the white page (`imgalt_ink` counts
-    /// only dark text ink; the icon's grey, blue and green are not dark).
-    fn imgalt_painted(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
-        (y0..y1).map(|y| (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count()).sum()
     }
 
     // ---- AETHERFILEVALUECLEAR (LEDGER SR715): `input.value = ""` and the form reset empty a file input's FileList (named tail block) ----

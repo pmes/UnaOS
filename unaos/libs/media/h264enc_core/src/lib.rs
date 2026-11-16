@@ -31,7 +31,7 @@
 //! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
-//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383) |
+//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383); TwoPass: CBR planned from a first pass's `Encoder::stats` (SR698) |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
 //! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
@@ -187,6 +187,11 @@ pub struct Config {
     /// source-luma AC energy, re-centred to mean zero over the picture and clamped +-6 (then to [`Config::qp_floor`]..=51), under
     /// every rate mode (constant QP too); the rule is the file tail's H264ENCAQ block.
     pub aq: Option<u8>,
+    /// H264ENCHRD (LEDGER SR699): signal the rate controller's bucket as the NAL HRD. false (the default) keeps every pinned byte;
+    /// true under a CBR / VBR [`Config::rate`] writes the VUI timing_info + nal_hrd_parameters, a buffering_period SEI on every IDR,
+    /// a pic_timing SEI on every picture and (CBR) filler NAL units where the bucket would underflow; unread under CRF / constant QP.
+    /// The rule is the file tail's H264ENCHRD block.
+    pub hrd: bool,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -285,7 +290,7 @@ impl Access {
     /// big-endian length; the parameter sets live in [`Encoder::avcc`].
     pub fn avcc_sample(&self) -> Vec<u8> {
         let mut v = Vec::new();
-        for n in self.nals.iter().filter(|n| matches!(n[0] & 0x1f, nal::NAL_SLICE | nal::NAL_IDR)) {
+        for n in self.nals.iter().filter(|n| matches!(n[0] & 0x1f, nal::NAL_SLICE | nal::NAL_IDR | h264_core::nal::NAL_SEI | h264_core::nal::NAL_FILLER)) {
             v.extend_from_slice(&(n.len() as u32).to_be_bytes());
             v.extend_from_slice(n);
         }
@@ -472,8 +477,14 @@ pub struct Encoder {
     depth: u64,
     /// The previous frame's padded source luma (H264ENCSCENECUT SR680; empty until [`Config::scenecut`] runs).
     scene_prev: Plane,
+    /// The previous picture's un-guarded scene-cut threshold test (H264ENCSCENECUTFADE SR709): a run of firing pictures is one cut.
+    scene_fired: bool,
     /// The adaptive-quantisation state of the picture being coded (H264ENCAQ SR693; empty without [`Config::aq`]).
     pub(crate) aq: Aq,
+    /// One record per coded picture (H264ENCTWOPASS SR698): [`Encoder::stats`], the first pass of a two-pass export.
+    pub(crate) stats: Vec<rc::PicStat>,
+    /// H264ENCHRD (SR699): the dts of the last buffering period (the pic_timing cpb_removal_delay's origin).
+    pub(crate) hrd_bp: u64,
 }
 
 impl Encoder {
@@ -488,7 +499,7 @@ impl Encoder {
             return Err(Error::Gop);
         }
         let rc = match cfg.rate {
-            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32, cfg.qp_floor())?.with_bframes(cfg.bframes.min(4))),
+            Some(r) => Some(rc::Rc::new(r.for_hrd(cfg.hrd)?, cfg.gop, cfg.qp as i32, cfg.qp_floor())?.with_bframes(cfg.bframes.min(4))),
             None => None,
         };
         let (mb_w, mb_h) = (cfg.width.div_ceil(16) as usize, cfg.height.div_ceil(16) as usize);
@@ -512,7 +523,7 @@ impl Encoder {
             (_, BiPred::Implicit) => 2,
             (_, BiPred::Explicit) => 1,
         };
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour };
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour, hrd: rc.as_ref().filter(|_| cfg.hrd).and_then(rc::Rc::hrd_params) };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
         let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high, bipred_idc));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
@@ -561,7 +572,10 @@ impl Encoder {
             bipred_idc,
             depth: num_reorder as u64,
             scene_prev: Plane::new(0, 0, 0),
+            scene_fired: false,
             aq: Aq::default(),
+            stats: Vec::new(),
+            hrd_bp: 0,
         })
     }
 
@@ -752,8 +766,8 @@ impl Encoder {
         }
         // A B picture is not a reference (nal_ref_idc 0) unless it is the pyramid's middle (1, SR349).
         let slice = nal::nal_unit(if !bpic { 3 } else { reference as u8 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
-        let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
-        self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
+        let mut nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] }; self.hrd_au(&mut nals, idr, display);
+        self.rc_update(nals.iter().filter(|n| n[0] & 0x1f != h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum()); self.note_stat(pic, slice_qp, &nals); // H264ENCTWOPASS (SR698): the picture's record
         self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
@@ -1089,14 +1103,14 @@ impl Encoder {
     /// Is the picture now in `src` (display index `display`) an IDR: `scheduled` (the GOP count), or under
     /// [`Config::scenecut`] a detected cut. None returns `scheduled` and does no work. Under Some the costs are skipped on a
     /// scheduled IDR, and `src`'s luma becomes the next picture's previous frame either way. A cut: inter x 100 >
-    /// (100 - k) x intra, or within min_keyint = gop / 4 of the last IDR, inter > intra.
+    /// (100 - k) x intra, or within min_keyint = gop / 4 of the last IDR, inter > intra. H264ENCSCENECUTFADE (SR709): not a cut when the previous picture's un-guarded threshold test also passed (a fade is one IDR at its first firing picture; a scheduled IDR leaves that state unchanged).
     pub(crate) fn scenecut_key(&mut self, display: u64, scheduled: bool) -> bool {
         let Some(k) = self.cfg.scenecut else { return scheduled };
         let mut cut = false;
         if !scheduled && !self.scene_prev.data.is_empty() {
             let (inter, intra) = self.scenecut_costs();
             let k = k.min(100) as u64;
-            cut = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { inter * 100 > (100 - k) * intra };
+            let fired = inter * 100 > (100 - k) * intra; let test = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { fired }; cut = test && !self.scene_fired; self.scene_fired = fired;
         }
         self.scene_prev.clone_from(&self.src[0]);
         scheduled || cut
@@ -1172,18 +1186,7 @@ pub(crate) struct Aq {
 
 /// log2(max(e, 1)) with 4 fractional bits: the integer part by `ilog2`, the fraction by repeated squaring of the mantissa (Q16).
 fn log2_q4(e: u32) -> i64 {
-    let e = e.max(1);
-    let n = e.ilog2();
-    let mut y: u64 = ((e as u64) << 16) >> n;
-    let mut r = (n as i64) << 4;
-    for b in (0..4).rev() {
-        y = (y * y) >> 16;
-        if y >= 2 << 16 {
-            y >>= 1;
-            r |= 1 << b;
-        }
-    }
-    r
+    rc::log2_q16(e as u64) >> 12 // H264ENCTWOPASS (SR698): the ONE log2, its top four fraction bits
 }
 
 /// The adaptive-quantisation offsets of a picture (H264ENCAQ SR693): one per macroblock in raster order over the luma plane `y`
@@ -1243,5 +1246,44 @@ impl Encoder {
     /// [`Entropy::Cabac`] (otherwise the record is not kept and the values are stale).
     pub fn mb_qps(&self) -> Vec<u8> {
         self.dinfo.iter().map(|i| i.qp).collect()
+    }
+}
+
+// ---- H264ENCHRD (LEDGER SR699): the access unit's HRD SEI and CBR filler (named tail block) ----
+// The HRD is rc.rs's bucket (`Rc::hrd_params` / `hrd_bucket`): two ticks per frame, so a picture's CPB removal is 2 x its dts
+// after its buffering period's (D.2.3; an IDR's own counts from the PREVIOUS one, the first 0) and its output 2 x (pts - dts)
+// after that. initial_cpb_removal_delay = (CpbSize - fullness) / BitRate in 90 kHz units: the decoder's CPB is the bucket's
+// mirror, so a bucket that never exceeds CpbSize never underflows the CPB and one that never drops below zero (CBR: the
+// filler) never overflows it.
+impl Encoder {
+    /// Under [`Config::hrd`] with a CBR / VBR bucket: one SEI NAL (a buffering_period on an IDR, then the pic_timing) after the
+    /// IDR's SPS / PPS or ahead of the slice, and under CBR a filler NAL appended where the access unit's bits would leave the
+    /// exact-rate bucket below one bit (the filler goes into the bucket through `Rc::hrd_pad`; `rc_update` skips it).
+    pub(crate) fn hrd_au(&mut self, nals: &mut Vec<Vec<u8>>, idr: bool, display: u64) {
+        if !self.cfg.hrd {
+            return;
+        }
+        let Some((cbr, bit_rate, size, full, drain)) = self.rc.as_ref().and_then(|rc| rc.hrd_bucket(self.coded)) else { return };
+        let dts = self.coded;
+        let cpb_removal_delay = (2 * (dts - self.hrd_bp)) as u32 & 0xFF_FFFF;
+        let dpb_output_delay = (2 * (display + self.depth - dts)) as u32 & 0xFF_FFFF;
+        let bp = idr.then(|| ((size - full).max(0) as i128 * 90_000 / bit_rate.max(1) as i128).clamp(1, 0xFF_FFFF) as u32);
+        if idr {
+            self.hrd_bp = dts;
+        }
+        let sei = nal::nal_unit(0, h264_core::nal::NAL_SEI, &sps::sei_rbsp(bp, cpb_removal_delay, dpb_output_delay));
+        nals.insert(if idr { 2 } else { 0 }, sei);
+        if cbr {
+            let bits: i64 = nals.iter().map(|n| n.len() as i64 * 8).sum();
+            let deficit = drain - full - bits + 1;
+            if deficit > 0 {
+                let total = ((deficit + 7) / 8).max(2) as usize;
+                let filler = nal::nal_unit(0, h264_core::nal::NAL_FILLER, &sps::filler_rbsp(total - 2));
+                if let Some(rc) = self.rc.as_mut() {
+                    rc.hrd_pad(filler.len() as u64 * 8);
+                }
+                nals.push(filler);
+            }
+        }
     }
 }

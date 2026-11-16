@@ -680,3 +680,156 @@ fn nle3etrimstretch_the_editor_moves_a_pair_and_ripple_trims() {
     st.deselect();
     assert_eq!(st.verb("rtrim in 1"), Some(Err(EditError::NoClip)));
 }
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide around transitions (named tail block) ----
+
+/// V1: A[0,20)@0 of a 30-tick source (a 10-tick handle) -> B[0,20)@20 under a 9-tick dissolve.
+fn nle3eslip_short() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 30);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap()
+}
+
+#[test]
+fn nle3eslip_slip_keeps_the_transitions() {
+    // B slipped 3: both of its cuts stay where they are, the dissolve and the wipe unchanged
+    let s = three().slip(0, 1, 3).unwrap();
+    assert_eq!(s.tracks[0].clips[1], Clip::new(SourceId(1), 3, 23, 20));
+    assert_eq!(s.tracks[0].transitions, three().tracks[0].transitions);
+    // A slipped 25 leaves a 5-tick handle under the 9-tick dissolve: refused by name (no fit on a slip)
+    assert_eq!(three().slip(0, 0, 25), Err(EditError::Handle));
+}
+
+#[test]
+fn nle3eslip_slide_retargets_and_fits_the_dissolve() {
+    // a 9-tick dissolve into C; B slid 12 leaves C 8 ticks: the dissolve moves with the cut and fits its room
+    let tl = cuts().add_transition(0, 40, TransitionKind::Dissolve, 9).unwrap();
+    let s = tl.slide(0, 1, 12).unwrap();
+    let (a, b, c) = (SourceId(0), SourceId(1), SourceId(2));
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 32, 0), Clip::new(b, 0, 20, 32), Clip::new(c, 17, 25, 52)]);
+    assert_eq!((ats(&s), s.end()), (vec![(52, 8, TransitionKind::Dissolve)], tl.end()));
+    let text = edl::write(&s, "NLE3").unwrap();
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!((ats(&back), edl::write(&back, "NLE3").unwrap()), (ats(&s), text));
+    // the previous clip's handle under the slid cut: 5 left fits the dissolve to 5, none left is Handle, past it OutOfSource
+    assert_eq!(ats(&nle3eslip_short().slide(0, 1, 5).unwrap()), vec![(25, 5, TransitionKind::Dissolve)]);
+    assert_eq!(nle3eslip_short().slide(0, 1, 10), Err(EditError::Handle));
+    assert_eq!(nle3eslip_short().slide(0, 1, 11), Err(EditError::OutOfSource));
+    // the next clip's in point before its source's start; the neighbour-less side onto C's span
+    assert_eq!(three().slide(0, 1, -6), Err(EditError::OutOfSource));
+    assert_eq!(nle3etrimstretch_pair().slide(0, 1, 21), Err(EditError::Overlap));
+}
+
+#[test]
+fn nle3eslip_the_editor_slips_and_slides_once() {
+    use timeline_core::editor::EditorState;
+    let mut st = EditorState::new(three());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("slide 5"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (three().slide(0, 1, 5).unwrap(), 1));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, three());
+    assert_eq!(st.verb("slip 3"), Some(Ok(())));
+    let slipped = three().slip(0, 1, 3).unwrap();
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (slipped.clone(), 1));
+    // refused: the state and the undo stack unchanged
+    assert_eq!(st.verb("slip -4"), Some(Err(EditError::OutOfSource)));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (slipped, 1));
+    assert_eq!(st.verb("slide sideways"), None);
+    st.deselect();
+    assert_eq!(st.verb("slip 1"), Some(Err(EditError::NoClip)));
+}
+
+// ---- NLE3ETRIMGROW (LEDGER SR712): a fitted transition grows back to its asked length (named tail block) ----
+
+/// `nle3etrimstretch_pair` with B trimmed to 5 ticks: the 9-tick dissolve fitted to 5, its ask kept.
+fn nle3etrimgrow_shrunk() -> Timeline {
+    nle3etrimstretch_pair().trim_out(0, 1, 5).unwrap()
+}
+
+/// `(dur, want)` of the transition on V1's cut at 20.
+fn nle3etrimgrow_dw(tl: &Timeline) -> (i64, Option<i64>) {
+    let x = tl.tracks[0].transitions.iter().find(|x| x.at == 20).unwrap();
+    (x.dur, x.want)
+}
+
+#[test]
+fn nle3etrimgrow_a_freed_room_grows_the_dissolve_back_to_its_ask() {
+    let s = nle3etrimgrow_shrunk();
+    assert_eq!(nle3etrimgrow_dw(&s), (5, Some(9)));
+    // a little room back: the dissolve grows with it, the ask kept
+    assert_eq!(nle3etrimgrow_dw(&s.trim_out(0, 1, 7).unwrap()), (7, Some(9)));
+    // more room than the ask: back to 9, never past it, the ask cleared
+    assert_eq!(nle3etrimgrow_dw(&s.trim_out(0, 1, 30).unwrap()), (9, None));
+    // the trim-back is the original timeline
+    assert_eq!(s.trim_out(0, 1, 20), Ok(nle3etrimstretch_pair()));
+}
+
+#[test]
+fn nle3etrimgrow_a_length_set_is_a_fresh_ask() {
+    use timeline_core::editor::EditorState;
+    let mut st = EditorState::new(nle3etrimgrow_shrunk());
+    st.select_transition(0, 0).unwrap();
+    st.set_transition_dur(4).unwrap();
+    assert_eq!(nle3etrimgrow_dw(&st.timeline), (4, None));
+    assert_eq!(nle3etrimgrow_dw(&st.timeline.trim_out(0, 1, 20).unwrap()), (4, None));
+    // the add op on the cut is the same fresh ask
+    let a = nle3etrimgrow_shrunk().add_transition(0, 20, TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(nle3etrimgrow_dw(&a), (3, None));
+    assert_eq!(nle3etrimgrow_dw(&a.trim_out(0, 1, 20).unwrap()), (3, None));
+}
+
+#[test]
+fn nle3etrimgrow_the_derived_crossfade_and_the_slide_follow() {
+    // the ripple trim-in that fitted the dissolve to 3, undone by its inverse: the dissolve and A1's crossfade back at 5
+    let tl = nle3etrimstretch_tight();
+    let r = tl.ripple_trim_in(0, 1, 2).unwrap();
+    assert_eq!(nle3etrimgrow_dw(&r), (3, Some(5)));
+    let back = r.ripple_trim_in(0, 1, 0).unwrap();
+    assert_eq!(nle3etrimgrow_dw(&back), (5, None));
+    assert_eq!(back.audio_crossfade(1, 1).map(|x| (x.at, x.dur)), Some((20, 5)));
+    assert_eq!(back, tl);
+    // SR704's slide that fitted the dissolve to the 5-tick handle, slid back: the original
+    let s = nle3eslip_short().slide(0, 1, 5).unwrap();
+    assert_eq!((s.tracks[0].transitions[0].dur, s.tracks[0].transitions[0].want), (5, Some(9)));
+    assert_eq!(s.slide(0, 1, -5), Ok(nle3eslip_short()));
+}
+
+const NLE3ETRIMGROW_EDL: &str = "TITLE: GROW
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE A 00:00:02:00
+* UNA SOURCE B 00:00:02:00
+* UNA SOURCE C 00:00:02:00
+
+001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20
+002  A        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20
+002  B        V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00
+* UNA WANT 9
+003  C        V     C        00:00:00:05 00:00:01:00 00:00:02:10 00:00:03:05
+";
+
+#[test]
+fn nle3etrimgrow_the_want_line_round_trips_byte_exact_and_refuses_by_name() {
+    let s = nle3etrimgrow_shrunk();
+    let text = edl::write(&s, "GROW").unwrap();
+    assert_eq!(text, NLE3ETRIMGROW_EDL);
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!((back.tracks[0].transitions.clone(), edl::write(&back, "GROW").unwrap()), (s.tracks[0].transitions.clone(), text));
+    // at its ask: no WANT line, the trim-back writes the original's bytes
+    let plain = edl::write(&nle3etrimstretch_pair(), "GROW").unwrap();
+    assert!(!plain.contains("UNA WANT"), "{plain}");
+    assert_eq!(edl::write(&s.trim_out(0, 1, 20).unwrap(), "GROW").unwrap(), plain);
+    // refused by name at the WANT line: not above the dissolve's 5, not a number, twice, under a plain cut
+    let swap = |to: &str| NLE3ETRIMGROW_EDL.replace("* UNA WANT 9\n", to);
+    assert_eq!(edl::parse(&swap("* UNA WANT 5\n"), 25), Err(EdlError::Syntax { line: 11 }));
+    assert_eq!(edl::parse(&swap("* UNA WANT 4\n"), 25), Err(EdlError::Syntax { line: 11 }));
+    assert_eq!(edl::parse(&swap("* UNA WANT nine\n"), 25), Err(EdlError::Syntax { line: 11 }));
+    assert_eq!(edl::parse(&swap("* UNA WANT 9\n* UNA WANT 9\n"), 25), Err(EdlError::Syntax { line: 12 }));
+    let first = "001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n";
+    let orphan = NLE3ETRIMGROW_EDL.replace(first, &format!("{first}* UNA WANT 9\n"));
+    assert_eq!(edl::parse(&orphan, 25), Err(EdlError::Syntax { line: 9 }));
+}

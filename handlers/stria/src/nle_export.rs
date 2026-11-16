@@ -144,12 +144,14 @@ impl VideoEncoder for RawSequence {
 /// NLE6EXPORT (rmbp-ledger B959): the glue is h264enc_core's `rgba::RgbaEncoder` (the kernel's `nle export` drives the same).
 pub struct H264Encoder {
     rgba: RgbaEncoder,
+    /// H264ENCTWOPASS (LEDGER SR698): the encoder's per-picture records, copied out at `flush` ([`H264Encoder::stats`]).
+    stats: std::rc::Rc<std::cell::RefCell<Vec<PicStat>>>,
 }
 
 impl H264Encoder {
     /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
     pub fn new(qp: u8, gop: u32) -> H264Encoder {
-        H264Encoder { rgba: RgbaEncoder::new(Config { qp, gop, ..Default::default() }) }
+        H264Encoder { rgba: RgbaEncoder::new(Config { qp, gop, ..Default::default() }), stats: Default::default() }
     }
 
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
@@ -185,7 +187,7 @@ impl VideoEncoder for H264Encoder {
         Ok(h264_units(self.rgba.push_rgba(width, height, rgba).map_err(ExportError::H264)?))
     }
     fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
-        Ok(h264_units(self.rgba.flush().map_err(ExportError::H264)?))
+        let u = self.rgba.flush().map_err(ExportError::H264)?; self.keep_stats(); Ok(h264_units(u)) // H264ENCTWOPASS (SR698): the records out
     }
     fn config(&self) -> VideoConfig {
         VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.rgba.avcc() }
@@ -222,6 +224,8 @@ pub struct ExportReport {
     /// FNV-1a 64 over the rendered RGBA stream (`nle render`'s fnv).
     pub fnv: u64,
     pub pcm_frames: u64,
+    /// NLESTANDINAUDIOEDITOR (SR713): the render's [`crate::nle::RenderReport::stand_in_audio`] (reels on the silent audio stand-in).
+    pub stand_in_audio: u32,
 }
 
 #[derive(Debug)]
@@ -694,8 +698,8 @@ pub fn export_as_with(
     let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     sink.container = container;
     let total = if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 };
-    render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?;
-    sink.finish(tl.tb)
+    let rr = render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?; // NLESTANDINAUDIOEDITOR (SR713): the render report kept for its stand-in count
+    sink.finish(tl.tb).map(|e| ExportReport { stand_in_audio: rr.stand_in_audio, ..e }) // NLESTANDINAUDIOEDITOR (SR713)
 }
 
 /// The progress wrapper over [`ExportSink`]: every [`RenderSink`] call forwarded unchanged, then the reading.
@@ -723,6 +727,10 @@ impl RenderSink for Ticked<'_> {
     fn track_pcm(&mut self, out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
         self.sink.track_pcm(out_t, track, rate, channels, interleaved);
     }
+    /// NLE5DEXPORTSTOP (SR705): a latched error (the face's cancel, or an encode failure) ends the render at its next step.
+    fn stop(&self) -> bool {
+        self.sink.err.is_some()
+    }
 }
 
 /// The video names [`video_named`] takes (`nle export --video`'s words).
@@ -741,4 +749,40 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
         "h264" => Box::new(H264Encoder::new(26, (den / num).max(1))),
         _ => return None,
     })
+}
+
+// ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
+/// h264enc_core's per-picture first-pass record (`rc::PicStat`), named here so a face needs no h264enc_core dependency.
+pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
+
+impl H264Encoder {
+    /// The second pass of a two-pass export (h264enc_core's `RcMode::TwoPass`, `nle export --two-pass`): a mean of `kbps` kbit/s
+    /// at `fps_num / fps_den` frames per second, each picture's start QP planned from the first pass's `stats` (its
+    /// [`H264Encoder::stats`] after an export of the same timeline). The caller runs the export twice.
+    pub fn with_two_pass(mut self, kbps: u32, fps_num: u32, fps_den: u32, stats: Vec<PicStat>) -> H264Encoder {
+        self.rgba.cfg.rate = Some(RateControl::two_pass(kbps, (fps_num, fps_den)));
+        self.rgba = self.rgba.with_two_pass(stats);
+        self
+    }
+
+    /// The per-picture records of this encoder's stream, filled when the export flushes it (the NLERAWEXPORT `size()` handle
+    /// idiom: `export_as` consumes the encoder, the handle outlives it).
+    pub fn stats(&self) -> std::rc::Rc<std::cell::RefCell<Vec<PicStat>>> {
+        self.stats.clone()
+    }
+
+    fn keep_stats(&self) {
+        *self.stats.borrow_mut() = self.rgba.stats().to_vec();
+    }
+}
+
+// ---- H264ENCHRD (LEDGER SR699): the HRD option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// Signal the rate controller's bucket as the NAL HRD (h264enc_core's `Config::hrd`, `nle export --bitrate K --hrd`): the
+    /// SPS VUI timing_info + nal_hrd_parameters, buffering-period / pic-timing SEI in the samples, CBR filler; false = the pinned
+    /// stream (and without a bit rate nothing is signalled).
+    pub fn with_hrd(mut self, on: bool) -> H264Encoder {
+        self.rgba.cfg.hrd = on;
+        self
+    }
 }
