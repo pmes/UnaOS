@@ -625,7 +625,7 @@ impl Timeline {
         let c = clip_mut(&mut tl, track, idx)?;
         c.at += src_in - c.src_in;
         c.src_in = src_in;
-        tl.retarget_transitions(self)?; tl.validate()?;
+        tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
         Ok(tl)
     }
 
@@ -633,7 +633,7 @@ impl Timeline {
     pub fn trim_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         clip_mut(&mut tl, track, idx)?.src_out = src_out;
-        tl.retarget_transitions(self)?; tl.validate()?;
+        tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
         Ok(tl)
     }
 
@@ -1308,4 +1308,110 @@ fn moved_cut(bt: &Track, clips: &[Clip], at: i64) -> Result<i64, EditError> {
         })
         .min_by_key(|&a| ((a - at).abs(), a))
         .ok_or(EditError::Transition)
+}
+
+// ---- NLE3ETRIMSTRETCH (LEDGER SR692): the stretching trim, the ripple trims and the transitioned pair's move (named tail block) ----
+// A trim that keeps a transitioned cut but eats its room (the incoming's length, the outgoing source's handle) shrinks the
+// transition to fit (`fit_trimmed`, never below 1, never growing back on its own) instead of refusing; the explicit audio
+// crossfade on the trimmed audio clip's edges fits the same way, and the derived one reads the video transition's `dur`.
+// A RIPPLE trim keeps the clip's start (so the cut at its head is kept) and shifts every later clip of its track, with that
+// track's transitions and audio crossfades, by the length change (`ripple_delete`'s shape: no cut is made or lost and no
+// clip changes order, so nothing needs the source-edge matcher). `move_pair` moves a clip and the clip across its
+// transition as ONE `move_many` transaction and carries the transition through `retarget_transitions`. `validate` stays
+// the one gate.
+impl Timeline {
+    /// NLE3ETRIMSTRETCH: shrink every transition (and explicit audio crossfade) of `track` on clip `idx`'s two edges whose
+    /// `dur` no longer fits its room (the incoming clip's length, the outgoing source's handle past `src_out`) to that
+    /// room. Shrink only; a room under 1 is left for `validate` to refuse (`Handle`, as before).
+    fn fit_trimmed(&mut self, track: usize, idx: usize) {
+        let Some(c) = self.tracks.get(track).and_then(|t| t.clips.get(idx)).copied() else { return };
+        let room = |tl: &Timeline, at: i64| -> Option<i64> {
+            let t = tl.tracks.get(track)?;
+            let inc = t.clips.iter().find(|i| i.at == at).map(|i| i.len());
+            let out = t.clips.iter().find(|o| o.end() == at).and_then(|o| tl.source(o.src).map(|s| s.duration - o.src_out));
+            match (inc, out) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        };
+        let rooms = [(c.at, room(self, c.at)), (c.end(), room(self, c.end()))];
+        let fit = |dur: &mut i64, at: i64| {
+            if let Some(&(_, Some(r))) = rooms.iter().find(|e| e.0 == at) {
+                if *dur > r && r >= 1 {
+                    *dur = r;
+                }
+            }
+        };
+        for x in self.tracks[track].transitions.iter_mut() {
+            fit(&mut x.dur, x.at);
+        }
+        for x in self.audio_xfades.iter_mut().filter(|x| x.track == track) {
+            fit(&mut x.dur, x.at);
+        }
+    }
+
+    /// NLE3ETRIMSTRETCH: move clip `idx`'s in point to source tick `src_in` keeping its timeline start (the cut at its head
+    /// is kept); every later clip of the track moves by the length change.
+    pub fn ripple_trim_in(&self, track: usize, idx: usize, src_in: i64) -> Result<Timeline, EditError> {
+        let c = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        self.ripple_trim(track, idx, Clip { src_in, ..c })
+    }
+
+    /// NLE3ETRIMSTRETCH: move clip `idx`'s out point to source tick `src_out`; every later clip of the track moves by the
+    /// length change, so the cut at its end is kept.
+    pub fn ripple_trim_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
+        let c = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        self.ripple_trim(track, idx, Clip { src_out, ..c })
+    }
+
+    /// The one body of the two ripple trims: clip `idx` becomes `now` (same `at`), and every other clip, transition and
+    /// explicit audio crossfade of `track` at or past its old end shifts by the length change; then the fit and `validate`.
+    fn ripple_trim(&self, track: usize, idx: usize, now: Clip) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let tr = &mut tl.tracks[track];
+        let was = tr.clips[idx];
+        let (edge, delta) = (was.end(), now.len() - was.len());
+        tr.clips[idx] = now;
+        for (i, c) in tr.clips.iter_mut().enumerate() {
+            if i != idx && c.at >= edge {
+                c.at += delta;
+            }
+        }
+        for x in tr.transitions.iter_mut().filter(|x| x.at >= edge) {
+            x.at += delta;
+        }
+        for x in tl.audio_xfades.iter_mut().filter(|x| x.track == track && x.at >= edge) {
+            x.at += delta;
+        }
+        tl.fit_trimmed(track, idx);
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE3ETRIMSTRETCH: move clip `idx` of `track` and its partner (the clip across the two-clip transition at its out
+    /// edge, else at its in edge; none: `Transition`) by `delta` ticks as ONE [`Timeline::move_many`] transaction (an
+    /// occupied span or a negative `at` refuses it by name); the transition goes with them (`retarget_transitions`), and a
+    /// third clip's transitioned cut left behind is refused by name.
+    pub fn move_pair(&self, track: usize, idx: usize, delta: i64) -> Result<Timeline, EditError> {
+        let t = self.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let c = t.clips.get(idx).ok_or(EditError::NoClip)?;
+        let pair = |at: i64| t.transitions.iter().any(|x| x.at == at && !x.from_black && !x.to_black);
+        let partner = if pair(c.end()) {
+            t.clips.iter().position(|p| p.at == c.end())
+        } else if pair(c.at) {
+            t.clips.iter().position(|p| p.end() == c.at)
+        } else {
+            None
+        };
+        let partner = partner.ok_or(EditError::Transition)?;
+        let mut bare = self.clone();
+        for tr in &mut bare.tracks {
+            tr.transitions.clear();
+        }
+        bare.audio_xfades.clear();
+        let mut tl = bare.move_many(&[(track, idx), (track, partner)], delta)?;
+        tl.retarget_transitions(self)?;
+        tl.validate()?;
+        Ok(tl)
+    }
 }
