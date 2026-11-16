@@ -54,6 +54,12 @@
 //! so an EDL with no policy writes as before. A SIZE line may sit anywhere (it applies once every reel exists); one naming a
 //! reel nothing cites, an unknown policy, or a second SIZE line for one reel is a syntax error.
 //!
+//! NLEXFADEPOWER (LEDGER SR678): a `D` event on an AUDIO channel (`A`, `A2`..`A9`; `AA` / `AA/V` stay refused as
+//! channels) is an explicit audio crossfade ([`crate::AudioXfade`]), two lines like a video dissolve; `* UNA XFADE EQUAL`
+//! under its incoming line makes it equal-power ([`crate::Curve::EqualPower`]; absent = linear, so a linear one writes no
+//! comment). A wipe or `BL` on an audio channel is refused (`Transition`), as is an XFADE line with no audio `D` line above
+//! it, under a video one, twice, or with another word (`Syntax`).
+//!
 //! [`write`] produces exactly what [`parse`] reads back: `write(parse(write(tl)))` is byte-identical.
 
 use alloc::format;
@@ -168,6 +174,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     let mut trans: Vec<(Kind, usize, Transition, &str, i64, usize)> = Vec::new();
     // NLESIZEPOLICY (SR394): each `* UNA SIZE` read: (reel, policy, line), applied once every source exists.
     let mut sizes: Vec<(&str, SizePolicy, usize)> = Vec::new();
+    // NLEXFADEPOWER (SR678): the `trans` index of the D/W line just read, and each XFADE line read: (its D line, its line).
+    let (mut xq, mut eq): (Option<usize>, Vec<(usize, usize)>) = (None, Vec::new());
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let l = raw.trim();
@@ -198,9 +206,13 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
+            if l.starts_with("* UNA XFADE") {
+                xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
+            }
             continue;
         }
         let w: Vec<&str> = l.split_whitespace().collect();
+        xq = None; // NLEXFADEPOWER: an XFADE line belongs to the event line just above it
         if w.is_empty() || !w[0].bytes().all(|b| b.is_ascii_digit()) {
             return Err(EdlError::Syntax { line });
         }
@@ -221,6 +233,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             match from.take() {
                 Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && !(reel == "BL" && w[1] == "BL") => {
                     let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL" };
+                    xq = Some(trans.len());
                     trans.push((kind, num, x, reel, o.src_in, line));
                 }
                 _ => return Err(EdlError::Transition { line }),
@@ -285,6 +298,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     // NLE3: the clip ending at each transition's cut is the one its outgoing line names.
     for (kind, num, x, reel, out_point, line) in trans {
         let ti = if kind == Kind::Video { num - 1 } else { nv + num - 1 };
+        audio_transition_ok(kind, &x, line, &eq)?; // NLEXFADEPOWER (SR678)
         if x.from_black {
             // NLE3c: no outgoing clip to name; validate checks the incoming clip and that nothing ends at the cut.
             tl.tracks[ti].transitions.push(x);
@@ -295,6 +309,13 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         let t = &mut tl.tracks[ti];
         if !t.clips.iter().any(|c| c.end() == x.at && c.src == rid && c.src_out == out_point) {
             return Err(EdlError::Transition { line });
+        }
+        if kind == Kind::Audio {
+            // NLEXFADEPOWER: an audio D event is an explicit audio crossfade (validate checks its incoming clip).
+            let curve = if eq.iter().any(|e| e.0 == line) { crate::Curve::EqualPower } else { crate::Curve::Linear };
+            tl.audio_xfades.push(crate::AudioXfade { track: ti, at: x.at, dur: x.dur, curve });
+            tl.audio_xfades.sort_by_key(|x| (x.track, x.at));
+            continue;
         }
         t.transitions.push(x);
         t.transitions.sort_by_key(|x| x.at);
@@ -391,7 +412,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             }
         };
         let reel = &tl.source(c.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel;
-        let (out_line, code) = transition_lines(tl, *ti, c, n + 1, &ch, fps)?;
+        let (out_line, code) = match audio_xfade_lines(tl, *ti, c, n + 1, &ch, fps) { Some(r) => r?, None => transition_lines(tl, *ti, c, n + 1, &ch, fps)? }; // NLEXFADEPOWER (SR678)
         s.push_str(&out_line);
         s.push_str(&format!(
             "{:03}  {:<8} {:<5} {:<8} {} {} {} {}\n",
@@ -410,6 +431,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
+        s.push_str(xfade_line(tl, *ti, c.at)); // NLEXFADEPOWER (SR678)
     }
     Ok(s)
 }
@@ -460,4 +482,48 @@ fn size_comment(r: &str, line: usize) -> Result<(&str, SizePolicy, usize), EdlEr
     }
     let p = SizePolicy::from_name(w[1]).ok_or(EdlError::Syntax { line })?;
     Ok((w[0], p, line))
+}
+
+// ---- NLEXFADEPOWER (LEDGER SR678): the A-only `D` event and `* UNA XFADE EQUAL` (named tail block) ----
+
+/// A `* UNA XFADE ...` line: only `EQUAL`, under a D/W line (`d_line`, the line just above), once per event; else `Syntax`.
+fn xfade_comment(l: &str, line: usize, d_line: Option<usize>, eq: &mut Vec<(usize, usize)>) -> Result<(), EdlError> {
+    let d = d_line.ok_or(EdlError::Syntax { line })?;
+    if l != "* UNA XFADE EQUAL" || eq.iter().any(|e| e.0 == d) {
+        return Err(EdlError::Syntax { line });
+    }
+    eq.push((d, line));
+    Ok(())
+}
+
+/// A transition read on an audio channel is a plain dissolve between two clips (a wipe or `BL`: `Transition` at its line);
+/// an XFADE line under a video transition's line is `Syntax` at the XFADE line.
+fn audio_transition_ok(kind: Kind, x: &Transition, line: usize, eq: &[(usize, usize)]) -> Result<(), EdlError> {
+    if kind == Kind::Audio && (x.from_black || x.to_black || x.kind != TransitionKind::Dissolve) {
+        return Err(EdlError::Transition { line });
+    }
+    match eq.iter().find(|e| e.0 == line) {
+        Some(&(_, xl)) if kind == Kind::Video => Err(EdlError::Syntax { line: xl }),
+        _ => Ok(()),
+    }
+}
+
+/// The two-line event of the explicit audio crossfade on clip `c`'s cut, if one sits there: the outgoing's zero-length
+/// `C` line (as [`transition_lines`] writes it) and the incoming line's field `D    ddd` (a duration past 999: `Transition`).
+fn audio_xfade_lines(tl: &Timeline, ti: usize, c: &Clip, num: usize, ch: &str, fps: u32) -> Option<Result<(String, String), EdlError>> {
+    let x = tl.audio_xfades.iter().find(|x| x.track == ti && x.at == c.at)?;
+    Some((|| {
+        if x.dur > 999 {
+            return Err(EdlError::Transition { line: 0 });
+        }
+        let o = tl.tracks[ti].clips.iter().find(|o| o.end() == x.at).ok_or(EdlError::Edit(EditError::Transition))?;
+        let reel = &tl.source(o.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel;
+        let (p, r) = (timecode(o.src_out, fps), timecode(x.at, fps));
+        Ok((format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C"), format!("D    {:03}", x.dur)))
+    })())
+}
+
+/// `* UNA XFADE EQUAL\n` under the incoming line of an equal-power explicit audio crossfade at `(ti, at)`; else nothing.
+fn xfade_line(tl: &Timeline, ti: usize, at: i64) -> &'static str {
+    if tl.audio_xfades.iter().any(|x| x.track == ti && x.at == at && x.curve == crate::Curve::EqualPower) { "* UNA XFADE EQUAL\n" } else { "" }
 }

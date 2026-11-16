@@ -34,6 +34,15 @@
 //! `min(fade, r)`), `r = (t - at) * ENV_ONE / dur` at each run edge: LINEAR, the two weights summing to `ENV_ONE`. The
 //! under layer has its own continuity: it seeks at the span's first run and continues after. (Exact except where an
 //! incoming fade-out reaches into the span: interpolated linearly between run edges.)
+//!
+//! NLEXFADEPOWER (LEDGER SR678): the fade on an audio cut is read through ONE accessor, [`crate::Timeline::crossfade_at`]
+//! (an explicit [`crate::AudioXfade`] first, else the paired crossfade above, else a fade FROM silence under a transition
+//! from black: the incoming's one layer, no under layer), and every weight through ONE fn, [`xfade_weight`]: the rising
+//! weight is `xfade_weight(curve, r)` and the falling one `xfade_weight(curve, ENV_ONE - r)` (linear: exactly the ramp
+//! above). An [`crate::Curve::EqualPower`] span breaks its runs at EVERY tick, so each edge carries the sine / cosine weight
+//! (the renderers interpolate linearly between edges); those runs continue their sources (no seek, the same decoder). A
+//! transition TO black fades the outgoing's handle out in the track's gap ([`crate::Timeline::fade_to_silence`]): the
+//! clip's layer continues past its end under the falling weight, on its own slot.
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -209,18 +218,18 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
         return Ok(Vec::new());
     }
     // NLE3b: the crossfade on clip `ci` of track `ti` covering tick `t`, if any.
-    let xfade = |ti: usize, ci: usize, t: i64| tl.audio_crossfade(ti, ci).filter(|x| t < x.at + x.dur);
+    let xfade = |ti: usize, ci: usize, t: i64| tl.crossfade_at(ti, ci).filter(|x| t < x.at + x.dur);
     // What each audio track shows at `t`: (clip index, envelope segment 0 fade-in / 1 body / 2 fade-out, in a
     // crossfade).
-    let key = |t: i64| -> Vec<Option<(usize, u8, bool)>> {
+    let key = |t: i64| -> Vec<Option<(usize, u8, i64)>> {
         tracks
             .iter()
             .map(|&ti| {
                 tl.clip_at(ti, t).map(|ci| {
                     let c = &tl.tracks[ti].clips[ci];
                     let seg = if t < c.at + c.fade_in { 0 } else if t >= c.end() - c.fade_out { 2 } else { 1 };
-                    (ci, seg, xfade(ti, ci, t).is_some())
-                })
+                    (ci, seg, xpiece(xfade(ti, ci, t), t))
+                }).or_else(|| black_key(tl, ti, t))
             })
             .collect()
     };
@@ -244,13 +253,18 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                     let mut env = [env_q16(&c, t), env_q16(&c, end)];
                     match xfade(ti, ci, t) {
                         Some(x) => {
-                            let o = tl.tracks[ti].clips[ci - 1];
-                            let under = under_layer(tl, idx, ti, &o, &x, t, end, &mut xnext[ti])?;
-                            layers.push(under);
-                            env = [env[0].min(ramp_q16(&x, t)), env[1].min(ramp_q16(&x, end))];
+                            if x.partner == crate::Partner::Clip {
+                                let o = tl.tracks[ti].clips[ci - 1];
+                                let under = under_layer(tl, idx, ti, &o, &x, t, end, &mut xnext[ti])?;
+                                layers.push(under);
+                            } else {
+                                xnext[ti] = None; // NLEXFADEPOWER: from silence: no under layer
+                            }
+                            env = [env[0].min(rise(&x, t)), env[1].min(rise(&x, end))];
                         }
                         None => xnext[ti] = None,
                     }
+                    env = tail_env(tl, ti, ci, t, end, env); // NLEXFADEPOWER: a fade to silence past the clip's end
                     let src_t = c.src_in + (t - c.at);
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, src_t + (end - t)));
@@ -339,7 +353,7 @@ fn handles_fit(tl: &Timeline, idx: &dyn SourceIndex) -> Result<(), ScheduleError
 }
 
 /// NLE3b: a crossfade's rising weight at timeline edge `t`, Q16: 0 at the cut, [`ENV_ONE`] at `at + dur`.
-fn ramp_q16(x: &crate::Transition, t: i64) -> u32 {
+fn ramp_q16(x: &crate::Crossfade, t: i64) -> u32 {
     ((t - x.at).clamp(0, x.dur) * ENV_ONE as i64 / x.dur.max(1)) as u32
 }
 
@@ -351,7 +365,7 @@ fn under_layer(
     idx: &dyn SourceIndex,
     ti: usize,
     o: &crate::Clip,
-    x: &crate::Transition,
+    x: &crate::Crossfade,
     t: i64,
     end: i64,
     xnext: &mut Option<(SourceId, i64)>,
@@ -360,7 +374,7 @@ fn under_layer(
     let seek = seek_for(tl, idx, Kind::Audio, o.src, src_t, *xnext)?;
     *xnext = Some((o.src, src_t + (end - t)));
     let tail = env_q16(o, o.end()) as i64;
-    let fall = |e: i64| ((ENV_ONE as i64 - ramp_q16(x, e) as i64) * tail / ENV_ONE as i64) as u32;
+    let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
     Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: o.gain_cdb, env: [fall(t), fall(end)] })
 }
 
@@ -404,5 +418,87 @@ impl AudioRun {
     /// order, under before incoming). It plays from its own decoder slot and, in the kernel, its own mixer source.
     pub fn under(&self, li: usize) -> bool {
         self.layers.get(li + 1).is_some_and(|m| self.layers.get(li).is_some_and(|l| m.track == l.track))
+    }
+}
+
+// ---- NLEXFADEPOWER (LEDGER SR678): the ONE crossfade weight and its quarter-wave table (named tail block) ----
+
+/// Q16 `sin(pi/2 * i / 256)`, `i` in `0..=256` (`QSIN[256] == ENV_ONE`): ONE quarter-wave table, built at compile time.
+const QSIN: [u32; 257] = qsin_table();
+
+/// The quarter-wave table by an integer Taylor series in Q60 (`i128`, no float): `sin x = x - x^3/3! + x^5/5! - ...` to
+/// the x^23 term (the remainder is under 2^-60 for `x <= pi/2`), rounded to Q16. Each entry is `round(sin * 65536)`.
+const fn qsin_table() -> [u32; 257] {
+    const ONE: i128 = 1 << 60;
+    const HALF_PI: i128 = 1_811_004_864_519_280_711; // round(pi / 2 * 2^60)
+    let mut t = [0u32; 257];
+    let mut i = 0;
+    while i < 257 {
+        let x = HALF_PI * i as i128 / 256;
+        let x2 = x * x / ONE;
+        let (mut term, mut sum, mut n) = (x, x, 1i128);
+        while n < 12 {
+            term = -term * x2 / ONE / ((2 * n) * (2 * n + 1));
+            sum += term;
+            n += 1;
+        }
+        t[i] = ((sum + (1 << 43)) >> 44) as u32;
+        i += 1;
+    }
+    t
+}
+
+/// Q16 `sin(pi/2 * p / ENV_ONE)` for a phase `p` in `0..=ENV_ONE` (clamped), linear between the table's entries.
+fn qsin(p: u32) -> u32 {
+    let p = p.min(ENV_ONE);
+    let (i, f) = ((p >> 8) as usize, p & 255);
+    if i == 256 {
+        return QSIN[256];
+    }
+    QSIN[i] + (((QSIN[i + 1] - QSIN[i]) * f + 128) >> 8)
+}
+
+/// NLEXFADEPOWER: THE crossfade weight (Q16) at the linear phase `p` (Q16, 0 at the cut, [`ENV_ONE`] at its end, clamped):
+/// [`crate::Curve::Linear`] is `p` itself (NLE3b's ramp, unchanged), [`crate::Curve::EqualPower`] is `sin(pi p / 2)` from the
+/// quarter-wave table. The rising weight is `xfade_weight(c, p)`, the falling one `xfade_weight(c, ENV_ONE - p)` (cos).
+pub fn xfade_weight(curve: crate::Curve, p: u32) -> u32 {
+    match curve {
+        crate::Curve::Linear => p.min(ENV_ONE),
+        crate::Curve::EqualPower => qsin(p),
+    }
+}
+
+/// The rising weight of fade `x` at timeline edge `e`.
+fn rise(x: &crate::Crossfade, e: i64) -> u32 {
+    xfade_weight(x.curve, ramp_q16(x, e))
+}
+
+/// The run key's fade word for a tick inside fade `x` (or none): -1 outside, 0 a linear fade (one run per span), and
+/// `t + 1` an equal-power one (one run per tick, so every edge carries its own weight).
+fn xpiece(x: Option<crate::Crossfade>, t: i64) -> i64 {
+    match x {
+        None => -1,
+        Some(x) if x.curve == crate::Curve::EqualPower => t + 1,
+        Some(_) => 0,
+    }
+}
+
+/// A gap tick `t` of audio track `ti` inside a fade to silence: keyed as the outgoing clip (segment 3, past its end).
+fn black_key(tl: &Timeline, ti: usize, t: i64) -> Option<(usize, u8, i64)> {
+    let tr = &tl.tracks[ti];
+    let ci = tr.clips.iter().rposition(|c| c.end() <= t)?;
+    let x = tl.fade_to_silence(ti, ci).filter(|x| x.at <= t && t < x.at + x.dur)?;
+    Some((ci, 3, xpiece(Some(x), t)))
+}
+
+/// A run `t..end` of clip `ci` on track `ti` lying past the clip's end (a fade to silence): its envelope `env` scaled down
+/// by the falling weight at both edges. Any other run's `env` comes back as it was.
+fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]) -> [u32; 2] {
+    match tl.fade_to_silence(ti, ci).filter(|x| t >= x.at) {
+        Some(x) => {
+            let fall = |e: i64| xfade_weight(x.curve, ENV_ONE - ramp_q16(&x, e));
+            [env[0].min(fall(t)), env[1].min(fall(end))]
+        }
+        None => env,
     }
 }
