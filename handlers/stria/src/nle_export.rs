@@ -565,6 +565,16 @@ pub fn export_png(
     Ok((r, frames))
 }
 
+// ---- H264ENCSCENECUT (LEDGER SR680): the scene-cut option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// Scene-cut IDRs (h264enc_core's `Config::scenecut`, `nle export --scenecut [K]`): Some(k) codes an IDR at a detected
+    /// cut, k the threshold in percent (40 the documented default); None = the pinned stream.
+    pub fn with_scenecut(mut self, k: Option<u8>) -> H264Encoder {
+        self.rgba.cfg.scenecut = k;
+        self
+    }
+}
+
 // ---- NLERAWEXPORT (LEDGER SR689): the raw planar exports over the ONE RGBA -> I420 converter (named tail block) ----
 /// Raw planar 4:2:0 (handlers.md §5 NLE5b's NLE5-I420): each frame through `h264enc_core::yuv::I420::from_rgba` (the tree's ONE
 /// RGBA -> I420 converter: BT.601 limited range, chroma the 2x2 block average), its Y, Cb, Cr planes appended to one
