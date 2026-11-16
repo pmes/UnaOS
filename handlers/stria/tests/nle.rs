@@ -1564,3 +1564,82 @@ fn nlefaceexport_band_paints_only_while_running() {
     assert_eq!(stria::nle_face::fnv1a(&face.paint()), stria::nle_face::fnv1a(&idle), "no band once the export is reported");
     println!("nlefaceexport: band {lit} px at 10/20 rows {band:?}");
 }
+
+// ---- NLE5DEXPORTSTOP (LEDGER SR705): a sink's stop query ends `render` at that step, so a cancel ends the decode (named tail block) ----
+
+/// Counts what `render` hands it; `stop` turns true once `after` frames have arrived (`None` = never: the default).
+struct Nle5dStopSink {
+    after: Option<usize>,
+    frames: Vec<i64>,
+    pcm: Vec<i64>,
+}
+impl RenderSink for Nle5dStopSink {
+    fn frame(&mut self, out_t: i64, _w: u32, _h: u32, _rgba: &[u8]) {
+        self.frames.push(out_t);
+    }
+    fn pcm(&mut self, out_t: i64, _rate: u32, _ch: u16, _s: &[f32]) {
+        self.pcm.push(out_t);
+    }
+    fn stop(&self) -> bool {
+        self.after.is_some_and(|n| self.frames.len() >= n)
+    }
+}
+
+#[test]
+fn nle5dexportstop_render_ends_at_the_step_the_sink_stops() {
+    let (tl, src) = synth_fixture();
+    let steps = schedule(&tl, 0..tl.end(), &src).unwrap();
+    let mut all = Nle5dStopSink { after: None, frames: Vec::new(), pcm: Vec::new() };
+    let full = render(&tl, 0..tl.end(), &src, &mut all).unwrap();
+    assert_eq!((all.frames.len(), full.frames, full.stopped), (35, 35, None), "the default sink renders the whole range");
+
+    // The step after the 3rd video step is where the stop is read true (steps interleave video and audio).
+    let third = steps.iter().enumerate().filter(|(_, s)| s.kind == Kind::Video).nth(2).map(|(i, _)| i).unwrap();
+    let at = steps[third + 1].out_t;
+    let audio_before = steps[..=third].iter().filter(|s| s.kind == Kind::Audio).count();
+    let mut sink = Nle5dStopSink { after: Some(3), frames: Vec::new(), pcm: Vec::new() };
+    let r = render(&tl, 0..tl.end(), &src, &mut sink).unwrap();
+    assert_eq!(sink.frames, all.frames[..3].to_vec(), "exactly three frame calls, the first three");
+    assert_eq!(r.frames, 3);
+    assert_eq!(r.stopped, Some(at), "the report names the step it stopped at");
+    assert_eq!(sink.pcm.len(), audio_before, "no audio step past the stop");
+    assert!(r.frames < full.frames && r.pcm_frames <= full.pcm_frames);
+    println!("nle5dexportstop: render stopped at out_t={at} after 3/35 frames ({} audio steps)", sink.pcm.len());
+}
+
+#[test]
+fn nle5dexportstop_cancelled_export_stops_the_render() {
+    use stria::nle_export::{AudioOut, Container, ExportError, PngSequence, export_as_with};
+    // The door: progress refuses at frame 3 -> Ticked latches it -> render stops at the next step.
+    // (The 35-tick synth fixture decodes in milliseconds, so the 2 s bound is a guard; the step count above is the pin.)
+    let (tl, src) = synth_fixture();
+    let dir = nlefaceexport_dir("stop-door");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut calls = 0u64;
+    let t0 = std::time::Instant::now();
+    let r = export_as_with(&tl, 0..tl.end(), &src, &dir, Box::new(PngSequence), AudioOut::Wav, Container::Mp4, &mut |n, _| {
+        calls += 1;
+        if n == 3 { Err(ExportError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"))) } else { Ok(()) }
+    });
+    let ms = t0.elapsed().as_millis();
+    assert!(matches!(&r, Err(ExportError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted), "{r:?}");
+    assert_eq!(calls, 3);
+    for n in 0..3 {
+        assert!(dir.join(format!("{n:06}.png")).is_file(), "partial frame {n}");
+    }
+    assert!(!dir.join("000003.png").exists());
+    assert!(ms < 2000, "the cancelled export returned in {ms} ms");
+
+    // The face: Esc's cancel at 3/35, joined within the bound, SR694's line unchanged.
+    let fdir = nlefaceexport_dir("stop-face");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&fdir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    let t1 = std::time::Instant::now();
+    assert!(face.cancel_export() && face.wait_export());
+    let joined = t1.elapsed().as_millis();
+    assert!(joined < 2000, "joined in {joined} ms");
+    assert_eq!(face.last_error.take(), Some(format!("export: cancelled at 3/35 frames; partial files left in {}", fdir.display())));
+    println!("nle5dexportstop: export cancelled at 3 frames, joined in {joined} ms (door {ms} ms)");
+}
