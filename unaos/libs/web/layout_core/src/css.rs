@@ -1391,7 +1391,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.stretch = Some(p);
             }
         }
-        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" => apply_font_synthesis(prop, value, &mut style.paint),
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => apply_font_synthesis(prop, value, &mut style.paint),
         // css-text-3 §7.1
         "word-spacing" => {
             if value == "normal" {
@@ -2593,7 +2593,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style,
+        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
@@ -3484,38 +3484,40 @@ fn hex_color(hex: &str) -> Option<(u8, u8, u8)> {
 // ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): css-fonts-4 §6 font-synthesis and its weight / style longhands (named tail block) ----
 
 /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 `font-synthesis: none | [weight || style || small-caps]` (the
-/// shorthand: a keyword it omits sets that longhand to `none`; `small-caps` is parsed and ignored, Aether has no
-/// small-caps synthesis) and the `font-synthesis-weight` / `font-synthesis-style` longhands (`auto | none`), into
+/// shorthand: a keyword it omits sets that longhand to `none`; `small-caps` sets `font-synthesis-small-caps`, SR772, which
+/// nothing paints yet: Aether has no small-caps synthesis) and the `font-synthesis-weight` / `font-synthesis-style` longhands (`auto | none`), into
 /// `PaintStyle::synth_weight` / `synth_style` (Some(true) = auto). `initial` is `weight style` / `auto`; an invalid
 /// value, `inherit` and `unset` change nothing (the property inherits). `font` does not reset it (css-fonts-4 §2.8's
 /// reset list omits it; Chromium's `font` longhands too).
 fn apply_font_synthesis<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
-    let Some((w, s)) = parse_font_synthesis(prop, value) else { return };
+    let Some((w, s, c)) = parse_font_synthesis(prop, value) else { return };
     if w.is_some() {
         paint.synth_weight = w;
     }
     if s.is_some() {
         paint.synth_style = s;
     }
+    if c.is_some() { paint.synth_small_caps = c; }
 }
 
 /// AETHERFONTSYNTHESISCSSOM (SR764): the ONE `font-synthesis` keyword parse, shared by the setter above and Aether's
 /// CSSOM (`expand`): the shorthand gives both halves (`initial` both auto, `none` both none, a keyword it omits none,
-/// `small-caps` parsed and dropped), a longhand `auto | none | initial` its own half (Some(true) = auto). None for an
+/// `small-caps` its third half, AETHERFONTSYNTHESISSMALLCAPS SR772), a longhand `auto | none | initial` its own half (Some(true) = auto). None for an
 /// invalid value and for `inherit` / `unset` (the values the setter ignores: the property inherits).
-pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Option<bool>)> {
+pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Option<bool>, Option<bool>)> {
     let v = value.trim().to_ascii_lowercase();
     let auto = |s: &str| match s {
         "auto" | "initial" => Some(true),
         "none" => Some(false),
         _ => None,
     };
-    let (w, s) = match prop {
-        "font-synthesis-weight" => (Some(auto(&v)?), None),
-        "font-synthesis-style" => (None, Some(auto(&v)?)),
+    let (w, s, c) = match prop {
+        "font-synthesis-weight" => (Some(auto(&v)?), None, None),
+        "font-synthesis-style" => (None, Some(auto(&v)?), None),
+        "font-synthesis-small-caps" => (None, None, Some(auto(&v)?)),
         _ => match v.as_str() {
-            "initial" => (Some(true), Some(true)),
-            "none" => (Some(false), Some(false)),
+            "initial" => (Some(true), Some(true), Some(true)),
+            "none" => (Some(false), Some(false), Some(false)),
             _ => {
                 let (mut w, mut s, mut c) = (false, false, false);
                 for k in v.split_whitespace() {
@@ -3533,9 +3535,9 @@ pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Op
                 if !(w || s || c) {
                     return None;
                 }
-                (Some(w), Some(s))
+                (Some(w), Some(s), Some(c))
             }
         },
     };
-    Some((w, s))
+    Some((w, s, c))
 }
