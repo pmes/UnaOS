@@ -311,7 +311,7 @@ fn vmix_for(
         return Ok(None);
     };
     let k = t - c.at;
-    let w = Frac { num: k + 1, den: x.dur + 1 };
+    let w = x.ease.apply(Frac { num: k + 1, den: x.dur + 1 }); // NLEWIPES (SR679): the ease, once, where t is born
     if x.from_black {
         *m_next = None;
         return Ok(Some(VideoMix { kind: x.kind, src: None, src_t: 0, seek: None, t: w }));
@@ -393,7 +393,7 @@ fn black_step(
     let src_t = o.src_out + k;
     let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { *v_next } else { *m_next })?;
     (*v_next, *m_next) = (None, Some((o.src, src_t + 1)));
-    let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: Frac { num: k + 1, den: x.dur + 1 } };
+    let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: x.ease.apply(Frac { num: k + 1, den: x.dur + 1 }) }; // NLEWIPES (SR679): the ease
     Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix) })
 }
 

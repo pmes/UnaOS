@@ -118,9 +118,9 @@ fn edl_refusals_are_named() {
         Err(EdlError::Edit(EditError::Handle))
     );
     assert!(edl::parse(&ev("002  B        V     D    005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25).is_ok());
-    // an unknown wipe code (NLE3cBLACK: W003 is a corner box now; W007 is not in the table)
+    // an unknown wipe code (NLE3cBLACK: W003 is a corner box now; NLEWIPES: W007 is four boxes, W008 is refused by name)
     assert_eq!(
-        edl::parse(&ev("002  B        V     W007 005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25),
+        edl::parse(&ev("002  B        V     W008 005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25),
         Err(EdlError::Transition { line: 8 })
     );
     // the incoming line's event number differs from its outgoing line's
@@ -240,7 +240,7 @@ fn nle3c_the_edl_carries_bl_and_the_new_wipes_byte_exact() {
         assert!(text.contains(&format!("{code} 007")), "{text}");
         assert_eq!(edl::parse(&text, 25).unwrap(), tl);
     }
-    assert_eq!(WipeDir::from_code(7), None);
+    assert_eq!(WipeDir::from_code(8), None); // NLEWIPES: W007 is built; W008 cornersOut is refused by name
 }
 
 #[test]
@@ -445,4 +445,142 @@ fn nle3cblack_a_to_black_follows_its_cut() {
     assert!(tl.tracks[0].transitions[0].to_black);
     // lifting the outgoing clip leaves no cut: refused by name
     assert_eq!(to_black().lift(0, 0), Err(EditError::Transition));
+}
+
+// ---- NLEWIPES (LEDGER SR679): the SMPTE families, the ease, the refused codes (named tail block) ----
+
+/// The 64x48 mask of `d` at `t`: which pixels show the incoming (white over a black outgoing).
+fn nlewipes_mask(d: WipeDir, t: Frac) -> Vec<bool> {
+    let mut o = [0u8, 0, 0, 255].repeat(64 * 48);
+    timeline_core::vmix::mix_step(TransitionKind::Wipe(d), t, &mut o, &[255u8, 255, 255, 255].repeat(64 * 48), 64, 48);
+    o.chunks_exact(4).map(|p| p[0] == 255).collect()
+}
+
+const NLEWIPES_BUILT: [(WipeDir, u16); 19] = [
+    (WipeDir::FourBoxCornersIn, 7),
+    (WipeDir::EdgeBoxTop, 23),
+    (WipeDir::EdgeBoxRight, 24),
+    (WipeDir::EdgeBoxBottom, 25),
+    (WipeDir::EdgeBoxLeft, 26),
+    (WipeDir::BowTieVertical, 43),
+    (WipeDir::BowTieHorizontal, 44),
+    (WipeDir::BarnDoorDiagonalBottomLeft, 45),
+    (WipeDir::BarnDoorDiagonalTopLeft, 46),
+    (WipeDir::DoubleBarnDoor, 47),
+    (WipeDir::Diamond, 102),
+    (WipeDir::Circle, 119),
+    (WipeDir::PinWheelTwoVertical, 205),
+    (WipeDir::PinWheelTwoHorizontal, 206),
+    (WipeDir::PinWheelFour, 207),
+    (WipeDir::FanCenterTop, 211),
+    (WipeDir::FanCenterRight, 212),
+    (WipeDir::DoubleFanVertical, 213),
+    (WipeDir::DoubleFanHorizontal, 214),
+];
+
+#[test]
+fn nlewipes_every_new_code_is_none_at_zero_and_all_at_one_and_round_trips() {
+    for (d, code) in NLEWIPES_BUILT {
+        assert!(nlewipes_mask(d, Frac { num: 0, den: 1 }).iter().all(|p| !p), "{d:?} at 0");
+        assert!(nlewipes_mask(d, Frac { num: 1, den: 1 }).iter().all(|p| *p), "{d:?} at 1");
+        assert_eq!((d.code(), WipeDir::from_code(code), WipeDir::refused(code)), (code, Some(d), None));
+        let tl = cuts().add_transition(0, 20, TransitionKind::Wipe(d), 7).unwrap();
+        let text = edl::write(&tl, "W").unwrap();
+        assert!(text.contains(&format!("W{code:03} 007")), "{text}");
+        assert_eq!(edl::parse(&text, 25).unwrap(), tl);
+    }
+}
+
+/// The pinned pixels at t = 1/2, hand-derived on 64x48 with X = 2x - 63, Y = 2y - 47 (doubled centred coordinates):
+/// * W007: in iff min(x, 63-x) < 16 and min(y, 47-y) < 12 (2 * dist * 2 < 64 / 48).
+/// * W023 top: x in 16..=47 (|2x-63| < 32) and y < 24; W024 right: y in 12..=35 and x >= 32; W025 bottom: x in 16..=47
+///   and y >= 24; W026 left: y in 12..=35 and x < 32.
+/// * W043: 64|Y| > 48|X| (the hourglass): (32,0) X=1 Y=-47 -> 3008 > 48 in; (20,5) 2368 > 1104 in; (5,20) X=-53 Y=-7 ->
+///   448 > 2544 out; (0,24) out. W044 the swap.
+/// * W045: |48X + 64Y| < 3072: (0,47) -3024+3008 = -16 in, (63,0) 16 in, (32,24) 112 in, (0,0) -6032 out, (63,47) out.
+///   W046: |48X - 64Y| < 3072: (0,0) -16 in, (63,47) in, (32,24) -16 in, (0,47) / (63,0) out.
+/// * W102: 48|X| + 64|Y| < 3072: (32,24) 112 in, (16,12) 2960 in, (32,0) 3056 in, (15,11) 3184 out, (0,24) 3088 out.
+/// * W119: X^2 + Y^2 < 1600: (51,24) 1522 in, (32,43) 1522 in, (52,24) 1682 out, (32,44) 1682 out.
+/// * W205 (hands from 12 and 6): the top-right and bottom-left quadrants; W206 (3 and 9): bottom-right and top-left.
+/// * W207 (four hands, each half its quadrant): (36,5) at 12 deg, (60,28) at 99, (28,44) at 190, (4,20) at 277 in;
+///   (60,20) at 83, (4,28) at 261 out.
+/// * W211 (fan from 12): the top half; W212 (from 3): the right half.
+/// * W213 (fans from 12 and 6, within 45 deg of the vertical): (36,2) at 12, (34,46) at 174 in; (60,26) at 95, (4,22)
+///   at 273 out. W214 the swap.
+#[test]
+fn nlewipes_each_new_mask_at_one_half() {
+    let half = Frac { num: 1, den: 2 };
+    type Pins = (WipeDir, &'static [(usize, usize)], &'static [(usize, usize)]);
+    let cases: [Pins; 18] = [
+        (WipeDir::FourBoxCornersIn, &[(0, 0), (15, 11), (63, 47), (48, 36), (0, 47)], &[(16, 0), (0, 12), (32, 24), (47, 35)]),
+        (WipeDir::EdgeBoxTop, &[(16, 0), (47, 23), (32, 10)], &[(15, 0), (48, 0), (32, 24)]),
+        (WipeDir::EdgeBoxRight, &[(63, 12), (32, 35)], &[(31, 24), (63, 11), (63, 36)]),
+        (WipeDir::EdgeBoxBottom, &[(16, 47), (47, 24)], &[(15, 47), (32, 23)]),
+        (WipeDir::EdgeBoxLeft, &[(0, 12), (31, 35)], &[(32, 24), (0, 11)]),
+        (WipeDir::BowTieVertical, &[(32, 0), (32, 47), (20, 5)], &[(0, 24), (63, 24), (5, 20)]),
+        (WipeDir::BowTieHorizontal, &[(0, 24), (63, 24), (5, 20)], &[(32, 0), (32, 47), (20, 5)]),
+        (WipeDir::BarnDoorDiagonalBottomLeft, &[(0, 47), (63, 0), (32, 24)], &[(0, 0), (63, 47)]),
+        (WipeDir::BarnDoorDiagonalTopLeft, &[(0, 0), (63, 47), (32, 24)], &[(0, 47), (63, 0)]),
+        (WipeDir::Diamond, &[(32, 24), (16, 12), (32, 0)], &[(0, 0), (0, 24), (15, 11), (63, 47)]),
+        (WipeDir::Circle, &[(32, 24), (51, 24), (32, 43)], &[(52, 24), (32, 44), (0, 0)]),
+        (WipeDir::PinWheelTwoVertical, &[(40, 10), (20, 40)], &[(20, 10), (40, 40)]),
+        (WipeDir::PinWheelTwoHorizontal, &[(40, 40), (20, 10)], &[(40, 10), (20, 40)]),
+        (WipeDir::PinWheelFour, &[(36, 5), (60, 28), (28, 44), (4, 20)], &[(60, 20), (4, 28)]),
+        (WipeDir::FanCenterTop, &[(10, 10), (50, 10)], &[(10, 40), (50, 40)]),
+        (WipeDir::FanCenterRight, &[(50, 10), (50, 40)], &[(10, 10), (10, 40)]),
+        (WipeDir::DoubleFanVertical, &[(36, 2), (34, 46)], &[(60, 26), (4, 22)]),
+        (WipeDir::DoubleFanHorizontal, &[(60, 26), (4, 22)], &[(36, 2), (34, 46)]),
+    ];
+    for (d, ins, outs) in cases {
+        let m = nlewipes_mask(d, half);
+        for &(x, y) in ins {
+            assert!(m[y * 64 + x], "{d:?} ({x},{y}) in");
+        }
+        for &(x, y) in outs {
+            assert!(!m[y * 64 + x], "{d:?} ({x},{y}) out");
+        }
+    }
+    // W047 (both diagonal bands) covers the frame at 1/2, so its pins are at t = 1/4: |48X +- 64Y| < 1536 for either
+    // sign: (0,0) / (0,47) / (32,24) in; (32,0) BL -2960 TL 3056 out; (0,24) BL -2960 TL -3088 out.
+    let m = nlewipes_mask(WipeDir::DoubleBarnDoor, Frac { num: 1, den: 4 });
+    assert!(m[0] && m[47 * 64] && m[24 * 64 + 32] && !m[32] && !m[24 * 64]);
+}
+
+#[test]
+fn nlewipes_the_ease_curves_and_where_they_apply() {
+    use timeline_core::Ease;
+    let q = |n: i64, d: i64| Frac { num: n, den: d };
+    let curve = |e: Ease| [q(1, 4), q(2, 4), q(3, 4)].map(|t| e.apply(t));
+    assert_eq!(curve(Ease::Linear), [q(1, 4), q(2, 4), q(3, 4)]);
+    assert_eq!(curve(Ease::In), [q(1, 16), q(4, 16), q(9, 16)]);
+    assert_eq!(curve(Ease::Out), [q(7, 16), q(12, 16), q(15, 16)]);
+    assert_eq!(curve(Ease::InOut), [q(10, 64), q(32, 64), q(54, 64)]);
+    assert_eq!((Ease::default(), Ease::from_name("InOut"), Ease::from_name("smooth")), (Ease::Linear, Some(Ease::InOut), None));
+    // the dissolve under InOut at t = 1/2 is Linear's (smoothstep(1/2) = 4/8 -> alpha round(255 * 4/8) = 128)
+    let mix = |t: Frac| {
+        let mut o = [10u8, 10, 10, 255].repeat(64 * 48);
+        timeline_core::vmix::mix_step(TransitionKind::Dissolve, t, &mut o, &[210u8, 210, 210, 255].repeat(64 * 48), 64, 48);
+        o
+    };
+    assert_eq!(mix(Ease::InOut.apply(q(1, 2))), mix(q(1, 2)));
+    assert_ne!(mix(Ease::In.apply(q(1, 2))), mix(q(1, 2)));
+    // the schedule eases the step's weight once: the dissolve into B (dur 9) at k = 4 is InOut(5/10) = 500/1000
+    let mut tl = three();
+    tl.tracks[0].transitions[0].ease = Ease::InOut;
+    let s = schedule(&tl, 0..60, &Gop { dur: 50 }).unwrap();
+    assert_eq!(s[24].vmix.map(|m| m.t), Some(q(500, 1000)));
+    assert_eq!(s[44].vmix.map(|m| m.t), Some(q(5, 10))); // the W001 wipe stays linear
+    // a re-put at the same cut (the editor's length change) keeps the ease
+    let longer = tl.add_transition(0, 20, TransitionKind::Dissolve, 8).unwrap();
+    assert_eq!((longer.tracks[0].transitions[0].dur, longer.tracks[0].transitions[0].ease), (8, Ease::InOut));
+}
+
+#[test]
+fn nlewipes_the_rest_of_the_table_is_refused_by_name() {
+    for &(code, name) in WipeDir::REFUSED {
+        assert_eq!((WipeDir::from_code(code), WipeDir::refused(code)), (None, Some(name)), "W{code:03}");
+    }
+    assert_eq!(WipeDir::refused(8), Some("fourBoxWipe cornersOut"));
+    assert_eq!(WipeDir::refused(1), None); // built
+    assert_eq!(WipeDir::refused(9), None); // not in the table
 }
