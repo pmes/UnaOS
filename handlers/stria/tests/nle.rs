@@ -2110,3 +2110,88 @@ fn striainforeelstrip_face_message_has_a_row_of_its_own() {
     assert_eq!(band(&sel, 0, m.message_y), band(&bare, 0, m.message_y), "no label ink in the preview rows above the row");
     println!("striainforeelstrip: face row={}+{} ruler_y={} preview_h={}", m.message_y, m.message_h, m.ruler_y, m.preview_h);
 }
+
+// ---- STRIAINFOREELHOVER (LEDGER SR762): the message names the clip under the pointer (named tail block) ----
+
+/// The labelled (or not) synth face with B (V1 clip 1) selected, and the face's pointer geometry.
+fn striainforeelhover_face(labels: bool) -> (stria::nle_face::Face, stria::nle_face::Layout) {
+    use stria::nle_face::{EditorState, Face, PixelOrder};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, labels);
+    face.state.select(0, 1).unwrap();
+    let l = face.layout();
+    (face, l)
+}
+
+/// A bare pointer move (no button), as the surface sends it and stria-view's `move:<x>:<y>` builds it.
+fn striainforeelhover_move(face: &mut stria::nle_face::Face, x: f64, y: f64) -> bool {
+    face.on(&bandy::SMessage::BrowserMouseMove(x, y, 0))
+}
+
+/// Rule: the pointer resting over an unselected clip makes the message (and the witness's reel line) that clip's
+/// `<reel>: <summary>`; the ruler, an empty track spot and the selected clip itself give the selected clip's line back; an
+/// error still wins; the message row's paint follows.
+#[test]
+fn striainforeelhover_message_names_the_clip_under_the_pointer() {
+    use stria::nle_face::Hit;
+    let (mut face, l) = striainforeelhover_face(true);
+    let (a, b) = (format!("A: {}", striainforeelhover_summary(&face, 0)), format!("B: {}", striainforeelhover_summary(&face, 1)));
+    let row_y = l.tracks_y as f64 + 10.0;
+    let at = |t: i64| l.x_of(t) as f64 + 0.5;
+    let tl = face.state.timeline.clone();
+    assert!(matches!(l.hit(&tl, at(5), row_y), Hit::Clip(0, 0, _)));
+    assert!(matches!(l.hit(&tl, at(5), l.ruler_y as f64 + 1.0), Hit::Ruler(_)));
+    assert!(matches!(l.hit(&tl, at(15), row_y), Hit::Clip(0, 1, _)));
+    assert!(matches!(l.hit(&tl, at(22), row_y), Hit::Track(0, _)));
+    assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
+    let selected = face.paint();
+    assert!(striainforeelhover_move(&mut face, at(5), row_y), "the hovered clip changed: repaint");
+    assert_eq!(face.hovered_clip(), Some((0, 0)));
+    assert_eq!(face.message_text().as_deref(), Some(a.as_str()));
+    assert_eq!(face.reel_line().as_deref(), Some(a.as_str()), "the witness's reel follows the hover");
+    assert_ne!(face.paint(), selected, "the message row shows A's line");
+    assert!(!striainforeelhover_move(&mut face, at(6), row_y), "still over A: no repaint");
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over the hover");
+    face.last_error = None;
+    assert!(striainforeelhover_move(&mut face, at(5), l.ruler_y as f64 + 1.0));
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the ruler");
+    assert_eq!(face.paint(), selected, "back to the selected clip's paint");
+    striainforeelhover_move(&mut face, at(5), row_y);
+    assert!(striainforeelhover_move(&mut face, at(15), row_y));
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the selected clip itself");
+    striainforeelhover_move(&mut face, at(5), row_y);
+    assert!(striainforeelhover_move(&mut face, at(22), row_y));
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "an empty track spot");
+    println!("striainforeelhover: hover={a} selected={b}");
+}
+
+/// Rule: while a drag is live the message keeps the selected clip's line (no flicker as the drag crosses other clips).
+#[test]
+fn striainforeelhover_a_live_drag_keeps_the_selected_line() {
+    let (mut face, l) = striainforeelhover_face(true);
+    let b = format!("B: {}", striainforeelhover_summary(&face, 1));
+    let (row_y, at) = (l.tracks_y as f64 + 10.0, |t: i64| l.x_of(t) as f64 + 0.5);
+    face.on(&bandy::SMessage::BrowserButton { down: true, x: at(15), y: row_y, mods: 0, surface: 0 });
+    assert!(face.dragging().is_some(), "a press on B's body begins a drag");
+    striainforeelhover_move(&mut face, at(5), row_y);
+    assert!(face.dragging().is_some());
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b)));
+}
+
+/// Rule: a labels-off face paints no message, so a move over another clip asks no repaint and the paint is byte-identical.
+#[test]
+fn striainforeelhover_labels_off_is_unchanged() {
+    let (mut face, l) = striainforeelhover_face(false);
+    let before = face.paint();
+    assert!(!striainforeelhover_move(&mut face, l.x_of(5) as f64 + 0.5, l.tracks_y as f64 + 10.0));
+    assert_eq!(face.hovered_clip(), Some((0, 0)));
+    assert_eq!(face.paint(), before);
+}
+
+/// The reel summary of V1 clip `i`'s source, as `Sources::summary` gives it (the face's own sources are private: a fresh
+/// synth fixture opens the same bytes).
+fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String {
+    let (_, src) = stria::nle_face::synth_fixture();
+    src.summary(face.state.timeline.tracks[0].clips[i].src).unwrap()
+}
