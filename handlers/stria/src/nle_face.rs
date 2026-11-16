@@ -28,6 +28,7 @@
 //!   edges and the playhead within [`SNAP_PX`] (the guide line painted by `paint_drag`); a press on the ruler scrubs.
 //!   NLE2-MODS (LEDGER SR306): shift-add and the no-snap Alt / Option come on the press itself (`BrowserButton`'s
 //!   `mods`, bandy's `MOD_SHIFT` / `MOD_ALT`), so both faces have them and no keydown latch exists.
+//! * NLEHOSTSAVE (LEDGER SR677): `save` (button, `Ctrl+s` / `Meta+s`) writes the timeline through `edl::write` to the path the document was opened from.
 
 use std::time::Duration;
 
@@ -151,7 +152,8 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
-pub const VERBS: [&str; 15] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size"];
+/// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
+pub const VERBS: [&str; 16] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save"];
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -180,13 +182,17 @@ pub struct Face {
     surface: Option<u32>,
     /// NLE2-SPLIT (SR339): the preview on its own Surface ([`Face::on_surfaces`]); `canvas` is then the tracks Surface's.
     split: Option<Split>,
+    /// NLEHOSTSAVE (SR677): the EDL this face was opened from ([`Face::with_doc`]); `None` (the synth fixture): `save` refuses.
+    doc_path: Option<std::path::PathBuf>,
+    /// NLEHOSTSAVE (SR677): the timeline as last opened or saved; [`Face::dirty`] is the current one differing from it.
+    clean: Timeline,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -221,7 +227,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; }
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -346,6 +352,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+z", "undo"),
     ("Ctrl+Shift+Z", "redo"),
     ("Meta+Shift+Z", "redo"),
+    ("Ctrl+s", "save"),
+    ("Meta+s", "save"),
     ("Left", "nudge-"),
     ("Right", "nudge+"),
     ("\u{f702}", "nudge-"),
@@ -1667,5 +1675,45 @@ mod split_tests {
         // The preview's rect set holds no hit target.
         let l = f.layout_for(Role::Preview);
         assert_eq!(l.hit(&f.state.timeline, 81.0, 36.0), Hit::None);
+    }
+}
+
+// ---- NLEHOSTSAVE (LEDGER SR677): the host face's save through timeline_core's ONE writer (named tail block) ----
+
+/// NLEHOSTSAVE (SR677): the document path, the derived dirty reading and the save. The EDL text is
+/// `timeline_core::edl::write`'s (the kernel face's `edit_save` writer), titled by the file stem as the kernel's
+/// `edl_stem` titles it; every refusal names its cause (no path) or the path.
+impl Face {
+    /// The face opened from `path` (`None`: no document, `save` refuses).
+    pub fn with_doc(mut self, path: Option<&std::path::Path>) -> Face {
+        self.doc_path = path.map(std::path::Path::to_path_buf);
+        self
+    }
+    /// The path the document was opened from.
+    pub fn doc_path(&self) -> Option<&std::path::Path> {
+        self.doc_path.as_deref()
+    }
+    /// True when the timeline differs from the one last opened or saved (an undo back to it reads clean).
+    pub fn dirty(&self) -> bool {
+        self.state.timeline != self.clean
+    }
+    /// The `save` verb: a refusal is the face's `last_error` (`save: <why>`), like every refused verb.
+    fn save_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "save" {
+            return None;
+        }
+        if let Err(e) = self.save() {
+            self.last_error = Some(format!("save: {e}"));
+        }
+        Some(true)
+    }
+    /// Write the timeline to the document's path; the bytes written. The face is clean after.
+    pub fn save(&mut self) -> Result<usize, String> {
+        let Some(path) = self.doc_path.clone() else { return Err("no document path".into()) };
+        let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled");
+        let text = timeline_core::edl::write(&self.state.timeline, title).map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::write(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.clean = self.state.timeline.clone();
+        Ok(text.len())
     }
 }
