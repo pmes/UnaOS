@@ -1183,7 +1183,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 /// anywhere down the tree still wins.
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
-        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited);
+        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
         if let Some(align) = effective.filter(|&a| a != 0 && a != 4) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
@@ -3284,4 +3284,23 @@ fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
         cur = tree.taffy.parent(b);
     }
     false
+}
+
+// ---- AETHERRTLBLOCKSTART (LEDGER SR711): an rtl column's narrow blocks at its inline start with no / start text-align (named tail block) ----
+
+/// AETHERRTLBLOCKSTART (SR711): an rtl block container whose text-align is none or `start` (code 0) puts its in-flow
+/// narrow blocks at its inline start, the RIGHT edge (CSS 2.2 §10.3.3: in rtl margin-left is the over-constrained one;
+/// taffy's default START is always the physical left). The filter in `propagate_text_align` admits no such code (and
+/// `Option::filter` never sees None), so this runs beside it: `place_narrow_blocks`' `_` arm gives END through `is_rtl`
+/// and records the write in `rule_align`, which SR686's `rule_align_undo` clears before the next prepass. The column's
+/// `justify_content` / `align_items` are never touched. Code 4 (`text-align: left`) is not admitted: it is also
+/// `align=left`, which Chromium keeps at the physical left (AETHER-RTL-BLOCK-LEFT owed, the 4 / 7 code split).
+fn rtl_start_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, effective: Option<u8>) {
+    if !matches!(effective, None | Some(0)) {
+        return;
+    }
+    let Ok(st) = tree.taffy.style(id).cloned() else { return };
+    if (crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st)) && is_rtl(tree, id) {
+        place_narrow_blocks(tree, id, 0);
+    }
 }
