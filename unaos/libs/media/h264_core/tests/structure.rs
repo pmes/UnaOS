@@ -482,3 +482,172 @@ fn exp_golomb_and_framing_helpers() {
     assert_eq!(units, vec![&[0x67u8, 1][..], &[0x68][..]]);
     assert_eq!(nal::length_prefixed_units(&[0, 9, 1], 2), Err(Error::Truncated));
 }
+
+// ---- H264COREHRD (LEDGER SR708): hrd_parameters and the buffering_period / pic_timing SEIs (named tail block) ----
+
+/// `sps(66, w, h, 1, false, false)` with vui_parameters: timing_info 1 / 60 fixed, nal_hrd_parameters (one CPB, BitRate =
+/// CpbSize = 400000 at scale 0, cbr_flag 1, every length 24 bits: H264ENCHRD SR699's signalling), low_delay_hrd_flag 0.
+fn sps_hrd(w: u32, h: u32) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.u(66, 8);
+    b.u(0, 8);
+    b.u(30, 8);
+    b.ue(0);
+    b.ue(0); // log2_max_frame_num_minus4
+    b.ue(0); // pic_order_cnt_type
+    b.ue(0); // log2_max_pic_order_cnt_lsb_minus4
+    b.ue(1);
+    b.bit(0);
+    b.ue(w - 1);
+    b.ue(h - 1);
+    b.bit(1); // frame_mbs_only_flag
+    b.bit(1); // direct_8x8_inference_flag
+    b.bit(0); // frame_cropping_flag
+    b.bit(1); // vui_parameters_present_flag
+    b.bit(0); // aspect_ratio_info_present_flag
+    b.bit(0); // overscan_info_present_flag
+    b.bit(0); // video_signal_type_present_flag
+    b.bit(0); // chroma_loc_info_present_flag
+    b.bit(1); // timing_info_present_flag
+    b.u(1, 32);
+    b.u(60, 32);
+    b.bit(1); // fixed_frame_rate_flag
+    b.bit(1); // nal_hrd_parameters_present_flag
+    b.ue(0); // cpb_cnt_minus1
+    b.u(0, 4); // bit_rate_scale
+    b.u(0, 4); // cpb_size_scale
+    b.ue(400_000 / 64 - 1); // bit_rate_value_minus1
+    b.ue(400_000 / 16 - 1); // cpb_size_value_minus1
+    b.bit(1); // cbr_flag
+    b.u(23, 5); // initial_cpb_removal_delay_length_minus1
+    b.u(23, 5); // cpb_removal_delay_length_minus1
+    b.u(23, 5); // dpb_output_delay_length_minus1
+    b.u(24, 5); // time_offset_length
+    b.bit(0); // vcl_hrd_parameters_present_flag
+    b.bit(0); // low_delay_hrd_flag
+    b.bit(0); // pic_struct_present_flag
+    b.bit(0); // bitstream_restriction_flag
+    b.trailing();
+    nal_unit(3, 7, &b.out)
+}
+
+/// A SEI NAL unit of (payloadType, payload) messages (7.3.2.3.1: 0xFF runs for type and size), rbsp_trailing_bits last.
+fn sei_nal(msgs: &[(usize, Vec<u8>)]) -> Vec<u8> {
+    let mut rbsp = Vec::new();
+    for (ty, body) in msgs {
+        for mut v in [*ty, body.len()] {
+            while v >= 255 {
+                rbsp.push(0xFF);
+                v -= 255;
+            }
+            rbsp.push(v as u8);
+        }
+        rbsp.extend_from_slice(body);
+    }
+    rbsp.push(0x80);
+    nal_unit(0, 6, &rbsp)
+}
+
+/// buffering_period (D.1.2) for seq_parameter_set_id 0 and one NAL CPB: 24-bit initial_cpb_removal_delay and offset, then
+/// the payload's alignment bits.
+fn bp_payload(delay: u32, offset: u32) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.ue(0);
+    b.u(delay, 24);
+    b.u(offset, 24);
+    b.trailing();
+    b.out
+}
+
+/// pic_timing (D.1.3) under 24-bit delays, pic_struct_present_flag 0.
+fn pt_payload(cpb: u32, dpb: u32) -> Vec<u8> {
+    let mut b = BitWriter::default();
+    b.u(cpb, 24);
+    b.u(dpb, 24);
+    b.out
+}
+
+#[test]
+fn hrd_parameters_parse_to_the_exact_values() {
+    let n = sps_hrd(3, 2);
+    let mut rbsp = Vec::new();
+    nal::unescape(&n[5..], &mut rbsp);
+    let s = h264_core::ps::parse_sps(&rbsp).unwrap();
+    let want = h264_core::ps::Hrd {
+        cpb_cnt: 1,
+        bit_rate: 400_000,
+        cpb_size: 400_000,
+        cbr: true,
+        initial_cpb_removal_delay_len: 24,
+        cpb_removal_delay_len: 24,
+        dpb_output_delay_len: 24,
+        time_offset_len: 24,
+    };
+    assert_eq!(s.nal_hrd, Some(want));
+    assert_eq!(s.vcl_hrd, None);
+    assert_eq!(s.timing_info, Some((1, 60, true)));
+    assert!(!s.low_delay_hrd);
+    assert_eq!((s.width_mbs, s.height_mbs()), (3, 2), "the fields after the HRD still parse");
+    // The plain SPS signals none of it.
+    let n = sps(66, 3, 2, 1, false, false);
+    nal::unescape(&n[5..], &mut rbsp);
+    let s = h264_core::ps::parse_sps(&rbsp).unwrap();
+    assert_eq!((s.timing_info, s.nal_hrd, s.vcl_hrd, s.low_delay_hrd), (None, None, None, false));
+}
+
+#[test]
+fn buffering_period_and_pic_timing_note() {
+    use h264_core::decoder::{HrdKind, HrdNote};
+    let user_data: Vec<u8> = (0..17u8).map(|v| v + 0x40).collect();
+    let s = [
+        sps_hrd(3, 2),
+        pps(false),
+        sei_nal(&[(0, bp_payload(0x1234, 0)), (5, user_data), (1, pt_payload(6, 4))]),
+        flat_idr(3, 2),
+        sei_nal(&[(1, pt_payload(2, 0))]),
+        flat_idr(3, 2),
+    ]
+    .concat();
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).unwrap();
+    d.flush();
+    let f = d.take_frames();
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|f| f.planes[0].iter().all(|&v| v == 128)), "the pictures decode as without the SEI");
+    let note = |pic, kind| HrdNote { pic, tag: 0, kind };
+    assert_eq!(
+        d.take_hrd_notes(),
+        vec![
+            note(0, HrdKind::BufferingPeriod { sps_id: 0, nal: vec![(0x1234, 0)], vcl: vec![] }),
+            note(0, HrdKind::PicTiming { cpb_removal_delay: 6, dpb_output_delay: 4 }),
+            note(1, HrdKind::PicTiming { cpb_removal_delay: 2, dpb_output_delay: 0 }),
+        ]
+    );
+    assert!(d.take_hrd_notes().is_empty(), "take drains");
+}
+
+#[test]
+fn malformed_sei_notes_nothing_and_decodes() {
+    // A payload size past the RBSP, then a buffering_period cut short: no note, no error, the picture decodes.
+    let s = [
+        sps_hrd(3, 2),
+        pps(false),
+        nal_unit(0, 6, &[0, 40, 0x81, 0x12, 0x80]),
+        sei_nal(&[(0, vec![0x80])]),
+        flat_idr(3, 2),
+    ]
+    .concat();
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).unwrap();
+    d.flush();
+    assert_eq!(d.take_frames().len(), 1);
+    assert!(d.take_hrd_notes().is_empty());
+    // A pic_timing under an SPS with no HRD: the delays are not present, so nothing is noted.
+    let s = [sps(66, 3, 2, 1, false, false), pps(false), sei_nal(&[(1, pt_payload(6, 4))]), flat_idr(3, 2)].concat();
+    let f = decode(&s).unwrap();
+    assert_eq!(f.len(), 1);
+    assert!(f[0].planes[0].iter().all(|&v| v == 128));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).unwrap();
+    assert!(d.take_hrd_notes().is_empty());
+}

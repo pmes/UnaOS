@@ -11,10 +11,12 @@
 //! frames, a bucket the scene cannot fill, where the filler holds the drained bucket (and the stream still decodes); (c) every access unit carries
 //! one pic_timing SEI and every IDR (only an IDR) one buffering_period, and h264_core decodes each to the encoder's
 //! reconstruction byte for byte (SEI and filler skipped); (d) `hrd: true` without a bucket (constant QP: tests/rc.rs's pin, CRF)
-//! changes no byte. h264_core reads hrd_parameters and drops them (H264CORE-HRD owed), so the walkers here read the bits.
+//! changes no byte. H264COREHRD (SR708): the SPS is read by h264_core's `ps::parse_sps` (`Sps::timing_info` / `nal_hrd`) and the
+//! SEIs by its decoder (`Decoder::take_hrd_notes`); no bit walker of its own.
 
-use h264_core::bits::BitReader;
-use h264_core::nal::{unescape, NAL_FILLER, NAL_IDR, NAL_SEI, NAL_SPS};
+use h264_core::decoder::HrdKind;
+use h264_core::nal::{unescape, NAL_FILLER, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SPS};
+use h264_core::ps::{parse_sps, Sps};
 use h264_core::Decoder;
 use h264enc_core::{Access, Config, Encoder, RateControl, Yuv420};
 
@@ -84,82 +86,10 @@ fn rbsp(nal: &[u8]) -> Vec<u8> {
     v
 }
 
-/// What the walker reads from the SPS: level_idc, timing_info (num_units_in_tick, time_scale, fixed_frame_rate_flag), the NAL
-/// hrd_parameters (BitRate, CpbSize, cbr_flag, the four lengths), vcl_hrd_parameters_present_flag and low_delay_hrd_flag.
-#[derive(Debug, Default)]
-struct Vui {
-    level: u8,
-    timing: Option<(u32, u32, bool)>,
-    hrd: Option<(u64, u64, bool, [u32; 4])>,
-    vcl: bool,
-    low_delay: Option<bool>,
-}
-
-/// seq_parameter_set_rbsp (7.3.2.1.1) walked to the end of vui_parameters' HRD fields (E.1.1, E.1.2), frames only.
-fn walk_sps(nal: &[u8]) -> Vui {
+/// The SPS as h264_core reads it (level_idc, timing_info, nal_hrd, vcl_hrd, low_delay_hrd).
+fn sps_of(nal: &[u8]) -> Sps {
     assert_eq!(nal[0] & 0x1f, NAL_SPS);
-    let b = rbsp(nal);
-    let mut r = BitReader::new(&b);
-    let profile = r.u(8);
-    r.u(8);
-    let mut v = Vui { level: r.u(8) as u8, ..Default::default() };
-    r.ue(); // seq_parameter_set_id
-    if profile == 100 {
-        r.ue();
-        r.ue();
-        r.ue();
-        r.bit();
-        assert!(!r.flag(), "scaling matrices are not written");
-    }
-    r.ue(); // log2_max_frame_num_minus4
-    if r.ue() == 0 {
-        r.ue(); // log2_max_pic_order_cnt_lsb_minus4
-    }
-    r.ue(); // max_num_ref_frames
-    r.bit(); // gaps_in_frame_num_value_allowed_flag
-    r.ue();
-    r.ue();
-    assert!(r.flag(), "frame_mbs_only_flag");
-    r.bit(); // direct_8x8_inference_flag
-    if r.flag() {
-        for _ in 0..4 {
-            r.ue();
-        }
-    }
-    assert!(r.flag(), "vui_parameters_present_flag");
-    if r.flag() && r.u(8) == 255 {
-        r.u(32);
-    }
-    if r.flag() {
-        r.bit();
-    }
-    if r.flag() {
-        r.u(4);
-        if r.flag() {
-            r.u(24);
-        }
-    }
-    if r.flag() {
-        r.ue();
-        r.ue();
-    }
-    if r.flag() {
-        v.timing = Some((r.u(32), r.u(32), r.flag()));
-    }
-    let nal_hrd = r.flag();
-    if nal_hrd {
-        assert_eq!(r.ue(), 0, "one CPB");
-        let (bs, cs) = (r.u(4), r.u(4));
-        let br = (r.ue() as u64 + 1) << (6 + bs);
-        let cpb = (r.ue() as u64 + 1) << (4 + cs);
-        let cbr = r.flag();
-        v.hrd = Some((br, cpb, cbr, [r.u(5) + 1, r.u(5) + 1, r.u(5) + 1, r.u(5)]));
-    }
-    v.vcl = r.flag();
-    if nal_hrd || v.vcl {
-        v.low_delay = Some(r.flag());
-    }
-    v
+    parse_sps(&rbsp(nal)).unwrap()
 }
 
 /// The SEI messages of one access unit: (buffering_period initial_cpb_removal_delay, pic_timing (cpb_removal_delay,
@@ -170,38 +100,30 @@ struct Sei {
     pt: Vec<(u32, u32)>,
 }
 
-fn walk_sei(au: &Access) -> Sei {
-    let mut s = Sei::default();
-    for n in au.nals.iter().filter(|n| n[0] & 0x1f == NAL_SEI) {
-        let b = rbsp(n);
-        let mut i = 0;
-        while i + 1 < b.len() {
-            let mut field = || {
-                let mut v = 0usize;
-                while b[i] == 0xFF {
-                    v += 255;
-                    i += 1;
-                }
-                v += b[i] as usize;
-                i += 1;
-                v
-            };
-            let (ty, size) = (field(), field());
-            let mut r = BitReader::new(&b[i..i + size]);
-            match ty {
-                0 => {
-                    assert_eq!(r.ue(), 0, "seq_parameter_set_id");
-                    s.bp.push(r.u(24));
-                    assert_eq!(r.u(24), 0, "initial_cpb_removal_delay_offset");
-                }
-                1 => s.pt.push((r.u(24), r.u(24))),
-                t => panic!("unexpected SEI payload type {t}"),
+/// h264_core's decoder fed every access unit's SPS / PPS / SEI NAL units: its HRD notes, per access unit.
+fn seis(aus: &[Access]) -> Vec<Sei> {
+    let mut dec = Decoder::new();
+    aus.iter()
+        .map(|au| {
+            for n in au.nals.iter().filter(|n| matches!(n[0] & 0x1f, NAL_SPS | NAL_PPS | NAL_SEI)) {
+                dec.decode_nal(n).unwrap();
             }
-            i += size;
-        }
-        assert_eq!(b.last(), Some(&0x80), "rbsp_trailing_bits");
-    }
-    s
+            let mut s = Sei::default();
+            for note in dec.take_hrd_notes() {
+                match note.kind {
+                    HrdKind::BufferingPeriod { sps_id, nal, vcl } => {
+                        assert_eq!(sps_id, 0, "seq_parameter_set_id");
+                        assert!(vcl.is_empty(), "no VCL HRD");
+                        assert_eq!(nal.len(), 1, "one CPB");
+                        assert_eq!(nal[0].1, 0, "initial_cpb_removal_delay_offset");
+                        s.bp.push(nal[0].0);
+                    }
+                    HrdKind::PicTiming { cpb_removal_delay, dpb_output_delay } => s.pt.push((cpb_removal_delay, dpb_output_delay)),
+                }
+            }
+            s
+        })
+        .collect()
 }
 
 fn bits(au: &Access) -> i128 {
@@ -210,17 +132,18 @@ fn bits(au: &Access) -> i128 {
 
 /// The decoder's CPB replayed exactly (C.1, CBR arrival from t = 0 at BitRate): returns (the filler NAL units, the smallest
 /// arrival margin in bits at a removal, the largest fullness before a removal). Time is counted in 1 / (90000 x time_scale) s.
-fn replay(aus: &[Access], vui: &Vui) -> (usize, i128, i128) {
-    let (nut, ts, _) = vui.timing.expect("timing_info");
-    let (br, cpb, cbr, _) = vui.hrd.expect("nal_hrd_parameters");
-    assert!(cbr, "the replay is the CBR one");
-    let (nut, ts, br, cpb) = (nut as i128, ts as i128, br as i128, cpb as i128);
+fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
+    let (nut, ts, _) = sps.timing_info.expect("timing_info");
+    let h = sps.nal_hrd.expect("nal_hrd_parameters");
+    assert!(h.cbr, "the replay is the CBR one");
+    let (nut, ts, br, cpb) = (nut as i128, ts as i128, h.bit_rate as i128, h.cpb_size as i128);
+    let notes = seis(aus);
     let unit = 90_000 * ts;
     let tick = nut * 90_000;
     let (mut anchor, mut cum, mut fillers) = (None::<i128>, 0i128, 0usize);
     let (mut margin, mut peak) = (i128::MAX, 0i128);
     for (n, au) in aus.iter().enumerate() {
-        let s = walk_sei(au);
+        let s = &notes[n];
         let (cpb_delay, _) = s.pt[0];
         let t = match (anchor, s.bp.first()) {
             (None, Some(&d)) => d as i128 * ts,
@@ -230,7 +153,7 @@ fn replay(aus: &[Access], vui: &Vui) -> (usize, i128, i128) {
         if anchor.is_none() || !s.bp.is_empty() {
             anchor = Some(t);
         }
-        assert_eq!(t, aus_first(aus, ts) + 2 * n as i128 * tick, "access unit {n}: removal times are one frame apart");
+        assert_eq!(t, aus_first(&notes, ts) + 2 * n as i128 * tick, "access unit {n}: removal times are one frame apart");
         let before = br * t - cum * unit; // CPB fullness x unit just before the removal (bits arrived - bits removed)
         cum += bits(au);
         let arrived = br * t - cum * unit; // >= 0: all of the access unit has arrived
@@ -243,29 +166,30 @@ fn replay(aus: &[Access], vui: &Vui) -> (usize, i128, i128) {
     (fillers, margin, peak)
 }
 
-fn aus_first(aus: &[Access], ts: i128) -> i128 {
-    walk_sei(&aus[0]).bp[0] as i128 * ts
+fn aus_first(notes: &[Sei], ts: i128) -> i128 {
+    notes[0].bp[0] as i128 * ts
 }
 
 #[test]
 fn a_sps_signals_the_bucket() {
     let aus = run(cbr400(6), 2, false);
-    let v = walk_sps(&aus[0].nals[0]);
+    let v = sps_of(&aus[0].nals[0]);
     println!("hrd sps cbr 400: {v:?}");
-    assert_eq!(v.timing, Some((1, 2 * FPS, true)), "two ticks per frame");
-    assert_eq!(v.hrd, Some((400_000, 400_000, true, [24, 24, 24, 24])), "BitRate / CpbSize are the bucket's");
-    assert!(!v.vcl);
-    assert_eq!(v.low_delay, Some(false));
-    assert_eq!(v.level, 12, "level 1.2: 400 kbit/s past level 1.1's 192 x 1200");
+    assert_eq!(v.timing_info, Some((1, 2 * FPS, true)), "two ticks per frame");
+    let lens = |h: h264_core::ps::Hrd| [h.initial_cpb_removal_delay_len, h.cpb_removal_delay_len, h.dpb_output_delay_len, h.time_offset_len];
+    assert_eq!(v.nal_hrd.map(|h| (h.cpb_cnt, h.bit_rate, h.cpb_size, h.cbr, lens(h))), Some((1, 400_000, 400_000, true, [24, 24, 24, 24])), "BitRate / CpbSize are the bucket's");
+    assert!(v.vcl_hrd.is_none());
+    assert!(!v.low_delay_hrd);
+    assert_eq!(v.level_idc, 12, "level 1.2: 400 kbit/s past level 1.1's 192 x 1200");
     // VBR: the max bucket, cbr_flag 0; a rate not a multiple of 64 is rounded down to the signalled one.
     let vbr = Config { rate: Some(RateControl::vbr(300, 601, (FPS, 1))), ..cbr400(6) };
-    let v = walk_sps(&run(vbr, 1, false)[0].nals[0]);
-    assert_eq!(v.hrd.map(|h| (h.0, h.1, h.2)), Some((600_960, 600_960, false)), "VBR: the max bucket, 601000 rounded to 64");
+    let v = sps_of(&run(vbr, 1, false)[0].nals[0]);
+    assert_eq!(v.nal_hrd.map(|h| (h.bit_rate, h.cpb_size, h.cbr)), Some((600_960, 600_960, false)), "VBR: the max bucket, 601000 rounded to 64");
     // hrd off, CRF: neither flag.
     for cfg in [Config { hrd: false, ..cbr400(6) }, Config { rate: Some(RateControl::crf(26, (FPS, 1))), ..cbr400(6) }] {
-        let v = walk_sps(&run(cfg, 1, false)[0].nals[0]);
-        assert_eq!((v.timing, v.hrd, v.low_delay), (None, None, None), "{:?} hrd {}", cfg.rate, cfg.hrd);
-        assert_eq!(v.level, 10);
+        let v = sps_of(&run(cfg, 1, false)[0].nals[0]);
+        assert_eq!((v.timing_info, v.nal_hrd, v.low_delay_hrd), (None, None, false), "{:?} hrd {}", cfg.rate, cfg.hrd);
+        assert_eq!(v.level_idc, 10);
     }
 }
 
@@ -275,7 +199,7 @@ fn b_cpb_replay_never_underflows_or_overflows() {
         let cfg = Config { bframes, ..cbr400(6) };
         let aus = run(cfg, N, false);
         assert_eq!(aus.len(), N);
-        let v = walk_sps(&aus[0].nals[0]);
+        let v = sps_of(&aus[0].nals[0]);
         let (fillers, margin, peak) = replay(&aus, &v);
         let total: i128 = aus.iter().map(bits).sum();
         println!(
@@ -288,9 +212,9 @@ fn b_cpb_replay_never_underflows_or_overflows() {
     // half-full bucket drains to empty and the filler NAL units hold it there; the replay counts them.
     let cfg = Config { rate: Some(RateControl::cbr(2000, (FPS, 1))), ..cbr400(30) };
     let aus = run(cfg, 60, true);
-    let v = walk_sps(&aus[0].nals[0]);
+    let v = sps_of(&aus[0].nals[0]);
     let (fillers, margin, peak) = replay(&aus, &v);
-    println!("hrd cbr 2000 kbit/s: 60 access units, filler NAL units {fillers}, arrival margin min {margin} bits, cpb peak {peak} / {} bits", v.hrd.unwrap().1);
+    println!("hrd cbr 2000 kbit/s: 60 access units, filler NAL units {fillers}, arrival margin min {margin} bits, cpb peak {peak} / {} bits", v.nal_hrd.unwrap().cpb_size);
     assert!(fillers > 0, "the filler path was not exercised");
 }
 
@@ -298,8 +222,9 @@ fn b_cpb_replay_never_underflows_or_overflows() {
 fn c_every_picture_times_and_decodes() {
     let aus = run(cbr400(6), N, true);
     let mut idrs = 0;
+    let notes = seis(&aus);
     for (n, au) in aus.iter().enumerate() {
-        let s = walk_sei(au);
+        let s = &notes[n];
         assert_eq!(s.pt.len(), 1, "access unit {n}: one pic_timing");
         let idr = au.nals.iter().any(|x| x[0] & 0x1f == NAL_IDR);
         assert_eq!(s.bp.len(), idr as usize, "access unit {n}: a buffering_period exactly on an IDR");
@@ -317,8 +242,8 @@ fn c_every_picture_times_and_decodes() {
     assert_eq!(idrs, 2);
     // Under B pictures the output delay is the reorder: 2 x (pts - dts).
     let aus = run(Config { bframes: 2, ..cbr400(6) }, N, false);
-    for au in &aus {
-        assert_eq!(walk_sei(au).pt[0].1 as u64, 2 * (au.pts - au.dts));
+    for (au, s) in aus.iter().zip(seis(&aus)) {
+        assert_eq!(s.pt[0].1 as u64, 2 * (au.pts - au.dts));
     }
 }
 
