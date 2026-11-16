@@ -1391,3 +1391,26 @@ fn nlerawexport_adopt_reel_refused_raw_planar() {
     }
     println!("nlerawexport: adopt refused i420 + y4m (frame does not match); letterbox y4m 768x512 F25:1 x4 in {}", root.display());
 }
+
+// ---- NLE3ETRIMSTRETCH (LEDGER SR692): the face's drag-trim on a transitioned cut stretches the transition (named tail block) ----
+
+#[test]
+fn nle3etrimstretch_face_drag_trim_shrinks_the_dissolve() {
+    use bandy::SMessage;
+    use timeline_core::TransitionKind;
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    // B[0,10)@10 on V1: its out handle 156..160 on row 0 (y 80..120) at zoom 8; drag it 7 ticks back (x 158 -> 102)
+    let btn = |down, x| SMessage::BrowserButton { down, x, y: 100.0, mods: 0, surface: 0 };
+    face.on(&btn(true, 158.0));
+    face.on(&SMessage::BrowserMouseMove(102.0, 100.0, 0));
+    face.on(&btn(false, 102.0));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    // B is 3 ticks, shorter than the 4-tick dissolve: the dissolve shrinks to 3 (was refused, Handle), A1's crossfade with it
+    let tl = &face.state.timeline;
+    assert_eq!(*tl, tl0.trim_out(0, 1, 3).unwrap());
+    assert_eq!((tl.tracks[0].clips[1].len(), tl.tracks[0].transitions[0].at, tl.tracks[0].transitions[0].dur), (3, 10, 3));
+    assert_eq!(tl.audio_crossfade(1, 1).map(|x| (x.at, x.dur)), Some((10, 3)));
+}
