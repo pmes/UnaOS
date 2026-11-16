@@ -522,13 +522,15 @@ mod tests {
 // H264ENC-TWOPASS-FILE (BUILT by SR719, the H264ENCTWOPASSFILE tail block), H264ENC-TWOPASS-QCOMP and H264ENC-TWOPASS-BLUR (BUILT by SR736, the H264ENCTWOPASSBLUR tail block), H264ENC-TWOPASS-KERNEL.
 
 /// One coded picture as the first pass saw it (H264ENCTWOPASS SR698): its type, its access unit's bits (every NAL unit), its
-/// SliceQPY and its complexity bits x [`step16`]`(qp)`.
+/// SliceQPY and its complexity bits x [`step16`]`(qp)`; its intra macroblocks of its mbs (x264's imb / nmb, H264ENCTWOPASSBLURINTRA SR751).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PicStat {
     pub kind: Pic,
     pub bits: u64,
     pub qp: i32,
     pub complexity: u64,
+    pub intra_mbs: u32,
+    pub mbs: u32,
 }
 
 /// x264's qcomp 0.6 as a fraction (3, 5): an anchor's qscale goes as complexity^(1 - 3/5). The knob is [`Pass2Opts::qcomp`] (SR736), this its default.
@@ -650,10 +652,10 @@ impl Encoder {
         &self.stats
     }
 
-    /// After picture `kind` at SliceQPY `qp`: its record from the access unit's NAL units.
-    pub(crate) fn note_stat(&mut self, kind: Pic, qp: i32, nals: &[Vec<u8>]) {
+    /// After picture `kind` at SliceQPY `qp` with `intra_mbs` intra macroblocks: its record from the access unit's NAL units.
+    pub(crate) fn note_stat(&mut self, kind: Pic, qp: i32, intra_mbs: u32, nals: &[Vec<u8>]) {
         let bits: u64 = nals.iter().filter(|n| n[0] & 0x1f != h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum();
-        self.stats.push(PicStat { kind, bits, qp, complexity: bits * step16(qp) });
+        self.stats.push(PicStat { kind, bits, qp, complexity: bits * step16(qp), intra_mbs, mbs: (self.mb_w * self.mb_h) as u32 });
     }
 }
 
@@ -740,11 +742,11 @@ impl RateControl {
 // x264's `--pass 1 --stats f` / `--pass 2 --stats f`: the [`PicStat`]s of a first pass written once, read by a later process. ONE text
 // form, here beside the record (the crate is no_std + alloc: out through `core::fmt::Write`, in from a `&str`; the file I/O is the
 // caller's, tools/nle). A header line `h264enc-stats v<STATS_VERSION> frames=<n> fps=<num>/<den>`, then one line per picture in coding
-// order: `<I|P|B> <bits> <qp> <complexity>`, each '\n'-terminated. The reader re-checks the record's own invariant (complexity = bits x
+// order: `<I|P|B> <bits> <qp> <complexity> <intra_mbs>/<mbs>` (v2, H264ENCTWOPASSBLURINTRA SR751: a v1 text is refused as `Header`), each '\n'-terminated. The reader re-checks the record's own invariant (complexity = bits x
 // step16(qp), `Encoder::note_stat`'s rule) and refuses by name. Owed: H264ENC-TWOPASS-FILE-RESCALE (a pass 2 over a different frame count).
 
 /// The stats text form's version (the header's `v<n>`).
-pub const STATS_VERSION: u32 = 1;
+pub const STATS_VERSION: u32 = 2;
 
 /// A first pass read back ([`read_stats`]): the frame rate its header names and its records in coding order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -758,7 +760,7 @@ pub struct StatsFile {
 pub enum StatsError {
     /// No first line, or not `h264enc-stats v<STATS_VERSION> frames=<n> fps=<num>/<den>` (num and den nonzero).
     Header,
-    /// File line `n` (1-based) is not `<I|P|B> <bits> <qp> <complexity>` with qp in 0..=51 and complexity = bits x step16(qp).
+    /// File line `n` (1-based) is not `<I|P|B> <bits> <qp> <complexity> <intra_mbs>/<mbs>` with qp in 0..=51, complexity = bits x step16(qp), intra_mbs <= mbs.
     Line(usize),
     /// The header's frame count against the picture lines the text holds.
     Count { header: usize, lines: usize },
@@ -768,7 +770,7 @@ impl core::fmt::Display for StatsError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             StatsError::Header => write!(f, "h264enc: stats: bad header (want `h264enc-stats v{STATS_VERSION} frames=<n> fps=<num>/<den>`)"),
-            StatsError::Line(n) => write!(f, "h264enc: stats: bad line {n} (want `<I|P|B> <bits> <qp> <complexity>`)"),
+            StatsError::Line(n) => write!(f, "h264enc: stats: bad line {n} (want `<I|P|B> <bits> <qp> <complexity> <intra_mbs>/<mbs>`)"),
             StatsError::Count { header, lines } => write!(f, "h264enc: stats: the header says {header} pictures, the text holds {lines}"),
         }
     }
@@ -796,7 +798,7 @@ fn kind_of(s: &str) -> Option<Pic> {
 pub fn write_stats(pics: &[PicStat], fps: (u32, u32), w: &mut impl core::fmt::Write) -> core::fmt::Result {
     writeln!(w, "h264enc-stats v{STATS_VERSION} frames={} fps={}/{}", pics.len(), fps.0, fps.1)?;
     for p in pics {
-        writeln!(w, "{} {} {} {}", kind_code(p.kind), p.bits, p.qp, p.complexity)?;
+        writeln!(w, "{} {} {} {} {}/{}", kind_code(p.kind), p.bits, p.qp, p.complexity, p.intra_mbs, p.mbs)?;
     }
     Ok(())
 }
@@ -833,10 +835,12 @@ fn parse_stats_line(l: &str) -> Option<PicStat> {
     let bits: u64 = f.next()?.parse().ok()?;
     let qp: i32 = f.next()?.parse().ok()?;
     let complexity: u64 = f.next()?.parse().ok()?;
-    if f.next().is_some() || !(0..=QP_MAX).contains(&qp) || bits.checked_mul(step16(qp)) != Some(complexity) {
+    let (intra_mbs, mbs) = f.next()?.split_once('/')?;
+    let (intra_mbs, mbs): (u32, u32) = (intra_mbs.parse().ok()?, mbs.parse().ok()?);
+    if f.next().is_some() || !(0..=QP_MAX).contains(&qp) || bits.checked_mul(step16(qp)) != Some(complexity) || intra_mbs > mbs {
         return None;
     }
-    Some(PicStat { kind, bits, qp, complexity })
+    Some(PicStat { kind, bits, qp, complexity, intra_mbs, mbs })
 }
 
 // ---- H264ENCTWOPASSRESCALE (LEDGER SR727): a first pass rescaled to another frame count (named tail block) ----
@@ -866,7 +870,7 @@ pub fn rescale_stats(stats: &[PicStat], n: usize) -> Vec<PicStat> {
             let mean = (span.iter().map(|p| p.complexity as u128).sum::<u128>() / span.len() as u128) as u64;
             let c = &span[(span.len() - 1) / 2];
             let bits = mean / step16(c.qp);
-            PicStat { kind: c.kind, bits, qp: c.qp, complexity: bits * step16(c.qp) }
+            PicStat { kind: c.kind, bits, qp: c.qp, complexity: bits * step16(c.qp), intra_mbs: (span.iter().map(|p| p.intra_mbs as u64).sum::<u64>() / span.len() as u64) as u32, mbs: (span.iter().map(|p| p.mbs as u64).sum::<u64>() / span.len() as u64) as u32 }
         })
         .collect()
 }
@@ -878,12 +882,12 @@ pub fn rescale_stats(stats: &[PicStat], n: usize) -> Vec<PicStat> {
 // the mean planned QP of the P pictures that follow it up to the next I less [`IP_QP_OFFSET`] (`get_diff_limited_q`, run backward;
 // its own when none follows), then the anchors' QP curve blurred over same-type neighbours ([`blur_qscale`], qblur), rounded and
 // clamped; a B picture its anchor's + `B_QP_OFFSET` as SR698. The bisection and the predicted total (each picture's OWN complexity /
-// step16) are SR698's. Departures, named: the intra mask is the kind (an IDR is all intra, a P / B none: PicStat carries no intra
-// macroblock count), and qblur averages the Q16 QP (log qscale) where x264 averages the linear qscale. [`Pass2Opts`] with cplxblur 0,
+// step16) are SR698's. Departures, named: the intra mask WAS the kind (an IDR all intra, a P / B none; x264's weight by the intra
+// macroblock count since H264ENCTWOPASSBLURINTRA SR751), and qblur averages the Q16 QP (log qscale) where x264 averages the linear qscale. [`Pass2Opts`] with cplxblur 0,
 // qblur 0 and `i_from_gop` false plans SR698's exact QPs. Owed: H264ENC-TWOPASS-BLUR-INTRA, H264ENC-TWOPASS-QBLUR-LINEAR,
-// H264ENC-TWOPASS-QPSTEP, H264ENC-TWOPASS-BLUR-RATETOL, H264ENC-TWOPASS-QCOMP-CLI, H264ENC-TWOPASS-BLUR-RUNTIME.
+// H264ENC-TWOPASS-QPSTEP (BUILT by SR763, the H264ENCTWOPASSQPSTEP tail block), H264ENC-TWOPASS-BLUR-RATETOL, H264ENC-TWOPASS-QCOMP-CLI, H264ENC-TWOPASS-BLUR-RUNTIME.
 
-/// The options of a second pass's plan (H264ENCTWOPASSBLUR SR736); Default = x264's (qcomp 0.6, cplxblur 20, qblur 0.5).
+/// The options of a second pass's plan (H264ENCTWOPASSBLUR SR736); Default = x264's (qcomp 0.6, cplxblur 20, qblur 0.5, qpstep 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pass2Opts {
     /// x264's qcompress as (num, den), 0 <= num <= den, den > 0: an anchor's qscale ~ complexity^(1 - num / den); (1, 1) one QP
@@ -896,11 +900,13 @@ pub struct Pass2Opts {
     /// x264's I rule (the mean planned QP of the P pictures after it up to the next I, less [`IP_QP_OFFSET`]); false = SR698's
     /// (its next P's complexity, else its previous P's, less [`IP_QP_OFFSET`]).
     pub i_from_gop: bool,
+    /// x264's qpstep in QP (H264ENCTWOPASSQPSTEP SR763): a planned P / I within this of the next same-type one ([`qpstep_limit`]); 0 = none.
+    pub qpstep: u8,
 }
 
 impl Default for Pass2Opts {
     fn default() -> Pass2Opts {
-        Pass2Opts { qcomp: QCOMP, cplxblur: 20, qblur_q8: 128, i_from_gop: true }
+        Pass2Opts { qcomp: QCOMP, cplxblur: 20, qblur_q8: 128, i_from_gop: true, qpstep: QP_STEP }
     }
 }
 
@@ -932,26 +938,30 @@ pub fn exp_neg_q16(t_q16: u64) -> u64 {
 }
 
 /// Each picture's complexity blurred as x264's `init_pass2` blurs it (H264ENCTWOPASSBLUR SR736): the weighted mean, weights
-/// exp(-j^2/200) in Q16, of the pictures j = 1 .. < 2 x `cplxblur` after it (stopping before the next IDR) and j = 0 ..= 2 x
-/// `cplxblur` before it (the previous IDR included, then stopping). `cplxblur` 0 returns each picture's own complexity.
+/// exp(-j^2/200) in Q16, of the pictures j = 1 .. < 2 x `cplxblur` after it and j = 0 ..= 2 x `cplxblur` before it, each scaled by
+/// x264's running intra weight ([`intra_keep_q16`], SR751: after it multiplied before a picture is summed, before it after; the walk
+/// stops below 1/10000, so an all-intra picture (an IDR) cuts it). `cplxblur` 0 returns each picture's own complexity.
 pub fn blur_complexity(stats: &[PicStat], cplxblur: u32) -> Vec<u64> {
     let n = stats.len();
     let w = 2 * cplxblur as usize;
     let g = |j: usize| exp_neg_q16(((j as u64 * j as u64) << 16) / 200) as u128;
     (0..n)
         .map(|i| {
-            let (mut ws, mut cs) = (0u128, 0u128);
+            let (mut ws, mut cs, mut wt) = (0u128, 0u128, 1u128 << 16);
             for j in 1..w.min(n - i) {
-                if stats[i + j].kind == Pic::Idr {
+                wt = (wt * intra_keep_q16(&stats[i + j])) >> 16;
+                if wt * 10_000 < 1 << 16 {
                     break;
                 }
-                ws += g(j);
-                cs += g(j) * stats[i + j].complexity as u128;
+                ws += wt * g(j);
+                cs += wt * g(j) * stats[i + j].complexity as u128;
             }
+            wt = 1 << 16;
             for j in 0..=w.min(i) {
-                ws += g(j);
-                cs += g(j) * stats[i - j].complexity as u128;
-                if stats[i - j].kind == Pic::Idr {
+                ws += wt * g(j);
+                cs += wt * g(j) * stats[i - j].complexity as u128;
+                wt = (wt * intra_keep_q16(&stats[i - j])) >> 16;
+                if wt * 10_000 < 1 << 16 {
                     break;
                 }
             }
@@ -1000,7 +1010,7 @@ fn plan_q16(s: i64, l: i64, qcomp: (i64, i64)) -> i64 {
 fn pass2_at(stats: &[PicStat], logs: &[i64], s: i64, floor: i32, opts: &Pass2Opts) -> Vec<i32> {
     let n = stats.len();
     let kinds: Vec<Pic> = stats.iter().map(|p| p.kind).collect();
-    let mut q16: Vec<i64> = logs.iter().map(|&l| plan_q16(s, l, opts.qcomp)).collect();
+    let mut q16: Vec<i64> = logs.iter().map(|&l| plan_q16(s, l, opts.qcomp)).collect(); qpstep_limit(&mut q16, &kinds, opts.qpstep, Pic::P); // H264ENCTWOPASSQPSTEP (SR763): the P clamp before the I rule
     let mut off = alloc::vec![0i32; n];
     for i in 0..n {
         if kinds[i] != Pic::Idr {
@@ -1016,7 +1026,7 @@ fn pass2_at(stats: &[PicStat], logs: &[i64], s: i64, floor: i32, opts: &Pass2Opt
             }
         }
     }
-    let q16 = blur_qscale(&q16, &kinds, opts.qblur_q8);
+    qpstep_limit(&mut q16, &kinds, opts.qpstep, Pic::Idr); let q16 = blur_qscale(&q16, &kinds, opts.qblur_q8);
     let mut out = Vec::with_capacity(n);
     let mut anchor: Option<i32> = None;
     for i in 0..n {
@@ -1050,5 +1060,57 @@ impl Encoder {
         let bits = stats.iter().zip(&qps).map(|(p, &q)| p.complexity / step16(q)).collect();
         rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64 });
         Ok(self)
+    }
+}
+
+// ---- H264ENCTWOPASSBLURINTRA (LEDGER SR751): x264's intra weight of the complexity blur's chain (named tail block) ----
+// x264's `init_pass2` (ratecontrol.c) scales each link of the blur's walk by `1 - pow(i_count / nmb, 2)`, the picture's intra
+// macroblock share squared ([`PicStat::intra_mbs`] / [`PicStat::mbs`], counted by `Encoder::note_stat`'s caller per picture), so a
+// mostly-intra P cuts the chain too. The coder codes intra macroblocks in an IDR only today (every P / B carries 0): the weight is
+// then exactly SR736's binary chain. Owed: H264ENC-P-INTRA (the P / B macroblock's intra decision).
+
+/// x264's per-link blur weight of `p`, 1 - (intra_mbs / mbs)^2, in Q16 (H264ENCTWOPASSBLURINTRA SR751): 65536 with no intra
+/// macroblock, 0 when all are intra; intra_mbs is clamped to mbs, and mbs 0 keeps 65536.
+pub fn intra_keep_q16(p: &PicStat) -> u128 {
+    let (i, m) = (p.intra_mbs.min(p.mbs) as u128, p.mbs.max(1) as u128);
+    (1 << 16) - ((i * i) << 16) / (m * m)
+}
+
+// ---- H264ENCTWOPASSQPSTEP (LEDGER SR763): x264's get_diff_limited_q qpstep clamp over the plan (named tail block) ----
+// x264's `init_pass2` (ratecontrol.c) runs `get_diff_limited_q` BACKWARD over each scale's planned qscales, before the qblur and the
+// clip: a picture whose next non-B picture (the last one visited) is of its own type is held within lstep = 2^(qpstep / 6) of that
+// picture's (already limited) qscale, i.e. within +-qpstep QP: our Q16 QP is that log domain, so no conversion. Same type only: a B
+// is never limited (the last non-B is never a B), and ip_factor / pb_factor are the I / B rules ([`IP_QP_OFFSET`],
+// `B_QP_OFFSET`), not offsets of this clamp. [`pass2_at`] limits the P pictures before its I rule (x264's I reads the LIMITED P
+// qps) and the I pictures after it; an I only against the next I with no P between them nor after that next I (x264's
+// `last_accum_p_norm < 1` read as "no P": exact while every P carries no intra macroblock, SR751). A lasting complexity step plans
+// a ramp before it, as x264. Departures, named: x264's `tex_bits == 0` P rule is not ported (the records split no texture bits);
+// qpstep 0 = no limit (x264's 0 would hold every same-type picture equal). Owed: H264ENC-TWOPASS-QPSTEP-RUNTIME (`pass2_pick` held
+// within qpstep of the last CODED picture of its type, x264's rate_estimate_qscale lmin / lmax), H264ENC-TWOPASS-QPSTEP-CLI.
+
+/// x264's `--qpstep` default (`i_qp_step` 4): [`Pass2Opts::qpstep`]'s Default.
+pub const QP_STEP: u8 = 4;
+
+/// The planned Q16 QPs `q16` of `kind` pictures (H264ENCTWOPASSQPSTEP SR763) each held within `qpstep` QP of the next non-B
+/// picture's when that one is of the same `kind`, walking backward (the next one already held); an [`Pic::Idr`] only when no P
+/// follows that next I before the non-B after it. B entries and other kinds are untouched; `qpstep` 0 returns `q16` unchanged.
+pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
+    if qpstep == 0 {
+        return;
+    }
+    let step = (qpstep as i64) << 16;
+    // `next`: the next non-B picture after i; `next_p`: whether the non-B picture after `next` is a P.
+    let (mut next, mut next_p): (Option<usize>, bool) = (None, false);
+    for i in (0..q16.len()).rev() {
+        if kinds[i] == Pic::B {
+            continue;
+        }
+        if let Some(j) = next {
+            if kinds[i] == kind && kinds[j] == kind && (kind != Pic::Idr || !next_p) {
+                q16[i] = q16[i].clamp(q16[j] - step, q16[j] + step);
+            }
+        }
+        next_p = next.is_some_and(|j| kinds[j] == Pic::P);
+        next = Some(i);
     }
 }
