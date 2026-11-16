@@ -261,6 +261,8 @@ pub struct FontDb {
     /// (None = file unreadable, empty = no cmap), and the bytes those bounded reads took.
     cmaps: Vec<OnceLock<Option<Box<[u8]>>>>,
     scan_bytes: AtomicU64,
+    /// AETHERFONTDBCACHE (SR684): what the persisted index answered for this discovery (Off for [`FontDb::from_faces`]).
+    cache: crate::db_cache::State,
 }
 
 impl FontDb {
@@ -273,28 +275,31 @@ impl FontDb {
             walk_dir(d, &mut files, 0);
         }
         files.dedup();
+        let (cached, cache) = crate::db_cache::load(&config, &files); // AETHERFONTDBCACHE (SR684): a hit skips the header reads
         let mut faces = Vec::new();
         let mut bytes_read = 0u64;
-        for f in &files {
+        for f in files.iter().filter(|_| cached.is_none()) {
             let (v, n) = faces_in_header(f);
             faces.extend(v);
             bytes_read += n;
         }
+        let faces = cached.unwrap_or_else(|| { crate::db_cache::store(&config, &files, &faces, cache); faces }); // AETHERFONTDBCACHE (SR684)
         eprintln!(
-            "[fonts] discover files={} bytes_read={} faces={} ms={}",
+            "[fonts] discover files={} bytes_read={} faces={} ms={} cache={}",
             files.len(),
             bytes_read / 1024,
             faces.len(),
-            t0.elapsed().as_millis()
+            t0.elapsed().as_millis(),
+            cache.as_str()
         );
         let (cmaps, scan_bytes) = ((0..faces.len()).map(|_| OnceLock::new()).collect(), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425)
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes }
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes, cache }
     }
 
     /// A database over explicit faces (tests).
     pub fn from_faces(faces: Vec<FaceInfo>, config: Config) -> FontDb {
         let (cmaps, scan_bytes) = ((0..faces.len()).map(|_| OnceLock::new()).collect(), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425)
-        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read: 0, cmaps, scan_bytes }
+        FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read: 0, cmaps, scan_bytes, cache: crate::db_cache::State::Off }
     }
 
     /// AETHER-FONTDB-LAZY (SR419): the bytes [`FontDb::discover`] read to index the faces.
@@ -388,7 +393,7 @@ fn latin_rank(db: &FontDb, i: usize) -> usize {
 /// The process-wide database, discovered on first use.
 pub fn db() -> &'static FontDb {
     static DB: OnceLock<FontDb> = OnceLock::new();
-    DB.get_or_init(|| FontDb::discover(Config::system()))
+    DB.get_or_init(|| FontDb::discover(Config { cache_dir: CACHE_DIR.get().cloned(), ..Config::system() })) // AETHERFONTDBCACHE (SR684)
 }
 
 // AETHER-FONTDB-LAZY (SR419): discovery from the headers. A face file is indexed from its table directory and the
@@ -988,5 +993,23 @@ mod tests {
             return;
         }
         assert_eq!(db.fallback_order(), &whole_order(db)[..], "the host's fallback order");
+    }
+}
+
+// ---- AETHERFONTDBCACHE (LEDGER SR684): the process database's index cache dir (named tail block) ----
+
+/// The directory [`db`] hands `FontDb::discover` as `Config::cache_dir` (the caller's: Aether sets its data dir).
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Sets the directory the process database persists its index in ([`crate::db_cache`]). Takes effect only when
+/// called before the first [`db`] call; a second call, or one after discovery, has no effect.
+pub fn set_cache_dir(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir);
+}
+
+impl FontDb {
+    /// What the persisted index answered for this discovery: `off`, `hit`, `miss` or `stale`.
+    pub fn discover_cache(&self) -> &'static str {
+        self.cache.as_str()
     }
 }

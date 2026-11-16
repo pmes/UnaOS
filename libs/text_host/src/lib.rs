@@ -14,6 +14,7 @@
 //!   geometry and painting into an RGBA/BGRA buffer. What a toolkit's label or entry needs.
 
 pub mod db;
+pub mod db_cache;
 pub mod fontconfig;
 pub mod line;
 pub mod raster;

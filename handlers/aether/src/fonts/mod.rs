@@ -534,3 +534,18 @@ mod tests {
         }
     }
 }
+
+// ---- AETHERFONTDBCACHE (LEDGER SR684): the installed-font index persisted under Aether's data dir (named tail block) ----
+
+/// Hands text_host's process font database Aether's cache directory (`<platform data dir>/fonts`), so a second
+/// launch with an unchanged font set reads the index instead of every face's tables (`text_host::db_cache`).
+/// Call before the first font use; later calls have no effect.
+#[cfg(not(test))]
+pub fn register_db_cache() {
+    db::set_cache_dir(crate::storage::platform_data_dir().join("fonts"));
+}
+
+/// A lib-test build registers no cache dir, so no `cargo test -p aether --lib` reaches the person's data
+/// directory (AETHER-TESTROOT).
+#[cfg(test)]
+pub fn register_db_cache() {}
