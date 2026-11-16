@@ -54,6 +54,7 @@ exec-rmbp-aetherimgaltelf edf0bd25a wave36 cut72h
 exec-rmbp-aetherimgalticononly c03931d8a wave36 cut76h
 exec-rmbp-aetherimgaltinlineicon df4ca757d wave36 cut77h
 exec-rmbp-aetherimgaltinlinewrap 7d19d4628 wave36 cut74h
+exec-rmbp-aetherimgaltvalign d9876e461 wave36 cut82h
 exec-rmbp-aetherimgbrokenicon 173b47bc3 wave36 cut73h
 exec-rmbp-aetherimgelf 0971bc01c wave36 cut71h
 exec-rmbp-aetherrtlblockstart de5c110a0 wave36 cut75h
@@ -204,6 +205,7 @@ exec-rmbp-nle5drangekeys 9dbb320a8 wave36 cut78h
 exec-rmbp-nle5drangesave df4ca757d wave36 cut77h
 exec-rmbp-nle6utp1 9dbb320a8 wave36 cut78h
 exec-rmbp-nle6utp1 df4ca757d wave36 cut77h
+exec-rmbp-nle6utp1synth d9876e461 wave36 cut82h
 exec-rmbp-nlefaceexport edf0bd25a wave36 cut72h
 exec-rmbp-nlehostsave 5cccda556 wave36 cut70h
 exec-rmbp-nleplayaudio 5cccda556 wave36 cut70h
@@ -219,6 +221,7 @@ exec-rmbp-striainfoaudiobitrate b822dcdf8 wave36 cut80h
 exec-rmbp-striainfobitrate df4ca757d wave36 cut77h
 exec-rmbp-striainfobitrateface 9dbb320a8 wave36 cut78h
 exec-rmbp-striainforeel b822dcdf8 wave36 cut80h
+exec-rmbp-striainforeelstrip d9876e461 wave36 cut82h
 exec-rmbp-striatesttmpdirrest d9ec9b656 wave36 cut79h
 exec-rmbp-unlockstack 339b65319 wave36 cut47
 exec-rmbp-vug3mf | /home/user/exec/vug3mf | cut 314860b90 | VUG3MF | wave36

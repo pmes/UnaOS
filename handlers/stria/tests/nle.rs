@@ -1688,6 +1688,134 @@ fn nlestandinaudioeditor_an_ac3_reel_renders_on_the_silent_stand_in() {
     println!("nlestandinaudioeditor: {} | stand_in_audio={} frames={} pcm={}", lines[0], r.stand_in_audio, r.frames, sink.pcm.len());
 }
 
+// ---- NLE5DEXPORTRANGE (LEDGER SR717): the face's in / out marks, the range `export` takes, their ruler marks (named tail block) ----
+
+/// The SR694 face over NLE1's fixture with the marks set at `a` and `b` through the verbs (the playhead back at 0).
+fn nle5dexportrange_face(a: i64, b: i64) -> Face {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(a);
+    assert!(face.verb("in"));
+    face.state.seek(b);
+    assert!(face.verb("out"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    face.state.seek(0);
+    face
+}
+
+#[test]
+fn nle5dexportrange_marked_png_writes_the_range() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as};
+    let (dir, by_hand) = (nlefaceexport_dir("range"), nlefaceexport_dir("range-by-hand"));
+    let mut face = nle5dexportrange_face(5, 15);
+    assert_eq!((face.marks(), face.export_range()), ((Some(5), Some(15)), Some(5..15)));
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 10 frames ticks 5..15, ") && line.ends_with(&format!(" bytes -> {}", dir.display())), "{line}");
+    for n in 0..10 {
+        assert!(dir.join(format!("{n:06}.png")).is_file(), "frame {n}");
+    }
+    assert!(!dir.join("000010.png").exists());
+    let (tl, src) = synth_fixture();
+    std::fs::create_dir_all(&by_hand).unwrap();
+    export_as(&tl, 5..15, &src, &by_hand, Box::new(PngSequence), AudioOut::Wav, Container::Mp4).unwrap();
+    for n in [0, 9] {
+        let f = format!("{n:06}.png");
+        assert_eq!(std::fs::read(dir.join(&f)).unwrap(), std::fs::read(by_hand.join(&f)).unwrap(), "{f} is export_as(5..15)'s");
+    }
+    println!("nle5dexportrange: {line}");
+}
+
+#[test]
+fn nle5dexportrange_marks_refuse_by_name_and_clear() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    face.state.seek(20);
+    assert!(face.verb("in"));
+    assert_eq!(face.last_error.take().as_deref(), Some("in: tick 20 is not before the out mark 15"));
+    assert_eq!(face.marks(), (None, Some(15)), "a refused in leaves the marks");
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.last_error.take()), ((Some(5), Some(15)), None));
+    face.state.seek(3);
+    assert!(face.verb("out"));
+    assert_eq!(face.last_error.take().as_deref(), Some("out: tick 3 is not after the in mark 5"));
+    assert_eq!(face.marks(), (Some(5), Some(15)));
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.export_range()), ((None, Some(15)), None), "in again at its tick clears it");
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert_eq!(face.marks(), (None, None), "out again at its tick clears it");
+    assert!(face.last_error.is_none());
+    println!("nle5dexportrange: refused in 20 past out 15, out 3 before in 5; cleared both");
+}
+
+#[test]
+fn nle5dexportrange_all_forces_the_whole_timeline() {
+    let dir = nlefaceexport_dir("range-all");
+    let mut face = nle5dexportrange_face(5, 15);
+    assert!(face.verb(&format!("export --all {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && !line.contains(" ticks "), "{line}");
+    assert!(dir.join("000034.png").is_file() && !dir.join("000035.png").exists());
+    assert_eq!(face.marks(), (Some(5), Some(15)), "--all leaves the marks");
+    println!("nle5dexportrange: --all {line}");
+}
+
+#[test]
+fn nle5dexportrange_marks_paint_two_ruler_columns() {
+    let (tl, src) = synth_fixture();
+    let mut idle = nlefaceexport_face(tl, src);
+    let mut face = nle5dexportrange_face(5, 15);
+    let (a, b) = (idle.paint(), face.paint());
+    let l = face.layout();
+    let cols = [l.x_of(5) as u32, l.x_of(15) as u32];
+    let mut lit = 0;
+    for y in 0..l.h {
+        for x in 0..l.w {
+            let i = ((y * l.w + x) * 4) as usize;
+            if (l.ruler_y..l.tracks_y).contains(&y) && cols.contains(&x) {
+                assert_eq!(&b[i..i + 4], &timeline_core::view::GUIDE, "mark pixel ({x},{y})");
+                lit += 1;
+            } else {
+                assert_eq!(&b[i..i + 4], &a[i..i + 4], "pixel ({x},{y}) outside the marks");
+            }
+        }
+    }
+    assert_eq!(lit, 2 * stria::nle_face::RULER_H);
+    println!("nle5dexportrange: marks {lit} px at columns {cols:?} rows {}..{}", l.ruler_y, l.tracks_y);
+}
+
+#[test]
+fn nle5dexportrange_shortened_timeline_clamps_or_refuses() {
+    let dir = nlefaceexport_dir("range-clamp");
+    let mut face = nle5dexportrange_face(5, 15);
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1); // A[13,23)@0: the timeline now ends at 10
+    }
+    assert_eq!(face.export_range(), Some(5..10));
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 5 frames ticks 5..10, "), "{line}");
+
+    let past = nlefaceexport_dir("range-past");
+    let mut face = nle5dexportrange_face(12, 15);
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1);
+    }
+    assert!(face.verb(&format!("export {} png", past.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: the marks 12..15 are past the timeline's end 10"));
+    assert!(!face.exporting() && !past.exists(), "a refused range makes nothing");
+    println!("nle5dexportrange: clamped {line}");
+}
+
 // ---- NLE6UTP1SYNTH (LEDGER SR749): the host's synthetic reel is demux_core's (named tail block) ----
 /// NLE6UTP1SYNTH (SR749): `synth_source` is demux_core's `build::synth_reel` (the reel both rings build): the same bytes
 /// by both roads, pinned by FNV-1a 64 (read on the pre-move `synth_source`; demux_core's `synth_reel_kats` pins the same u64).
