@@ -214,3 +214,46 @@ fn caption_ua_centres_text() {
     let (x, _, _) = line(&lay(&inline, VW, 400.0), &inline);
     assert_eq!(x, 0.0, "style=\"text-align: left\" on the caption wins over the UA value");
 }
+
+// ---- AETHERIMAGEINPUTFACE (LEDGER SR701): a narrow block stays at an rtl column's inline start (named tail block) ----
+
+/// AETHERIMAGEINPUTFACE (SR701, AETHER-CENTER-RTL): plain center / right / end align inline content only (CSS 2.2 §16.2),
+/// so a narrow block stays at the column's inline start, which in an rtl containing block is the RIGHT edge (§10.3.3:
+/// margin-left is ignored). -webkit-right stays the physical right and -webkit-center the middle in either direction;
+/// the column's direction decides, never the child's own `dir`; the ltr column keeps its block at the left.
+#[test]
+fn rtl_column_starts_narrow_blocks_at_the_right() {
+    let col = |col_attrs: &[(&'static str, &str)], kid_attrs: &[(&'static str, &str)]| {
+        let mut ca: Vec<(&'static str, &str)> = vec![("id", "col")];
+        ca.extend_from_slice(col_attrs);
+        let mut ka: Vec<(&'static str, &str)> = vec![("id", "n"), ("style", "width: 100px")];
+        ka.extend_from_slice(kid_attrs);
+        page(vec![el("div", &ca, vec![el("div", &ka, vec![text("ab")])])])
+    };
+    let offset = |doc: &N| {
+        let tree = lay(doc, VW, 400.0);
+        let (cx, _, cw, _) = box_of(&tree, &doc.by_id("col"));
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("n"));
+        assert_eq!((cw, w), (300.0, 100.0), "the column is 300 wide and the block 100");
+        x - cx
+    };
+    let cases: [(&str, N, f32); 7] = [
+        ("dir=rtl text-align: center", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: center")], &[]), 200.0),
+        ("direction: rtl text-align: center", col(&[("style", "width: 300px; direction: rtl; text-align: center")], &[]), 200.0),
+        ("dir=rtl text-align: right", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: right")], &[]), 200.0),
+        ("a dir=ltr child in a dir=rtl column", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: center")], &[("dir", "ltr")]), 200.0),
+        ("dir=rtl -webkit-right", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: -webkit-right")], &[]), 200.0),
+        ("dir=rtl -webkit-center", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: -webkit-center")], &[]), 100.0),
+        ("ltr text-align: center", col(&[("style", "width: 300px; text-align: center")], &[]), 0.0),
+    ];
+    for (how, doc, want) in &cases {
+        assert_eq!(offset(doc), *want, "{how}: the 100px block's offset in the 300px column");
+    }
+    // Inherited through an auto-width block: the text-align sits on the inner column, the dir on its parent.
+    let doc = page(vec![el(
+        "div",
+        &[("dir", "rtl"), ("style", "width: 300px")],
+        vec![el("div", &[("id", "col"), ("style", "text-align: center")], vec![el("div", &[("id", "n"), ("style", "width: 100px")], vec![text("ab")])])],
+    )]);
+    assert_eq!(offset(&doc), 200.0, "dir=rtl inherited by the centred column");
+}

@@ -528,8 +528,8 @@ pub fn build_taffy_tree<H: Host>(
         }
     }
     // AETHERFILEFACE (SR463): html.css gives `input[type="file" i]` no background (initial): Chromium paints ButtonFace on
-    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`).
-    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) {
+    // the inner Choose-File button only, which both rings' file paint draws over the button sub-box (`BUTTON_FACE`). AETHERIMAGEINPUTFACE (SR701): `input[type="image" i]` gets none either (`is_image_input`).
+    if control_kind(dom_node) == Some(Control::Button) && !dom_node.attr("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("file")) && !is_image_input(dom_node) {
         // Chromium's ButtonFace.
         paint.background = Some(BUTTON_FACE);
     }
@@ -1239,7 +1239,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
     let to = match align {
         5 => taffy::style::AlignSelf::CENTER,
         6 => taffy::style::AlignSelf::END,
-        _ => taffy::style::AlignSelf::START,
+        _ => if is_rtl(tree, id) { taffy::style::AlignSelf::END } else { taffy::style::AlignSelf::START },
     };
     for k in tree.taffy.children(id).unwrap_or_default() {
         let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
@@ -3214,4 +3214,28 @@ pub fn file_status<'a>(value: Option<&'a str>, multiple: bool, count: usize) -> 
     } else {
         Cow::Borrowed(name)
     }
+}
+
+// ---- AETHERIMAGEINPUTFACE (LEDGER SR701): the column's direction before pass 1 (named tail block) ----------------
+
+/// AETHERIMAGEINPUTFACE (SR701): whether box `id`'s used `direction` is rtl, by the precedence pass 1 resolves `mode.rtl`
+/// with (an author / style="" `direction` on `PaintStyle::rtl`, else `default_rtl`'s `dir` attribute, else the parent
+/// box's), read before pass 1 runs so `place_narrow_blocks` can keep a narrow block at an rtl column's inline start (the
+/// right edge, CSS 2.2 §10.3.3; taffy's START is always the physical left). A `dir` counts as set when `default_rtl`
+/// ignores the inherited value; anonymous boxes and text pass through to the parent.
+fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(b) = cur {
+        if let Some(r) = tree.paint_map.get(&b).and_then(|p| p.rtl) {
+            return r;
+        }
+        if let Some(n) = tree.node_map.get(&b) {
+            let own = default_rtl(n, false);
+            if own == default_rtl(n, true) {
+                return own;
+            }
+        }
+        cur = tree.taffy.parent(b);
+    }
+    false
 }
