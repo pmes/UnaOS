@@ -375,7 +375,7 @@ fn main() {
             }
         }
     }
-    extra += &profile_json(&info.video_profile); extra += &format!(",\"bitrate\":\"{}\"", info.bitrate); // STRIAINFOBITRATE (SR728): "bitrate"; HEVCLEVELLINE (SR368): "profile" / "tier" / "level"
+    extra += &profile_json(&info.video_profile); extra += &format!(",\"bitrate\":\"{}\"", info.bitrate); extra += &format!(",\"audio_bitrate\":\"{}\"", info.audio_bitrate); // STRIAINFOAUDIOBITRATE (SR742): "audio_bitrate"; STRIAINFOBITRATE (SR728): "bitrate"; HEVCLEVELLINE (SR368): "profile" / "tier" / "level"
     println!(
         "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"audio_decoder\":\"{}\",\"sample_rate\":{},\"channels\":{},\"audio_clock\":{},\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
         file,
