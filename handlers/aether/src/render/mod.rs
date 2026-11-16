@@ -1456,7 +1456,7 @@ fn paint_file_color(
     }
     match crate::forms::input_type(dom_node).as_str() {
         "file" => {
-            let (button, status) = layout_core::file_label(dom_node.as_element().is_some_and(|e| e.attributes.borrow().get("multiple").is_some()));
+            let (button, _) = layout_core::file_label(dom_node.as_element().is_some_and(|e| e.attributes.borrow().get("multiple").is_some()));
             let Some(font) = crate::fonts::face(&inherited.sel()).or(font) else { return true };
             let adv = inherited.advancer();
             let (ascent, descent) = text_extents(font, inherited.font_size);
@@ -1479,7 +1479,7 @@ fn paint_file_color(
                 fill_rect(fx0 + 1.0, fy0 + 1.0, fx1 - 1.0, fy1 - 1.0, layout_core::BUTTON_FACE, 255, surface, width, height, damage_rects, clip);
             }
             draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
-            draw_text(status, cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
+            draw_text(&file_status_fit(dom_node, &adv, bx + bw - bord.right - pad.right - (cx0 + btn_bw + 4.0)), cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
             true
         }
         "color" => {
@@ -4491,4 +4491,23 @@ fn paint_img_alt(
     let text = transform_text(&text, inherited.text_transform);
     let clip = (clip.0.max(cx + inset), clip.1.max(cy + inset), clip.2.min(cx + cw - inset), clip.3.min(cy + ch - inset));
     draw_text(&text, tx, ty, f32::MAX, &inherited.advancer(), inherited.line_height, inherited.color, false, surface, width, height, damage_rects, clip);
+}
+
+// ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status from its value, ellipsized to the box (named tail block) ----
+
+/// AETHERFILECHOSEN (SR682): the status text `paint_file_color` draws after a file input's button: layout_core's ONE
+/// rule `file_status` over the element's `multiple` and `value` attributes (one name: Chromium ignores the attribute, the
+/// stand-in until a picker or the JS FileList feeds it, AETHER-FILEPICKER / AETHER-FILECHOSEN-JSFILES owed), fitted to
+/// `avail` px (the input's content right edge less the status origin) by the render's existing ellipsis,
+/// `pdf::thumbs::ellipsize` (whole when it fits, else cut with a trailing `…`).
+fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -> String {
+    let (multiple, value) = dom_node
+        .as_element()
+        .map(|e| {
+            let a = e.attributes.borrow();
+            (a.get("multiple").is_some(), a.get("value").map(str::to_string))
+        })
+        .unwrap_or((false, None));
+    let status = layout_core::file_status(value.as_deref(), multiple, 1);
+    crate::pdf::thumbs::ellipsize(adv, &status, avail.max(0.0) as f64).into_owned()
 }

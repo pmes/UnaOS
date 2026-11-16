@@ -1558,3 +1558,12 @@ exec-rmbp-vugcomscanresumetoolindex 7b12b1b82 wave36 cut69h
 exec-rmbp-vugintentfeaturesdeclined 7b12b1b82 wave36 cut69h
 exec-rmbp-vugintentsetsiblings 7b12b1b82 wave36 cut69h
 exec-rmbp-vugintentfeaturesslotconstrain 7b12b1b82 wave36 cut69h
+exec-rmbp-nleplayaudio 5cccda556 wave36 cut70h
+exec-rmbp-nlehostsave 5cccda556 wave36 cut70h
+exec-rmbp-nlexfadepower 5cccda556 wave36 cut70h
+exec-rmbp-nlewipes 5cccda556 wave36 cut70h
+exec-rmbp-h264encscenecut 5cccda556 wave36 cut70h
+exec-rmbp-aetherimgalt 5cccda556 wave36 cut70h
+exec-rmbp-aetherfilechosen 5cccda556 wave36 cut70h
+exec-rmbp-aetherimageinputelf 5cccda556 wave36 cut70h
+exec-rmbp-aetherfontdbcache 5cccda556 wave36 cut70h

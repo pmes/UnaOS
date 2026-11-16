@@ -334,7 +334,7 @@ fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
     let node = tree.node_map.get(&id);
     let (w, h) = (l.size.width, l.size.height);
     if !hidden && y + h >= 0.0 {
-        if let Some(c) = p.and_then(|p| p.background).filter(|_| p.and_then(|p| p.bg_alpha).unwrap_or(1.0) >= 0.5) {
+        if let Some(c) = p.and_then(|p| p.background).filter(|_| p.and_then(|p| p.bg_alpha).unwrap_or(1.0) >= 0.5).filter(|c| !(*c == layout_core::BUTTON_FACE && node.is_some_and(|n| layout_core::is_image_input(n)))) { // AETHERIMAGEINPUTELF (SR683): html.css gives an image input no background, so the UA face is not filled
             cv.fill(fl(x), fl(y), fl(x + w) - fl(x), fl(y + h) - fl(y), rgb(c));
         }
         let sides = p.and_then(|p| p.border).unwrap_or([None; 4]);
@@ -487,11 +487,12 @@ fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
         return;
     }
     let ty = n.attr("type").unwrap_or_default();
-    if !layout_core::is_push_type(&ty) {
+    let image = layout_core::is_image_input(n); if image && image_blit(cv, cx, id, x, y) { return; } // AETHERIMAGEINPUTELF (SR683): the bitmap, else the AltText below
+    if !layout_core::is_push_type(&ty) && !image { // AETHERIMAGEINPUTELF (SR683)
         return file_color(cv, cx, id, ink, x, y, &ty); // AETHERFILECOLORPAINT (SR456)
     }
-    let value = n.attr("value");
-    let label = layout_core::button_label(&ty, value.as_deref());
+    let value = n.attr("value"); let alt = if image { n.attr("alt") } else { None }; // AETHERIMAGEINPUTELF (SR683)
+    let label = if image { layout_core::image_alt_label(alt.as_deref(), value.as_deref()) } else { layout_core::button_label(&ty, value.as_deref()) }; // AETHERIMAGEINPUTELF (SR683): the AltText control_intrinsic sized the box by
     if label.is_empty() {
         return;
     }
@@ -530,7 +531,7 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
     let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
     let ty = ty.trim();
     if ty.eq_ignore_ascii_case("file") {
-        let (button, status) = layout_core::file_label(n.attr("multiple").is_some());
+        let (button, status) = (layout_core::file_label(n.attr("multiple").is_some()).0, layout_core::file_status(n.attr("value").as_deref(), n.attr("multiple").is_some(), 1).into_owned());
         let color = tree.paint_map.get(&id).and_then(|p| p.color).map(rgb).unwrap_or(crate::theme::PAGE_INK);
         let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, 0.0);
         let mut t = cx.fonts.0.borrow_mut();
@@ -548,7 +549,7 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
         let (px0, py0, px1, py1) = whole.clip;
         // AETHERFILEFACE (SR463): ButtonFace on the button sub-box only (the input paints none), this ring's push rule: no UA frame.
         cv.fill(fl(ox), fl(oy), fl(ox + btn_bw) - fl(ox), fl(oy + oh) - fl(oy), rgb(layout_core::BUTTON_FACE));
-        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status)] {
+        for (sx, s) in [(btn.x, button), (ox + btn_bw + 4.0, status.as_str())] {
             t.draw(sx, base, s, ink.sel, ink.size, color, &mut |gx, gy, cov| {
                 let (fx, fy) = (gx as f32, gy as f32);
                 if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
@@ -566,4 +567,43 @@ fn file_color(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32, t
             cv.fill(x0 + 1, y0 + 1, x1 - x0 - 2, y1 - y0 - 2, rgb(fill));
         }
     }
+}
+
+// ---- AETHERIMAGEINPUTELF (LEDGER SR683): an image input's bitmap (named tail block) ----
+
+/// AETHERIMAGEINPUTELF (SR683): the host render's img blit for an image input (AETHERIMAGEINPUTFETCH SR461) on this ring:
+/// the decoded bitmap `style::with_image` holds for box `id`'s node (main.rs `image_inputs` fetched it), drawn into the
+/// content box (the border box: ua_control gives an image input no UA edges) whose border box's top-left is (`x`, `y`),
+/// nearest-sampled to the box layout_core's img rule sized (object-fit is not read: the initial `fill`), clipped to the
+/// canvas; straight alpha 255 is stored, 0 < a < 255 blends over what is there. True when a bitmap was drawn, so
+/// `caption` paints no text over it (SR461's `image_painted`); false leaves the AltText caption.
+fn image_blit(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) -> bool {
+    let tree = cx.tree;
+    let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return false };
+    let (ox, oy) = (x + l.border.left + l.padding.left, y + l.border.top + l.padding.top);
+    let ow = l.size.width - l.border.left - l.padding.left - l.border.right - l.padding.right;
+    let oh = l.size.height - l.border.top - l.padding.top - l.border.bottom - l.padding.bottom;
+    let drawn = crate::style::with_image(n, |img| {
+        let (x0, y0, x1, y1) = (fl(ox), fl(oy), fl(ox + ow), fl(oy + oh));
+        let (dw, dh) = ((x1 - x0) as i64, (y1 - y0) as i64);
+        if dw <= 0 || dh <= 0 {
+            return;
+        }
+        let (iw, ih) = (img.width as i64, img.height as i64);
+        for dy in y0.max(0)..y1.min(cv.h) {
+            let sy = (((dy - y0) as i64 * ih) / dh).min(ih - 1);
+            for dx in x0.max(0)..x1.min(cv.w) {
+                let sx = (((dx - x0) as i64 * iw) / dw).min(iw - 1);
+                let o = ((sy * iw + sx) * 4) as usize;
+                let (r, g, b, a) = (img.rgba[o], img.rgba[o + 1], img.rgba[o + 2], img.rgba[o + 3]);
+                let c = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+                if a == 255 {
+                    cv.px[(dy * cv.w + dx) as usize] = c;
+                } else if a > 0 {
+                    cv.blend(dx, dy, c, a);
+                }
+            }
+        }
+    });
+    drawn.is_some()
 }

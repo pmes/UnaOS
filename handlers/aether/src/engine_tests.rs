@@ -3794,7 +3794,7 @@ mod tests {
 
     /// AETHERFILECOLORPAINT (SR456): a file input paints its Choose-File button caption at its start and the "No file
     /// chosen" status after it (Chromium's file control; layout_core `file_label`), with and without `multiple`; a
-    /// value attribute is never painted as text. Before, the box was an empty ButtonFace frame.
+    /// value attribute paints as the status name (AETHERFILECHOSEN SR682, layout_core `file_status`). Before, the box was an empty ButtonFace frame.
     #[test]
     fn file_caption_paints() {
         let html = r#"<!doctype html><html><body>
@@ -4277,6 +4277,113 @@ mod tests {
         }
         let (n, _, _) = caption_ink(&mut engine, "a");
         assert!(n > 0, "a: an image input with no image paints its alt text");
+    }
+
+    // ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status text from its value (named tail block) ----
+
+    /// AETHERFILECHOSEN (SR682): the file input `id`'s border box (left, top, width, height), the column one past its
+    /// button's right edge (the end of the button's #767676 top frame row, SR463), and the sorted columns from there to
+    /// the box's right edge that carry ink darker than 160 (the `caption_ink` test) in the rows 3 px inside the box.
+    fn file_status_ink(engine: &mut crate::AetherEngine, id: &str) -> ((f64, f64, f64, f64), usize, Vec<usize>) {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(engine, "left"), r(engine, "top"), r(engine, "width"), r(engine, "height"));
+        assert!(w > 40.0 && h > 14.0, "{id}: the file input has a box ({w}x{h})");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let px = |x: usize, y: usize| -> (u8, u8, u8) {
+            let i = (y * sw + x) * 4;
+            (s[i + 2], s[i + 1], s[i])
+        };
+        let (x0, y0, x1) = (l.trunc() as usize, t.trunc() as usize, ((l + w).floor() as usize).min(sw));
+        let mut end = x0;
+        while end < x1 && px(end, y0) == (118, 118, 118) {
+            end += 1;
+        }
+        let (ya, yb) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let cols = (end..x1)
+            .filter(|&x| (ya..yb).any(|y| {
+                let p = px(x, y);
+                p.0 < 160 || p.1 < 160 || p.2 < 160
+            }))
+            .collect();
+        ((l, t, w, h), end, cols)
+    }
+
+    /// AETHERFILECHOSEN (SR682): with no value the status is layout_core `file_status`'s "No file chosen", painted 4 px
+    /// (kAfterButtonSpacing) after the button's border box: the columns just right of the button carry no ink, the
+    /// status's first glyph starts within a few px after the gap.
+    #[test]
+    fn file_status_no_file_chosen_painted() {
+        let html = r#"<!doctype html><html><body><div><input type="file" id="f"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let ((l, _, _, _), end, cols) = file_status_ink(&mut engine, "f");
+        assert!(end as f64 > l + 20.0, "the button's top frame row was found ({l} .. {end})");
+        assert!(!cols.iter().any(|&x| x < end + 3), "the 4 px gap after the button carries no ink (button end {end}): {cols:?}");
+        assert!(cols.iter().any(|&x| x >= end + 3 && x <= end + 30), "the status's first glyph follows the gap (button end {end}): {cols:?}");
+        assert_eq!(layout_core::file_status(None, false, 1), "No file chosen");
+    }
+
+    /// AETHERFILECHOSEN (SR682): a chosen file shows its basename: value `C:\fakepath\report.pdf` paints the same status
+    /// ink extent as value `report.pdf`, and a different one from no value ("No file chosen").
+    #[test]
+    fn file_status_shows_basename() {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="p" value="C:\fakepath\report.pdf"></div>
+            <div><input type="file" id="b" value="report.pdf"></div>
+            <div><input type="file" id="n"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let extent = |e: &mut crate::AetherEngine, id: &str| -> (usize, usize) {
+            let (_, end, cols) = file_status_ink(e, id);
+            assert!(!cols.is_empty(), "{id}: the status paints ink");
+            (cols[0] - end, cols[cols.len() - 1] - end)
+        };
+        let (p, b, n) = (extent(&mut engine, "p"), extent(&mut engine, "b"), extent(&mut engine, "n"));
+        assert_eq!(p, b, "the fakepath value paints its basename");
+        assert_ne!(p, n, "a chosen name is not the No-file-chosen text");
+        assert_eq!(layout_core::file_status(Some("C:\\fakepath\\report.pdf"), false, 1), "report.pdf");
+    }
+
+    /// AETHERFILECHOSEN (SR682): a status wider than the box is cut at the input's content right edge with a trailing
+    /// `…` (the render's `pdf::thumbs::ellipsize`): a 60-char name in a 227 px box keeps its ink inside the box, reaches
+    /// near its right edge, and its last glyph is a short dot band in the line's lower half (the ellipsis), not a
+    /// clipped letter.
+    #[test]
+    fn file_status_ellipsized() {
+        let name = "Quarterly_Budget_Report_Final_Draft_Version_Seven_2026_A.pdf";
+        assert_eq!(name.len(), 60);
+        let html = format!(
+            r#"<!doctype html><html><body><div><input type="file" id="e" style="width: 227px" value="C:\fakepath\{name}"></div></body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let ((l, t, w, h), end, cols) = file_status_ink(&mut engine, "e");
+        assert!((w - 227.0).abs() <= 0.5, "the author width holds the box at 227 px ({w})");
+        let last = *cols.last().expect("the status paints ink");
+        assert!((last as f64) < l + w, "the status stays inside the box ({last} vs {})", l + w);
+        assert!(last as f64 >= l + w - 20.0, "the cut status runs to near the box's right edge ({last} vs {})", l + w);
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let ink = |x: usize, y: usize| {
+            let i = (y * sw + x) * 4;
+            s[i] < 160 || s[i + 1] < 160 || s[i + 2] < 160
+        };
+        let (ya, yb) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let rows = |xa: usize, xb: usize| -> Vec<usize> { (ya..yb).filter(|&y| (xa..=xb).any(|x| ink(x, y))).collect() };
+        let all = rows(end, last);
+        let dot = rows(last.saturating_sub(1), last);
+        let (top, bottom) = (all[0], all[all.len() - 1]);
+        assert!(bottom - top >= 7, "the status line has letter-height ink ({top}..{bottom})");
+        assert!(!dot.is_empty() && dot[dot.len() - 1] - dot[0] <= 3, "the last glyph is a dot, not a clipped letter: {dot:?}");
+        assert!(dot[0] * 2 >= top + bottom, "the dot sits in the line's lower half: {dot:?} in {top}..{bottom}");
     }
 
     // ---- AETHERIMGALT (LEDGER SR681): a failed img's alt text (named tail block) --------------------------------
