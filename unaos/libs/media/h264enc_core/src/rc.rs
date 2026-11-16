@@ -519,7 +519,7 @@ mod tests {
 // bisection so the predicted total meets the target. In the second pass [`RcMode::TwoPass`] keeps the CBR bucket: `Rc::picture`'s
 // QP line hands its choice to `pass2_pick`, which starts the picture at its planned QP moved by the remaining budget against the
 // remaining plan, then raises it while the type's model predicts more than the bucket's room; `row_qp` corrects the rows. Owed:
-// H264ENC-TWOPASS-FILE, H264ENC-TWOPASS-QCOMP, H264ENC-TWOPASS-KERNEL, H264ENC-TWOPASS-BLUR.
+// H264ENC-TWOPASS-FILE (BUILT by SR719, the H264ENCTWOPASSFILE tail block), H264ENC-TWOPASS-QCOMP, H264ENC-TWOPASS-KERNEL, H264ENC-TWOPASS-BLUR.
 
 /// One coded picture as the first pass saw it (H264ENCTWOPASS SR698): its type, its access unit's bits (every NAL unit), its
 /// SliceQPY and its complexity bits x [`step16`]`(qp)`.
@@ -699,4 +699,107 @@ mod twopass_tests {
     fn two_pass_constructor_equals_the_literal() {
         assert_eq!(RateControl::two_pass(200, (25, 1)), RateControl { bits_per_second: 200_000, fps_num: 25, fps_den: 1, mode: RcMode::TwoPass });
     }
+}
+
+// ---- H264ENCTWOPASSFILE (LEDGER SR719): the first pass's records as text (named tail block) ----
+// x264's `--pass 1 --stats f` / `--pass 2 --stats f`: the [`PicStat`]s of a first pass written once, read by a later process. ONE text
+// form, here beside the record (the crate is no_std + alloc: out through `core::fmt::Write`, in from a `&str`; the file I/O is the
+// caller's, tools/nle). A header line `h264enc-stats v<STATS_VERSION> frames=<n> fps=<num>/<den>`, then one line per picture in coding
+// order: `<I|P|B> <bits> <qp> <complexity>`, each '\n'-terminated. The reader re-checks the record's own invariant (complexity = bits x
+// step16(qp), `Encoder::note_stat`'s rule) and refuses by name. Owed: H264ENC-TWOPASS-FILE-RESCALE (a pass 2 over a different frame count).
+
+/// The stats text form's version (the header's `v<n>`).
+pub const STATS_VERSION: u32 = 1;
+
+/// A first pass read back ([`read_stats`]): the frame rate its header names and its records in coding order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsFile {
+    pub fps: (u32, u32),
+    pub pics: Vec<PicStat>,
+}
+
+/// A stats text [`read_stats`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsError {
+    /// No first line, or not `h264enc-stats v<STATS_VERSION> frames=<n> fps=<num>/<den>` (num and den nonzero).
+    Header,
+    /// File line `n` (1-based) is not `<I|P|B> <bits> <qp> <complexity>` with qp in 0..=51 and complexity = bits x step16(qp).
+    Line(usize),
+    /// The header's frame count against the picture lines the text holds.
+    Count { header: usize, lines: usize },
+}
+
+impl core::fmt::Display for StatsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StatsError::Header => write!(f, "h264enc: stats: bad header (want `h264enc-stats v{STATS_VERSION} frames=<n> fps=<num>/<den>`)"),
+            StatsError::Line(n) => write!(f, "h264enc: stats: bad line {n} (want `<I|P|B> <bits> <qp> <complexity>`)"),
+            StatsError::Count { header, lines } => write!(f, "h264enc: stats: the header says {header} pictures, the text holds {lines}"),
+        }
+    }
+}
+
+/// The one-letter code of a picture type in the stats text.
+fn kind_code(k: Pic) -> char {
+    match k {
+        Pic::Idr => 'I',
+        Pic::P => 'P',
+        Pic::B => 'B',
+    }
+}
+
+fn kind_of(s: &str) -> Option<Pic> {
+    match s {
+        "I" => Some(Pic::Idr),
+        "P" => Some(Pic::P),
+        "B" => Some(Pic::B),
+        _ => None,
+    }
+}
+
+/// Write a first pass's records at frame rate `fps` (num, den) as the stats text: the header, then one line per picture.
+pub fn write_stats(pics: &[PicStat], fps: (u32, u32), w: &mut impl core::fmt::Write) -> core::fmt::Result {
+    writeln!(w, "h264enc-stats v{STATS_VERSION} frames={} fps={}/{}", pics.len(), fps.0, fps.1)?;
+    for p in pics {
+        writeln!(w, "{} {} {} {}", kind_code(p.kind), p.bits, p.qp, p.complexity)?;
+    }
+    Ok(())
+}
+
+/// Read the stats text [`write_stats`] writes; a refusal names the header, the line, or the count.
+pub fn read_stats(text: &str) -> core::result::Result<StatsFile, StatsError> {
+    let mut lines = text.lines();
+    let head = lines.next().ok_or(StatsError::Header)?;
+    let (frames, fps) = parse_stats_header(head).ok_or(StatsError::Header)?;
+    let mut pics = Vec::with_capacity(frames.min(1 << 20));
+    for (i, l) in lines.enumerate() {
+        pics.push(parse_stats_line(l).ok_or(StatsError::Line(i + 2))?);
+    }
+    if pics.len() != frames {
+        return Err(StatsError::Count { header: frames, lines: pics.len() });
+    }
+    Ok(StatsFile { fps, pics })
+}
+
+fn parse_stats_header(l: &str) -> Option<(usize, (u32, u32))> {
+    let mut f = l.split(' ');
+    if f.next()? != "h264enc-stats" || f.next()?.strip_prefix('v')?.parse::<u32>().ok()? != STATS_VERSION {
+        return None;
+    }
+    let frames = f.next()?.strip_prefix("frames=")?.parse().ok()?;
+    let (num, den) = f.next()?.strip_prefix("fps=")?.split_once('/')?;
+    let fps: (u32, u32) = (num.parse().ok()?, den.parse().ok()?);
+    (f.next().is_none() && fps.0 != 0 && fps.1 != 0).then_some((frames, fps))
+}
+
+fn parse_stats_line(l: &str) -> Option<PicStat> {
+    let mut f = l.split(' ');
+    let kind = kind_of(f.next()?)?;
+    let bits: u64 = f.next()?.parse().ok()?;
+    let qp: i32 = f.next()?.parse().ok()?;
+    let complexity: u64 = f.next()?.parse().ok()?;
+    if f.next().is_some() || !(0..=QP_MAX).contains(&qp) || bits.checked_mul(step16(qp)) != Some(complexity) {
+        return None;
+    }
+    Some(PicStat { kind, bits, qp, complexity })
 }
