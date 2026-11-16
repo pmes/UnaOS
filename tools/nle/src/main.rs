@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -30,7 +30,7 @@
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
 //! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP); `--crf` (0..=51,
 //! H264ENCVBRCRF SR383) a constant quality instead (h264enc_core's `RcMode::Crf`), exclusive with `--bitrate`. `--scenecut [K]`
-//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--audio aac` (or
+//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--hrd` (H264ENCHRD SR699, with `--bitrate`) signals the CBR bucket as the NAL HRD (VUI nal_hrd_parameters, buffering-period / pic-timing SEI, filler). `--audio aac` (or
 //! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
@@ -42,14 +42,14 @@
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, I420Raw, PngSequence, RawSequence, VideoEncoder, Y4m, export_as, export_png};
+use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, H264Opts, I420Raw, VIDEO_NAMES, VideoEncoder, Y4m, export_as, export_png, video_named_with};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"));
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -115,7 +115,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
-    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = false; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
+    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = false; let mut hrd = false; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -134,6 +134,7 @@ fn main() {
             "--scenecut" => scenecut = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 40 }),
             "--two-pass" => two_pass = true, // H264ENCTWOPASS (SR698): two exports, the second planned from the first
             "--aq" => aq = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 10 }), // H264ENCAQ (SR693): h264enc_core's `Config::aq`
+            "--hrd" => hrd = true, // H264ENCHRD (SR699): h264enc_core's `Config::hrd`
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -183,7 +184,7 @@ fn main() {
             }
             if two_pass && bitrate.is_none() { die("--two-pass needs --bitrate".into()); } // H264ENCTWOPASS (SR698)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, aq, two_pass, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, aq, two_pass, hrd, container)
         }
         _ => usage(),
     }
@@ -191,20 +192,9 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: bool, container: Container) {
-    let enc: Box<dyn VideoEncoder> = match video {
-        "png" => Box::new(PngSequence),
-        "raw" => Box::new(RawSequence),
-        "i420" => Box::new(I420Raw::default()),
-        "y4m" => Box::new(Y4m::new(tl.tb.den as u32, tl.tb.num as u32)),
-        "h264" => match (bitrate, crf) {
-            (Some(k), _) if two_pass => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_two_pass(k, tl.tb.den as u32, tl.tb.num as u32, pass1_stats(tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container))),
-            (Some(k), _) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
-            (None, Some(c)) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_quality(c, tl.tb.den as u32, tl.tb.num as u32)),
-            (None, None) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq)),
-        },
-        _ => usage(),
-    };
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: bool, hrd: bool, container: Container) {
+    let two_pass_stats = match bitrate { Some(k) if two_pass && video == "h264" => Some(pass1_stats(tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container)), _ => None }; // NLE5DCLITABLE (SR718): the first pass of --two-pass (file tail), then the ONE table
+    let enc = video_named_with(video, tl.tb, H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats }).unwrap_or_else(|| usage());
     let aud = match audio {
         "wav" => AudioOut::Wav,
         "mp4" => AudioOut::Mp4,

@@ -670,3 +670,115 @@ fn nlerawexport_second_size_refused_by_name() {
         assert!(e.to_string().contains("frame does not match"), "{e}");
     }
 }
+
+// ---- NLE5DCLITABLE (LEDGER SR718): the one encoder table against tools/nle's old match (named tail block) ----
+use stria::nle_export::{H264Opts, VIDEO_NAMES, video_named, video_named_with};
+
+/// FNV-1a over everything an export takes from a video encoder: the colour call, every access unit (keyframe, time, data)
+/// of every frame and of the flush, then the config (fourcc, config bytes) and the layout.
+fn nle5dclitable_fnv(mut e: Box<dyn stria::nle_export::VideoEncoder>, frames: &[Vec<u8>]) -> u64 {
+    fn eat(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h = (*h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let _ = e.colour((2, 2));
+    let mut units = Vec::new();
+    for f in frames {
+        units.extend(e.encode(64, 48, f).unwrap());
+    }
+    units.extend(e.flush().unwrap());
+    for a in &units {
+        eat(&mut h, &[a.keyframe as u8]);
+        if let Some((d, p)) = a.time {
+            eat(&mut h, &d.to_le_bytes());
+            eat(&mut h, &p.to_le_bytes());
+        }
+        eat(&mut h, &a.data);
+    }
+    let c = e.config();
+    eat(&mut h, &c.fourcc);
+    eat(&mut h, &c.config);
+    eat(&mut h, format!("{:?}", e.layout()).as_bytes());
+    h
+}
+
+/// A first pass (`nle export --two-pass`'s `pass1_stats` chain: CBR 40 kbit/s at 25 fps) and its per-picture records.
+fn nle5dclitable_pass1(frames: &[Vec<u8>]) -> Vec<stria::nle_export::PicStat> {
+    let enc = H264Encoder::new(26, 10).with_bitrate(40, 25, 1);
+    let stats = enc.stats();
+    nle5dclitable_fnv(Box::new(enc), frames);
+    let v = stats.borrow().clone();
+    v
+}
+
+/// One `nle export` h264 option set: (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass).
+type Nle5dSet = (u8, u32, Option<u32>, Option<u8>, Option<u8>, Option<u8>, bool, bool);
+
+/// The option sets the tool accepts (and bitrate + crf, which the tool refuses before the table: the bitrate arm wins).
+const NLE5DCLITABLE_SETS: [Nle5dSet; 8] = [
+    (26, 10, None, None, None, None, false, false),
+    (30, 5, None, None, Some(40), Some(10), false, false),
+    (26, 10, Some(40), None, None, None, false, false),
+    (26, 10, Some(40), None, None, None, true, false),
+    (26, 10, None, Some(28), None, None, false, false),
+    (26, 10, None, Some(28), None, None, true, false),
+    (26, 10, Some(40), Some(28), None, None, false, false),
+    (26, 10, Some(40), None, None, None, false, true),
+];
+
+/// tools/nle's encoder match before SR718 (main.rs `export_verb`), written out at the fixture's 25 fps: the oracle.
+fn nle5dclitable_chain(s: Nle5dSet, stats: Vec<stria::nle_export::PicStat>) -> H264Encoder {
+    let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = s;
+    match (bitrate, crf) {
+        (Some(k), _) if two_pass => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_two_pass(k, 25, 1, stats),
+        (Some(k), _) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, 25, 1),
+        (None, Some(c)) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_quality(c, 25, 1),
+        (None, None) => H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq),
+    }
+}
+
+#[test]
+fn nle5dclitable_h264_table_is_the_cli_chain() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let stats = nle5dclitable_pass1(&refr.frames);
+    for (i, s) in NLE5DCLITABLE_SETS.iter().enumerate() {
+        let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = *s;
+        let chain = nle5dclitable_fnv(Box::new(nle5dclitable_chain(*s, stats.clone())), &refr.frames);
+        assert_eq!(chain, NLE5DCLITABLE_BEFORE[i], "set {i}: the old match's stream, pinned before SR718");
+        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()) };
+        let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
+        assert_eq!(table, chain, "set {i}: the table is the CLI's chain");
+    }
+}
+
+/// The fnvs of [`nle5dclitable_chain`] over [`NLE5DCLITABLE_SETS`], measured on the tree before SR718 (the old match in place).
+const NLE5DCLITABLE_BEFORE: [u64; 8] = [
+    0xb3c1_26d2_643f_7976,
+    0xd4a7_27d4_5b5d_78c5,
+    0x050f_27c6_7cc3_2beb,
+    0x7265_0fd7_6ad4_126c,
+    0x3657_59b8_8c60_a4d0,
+    0x3657_59b8_8c60_a4d0,
+    0x050f_27c6_7cc3_2beb,
+    0x7aca_82b3_ce88_470a,
+];
+
+#[test]
+fn nle5dclitable_video_named_is_the_default_options() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    for name in VIDEO_NAMES {
+        let a = nle5dclitable_fnv(video_named(name, tl.tb).unwrap(), &refr.frames);
+        let b = nle5dclitable_fnv(video_named_with(name, tl.tb, H264Opts::default()).unwrap(), &refr.frames);
+        assert_eq!(a, b, "{name}");
+    }
+    let face = nle5dclitable_fnv(video_named("h264", tl.tb).unwrap(), &refr.frames);
+    assert_eq!(face, 0x8318_f822_3505_f96b, "the face's h264 (SR694), pinned before SR718");
+    assert_eq!(face, nle5dclitable_fnv(Box::new(H264Encoder::new(26, 25)), &refr.frames), "QP 26, a one-second GOP");
+    assert!(video_named_with("vp9", tl.tb, H264Opts::default()).is_none());
+}
