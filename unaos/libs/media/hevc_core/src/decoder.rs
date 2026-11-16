@@ -455,7 +455,7 @@ impl Decoder {
             let i = cur.pic.slices.len() - 1;
             (i as u32, cur.pic.slices[i].addr_rs)
         } else {
-            cur.pic.slices.push(SliceInfo {
+            crate::dpb::keep_weights(&mut cur.pic, &sh, &cur.sps); cur.pic.slices.push(SliceInfo {
                 addr_rs: sh.segment_address,
                 deblocking_disabled: sh.deblocking_filter_disabled_flag,
                 beta_offset_div2: sh.beta_offset_div2,
