@@ -43,6 +43,10 @@
 //! * EXPORTCOLOURPRIM (rmbp-ledger B979): [`Timeline::reels_colour`] — the ONE file-colour rule both exports call (Stria's `nle_export::export`, the kernel's EDL export).
 //! * NLESIZEPOLICY (LEDGER SR394): each [`Source`] carries a [`SizePolicy`] (`* UNA SIZE` in the [`edl`]) — how a frame of
 //!   another size than its reel's first fills the reel's box; [`SizePolicy::place`] is the ONE geometry both faces read.
+//! * NLEXFADEPOWER (LEDGER SR678): a crossfade has a [`Curve`] (linear, or equal-power through [`schedule::xfade_weight`]);
+//!   an audio-only crossfade with no video transition is an explicit [`AudioXfade`] record ([`Timeline::audio_xfades`],
+//!   CMX's A-only `D` event); a BL transition's paired audio fades from / to silence; [`Timeline::crossfade_at`] is the
+//!   ONE reader of an audio cut's fade (explicit, derived, from black) and [`Timeline::fade_to_silence`] its to-black twin.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -321,6 +325,8 @@ pub struct Timeline {
     pub tb: Timebase,
     pub sources: Vec<Source>,
     pub tracks: Vec<Track>,
+    /// NLEXFADEPOWER (SR678): the explicit audio crossfades (CMX's A-only `D` event), ordered by `(track, at)`.
+    pub audio_xfades: Vec<AudioXfade>,
 }
 
 /// How [`Timeline::place`] makes room.
@@ -400,7 +406,7 @@ pub trait SourceIndex {
 impl Timeline {
     /// An empty timeline at an integer frame rate (one tick = one frame).
     pub fn new(fps: u32) -> Timeline {
-        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new() }
+        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new(), audio_xfades: Vec::new() }
     }
     /// The frame rate when the time base is `1/n`.
     pub fn fps(&self) -> Option<u32> {
@@ -466,6 +472,7 @@ impl Timeline {
             }
             self.validate_transitions(t)?;
         }
+        self.validate_audio_xfades()?;
         Ok(())
     }
 
@@ -750,24 +757,13 @@ impl Timeline {
             let mut moved = Vec::with_capacity(bt.transitions.len());
             for x in &bt.transitions {
                 if x.to_black { moved.push(Transition { at: black_cut(bt, clips, x)?, ..*x }); continue; } // NLE3cBLACK
-                let inc = bt.clips.iter().find(|c| c.at == x.at).ok_or(EditError::Transition)?;
-                let out = bt.clips.iter().find(|c| c.end() == x.at);
-                let at = clips
-                    .iter()
-                    .filter(|i| i.src == inc.src && i.src_in == inc.src_in)
-                    .map(|i| i.at)
-                    .filter(|&at| match (out, clips.iter().find(|c| c.end() == at)) {
-                        (Some(a), Some(b)) => a.src == b.src && a.src_out == b.src_out,
-                        (None, None) => true,
-                        _ => false,
-                    })
-                    .min_by_key(|&at| ((at - x.at).abs(), at))
-                    .ok_or(EditError::Transition)?;
+                let at = moved_cut(bt, clips, x.at)?; // NLEXFADEPOWER (SR678): the matcher moved to the file tail, shared
                 moved.push(Transition { at, ..*x });
             }
             moved.sort_by_key(|y| y.at);
             self.tracks[k].transitions = moved;
         }
+        self.retarget_audio_xfades(before)?;
         Ok(())
     }
 
@@ -1128,4 +1124,188 @@ impl WipeDir {
     pub fn refused(code: u16) -> Option<&'static str> {
         WipeDir::REFUSED.iter().find(|r| r.0 == code).map(|r| r.1)
     }
+}
+
+// ---- NLEXFADEPOWER (LEDGER SR678): the crossfade curve, the explicit audio-only crossfade and the BL audio fades (named tail block) ----
+// A crossfade's weights come from ONE fn, `schedule::xfade_weight(curve, p)` over the linear phase. An audio cut's fade
+// is read through ONE accessor, `Timeline::crossfade_at`: an explicit record (CMX's A-only `D` event) first, else the
+// crossfade a video transition implies (NLE3b's pairing, linear), else a fade FROM silence under a video transition from
+// black. `Timeline::fade_to_silence` is its to-black twin: the outgoing's handle fades out in the gap after the clip.
+
+/// NLEXFADEPOWER: a crossfade's weight curve. `Linear` (the default, NLE3b's ramp: the weights sum to `ENV_ONE`) or
+/// `EqualPower` (`w_in = sin(pi t / 2)`, `w_out = cos(pi t / 2)`: the squares sum to `ENV_ONE^2`); `* UNA XFADE EQUAL` in
+/// the [`edl`], absent = linear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Curve {
+    #[default]
+    Linear,
+    EqualPower,
+}
+
+/// NLEXFADEPOWER: an explicit audio crossfade on the cut at tick `at` of audio track `track` (the outgoing clip ends
+/// there, the incoming starts there), lasting `dur` ticks from the cut like a [`Transition`]: the outgoing's handle
+/// `src_out..src_out + dur` under the falling weight, the incoming's first `dur` ticks under the rising one. Where a video
+/// transition already implies a crossfade on that cut, the record overrides it (its `dur` and `curve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioXfade {
+    pub track: usize,
+    pub at: i64,
+    pub dur: i64,
+    pub curve: Curve,
+}
+
+/// NLEXFADEPOWER: what the other side of an audio fade is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Partner {
+    /// The outgoing clip's handle (a crossfade: two layers).
+    Clip,
+    /// Silence (a BL transition's audio: one layer, no partner to decode).
+    Silence,
+}
+
+/// NLEXFADEPOWER: the fade on an audio cut, derived or explicit: over ticks `at..at + dur`, weighted by `curve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crossfade {
+    pub at: i64,
+    pub dur: i64,
+    pub curve: Curve,
+    pub partner: Partner,
+}
+
+impl Timeline {
+    /// NLEXFADEPOWER: THE fade on the HEAD of clip `ci` of audio track `track`: an explicit [`AudioXfade`] on its cut,
+    /// else the crossfade a video transition implies ([`Timeline::audio_crossfade`]'s pairing, linear), else, when no
+    /// clip ends at its start, a fade FROM silence under a video transition from black whose incoming clip has the same
+    /// source and starts there (linear). `None`: a plain start.
+    pub fn crossfade_at(&self, track: usize, ci: usize) -> Option<Crossfade> {
+        let t = self.tracks.get(track)?;
+        if t.kind != Kind::Audio {
+            return None;
+        }
+        let i = t.clips.get(ci)?;
+        if ci > 0 && t.clips[ci - 1].end() == i.at {
+            if let Some(x) = self.audio_xfades.iter().find(|x| x.track == track && x.at == i.at) {
+                return Some(Crossfade { at: x.at, dur: x.dur, curve: x.curve, partner: Partner::Clip });
+            }
+            return self.crossfade_of(&t.clips, ci).map(|x| Crossfade { at: x.at, dur: x.dur, curve: Curve::Linear, partner: Partner::Clip });
+        }
+        self.black_pair(i.at, i.src, true).map(|dur| Crossfade { at: i.at, dur, curve: Curve::Linear, partner: Partner::Silence })
+    }
+
+    /// NLEXFADEPOWER: the fade TO silence after clip `ci` of audio track `track`: no clip starts at its end, and a video
+    /// transition to black sits there whose outgoing clip has the same source and ends there. The clip's handle plays on
+    /// in the gap `at..at + dur` under the falling weight (linear).
+    pub fn fade_to_silence(&self, track: usize, ci: usize) -> Option<Crossfade> {
+        let t = self.tracks.get(track)?;
+        if t.kind != Kind::Audio {
+            return None;
+        }
+        let o = t.clips.get(ci)?;
+        if t.clips.iter().any(|c| c.at == o.end()) {
+            return None;
+        }
+        self.black_pair(o.end(), o.src, false).map(|dur| Crossfade { at: o.end(), dur, curve: Curve::Linear, partner: Partner::Silence })
+    }
+
+    /// The duration of the video transition from black (`from`) whose incoming clip of source `src` starts at `at`, or to
+    /// black whose outgoing clip of source `src` ends at `at`.
+    fn black_pair(&self, at: i64, src: SourceId, from: bool) -> Option<i64> {
+        self.tracks.iter().filter(|v| v.kind == Kind::Video).find_map(|v| {
+            let x = v.transitions.iter().find(|x| x.at == at && if from { x.from_black } else { x.to_black })?;
+            let clip = v.clips.iter().any(|c| c.src == src && if from { c.at == at } else { c.end() == at });
+            clip.then_some(x.dur)
+        })
+    }
+
+    /// NLEXFADEPOWER: put an explicit audio crossfade on the cut at tick `at` of audio track `track` (replacing one there).
+    pub fn add_audio_xfade(&self, track: usize, at: i64, dur: i64, curve: Curve) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        tl.tracks.get(track).ok_or(EditError::NoTrack)?;
+        tl.audio_xfades.retain(|x| !(x.track == track && x.at == at));
+        tl.audio_xfades.push(AudioXfade { track, at, dur, curve });
+        tl.audio_xfades.sort_by_key(|x| (x.track, x.at));
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLEXFADEPOWER: take the explicit audio crossfade off the cut at tick `at` of `track` (none there: `Transition`).
+    pub fn remove_audio_xfade(&self, track: usize, at: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let n = tl.audio_xfades.len();
+        tl.audio_xfades.retain(|x| !(x.track == track && x.at == at));
+        if tl.audio_xfades.len() == n {
+            return Err(EditError::Transition);
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLEXFADEPOWER: every explicit record is in `(track, at)` order on a cut of an audio track (`Transition`) and fits the
+    /// incoming clip and the outgoing source's handle (`Handle`); a BL fade's audio fits its clip (from black) or its
+    /// handle (to black) (`Handle`, NLE3b's rule for the paired crossfade).
+    fn validate_audio_xfades(&self) -> Result<(), EditError> {
+        let mut last: Option<(usize, i64)> = None;
+        for x in &self.audio_xfades {
+            let t = self.tracks.get(x.track).ok_or(EditError::NoTrack)?;
+            if t.kind != Kind::Audio || x.dur < 1 || last.is_some_and(|l| (x.track, x.at) <= l) {
+                return Err(EditError::Transition);
+            }
+            last = Some((x.track, x.at));
+            let (Some(o), Some(i)) = (t.clips.iter().find(|c| c.end() == x.at), t.clips.iter().find(|c| c.at == x.at)) else {
+                return Err(EditError::Transition);
+            };
+            let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+            if x.dur > i.len() || x.dur > handle {
+                return Err(EditError::Handle);
+            }
+        }
+        for (ti, t) in self.tracks.iter().enumerate().filter(|(_, t)| t.kind == Kind::Audio) {
+            for (ci, c) in t.clips.iter().enumerate() {
+                if self.crossfade_at(ti, ci).is_some_and(|x| x.partner == Partner::Silence && x.dur > c.len()) {
+                    return Err(EditError::Handle);
+                }
+                if let Some(x) = self.fade_to_silence(ti, ci) {
+                    let handle = self.source(c.src).ok_or(EditError::NoSource)?.duration - c.src_out;
+                    if x.dur > handle {
+                        return Err(EditError::Handle);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// NLEXFADEPOWER: after an op moved clips, move every explicit record of `before` to where its cut now is, by the same
+    /// matcher as the video transitions ([`moved_cut`]); a cut that is gone is refused by name (`Transition`), never dropped.
+    fn retarget_audio_xfades(&mut self, before: &Timeline) -> Result<(), EditError> {
+        let mut moved = Vec::with_capacity(before.audio_xfades.len());
+        for x in &before.audio_xfades {
+            let bt = before.tracks.get(x.track).ok_or(EditError::NoTrack)?;
+            let clips = &self.tracks.get(x.track).ok_or(EditError::NoTrack)?.clips;
+            moved.push(AudioXfade { at: moved_cut(bt, clips, x.at)?, ..*x });
+        }
+        moved.sort_by_key(|x| (x.track, x.at));
+        self.audio_xfades = moved;
+        Ok(())
+    }
+}
+
+/// NLE3E (LEDGER SR225), lifted here by NLEXFADEPOWER: where the cut at tick `at` of track `bt` (before an op) sits among
+/// the op's `clips`. A cut is known by its clips' SOURCE edges: the incoming's `(src, src_in)` and the outgoing's
+/// `(src, src_out)` (from black: no clip ends at the cut). The match nearest the old tick wins (ties: the earlier); none is
+/// the cut gone, `EditError::Transition`.
+fn moved_cut(bt: &Track, clips: &[Clip], at: i64) -> Result<i64, EditError> {
+    let inc = bt.clips.iter().find(|c| c.at == at).ok_or(EditError::Transition)?;
+    let out = bt.clips.iter().find(|c| c.end() == at);
+    clips
+        .iter()
+        .filter(|i| i.src == inc.src && i.src_in == inc.src_in)
+        .map(|i| i.at)
+        .filter(|&a| match (out, clips.iter().find(|c| c.end() == a)) {
+            (Some(p), Some(q)) => p.src == q.src && p.src_out == q.src_out,
+            (None, None) => true,
+            _ => false,
+        })
+        .min_by_key(|&a| ((a - at).abs(), a))
+        .ok_or(EditError::Transition)
 }

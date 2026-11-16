@@ -270,3 +270,62 @@ fn nlewipes_ease_refusals_are_named() {
     let orphan = NLEWIPES_EASED.replace("001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n", "001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n* UNA EASE in\n");
     assert_eq!(edl::parse(&orphan, 25), Err(EdlError::Syntax { line: 8 }));
 }
+
+// ---- NLEXFADEPOWER (SR678): the A-only `D` event and `* UNA XFADE EQUAL`.
+
+/// A1: A[10,30)@0, B[0,40)@20 and an explicit 8-tick crossfade on the cut at 20.
+fn axf(curve: timeline_core::Curve) -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = vec![Clip::new(a, 10, 30, 0), Clip::new(b, 0, 40, 20)];
+    tl.add_audio_xfade(0, 20, 8, curve).unwrap()
+}
+
+const AXF: &str = "TITLE: AX
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE A 00:00:02:00
+* UNA SOURCE B 00:00:02:00
+
+001  A        A     C        00:00:00:10 00:00:01:05 00:00:00:00 00:00:00:20
+002  A        A     C        00:00:01:05 00:00:01:05 00:00:00:20 00:00:00:20
+002  B        A     D    008 00:00:00:00 00:00:01:15 00:00:00:20 00:00:02:10
+* UNA XFADE EQUAL
+";
+
+#[test]
+fn nlexfadepower_the_a_only_d_event_round_trips_byte_exact() {
+    use timeline_core::{AudioXfade, Curve};
+    let tl = axf(Curve::EqualPower);
+    let text = edl::write(&tl, "AX").unwrap();
+    assert_eq!(text, AXF);
+    let back = edl::parse(&text, 30).unwrap();
+    assert_eq!(back.audio_xfades, vec![AudioXfade { track: 0, at: 20, dur: 8, curve: Curve::EqualPower }]);
+    assert_eq!(back, tl);
+    assert_eq!(edl::write(&back, "AX").unwrap(), text);
+    // linear: the same two-line event, no XFADE line (absent = linear)
+    let lin = edl::write(&axf(Curve::Linear), "AX").unwrap();
+    assert_eq!(lin, AXF.replace("* UNA XFADE EQUAL\n", ""));
+    assert_eq!(edl::parse(&lin, 25).unwrap(), axf(Curve::Linear));
+}
+
+#[test]
+fn nlexfadepower_audio_transitions_and_xfade_lines_are_refused_by_name() {
+    // a D on an audio channel with no cut there (the outgoing line names an out point no clip ends on)
+    let nocut = AXF.replace("002  A        A     C        00:00:01:05 00:00:01:05", "002  A        A     C        00:00:01:04 00:00:01:04");
+    assert_eq!(edl::parse(&nocut, 25), Err(EdlError::Transition { line: 9 }));
+    // a wipe or BL on an audio channel
+    assert_eq!(edl::parse(&AXF.replace("D    008", "W001 008"), 25), Err(EdlError::Transition { line: 9 }));
+    let bl = AXF.replace("002  A        A     C        00:00:01:05 00:00:01:05", "002  BL       A     C        00:00:00:00 00:00:00:00");
+    assert_eq!(edl::parse(&bl, 25), Err(EdlError::Transition { line: 9 }));
+    // an XFADE line with no D line above it, twice, with another word, under a VIDEO dissolve
+    let first = AXF.replace("00:00:00:20\n002", "00:00:00:20\n* UNA XFADE EQUAL\n002");
+    assert_eq!(edl::parse(&first, 25), Err(EdlError::Syntax { line: 8 }));
+    assert_eq!(edl::parse(&format!("{AXF}* UNA XFADE EQUAL\n"), 25), Err(EdlError::Syntax { line: 11 }));
+    assert_eq!(edl::parse(&AXF.replace("XFADE EQUAL", "XFADE LINEAR"), 25), Err(EdlError::Syntax { line: 10 }));
+    let video = AXF.replace(" A     C", " V     C").replace(" A     D", " V     D");
+    assert_eq!(edl::parse(&video, 25), Err(EdlError::Syntax { line: 10 }));
+    assert!(edl::parse(&video.replace("* UNA XFADE EQUAL\n", ""), 25).is_ok());
+}

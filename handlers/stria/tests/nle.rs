@@ -1302,3 +1302,50 @@ fn nlehostsave_ctrl_s_and_meta_s_save() {
     }
     drop(src);
 }
+
+/// NLEXFADEPOWER (SR678): an audio-only crossfade (no video transition) A[0,20)@0 -> B[0,20)@20 over 8 ticks. Around its
+/// midpoint (samples `24 PER +- 96`) the rendered power under EqualPower is twice the Linear one (the weights sin(pi/4)
+/// against 1/2, both sources at their own level), within 1%; the per-tick equal-power runs CONTINUE their decoders (the
+/// same seeks as the linear span); and the explicit linear crossfade renders sample for sample as the one a video
+/// dissolve implies (NLE3b).
+#[test]
+fn nlexfadepower_equal_power_doubles_the_midpoint_power() {
+    use timeline_core::{Curve, TransitionKind};
+    let base = |video: bool| {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 50), tl.add_source("B", 50));
+        if video {
+            tl.add_track(Kind::Video);
+        }
+        let ti = tl.add_track(Kind::Audio);
+        tl.tracks[ti].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+        if video {
+            tl.tracks[0].clips = tl.tracks[ti].clips.clone();
+        }
+        tl
+    };
+    let run = |tl: &Timeline| {
+        let mut src = Sources::new(tl);
+        for (i, b) in BASE.iter().enumerate() {
+            src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
+        }
+        let mut sink = Collect::default();
+        let r = render(tl, 0..40, &src, &mut sink).unwrap();
+        assert_eq!(sink.pcm.len(), 40 * PER);
+        (r.seeks, sink.pcm.iter().map(|x| (*x * 32768.0).round() as i64).collect::<Vec<i64>>())
+    };
+    let (eq_seeks, eq) = run(&base(false).add_audio_xfade(0, 20, 8, Curve::EqualPower).unwrap());
+    let (lin_seeks, lin) = run(&base(false).add_audio_xfade(0, 20, 8, Curve::Linear).unwrap());
+    let mid = 24 * PER;
+    let power = |s: &[i64]| s[mid - 96..mid + 96].iter().map(|&x| (x * x) as f64).sum::<f64>();
+    let ratio = power(&eq) / power(&lin);
+    assert!((ratio - 2.0).abs() <= 0.02, "equal-power / linear midpoint power {ratio}");
+    // A, A's handle (the under layer's own seek), B: the per-tick runs reopen nothing
+    assert_eq!((eq_seeks, lin_seeks), (3, 3));
+    // outside the span the two curves are the same cut
+    assert_eq!((&eq[..20 * PER], &eq[28 * PER..]), (&lin[..20 * PER], &lin[28 * PER..]));
+    // the explicit linear crossfade is the derived one's sound
+    let (_, derived) = run(&base(true).add_transition(0, 20, TransitionKind::Dissolve, 8).unwrap());
+    assert_eq!(derived, lin);
+    println!("nlexfadepower: midpoint power eq/lin={ratio:.4} seeks={eq_seeks}");
+}
