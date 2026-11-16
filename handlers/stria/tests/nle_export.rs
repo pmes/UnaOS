@@ -670,3 +670,48 @@ fn nlerawexport_second_size_refused_by_name() {
         assert!(e.to_string().contains("frame does not match"), "{e}");
     }
 }
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the H.264 movie's btrt, read back through demux_core (named tail block) ----
+/// ffmpeg movenc's avgBitrate: floor(coded bits x 25 / frames) at the test timeline's 25 fps, over the demuxed samples.
+fn h264enchrdmp4_avg(d: &Demuxer) -> (u32, u64) {
+    let bytes: u64 = d.track_samples(0).map(|s| d.packet_at(s).data.len() as u64).sum();
+    let frames = d.track_samples(0).count() as u64;
+    ((bytes * 8 * 25 / frames) as u32, frames)
+}
+
+/// H264ENCHRDMP4 (SR720): a CBR 400 kbit/s export with the HRD signalled carries the bucket in the avc1's `btrt`: bufferSizeDB
+/// 50000 (the one-second CPB / 8), maxBitrate 400000 (the HRD rate), avgBitrate the floored coded rate, the coded bits within one
+/// CpbSize of rate x duration (the HRD's bound: the 1.4 s clip's bucket transient is about half the CPB).
+#[test]
+fn h264enchrdmp4_cbr_export_carries_the_hrd_btrt() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264enchrdmp4_cbr");
+    let enc = H264Encoder::new(26, 10).with_bitrate(400, tl.tb.den as u32, tl.tb.num as u32).with_hrd(true);
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!(r.frames, 35);
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let (avg, frames) = h264enchrdmp4_avg(&d);
+    assert_eq!(frames, 35);
+    let (buffer, max, got_avg) = d.tracks()[0].btrt.expect("a CBR export carries a btrt");
+    assert_eq!((buffer, max, got_avg), (50_000, 400_000, avg), "the HRD CPB / 8, the HRD rate, the floored coded rate");
+    let coded: u64 = d.track_samples(0).map(|s| d.packet_at(s).data.len() as u64 * 8).sum(); assert!(coded.abs_diff(400_000 * frames / 25) <= 400_000, "coded {coded} bits (avgBitrate {avg}) within one CpbSize of 400000 x {frames} / 25 (the HRD bound; 258360 measured on this 1.4 s clip)");
+}
+
+/// H264ENCHRDMP4 (SR720): a constant-QP export has no bucket: the btrt is ffmpeg's CRF form (buffer 0, max = avg); an
+/// audio-only `audio.mp4` (no video hint) carries none.
+#[test]
+fn h264enchrdmp4_cqp_export_carries_avg_only() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264enchrdmp4_cqp");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let (avg, _) = h264enchrdmp4_avg(&d);
+    assert!(avg > 0);
+    assert_eq!(d.tracks()[0].btrt, Some((0, avg, avg)));
+    let dir = fresh("h264enchrdmp4_audio");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Mp4).unwrap();
+    let a = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
+    assert_eq!(a.tracks()[0].btrt, None, "no video encoder hint, no btrt");
+}

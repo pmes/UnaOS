@@ -162,3 +162,13 @@ mod tests {
         }
     }
 }
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the bucket's values for the MP4 btrt (named tail block) ----
+impl RgbaEncoder {
+    /// The rate controller's bucket as SR699's HRD values (`Rc::hrd_params`: CBR the mean rate and its one-second CPB, VBR the
+    /// max rate and its bucket), whether or not `cfg.hrd` signals them in the SPS; None before the first frame and without a
+    /// bucket (constant QP, CRF). Stria's export writes them as the MP4 sample entry's `btrt`.
+    pub fn hrd(&self) -> Option<crate::sps::Hrd> {
+        self.enc.as_ref().and_then(|e| e.rc.as_ref()).and_then(crate::rc::Rc::hrd_params)
+    }
+}
