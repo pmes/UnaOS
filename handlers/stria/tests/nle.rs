@@ -1900,3 +1900,62 @@ fn nle6utp1_nle_fixtures_pin() {
 
 /// The fnv [`nle6utp1_nle_fixtures_pin`] reads, measured on the copy before SR729.
 const NLE6UTP1_NLE_PIN: u64 = 0xfe29_54c3_c765_08b4;
+
+// ---- NLE5DRANGEKEYS (LEDGER SR735): Shift+I / O / X bind the editor's mark words through the face's KEYS (named tail block) ----
+
+/// A key as GTK sends it and as stria-view's `--do key:<k>` token builds it (`BrowserKey` + `BrowserText` for one char).
+fn nle5drangekeys_press(face: &mut Face, k: &str) -> bool {
+    let a = face.on(&bandy::SMessage::BrowserKey(k.to_string()));
+    let b = face.on(&bandy::SMessage::BrowserText(k.to_string()));
+    a || b
+}
+
+/// Shift+I at 5 and Shift+O at 15 set the export marks through the editor's ONE `mark in` / `mark out` words (one
+/// commit each); an out key before the in mark is refused by the editor's name and leaves the marks; Shift+X (AppKit:
+/// the text alone) clears them in one commit, undone by Ctrl+z; a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle5drangekeys_shift_i_o_x_drive_the_editor_mark_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(5);
+    assert!(nle5drangekeys_press(&mut face, "I"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), None), 1));
+    face.state.seek(15);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.last_error.take()), ((Some(5), Some(15)), 2, None));
+    face.state.seek(2);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!(face.last_error.take().as_deref(), Some("mark out: the in mark is not before the out mark"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), Some(15)), 2), "a refused mark leaves the marks");
+    assert!(face.on(&bandy::SMessage::BrowserText("X".into())));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.export_range()), ((None, None), 3, None));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+z".into())));
+    assert_eq!(face.marks(), (Some(5), Some(15)), "undo restores the cleared marks");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("I".into())), "a one-char key is read from the text only");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("Shift+I".into())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle5drangekeys: I / O / refused / X / undo");
+}
+
+/// The lower-case `i` / `o` stay SR208's clip trims: the timeline is the one `EditorState::verb("mark-in" / "mark-out")`
+/// makes at the same ticks, and the export marks are untouched.
+#[test]
+fn nle5drangekeys_lower_i_o_still_trim_the_clip() {
+    let (tl, src) = synth_fixture();
+    let mut want = EditorState::new(tl.clone());
+    want.select_at(0, 12).unwrap();
+    want.seek(13);
+    assert_eq!(want.verb("mark-in"), Some(Ok(())));
+    want.seek(18);
+    assert_eq!(want.verb("mark-out"), Some(Ok(())));
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(13);
+    assert!(nle5drangekeys_press(&mut face, "i"));
+    face.state.seek(18);
+    assert!(nle5drangekeys_press(&mut face, "o"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_ne!(face.state.timeline, tl, "the trims moved the clip");
+    assert_eq!((&face.state.timeline.tracks, face.marks()), (&want.timeline.tracks, (None, None)));
+    println!("nle5drangekeys: i / o still trim");
+}
