@@ -2088,7 +2088,7 @@ pub struct ExportJob {
     /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>,
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2112,7 +2112,7 @@ impl Face {
             [d] => (Some(*d), "h264"),
             [d, f] => (Some(*d), *f),
             _ => {
-                self.last_error = Some(format!("export: usage: export [<dir>] [{}]", VIDEO_NAMES.join("|")));
+                self.last_error = Some(format!("export: usage: {}", export_usage())); // NLE5DEXPORTMESSAGEAUDIO (SR756): the one usage
                 return Some(true);
             }
         };
@@ -2142,7 +2142,7 @@ impl Face {
         self.range_check(&range)?; std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
         let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
-        let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), range.clone());
+        let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), range.clone());
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
@@ -2163,7 +2163,7 @@ impl Face {
                 export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range });
+        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2210,13 +2210,13 @@ impl Face {
         self.finish_export();
         true
     }
-    /// Join the job and put its outcome on the message line: `export: <n> frames, <bytes> bytes -> <dir>`, the cancel
+    /// Join the job and put its outcome on the message line: `export: <n> frames, <bytes> bytes, <video> + <audio> -> <dir>` (`<video>, no audio`), the cancel
     /// `export: cancelled at d/t frames; partial files left in <dir>`, or the refusal `export: <ExportError>`.
     fn finish_export(&mut self) {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes -> {}", r.frames, ticks_note(&j.range), r.bytes, j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio), j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2324,7 +2324,7 @@ fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String
         }
         (3, None) => {
             let w = args.pop().unwrap_or_default();
-            (args, Err(format!("unknown audio {w} ({})", crate::nle_export::AUDIO_NAMES.join("|"))))
+            (args, Err(format!("unknown audio {w}; the words are {}", export_usage()))) // NLE5DEXPORTMESSAGEAUDIO (SR756)
         }
         _ => (args, Ok(AudioOut::Wav)),
     }
@@ -2717,5 +2717,31 @@ impl Face {
             x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
         }
         c.px
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the words (named tail block) ----
+/// The result line's words for what was written: `<video> + <audio>` (the audio as the table spells it,
+/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`.
+fn export_words(video: &str, audio: AudioOut) -> String {
+    match audio {
+        AudioOut::None => format!("{video}, no audio"),
+        a => format!("{video} + {}", crate::nle_export::audio_word(&a)),
+    }
+}
+
+/// The `export` verb's usage, from the two tables (`VIDEO_NAMES`, `AUDIO_NAMES`; `aac` shown as `aac[:KBPS]`):
+/// `export [--all] [<dir>] [h264|png|i420|y4m|raw] [wav|aac[:KBPS]|mp4|none]`. The usage refusal and the unknown-audio
+/// refusal both name it.
+fn export_usage() -> String {
+    let audio: Vec<&str> = crate::nle_export::AUDIO_NAMES.iter().map(|w| if *w == "aac" { "aac[:KBPS]" } else { *w }).collect();
+    format!("export [--all] [<dir>] [{}] [{}]", VIDEO_NAMES.join("|"), audio.join("|"))
+}
+
+impl Face {
+    /// The running export's audio word ([`crate::nle_export::audio_word`]), `None` when no export runs (the witness's
+    /// `"audio"` field).
+    pub fn export_audio(&self) -> Option<String> {
+        self.export.as_ref().map(|j| crate::nle_export::audio_word(&j.audio))
     }
 }

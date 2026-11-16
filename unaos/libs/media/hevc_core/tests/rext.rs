@@ -955,3 +955,109 @@ fn x_decoder_profile_tier_level() {
     d.decode_annexb(&nal(33, &sps_rbsp(&SpsCfg::default()))).expect("sps");
     assert_eq!(d.profile_tier_level(), Some(Ptl { profile: "Main", tier: "main", level: (2, 0) }));
 }
+
+// ---- HEVCCONCEALSUBPELCHROMA422 (LEDGER SR758): 4:2:2 / 4:4:4 fractional concealment pinned (named tail block) ----
+
+/// SR758: one residual-free P picture NAL over the four 16x16 CTBs (initType 1): with `mvd`, CTB 0 a 2Nx2N AMVP unit (no
+/// neighbours, no TMVP: mvp 0, so mv = mvd) and CTBs 1..3 skip coding units merging it (tests/inter.rs `amvp_then_merge`,
+/// (f) above); without, four skip coding units (tests/inter.rs `skip_picture`). No chroma syntax: the format enters through
+/// the SPS and the IDR's pcm sample counts only (HEVC-TESTKIT-PBODY owes one shared copy in tests/common).
+fn conceal_p(cfg: &SliceCfg, mvd: Option<[i32; 2]>) -> Vec<u8> {
+    let mut e = CabacEnc::new(slice_header(cfg), 1, 26);
+    match mvd {
+        Some(mvd) => {
+            e.split_cu(0, false);
+            e.cu_skip(0, false);
+            e.pred_inter();
+            e.part_mode_2nx2n();
+            e.merge_flag(false);
+            e.mvd(mvd);
+            e.mvp_flag(0);
+            e.rqt_root_cbf(false);
+            for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+                e.terminate(0);
+                e.split_cu(0, false);
+                e.cu_skip(inc, true);
+                if last {
+                    break;
+                }
+            }
+        }
+        None => {
+            for (k, inc) in [0usize, 1, 1, 2].into_iter().enumerate() {
+                e.split_cu(0, false);
+                e.cu_skip(inc, true);
+                if k < 3 {
+                    e.terminate(0);
+                }
+            }
+        }
+    }
+    nal(cfg.nal_type, &e.finish().out)
+}
+
+/// SR758: HEVCCONCEALSUBPEL's (SR733) shape at chroma_format_idc `idc`: IDR0 (four pcm CTBs of the non-linear `pat`: a
+/// linear ramp's filtered 1/8 and 2/8 fractions round alike, so a wrong (SubWidthC, SubHeightC) arm could hide), P2
+/// (references POC 0 with mv (6, 2)), P4 (skip-only, references the lost POC 3, keeps POC 2 unused), P5 (references POC 2
+/// with mv (3, 1)). POC 3 is concealed from POC 2 along (6, 2) rescaled by td 2, tb 1 to (3, 1) through dpb.rs
+/// `conceal_fetch`, chroma mvC = (3 * 2 / SubWidthC, 1 * 2 / SubHeightC): (3, 2) at 4:2:2, (6, 2) at 4:4:4 (4:2:0 reads
+/// (3, 1)). P4's end refines POC 3 from P4's zero vectors (HEVCCONCEALFORWARD SR754: P4's own samples, unchanged), so
+/// P4 (the concealed picture's skip copy) equals P5, the decoder's own MC of P2 at (3, 1), on every plane, and its chroma
+/// is 8.5.3.3.3.2 at mvC on every sample (a 4:4:4 8x8 block is a full 64), not the 4:2:0 arm's (3, 1).
+fn conceal_subpel_case(idc: u32) {
+    let (sw, sh) = sub(idc);
+    let cfg = SpsCfg { width: 32, height: 32, log2_ctb: 4, log2_max_tb: 4, chroma_format_idc: idc, pcm: Some((8, 8, 3, 4, true)), ..Default::default() };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&cfg, &InterSps { max_dec_pic_buffering_minus1: 4, ..Default::default() })));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, &PpsInter::default())));
+    let (w, h) = (32 / sw, 32 / sh);
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    for k in 0..4 {
+        let (bx, by) = (k % 2, k / 2);
+        let ctb = |seed: usize, cw: usize, chh: usize| (0..cw * chh).map(|i| pat(bx * cw + i % cw, by * chh + i / cw, seed, 8)).collect::<Vec<u16>>();
+        let (cw, chh) = (16 / sw, 16 / sh);
+        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, chh), &ctb(170, cw, chh), (sw, sh));
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    s.extend(nal(19, &e.finish().out));
+    let p = |poc: u32, neg: Vec<(i32, bool)>| SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: poc, neg, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
+    s.extend(conceal_p(&p(2, vec![(-2, true)]), Some([6, 2])));
+    s.extend(conceal_p(&p(4, vec![(-1, true), (-2, false)]), None));
+    s.extend(conceal_p(&p(5, vec![(-3, true)]), Some([3, 1])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3], "idc {idc}");
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "idc {idc}");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "idc {idc}");
+    let at = |poc: i32| f.iter().find(|f| f.poc == poc).expect("frame of that POC");
+    let (p2, p4, p5) = (at(2), at(4), at(5));
+    for c in 0..3 {
+        let n = if c == 0 { 32 * 32 } else { w * h };
+        assert_eq!(samples(p4, c).len(), n, "idc {idc} plane {c}: the format's sample count");
+        assert_eq!(samples(p4, c), samples(p5, c), "idc {idc} plane {c}: the concealed picture equals the decoder's own MC of P2 at (3, 1)");
+    }
+    let mvc = [3 * 2 / sw as i32, 2 / sh as i32];
+    assert_eq!(mvc, if idc == 2 { [3, 2] } else { [6, 2] });
+    let hand = |r: &[u16], mv: [i32; 2]| {
+        (0..w * h).map(|i| ((hand_chroma(r, w as i32, h as i32, (i % w) as i32, (i / w) as i32, mv) + 32) >> 6).clamp(0, 255) as u16).collect::<Vec<u16>>()
+    };
+    for c in 1..3 {
+        let (r, got) = (samples(p2, c), samples(p4, c));
+        assert_eq!(got, hand(&r, mvc), "idc {idc} plane {c}: 8.5.3.3.3.2 at mvC {mvc:?} on every sample");
+        assert_ne!(got, hand(&r, [3, 1]), "idc {idc} plane {c}: not the 4:2:0 arm's mvC (3, 1)");
+    }
+}
+
+#[test]
+fn y_conceal_subpel_422_chroma_follows_the_vertical_full_resolution() {
+    conceal_subpel_case(2);
+}
+
+#[test]
+fn z_conceal_subpel_444_chroma_fills_every_full_block() {
+    conceal_subpel_case(3);
+}
