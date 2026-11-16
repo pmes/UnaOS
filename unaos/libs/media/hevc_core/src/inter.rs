@@ -517,8 +517,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
                     let (w1, o1, _) = explicit_weight(sh, c, 1, m.ref_idx[1], bd, high);
                     a.iter().zip(b.iter()).map(|(&p0, &p1)| (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)).collect()
                 } else {
-                    let shift2 = (15 - bd as i32).max(3);
-                    a.iter().zip(b.iter()).map(|(&p0, &p1)| (p0 + p1 + (1 << (shift2 - 1))) >> shift2).collect()
+                    a.iter().zip(b.iter()).map(|(&p0, &p1)| bi_default(p0, p1, bd)).collect()
                 }
             }
             (Some(a), None) | (None, Some(a)) => {
@@ -630,4 +629,13 @@ fn mc_block<const T: usize>(r: &Plane, xi: i32, yi: i32, fx: &[i32; T], fy: &[i3
             }
         }
     }
+}
+
+// ---- HEVCCONCEALBIDIR (LEDGER SR721): the ONE default weighted bi-prediction average (named tail block) ----
+/// HEVCCONCEALBIDIR (SR721): 8-262, the default weighted sample prediction of two 14-bit intermediates p0 / p1 at sample
+/// depth `bd`: (p0 + p1 + offset2) >> shift2, shift2 = Max(3, 15 - bitDepth) (HEVCREXTTOOLS SR345). `predict_pu`'s
+/// bi arm and dpb.rs's bi-directional concealment (`conceal_fetch`) both average through it.
+pub(crate) fn bi_default(p0: i32, p1: i32, bd: u32) -> i32 {
+    let shift2 = (15 - bd as i32).max(3);
+    (p0 + p1 + (1 << (shift2 - 1))) >> shift2
 }

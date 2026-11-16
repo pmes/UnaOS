@@ -375,7 +375,7 @@ impl Dpb {
             dst.data.copy_from_slice(&from.data);
         }
         let src_poc = s.poc;
-        let projected = self.conceal_motion(pic, src); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected });
+        let projected = self.conceal_motion(pic, src); let bidir_blocks = bidir_blocks(pic); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected, bidir_blocks });
     }
 }
 
@@ -388,6 +388,8 @@ pub struct Concealed {
     pub poc: i32,
     pub src_poc: i32,
     pub projected: bool,
+    /// HEVCCONCEALBIDIR (SR721): the 8x8 blocks projected along BOTH lists of a bi-predicted source block (averaged).
+    pub bidir_blocks: u32,
 }
 
 impl Dpb {
@@ -397,11 +399,10 @@ impl Dpb {
     /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), rounded to whole samples and fetched from S's own
     /// planes through `luma_mc` / `chroma_mc`'s zero-fraction arm (nearest-edge clamped), per 8x8 block read at its
     /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
-    /// intra block copy (ref_poc == s); predFlagL0 picks L0, else L1. A projected block's motion becomes mv' to S, so a
+    /// intra block copy (ref_poc == s); HEVCCONCEALBIDIR (SR721): each usable list projects (`project_lists`), two are averaged by
+    /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
     /// later picture's TMVP reads the projected vector. True when any block was projected.
     fn conceal_motion(&self, pic: &mut Picture, src: usize) -> bool {
-        use crate::inter::{chroma_mc, luma_mc, scale_mv};
-        use crate::picture::PuMotion;
         let s = &self.pics[src].pic;
         if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
             return false;
@@ -416,44 +417,134 @@ impl Dpb {
         for y in (0..h).step_by(8) {
             for x in (0..w).step_by(8) {
                 let m = s.motion[s.idx4(x as usize, y as usize)];
-                let l = if m.uses(0) { 0 } else { 1 };
-                if m.pred == 0 || m.ref_lt[l] || m.ref_poc[l] == s.poc {
+                let cand = project_lists(&m, s.poc, pic.poc);
+                if cand == [None, None] {
                     continue;
                 }
-                let mv = scale_mv(m.mv[l], s.poc - m.ref_poc[l], pic.poc - s.poc).map(|v| ((v + 2) >> 2) << 2);
                 let (bw, bh) = ((w - x).min(8), (h - y).min(8));
                 for c in 0..3 {
-                    let (cx, cy, cw, ch, mvc, bd) = if c == 0 {
-                        (x, y, bw, bh, mv, pic.bit_depth)
+                    let (cx, cy, cw, ch, bd) = if c == 0 {
+                        (x, y, bw, bh, pic.bit_depth)
                     } else {
-                        (x / sub_w, y / sub_h, bw / sub_w, bh / sub_h, [((mv[0] * 2 / sub_w) >> 3) << 3, ((mv[1] * 2 / sub_h) >> 3) << 3], pic.bit_depth_c)
+                        (x / sub_w, y / sub_h, bw / sub_w, bh / sub_h, pic.bit_depth_c)
                     };
                     if pic.planes[c].w == 0 || pic.planes[c].h == 0 || cw <= 0 || ch <= 0 {
                         continue;
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    if c == 0 {
-                        luma_mc(&s.planes[0], cx, cy, mvc, cw, ch, bd, &mut out);
-                    } else {
-                        chroma_mc(&s.planes[c], cx, cy, mvc, cw, ch, bd, &mut out);
-                    }
-                    let shift3 = (14 - bd as i32).max(2);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
                             let (px, py) = ((cx + i) as usize, (cy + j) as usize);
                             if px < plane.w && py < plane.h {
-                                plane.set(px, py, (out[(j * cw + i) as usize] >> shift3) as u16);
+                                plane.set(px, py, out[(j * cw + i) as usize] as u16);
                             }
                         }
                     }
                 }
-                let pm = PuMotion { pred: 1, ref_idx: [0, -1], mv: [mv, [0, 0]], ref_poc: [s.poc, 0], ref_lt: [false, false] };
+                let pm = conceal_pu(s.poc, &cand);
                 pic.fill4(x as usize, y as usize, bw as usize, bh as usize, |p, i| p.motion[i] = pm);
                 projected = true;
             }
         }
         projected
+    }
+}
+
+// ---- HEVCCONCEALBIDIR (LEDGER SR721): a bi-predicted source block projected along both lists (named tail block) ----
+/// HEVCCONCEALBIDIR (SR721): the projected vector of each list of source block motion `m` (source POC `s_poc`, lost POC
+/// `c_poc`): a list that is used, not long-term and not intra block copy (its ref_poc is not the source's) gives
+/// `scale_mv(mv, s - r, c - s)` rounded to whole samples (SR710's rule, per list); an unusable list is `None`, so a block
+/// with one unusable list projects along the other alone.
+fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Option<[i32; 2]>; 2] {
+    let mut cand = [None, None];
+    for (l, slot) in cand.iter_mut().enumerate() {
+        if m.uses(l) && !m.ref_lt[l] && m.ref_poc[l] != s_poc {
+            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc).map(|v| ((v + 2) >> 2) << 2));
+        }
+    }
+    cand
+}
+
+/// HEVCCONCEALBIDIR (SR721): the cw x ch samples of component `c` at (cx, cy) fetched from the source plane `r` along each
+/// candidate of [`project_lists`] (whole-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub`) through
+/// `luma_mc` / `chroma_mc`'s zero-fraction arm, written to `out` at sample depth: two candidates averaged by inter.rs
+/// `bi_default` (8-262), one shifted down by shift3. A block is at most 8x8 in every plane (the stack buffer).
+fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, out: &mut [i32]) {
+    let n = (cw * ch) as usize;
+    let mut second = [0i32; 64];
+    let mut got = 0;
+    for mv in cand.iter().flatten() {
+        let buf: &mut [i32] = if got == 0 { &mut out[..n] } else { &mut second[..n] };
+        if c == 0 {
+            crate::inter::luma_mc(r, cx, cy, *mv, cw, ch, bd, buf);
+        } else {
+            let mvc = [((mv[0] * 2 / sub.0) >> 3) << 3, ((mv[1] * 2 / sub.1) >> 3) << 3];
+            crate::inter::chroma_mc(r, cx, cy, mvc, cw, ch, bd, buf);
+        }
+        got += 1;
+    }
+    if got == 2 {
+        for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
+            *a = crate::inter::bi_default(*a, b, bd);
+        }
+    } else {
+        let shift3 = (14 - bd as i32).max(2);
+        for a in out[..n].iter_mut() {
+            *a >>= shift3;
+        }
+    }
+}
+
+/// HEVCCONCEALBIDIR (SR721): the motion a projected block stores: both candidates — pred 3, both vectors, both
+/// ref_poc the source — so a later TMVP reads either; one — SR710's L0-slot motion to the source.
+fn conceal_pu(s_poc: i32, cand: &[Option<[i32; 2]>; 2]) -> crate::picture::PuMotion {
+    use crate::picture::PuMotion;
+    match *cand {
+        [Some(a), Some(b)] => PuMotion { pred: 3, ref_idx: [0, 0], mv: [a, b], ref_poc: [s_poc, s_poc], ref_lt: [false, false] },
+        [Some(a), None] | [None, Some(a)] => PuMotion { pred: 1, ref_idx: [0, -1], mv: [a, [0, 0]], ref_poc: [s_poc, 0], ref_lt: [false, false] },
+        [None, None] => PuMotion::default(),
+    }
+}
+
+/// HEVCCONCEALBIDIR (SR721): the 8x8 blocks of the concealed picture `pic` whose top-left 4x4 motion is bi-predicted
+/// (pred 3: written only by [`conceal_pu`]; a generated picture starts intra everywhere).
+fn bidir_blocks(pic: &Picture) -> u32 {
+    let mut n = 0;
+    for y in (0..pic.height).step_by(8) {
+        for x in (0..pic.width).step_by(8) {
+            if pic.motion[pic.idx4(x, y)].pred == 3 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[cfg(test)]
+mod hevcconcealbidir_tests {
+    use super::project_lists;
+    use crate::picture::PuMotion;
+
+    fn bi(lt0: bool, ref1: i32) -> PuMotion {
+        PuMotion { pred: 3, ref_idx: [0, 0], mv: [[32, 16], [-64, 0]], ref_poc: [0, ref1], ref_lt: [lt0, false] }
+    }
+
+    #[test]
+    fn both_lists_project_by_their_own_poc_distance() {
+        // s 2, c 3: L0 to POC 0 (td 2, tb 1) halves (32, 16) to (16, 8); L1 to POC 4 (td -2, tb 1) negates half of (-64, 0).
+        assert_eq!(project_lists(&bi(false, 4), 2, 3), [Some([16, 8]), Some([32, 0])]);
+    }
+
+    #[test]
+    fn a_long_term_list_falls_back_to_the_other() {
+        assert_eq!(project_lists(&bi(true, 4), 2, 3), [None, Some([32, 0])]);
+    }
+
+    #[test]
+    fn an_intra_block_copy_list_falls_back_to_the_other() {
+        assert_eq!(project_lists(&bi(false, 2), 2, 3), [Some([16, 8]), None]);
     }
 }
