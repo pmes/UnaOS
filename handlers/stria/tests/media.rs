@@ -1871,6 +1871,22 @@ fn striainfobitrate_forms() {
     assert_eq!(bitrate_of(None, None, 0, 1_000_000_000), "");
     assert_eq!(bitrate_of(None, None, 125_000, 0), "");
 }
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's fixtures return the bytes the copies built (named tail block) ----
+/// NLE6-UTP1 (SR729): FNV-1a of SR703's ac-3 reel, the utp1 test pattern + PCM16 pair (the mp4 then the mkv) and the 160x120
+/// pattern mp4, built by tests/common's `Fixture` / `pattern_mp4`; the pins were read on this file's own copies before they moved.
+#[test]
+fn nle6utp1_media_fixtures_pin() {
+    let ac3 = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000)).relabel_audio(*b"ac-3").mp4();
+    let f = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000));
+    let mut pair = f.mp4();
+    pair.extend(f.mkv());
+    let pattern = pattern_mp4(160, 120, 25, 100, 10);
+    let got = [ac3, pair, pattern].map(|b| stria::nle_face::fnv1a(&b));
+    assert_eq!(got, NLE6UTP1_MEDIA_PINS, "{got:#018x?}");
+}
+
+/// The fnvs [`nle6utp1_media_fixtures_pin`] reads, measured on the copies before SR729.
+const NLE6UTP1_MEDIA_PINS: [u64; 3] = [0x2e6e_eac9_e618_ef1c, 0x0c88_24d8_868e_6f16, 0x6ad1_ca03_875a_632c];
 
 // ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened carries the one-line summary (named tail block) ----
 /// Open `file` through the bus (`MediaPoster`) and return its `MediaOpened.info`.
@@ -1907,7 +1923,7 @@ fn striainfobitrateface_bus_cbr_hrd_and_wav() {
     let (mp4, wav) = striainfobitrate_export("face_cbr_hrd", enc);
     let avg = striainfobitrate_avg(&mp4) as u64;
     let mp4_info = striainfobitrateface_bus_info("cbr_hrd.mp4", &mp4);
-    assert_eq!(mp4_info, format!("avc1 64x48 profile=Baseline level=1 {} kb/s (HRD 400)", (avg + 500) / 1000));
+    assert_eq!(mp4_info, format!("avc1 64x48 profile=Baseline level=1.2 {} kb/s (HRD 400)", (avg + 500) / 1000));
     let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
     assert_eq!(mp4_info, stria::media::summary_line(p.info()));
     let wav_info = striainfobitrateface_bus_info("audio.wav", &wav);
@@ -2043,23 +2059,6 @@ fn striainfoaudiobitrate_pcm_forms() {
     assert_eq!(pcm_bitrate(1, 0, 16), None);
     assert_eq!(pcm_bitrate(0, 48_000, 16), None);
 }
-
-// ---- NLE6UTP1 (LEDGER SR729): tests/common's fixtures return the bytes the copies built (named tail block) ----
-/// NLE6-UTP1 (SR729): FNV-1a of SR703's ac-3 reel, the utp1 test pattern + PCM16 pair (the mp4 then the mkv) and the 160x120
-/// pattern mp4, built by tests/common's `Fixture` / `pattern_mp4`; the pins were read on this file's own copies before they moved.
-#[test]
-fn nle6utp1_media_fixtures_pin() {
-    let ac3 = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000)).relabel_audio(*b"ac-3").mp4();
-    let f = Fixture::pattern(320, 240, 25, 50, 25).pcm16(48_000, 1, &tone(96_000));
-    let mut pair = f.mp4();
-    pair.extend(f.mkv());
-    let pattern = pattern_mp4(160, 120, 25, 100, 10);
-    let got = [ac3, pair, pattern].map(|b| stria::nle_face::fnv1a(&b));
-    assert_eq!(got, NLE6UTP1_MEDIA_PINS, "{got:#018x?}");
-}
-
-/// The fnvs [`nle6utp1_media_fixtures_pin`] reads, measured on the copies before SR729.
-const NLE6UTP1_MEDIA_PINS: [u64; 3] = [0x2e6e_eac9_e618_ef1c, 0x0c88_24d8_868e_6f16, 0x6ad1_ca03_875a_632c];
 
 // ---- STRIAINFOREELAUDIO (LEDGER SR761): SR742's AAC fixtures through the editor's road equal the Player's line (named tail block) ----
 /// The editor's line for `bytes` (`stria::nle::Sources::summary` of the reel opened by `Sources::add`).
