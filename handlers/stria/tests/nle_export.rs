@@ -794,7 +794,7 @@ fn nle5dclitable_h264_table_is_the_cli_chain() {
         let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = *s;
         let chain = nle5dclitable_fnv(Box::new(nle5dclitable_chain(*s, stats.clone())), &refr.frames);
         assert_eq!(chain, NLE5DCLITABLE_BEFORE[i], "set {i}: the old match's stream, pinned before SR718");
-        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()) };
+        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint: None, hrd, two_pass_stats: two_pass.then(|| stats.clone()) };
         let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
         assert_eq!(table, chain, "set {i}: the table is the CLI's chain");
     }

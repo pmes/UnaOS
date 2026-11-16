@@ -192,6 +192,11 @@ pub struct Config {
     /// a pic_timing SEI on every picture and (CBR) filler NAL units where the bucket would underflow; unread under CRF / constant QP.
     /// The rule is the file tail's H264ENCHRD block.
     pub hrd: bool,
+    /// H264ENCSCENECUTKEYINTMIN (LEDGER SR757): x264's --min-keyint for [`Config::scenecut`]: inside it a cut must have inter >
+    /// intra, past it the [`scenecut_bias`] ramp runs from k / 4 to k at `gop`. None (the default) = `gop / 4`, SR680's, every
+    /// pinned byte; Some(n) clamped to 1..=gop / 2 + 1 as x264's validate_parameters clamps. Read through [`Config::min_keyint()`];
+    /// unread without `scenecut`.
+    pub min_keyint: Option<u32>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -1393,8 +1398,8 @@ impl Encoder {
     /// SR680's threshold of a picture at `display` with these costs: (fired, the un-guarded inter x 100 > (100 - kk) x intra, kk the
     /// [`scenecut_bias`] ramp (H264ENCSCENECUTBIAS SR740); test, inter > intra within min_keyint = gop / 4 of the last IDR, else fired).
     fn scene_thresholds(&self, inter: u64, intra: u64, display: u64, k: u64) -> (bool, bool) {
-        let since = display - self.idr_display; let fired = inter * 100 > (100 - scenecut_bias(k, since, self.cfg.gop)) * intra;
-        (fired, if since < (self.cfg.gop / 4) as u64 { inter > intra } else { fired })
+        let since = display - self.idr_display; let fired = inter * 100 > (100 - scenecut_bias(k, since, self.cfg.gop, self.cfg.min_keyint())) * intra;
+        (fired, if since < self.cfg.min_keyint() as u64 { inter > intra } else { fired })
     }
 }
 
@@ -1407,12 +1412,31 @@ impl Encoder {
 // both values stay SR680's: the bias is the full k (`fired`, which SR709's fade rule reads) beside the inter > intra test.
 
 /// The scene-cut bias in percent of intra for threshold `k` (percent), `since` pictures past the last IDR, GOP length `gop`:
-/// k below gop / 4 (SR680's un-guarded k: SR709's fade rule reads it there, beside the caller's inter > intra floor), then k / 4
-/// at gop / 4 rising linearly to k at gop, k at or after gop (gop 0 included). Integer, one division.
-pub fn scenecut_bias(k: u64, since: u64, gop: u32) -> u64 {
-    let (m, g) = ((gop / 4) as u64, gop as u64);
+/// k below `m` (the caller's [`Config::min_keyint()`]; SR680's un-guarded k: SR709's fade rule reads it there, beside the caller's inter > intra floor), then k / 4
+/// at `m` rising linearly to k at gop, k at or after gop (gop 0 included; m past gop is k throughout). Integer, one division.
+pub fn scenecut_bias(k: u64, since: u64, gop: u32, m: u32) -> u64 {
+    let (m, g) = (m as u64, gop as u64);
     if since >= g || since < m {
         return k;
     }
     k * ((g - m) + 3 * (since - m)) / (4 * (g - m))
+}
+
+// ---- H264ENCSCENECUTKEYINTMIN (LEDGER SR757): x264's min keyint as a Config knob (named tail block) ----
+// x264 common/base.c `i_keyint_min = X264_KEYINT_MIN_AUTO`; encoder/encoder.c validate_parameters: AUTO = min(keyint_max / 10,
+// fps), then clip3(i_keyint_min, 1, keyint_max / 2 + 1). Ours keeps SR680's gop / 4 when unset (its pins, and SR709 / SR732 /
+// SR740's); a set value takes x264's clamp. Owed: H264ENC-SCENECUT-KEYINT-MIN-X264-DEFAULT (x264's formula as the default).
+impl Config {
+    /// x264's automatic min keyint is min(gop / X264_MIN_KEYINT_DIV, fps) (then clamped): `min_keyint: Some(gop / 10)` asks
+    /// for it. Not the default here (SR680's pins).
+    pub const X264_MIN_KEYINT_DIV: u32 = 10;
+
+    /// THE min keyint of the scene-cut rule (the `min_keyint` field): None = gop / 4; Some(n) = n clamped to
+    /// 1..=gop / 2 + 1 (x264's clamp; gop / 2 + 1 >= 1, so the clamp is well formed for every gop).
+    pub fn min_keyint(&self) -> u32 {
+        match self.min_keyint {
+            None => self.gop / 4,
+            Some(n) => n.clamp(1, self.gop / 2 + 1),
+        }
+    }
 }
