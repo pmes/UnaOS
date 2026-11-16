@@ -519,7 +519,7 @@ mod tests {
 // bisection so the predicted total meets the target. In the second pass [`RcMode::TwoPass`] keeps the CBR bucket: `Rc::picture`'s
 // QP line hands its choice to `pass2_pick`, which starts the picture at its planned QP moved by the remaining budget against the
 // remaining plan, then raises it while the type's model predicts more than the bucket's room; `row_qp` corrects the rows. Owed:
-// H264ENC-TWOPASS-FILE (BUILT by SR719, the H264ENCTWOPASSFILE tail block), H264ENC-TWOPASS-QCOMP, H264ENC-TWOPASS-KERNEL, H264ENC-TWOPASS-BLUR.
+// H264ENC-TWOPASS-FILE (BUILT by SR719, the H264ENCTWOPASSFILE tail block), H264ENC-TWOPASS-QCOMP and H264ENC-TWOPASS-BLUR (BUILT by SR736, the H264ENCTWOPASSBLUR tail block), H264ENC-TWOPASS-KERNEL.
 
 /// One coded picture as the first pass saw it (H264ENCTWOPASS SR698): its type, its access unit's bits (every NAL unit), its
 /// SliceQPY and its complexity bits x [`step16`]`(qp)`.
@@ -531,7 +531,7 @@ pub struct PicStat {
     pub complexity: u64,
 }
 
-/// x264's qcomp 0.6 as a fraction (3, 5): an anchor's qscale goes as complexity^(1 - 3/5). The knob is owed (H264ENC-TWOPASS-QCOMP).
+/// x264's qcomp 0.6 as a fraction (3, 5): an anchor's qscale goes as complexity^(1 - 3/5). The knob is [`Pass2Opts::qcomp`] (SR736), this its default.
 pub const QCOMP: (i64, i64) = (3, 5);
 /// An I picture's planned QP below its P neighbour's: x264's ip_factor 1.4 (6 x log2 1.4 = 2.9).
 pub const IP_QP_OFFSET: i32 = 3;
@@ -553,40 +553,24 @@ pub fn log2_q16(e: u64) -> i64 {
     r
 }
 
-/// The QP of a picture whose anchor complexity has log2 `l` (Q16) at scale log2 `s` (Q16), `off` below, clamped `floor..=51`:
-/// log2 step16(q) = 4 + (q - 4) / 6, so q = 6 (s + (1 - qcomp) l) - 20.
-fn plan_qp(s: i64, l: i64, off: i32, floor: i32) -> i32 {
-    let q16 = 6 * s + 6 * l * (QCOMP.1 - QCOMP.0) / QCOMP.1 - (20 << 16);
+/// The QP of a picture whose planned QP is `q16` (Q16, [`plan_q16`]), `off` below, rounded and clamped `floor..=51`.
+fn plan_qp(q16: i64, off: i32, floor: i32) -> i32 {
     ((q16 + (1 << 15)) >> 16).saturating_sub(off as i64).clamp(floor as i64, QP_MAX as i64) as i32
 }
 
 /// The planned QP of every picture of a first pass (H264ENCTWOPASS SR698, x264's `init_pass2`) for `target_bits` over them all,
 /// each within `floor..=51`: the smallest scale whose predicted total (sum of complexity / step16(qp)) is at most the target.
-pub fn pass2_qps(stats: &[PicStat], target_bits: u64, floor: i32) -> Vec<i32> {
+pub fn pass2_qps(stats: &[PicStat], target_bits: u64, floor: i32, opts: &Pass2Opts) -> Vec<i32> {
+    let blurred = blur_complexity(stats, opts.cplxblur);
     let logs: Vec<i64> = stats
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let a = if p.kind == Pic::Idr { stats[i + 1..].iter().chain(stats[..i].iter().rev()).find(|q| q.kind == Pic::P).unwrap_or(p) } else { p };
-            log2_q16(a.complexity)
+            let a = if p.kind == Pic::Idr && !opts.i_from_gop { (i + 1..stats.len()).chain((0..i).rev()).find(|&j| stats[j].kind == Pic::P).unwrap_or(i) } else { i };
+            log2_q16(blurred[a])
         })
         .collect();
-    let at = |s: i64| -> Vec<i32> {
-        let mut out = Vec::with_capacity(stats.len());
-        let mut anchor: Option<i32> = None;
-        for (i, p) in stats.iter().enumerate() {
-            let q = match (p.kind, anchor) {
-                (Pic::B, Some(a)) => (a + B_QP_OFFSET).clamp(floor, QP_MAX),
-                (Pic::Idr, _) => plan_qp(s, logs[i], IP_QP_OFFSET, floor),
-                _ => plan_qp(s, logs[i], 0, floor),
-            };
-            if p.kind != Pic::B {
-                anchor = Some(q);
-            }
-            out.push(q);
-        }
-        out
-    };
+    let at = |s: i64| -> Vec<i32> { pass2_at(stats, &logs, s, floor, opts) };
     let total = |q: &[i32]| -> u128 { stats.iter().zip(q).map(|(p, &q)| p.complexity as u128 / step16(q) as u128).sum() };
     let (mut lo, mut hi) = (-(64i64 << 16), 64i64 << 16);
     if total(&at(lo)) <= target_bits as u128 {
@@ -657,17 +641,8 @@ impl Encoder {
     /// H264ENCTWOPASS (SR698): plan the second pass from a first pass's `stats` (the same frames, the same picture types in coding
     /// order). An empty slice returns the encoder unchanged; a plan needs [`RcMode::TwoPass`] (else [`Error::Rate`]). The target is
     /// `bits_per_second` x pictures x fps_den / fps_num.
-    pub fn planned(mut self, stats: &[PicStat]) -> Result<Encoder> {
-        if stats.is_empty() {
-            return Ok(self);
-        }
-        let Some(rc) = self.rc.as_mut().filter(|rc| rc.rate.mode == RcMode::TwoPass) else { return Err(Error::Rate) };
-        let rate = rc.rate;
-        let total = (rate.bits_per_second as u128 * stats.len() as u128 * rate.fps_den as u128 / rate.fps_num as u128) as u64;
-        let qps = pass2_qps(stats, total, rc.floor);
-        let bits = stats.iter().zip(&qps).map(|(p, &q)| p.complexity / step16(q)).collect();
-        rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64 });
-        Ok(self)
+    pub fn planned(self, stats: &[PicStat]) -> Result<Encoder> {
+        self.planned_with(stats, &Pass2Opts::default()) // H264ENCTWOPASSBLUR (SR736): x264's default blurs and I rule
     }
 
     /// H264ENCTWOPASS (SR698): one record per coded picture, in coding order, under every rate mode.
@@ -894,4 +869,186 @@ pub fn rescale_stats(stats: &[PicStat], n: usize) -> Vec<PicStat> {
             PicStat { kind: c.kind, bits, qp: c.qp, complexity: bits * step16(c.qp) }
         })
         .collect()
+}
+
+// ---- H264ENCTWOPASSBLUR (LEDGER SR736): x264's complexity blur, qblur and GOP-mean I rule, the qcomp knob (named tail block) ----
+// x264's `init_pass2` (encoder/ratecontrol.c) in the plan's integers, inside [`pass2_qps`]: each picture's complexity is first
+// BLURRED ([`blur_complexity`]: a fixed gaussian exp(-j^2/200) over 2 x cplxblur pictures each side, the walk cut at an IDR), its
+// anchor QP planned from the blurred value at qscale ~ complexity^(1 - qcomp) ([`Pass2Opts::qcomp`], the knob), an I picture given
+// the mean planned QP of the P pictures that follow it up to the next I less [`IP_QP_OFFSET`] (`get_diff_limited_q`, run backward;
+// its own when none follows), then the anchors' QP curve blurred over same-type neighbours ([`blur_qscale`], qblur), rounded and
+// clamped; a B picture its anchor's + `B_QP_OFFSET` as SR698. The bisection and the predicted total (each picture's OWN complexity /
+// step16) are SR698's. Departures, named: the intra mask is the kind (an IDR is all intra, a P / B none: PicStat carries no intra
+// macroblock count), and qblur averages the Q16 QP (log qscale) where x264 averages the linear qscale. [`Pass2Opts`] with cplxblur 0,
+// qblur 0 and `i_from_gop` false plans SR698's exact QPs. Owed: H264ENC-TWOPASS-BLUR-INTRA, H264ENC-TWOPASS-QBLUR-LINEAR,
+// H264ENC-TWOPASS-QPSTEP, H264ENC-TWOPASS-BLUR-RATETOL, H264ENC-TWOPASS-QCOMP-CLI, H264ENC-TWOPASS-BLUR-RUNTIME.
+
+/// The options of a second pass's plan (H264ENCTWOPASSBLUR SR736); Default = x264's (qcomp 0.6, cplxblur 20, qblur 0.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pass2Opts {
+    /// x264's qcompress as (num, den), 0 <= num <= den, den > 0: an anchor's qscale ~ complexity^(1 - num / den); (1, 1) one QP
+    /// for every P picture (constant-QP-like), (0, 1) qscale ~ complexity (equal bits per picture).
+    pub qcomp: (i64, i64),
+    /// x264's cplxblur in pictures: the complexity gaussian's window, 2 x cplxblur each side; 0 = each picture's own.
+    pub cplxblur: u32,
+    /// x264's qblur in Q8 (128 = 0.5): the QP curve's gaussian exp(-d^2 / qblur^2) over (qblur x 4) | 1 pictures; below 64, none.
+    pub qblur_q8: u32,
+    /// x264's I rule (the mean planned QP of the P pictures after it up to the next I, less [`IP_QP_OFFSET`]); false = SR698's
+    /// (its next P's complexity, else its previous P's, less [`IP_QP_OFFSET`]).
+    pub i_from_gop: bool,
+}
+
+impl Default for Pass2Opts {
+    fn default() -> Pass2Opts {
+        Pass2Opts { qcomp: QCOMP, cplxblur: 20, qblur_q8: 128, i_from_gop: true }
+    }
+}
+
+impl Pass2Opts {
+    /// The qcomp fraction is within 0..=1 with a positive denominator.
+    pub fn valid(&self) -> bool {
+        self.qcomp.1 > 0 && (0..=self.qcomp.1).contains(&self.qcomp.0)
+    }
+}
+
+/// e^-k x 2^32, k = 0..=11 (e^-12 x 65536 < 0.5).
+const E_NEG_Q32: [u64; 12] = [4294967296, 1580030169, 581260615, 213833830, 78665070, 28939262, 10646160, 3916503, 1440801, 530041, 194991, 71733];
+
+/// round(65536 x e^-t) for t = `t_q16` / 65536, in integers: e^-k from [`E_NEG_Q32`] for the integer part, e^-f by its Taylor series
+/// in Q32 for the fraction. The ONE exponential of both blurs.
+pub fn exp_neg_q16(t_q16: u64) -> u64 {
+    let k = (t_q16 >> 16) as usize;
+    if k >= E_NEG_Q32.len() {
+        return 0;
+    }
+    let f = (t_q16 & 0xffff) as i128;
+    let (mut term, mut sum) = (1i128 << 32, 1i128 << 32);
+    for n in 1..16i128 {
+        term = -((term * f) >> 16) / n;
+        sum += term;
+    }
+    let q32 = (E_NEG_Q32[k] as u128 * sum.max(0) as u128) >> 32;
+    ((q32 + (1 << 15)) >> 16) as u64
+}
+
+/// Each picture's complexity blurred as x264's `init_pass2` blurs it (H264ENCTWOPASSBLUR SR736): the weighted mean, weights
+/// exp(-j^2/200) in Q16, of the pictures j = 1 .. < 2 x `cplxblur` after it (stopping before the next IDR) and j = 0 ..= 2 x
+/// `cplxblur` before it (the previous IDR included, then stopping). `cplxblur` 0 returns each picture's own complexity.
+pub fn blur_complexity(stats: &[PicStat], cplxblur: u32) -> Vec<u64> {
+    let n = stats.len();
+    let w = 2 * cplxblur as usize;
+    let g = |j: usize| exp_neg_q16(((j as u64 * j as u64) << 16) / 200) as u128;
+    (0..n)
+        .map(|i| {
+            let (mut ws, mut cs) = (0u128, 0u128);
+            for j in 1..w.min(n - i) {
+                if stats[i + j].kind == Pic::Idr {
+                    break;
+                }
+                ws += g(j);
+                cs += g(j) * stats[i + j].complexity as u128;
+            }
+            for j in 0..=w.min(i) {
+                ws += g(j);
+                cs += g(j) * stats[i - j].complexity as u128;
+                if stats[i - j].kind == Pic::Idr {
+                    break;
+                }
+            }
+            (cs / ws.max(1)) as u64
+        })
+        .collect()
+}
+
+/// The anchors' planned QPs `q16` (Q16) blurred as x264 blurs qscale (H264ENCTWOPASSBLUR SR736): over the (qblur x 4) | 1 pictures
+/// centred on each, same kind only, weights exp(-d^2 / qblur^2) with qblur = `qblur_q8` / 256, floor of the weighted mean. B
+/// entries are returned unchanged (a B follows its anchor); a window of one picture (`qblur_q8` < 64) returns `q16` unchanged.
+pub fn blur_qscale(q16: &[i64], kinds: &[Pic], qblur_q8: u32) -> Vec<i64> {
+    let half = ((((qblur_q8 as u64 * 4) >> 8) | 1) / 2) as usize;
+    if half == 0 || q16.is_empty() {
+        return q16.to_vec();
+    }
+    let qq = qblur_q8 as u128 * qblur_q8 as u128;
+    (0..q16.len())
+        .map(|i| {
+            if kinds[i] == Pic::B {
+                return q16[i];
+            }
+            let (mut num, mut den) = (0i128, 0i128);
+            for idx in i.saturating_sub(half)..=(i + half).min(q16.len() - 1) {
+                if kinds[idx] != kinds[i] {
+                    continue;
+                }
+                let d = idx.abs_diff(i) as u128;
+                let c = exp_neg_q16((((d * d) << 32) / qq).min(u64::MAX as u128) as u64) as i128;
+                num += c * q16[idx] as i128;
+                den += c;
+            }
+            num.div_euclid(den.max(1)) as i64
+        })
+        .collect()
+}
+
+/// The planned QP (Q16, unrounded) of a picture whose anchor complexity has log2 `l` (Q16) at scale log2 `s` (Q16):
+/// log2 step16(q) = 4 + (q - 4) / 6, so q = 6 (s + (1 - qcomp) l) - 20.
+fn plan_q16(s: i64, l: i64, qcomp: (i64, i64)) -> i64 {
+    6 * s + 6 * l * (qcomp.1 - qcomp.0) / qcomp.1 - (20 << 16)
+}
+
+/// [`pass2_qps`]'s plan at scale `s` (H264ENCTWOPASSBLUR SR736): every anchor's Q16 QP from its (blurred) log complexity, the I
+/// rule, [`blur_qscale`], then rounded and clamped `floor..=51`; a B its previous anchor's QP + `B_QP_OFFSET`.
+fn pass2_at(stats: &[PicStat], logs: &[i64], s: i64, floor: i32, opts: &Pass2Opts) -> Vec<i32> {
+    let n = stats.len();
+    let kinds: Vec<Pic> = stats.iter().map(|p| p.kind).collect();
+    let mut q16: Vec<i64> = logs.iter().map(|&l| plan_q16(s, l, opts.qcomp)).collect();
+    let mut off = alloc::vec![0i32; n];
+    for i in 0..n {
+        if kinds[i] != Pic::Idr {
+            continue;
+        }
+        off[i] = IP_QP_OFFSET;
+        if opts.i_from_gop {
+            let ps: Vec<i64> = (i + 1..n).take_while(|&j| kinds[j] != Pic::Idr).filter(|&j| kinds[j] == Pic::P).map(|j| q16[j]).collect();
+            if ps.is_empty() {
+                off[i] = 0;
+            } else {
+                q16[i] = ps.iter().sum::<i64>().div_euclid(ps.len() as i64);
+            }
+        }
+    }
+    let q16 = blur_qscale(&q16, &kinds, opts.qblur_q8);
+    let mut out = Vec::with_capacity(n);
+    let mut anchor: Option<i32> = None;
+    for i in 0..n {
+        let q = match (kinds[i], anchor) {
+            (Pic::B, Some(a)) => (a + B_QP_OFFSET).clamp(floor, QP_MAX),
+            _ => plan_qp(q16[i], off[i], floor),
+        };
+        if kinds[i] != Pic::B {
+            anchor = Some(q);
+        }
+        out.push(q);
+    }
+    out
+}
+
+impl Encoder {
+    /// H264ENCTWOPASSBLUR (SR736): [`Encoder::planned`] with the plan's options. An empty slice returns the encoder unchanged; a
+    /// plan needs [`RcMode::TwoPass`] and valid `opts` ([`Pass2Opts::valid`]), else [`Error::Rate`]. The target is
+    /// `bits_per_second` x pictures x fps_den / fps_num.
+    pub fn planned_with(mut self, stats: &[PicStat], opts: &Pass2Opts) -> Result<Encoder> {
+        if stats.is_empty() {
+            return Ok(self);
+        }
+        let Some(rc) = self.rc.as_mut().filter(|rc| rc.rate.mode == RcMode::TwoPass) else { return Err(Error::Rate) };
+        if !opts.valid() {
+            return Err(Error::Rate);
+        }
+        let rate = rc.rate;
+        let total = (rate.bits_per_second as u128 * stats.len() as u128 * rate.fps_den as u128 / rate.fps_num as u128) as u64;
+        let qps = pass2_qps(stats, total, rc.floor, opts);
+        let bits = stats.iter().zip(&qps).map(|(p, &q)| p.complexity / step16(q)).collect();
+        rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64 });
+        Ok(self)
+    }
 }

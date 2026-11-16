@@ -41,11 +41,13 @@ pub struct RgbaEncoder {
     enc: Option<Encoder>,
     /// H264ENCTWOPASS (LEDGER SR698): the first pass's records the encoder is planned from (empty: no plan).
     two_pass: Vec<crate::rc::PicStat>,
+    /// H264ENCTWOPASSBLUR (LEDGER SR736): the plan's options (`Encoder::planned_with`; Default = x264's).
+    pass2: crate::rc::Pass2Opts,
 }
 
 impl RgbaEncoder {
     pub fn new(cfg: Config) -> RgbaEncoder {
-        RgbaEncoder { cfg, enc: None, two_pass: Vec::new() }
+        RgbaEncoder { cfg, enc: None, two_pass: Vec::new(), pass2: Default::default() }
     }
 
     /// The encoder has been built (a first frame was pushed).
@@ -67,7 +69,7 @@ impl RgbaEncoder {
     /// THE planar entry (H264ENCPLANES B973): one 8-bit 4:2:0 picture, the encoder built from its size at the first frame.
     pub fn push_planes(&mut self, f: &Yuv420) -> Result<Vec<Unit>> {
         if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width: f.width, height: f.height, ..self.cfg })?.planned(&self.two_pass)?);
+            self.enc = Some(Encoder::new(Config { width: f.width, height: f.height, ..self.cfg })?.planned_with(&self.two_pass, &self.pass2)?);
         }
         let Some(enc) = self.enc.as_mut() else { return Ok(Vec::new()) };
         Ok(enc.push(f)?.into_iter().map(Unit::of).collect())
@@ -99,6 +101,16 @@ impl RgbaEncoder {
     /// The encoder's record per coded picture (`Encoder::stats`); empty before the first frame.
     pub fn stats(&self) -> &[crate::rc::PicStat] {
         self.enc.as_ref().map_or(&[][..], |e| e.stats())
+    }
+}
+
+// ---- H264ENCTWOPASSBLUR (LEDGER SR736): the plan's options in (named tail block) ----
+impl RgbaEncoder {
+    /// The options the first pass's records are planned with when the encoder is built (`Encoder::planned_with`: qcomp, the
+    /// complexity and QP blurs, the I rule); without this, x264's defaults (`Pass2Opts::default()`).
+    pub fn with_pass2_opts(mut self, opts: crate::rc::Pass2Opts) -> RgbaEncoder {
+        self.pass2 = opts;
+        self
     }
 }
 
