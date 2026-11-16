@@ -36,6 +36,7 @@
 //! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 //! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
+//! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>}` after the other fields (the default line unchanged).
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -250,9 +251,9 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face);
-    let presses = presses_json(c, &presses);
+    let presses = presses_json(c, &presses); let export = export_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail)
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -510,6 +511,7 @@ fn transport() -> TetraNode {
         button("lift", "Lift"),
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
         button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
+        button("export", "Export"), // NLEFACEEXPORT (SR694): exports beside the document (`<stem>-export/`, H.264), off the face's thread
     ])
 }
 
@@ -603,4 +605,10 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
             face
         }
     }
+}
+
+// ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
+/// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
+fn export_json(face: &Face) -> String {
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t}}}")).unwrap_or_default()
 }

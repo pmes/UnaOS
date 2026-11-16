@@ -1715,3 +1715,118 @@ fn vp9inbandswitch_player_repicks_and_reports_size() {
     assert!(size[0].contains("8x8->6x4"), "{}", size[0]);
     println!("vp9inbandswitch: {} ; {} ; {}", colour[0], colour[1], size[0]);
 }
+
+// ---- NLESTANDINAUDIO (LEDGER SR703): an audio track whose decoder is missing or refuses plays the silent stand-in ----
+/// A resonance feed that also records every stereo sample the device accepted.
+struct NlestandinFeed(Arc<Mutex<resonance::StreamFeed>>, Arc<Mutex<Vec<f32>>>);
+impl AudioOut for NlestandinFeed {
+    fn push(&mut self, stereo: &[f32]) -> usize {
+        let n = self.0.lock().unwrap().push(stereo);
+        self.1.lock().unwrap().extend_from_slice(&stereo[..n]);
+        n
+    }
+    fn consumed(&self) -> u64 {
+        self.0.lock().unwrap().consumed()
+    }
+    fn flush(&mut self) {
+        self.0.lock().unwrap().flush()
+    }
+    fn set_paused(&mut self, paused: bool) {
+        self.0.lock().unwrap().set_paused(paused)
+    }
+}
+
+/// Play `file` to its end at 60 Hz through a 48 kHz resonance graph pulled 800 frames per refresh (the utp1 device);
+/// returns the frames shown (ordinal, pts, counter, clock at present) and the stereo the device accepted.
+fn nlestandinaudio_play(p: &mut Player, time: &ManualTime, graph: &mut AudioGraph, pushed: &Arc<Mutex<Vec<f32>>>) -> (Rec, Vec<f32>) {
+    p.play();
+    let mut rec = Rec::default();
+    let mut owed = 0usize;
+    let mut ended = false;
+    for _ in 0..400 {
+        let clock = p.clock_ns();
+        if p.tick(&mut RecSink { rec: &mut rec, clock }) == Tick::Ended {
+            ended = true;
+            break;
+        }
+        time.advance(16_666_667);
+        owed += 800;
+        while owed >= BLOCK_SIZE {
+            graph.process_stereo();
+            owed -= BLOCK_SIZE;
+        }
+    }
+    assert!(ended);
+    let out = pushed.lock().unwrap().clone();
+    (rec, out)
+}
+
+fn nlestandinaudio_open(file: Vec<u8>, time: &ManualTime) -> (Player, AudioGraph, Arc<Mutex<Vec<f32>>>) {
+    let (src, feed) = stream_pair_channels(48_000, 2, 24_000);
+    let mut graph = AudioGraph::new(48_000.0);
+    graph.add_node(Box::new(src));
+    let pushed = Arc::new(Mutex::new(Vec::new()));
+    let p = Player::open(file, Arc::new(time.clone()), Some(Box::new(NlestandinFeed(Arc::new(Mutex::new(feed)), pushed.clone()))), 60).unwrap();
+    (p, graph, pushed)
+}
+
+/// Rule: an audio track no decoder takes (an `ac-3` sample entry: its rate and channels read, `Codec::Other`) beside a video
+/// track opens on the stand-in: `audio_decoder` "stand-in", the audio clock kept, every frame presented on it, the device fed
+/// zeros for the track's whole length; one `swapped to stand-in` line. With no video track the open still fails.
+#[test]
+fn nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in() {
+    capture_logs();
+    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
+    let mut audio = build::pcm16_track(2, 48_000, 1, &tone(96_000), 960);
+    audio.spec.fourcc = *b"ac-3";
+    let file = build::mp4(&[video, audio.clone()], &Mp4Options::default());
+    let time = ManualTime::new();
+    let (mut p, mut graph, pushed) = nlestandinaudio_open(file, &time);
+    assert_eq!(p.info().audio_decoder, "stand-in", "{:?}", p.info());
+    assert!(p.info().audio_clock, "{:?}", p.info());
+    assert_eq!((p.info().sample_rate, p.info().channels), (48_000, 1));
+    let (rec, out) = nlestandinaudio_play(&mut p, &time, &mut graph, &pushed);
+    assert_eq!(rec.shown.len(), 50);
+    for (i, &(ord, pts, n, clock)) in rec.shown.iter().enumerate() {
+        assert_eq!((ord, n as u64, pts), (i as u64, i as u64, i as i64 * 40_000_000));
+        assert!((pts - clock).abs() <= 8_333_334, "frame {i}: pts {pts} clock {clock}");
+    }
+    assert_eq!(out.len(), 96_000 * 2, "the stand-in covers the track");
+    assert!(out.iter().all(|&x| x == 0.0));
+    let lines = my_log_lines("[STRIA] :: audio decode:");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("[STRIA] :: audio decode: swapped to stand-in: no decoder: ") && lines[0].contains("ac-3"), "{}", lines[0]);
+    let alone = build::mp4(&[audio], &Mp4Options::default());
+    assert!(Player::open(alone, Arc::new(ManualTime::new()), None, 60).is_err(), "a pure-audio stream with no decoder has nothing to play");
+    println!("nlestandinaudio: {} | frames={} samples={}", lines[0], rec.shown.len(), out.len() / 2);
+}
+
+/// Rule: a decoder that refuses one packet mid-stream (PCM: a packet that is not whole frames) hands that packet's interval
+/// to the silent stand-in and takes the next keyframe packet back: the device plays the source with exactly that interval
+/// zeroed, no sample shifted, and the two swap lines are the only audio-decode lines.
+#[test]
+fn nlestandinaudio_refused_packet_plays_silence_then_swaps_back() {
+    capture_logs();
+    let video = build::test_pattern_track(1, 320, 240, 25, 25, 25);
+    let pcm = tone(48_000);
+    let mut audio = build::pcm16_track(2, 48_000, 1, &pcm, 960);
+    audio.samples[10].data.pop();
+    let file = build::mp4(&[video, audio], &Mp4Options::default());
+    let time = ManualTime::new();
+    let (mut p, mut graph, pushed) = nlestandinaudio_open(file, &time);
+    assert_eq!(p.info().audio_decoder, "pcm");
+    let (rec, out) = nlestandinaudio_play(&mut p, &time, &mut graph, &pushed);
+    assert_eq!(rec.shown.len(), 25);
+    let mut want: Vec<f32> = pcm.iter().map(|&x| x as f32 / 32768.0).collect();
+    want[9_600..10_560].iter_mut().for_each(|x| *x = 0.0);
+    let got: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
+    assert_eq!(got.len(), want.len());
+    let bad = got.iter().zip(&want).position(|(g, w)| (g - w).abs() > 1e-6);
+    assert_eq!(bad, None, "first differing frame");
+    let lines = my_log_lines("[STRIA] :: audio decode:");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("[STRIA] :: audio decode: swapped to stand-in: corrupt bitstream: PCM packet of 1919 bytes"), "{}", lines[0]);
+    assert_eq!(lines[1], "[STRIA] :: audio decode: swapped back at 220000000");
+    assert_eq!(p.info().audio_decoder, "pcm");
+    println!("nlestandinaudio: {} ; {}", lines[0], lines[1]);
+}
