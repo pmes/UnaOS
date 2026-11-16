@@ -310,3 +310,53 @@ fn rtl_column_starts_narrow_blocks_at_the_right() {
     )]);
     assert_eq!(offset(&doc), 200.0, "dir=rtl inherited by the centred column");
 }
+
+// ---- AETHERRTLBLOCKSTART (LEDGER SR711): an rtl column with no / start text-align starts its narrow blocks at the right (named tail block) ----
+
+/// AETHERRTLBLOCKSTART (SR711, AETHER-RTL-BLOCK-START): with no text-align, or `text-align: start`, an rtl column puts a
+/// definite-width block at its inline start, the RIGHT edge (CSS 2.2 §10.3.3). `text-align: left` and `align=left` share
+/// code 4 and stay at the physical left (AETHER-RTL-BLOCK-LEFT owed); the column's direction decides, never the child's;
+/// a restyle to `direction: ltr` undoes the rule's align-self through SR686's `rule_align` (the block is back at 0).
+#[test]
+fn rtl_column_starts_narrow_blocks_with_no_align() {
+    use layout_core::taffy::style::AlignSelf;
+    let col = |col_attrs: &[(&'static str, &str)], kid_attrs: &[(&'static str, &str)]| {
+        let mut ca: Vec<(&'static str, &str)> = vec![("id", "col")];
+        ca.extend_from_slice(col_attrs);
+        let mut ka: Vec<(&'static str, &str)> = vec![("id", "n"), ("style", "width: 100px")];
+        ka.extend_from_slice(kid_attrs);
+        page(vec![el("div", &ca, vec![el("div", &ka, vec![text("ab")])])])
+    };
+    let offset_in = |tree: &Tree, doc: &N| {
+        let (cx, _, cw, _) = box_of(tree, &doc.by_id("col"));
+        let (x, _, w, _) = box_of(tree, &doc.by_id("n"));
+        assert_eq!((cw, w), (300.0, 100.0), "the column is 300 wide and the block 100");
+        x - cx
+    };
+    let cases: [(&str, N, f32); 7] = [
+        ("dir=rtl, no text-align", col(&[("dir", "rtl"), ("style", "width: 300px")], &[]), 200.0),
+        ("direction: rtl, no text-align", col(&[("style", "width: 300px; direction: rtl")], &[]), 200.0),
+        ("dir=rtl text-align: start", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: start")], &[]), 200.0),
+        ("dir=rtl text-align: left (code 4, owed)", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: left")], &[]), 0.0),
+        ("dir=rtl align=left", col(&[("dir", "rtl"), ("align", "left"), ("style", "width: 300px")], &[]), 0.0),
+        ("a dir=rtl child in an ltr column", col(&[("style", "width: 300px")], &[("dir", "rtl")]), 0.0),
+        ("ltr, no text-align", col(&[("style", "width: 300px")], &[]), 0.0),
+    ];
+    for (how, doc, want) in &cases {
+        let tree = lay(doc, VW, 400.0);
+        assert_eq!(offset_in(&tree, doc), *want, "{how}: the 100px block's offset in the 300px column");
+    }
+
+    let doc = col(&[("dir", "rtl"), ("style", "width: 300px")], &[]);
+    let mut tree = lay(&doc, VW, 400.0);
+    let align = |tree: &Tree| tree.taffy.style(id_of(tree, &doc.by_id("n"))).unwrap().align_self;
+    assert_eq!(align(&tree), Some(AlignSelf::END), "dir=rtl: the rule ends the block");
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut ltr = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("direction", "ltr", &mut ltr, &cx);
+    let specs = [(id_of(&tree, &doc.by_id("col")), std::rc::Rc::new(ltr))];
+    layout_core::apply_specs(&mut tree, &specs);
+    layout_core::remeasure(&mut tree, &F);
+    assert_eq!(align(&tree), None, "direction: ltr restyle: the rule's align-self is undone");
+    assert_eq!(offset_in(&tree, &doc), 0.0, "direction: ltr restyle: the block is back at the left");
+}
