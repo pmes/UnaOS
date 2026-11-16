@@ -184,6 +184,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
+        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         _ => return None,
     };
     Some(vec![one])
@@ -393,7 +394,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 5).unwrap());
         face.frame();
-        assert_eq!(transition_json(&face), r#"{"track":0,"idx":0,"at":10,"dur":5,"kind":"D","from_black":false,"still":"64x48"}"#);
+        assert_eq!(transition_json(&face), r#"{"track":0,"idx":0,"at":10,"dur":5,"kind":"D","ease":"linear","from_black":false,"still":"64x48"}"#);
         assert!(drive(&mut face, "key:[,key:[,delete").is_empty());
         assert_eq!(face.state.timeline, tl0.remove_transition(0, 10).unwrap());
         assert_eq!((transition_json(&face), face.state.undo_depth()), ("null".to_string(), 4));
@@ -469,8 +470,8 @@ fn transition_json(face: &Face) -> String {
     };
     let still = face.transition_still().map(|s| format!("\"{}x{}\"", s.width, s.height)).unwrap_or_else(|| "null".into());
     format!(
-        "{{\"track\":{t},\"idx\":{i},\"at\":{},\"dur\":{},\"kind\":\"{kind}\",\"from_black\":{},\"still\":{still}}}",
-        x.at, x.dur, x.from_black
+        "{{\"track\":{t},\"idx\":{i},\"at\":{},\"dur\":{},\"kind\":\"{kind}\",\"ease\":\"{}\",\"from_black\":{},\"still\":{still}}}",
+        x.at, x.dur, x.ease.name(), x.from_black
     )
 }
 
@@ -510,6 +511,7 @@ fn transport() -> TetraNode {
         button("lift", "Lift"),
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
         button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
+        button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
     ])
 }
 
@@ -602,5 +604,30 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
             eprintln!("[STRIA] :: nle audio=none why=no-device");
             face
         }
+    }
+}
+
+// ---- NLETRANSITIONFACE (LEDGER SR691): the Kind / Ease buttons, the `kind:` / `ease:` tokens and the JSON `ease` (named tail block) ----
+
+#[cfg(test)]
+mod transitionface_tests {
+    use super::*;
+
+    /// M3: `transition:T:I` selects the dissolve, `kind:W007` / `ease:inout` are timeline_core's verbs with their argument,
+    /// bare `kind` / `ease` (the buttons' words) cycle; the JSON value names the kind and the ease.
+    #[test]
+    fn nletransitionface_witness_kind_and_ease() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "transition:0:0,kind:W007,ease:inout");
+        assert!(errors.is_empty(), "{errors:?}");
+        let json = transition_json(&face);
+        assert!(json.contains(r#""kind":"W007","ease":"inout""#), "{json}");
+        assert!(drive(&mut face, "kind,ease").is_empty());
+        let json = transition_json(&face);
+        assert!(json.contains(r#""kind":"W021","ease":"linear""#), "{json}");
+        assert_eq!(face.state.undo_depth(), 4);
+        assert_eq!(drive(&mut face, "kind:W008"), vec![format!("kind W008: {}", timeline_core::EditError::Transition)]);
     }
 }

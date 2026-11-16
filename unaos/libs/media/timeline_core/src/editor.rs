@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } // NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -446,6 +446,78 @@ impl EditorState {
             },
             (Some(reel), None, _) if self.timeline.source_by_reel(reel).is_none() => Err(EditError::NoSource),
             _ => Err(EditError::Policy),
+        })
+    }
+}
+
+// ---- NLETRANSITIONFACE (LEDGER SR691): the transition's kind and ease verbs (named tail block) ----
+// The `kind` and `ease` words ride THE verb dispatch ([`EditorState::verb`]) both faces call, so the host face's buttons,
+// `stria-view --do` and the kernel Player's keys all reach them. `kind <code>` reads its code through the EDL's ONE parser
+// (`edl::transition_kind`: `D` or a `W<nnn>` [`crate::WipeDir::from_code`] builds) and re-puts the selected transition with
+// that kind (`Timeline::put_transition`, which keeps its `dur`, its black flags and its ease); bare `kind` steps Dissolve ->
+// every built wipe in ascending SMPTE code order -> Dissolve. `ease <word>` ([`crate::Ease::from_name`]) takes the transition
+// off its cut and puts it back with the new ease (two pure ops, ONE commit: put_transition alone keeps the old ease); bare
+// `ease` steps [`crate::Ease::ALL`]. Each change is ONE `commit` (undo-able); the same value again commits nothing. Refused
+// as `EditError::Transition`: no transition selected, a `C` / unknown / refused code, an unknown ease word, extra words.
+impl EditorState {
+    /// The selected transition given `kind` (one commit; the same kind again commits nothing).
+    pub fn set_transition_kind(&mut self, kind: crate::TransitionKind) -> Result<(), EditError> {
+        let (track, idx) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        if x.kind == kind {
+            return Ok(());
+        }
+        let tl = self.timeline.put_transition(track, Transition { kind, ..x })?;
+        self.commit(tl);
+        self.transition = Some((track, idx));
+        Ok(())
+    }
+    /// The selected transition's next kind: Dissolve -> the built wipes in ascending SMPTE code -> Dissolve.
+    pub fn cycle_transition_kind(&mut self) -> Result<(), EditError> {
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let from = match x.kind {
+            crate::TransitionKind::Dissolve => 0,
+            crate::TransitionKind::Wipe(d) => d.code(),
+        };
+        let next = (from.saturating_add(1)..=999).find_map(crate::WipeDir::from_code);
+        self.set_transition_kind(next.map_or(crate::TransitionKind::Dissolve, crate::TransitionKind::Wipe))
+    }
+    /// The selected transition given `ease` (one commit of `remove_transition` + `put_transition`; the same ease again
+    /// commits nothing).
+    pub fn set_transition_ease(&mut self, ease: crate::Ease) -> Result<(), EditError> {
+        let (track, idx) = self.transition.ok_or(EditError::Transition)?;
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        if x.ease == ease {
+            return Ok(());
+        }
+        let tl = self.timeline.remove_transition(track, x.at)?.put_transition(track, Transition { ease, ..x })?;
+        self.commit(tl);
+        self.transition = Some((track, idx));
+        Ok(())
+    }
+    /// The selected transition's next ease in [`crate::Ease::ALL`] (InOut wraps to Linear).
+    pub fn cycle_transition_ease(&mut self) -> Result<(), EditError> {
+        let x = self.selected_transition().ok_or(EditError::Transition)?;
+        let all = crate::Ease::ALL;
+        let i = all.iter().position(|&e| e == x.ease).unwrap_or(0);
+        self.set_transition_ease(all[(i + 1) % all.len()])
+    }
+    /// The `kind` / `ease` words of [`EditorState::verb`]; `None` when `v` is neither.
+    fn look_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let word = w.next().filter(|&w| w == "kind" || w == "ease")?;
+        Some(match (word, w.next(), w.next()) {
+            ("kind", None, _) => self.cycle_transition_kind(),
+            ("kind", Some(code), None) => match edl::transition_kind(code) {
+                Some(Some(k)) => self.set_transition_kind(k),
+                _ => Err(EditError::Transition),
+            },
+            ("ease", None, _) => self.cycle_transition_ease(),
+            ("ease", Some(name), None) => match crate::Ease::from_name(name) {
+                Some(e) => self.set_transition_ease(e),
+                None => Err(EditError::Transition),
+            },
+            _ => Err(EditError::Transition),
         })
     }
 }

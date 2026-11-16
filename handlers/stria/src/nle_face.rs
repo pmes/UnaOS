@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 16] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save"];
+pub const VERBS: [&str; 18] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "kind", "ease"];
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -397,7 +397,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
-        if let Some(r) = self.pick_transition(x, y) { return r; }
+        if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -538,6 +538,7 @@ impl Face {
             "delete" => self.state.remove_selected_transition(),
             "[" => self.state.set_transition_dur(x.dur - 1),
             "]" => self.state.set_transition_dur(x.dur + 1),
+            _ if matches!(v.split_ascii_whitespace().next(), Some("kind" | "ease")) => self.look_verb(v), // NLETRANSITIONFACE (SR691): file tail
             _ => return None,
         };
         if let Err(e) = r {
@@ -2038,5 +2039,157 @@ mod playaudio_tests {
         assert_eq!(log.lock().unwrap().first(), Some(&Ev::Flush), "a range that does not continue flushes the ring");
         let _ = f.frames();
         assert_eq!(TestPattern::read_counter(&f.still().unwrap().rgba, 64, 48), Some(28));
+    }
+}
+
+// ---- NLETRANSITIONFACE (LEDGER SR691): the transition widget's edge drag and kind / ease (named tail block) ----
+
+/// NLETRANSITIONFACE (SR691): a press on a transition widget's edge zone begins timeline_core's edge drag
+/// (`Drag::begin_transition_edge`; the release's generic `Drag::finish` is its ONE `set_transition_dur`, the paint's
+/// `Drag::shown` / `paint_drag` its preview and guide); the `kind` / `ease` words are timeline_core's verbs
+/// (`EditorState::verb`), with the selected transition's thumbnail re-rendered after them.
+impl Face {
+    /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
+    fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
+        let l = self.layout();
+        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0)?;
+        self.drag = Some(d);
+        Some(true)
+    }
+    /// A `kind` / `ease` word on the selected transition: timeline_core's verb; the thumbnail (keyed without the kind
+    /// and the ease) is dropped so the next frame renders it again.
+    fn look_verb(&mut self, v: &str) -> Result<(), EditError> {
+        self.trans_still = None;
+        self.state.verb(v).unwrap_or(Err(EditError::Transition))
+    }
+}
+
+#[cfg(test)]
+mod transitionface_tests {
+    use super::*;
+    use timeline_core::{Ease, TransitionKind, WipeDir, edl};
+
+    /// NLE1's fixture with a 4-tick dissolve on V1's cut at 10 (the widget x 80..112, y 108..118 at zoom 8).
+    fn dissolve_face() -> Face {
+        let (tl, src) = synth_fixture();
+        let tl = tl.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn btn(down: bool, x: f64, y: f64, mods: u8) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods, surface: 0 }
+    }
+
+    /// M3: a press on the right edge zone is `TransitionOut`; +24 px (3 ticks, no target within `SNAP_PX`) released is
+    /// ONE `set_transition_dur(4 + 3)` = `add_transition(0, 10, D, 7)`; nothing commits per move; undo restores.
+    #[test]
+    fn nletransitionface_right_edge_drag_is_one_set_dur() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        assert!(face.on(&btn(true, 110.0, 113.0, 0)));
+        assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TransitionOut));
+        assert_eq!(face.state.transition, Some((0, 0)));
+        assert!(face.on(&SMessage::BrowserMouseMove(134.0, 113.0, 0)));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((3, None)));
+        assert_eq!(face.state.timeline, tl0, "a move commits nothing");
+        face.paint();
+        assert!(face.on(&btn(false, 134.0, 113.0, 0)));
+        assert_eq!(face.state.timeline, tl0.add_transition(0, 10, TransitionKind::Dissolve, 7).unwrap());
+        assert_eq!((face.state.transition, face.state.undo_depth()), (Some((0, 0)), 1));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert!(face.state.undo());
+        assert_eq!(face.state.timeline, tl0);
+    }
+
+    /// M3: released at x 160 the raw delta is 7 ticks, but the right edge (at + dur = 14, at x 112 + 50 = 162) lies
+    /// within `SNAP_PX` of B's end at 20 (x 160): delta 6, the guide at 20, dur 10.
+    #[test]
+    fn nletransitionface_right_edge_snaps_to_a_clip_edge() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        face.on(&btn(true, 110.0, 113.0, 0));
+        face.on(&SMessage::BrowserMouseMove(160.0, 113.0, 0));
+        let l = face.layout();
+        assert_eq!(l.tick_at(160.0) - l.tick_at(110.0), 7, "the raw delta");
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((6, Some(20))));
+        face.on(&btn(false, 160.0, 113.0, 0));
+        assert_eq!(face.state.timeline, tl0.add_transition(0, 10, TransitionKind::Dissolve, 10).unwrap());
+    }
+
+    /// M3: released at x 168 (raw 8 ticks, no target within `SNAP_PX`) the length 12 runs past B's 10 ticks: refused,
+    /// the state unchanged, the refusal named.
+    #[test]
+    fn nletransitionface_past_the_handle_is_refused() {
+        let mut face = dissolve_face();
+        face.on(&btn(true, 110.0, 113.0, 0));
+        let before = face.state.clone();
+        face.on(&SMessage::BrowserMouseMove(168.0, 113.0, 0));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((8, None)));
+        assert!(face.on(&btn(false, 168.0, 113.0, 0)));
+        assert_eq!(face.state, before);
+        assert_eq!(face.last_error.take(), Some(format!("drag: {}", EditError::Handle)));
+    }
+
+    /// M3: the left edge zone (x 80..84) is `TransitionIn`; with Alt (no snap) -16 px is -2 ticks: dur 4 + 2 = 6 at the
+    /// same cut. The widget's middle stays the NLE3d click (no drag).
+    #[test]
+    fn nletransitionface_left_edge_and_middle() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        face.on(&btn(true, 82.0, 113.0, bandy::MOD_ALT));
+        assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::TransitionIn, false)));
+        face.on(&SMessage::BrowserMouseMove(66.0, 113.0, 0));
+        face.on(&btn(false, 66.0, 113.0, 0));
+        assert_eq!(face.state.timeline, tl0.add_transition(0, 10, TransitionKind::Dissolve, 6).unwrap());
+        assert!(face.on(&btn(true, 96.0, 113.0, 0)));
+        assert!(face.dragging().is_none(), "the middle is a click");
+    }
+
+    /// M3: `kind W007` re-puts the dissolve as fourBoxWipe cornersIn (dur, ease kept) and the EDL carries it; `C`,
+    /// a refused `W008` and junk are refused leaving the state; bare `kind` steps D -> W001 and wraps W214 -> D; bare
+    /// `ease` cycles `Ease::ALL`; an ease survives a kind change; each is ONE undo step; no selection is refused.
+    #[test]
+    fn nletransitionface_kind_and_ease_verbs() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        assert!(face.verb("kind"));
+        assert_eq!(face.last_error.take(), Some(format!("kind: {}", EditError::Transition)), "no transition selected");
+        assert_eq!(face.state.timeline, tl0);
+        face.state.select_transition(0, 0).unwrap();
+        let kind = |f: &Face| f.state.selected_transition().map(|x| (x.kind, x.dur, x.ease));
+        assert!(face.on(&SMessage::Input { target: SURFACE.into(), text: "kind W007".into() }));
+        assert_eq!(kind(&face), Some((TransitionKind::Wipe(WipeDir::FourBoxCornersIn), 4, Ease::Linear)));
+        let text = edl::write(&face.state.timeline, "NLEKIND").unwrap();
+        assert!(text.contains("W007 004"), "{text}");
+        assert_eq!(edl::parse(&text, 25).unwrap().tracks[0].transitions, face.state.timeline.tracks[0].transitions);
+        for bad in ["kind C", "kind W008", "kind X", "kind D W001", "ease fast"] {
+            let before = face.state.clone();
+            assert!(face.verb(bad), "{bad}");
+            assert_eq!(face.state, before, "{bad}");
+            assert!(face.last_error.take().is_some(), "{bad}");
+        }
+        assert!(face.verb("kind D"));
+        assert!(face.verb("kind"));
+        assert_eq!(kind(&face).map(|k| k.0), Some(TransitionKind::Wipe(WipeDir::LeftToRight)));
+        face.state.set_transition_kind(TransitionKind::Wipe(WipeDir::DoubleFanHorizontal)).unwrap();
+        assert!(face.verb("kind"));
+        assert_eq!(kind(&face).map(|k| k.0), Some(TransitionKind::Dissolve), "W214 wraps to D");
+        for want in [Ease::In, Ease::Out, Ease::InOut, Ease::Linear] {
+            assert!(face.verb("ease"));
+            assert_eq!(kind(&face).map(|k| k.2), Some(want));
+        }
+        assert!(face.verb("ease in"));
+        assert!(face.verb("kind W001"));
+        assert_eq!(kind(&face), Some((TransitionKind::Wipe(WipeDir::LeftToRight), 4, Ease::In)), "a kind change keeps the ease");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        let depth = face.state.undo_depth();
+        assert!(face.verb("kind W001"));
+        assert_eq!(face.state.undo_depth(), depth, "the same kind commits nothing");
+        assert!(face.state.undo());
+        assert_eq!(kind(&face), Some((TransitionKind::Dissolve, 4, Ease::In)));
+        assert!(face.state.undo());
+        assert_eq!(kind(&face), Some((TransitionKind::Dissolve, 4, Ease::Linear)));
+        while face.state.undo() {}
+        assert_eq!(face.state.timeline, tl0);
     }
 }

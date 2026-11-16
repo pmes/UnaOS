@@ -344,7 +344,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
 }
 
 /// NLE3: a CMX transition code: `C` (a cut: `None`), `D`, or `W001` / `W002`; `None` outside for any other.
-fn transition_kind(s: &str) -> Option<Option<TransitionKind>> {
+pub(crate) fn transition_kind(s: &str) -> Option<Option<TransitionKind>> {
     match s {
         "C" => Some(None),
         "D" => Some(Some(TransitionKind::Dissolve)),
