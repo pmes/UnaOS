@@ -1253,8 +1253,7 @@ pub fn open_line(i: &MediaInfo) -> String {
 
 /// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (an audio-only file: its `~` rate alone; none: "").
 pub fn summary_line(i: &MediaInfo) -> String {
-    let size = if i.width > 0 && i.height > 0 { format!("{}x{}", i.width, i.height) } else { String::new() };
-    with_audio_part([i.video.as_str(), size.as_str(), i.video_profile.as_str(), i.bitrate.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" "), i)
+    with_audio_part(summary_parts(&i.video, i.width, i.height, &i.video_profile, &i.bitrate), i) // STRIAINFOREEL (SR743): the ONE formatter (file tail)
 }
 
 // ---- STRIAINFOAUDIOBITRATE (LEDGER SR742): MediaInfo's audio bit rate (named tail block) ----
@@ -1298,4 +1297,14 @@ fn with_audio_part(video_part: String, i: &MediaInfo) -> String {
     }
     let audio_part = [i.audio_decoder.as_str(), i.audio_bitrate.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
     if i.video.is_empty() || video_part.is_empty() { audio_part } else { format!("{video_part} | {audio_part}") }
+}
+
+// ---- STRIAINFOREEL (LEDGER SR743): the person's media line from its parts (named tail block) ----
+// THE one formatter of the person's line: `summary_line` (the Player's MediaInfo, SR734) and `nle::Sources::summary` (an editor
+// reel, from the same `Track` facts the Player reads) both call it. Owed: STRIA-INFO-REEL-AUDIO (the audio part, one more part here).
+
+/// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (the size only when both sides are > 0).
+pub fn summary_parts(video: &str, width: u32, height: u32, profile: &str, bitrate: &str) -> String {
+    let size = if width > 0 && height > 0 { format!("{width}x{height}") } else { String::new() };
+    [video, size.as_str(), profile, bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ")
 }

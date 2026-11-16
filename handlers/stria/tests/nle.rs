@@ -1934,3 +1934,80 @@ fn nle5drangesave_a_mark_is_one_undoable_commit() {
     assert_eq!((face.marks(), face.export_range()), ((None, None), None));
     println!("nle5drangesave: in / out / undo / redo / mark out / refused / clear");
 }
+
+// ---- STRIAINFOREEL (LEDGER SR743): an editor reel's person's line (named tail block) ----
+
+/// The Player's own line for `bytes` (SR734's `summary_line` of the MediaInfo `Player::open` fills).
+fn striainforeel_player_line(bytes: Vec<u8>) -> String {
+    let p = stria::media::Player::open(bytes, std::sync::Arc::new(gneiss_pal::dsp::avsync::ManualTime::new()), None, 60).unwrap();
+    stria::media::summary_line(p.info())
+}
+
+/// Rule: a synth reel's `Sources::summary` is the Player's `summary_line` of the same bytes (the two roads agree): the utp1
+/// codec, its size, no profile (no configuration record), the measured `~` rate; an unknown id is `None`.
+#[test]
+fn striainforeel_synth_reel_summary_is_the_players_line() {
+    let bytes = synth_source(0, 50, 25);
+    let tl = Timeline::new(25);
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), bytes.clone()).unwrap();
+    let s = src.summary(SourceId(0)).expect("a synth reel has a line");
+    assert!(s.starts_with("utp1 64x48 ~") && s.ends_with(" kb/s"), "{s}");
+    assert_eq!(s, striainforeel_player_line(bytes));
+    assert_eq!(src.summary(SourceId(7)), None);
+    println!("striainforeel: synth reel summary=\"{s}\"");
+}
+
+/// Rule: an H.264 reel (SR728's CBR 400 + HRD export) says codec, size, the SPS's profile tokens and the btrt avg with the HRD
+/// rate, exactly as the Player's line of the same bytes.
+#[test]
+fn striainforeel_h264_reel_summary_is_the_players_line() {
+    use stria::nle_export::{AudioOut, H264Encoder, export};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainforeel");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    export(&tl, 0..35, &src, &dir, Box::new(H264Encoder::new(26, 10).with_bitrate(400, 25, 1).with_hrd(true)), AudioOut::None).unwrap();
+    let mp4 = std::fs::read(dir.join("video.mp4")).unwrap();
+    let avg = gneiss_pal::dsp::demux::Demuxer::open(mp4.clone()).unwrap().tracks()[0].btrt.expect("an H.264 export carries a btrt").2 as u64;
+    let mut reels = Sources::new(&Timeline::new(25));
+    reels.add(SourceId(0), mp4.clone()).unwrap();
+    let s = reels.summary(SourceId(0)).unwrap();
+    assert_eq!(s, format!("avc1 64x48 profile=Baseline level=1 {} kb/s (HRD 400)", (avg + 500) / 1000));
+    assert_eq!(s, striainforeel_player_line(mp4));
+    println!("striainforeel: h264 reel summary=\"{s}\"");
+}
+
+/// Rule: a labelled face's message line is the selected clip's `<reel>: <summary>`, painted at the preview band's foot (ink in
+/// rows `preview_h - MESSAGE_H .. preview_h` left of the centred frame, where the deselected paint at the same playhead has
+/// none of it); an error replaces it; nothing selected and no error: no message.
+#[test]
+fn striainforeel_face_message_is_the_selected_reel_and_an_error_wins() {
+    use stria::nle_face::{EditorState, Face, Layout, MESSAGE_H, PixelOrder};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let line = src.summary(SourceId(0)).unwrap();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, true);
+    let l: Layout = face.layout();
+    let strip = |px: &[u8]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in l.preview_h - MESSAGE_H..l.preview_h {
+            let row = (y * l.w) as usize * 4;
+            out.extend_from_slice(&px[row..row + 64 * 4]);
+        }
+        out
+    };
+    assert_eq!(face.message_text(), None);
+    let bare = strip(&face.paint());
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.message_text(), Some(format!("A: {line}")));
+    let summary = strip(&face.paint());
+    assert_ne!(summary, bare, "the summary inks the message rows");
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"));
+    let error = strip(&face.paint());
+    assert_ne!(error, summary, "the error replaces the summary");
+    face.last_error = None;
+    face.state.deselect();
+    assert_eq!(strip(&face.paint()), bare);
+    println!("striainforeel: face message=\"A: {line}\" preview_h={} rows={}", l.preview_h, MESSAGE_H);
+}
