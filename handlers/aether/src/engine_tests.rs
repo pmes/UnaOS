@@ -4667,4 +4667,31 @@ mod tests {
         assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
         assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
     }
+
+    // ---- AETHERIMGALTICONONLY (LEDGER SR714): an unsized failed img with no alt is the icon alone (named tail block) ----
+
+    /// AETHERIMGALTICONONLY (SR714): a failed, unsized img with a src and no alt or title shows Chromium's broken-image
+    /// icon ALONE (HTMLImageFallbackHelper's represents-text arm): a 16x16 box, the icon at its (0, 0) (the page outline
+    /// grey at icon pixel (1, 5)), no silver frame, nothing right of it; an img with neither src nor alt represents
+    /// nothing. (alt="" stays nothing: `img_empty_alt_paints_nothing`.)
+    #[test]
+    fn img_alt_icon_only_when_no_alt() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="o" src="missing.png"></div>
+            <div><img id="x"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "o");
+        assert!((w - 16.0).abs() <= 0.5 && (h - 16.0).abs() <= 0.5, "o: the icon box is 16x16 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l, l + 16, t, t + 16) > 0, "o: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 1, t + 5), (128, 128, 128), "o: the icon's page outline at the box's (1, 5)");
+        assert_eq!(imgalt_px(&engine, l, t), (255, 255, 255), "o: no frame");
+        assert_eq!(imgalt_painted(&engine, l + 16, 400, t, t + 16), 0, "o: nothing paints right of the icon");
+        let (_, _, xw, _) = imgalt_rect(&mut engine, "x");
+        assert!(xw <= 0.5, "x: no src and no alt takes no width ({xw})");
+    }
 }
