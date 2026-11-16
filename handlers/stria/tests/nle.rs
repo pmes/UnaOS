@@ -8,6 +8,7 @@ use gneiss_pal::dsp::video::TestPattern;
 use stria::nle::{RenderSink, SYNTH_RATE, Sources, render, synth_sample, synth_source};
 use timeline_core::schedule::schedule;
 use timeline_core::{Clip, Kind, SourceId, Timeline, edl};
+mod common; use common::*; // NLE6-UTP1 (LEDGER SR729): tests/common, the ONE fixture / log / feed helper set the four binaries share
 
 #[derive(Default)]
 struct Collect {
@@ -25,27 +26,8 @@ impl RenderSink for Collect {
     }
 }
 
-const BASE: [u32; 2] = [0, 1000];
-const PER: usize = (SYNTH_RATE / 25) as usize; // samples per tick
-
-/// V1 and A1: A[13,23)@0 (mid-GOP in point), B[0,10)@10 split at 15, a gap 20..25, A[23,33)@25.
-fn timeline() -> Timeline {
-    let mut tl = Timeline::new(25);
-    let a = tl.add_source("A", 50);
-    let b = tl.add_source("B", 50);
-    tl.add_track(Kind::Video);
-    tl.add_track(Kind::Audio);
-    for t in 0..2 {
-        tl.tracks[t].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
-    }
-    tl.split(0, 15).unwrap().split(1, 15).unwrap()
-}
-
 fn agree(tl: &Timeline) {
-    let mut src = Sources::new(tl);
-    for (i, b) in BASE.iter().enumerate() {
-        src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
-    }
+    let src = sources(tl); // NLE6-UTP1 (SR729): tests/common's NLE1 reels
     let steps = schedule(tl, 0..35, &src).unwrap();
     let mut sink = Collect::default();
     let r = render(tl, 0..35, &src, &mut sink).unwrap();
@@ -848,27 +830,8 @@ fn swapbacknlecache_scrubbed_runs_draw_the_whole_render() {
 #[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
 mod av1_vectors;
 
-/// The run's log lines, captured per thread (tests/media.rs's HEVCPAL-SWAP shape; this binary had no logger).
-struct NleSizeSwitchLog;
-static NLESIZESWITCH_LINES: std::sync::Mutex<Vec<(std::thread::ThreadId, String)>> = std::sync::Mutex::new(Vec::new());
-impl log::Log for NleSizeSwitchLog {
-    fn enabled(&self, _: &log::Metadata) -> bool {
-        true
-    }
-    fn log(&self, r: &log::Record) {
-        NLESIZESWITCH_LINES.lock().unwrap().push((std::thread::current().id(), r.args().to_string()));
-    }
-    fn flush(&self) {}
-}
-fn nlesizeswitch_lines(containing: &str) -> Vec<String> {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        log::set_logger(&NleSizeSwitchLog).expect("no other logger in this test binary");
-        log::set_max_level(log::LevelFilter::Info);
-    });
-    let me = std::thread::current().id();
-    NLESIZESWITCH_LINES.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
-}
+/// The run's log lines, captured per thread: tests/common's `log_lines` (NLE6-UTP1 SR729; tests/media.rs's HEVCPAL-SWAP shape).
+use common::log_lines as nlesizeswitch_lines;
 
 /// SR379's fixture (tests/media.rs `av1inbandsize_reel`): one av01 track declared 768x512, 4 key samples of 40 ms.
 fn nlesizeswitch_reel() -> Option<Vec<u8>> {
@@ -1235,10 +1198,7 @@ fn adoptpng_refused_dir_by_name() {
 // `dirty()` is the timeline differing from the one opened / saved; no path is a refusal by name.
 
 fn nlehostsave_dir(name: &str) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlehostsave").join(name);
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    root
+    common::fresh_dir("nlehostsave", name) // STRIA-TEST-TMPDIR (SR729): a per-process subdir
 }
 
 #[test]
@@ -1418,9 +1378,7 @@ fn nle3etrimstretch_face_drag_trim_shrinks_the_dissolve() {
 // ---- NLEFACEEXPORT (LEDGER SR694): the editor face's export verb, its progress seam, busy, Esc and the band (named tail block) ----
 
 fn nlefaceexport_dir(name: &str) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlefaceexport").join(name);
-    let _ = std::fs::remove_dir_all(&root);
-    root
+    common::scratch_dir("nlefaceexport", name) // STRIA-TEST-TMPDIR (SR729): a per-process subdir, not created
 }
 
 fn nlefaceexport_face(tl: Timeline, src: Sources) -> Face {
@@ -1645,14 +1603,10 @@ fn nle5dexportstop_cancelled_export_stops_the_render() {
 }
 
 // ---- NLESTANDINAUDIOEDITOR (LEDGER SR713): the editor's audio reel opens through media.rs's AudioSwap (named tail block) ----
-/// SR703's fixture (tests/media.rs `nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in`, copied: NLE6-UTP1 owed):
+/// SR703's fixture (tests/media.rs `nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in`, tests/common's `Fixture`, NLE6-UTP1 SR729):
 /// a 64x48 test-pattern video beside PCM16 (every sample 1000) re-labelled `ac-3` — its rate and channels read, no decoder.
 fn nlestandinaudioeditor_ac3_reel() -> Vec<u8> {
-    use gneiss_pal::dsp::demux::build::{self, Mp4Options};
-    let video = build::test_pattern_track(1, 64, 48, 25, 50, 10);
-    let mut audio = build::pcm16_track(2, SYNTH_RATE, 1, &vec![1000i16; 2 * SYNTH_RATE as usize], 960);
-    audio.spec.fourcc = *b"ac-3";
-    build::mp4(&[video, audio], &Mp4Options::default())
+    Fixture::pattern(64, 48, 25, 50, 10).pcm16(SYNTH_RATE, 1, &vec![1000i16; 2 * SYNTH_RATE as usize]).relabel_audio(*b"ac-3").mp4()
 }
 
 /// Rule: a timeline citing a reel whose audio no decoder takes renders (no `RenderError::Decode`): that reel's run is the
@@ -1687,3 +1641,15 @@ fn nlestandinaudioeditor_an_ac3_reel_renders_on_the_silent_stand_in() {
     assert_eq!(normal.stand_in_audio, 0);
     println!("nlestandinaudioeditor: {} | stand_in_audio={} frames={} pcm={}", lines[0], r.stand_in_audio, r.frames, sink.pcm.len());
 }
+
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's fixtures return the bytes the copies built (named tail block) ----
+/// NLE6-UTP1 (SR729): FNV-1a of SR713's ac-3 reel (64x48 pattern + PCM16 of 1000s relabelled `ac-3`), pinned on its copy before
+/// it moved onto tests/common's `Fixture` (the reel is now that one expression).
+#[test]
+fn nle6utp1_nle_fixtures_pin() {
+    let got = stria::nle_face::fnv1a(&nlestandinaudioeditor_ac3_reel());
+    assert_eq!(got, NLE6UTP1_NLE_PIN, "{got:#018x}");
+}
+
+/// The fnv [`nle6utp1_nle_fixtures_pin`] reads, measured on the copy before SR729.
+const NLE6UTP1_NLE_PIN: u64 = 0xfe29_54c3_c765_08b4;

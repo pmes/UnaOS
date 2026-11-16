@@ -17,31 +17,9 @@ use stria::nle::{RenderSink, SYNTH_RATE, Sources, render, synth_sample, synth_so
 use stria::nle_export::{AudioOut, H264Encoder, PngSequence, RawSequence, export, pcm16, wav_header};
 use timeline_core::schedule::schedule;
 use timeline_core::{Clip, Kind, SourceId, Timeline};
+mod common; use common::*; // NLE6-UTP1 (LEDGER SR729): tests/common, the ONE fixture / log / feed helper set the four binaries share
 
-const BASE: [u32; 2] = [0, 1000];
-const PER: usize = (SYNTH_RATE / 25) as usize; // samples per tick
 const TICKS: i64 = 35; // H264ENCCOLOURHOST (SR377): HOST_VUI, the export's VUI colour, the fresh encoders' too (test tail)
-
-/// NLE1's timeline: A[13,23)@0, B[0,10)@10 split at 15, a gap 20..25, A[23,33)@25 (video and audio alike).
-fn timeline() -> Timeline {
-    let mut tl = Timeline::new(25);
-    let a = tl.add_source("A", 50);
-    let b = tl.add_source("B", 50);
-    tl.add_track(Kind::Video);
-    tl.add_track(Kind::Audio);
-    for t in 0..2 {
-        tl.tracks[t].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
-    }
-    tl.split(0, 15).unwrap().split(1, 15).unwrap()
-}
-
-fn sources(tl: &Timeline) -> Sources {
-    let mut src = Sources::new(tl);
-    for (i, b) in BASE.iter().enumerate() {
-        src.add(SourceId(i as u32), synth_source(*b, 50, 25)).unwrap();
-    }
-    src
-}
 
 #[derive(Default)]
 struct Collect {
@@ -69,10 +47,7 @@ fn reference(tl: &Timeline, src: &Sources) -> Collect {
 }
 
 fn fresh(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nle_export").join(name);
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    common::fresh_dir("nle_export", name) // STRIA-TEST-TMPDIR (SR729): a per-process subdir
 }
 
 /// The schedule's synthetic sample for every output sample.
@@ -827,3 +802,18 @@ fn h264enchrdmp4_cqp_export_carries_avg_only() {
     let a = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
     assert_eq!(a.tracks()[0].btrt, None, "no video encoder hint, no btrt");
 }
+
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's NLE1 fixture is the one this file built (named tail block) ----
+/// NLE6-UTP1 (SR729): FNV-1a of NLE1's timeline as CMX text and of the plain render's frame fnv over its two reels, pinned on
+/// this file's own `timeline()` / `sources()` before they moved into tests/common (the test now reads tests/common's).
+#[test]
+fn nle6utp1_nle_export_fixture_pin() {
+    let tl = timeline();
+    let mut bytes = timeline_core::edl::write(&tl, "NLE1").unwrap().into_bytes();
+    bytes.extend(reference(&tl, &sources(&tl)).fnv.to_le_bytes());
+    let got = stria::nle_face::fnv1a(&bytes);
+    assert_eq!(got, NLE6UTP1_NLE_EXPORT_PIN, "{got:#018x}");
+}
+
+/// The fnv [`nle6utp1_nle_export_fixture_pin`] reads, measured on the copies before SR729.
+const NLE6UTP1_NLE_EXPORT_PIN: u64 = 0xe149_8435_238b_ff8e;
