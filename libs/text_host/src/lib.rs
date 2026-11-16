@@ -180,7 +180,7 @@ pub fn platform_fallback_in(d: &db::FontDb, c: char, want: Style) -> Option<&'st
             .select(&info.families[0], want)
             .and_then(|(k, b, o)| load_face_styled(d.faces.get(k)?, b, o, want, None))
             .filter(|g| g.font.glyph_index(c) != 0);
-        return picked.or(Some(f));
+        return picked.or_else(|| cover_face(info, want)).or(Some(f));
     }
     None
 }
@@ -413,5 +413,66 @@ mod hostwghtquartzite_tests {
         if let Some(f) = platform_fallback('H', want(700.0)) {
             assert!(std::ptr::eq(f, platform_fallback_in(db::db(), 'H', want(700.0)).unwrap()));
         }
+    }
+}
+
+// ---- AETHERHOSTWGHTCOVERFACE (LEDGER SR725): the covering face on the instancing road (named tail block) ----
+
+/// AETHERHOSTWGHTCOVERFACE (SR725): the face a covering road draws `want` with — the face [`platform_fallback_in`] and
+/// Aether's `fallback_for` fall back to when the style-matched face lacks the character, and the last resort of
+/// [`line::TextStyle::stack`] / Aether's `stack`. No select ran on it, so no synthesis flags: a static face is the plain
+/// [`load_face`] object at every weight and slant (as before); a variable face is instanced at the asked weight /
+/// stretch through [`load_face_styled`], synthetic bold only where its `wght` axis cannot reach (owed
+/// AETHER-FALLBACK-SYNTH: Chromium also emboldens a static fallback face).
+pub fn cover_face(info: &FaceInfo, want: Style) -> Option<&'static Face> {
+    load_face_styled(info, false, false, want, None)
+}
+
+#[cfg(test)]
+mod hostwghtcoverface_tests {
+    use super::*;
+
+    fn tree_face(rel: &str) -> FaceInfo {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel);
+        db::faces_in_file(&p).into_iter().next().unwrap_or_else(|| panic!("{rel}: the tree's fixture face"))
+    }
+
+    fn want(weight: f32) -> Style {
+        Style { weight, ..Style::default() }
+    }
+
+    /// The style-matched face lacks `Ж` (the static fixture relabelled into Inter's family at 700; no tree fixture has
+    /// U+4E00), so `platform_fallback_in` returns the covering Inter: at 700 the wght 700 instance (the pre-SR725 road
+    /// gave its default instance), at 400 select's own Inter, today's object.
+    #[test]
+    fn hostwghtcoverface_platform_fallback_cover_instances() {
+        let inter = tree_face("fonts/inter/InterVariable.ttf");
+        let mut bold = tree_face("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        bold.families = inter.families.clone();
+        bold.style = Style { weight: 700.0, ..inter.style };
+        let d = db::FontDb::from_faces(vec![inter.clone(), bold.clone()], crate::fontconfig::Config::default());
+        assert_eq!(d.select(&inter.families[0], want(700.0)).map(|k| k.0), Some(1), "700 selects the static face");
+        assert_eq!(load_face(&bold).unwrap().font.glyph_index('Ж'), 0, "the selected face lacks the character");
+        let g = platform_fallback_in(&d, 'Ж', want(700.0)).unwrap();
+        assert_ne!(g.id, load_face(&inter).unwrap().id, "not the default instance");
+        assert!(g.font.is_instanced() && !g.synth_bold);
+        assert!(std::ptr::eq(g, cover_face(&inter, want(700.0)).unwrap()));
+        assert!(std::ptr::eq(platform_fallback_in(&d, 'Ж', want(400.0)).unwrap(), load_face(&inter).unwrap()));
+    }
+
+    /// A static covering face is the very `load_face` object at every weight and slant; a variable one asked for its
+    /// default weight is too. This is the face line.rs `stack`'s last resort loads (that road reads the process
+    /// `db::db()`, so the KAT is on the one fn it calls).
+    #[test]
+    fn hostwghtcoverface_static_and_default_unchanged() {
+        let s = tree_face("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let plain = load_face(&s).unwrap();
+        for w in [400.0, 700.0, 900.0] {
+            assert!(std::ptr::eq(plain, cover_face(&s, want(w)).unwrap()), "{w}");
+        }
+        let italic = Style { slant: db::Slant::Italic, ..want(700.0) };
+        assert!(std::ptr::eq(plain, cover_face(&s, italic).unwrap()), "no synthetic oblique on a covering face");
+        let inter = tree_face("fonts/inter/InterVariable.ttf");
+        assert!(std::ptr::eq(load_face(&inter).unwrap(), cover_face(&inter, want(400.0)).unwrap()));
     }
 }
