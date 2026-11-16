@@ -318,6 +318,8 @@ pub struct Transition {
     pub to_black: bool,
     /// NLEWIPES (SR679): the easing curve the schedule applies ONCE to the incoming's weight `t` (Linear: unchanged).
     pub ease: Ease,
+    /// NLE3ETRIMGROW (SR712): the length asked for while `dur` is a trim's FIT below it (`None`: `dur` is the ask).
+    pub want: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,12 +529,12 @@ impl Timeline {
 
     /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
     pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false, ease: Ease::Linear })
+        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false, ease: Ease::Linear, want: None })
     }
 
     /// NLE3c: put a transition FROM BLACK on the clip starting at tick `at` of `track` (no clip may end there).
     pub fn add_transition_from_black(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false, ease: Ease::Linear })
+        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false, ease: Ease::Linear, want: None })
     }
 
     /// The one body of the two `add_transition` ops: replace whatever sits at `x.at`, keep `at` order, validate.
@@ -811,7 +813,7 @@ impl Timeline {
     /// NLE3cBLACK (LEDGER SR323): put a transition TO BLACK on the clip ending at tick `at_end` of `track` (no clip may
     /// start there): ticks `at_end..at_end + dur` show the outgoing's handle mixed with black, in the track's gap.
     pub fn add_transition_to_black(&self, track: usize, at_end: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true, ease: Ease::Linear })
+        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true, ease: Ease::Linear, want: None })
     }
 }
 
@@ -1322,7 +1324,8 @@ fn moved_cut(bt: &Track, clips: &[Clip], at: i64) -> Result<i64, EditError> {
 impl Timeline {
     /// NLE3ETRIMSTRETCH: shrink every transition (and explicit audio crossfade) of `track` on clip `idx`'s two edges whose
     /// `dur` no longer fits its room (the incoming clip's length, the outgoing source's handle past `src_out`) to that
-    /// room. Shrink only; a room under 1 is left for `validate` to refuse (`Handle`, as before).
+    /// room. A transition grows back toward its asked length (`fit_want`, NLE3ETRIMGROW SR712); an explicit audio crossfade
+    /// shrinks only; a room under 1 is left for `validate` to refuse (`Handle`, as before).
     fn fit_trimmed(&mut self, track: usize, idx: usize) {
         let Some(c) = self.tracks.get(track).and_then(|t| t.clips.get(idx)).copied() else { return };
         let room = |tl: &Timeline, at: i64| -> Option<i64> {
@@ -1343,7 +1346,7 @@ impl Timeline {
             }
         };
         for x in self.tracks[track].transitions.iter_mut() {
-            fit(&mut x.dur, x.at);
+            fit_want(x, &rooms); // NLE3ETRIMGROW (SR712): grow back toward the ask
         }
         for x in self.audio_xfades.iter_mut().filter(|x| x.track == track) {
             fit(&mut x.dur, x.at);
@@ -1481,4 +1484,22 @@ impl Timeline {
         }
         Ok(())
     }
+}
+
+// ---- NLE3ETRIMGROW (LEDGER SR712): a fitted transition grows back to its asked length (named tail block) ----
+// `fit_trimmed` fits each transition on the trimmed clip's edges to that edge's room through ONE rule: the ask is `want`
+// when the transition is a fit, else its `dur`; `dur` becomes min(ask, room) and `want` is kept only while `dur` is below
+// the ask. A shrink records the ask, a freed room grows the transition back and never past it, and at the ask `want`
+// clears, so a trim and its trim-back give the original Timeline. An explicit ask (`add_transition*`, so the editor's
+// `set_transition_dur`) carries `want: None`; a room under 1 is left for `validate` (`Handle`).
+
+/// NLE3ETRIMGROW: fit `x` to the room recorded for its cut in `rooms` (none, or under 1: unchanged).
+fn fit_want(x: &mut Transition, rooms: &[(i64, Option<i64>)]) {
+    let Some(&(_, Some(r))) = rooms.iter().find(|e| e.0 == x.at) else { return };
+    if r < 1 {
+        return;
+    }
+    let ask = x.want.unwrap_or(x.dur);
+    x.dur = ask.min(r);
+    x.want = (x.dur < ask).then_some(ask);
 }
