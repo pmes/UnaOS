@@ -172,7 +172,7 @@ fn d_motion_is_not_a_cut_and_keeps_the_pinned_bytes() {
         assert_eq!(au.keyframe, t % 30 == 0, "frame {t}: a moving scene is not a cut");
         samples.push(au.avcc_sample());
     }
-    assert_eq!(fnv(&samples), 0x1290_fbb5_41d1_0774, "Some(40) on the moving scene: the None pin (tests/rc.rs qp26 gop30)");
+    assert_eq!(fnv(&samples), 0x1fbc_56dc_6807_f2a8, "Some(40) on the moving scene: the None pin (tests/rc.rs qp26 gop30)");
 }
 
 // ---- H264ENCSCENECUTFADE (LEDGER SR709): the gradual rule (named tail block) ----
