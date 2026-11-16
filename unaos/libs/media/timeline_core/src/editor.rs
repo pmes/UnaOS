@@ -362,6 +362,7 @@ impl EditorState {
             "nudge-" => self.move_set(-1),
             "nudge+" => self.move_set(1),
             _ if rtrim_words(v).is_some() => self.rtrim_verb(v),
+            _ if slipslide_words(v).is_some() => self.slipslide_verb(v),
             _ => return None,
         })
     }
@@ -501,4 +502,45 @@ fn rtrim_words(v: &str) -> Option<(Edge, i64)> {
     };
     let delta = w.next()?.parse::<i64>().ok()?;
     w.next().is_none().then_some((edge, delta))
+}
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide from the editor (named tail block) ----
+// `slip <delta>` / `slide <delta>` ride THE verb dispatch both faces call (and the `--do` tokens): the selected clip slips
+// its source window (`Timeline::slip`) or slides along its track with its neighbours' edges following (`Timeline::slide`),
+// ONE commit each (undo restores the whole pre-op timeline); a refusal leaves the state and names its `EditError`.
+impl EditorState {
+    /// Slip the selected clip by `delta` source ticks (`Timeline::slip`).
+    pub fn slip_selected(&mut self, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.slip(track, idx, delta)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// Slide the selected clip by `delta` timeline ticks (`Timeline::slide`); the selection stays on it.
+    pub fn slide_selected(&mut self, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.slide(track, idx, delta)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `slip` / `slide` words of [`EditorState::verb`].
+    fn slipslide_verb(&mut self, v: &str) -> Result<(), EditError> {
+        match slipslide_words(v) {
+            Some((true, delta)) => self.slip_selected(delta),
+            Some((false, delta)) => self.slide_selected(delta),
+            None => Err(EditError::NoClip),
+        }
+    }
+}
+
+/// `slip <delta>` -> `(true, delta)`, `slide <delta>` -> `(false, delta)` (signed ticks); any other shape is not this verb.
+fn slipslide_words(v: &str) -> Option<(bool, i64)> {
+    let mut w = v.split_ascii_whitespace();
+    let slip = match w.next()? {
+        "slip" => true,
+        "slide" => false,
+        _ => return None,
+    };
+    let delta = w.next()?.parse::<i64>().ok()?;
+    w.next().is_none().then_some((slip, delta))
 }
