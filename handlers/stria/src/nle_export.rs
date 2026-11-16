@@ -102,6 +102,8 @@ pub trait VideoEncoder {
         let _ = reels;
         None
     }
+    /// H264ENCHRDMP4 (SR720): read at `finish`: Some((bufferSizeDB, maxBitrate)) = the MP4 sample entry carries a `btrt` (avg from the coded bytes); (0, 0) = no bucket (max = avg, buffer 0, ffmpeg's CRF form).
+    fn bitrate_hint(&self) -> Option<(u32, u32)> { None }
 }
 
 /// A PNG per frame through pixel_core's writer (lossless RGBA, colour type 6).
@@ -200,6 +202,7 @@ impl VideoEncoder for H264Encoder {
         self.rgba.cfg.colour = Some((c.primaries, c.transfer, c.matrix, c.full_range == Some(true)));
         Some(c)
     }
+    fn bitrate_hint(&self) -> Option<(u32, u32)> { Some(self.rgba.hrd().map_or((0, 0), |h| (h.cpb_size / 8, h.bit_rate))) } // H264ENCHRDMP4 (SR720): the bucket's CPB / rate (`RgbaEncoder::hrd`), none under constant QP / CRF
 }
 
 /// Where the PCM goes.
@@ -428,7 +431,7 @@ impl ExportSink {
         }
         let movie = self.video.layout() == Layout::Mp4;
         let mut extras = build::Mp4Extras::default();
-        if movie { extras.colour.extend(self.colour.map(|c| (1, c))); } // H264ENCCOLOURHOST (SR377): the file colour as the avc1's (track 1) `colr`
+        if movie { extras.colour.extend(self.colour.map(|c| (1, c))); extras.btrt.extend(self.btrt(tb)); } // H264ENCCOLOURHOST (SR377): the file colour as the avc1's (track 1) `colr`
         let audio = match (self.audio, self.afmt) {
             (AudioOut::Mp4, Some((rate, ch))) => Some(build::pcm16_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, 1024)),
             (AudioOut::Aac(kbps), Some((rate, ch))) => {
@@ -753,7 +756,7 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
 
 // ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
 /// h264enc_core's per-picture first-pass record (`rc::PicStat`), named here so a face needs no h264enc_core dependency.
-pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
+pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, rescale_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
 
 impl H264Encoder {
     /// The second pass of a two-pass export (h264enc_core's `RcMode::TwoPass`, `nle export --two-pass`): a mean of `kbps` kbit/s
@@ -784,5 +787,24 @@ impl H264Encoder {
     pub fn with_hrd(mut self, on: bool) -> H264Encoder {
         self.rgba.cfg.hrd = on;
         self
+    }
+}
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the H.264 movie's btrt from the encoder's bucket and the coded bytes (named tail block) ----
+impl ExportSink {
+    /// The video track's (track 1) `btrt` (bufferSizeDB, maxBitrate, avgBitrate) from [`VideoEncoder::bitrate_hint`], read
+    /// while `samples` still holds every coded unit: avg = floor(coded bits x `tb.den` / (frames x `tb.num`)) (ffmpeg movenc's
+    /// size x 8 x timescale / duration), max = the hint's or avg when the hint has none, buffer the hint's. None without a hint
+    /// or when all three are 0 (ffmpeg writes no btrt then).
+    fn btrt(&self, tb: Timebase) -> Option<(u32, (u32, u32, u32))> {
+        let (buffer, max) = self.video.bitrate_hint()?;
+        let bytes: u64 = self.samples.iter().map(|(_, data, _)| data.len() as u64).sum();
+        let ticks = self.samples.len() as u128 * tb.num.max(1) as u128;
+        let avg = if ticks == 0 { 0 } else { (bytes as u128 * 8 * tb.den as u128 / ticks).min(u32::MAX as u128) as u32 };
+        let max = if max == 0 { avg } else { max };
+        if buffer == 0 && max == 0 && avg == 0 {
+            return None;
+        }
+        Some((1, (buffer, max, avg)))
     }
 }
