@@ -742,3 +742,14 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
         _ => return None,
     })
 }
+
+// ---- H264ENCHRD (LEDGER SR699): the HRD option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// Signal the rate controller's bucket as the NAL HRD (h264enc_core's `Config::hrd`, `nle export --bitrate K --hrd`): the
+    /// SPS VUI timing_info + nal_hrd_parameters, buffering-period / pic-timing SEI in the samples, CBR filler; false = the pinned
+    /// stream (and without a bit rate nothing is signalled).
+    pub fn with_hrd(mut self, on: bool) -> H264Encoder {
+        self.rgba.cfg.hrd = on;
+        self
+    }
+}
