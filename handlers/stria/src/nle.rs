@@ -649,14 +649,10 @@ fn to_i16(x: f32) -> i64 {
     (x as f64 * 32768.0).round().clamp(-32768.0, 32767.0) as i64
 }
 
-/// The synthetic sources' audio rate.
-pub const SYNTH_RATE: u32 = 48_000;
-
-/// Sample `i` of the synthetic source whose frame ordinals start at `base`: `(base / 1000 mod 3) * 10000 + i mod 10000`
-/// (so a sample names its source and its index).
-pub fn synth_sample(base: u32, i: u64) -> i16 {
-    ((base / 1000 % 3) as i32 * 10_000 + (i % 10_000) as i32) as i16
-}
+/// The synthetic sources' audio rate, and sample `i` of the synthetic source whose frame ordinals start at `base`:
+/// `(base / 1000 mod 3) * 10000 + i mod 10000` (so a sample names its source and its index). NLE6UTP1SYNTH (SR749): both
+/// live in demux_core's `build` beside `synth_reel`, the reel both rings build.
+pub use gneiss_pal::dsp::demux::build::{SYNTH_RATE, synth_sample};
 
 /// A codec-free test source (MP4): `frames` `utp1` test-pattern frames, 64x48 at `fps`, ordinals `base..`, a keyframe
 /// every 10 frames; plus mono 16-bit PCM at [`SYNTH_RATE`] of [`synth_sample`]s, as long as the video.
@@ -667,15 +663,7 @@ pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
 /// EDITMAP (SR223): [`synth_source`] written with DEMUXSEEK's [`build::Mp4Extras`] (whole edit lists: track 1 is the video,
 /// track 2 the audio).
 pub fn synth_source_with(base: u32, frames: u32, fps: u32, x: &build::Mp4Extras) -> Vec<u8> {
-    let fps = fps.max(1);
-    let mut video = build::test_pattern_track(1, 64, 48, fps, frames, 10);
-    for (i, s) in video.samples.iter_mut().enumerate() {
-        s.data = build::TestPatternPacket { frame: base + i as u32, width: 64, height: 48 }.encode();
-    }
-    let n = frames as u64 * SYNTH_RATE as u64 / fps as u64;
-    let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
-    let audio = build::pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
-    build::mp4_with(&[video, audio], &build::Mp4Options::default(), x)
+    build::synth_reel(base, frames, fps, x) // NLE6UTP1SYNTH (SR749): the body moved to demux_core's build (ONE source)
 }
 
 /// The frame at source tick `src_t` of `src` from the decode run `run`: a step with `seek`, or a run on another
