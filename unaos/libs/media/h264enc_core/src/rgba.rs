@@ -39,11 +39,13 @@ pub struct RgbaEncoder {
     /// The stream's parameters; read when the first frame arrives (its size fills `width` / `height`).
     pub cfg: Config,
     enc: Option<Encoder>,
+    /// H264ENCTWOPASS (LEDGER SR698): the first pass's records the encoder is planned from (empty: no plan).
+    two_pass: Vec<crate::rc::PicStat>,
 }
 
 impl RgbaEncoder {
     pub fn new(cfg: Config) -> RgbaEncoder {
-        RgbaEncoder { cfg, enc: None }
+        RgbaEncoder { cfg, enc: None, two_pass: Vec::new() }
     }
 
     /// The encoder has been built (a first frame was pushed).
@@ -65,7 +67,7 @@ impl RgbaEncoder {
     /// THE planar entry (H264ENCPLANES B973): one 8-bit 4:2:0 picture, the encoder built from its size at the first frame.
     pub fn push_planes(&mut self, f: &Yuv420) -> Result<Vec<Unit>> {
         if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width: f.width, height: f.height, ..self.cfg })?);
+            self.enc = Some(Encoder::new(Config { width: f.width, height: f.height, ..self.cfg })?.planned(&self.two_pass)?);
         }
         let Some(enc) = self.enc.as_mut() else { return Ok(Vec::new()) };
         Ok(enc.push(f)?.into_iter().map(Unit::of).collect())
@@ -82,6 +84,21 @@ impl RgbaEncoder {
     /// The AVCDecoderConfigurationRecord (the `avcC` box body); empty before the first frame.
     pub fn avcc(&self) -> Vec<u8> {
         self.enc.as_ref().map(Encoder::avcc).unwrap_or_default()
+    }
+}
+
+// ---- H264ENCTWOPASS (LEDGER SR698): the two-pass plan in, the per-picture records out (named tail block) ----
+impl RgbaEncoder {
+    /// Plan the encoder from a first pass's `stats` when it is built (`Encoder::planned`; the config's rate must be
+    /// `RcMode::TwoPass`, else the first frame is refused with `Error::Rate`). Empty = no plan.
+    pub fn with_two_pass(mut self, stats: Vec<crate::rc::PicStat>) -> RgbaEncoder {
+        self.two_pass = stats;
+        self
+    }
+
+    /// The encoder's record per coded picture (`Encoder::stats`); empty before the first frame.
+    pub fn stats(&self) -> &[crate::rc::PicStat] {
+        self.enc.as_ref().map_or(&[][..], |e| e.stats())
     }
 }
 
