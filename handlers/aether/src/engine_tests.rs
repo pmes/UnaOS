@@ -4385,4 +4385,29 @@ mod tests {
         assert!(!dot.is_empty() && dot[dot.len() - 1] - dot[0] <= 3, "the last glyph is a dot, not a clipped letter: {dot:?}");
         assert!(dot[0] * 2 >= top + bottom, "the dot sits in the line's lower half: {dot:?} in {top}..{bottom}");
     }
+
+    // ---- AETHERHOSTWGHT (LEDGER SR690): font-weight on a variable face paints its instance (named tail block) ----
+
+    /// AETHERHOSTWGHT (SR690): the face the installed-family roads give (`fonts::styled_face`, what `db_face` loads)
+    /// for the tree's Inter variable face at 600 is the wght 600 instance, not the 400 one: a distinct face, no
+    /// synthetic bold, more ink in `H`; at 700 (where `select` asks for synthetic bold) the axis reaches the weight and
+    /// no embolden path is taken. Through `styled_face` rather than a page: the process-wide font database holds no
+    /// installed variable face on the seat.
+    #[test]
+    fn font_weight_600_paints_the_instance() {
+        use crate::fonts::{db, raster};
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fonts/inter/InterVariable.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter variable face");
+        let at = |w: f32, bold: bool| {
+            let want = db::Style { weight: w, ..db::Style::default() };
+            crate::fonts::styled_face(&info, bold, false, want).expect("Inter loads")
+        };
+        let (regular, semibold, bold) = (at(400.0, false), at(600.0, false), at(700.0, true));
+        assert_ne!(regular.id, semibold.id, "600 is its own instance");
+        assert!(!regular.synth_bold && !semibold.synth_bold && !bold.synth_bold, "no embolden path on a wght face");
+        let gid = regular.font.glyph_index('H');
+        let ink = |f: &crate::fonts::Face| raster::glyph(f, gid, 32.0, 0).map_or(0u64, |m| m.data.iter().map(|&v| v as u64).sum());
+        let (r, s, b) = (ink(regular), ink(semibold), ink(bold));
+        assert!(r < s && s < b, "ink grows with the instanced weight: 400 {r}, 600 {s}, 700 {b}");
+    }
 }
