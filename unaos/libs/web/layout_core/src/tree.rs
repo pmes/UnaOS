@@ -1932,7 +1932,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
                     let h = attr_px("height").or(intrinsic.map(|(_, h)| h));
-                    if let Some(wh) = img_alt_extent::<H, F>(tree, node_id, &size, fonts) { out.imgs.insert(node_id, wh); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
+                    if let Some(run) = img_alt_extent::<H>(tree, node_id, &size) { out.text.insert(node_id, run); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
                         out.imgs.insert(node_id, (w, h));
                     }
                 }
@@ -2160,7 +2160,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
     let is_cell = |tree: &LayoutTree<H>, id: taffy::NodeId| {
         tree.node_map.get(&id).and_then(|n| n.tag().map(|t| matches!(t.as_str(), "td" | "th"))).unwrap_or(false)
     };
-    let mut saved_widths: Vec<(taffy::NodeId, Dimension)> = Vec::new();
+    let mut saved_widths: Vec<(taffy::NodeId, Dimension)> = Vec::new(); let alt_caps = img_alt_cap(tree, &text_info); if !alt_caps.is_empty() { run_pass(tree); }
     for _ in 0..4 {
         let heights = inline::layout_all(tree, &text_info, &elem_info, fonts);
         let mut changed = false;
@@ -2294,7 +2294,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
             let _ = tree.taffy.set_style(f.id, st);
         }
     }
-    for (id, d) in mc_heights {
+    img_alt_uncap(tree, alt_caps); for (id, d) in mc_heights {
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
             st.size.height = d;
@@ -3133,14 +3133,15 @@ pub fn img_fallback_of<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> ImgF
     img_fallback(alt.as_deref(), title.as_deref(), state, w, h, aspect, is_quirks(node))
 }
 
-/// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) measured as ONE
-/// line in the element's own run by `measure_text_run`, the measurer the painter's line breaker matches; None for
-/// every other img (today's sizing).
-fn img_alt_extent<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, id: taffy::NodeId, run: &TextRun, fonts: &F) -> Option<(f32, f32)> {
+/// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) in the element's
+/// own run, the img node's measured text run (AETHERIMGALTINLINEWRAP SR707: `run_pass`'s text branch measures it by
+/// `measure_text_run` at the width taffy settles, capped at the containing block by `img_alt_cap`, so it wraps); None
+/// for every other img (today's sizing).
+fn img_alt_extent<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, run: &TextRun) -> Option<TextRun> {
     match img_fallback_of(tree, id) {
         ImgFallback::InlineAlt(alt) => {
             let text = H::transform_text(&alt, run.text_transform);
-            Some(measure_text_run(&TextRun { text, ..run.clone() }, f32::MAX, fonts))
+            Some(TextRun { text, ..run.clone() })
         }
         _ => None,
     }
@@ -3370,5 +3371,126 @@ mod img_broken_icon_kat {
         let at = |x: u8, y: u8| BROKEN_ICON.iter().rev().find(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h).map(|r| r.fill);
         assert_eq!(at(1, 5), Some((128, 128, 128)));
         assert_eq!(at(0, 0), None);
+    }
+}
+
+// ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's text wraps at its containing block (named tail block) ----
+
+/// AETHERIMGALTINLINEWRAP (SR707): caps every in-flow inline-level InlineAlt img (an ELEMENT key of `text`: `resolve`
+/// files text nodes and, through `img_alt_extent`, those imgs only) at its containing block: the content width of its
+/// nearest ancestor that is not inline-level, less the img's own horizontal margins (and border / padding under
+/// content-box sizing), as `max_size.width` (`img_alt_cap_of` meets an author value). taffy measures an inline item's
+/// flex basis at max-content and never shrinks it (`flex_shrink` 0), so without the cap a long alt is one line as wide
+/// as the viewport; with it the main size clamps and `run_pass` measures the run at that width, over lines. Returns
+/// the saved values for `img_alt_uncap` (the `mc_saved` shape).
+fn img_alt_cap<H: Host>(tree: &mut LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<(taffy::NodeId, LengthPercentageAuto)> {
+    let mut saved = Vec::new();
+    let alts: Vec<taffy::NodeId> = text.keys().copied().filter(|id| tree.node_map.get(id).is_some_and(|n| n.is_element())).collect();
+    for id in alts {
+        let placed = tree.paint_map.get(&id).is_some_and(|p| matches!(p.position_kind, Some(2 | 3)) || p.float.is_some_and(|f| f != 0));
+        if placed || !is_inline_level(tree, id) {
+            continue;
+        }
+        let mut cb = tree.taffy.parent(id);
+        while let Some(p) = cb {
+            if !is_inline_level(tree, p) {
+                break;
+            }
+            cb = tree.taffy.parent(p);
+        }
+        let Some(cb) = cb else { continue };
+        let Ok(l) = tree.taffy.layout(cb) else { continue };
+        let cw = l.size.width - l.padding.left - l.padding.right - l.border.left - l.border.right;
+        let Ok(il) = tree.taffy.layout(id) else { continue };
+        let Ok(st) = tree.taffy.style(id) else { continue };
+        let mut own = il.margin.left + il.margin.right;
+        if st.box_sizing == taffy::style::BoxSizing::ContentBox {
+            own += il.border.left + il.border.right + il.padding.left + il.padding.right;
+        }
+        let Some(cap) = img_alt_cap_of(st.max_size.width, (cw - own).max(0.0)) else { continue };
+        if cap == st.max_size.width {
+            continue;
+        }
+        saved.push((id, st.max_size.width));
+        let mut st = st.clone();
+        st.max_size.width = cap;
+        let _ = tree.taffy.set_style(id, st);
+    }
+    saved
+}
+
+/// AETHERIMGALTINLINEWRAP (SR707): the cap `img_alt_cap` writes over an author `max-width`: `auto` -> the containing
+/// block's width `cw`; a px length -> the smaller of the two; anything else (a percentage, calc) -> None, the author's
+/// value kept.
+fn img_alt_cap_of(author: LengthPercentageAuto, cw: f32) -> Option<LengthPercentageAuto> {
+    let raw = author.into_raw();
+    if author == LengthPercentageAuto::auto() {
+        Some(LengthPercentageAuto::length(cw))
+    } else if raw.tag() == taffy::style::CompactLength::LENGTH_TAG {
+        Some(LengthPercentageAuto::length(raw.value().min(cw)))
+    } else {
+        None
+    }
+}
+
+/// AETHERIMGALTINLINEWRAP (SR707): puts back the `max-width`s `img_alt_cap` replaced, last saved first.
+fn img_alt_uncap<H: Host>(tree: &mut LayoutTree<H>, saved: Vec<(taffy::NodeId, LengthPercentageAuto)>) {
+    for (id, mw) in saved.into_iter().rev() {
+        if let Ok(st) = tree.taffy.style(id) {
+            let mut st = st.clone();
+            st.max_size.width = mw;
+            let _ = tree.taffy.set_style(id, st);
+        }
+    }
+}
+
+#[cfg(test)]
+mod img_alt_wrap_kat {
+    use super::{img_alt_cap_of, measure_text_run, TextRun};
+    use crate::prelude::*;
+    use crate::{Adv, FontSel, Fonts};
+    use taffy::style::LengthPercentageAuto;
+
+    /// 8 px per char, ascent 12 / descent 4 / no gap: a 16 px line.
+    struct Mono;
+    impl Fonts for Mono {
+        fn has_face(&self, _sel: FontSel) -> bool {
+            true
+        }
+        fn measure(&self, run: &str, _adv: &Adv) -> f32 {
+            run.chars().count() as f32 * 8.0
+        }
+        fn line_metrics(&self, _sel: FontSel, _size: f32) -> (f32, f32, f32) {
+            (12.0, 4.0, 0.0)
+        }
+        fn x_height(&self, _sel: FontSel, _size: f32) -> f32 {
+            8.0
+        }
+    }
+
+    fn run(text: &str) -> TextRun {
+        TextRun { text: text.to_string(), font_size: 16.0, ..Default::default() }
+    }
+
+    /// A 20-word alt measured at a 120 px column is several lines no wider than it; at f32::MAX (and a short alt at
+    /// 120 px) it is the one line SR681 sized.
+    #[test]
+    fn imgalt_wraps_at_the_column_kat() {
+        let long = run("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty");
+        let (w, h) = measure_text_run(&long, 120.0, &Mono);
+        assert!(w <= 120.0 && w > 0.0, "wrapped width {w}");
+        assert!(h > 16.0 * 2.0, "several 16 px lines: {h}");
+        let (_, h1) = measure_text_run(&long, f32::MAX, &Mono);
+        assert_eq!(h1, 16.0, "unbounded: one line");
+        assert_eq!(measure_text_run(&run("Logo"), 120.0, &Mono), (32.0, 16.0), "a short alt is unchanged");
+    }
+
+    /// The cap over an author max-width: auto -> the column, a length -> the smaller, a percentage -> kept.
+    #[test]
+    fn imgalt_cap_of_kat() {
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::auto(), 120.0), Some(LengthPercentageAuto::length(120.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::length(80.0), 120.0), Some(LengthPercentageAuto::length(80.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::length(300.0), 120.0), Some(LengthPercentageAuto::length(120.0)));
+        assert_eq!(img_alt_cap_of(LengthPercentageAuto::percent(0.5), 120.0), None);
     }
 }
