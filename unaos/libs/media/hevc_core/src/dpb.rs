@@ -396,8 +396,8 @@ impl Dpb {
     /// HEVCERRORCONCEALMOTION (SR710): project the source picture `src` (POC s) along its own motion into the generated
     /// picture `pic` (POC c), over the still copy `conceal_from` already made. Source S predicted block x from reference
     /// R (POC r, the block's stored `ref_poc`) by mv: S(x) = R(x + mv), so the lost picture is C(x) ~ S(x + mv'), mv' =
-    /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), rounded to whole samples and fetched from S's own
-    /// planes through `luma_mc` / `chroma_mc`'s zero-fraction arm (nearest-edge clamped), per 8x8 block read at its
+    /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), kept at quarter samples (HEVCCONCEALSUBPEL SR733) and
+    /// fetched from S's own planes through `luma_mc` / `chroma_mc`'s fractional filters (nearest-edge clamped), per 8x8 block read at its
     /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
     /// intra block copy (ref_poc == s); HEVCCONCEALBIDIR (SR721): each usable list projects (`project_lists`), two are averaged by
     /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
@@ -456,24 +456,25 @@ impl Dpb {
 // ---- HEVCCONCEALBIDIR (LEDGER SR721): a bi-predicted source block projected along both lists (named tail block) ----
 /// HEVCCONCEALBIDIR (SR721): the projected vector of each list of source block motion `m` (source POC `s_poc`, lost POC
 /// `c_poc`): a list that is used, not long-term and not intra block copy (its ref_poc is not the source's) gives
-/// `scale_mv(mv, s - r, c - s)` rounded to whole samples (SR710's rule, per list); an unusable list is `None`, so a block
+/// `scale_mv(mv, s - r, c - s)` kept at quarter samples (HEVCCONCEALSUBPEL SR733; SR710's rule, per list); an unusable list is `None`, so a block
 /// with one unusable list projects along the other alone.
 fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Option<[i32; 2]>; 2] {
     let mut cand = [None, None];
     for (l, slot) in cand.iter_mut().enumerate() {
         if m.uses(l) && !m.ref_lt[l] && m.ref_poc[l] != s_poc {
-            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc).map(|v| ((v + 2) >> 2) << 2));
+            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc));
         }
     }
     cand
 }
 
 /// HEVCCONCEALBIDIR (SR721): the cw x ch samples of component `c` at (cx, cy) fetched from the source plane `r` along each
-/// candidate of [`project_lists`] (whole-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub`) through
-/// `luma_mc` / `chroma_mc`'s zero-fraction arm, written to `out` at sample depth: two candidates averaged by inter.rs
-/// `bi_default` (8-262), one shifted down by shift3. A block is at most 8x8 in every plane (the stack buffer).
+/// candidate of [`project_lists`] (quarter-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub` as `predict_pu`) through
+/// `luma_mc` / `chroma_mc`'s fractional filters (HEVCCONCEALSUBPEL SR733), written to `out` at sample depth, clipped: two candidates averaged by inter.rs
+/// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261). A block is at most 8x8 in every plane (the stack buffer).
 fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, out: &mut [i32]) {
     let n = (cw * ch) as usize;
+    let max = (1i32 << bd) - 1;
     let mut second = [0i32; 64];
     let mut got = 0;
     for mv in cand.iter().flatten() {
@@ -481,19 +482,18 @@ fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32,
         if c == 0 {
             crate::inter::luma_mc(r, cx, cy, *mv, cw, ch, bd, buf);
         } else {
-            let mvc = [((mv[0] * 2 / sub.0) >> 3) << 3, ((mv[1] * 2 / sub.1) >> 3) << 3];
+            let mvc = [mv[0] * 2 / sub.0, mv[1] * 2 / sub.1];
             crate::inter::chroma_mc(r, cx, cy, mvc, cw, ch, bd, buf);
         }
         got += 1;
     }
     if got == 2 {
         for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
-            *a = crate::inter::bi_default(*a, b, bd);
+            *a = crate::inter::bi_default(*a, b, bd).clamp(0, max);
         }
     } else {
-        let shift3 = (14 - bd as i32).max(2);
         for a in out[..n].iter_mut() {
-            *a >>= shift3;
+            *a = crate::inter::uni_default(*a, bd).clamp(0, max);
         }
     }
 }
