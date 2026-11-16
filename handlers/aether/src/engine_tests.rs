@@ -4278,4 +4278,114 @@ mod tests {
         let (n, _, _) = caption_ink(&mut engine, "a");
         assert!(n > 0, "a: an image input with no image paints its alt text");
     }
+
+    // ---- AETHERIMGALT (LEDGER SR681): a failed img's alt text (named tail block) --------------------------------
+
+    /// AETHERIMGALT (SR681): the border box of `id` and the dark-ink count over [x0, x1) x [y0, y1) of the surface.
+    fn imgalt_rect(e: &mut crate::AetherEngine, id: &str) -> (f64, f64, f64, f64) {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        (r(e, "left"), r(e, "top"), r(e, "width"), r(e, "height"))
+    }
+
+    fn imgalt_ink(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        let sw = e.width as usize;
+        let s = e.surface();
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                if s.get(i..i + 3).is_some_and(|p| p.iter().all(|&c| c < 128)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn imgalt_px(e: &crate::AetherEngine, x: usize, y: usize) -> (u8, u8, u8) {
+        let i = (y * e.width as usize + x) * 4;
+        let s = e.surface();
+        (s[i + 2], s[i + 1], s[i])
+    }
+
+    /// AETHERIMGALT (SR681): a failed img with a non-empty alt and no size is its alt text laid out inline (Chromium's
+    /// HTMLImageFallbackHelper: a non-replaced phrasing element whose content is the text): the box is the text's
+    /// width, the text paints. In standards mode a SIZED one is inline text too (AdjustHostStyle drops the size).
+    #[test]
+    fn img_alt_inline_when_unsized_and_failed() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="i" src="missing.png" alt="Hello"></div>
+            <div><span id="s">Hello</span></div>
+            <div><img id="z" src="missing.png" alt="Hello" width="200" height="100"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (_, _, sw, _) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "i");
+        assert!(sw > 10.0 && (w - sw).abs() <= 1.0, "i: the box is the alt text's width ({w} vs the span's {sw})");
+        assert!(h > 8.0 && h < 40.0, "i: one line tall ({h})");
+        let ink = imgalt_ink(&engine, l.floor() as usize, (l + w).ceil() as usize, t.floor() as usize, (t + h).ceil() as usize);
+        assert!(ink > 0, "i: the alt text paints");
+        let (_, _, zw, zh) = imgalt_rect(&mut engine, "z");
+        assert!((zw - sw).abs() <= 1.0 && zh < 40.0, "z: a standards-mode sized img with alt is inline text, not 200x100 ({zw}x{zh})");
+    }
+
+    /// AETHERIMGALT (SR681): in quirks mode a sized failed img is a box of its size (TreatImageAsReplaced) with the 1px
+    /// solid silver border, 1px padding, the 16px icon slot left empty, and the alt text after it on the first line.
+    #[test]
+    fn img_alt_boxed_when_sized() {
+        let html = r#"<html><body style="margin:0;font:16px sans-serif">
+            <div><img id="b" src="missing.png" alt="Hi" width="200" height="100"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "b");
+        assert!((w - 200.0).abs() <= 0.5 && (h - 100.0).abs() <= 0.5, "b: the box keeps its 200x100 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        let silver = (192, 192, 192);
+        assert_eq!(imgalt_px(&engine, l, t + 50), silver, "b: the left border");
+        assert_eq!(imgalt_px(&engine, l + 199, t + 50), silver, "b: the right border");
+        assert_eq!(imgalt_px(&engine, l + 100, t), silver, "b: the top border");
+        assert_eq!(imgalt_px(&engine, l + 100, t + 99), silver, "b: the bottom border");
+        assert_eq!(imgalt_px(&engine, l + 100, t + 70), (255, 255, 255), "b: the inside is not filled");
+        assert!(imgalt_ink(&engine, l + 18, l + 199, t + 2, t + 30) > 0, "b: the alt text paints after the icon slot");
+        assert_eq!(imgalt_ink(&engine, l + 1, l + 17, t + 1, t + 99), 0, "b: the icon slot stays empty (icon owed)");
+    }
+
+    /// AETHERIMGALT (SR681): a failed, unsized img with alt="" represents nothing: no box, no ink.
+    #[test]
+    fn img_empty_alt_paints_nothing() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="e" src="missing.png" alt=""></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (_, _, w, _) = imgalt_rect(&mut engine, "e");
+        assert!(w <= 0.5, "e: an empty alt takes no width ({w})");
+        assert_eq!(imgalt_ink(&engine, 0, 400, 0, 60), 0, "e: nothing paints");
+    }
+
+    /// AETHERIMGALT (SR681): a `loading=lazy` img not yet fetched is pending, not failed: it keeps its attribute size
+    /// and paints no alt text and no border (a file page, so the lazy pass starts no fetch).
+    #[test]
+    fn img_pending_paints_nothing_yet() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="p" src="x.png" loading="lazy" alt="Hello" width="200" height="100"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("file:///imgalt.html", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "p");
+        assert!((w - 200.0).abs() <= 0.5 && (h - 100.0).abs() <= 0.5, "p: the attributes size the pending box ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_px(&engine, l, t + 50), (255, 255, 255), "p: no border");
+        assert_eq!(imgalt_ink(&engine, l, l + 200, t, t + 100), 0, "p: no alt text yet");
+    }
 }
