@@ -2322,6 +2322,43 @@ fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String
     }
 }
 
+// ---- STRIAINFOREEL (LEDGER SR743): the face's message line — an error, else the selected clip's reel summary (named tail block) ----
+// `last_error` stays THE message; its idle text is the selected clip's reel line (`<reel>: <nle::Sources::summary>`). It paints as
+// one quiet line over the preview band's foot through the face's own `Labels` hook (the clip labels' style and ink, no fill),
+// only when labels are on, so every labels-off golden is byte-identical. Owed: STRIA-INFO-REEL-STRIP (a message row of its own
+// in timeline_core::view's Layout), STRIA-INFO-REEL-ELIDE (an ellipsis at the band's width: none is reachable here, the paint
+// clips at it), STRIA-INFO-REEL-HOVER (the summary on hover over an unselected clip).
+
+/// STRIAINFOREEL (SR743): the message line's height (px): a band shorter than this shows no message.
+pub const MESSAGE_H: u32 = 14;
+
+impl Face {
+    /// The selected clip's reel as a person reads it: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
+    /// selected or a reel with nothing to say.
+    pub fn reel_line(&self) -> Option<String> {
+        let c = self.state.selected()?;
+        let s = self.sources.summary(c.src)?;
+        let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
+        Some(format!("{name}: {s}"))
+    }
+    /// The face's message line: the last error while one stands, else [`Face::reel_line`].
+    pub fn message_text(&self) -> Option<String> {
+        self.last_error.clone().or_else(|| self.reel_line())
+    }
+    /// The message over a painted canvas: one line at x 4, baseline `preview_h - 4`, clipped to the canvas width, through
+    /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
+    fn paint_message(&self, px: Vec<u8>, l: Layout, role: Role) -> Vec<u8> {
+        let Some(style) = self.labels.as_ref() else { return px };
+        if role == Role::Tracks || l.preview_h < MESSAGE_H {
+            return px;
+        }
+        let Some(text) = self.message_text() else { return px };
+        let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
+        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, l.preview_h as f32 - 4.0, (0, l.w as i32));
+        c.px
+    }
+}
+
 // ---- NLETRANSITIONFACE (LEDGER SR691): the transition widget's edge drag and kind / ease (named tail block) ----
 
 /// NLETRANSITIONFACE (SR691): a press on a transition widget's edge zone begins timeline_core's edge drag
@@ -2486,43 +2523,6 @@ fn slipslide_word(v: &str) -> String {
         None => (v.trim_end_matches('+'), 1),
     };
     format!("{word} {step}")
-}
-
-// ---- STRIAINFOREEL (LEDGER SR743): the face's message line — an error, else the selected clip's reel summary (named tail block) ----
-// `last_error` stays THE message; its idle text is the selected clip's reel line (`<reel>: <nle::Sources::summary>`). It paints as
-// one quiet line over the preview band's foot through the face's own `Labels` hook (the clip labels' style and ink, no fill),
-// only when labels are on, so every labels-off golden is byte-identical. Owed: STRIA-INFO-REEL-STRIP (a message row of its own
-// in timeline_core::view's Layout), STRIA-INFO-REEL-ELIDE (an ellipsis at the band's width: none is reachable here, the paint
-// clips at it), STRIA-INFO-REEL-HOVER (the summary on hover over an unselected clip).
-
-/// STRIAINFOREEL (SR743): the message line's height (px): a band shorter than this shows no message.
-pub const MESSAGE_H: u32 = 14;
-
-impl Face {
-    /// The selected clip's reel as a person reads it: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
-    /// selected or a reel with nothing to say.
-    pub fn reel_line(&self) -> Option<String> {
-        let c = self.state.selected()?;
-        let s = self.sources.summary(c.src)?;
-        let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
-        Some(format!("{name}: {s}"))
-    }
-    /// The face's message line: the last error while one stands, else [`Face::reel_line`].
-    pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.reel_line())
-    }
-    /// The message over a painted canvas: one line at x 4, baseline `preview_h - 4`, clipped to the canvas width, through
-    /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
-    fn paint_message(&self, px: Vec<u8>, l: Layout, role: Role) -> Vec<u8> {
-        let Some(style) = self.labels.as_ref() else { return px };
-        if role == Role::Tracks || l.preview_h < MESSAGE_H {
-            return px;
-        }
-        let Some(text) = self.message_text() else { return px };
-        let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
-        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, l.preview_h as f32 - 4.0, (0, l.w as i32));
-        c.px
-    }
 }
 
 // ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay over the timeline band (named tail block) ----
