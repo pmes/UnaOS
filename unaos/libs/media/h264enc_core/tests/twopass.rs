@@ -521,7 +521,7 @@ fn o_intra_counts_from_the_coder() {
         enc.push(&frame(&scene(t))).unwrap();
     }
     enc.flush().unwrap();
-    for (pics, want) in [(first_pass(60), 19u32), (enc.stats().to_vec(), 9)] {
+    for (pics, want) in [(first_pass(60), 8u32), (enc.stats().to_vec(), 7)] { // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 19 / 9
         let counts: Vec<String> = pics.iter().map(|p| format!("{:?}:{}/{}", p.kind, p.intra_mbs, p.mbs)).collect();
         println!("twopassblurintra counts {}", counts.join(" ")); assert_eq!(pics.iter().filter(|p| p.kind != Pic::Idr).map(|p| p.intra_mbs).sum::<u32>(), want, "the P / B intra total");
         for p in &pics {

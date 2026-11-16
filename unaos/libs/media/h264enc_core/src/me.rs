@@ -282,7 +282,7 @@ impl Encoder {
             (luma, chroma) = self.inter_pred(&self.refp, mbx, mby, mv);
             code = self.inter_luma(mbx, mby, &luma, Kind::P16);
         }
-        code.mvd = [mv.x as i32 - pred_mv.x as i32, mv.y as i32 - pred_mv.y as i32]; if let Some(intra) = self.intra_over(mbx, mby, self.p16_cost(mbx, mby, &luma, code.mvd), 5) { return intra; }
+        code.mvd = [mv.x as i32 - pred_mv.x as i32, mv.y as i32 - pred_mv.y as i32]; if let Some(intra) = self.intra_over(mbx, mby, self.p16_cost(mbx, mby, &luma, &chroma, code.mvd), 5) { return intra; }
         self.inter_recon(mbx, mby, &luma, &chroma, &mut code);
         self.motion[i] = MbMotion { r: 0, mv };
         code
@@ -376,7 +376,7 @@ impl Encoder {
                 best = Some((cost, kind, m, l, c));
             }
         }
-        let (cost, kind, m, l, c) = best.expect("four candidates"); if let Some(intra) = self.intra_over(mbx, mby, cost, 23) { return intra; }
+        let (cost, kind, m, l, c) = best.expect("four candidates"); if let Some(intra) = self.intra_over(mbx, mby, cost + self.chroma_sad(mbx, mby, &c), 23) { return intra; }
         let mut code = self.inter_luma(mbx, mby, &l, kind);
         if kind.l0() {
             code.mvd = mvd0;
@@ -427,8 +427,19 @@ impl Encoder {
 // ---- H264ENCPINTRA (LEDGER SR759): the P_L0_16x16 candidate's cost on b_mb's scale (named tail block) ----
 impl Encoder {
     /// The cost of macroblock (mbx, mby) as P_L0_16x16 with luma prediction `luma` and motion vector difference `mvd`:
-    /// luma SAD + lambda x (mb_type ue(0) + the mvd's se(v) bits), the unit `b_mb` scores its candidates in.
-    fn p16_cost(&self, mbx: usize, mby: usize, luma: &[i32; 256], mvd: [i32; 2]) -> u32 {
-        self.sad(0, mbx * 16, mby * 16, 16, luma) + lambda(self.qp) * (ue_bits(0) + se_bits(mvd[0]) + se_bits(mvd[1]))
+    /// luma SAD + lambda x (mb_type ue(0) + the mvd's se(v) bits), the unit `b_mb` scores its candidates in, + the chroma
+    /// prediction `chroma`'s Cb + Cr SAD ([`Encoder::chroma_sad`], H264ENCPINTRACHROMA SR771).
+    fn p16_cost(&self, mbx: usize, mby: usize, luma: &[i32; 256], chroma: &[[i32; 64]; 2], mvd: [i32; 2]) -> u32 {
+        self.sad(0, mbx * 16, mby * 16, 16, luma) + lambda(self.qp) * (ue_bits(0) + se_bits(mvd[0]) + se_bits(mvd[1])) + self.chroma_sad(mbx, mby, chroma)
+    }
+}
+
+// ---- H264ENCPINTRACHROMA (LEDGER SR771): the inter chroma SAD of the intra / inter decision (named tail block) ----
+impl Encoder {
+    /// The Cb + Cr SAD of macroblock (mbx, mby) against the inter chroma prediction `chroma` (the unit `intra_scored`'s chroma
+    /// mode search scores in): the inter side of `intra_over`'s compare pays the chroma as the intra side does (x264 analyse.c
+    /// under its default b_chroma_me: `i_satd_chroma` added to the intra candidates, the chroma in the inter costs).
+    fn chroma_sad(&self, mbx: usize, mby: usize, chroma: &[[i32; 64]; 2]) -> u32 {
+        self.sad(1, mbx * 8, mby * 8, 8, &chroma[0]) + self.sad(2, mbx * 8, mby * 8, 8, &chroma[1])
     }
 }

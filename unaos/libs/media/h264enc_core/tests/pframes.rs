@@ -337,3 +337,45 @@ fn pintra_static_and_flat_p_code_no_intra() {
         }
     }
 }
+
+// ---- H264ENCPINTRACHROMA (LEDGER SR771): a P macroblock whose chroma the reference cannot predict codes intra (named tail block) ----
+
+/// Luma flat 100 in every frame; frame 0's chroma flat 128, every later frame's chroma a ramp across the picture (Cb 64 + 4x,
+/// Cr 192 - 4x, x the chroma column; constant down each column). The inter prediction of a later frame matches its luma exactly
+/// and its chroma not at all (the reference's flat 128 at any vector); the intra prediction matches its luma (Intra_16x16 from the
+/// reconstructed 100) and, below the first macroblock row, its chroma (chroma Vertical copies the row above).
+fn chroma_ramp_new(t: usize) -> [Vec<u8>; 3] {
+    let mut p = [vec![100u8; W * H], vec![128u8; W * H / 4], vec![128u8; W * H / 4]];
+    if t == 0 {
+        return p;
+    }
+    for y in 0..H / 2 {
+        for x in 0..W / 2 {
+            p[1][y * (W / 2) + x] = (64 + 4 * x) as u8;
+            p[2][y * (W / 2) + x] = (192 - 4 * x) as u8;
+        }
+    }
+    p
+}
+
+/// The fewest intra macroblocks [`chroma_ramp_new`]'s first P codes under the chroma-aware decision (measured: [12, 9, 0] under CAVLC and CABAC, the 8x8 transform off and on; P bytes CAVLC 77 / 74, CABAC 69 / 66).
+const PCHROMA_MIN: u32 = 9;
+
+/// H264ENCPINTRACHROMA (SR771): [`chroma_ramp_new`]'s first P codes intra where the chroma decides it — the intra / inter
+/// compare pays the chroma SAD on both sides (x264 analyse.c under its default b_chroma_me adds `i_satd_chroma` to every
+/// intra candidate and carries the chroma in the inter costs). Under SR759's luma-only rule the inter candidate's luma SAD 0
+/// + lambda x 3 bits beat the intra's ~0 + lambda x >= 5 bits on every macroblock (measured before the edit: P intra_mbs
+/// [12, 0, 0], CAVLC P bytes 162); with the chroma the inter's Cb + Cr SAD against the flat reference loses to chroma Vertical's. The stream
+/// decodes frame by frame to the encoder's reconstruction under CAVLC and CABAC, the 8x8 transform off and on.
+#[test]
+fn pchroma_ramp_codes_intra_and_decodes() {
+    for entropy in [h264enc_core::Entropy::Cavlc, h264enc_core::Entropy::Cabac] {
+        for t8x8 in [false, true] {
+            let c = Config { entropy, transform8x8: t8x8, ..cfg(26, 10, false, 2) };
+            let (aus, _) = round_trip_cfg(c, 3, chroma_ramp_new, 30.0);
+            let intra = intra_counts(c, 3, chroma_ramp_new);
+            println!("pchroma {entropy:?} t8x8 {t8x8} P intra_mbs={intra:?} p_bytes={}", p_bytes(&aus));
+            assert!(intra[1] >= PCHROMA_MIN, "{entropy:?} t8x8 {t8x8}: the chroma ramp coded {} intra macroblocks, want >= {PCHROMA_MIN} ({intra:?})", intra[1]);
+        }
+    }
+}

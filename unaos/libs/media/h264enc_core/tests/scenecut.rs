@@ -172,7 +172,7 @@ fn d_motion_is_not_a_cut_and_keeps_the_pinned_bytes() {
         assert_eq!(au.keyframe, t % 30 == 0, "frame {t}: a moving scene is not a cut");
         samples.push(au.avcc_sample());
     }
-    assert_eq!(fnv(&samples), 0x1fbc_56dc_6807_f2a8, "Some(40) on the moving scene: the None pin (tests/rc.rs qp26 gop30)");
+    assert_eq!(fnv(&samples), 0xd572_6ae5_9a9b_6d9c, "Some(40) on the moving scene: the None pin (tests/rc.rs qp26 gop30)"); // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1fbc_56dc_6807_f2a8
 }
 
 // ---- H264ENCSCENECUTFADE (LEDGER SR709): the gradual rule (named tail block) ----
