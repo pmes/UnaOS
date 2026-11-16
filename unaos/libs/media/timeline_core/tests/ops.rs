@@ -170,3 +170,27 @@ fn exportcolourprim_reels_colour_is_the_one_pair() {
     audio.tracks[0].clips.clear();
     assert_eq!(audio.reels_colour(by(Some(col(1, 1, 1)), Some(col(1, 1, 1)))), (2, 2), "no video clip");
 }
+
+// ---- NLE3ETRIMSTRETCH (LEDGER SR692): the ripple trims on plain clips (named tail block) ----
+#[test]
+fn nle3etrimstretch_ripple_trims_shift_the_rest_of_the_track() {
+    let (mut tl, a, b) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 55, 25)); // V1: A[0,10)@0 B[20,30)@10 A[50,55)@25
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    tl.validate().unwrap();
+    let before = tl.clone();
+    // out 5 earlier: the clip keeps its start, the later clip of its track moves 5 earlier, the other track stays
+    let r = tl.ripple_trim_out(0, 1, 25).unwrap();
+    assert_eq!(r.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 25, 10), Clip::new(a, 50, 55, 20)]);
+    assert_eq!(r.tracks[1], tl.tracks[1]);
+    // in 2 earlier: the clip is 2 longer from the same start, the later clip moves 2 later
+    let r = tl.ripple_trim_in(0, 1, 18).unwrap();
+    assert_eq!((r.tracks[0].clips[1], r.tracks[0].clips[2].at), (Clip::new(b, 18, 30, 10), 27));
+    // refused by name, the input untouched
+    assert_eq!(tl.ripple_trim_in(0, 1, 30), Err(EditError::Empty));
+    assert_eq!(tl.ripple_trim_in(0, 1, -1), Err(EditError::Negative));
+    assert_eq!(tl.ripple_trim_out(0, 1, 61), Err(EditError::OutOfSource));
+    assert_eq!(tl.ripple_trim_out(0, 5, 1), Err(EditError::NoClip));
+    assert_eq!(tl.ripple_trim_out(9, 0, 1), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
