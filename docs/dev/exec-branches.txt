@@ -1604,3 +1604,11 @@ exec-rmbp-nle5dclitable c03931d8a wave36 cut76h
 exec-rmbp-h264enctwopassfile c03931d8a wave36 cut76h
 exec-rmbp-h264enchrdmp4 c03931d8a wave36 cut76h
 exec-rmbp-hevcconcealbidir c03931d8a wave36 cut76h
+exec-rmbp-nle5dexportaudiooptions df4ca757d wave36 cut77h
+exec-rmbp-nle5drangesave df4ca757d wave36 cut77h
+exec-rmbp-aethertextaligncodes df4ca757d wave36 cut77h
+exec-rmbp-aetherhostwghtcoverface df4ca757d wave36 cut77h
+exec-rmbp-aetherimgaltinlineicon df4ca757d wave36 cut77h
+exec-rmbp-h264enctwopassrescale df4ca757d wave36 cut77h
+exec-rmbp-striainfobitrate df4ca757d wave36 cut77h
+exec-rmbp-nle6utp1 df4ca757d wave36 cut77h

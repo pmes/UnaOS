@@ -80,9 +80,9 @@ pub struct Dpb {
     /// HEVCINTERCIP (SR688): the PicOrderCntVal of every picture [`Dpb::generate_missing`] made, until taken.
     pub generated: Vec<i32>,
     // ---- HEVCERRORCONCEAL (LEDGER SR700): the concealment note (named struct-tail block) ----
-    /// HEVCERRORCONCEAL (SR700): (generated PicOrderCntVal, source PicOrderCntVal) of every generated picture whose
+    /// HEVCERRORCONCEAL (SR700): the [`Concealed`] note (generated / source PicOrderCntVal, projected: SR710) of every generated picture whose
     /// samples [`Dpb::conceal_from`] copied from the nearest held picture, until taken.
-    pub concealed: Vec<(i32, i32)>,
+    pub concealed: Vec<Concealed>,
     /// HEVCERRORCONCEAL (SR700): generated pictures left grey because the nearest held picture's planes or bit depths
     /// differed from theirs.
     pub conceal_misfit: u32,
@@ -375,6 +375,85 @@ impl Dpb {
             dst.data.copy_from_slice(&from.data);
         }
         let src_poc = s.poc;
-        self.concealed.push((pic.poc, src_poc));
+        let projected = self.conceal_motion(pic, src); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected });
+    }
+}
+
+// ---- HEVCERRORCONCEALMOTION (LEDGER SR710): a concealed picture projected along its source's motion (named tail block) ----
+/// HEVCERRORCONCEALMOTION (SR710): one concealment note — the generated picture's PicOrderCntVal, its source's, and
+/// whether any of its 8x8 blocks was projected along the source's motion by [`Dpb::conceal_motion`] (else the still
+/// copy of [`Dpb::conceal_from`] stands everywhere).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Concealed {
+    pub poc: i32,
+    pub src_poc: i32,
+    pub projected: bool,
+}
+
+impl Dpb {
+    /// HEVCERRORCONCEALMOTION (SR710): project the source picture `src` (POC s) along its own motion into the generated
+    /// picture `pic` (POC c), over the still copy `conceal_from` already made. Source S predicted block x from reference
+    /// R (POC r, the block's stored `ref_poc`) by mv: S(x) = R(x + mv), so the lost picture is C(x) ~ S(x + mv'), mv' =
+    /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), rounded to whole samples and fetched from S's own
+    /// planes through `luma_mc` / `chroma_mc`'s zero-fraction arm (nearest-edge clamped), per 8x8 block read at its
+    /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
+    /// intra block copy (ref_poc == s); predFlagL0 picks L0, else L1. A projected block's motion becomes mv' to S, so a
+    /// later picture's TMVP reads the projected vector. True when any block was projected.
+    fn conceal_motion(&self, pic: &mut Picture, src: usize) -> bool {
+        use crate::inter::{chroma_mc, luma_mc, scale_mv};
+        use crate::picture::PuMotion;
+        let s = &self.pics[src].pic;
+        if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
+            return false;
+        }
+        let (sub_w, sub_h) = {
+            let (a, b) = pic.chroma.sub();
+            (a as i32, b as i32)
+        };
+        let (w, h) = (pic.width as i32, pic.height as i32);
+        let mut projected = false;
+        let mut out: Vec<i32> = Vec::new();
+        for y in (0..h).step_by(8) {
+            for x in (0..w).step_by(8) {
+                let m = s.motion[s.idx4(x as usize, y as usize)];
+                let l = if m.uses(0) { 0 } else { 1 };
+                if m.pred == 0 || m.ref_lt[l] || m.ref_poc[l] == s.poc {
+                    continue;
+                }
+                let mv = scale_mv(m.mv[l], s.poc - m.ref_poc[l], pic.poc - s.poc).map(|v| ((v + 2) >> 2) << 2);
+                let (bw, bh) = ((w - x).min(8), (h - y).min(8));
+                for c in 0..3 {
+                    let (cx, cy, cw, ch, mvc, bd) = if c == 0 {
+                        (x, y, bw, bh, mv, pic.bit_depth)
+                    } else {
+                        (x / sub_w, y / sub_h, bw / sub_w, bh / sub_h, [((mv[0] * 2 / sub_w) >> 3) << 3, ((mv[1] * 2 / sub_h) >> 3) << 3], pic.bit_depth_c)
+                    };
+                    if pic.planes[c].w == 0 || pic.planes[c].h == 0 || cw <= 0 || ch <= 0 {
+                        continue;
+                    }
+                    out.clear();
+                    out.resize((cw * ch) as usize, 0);
+                    if c == 0 {
+                        luma_mc(&s.planes[0], cx, cy, mvc, cw, ch, bd, &mut out);
+                    } else {
+                        chroma_mc(&s.planes[c], cx, cy, mvc, cw, ch, bd, &mut out);
+                    }
+                    let shift3 = (14 - bd as i32).max(2);
+                    let plane = &mut pic.planes[c];
+                    for j in 0..ch {
+                        for i in 0..cw {
+                            let (px, py) = ((cx + i) as usize, (cy + j) as usize);
+                            if px < plane.w && py < plane.h {
+                                plane.set(px, py, (out[(j * cw + i) as usize] >> shift3) as u16);
+                            }
+                        }
+                    }
+                }
+                let pm = PuMotion { pred: 1, ref_idx: [0, -1], mv: [mv, [0, 0]], ref_poc: [s.poc, 0], ref_lt: [false, false] };
+                pic.fill4(x as usize, y as usize, bw as usize, bh as usize, |p, i| p.motion[i] = pm);
+                projected = true;
+            }
+        }
+        projected
     }
 }
