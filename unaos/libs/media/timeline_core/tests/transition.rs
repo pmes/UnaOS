@@ -680,3 +680,65 @@ fn nle3etrimstretch_the_editor_moves_a_pair_and_ripple_trims() {
     st.deselect();
     assert_eq!(st.verb("rtrim in 1"), Some(Err(EditError::NoClip)));
 }
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide around transitions (named tail block) ----
+
+/// V1: A[0,20)@0 of a 30-tick source (a 10-tick handle) -> B[0,20)@20 under a 9-tick dissolve.
+fn nle3eslip_short() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 30);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap()
+}
+
+#[test]
+fn nle3eslip_slip_keeps_the_transitions() {
+    // B slipped 3: both of its cuts stay where they are, the dissolve and the wipe unchanged
+    let s = three().slip(0, 1, 3).unwrap();
+    assert_eq!(s.tracks[0].clips[1], Clip::new(SourceId(1), 3, 23, 20));
+    assert_eq!(s.tracks[0].transitions, three().tracks[0].transitions);
+    // A slipped 25 leaves a 5-tick handle under the 9-tick dissolve: refused by name (no fit on a slip)
+    assert_eq!(three().slip(0, 0, 25), Err(EditError::Handle));
+}
+
+#[test]
+fn nle3eslip_slide_retargets_and_fits_the_dissolve() {
+    // a 9-tick dissolve into C; B slid 12 leaves C 8 ticks: the dissolve moves with the cut and fits its room
+    let tl = cuts().add_transition(0, 40, TransitionKind::Dissolve, 9).unwrap();
+    let s = tl.slide(0, 1, 12).unwrap();
+    let (a, b, c) = (SourceId(0), SourceId(1), SourceId(2));
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 32, 0), Clip::new(b, 0, 20, 32), Clip::new(c, 17, 25, 52)]);
+    assert_eq!((ats(&s), s.end()), (vec![(52, 8, TransitionKind::Dissolve)], tl.end()));
+    let text = edl::write(&s, "NLE3").unwrap();
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!((ats(&back), edl::write(&back, "NLE3").unwrap()), (ats(&s), text));
+    // the previous clip's handle under the slid cut: 5 left fits the dissolve to 5, none left is Handle, past it OutOfSource
+    assert_eq!(ats(&nle3eslip_short().slide(0, 1, 5).unwrap()), vec![(25, 5, TransitionKind::Dissolve)]);
+    assert_eq!(nle3eslip_short().slide(0, 1, 10), Err(EditError::Handle));
+    assert_eq!(nle3eslip_short().slide(0, 1, 11), Err(EditError::OutOfSource));
+    // the next clip's in point before its source's start; the neighbour-less side onto C's span
+    assert_eq!(three().slide(0, 1, -6), Err(EditError::OutOfSource));
+    assert_eq!(nle3etrimstretch_pair().slide(0, 1, 21), Err(EditError::Overlap));
+}
+
+#[test]
+fn nle3eslip_the_editor_slips_and_slides_once() {
+    use timeline_core::editor::EditorState;
+    let mut st = EditorState::new(three());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("slide 5"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (three().slide(0, 1, 5).unwrap(), 1));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, three());
+    assert_eq!(st.verb("slip 3"), Some(Ok(())));
+    let slipped = three().slip(0, 1, 3).unwrap();
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (slipped.clone(), 1));
+    // refused: the state and the undo stack unchanged
+    assert_eq!(st.verb("slip -4"), Some(Err(EditError::OutOfSource)));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (slipped, 1));
+    assert_eq!(st.verb("slide sideways"), None);
+    st.deselect();
+    assert_eq!(st.verb("slip 1"), Some(Err(EditError::NoClip)));
+}
