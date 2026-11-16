@@ -4784,4 +4784,79 @@ mod tests {
         let ib = bottom_ink(&engine, ix0, (il + iw).ceil() as usize).expect("the img's alt paints");
         assert!((sb as i64 - ib as i64).abs() <= 1, "both Hellos sit on one baseline (bottom ink rows {sb} vs {ib})");
     }
+
+    // ---- AETHERFILEVALUECLEAR (LEDGER SR715): `input.value = ""` and the form reset empty a file input's FileList (named tail block) ----
+
+    /// AETHERFILEVALUECLEAR (SR715): a form holding file input `in`, and outside it `out`, `cl`, `th` and a fresh `fresh`
+    /// (all multiple); every one but `fresh` is given two Files through SR706's DataTransfer helper.
+    fn file_value_clear_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <form id="fm"><div><input type="file" id="in" multiple></div></form>
+            <div><input type="file" id="out" multiple></div>
+            <div><input type="file" id="cl" multiple></div>
+            <div><input type="file" id="th" multiple></div>
+            <div><input type="file" id="fresh" multiple></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              ["in", "out", "cl", "th"].forEach(function (id) { document.getElementById(id).files = list(["a.txt", "b.txt"]); });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILEVALUECLEAR (SR715): the file input `id`'s status ink extent from its button's right edge (SR682's probe).
+    fn file_value_clear_extent(engine: &mut crate::AetherEngine, id: &str) -> (usize, usize) {
+        let (_, end, cols) = file_status_ink(engine, id);
+        assert!(!cols.is_empty(), "{id}: the status paints ink");
+        (cols[0] - end, cols[cols.len() - 1] - end)
+    }
+
+    /// AETHERFILEVALUECLEAR (SR715): `input.value = ""` empties the selected files (HTML §4.10.5.1.18): the FileList held
+    /// before the clear reads length 0 and loses its index, `value` reads "", and the painted status returns to a fresh
+    /// input's `No files chosen`.
+    #[test]
+    fn file_value_clear_empties_list() {
+        let mut engine = file_value_clear_page();
+        let before = file_value_clear_extent(&mut engine, "cl");
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var e = document.getElementById("cl"), k = e.files, n = k.length; e.value = ""; return [n, k.length, e.files.length, k[0] === undefined, k === e.files, JSON.stringify(e.value)].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "2,0,0,true,true,\"\"");
+        engine.tick(); engine.render_frame();
+        let (cl, fresh) = (file_value_clear_extent(&mut engine, "cl"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_ne!(before, fresh, "two Files painted `2 files` before the clear");
+        assert_eq!(cl, fresh, "the cleared input paints a fresh input's status");
+    }
+
+    /// AETHERFILEVALUECLEAR (SR715): any other string throws an InvalidStateError DOMException and leaves the selection.
+    #[test]
+    fn file_value_clear_nonempty_throws() {
+        let mut engine = file_value_clear_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var e = document.getElementById("th"), r; try { e.value = "x"; r = "no throw"; } catch (x) { r = x.name + "," + (x instanceof DOMException); } return r + "," + e.files.length; })()"#)
+            .unwrap();
+        assert_eq!(got, "InvalidStateError,true,2");
+        assert_eq!(js.eval_string("document.getElementById('th').value").unwrap(), "C:\\fakepath\\a.txt");
+    }
+
+    /// AETHERFILEVALUECLEAR (SR715): the form reset algorithm empties the list of a file input in the form (its status
+    /// paints a fresh input's) and leaves a file input outside the form.
+    #[test]
+    fn file_value_clear_form_reset() {
+        let mut engine = file_value_clear_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { document.getElementById("fm").reset(); return document.getElementById("in").files.length + "," + document.getElementById("out").files.length; })()"#)
+            .unwrap();
+        assert_eq!(got, "0,2");
+        engine.tick(); engine.render_frame();
+        let (inn, fresh) = (file_value_clear_extent(&mut engine, "in"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_eq!(inn, fresh, "the reset input paints a fresh input's status");
+    }
 }

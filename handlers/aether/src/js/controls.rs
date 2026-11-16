@@ -611,7 +611,7 @@ fn input_value_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         Mode::Filename => {
             if !v.is_empty() {
                 return throw_dom(vm, "InvalidStateError", "This input element accepts a filename, which may only be programmatically set to the empty string.");
-            }
+            } set_files(vm, el, Vec::new());
         }
         Mode::Value => set_value(el, &v),
     }
@@ -758,17 +758,7 @@ fn files_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     let v = arg(vm, ctx, 0);
     let Some(list) = this_tagged(vm, &v, T_FILELIST) else { return Ok(Value::Undefined) };
-    let files = filelist_files(vm, list); file_names_record(vm, el, &files);
-    let roots: Vec<usize> = files.into_iter().map(|f| root(vm, f)).collect();
-    if let Some(old) = FILES.with(|f| f.borrow_mut().insert(el, roots)) {
-        for r in old {
-            unroot(vm, r);
-        }
-    }
-    let own = files_get(vm, ctx)?;
-    if let Value::Object(o) = own {
-        filelist_sync(vm, o);
-    }
+    let files = filelist_files(vm, list); files_get(vm, ctx)?; set_files(vm, el, files);
     Ok(Value::Undefined)
 }
 
@@ -2391,7 +2381,7 @@ fn reset_control(vm: &mut Vm, el: usize) -> JsResult<()> {
                 p.checked.remove(&el);
             });
             let l = utf16_len(&value_of(el));
-            SELECTION.with(|s| s.borrow_mut().insert(el, Sel { start: l, end: l, dir: 0 }));
+            SELECTION.with(|s| s.borrow_mut().insert(el, Sel { start: l, end: l, dir: 0 })); if local(el) == "input" && input_type(el) == "file" { set_files(vm, el, Vec::new()); }
         }
         "select" => {
             for o in select_options(el) {
@@ -2652,4 +2642,24 @@ pub fn file_names(node: &crate::dom::NodeRef) -> Vec<String> {
 /// first selected file's name, else the empty string.
 fn file_value(el: usize) -> String {
     FILE_NAMES.with(|n| n.borrow().get(&el).and_then(|v| v.first().cloned())).map(|f| format!("C:\\fakepath\\{f}")).unwrap_or_default()
+}
+
+// ---- AETHERFILEVALUECLEAR (LEDGER SR715): one writer of a file input's selection (named tail block) ----
+
+/// AETHERFILEVALUECLEAR (SR715): replaces file input `el`'s selected files with `files` (HTML §4.10.5.1.18) — the one
+/// writer of `FILES` and, through `file_names_record`, of `FILE_NAMES` and the status repaint. Called by `files_set`
+/// (`input.files = list`), by `input_value_set` with the empty string (`input.value = ""` empties the list) and by
+/// `reset_control` (the form reset algorithm empties it). The element's own FileList reads `FILES` live; its indexed
+/// properties are re-read only when it already exists (the SameObject peek, as canvas.rs does for its context).
+fn set_files(vm: &mut Vm, el: usize, files: Vec<Value>) {
+    file_names_record(vm, el, &files);
+    let roots: Vec<usize> = files.into_iter().map(|f| root(vm, f)).collect();
+    if let Some(old) = FILES.with(|f| f.borrow_mut().insert(el, roots)) {
+        for r in old {
+            unroot(vm, r);
+        }
+    }
+    if let Some(o) = page(|p| p.same_object.get(&(el, SO_FILES)).map(|x| x.0)) {
+        filelist_sync(vm, o);
+    }
 }
