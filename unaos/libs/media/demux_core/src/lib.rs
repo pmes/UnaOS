@@ -196,6 +196,8 @@ pub struct Track {
     pub smpb: Option<(u64, u64)>,
     /// NLEPROBEHDR (SR226): the colour description and HDR metadata the container states ([`colour`]); `None` when it says nothing.
     pub colour: Option<colour::Colour>,
+    /// H264ENCHRDMP4 (SR720): the MP4 sample entry's `btrt` (bufferSizeDB, maxBitrate, avgBitrate); `None` when it carries none (and for Matroska).
+    pub btrt: Option<(u32, u32, u32)>,
 }
 
 /// MP4ONE (rmbp B464): the first media edit of an MP4 `elst` (ISO/IEC 14496-12 §8.6.6) — the edit the
