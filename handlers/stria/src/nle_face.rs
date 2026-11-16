@@ -424,7 +424,7 @@ impl Face {
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
         let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0);
-        self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap);
+        self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick);
         }

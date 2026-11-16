@@ -589,6 +589,10 @@ pub enum DragKind {
     Marquee,
     /// NLE2c: a press on the ruler; the playhead follows the pointer (a seek, not an edit).
     Scrub,
+    /// NLE3ESLIPDRAG (SR760): the slip modifier on a clip body (`EditorState::slip_selected`: the source window moves).
+    Slip,
+    /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
+    Slide,
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -620,12 +624,13 @@ pub struct Drag {
 impl Drag {
     /// A press at `(x, y)` with no modifier ([`Drag::begin_with`]).
     pub fn begin(st: &mut EditorState, l: Layout, x: f64, y: f64) -> Option<Drag> {
-        Drag::begin_with(st, l, x, y, false, false)
+        Drag::begin_with(st, l, x, y, false, false, false)
     }
     /// A press at `(x, y)`: on the primary's drawn trim handle (the rects [`paint`] draws) a trim; on a clip body a move
     /// (a clip of the set keeps the set and becomes its primary, `shift` adds the clip, else it alone is selected); on
-    /// an empty track spot a marquee; on the ruler a scrub; anywhere else no drag.
-    pub fn begin_with(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool) -> Option<Drag> {
+    /// an empty track spot a marquee; on the ruler a scrub; anywhere else no drag. NLE3ESLIPDRAG (SR760): with `slip` the
+    /// same hits begin a slide (the trim handle) or a slip (the clip body) instead.
+    pub fn begin_with(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool, slip: bool) -> Option<Drag> {
         let origin_tick = l.tick_at(x);
         let mk = |kind, track, idx| Drag {
             kind,
@@ -654,7 +659,7 @@ impl Drag {
                     None
                 };
                 if let Some(kind) = kind {
-                    return Some(mk(kind, track, idx));
+                    return Some(mk(if slip { DragKind::Slide } else { kind }, track, idx));
                 }
             }
         }
@@ -665,7 +670,7 @@ impl Drag {
                 } else {
                     st.select(track, idx).ok()?;
                 }
-                Some(mk(DragKind::Move, track, idx))
+                Some(mk(if slip { DragKind::Slip } else { DragKind::Move }, track, idx))
             }
             Hit::Track(track, _) => Some(mk(DragKind::Marquee, track, 0)),
             Hit::Ruler(_) => Some(mk(DragKind::Scrub, 0, 0)),
@@ -717,6 +722,8 @@ impl Drag {
         match self.kind {
             DragKind::TrimIn => st.trim(Edge::In, self.delta),
             DragKind::TrimOut => st.trim(Edge::Out, self.delta),
+            DragKind::Slip => st.slip_selected(self.delta),
+            DragKind::Slide => st.slide_selected(self.delta),
             DragKind::Move if st.set.len() > 1 => st.move_set(self.delta),
             _ => {
                 let at = st.selected().ok_or(EditError::NoClip)?.at;
@@ -784,8 +791,9 @@ impl Drag {
         let l = self.layout;
         let dx = x - self.origin.0;
         let one = [(self.track, self.idx)];
+        let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
+            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
             DragKind::Scrub => {
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -805,6 +813,18 @@ impl Drag {
                     .flat_map(|c| [c.at, c.end()])
                     .collect();
                 (edges, set, true)
+            }
+            DragKind::Slide => {
+                let Some(tr) = st.timeline.tracks.get(self.track) else { return };
+                let Some(&c) = tr.clips.get(self.idx) else { return };
+                let butted = |i: usize| tr.clips.get(i).is_some_and(|n| n.end() == c.at || n.at == c.end());
+                slide_ex = [self.idx.checked_sub(1), Some(self.idx), Some(self.idx + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|&i| i == self.idx || butted(i))
+                    .map(|i| (self.track, i))
+                    .collect();
+                (alloc::vec![c.at, c.end()], &slide_ex, true)
             }
         };
         let targets = snap_targets(st, exclude, playhead);
@@ -850,21 +870,21 @@ mod drag_tests {
         let l = Layout::of_role(Role::Tracks, 320, 56, &st);
         let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
         let x = l.x_of(5) as f64 + z / 2.0;
-        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
         assert_eq!((d.kind, d.origin_tick), (DragKind::Move, 5));
         d.update(&st, x + 3.0 * z, y);
         assert_eq!(d.guide, None);
         assert_eq!(d.finish(&mut st), Ok(()));
         assert_eq!(st.timeline, want_move);
         let x = l.x_of(23) as f64 - 2.0;
-        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
         assert_eq!((d.kind, d.origin_tick), (DragKind::TrimOut, 22));
         d.update(&st, x - 5.0 * z, y);
         assert_eq!((d.origin_tick + d.delta, d.guide), (17, None));
         assert_eq!(d.finish(&mut st), Ok(()));
         assert_eq!(st.timeline, want_trim);
         let x = l.x_of(5) as f64 + 1.0;
-        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
         assert_eq!((d.kind, d.origin_tick), (DragKind::Move, 5));
         d.update(&st, x + 94.0, y);
         assert_eq!(l.tick_at(x + 94.0) - d.origin_tick, 11, "the raw delta");
@@ -925,7 +945,7 @@ mod snap_tests {
         let l = Layout::of_role(Role::Tracks, 320, 56, &st);
         let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
         let x = l.x_of(5) as f64 + 1.0;
-        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
         d.update(&st, x + 94.0, y);
         assert_eq!(d.guide, Some(30));
         let at = |px: &[u8], x: i64, y: i64| {
@@ -1084,5 +1104,88 @@ mod message_row_tests {
         let r = m.ruler_y as usize * 320 * 4;
         assert_eq!(&a[r..], &b[r..], "the ruler and the tracks are unchanged");
         assert_eq!(&a[..m.message_y as usize * 320 * 4], &b[..m.message_y as usize * 320 * 4]);
+    }
+}
+
+// ---- NLE3ESLIPDRAG (LEDGER SR760): the slip modifier turns the body hit into a slip, the trim-handle hit into a slide (named tail block) ----
+
+#[cfg(test)]
+mod slipdrag_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLEFXA 0..20 at 0 and NLEFXA 20..30 at 20 (butted), a 40-tick source, the view band `Role::Tracks` 320x56.
+    fn slipdrag_fixture() -> (Timeline, EditorState, Layout, f64, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 20)];
+        let st = EditorState::new(tl.clone());
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        (tl, st, l, z, y)
+    }
+
+    /// NLE3ESLIPDRAG (SR760) M3: a slip press on the second clip's body dragged +3 ticks is `Timeline::slip(0, 1, 3)`, the
+    /// twin of the editor's `slip 3` word (one commit); a slip never snaps (no guide); the preview (`Drag::shown`) is the
+    /// slipped timeline while the committed one is unchanged. The same press without the modifier is the Move it was.
+    #[test]
+    fn slip_press_on_the_body_is_the_slip_word() {
+        let (tl, mut st, l, z, y) = slipdrag_fixture();
+        let x = l.x_of(25) as f64 + z / 2.0;
+        let mut plain = st.clone();
+        assert_eq!(Drag::begin_with(&mut plain, l, x, y, false, false, false).map(|d| d.kind), Some(DragKind::Move));
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, true).unwrap();
+        assert_eq!((d.kind, d.track, d.idx, d.origin_tick), (DragKind::Slip, 0, 1, 25));
+        d.update(&st, x + 3.0 * z, y);
+        assert_eq!((d.delta, d.guide), (3, None));
+        let want = tl.slip(0, 1, 3).unwrap();
+        assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the preview slips");
+        assert_eq!(st.timeline, tl, "nothing committed before the release");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want);
+        let mut twin = EditorState::new(tl.clone());
+        twin.select(0, 1).unwrap();
+        assert_eq!(twin.verb("slip 3"), Some(Ok(())));
+        assert_eq!(st.timeline, twin.timeline);
+        assert_eq!(st.undo_depth(), 1);
+    }
+
+    /// NLE3ESLIPDRAG (SR760) M3: with the second clip selected, a slip press on its in handle dragged -5 ticks is
+    /// `Timeline::slide(0, 1, -5)` (the butted first clip's out edge follows), the twin of `slide -5`; snapping is on and
+    /// finds no target (the clip and its butted neighbour are excluded). Without the modifier the same press is TrimIn.
+    #[test]
+    fn slip_press_on_the_handle_is_the_slide_word() {
+        let (tl, mut st, l, z, y) = slipdrag_fixture();
+        st.select(0, 1).unwrap();
+        let x = l.x_of(20) as f64 + 1.0;
+        let mut plain = st.clone();
+        assert_eq!(Drag::begin_with(&mut plain, l, x, y, false, false, false).map(|d| d.kind), Some(DragKind::TrimIn));
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, true).unwrap();
+        assert_eq!((d.kind, d.idx, d.origin_tick, d.snap), (DragKind::Slide, 1, 20, true));
+        d.update(&st, x - 5.0 * z, y);
+        assert_eq!((d.delta, d.guide), (-5, None));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        let want = tl.slide(0, 1, -5).unwrap();
+        assert_eq!(st.timeline, want);
+        assert_eq!(st.timeline.tracks[0].clips[0].end(), 15, "the neighbour follows");
+        let mut twin = EditorState::new(tl.clone());
+        twin.select(0, 1).unwrap();
+        assert_eq!(twin.verb("slide -5"), Some(Ok(())));
+        assert_eq!(st.timeline, twin.timeline);
+    }
+
+    /// NLE3ESLIPDRAG (SR760) M3: a slip past the source's end is refused by name (`OutOfSource`) and changes nothing; the
+    /// preview of a refused slip is None (the committed state shows).
+    #[test]
+    fn slip_drag_past_the_source_is_refused() {
+        let (tl, mut st, l, z, y) = slipdrag_fixture();
+        let x = l.x_of(25) as f64 + z / 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, true).unwrap();
+        d.update(&st, x + 11.0 * z, y);
+        assert_eq!(d.delta, 11);
+        assert!(d.shown(&st).is_none());
+        assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
     }
 }
