@@ -1643,3 +1643,47 @@ fn nle5dexportstop_cancelled_export_stops_the_render() {
     assert_eq!(face.last_error.take(), Some(format!("export: cancelled at 3/35 frames; partial files left in {}", fdir.display())));
     println!("nle5dexportstop: export cancelled at 3 frames, joined in {joined} ms (door {ms} ms)");
 }
+
+// ---- NLESTANDINAUDIOEDITOR (LEDGER SR713): the editor's audio reel opens through media.rs's AudioSwap (named tail block) ----
+/// SR703's fixture (tests/media.rs `nlestandinaudio_unknown_audio_codec_opens_on_the_silent_stand_in`, copied: NLE6-UTP1 owed):
+/// a 64x48 test-pattern video beside PCM16 (every sample 1000) re-labelled `ac-3` — its rate and channels read, no decoder.
+fn nlestandinaudioeditor_ac3_reel() -> Vec<u8> {
+    use gneiss_pal::dsp::demux::build::{self, Mp4Options};
+    let video = build::test_pattern_track(1, 64, 48, 25, 50, 10);
+    let mut audio = build::pcm16_track(2, SYNTH_RATE, 1, &vec![1000i16; 2 * SYNTH_RATE as usize], 960);
+    audio.spec.fourcc = *b"ac-3";
+    build::mp4(&[video, audio], &Mp4Options::default())
+}
+
+/// Rule: a timeline citing a reel whose audio no decoder takes renders (no `RenderError::Decode`): that reel's run is the
+/// silent stand-in (zeros where the source holds 1000), the other reel's samples pass bit for bit, the report counts ONE
+/// stand-in reel, and media.rs's one `swapped to stand-in` line is the only audio-decode line. A normal timeline counts 0.
+#[test]
+fn nlestandinaudioeditor_an_ac3_reel_renders_on_the_silent_stand_in() {
+    let _ = nlesizeswitch_lines("");
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    for t in 0..2 {
+        tl.tracks[t].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    }
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, nlestandinaudioeditor_ac3_reel()).unwrap();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..20, &src, &mut sink).expect("an ac-3 reel renders on the silent stand-in");
+    assert_eq!((r.frames, r.stand_in_audio), (20, 1), "{r:?}");
+    assert_eq!(sink.pcm.len(), 20 * PER);
+    for j in 0..10 * PER {
+        assert_eq!(sink.pcm[j], q(synth_sample(0, j as u64) as i32), "reel A sample {j}");
+    }
+    assert!(sink.pcm[10 * PER..].iter().all(|&x| x == 0.0), "the ac-3 reel's run is silence");
+    let lines = nlesizeswitch_lines("[STRIA] :: audio decode:");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("[STRIA] :: audio decode: swapped to stand-in: ") && lines[0].contains("ac-3"), "{}", lines[0]);
+    let (normal, _) = mix(&[0], vec![vec![Clip::new(SourceId(0), 0, 10, 0)]], 10, 0);
+    assert_eq!(normal.stand_in_audio, 0);
+    println!("nlestandinaudioeditor: {} | stand_in_audio={} frames={} pcm={}", lines[0], r.stand_in_audio, r.frames, sink.pcm.len());
+}
