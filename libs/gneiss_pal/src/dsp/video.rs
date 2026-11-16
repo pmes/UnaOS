@@ -658,3 +658,14 @@ pub(crate) fn inband_frame(st: &mut yuv_core::inband::InBand, now: Option<(u8, u
     let rgba = f.to_rgba_colour(Some(&c), chroma);
     Frame { pixels: Pixels::Rgba(rgba), ..f }
 }
+
+// ---- STRIAINFOBITRATE (LEDGER SR728): the video's declared HRD bit rate (named tail block) ----
+/// The NAL HRD BitRate (bits per second, SchedSelIdx 0; H264COREHRD SR708's `Sps::nal_hrd`) of an H.264 track's configuration
+/// record, through the SPS [`profile_level`] reads; None for another codec or an SPS without one (HEVC's VUI HRD: owed,
+/// STRIA-INFO-BITRATE-HEVC).
+pub fn hrd_bit_rate(track: &Track) -> Option<u64> {
+    match &track.codec {
+        Codec::Avc => h264_core::ps::avcc_sps(&track.config)?.nal_hrd.map(|h| h.bit_rate),
+        _ => None,
+    }
+}

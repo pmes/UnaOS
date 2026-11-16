@@ -827,3 +827,35 @@ fn nle5dclitable_video_named_is_the_default_options() {
     assert_eq!(face, nle5dclitable_fnv(Box::new(H264Encoder::new(26, 25)), &refr.frames), "QP 26, a one-second GOP");
     assert!(video_named_with("vp9", tl.tb, H264Opts::default()).is_none());
 }
+
+// ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the one audio table against tools/nle's old audio match (named tail block) ----
+use stria::nle_export::{AUDIO_NAMES, DEFAULT_AAC_KBPS, audio_named};
+
+/// tools/nle's `--audio` match as it stood before SR722 (main.rs `export_verb`, pinned here as SR718 pinned the h264 chain).
+fn nle5daudio_cli_arm(word: &str) -> Option<AudioOut> {
+    match word {
+        "wav" => Some(AudioOut::Wav),
+        "mp4" => Some(AudioOut::Mp4),
+        "aac" => Some(AudioOut::Aac(128)),
+        "none" => Some(AudioOut::None),
+        _ => None,
+    }
+}
+
+#[test]
+fn nle5dexportaudiooptions_table_is_the_cli_arm() {
+    for w in AUDIO_NAMES {
+        assert!(audio_named(w).is_some(), "{w}");
+        assert_eq!(audio_named(w), nle5daudio_cli_arm(w), "{w} is the CLI's old arm");
+    }
+    for w in ["png", "h264", "flac", "pcm"] {
+        assert_eq!(audio_named(w), nle5daudio_cli_arm(w), "{w}: refused by both");
+    }
+    assert_eq!(DEFAULT_AAC_KBPS, 128);
+    assert_eq!(audio_named("aac:96"), Some(AudioOut::Aac(96)));
+    assert_eq!(audio_named("aac:128"), audio_named("aac"));
+    for w in ["flac", "aac:x", "aac:", "aac:0", "wav:96", "mp4:1", "AAC", ""] {
+        assert_eq!(audio_named(w), None, "{w:?} refused");
+    }
+    println!("nle5dexportaudiooptions: table {} words = the CLI arm; aac:96 -> {:?}", AUDIO_NAMES.len(), audio_named("aac:96"));
+}
