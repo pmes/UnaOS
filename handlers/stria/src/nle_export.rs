@@ -509,10 +509,7 @@ pub fn export_as(
     audio: AudioOut,
     container: build::Container,
 ) -> Result<ExportReport, ExportError> {
-    let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
-    sink.container = container;
-    render(tl, range, sources, &mut sink).map_err(ExportError::Render)?;
-    sink.finish(tl.tb)
+    export_as_with(tl, range, sources, dir, video, audio, container, &mut |_, _| Ok(())) // NLEFACEEXPORT (SR694): the one door, its body the progress seam's (file tail)
 }
 
 /// NLE6EXPORTAAC (rmbp-ledger B960): interleaved PCM16 as an `mp4a` AAC-LC track `id` through audio_core's encoder, and
@@ -676,4 +673,72 @@ impl H264Encoder {
         self.rgba.cfg.aq = k;
         self
     }
+}
+
+// ---- NLEFACEEXPORT (LEDGER SR694): the export's progress seam and the one encoder table (named tail block) ----
+/// NLE5d (SR694): [`export_as`] with a progress reading: `progress(frames done, frames total)` after every encoded frame
+/// (the sink's own `frame_inner` count; total = the range's ticks when the timeline has a video track, 0 without). An
+/// `Err` from `progress` is latched as the sink's first error (the encode stops, `finish` returns it): the editor face's
+/// cancel refuses with `ExportError::Io(ErrorKind::Interrupted, "cancelled")`. `export_as` is this with a no-op closure.
+#[allow(clippy::too_many_arguments)]
+pub fn export_as_with(
+    tl: &Timeline,
+    range: std::ops::Range<i64>,
+    sources: &Sources,
+    dir: &Path,
+    video: Box<dyn VideoEncoder>,
+    audio: AudioOut,
+    container: build::Container,
+    progress: &mut dyn FnMut(u64, u64) -> Result<(), ExportError>,
+) -> Result<ExportReport, ExportError> {
+    let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
+    sink.container = container;
+    let total = if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 };
+    render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?;
+    sink.finish(tl.tb)
+}
+
+/// The progress wrapper over [`ExportSink`]: every [`RenderSink`] call forwarded unchanged, then the reading.
+struct Ticked<'a> {
+    sink: &'a mut ExportSink,
+    progress: &'a mut dyn FnMut(u64, u64) -> Result<(), ExportError>,
+    total: u64,
+}
+
+impl RenderSink for Ticked<'_> {
+    fn frame(&mut self, out_t: i64, width: u32, height: u32, rgba: &[u8]) {
+        self.sink.frame(out_t, width, height, rgba);
+        if self.sink.err.is_none() {
+            if let Err(e) = (self.progress)(self.sink.report.frames, self.total) {
+                self.sink.err = Some(e);
+            }
+        }
+    }
+    fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        self.sink.pcm(out_t, rate, channels, interleaved);
+    }
+    fn taps_tracks(&self) -> bool {
+        self.sink.taps_tracks()
+    }
+    fn track_pcm(&mut self, out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
+        self.sink.track_pcm(out_t, track, rate, channels, interleaved);
+    }
+}
+
+/// The video names [`video_named`] takes (`nle export --video`'s words).
+pub const VIDEO_NAMES: [&str; 5] = ["h264", "png", "i420", "y4m", "raw"];
+
+/// THE encoder table by name, with `nle export`'s defaults: `png` [`PngSequence`], `raw` [`RawSequence`], `i420`
+/// [`I420Raw`], `y4m` [`Y4m`] at the timeline's rate, `h264` [`H264Encoder`] at QP 26 with a one-second GOP (`tb` is the
+/// timeline's `1/fps`). None for any other word. (The encoders are not `Send`: build one on the thread that exports.)
+pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
+    let (num, den) = (tb.num.max(1) as u32, tb.den.max(1) as u32);
+    Some(match name {
+        "png" => Box::new(PngSequence),
+        "raw" => Box::new(RawSequence),
+        "i420" => Box::new(I420Raw::default()),
+        "y4m" => Box::new(Y4m::new(den, num)),
+        "h264" => Box::new(H264Encoder::new(26, (den / num).max(1))),
+        _ => return None,
+    })
 }
