@@ -524,6 +524,8 @@ pub struct InterSps {
     pub depth_inter: u32,
     pub amp: bool,
     pub temporal_mvp: bool,
+    /// HEVCCONCEALWEIGHTEDBIDIRECT (SR774): long_term_ref_pics_present_flag (num_long_term_ref_pics_sps 0).
+    pub long_term_refs: bool,
 }
 
 pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
@@ -581,7 +583,7 @@ pub fn sps_rbsp_scc(c: &SpsCfg, x: &InterSps, scc: Option<&SpsScc>) -> Vec<u8> {
         None => b.bit(0),
     }
     b.ue(0); // num_short_term_ref_pic_sets
-    b.bit(0); // long_term_ref_pics_present_flag
+    b.flag(x.long_term_refs); if x.long_term_refs { b.ue(0); } // long_term_ref_pics_present_flag, num_long_term_ref_pics_sps 0
     b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
@@ -837,6 +839,8 @@ pub struct SliceCfg {
     /// The slice's own st_ref_pic_set: (DeltaPocS0, used) nearest first, (DeltaPocS1, used) nearest first.
     pub neg: Vec<(i32, bool)>,
     pub pos: Vec<(i32, bool)>,
+    /// HEVCCONCEALWEIGHTEDBIDIRECT (SR774): the slice's long-term entries (PocLsbLt, used, no msb) when the SPS has long_term_ref_pics_present_flag.
+    pub lt_pocs: Option<Vec<u32>>,
     /// The SPS enables TMVP (slice_temporal_mvp_enabled_flag is coded) / its value.
     pub sps_tmvp: bool,
     pub tmvp: bool,
@@ -890,6 +894,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
             b.flag(used);
             prev = d;
         }
+        if let Some(lt) = &c.lt_pocs { b.ue(lt.len() as u32); for &p in lt { b.u(p as u64, 8); b.bit(1); b.bit(0); } } // num_long_term_pics, poc_lsb_lt, used_by_curr_pic_lt_flag 1, no msb (SR774)
         if c.sps_tmvp {
             b.flag(c.tmvp);
         }
