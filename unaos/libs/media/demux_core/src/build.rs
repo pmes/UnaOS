@@ -372,6 +372,8 @@ pub struct Mp4Extras {
     /// NLEPROBEHDR (SR226): per track id, the colour its visual sample entry states: `colr` (`nclx` when `full_range` is
     /// `Some`, else QuickTime `nclc`), then `mdcv` (G, B, R order) and `clli` when present, after the config box.
     pub colour: Vec<(u32, crate::colour::Colour)>,
+    /// H264ENCHRDMP4 (SR720): per track id, the `btrt` (bufferSizeDB, maxBitrate, avgBitrate) its sample entry carries, the last child.
+    pub btrt: Vec<(u32, (u32, u32, u32))>,
 }
 
 fn track_duration(t: &MediaTrack) -> u64 {
@@ -474,7 +476,7 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_o
 
     let mut stsd = Vec::new();
     stsd.u32b(1);
-    stsd.extend_from_slice(&sample_entry(s, &entry_colour(x, s.id)));
+    stsd.extend_from_slice(&sample_entry(s, &[entry_colour(x, s.id), entry_btrt(x, s.id)].concat()));
     let stsd = fbx(b"stsd", 0, 0, &stsd);
 
     let samples: &[SampleSpec] = if progressive { &t.samples } else { &[] };
@@ -2151,5 +2153,79 @@ mod mkv_stream_kats {
         let e = mux(&[aac.clone()], Container::Mkv, &x).unwrap_err();
         assert!(e.starts_with("track 2:"), "{}", e);
         assert_eq!(mux(&[aac.clone()], Container::Mp4, &x).unwrap(), mp4_with(&[aac], &Mp4Options::default(), &x));
+    }
+}
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the sample entry's btrt (named tail block) ----
+/// H264ENCHRDMP4 (SR720): the MPEG4BitRateBox [`Mp4Extras::btrt`] gives track `id` (ISO/IEC 14496-12 §8.5.2.2 / 14496-15: bufferSizeDB,
+/// maxBitrate, avgBitrate as u32), written after the colour boxes as ffmpeg's movenc writes it (the last child); empty when none.
+fn entry_btrt(x: &Mp4Extras, id: u32) -> Vec<u8> {
+    let Some((_, (buffer, max, avg))) = x.btrt.iter().find(|(t, _)| *t == id) else { return Vec::new() };
+    let mut b = Vec::new();
+    b.u32b(*buffer);
+    b.u32b(*max);
+    b.u32b(*avg);
+    bx(b"btrt", &b)
+}
+
+#[cfg(test)]
+mod btrt_kats {
+    use super::*;
+    use alloc::vec;
+
+    fn video() -> MediaTrack {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let units = (0..10i64).map(|i| (i == 0, vec![i as u8; 30 + i as usize], i, i));
+        coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 2, 3], 64, 48, tb), tb, units)
+    }
+
+    /// The child boxes of the first sample entry (the avc1's, after its 78-byte VisualSampleEntry body).
+    fn entry_kids(file: &[u8]) -> Vec<[u8; 4]> {
+        let at = file.windows(4).position(|w| w == b"avc1").expect("an avc1 entry") - 4;
+        let end = at + u32::from_be_bytes([file[at], file[at + 1], file[at + 2], file[at + 3]]) as usize;
+        let mut o = at + 8 + 78;
+        let mut out = Vec::new();
+        while o + 8 <= end {
+            let n = u32::from_be_bytes([file[o], file[o + 1], file[o + 2], file[o + 3]]) as usize;
+            out.push([file[o + 4], file[o + 5], file[o + 6], file[o + 7]]);
+            o += n.max(8);
+        }
+        out
+    }
+
+    /// H264ENCHRDMP4 (SR720): no btrt in the extras = the file without one, byte for byte (every pin keeps its bytes) and
+    /// `Track::btrt` None; with one, the 20-byte box after avcC, read back exactly.
+    #[test]
+    fn btrt_is_written_only_when_given_and_reads_back() {
+        let plain = mp4_with(&[video()], &Mp4Options::default(), &Mp4Extras::default());
+        assert_eq!(plain, mp4(&[video()], &Mp4Options::default()), "default extras write no btrt");
+        assert_eq!(entry_kids(&plain), vec![*b"avcC"]);
+        assert_eq!(crate::Demuxer::open(plain.clone()).unwrap().tracks()[0].btrt, None);
+        let x = Mp4Extras { btrt: vec![(1, (50_000, 400_000, 398_765))], ..Default::default() };
+        let with = mp4_with(&[video()], &Mp4Options::default(), &x);
+        assert_eq!(with.len(), plain.len() + 20, "one 20-byte box");
+        assert_eq!(entry_kids(&with), vec![*b"avcC", *b"btrt"]);
+        assert_eq!(crate::Demuxer::open(with).unwrap().tracks()[0].btrt, Some((50_000, 400_000, 398_765)));
+    }
+
+    /// H264ENCHRDMP4 (SR720): with a colour the btrt follows `colr` (ffmpeg's order: the last child); the stream writer writes
+    /// the same entry, and a btrt for another track id is not this track's.
+    #[test]
+    fn btrt_is_the_last_child_in_both_writers() {
+        let c = crate::colour::Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+        let x = Mp4Extras { colour: vec![(1, c)], btrt: vec![(1, (0, 12_345, 12_345)), (7, (1, 2, 3))], ..Default::default() };
+        let one = mp4_with(&[video()], &Mp4Options::default(), &x);
+        assert_eq!(entry_kids(&one), vec![*b"avcC", *b"colr", *b"btrt"]);
+        let mut st = Mp4Stream::begin(Vec::new()).unwrap();
+        let t = video();
+        let i = st.track(t.spec);
+        for s in t.samples {
+            st.push(i, s).unwrap();
+        }
+        let (file, _) = st.finish(&Mp4Options::default(), &x).unwrap();
+        assert_eq!(entry_kids(&file), vec![*b"avcC", *b"colr", *b"btrt"]);
+        let d = crate::Demuxer::open(file).unwrap();
+        assert_eq!(d.tracks()[0].btrt, Some((0, 12_345, 12_345)));
+        assert_eq!(d.tracks()[0].colour.as_ref().map(|c| c.primaries), Some(1));
     }
 }

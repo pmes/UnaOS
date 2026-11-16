@@ -345,7 +345,7 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
         trim_start_ns: 0,
         play_ns,
         edit,
-        smpb: None, colour: None,
+        smpb: None, colour: None, btrt: None,
     };
 
     let minf = child(&mdia_kids, b"minf").ok_or(Error::Invalid("mdia without minf"))?;
@@ -401,7 +401,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
         _ => child_start = e.end,
     }
     let kids = if child_start < e.end { boxes(data, child_start, e.end)? } else { Vec::new() };
-    let cfg = |k: &[u8; 4]| child(&kids, k).map(|b| data[b.body..b.end].to_vec()); track.colour = colour_boxes(data, &kids);
+    let cfg = |k: &[u8; 4]| child(&kids, k).map(|b| data[b.body..b.end].to_vec()); track.colour = colour_boxes(data, &kids); track.btrt = btrt_box(data, &kids);
     track.codec = match &fourcc {
         b"av01" => {
             track.config = cfg(b"av1C").unwrap_or_default();
@@ -1073,4 +1073,13 @@ fn colour_boxes(data: &[u8], kids: &[BoxHeader]) -> Option<crate::colour::Colour
     }
     let (primaries, transfer, matrix, full_range) = colr.unwrap_or((2, 2, 2, None));
     Some(Colour { primaries, transfer, matrix, full_range, mastering, light })
+}
+
+// ---- H264ENCHRDMP4 (LEDGER SR720): the sample entry's btrt (named tail block) ----
+/// H264ENCHRDMP4 (SR720): the MPEG4BitRateBox among the sample entry's children [`parse_stsd`] already walked (ISO/IEC 14496-12
+/// §8.5.2.2: bufferSizeDB, maxBitrate, avgBitrate as u32). `None` when absent; a short box is left out, never an error.
+fn btrt_box(data: &[u8], kids: &[BoxHeader]) -> Option<(u32, u32, u32)> {
+    let b = child(kids, b"btrt")?;
+    let mut r = body(data, b);
+    Some((r.u32().ok()?, r.u32().ok()?, r.u32().ok()?))
 }

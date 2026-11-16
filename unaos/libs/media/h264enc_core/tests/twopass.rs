@@ -10,9 +10,12 @@
 //! H264ENCTWOPASSFILE (LEDGER SR719): (d) the records round-trip byte-exact through `rc::write_stats` / `read_stats` (I, P and B);
 //! (e) a second pass planned from the read-back records codes the same bytes as one planned from the records in memory; (f) a
 //! truncated text, a wrong count, a wrong version, a bad kind and a tampered complexity refuse by name.
+//! H264ENCTWOPASSRESCALE (LEDGER SR727): (g) `rc::rescale_stats` 30 -> 15 means each pair, keeps the first I and the record invariant;
+//! (h) a 15-frame pass 2 planned from the 30-frame pass 1 lands within 3% of its target, equal counts byte-identical; (i)
+//! `Encoder::stats` leaves the HRD's filler NAL units out of a picture's bits, as the rc_update line does.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, pass2_qps, read_stats, step16, write_stats};
+use h264enc_core::rc::{PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, pass2_qps, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -261,4 +264,80 @@ fn f_stats_refusals_by_name() {
     let mut x = owned.clone();
     x[3].push_str(" 7");
     assert_eq!(read_stats(&join(&x)), Err(StatsError::Line(4)));
+}
+
+// ---- H264ENCTWOPASSRESCALE (LEDGER SR727): a first pass rescaled to another frame count (named tail block) ----
+
+#[test]
+fn g_rescale_30_to_15_means_pairs() {
+    let s = first_pass(60);
+    assert_eq!(s.len(), N);
+    let r = rescale_stats(&s, 15);
+    assert_eq!(r.len(), 15);
+    assert_eq!(r[0].kind, Pic::Idr, "the first I kept");
+    for (j, p) in r.iter().enumerate() {
+        let mean = (s[2 * j].complexity + s[2 * j + 1].complexity) / 2;
+        let step = step16(p.qp);
+        assert!(p.complexity <= mean && p.complexity + step > mean, "record {j}: complexity {} vs pair mean {mean}", p.complexity);
+        assert_eq!((p.kind, p.qp), (s[2 * j].kind, s[2 * j].qp), "record {j}: the lower-middle record's kind and qp");
+        assert_eq!(p.complexity, p.bits * step);
+    }
+    assert_eq!(read_stats(&text_of(&r)).unwrap().pics, r, "a rescaled vector round-trips the stats text");
+    assert_eq!(rescale_stats(&s, N), s, "equal counts: the records unchanged");
+    assert!(rescale_stats(&s, 0).is_empty());
+    assert!(rescale_stats(&[], 7).is_empty());
+    // Upsampled 15 -> 30: each picture derived from record j / 2.
+    let u = rescale_stats(&r, 30);
+    assert_eq!(u.len(), 30);
+    assert_eq!(u[0].kind, Pic::Idr);
+    for (j, p) in u.iter().enumerate() {
+        let q = r[j / 2];
+        assert_eq!((p.kind, p.qp, p.complexity), (q.kind, q.qp, q.complexity), "upsampled {j}");
+    }
+}
+
+#[test]
+fn h_range_planned_from_whole_pass_lands_within_3_percent() {
+    const M: usize = 15;
+    let encode = |kbps: u32, plan: &[PicStat], n: usize| -> (u64, Vec<u8>) {
+        let mut enc = Encoder::new(base(Some(RateControl::two_pass(kbps, (FPS, 1))))).unwrap().planned(plan).unwrap();
+        let mut dec = Decoder::new();
+        let (mut bits, mut bytes) = (0u64, Vec::new());
+        for t in 0..n {
+            let p = scene(t);
+            let au = enc.encode(&frame(&p)).unwrap();
+            dec.decode_annexb(&au.annexb()).unwrap();
+            dec.end_access_unit();
+            let f = dec.take_frames().pop().unwrap();
+            let rec = enc.reconstruction();
+            for c in 0..3 {
+                assert_eq!(f.planes[c].as_slice(), rec[c], "kbps {kbps} frame {t} plane {c}: decode differs from the reconstruction");
+            }
+            bits += au_bits(&au);
+            bytes.extend(au.annexb());
+        }
+        (bits, bytes)
+    };
+    for kbps in [60u32, 100] {
+        let stats = first_pass(kbps);
+        let (bits, _) = encode(kbps, &rescale_stats(&stats, M), M);
+        let target = kbps as f64 * 1000.0 * M as f64 / FPS as f64;
+        println!("twopass rescale 30->15 kbps={kbps} bits={bits} target={target:.0} ({:+.2}%)", (bits as f64 / target - 1.0) * 100.0);
+        assert!((bits as f64 - target).abs() <= target * 0.03, "rescaled pass 2 {bits} bits vs target {target}");
+        assert_eq!(encode(kbps, &rescale_stats(&stats, N), N).1, encode(kbps, &stats, N).1, "equal counts: the same bytes");
+    }
+}
+
+#[test]
+fn i_note_stat_skips_filler() {
+    let mut enc = Encoder::new(Config { hrd: true, ..base(Some(RateControl::cbr(2000, (FPS, 1)))) }).unwrap();
+    let aus: Vec<Access> = (0..60).map(|t| enc.encode(&frame(&scene(t))).unwrap()).collect();
+    let filler = |a: &Access| -> u64 { a.nals.iter().filter(|n| n[0] & 0x1f == h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum() };
+    assert!(aus.iter().any(|a| filler(a) > 0), "the filler path was not exercised");
+    let s = enc.stats();
+    assert_eq!(s.len(), aus.len());
+    for (r, a) in s.iter().zip(&aus) {
+        assert_eq!(r.bits, au_bits(a) - filler(a), "a record's bits leave the filler out");
+        assert_eq!(r.complexity, r.bits * step16(r.qp));
+    }
 }

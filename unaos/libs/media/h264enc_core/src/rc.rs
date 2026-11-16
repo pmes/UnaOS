@@ -677,7 +677,7 @@ impl Encoder {
 
     /// After picture `kind` at SliceQPY `qp`: its record from the access unit's NAL units.
     pub(crate) fn note_stat(&mut self, kind: Pic, qp: i32, nals: &[Vec<u8>]) {
-        let bits: u64 = nals.iter().map(|n| n.len() as u64 * 8).sum();
+        let bits: u64 = nals.iter().filter(|n| n[0] & 0x1f != h264_core::nal::NAL_FILLER).map(|n| n.len() as u64 * 8).sum();
         self.stats.push(PicStat { kind, bits, qp, complexity: bits * step16(qp) });
     }
 }
@@ -862,4 +862,36 @@ fn parse_stats_line(l: &str) -> Option<PicStat> {
         return None;
     }
     Some(PicStat { kind, bits, qp, complexity })
+}
+
+// ---- H264ENCTWOPASSRESCALE (LEDGER SR727): a first pass rescaled to another frame count (named tail block) ----
+// A pass 2 over a different frame count (a trimmed timeline, a range exported from a whole-timeline pass 1) plans from the first
+// pass's complexity curve resampled to the new count; `Encoder::planned` / `pass2_qps` then plan whatever length they are given,
+// unchanged. UnaOS's own rule, not x264's (x264 refuses a pass 2 with more frames than its stats and truncates one with fewer).
+// Owed: H264ENC-TWOPASS-RESCALE-KIND (a resampled kind that misses the encoder's own I), H264ENC-TWOPASS-RESCALE-RANGE.
+
+/// `stats` (m records) resampled to `n` pictures (H264ENCTWOPASSRESCALE SR727): picture j covers the records
+/// [j m / n, max((j + 1) m / n, j m / n + 1)), its complexity the integer mean of theirs, its kind and qp the covered span's
+/// lower-middle record's (so 30 -> 15 keeps record 0's I), its bits mean / step16(qp) and its complexity bits x step16(qp), so a
+/// rescaled record keeps [`PicStat`]'s invariant and round-trips through [`write_stats`] / [`read_stats`]. m == n returns the
+/// records unchanged; m == 0 or n == 0 an empty plan.
+pub fn rescale_stats(stats: &[PicStat], n: usize) -> Vec<PicStat> {
+    let m = stats.len();
+    if m == n {
+        return stats.to_vec();
+    }
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
+    (0..n)
+        .map(|j| {
+            let start = (j as u128 * m as u128 / n as u128) as usize;
+            let end = (((j as u128 + 1) * m as u128 / n as u128) as usize).max(start + 1).min(m);
+            let span = &stats[start..end];
+            let mean = (span.iter().map(|p| p.complexity as u128).sum::<u128>() / span.len() as u128) as u64;
+            let c = &span[(span.len() - 1) / 2];
+            let bits = mean / step16(c.qp);
+            PicStat { kind: c.kind, bits, qp: c.qp, complexity: bits * step16(c.qp) }
+        })
+        .collect()
 }
