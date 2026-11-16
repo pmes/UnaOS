@@ -1815,3 +1815,122 @@ fn nle5dexportrange_shortened_timeline_clamps_or_refuses() {
     assert!(!face.exporting() && !past.exists(), "a refused range makes nothing");
     println!("nle5dexportrange: clamped {line}");
 }
+
+// ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the face's export takes an audio word through the one audio table (named tail block) ----
+
+#[test]
+fn nle5dexportaudiooptions_png_none_writes_no_audio() {
+    let (wav, none) = (nlefaceexport_dir("audio-default"), nlefaceexport_dir("audio-none"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", wav.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: 35 frames, ")));
+    assert!(wav.join("audio.wav").is_file(), "the default audio stays wav");
+    assert!(face.verb(&format!("export {} png none", none.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes -> {}", none.display())), "{line}");
+    for n in [0, 34] {
+        let f = format!("{n:06}.png");
+        assert_eq!(std::fs::read(none.join(&f)).unwrap(), std::fs::read(wav.join(&f)).unwrap(), "{f}: the frames do not move");
+    }
+    assert!(!none.join("000035.png").exists());
+    assert!(!none.join("audio.wav").exists() && !none.join("audio.mp4").exists(), "none writes no audio file");
+    println!("nle5dexportaudiooptions: none {line}");
+}
+
+#[test]
+fn nle5dexportaudiooptions_png_aac_writes_audio_mp4() {
+    use gneiss_pal::dsp::demux::{Codec, Demuxer, TrackKind};
+    let dir = nlefaceexport_dir("audio-aac");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png aac", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("000034.png").is_file() && !dir.join("audio.wav").exists(), "{line}");
+    let d = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
+    assert_eq!(d.tracks().len(), 1);
+    let t = &d.tracks()[0];
+    assert_eq!((t.kind, t.codec.clone()), (TrackKind::Audio, Codec::Aac), "one AAC-LC track");
+    println!("nle5dexportaudiooptions: aac {line}");
+}
+
+#[test]
+fn nle5dexportaudiooptions_unknown_audio_refused_by_name() {
+    let root = nlefaceexport_dir("audio-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png flac", root.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio flac (wav|aac|mp4|none)"));
+    assert!(face.verb(&format!("export {} png aac:x", root.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio aac:x (wav|aac|mp4|none)"));
+    assert!(!face.exporting() && !root.exists(), "a refused audio word makes nothing");
+    println!("nle5dexportaudiooptions: refused flac and aac:x by name");
+}
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the marks live on the Timeline: saved with the document, reopened, undone (named tail block) ----
+
+#[test]
+fn nle5drangesave_marks_save_and_reopen_through_the_document() {
+    let (tl0, src) = synth_fixture();
+    let path = nlehostsave_dir("marks").join("cut.edl");
+    std::fs::write(&path, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let opened = edl::parse(&std::fs::read_to_string(&path).unwrap(), 25).unwrap();
+    assert_eq!(opened.marks, (None, None));
+    let mut face = Face::new(EditorState::new(opened), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert!(face.dirty(), "a mark dirties the document");
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline.marks, (Some(5), Some(15)));
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!face.dirty(), "clean after save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\n* UNA MARK 5 15\n\n"), "the header's last line, before the first event: {text}");
+    assert_eq!(text.matches("* UNA MARK").count(), 1);
+    let (_, src2) = synth_fixture();
+    let reopened = Face::new(EditorState::open(&text, 25).unwrap(), src2, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    assert_eq!((reopened.marks(), reopened.export_range()), ((Some(5), Some(15)), Some(5..15)));
+    assert_eq!(reopened.state.timeline, face.state.timeline);
+    assert!(!reopened.dirty());
+    println!("nle5drangesave: saved {} bytes, reopened marks {:?}", text.len(), reopened.marks());
+}
+
+#[test]
+fn nle5drangesave_a_mark_is_one_undoable_commit() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), None), 1));
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), Some(15)), 2));
+    assert!(face.verb("undo"));
+    assert_eq!(face.marks(), (Some(5), None), "undo clears the out mark");
+    assert!(face.verb("undo"));
+    assert_eq!(face.marks(), (None, None), "undo clears the in mark");
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("redo"));
+    assert_eq!(face.marks(), (Some(5), None));
+    // the editor's words (THE dispatch the kernel face calls), through the face's fall-through
+    face.state.seek(15);
+    assert!(face.verb("mark out"));
+    assert_eq!((face.marks(), face.last_error.take()), ((Some(5), Some(15)), None));
+    face.state.seek(2);
+    assert!(face.verb("mark out"));
+    assert_eq!(face.last_error.take().as_deref(), Some("mark out: the in mark is not before the out mark"));
+    assert_eq!(face.marks(), (Some(5), Some(15)), "a refused mark leaves the marks");
+    assert!(face.verb("mark clear"));
+    assert_eq!((face.marks(), face.export_range()), ((None, None), None));
+    println!("nle5drangesave: in / out / undo / redo / mark out / refused / clear");
+}

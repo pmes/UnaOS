@@ -1830,3 +1830,85 @@ fn nlestandinaudio_refused_packet_plays_silence_then_swaps_back() {
     assert_eq!(p.info().audio_decoder, "pcm");
     println!("nlestandinaudio: {} ; {}", lines[0], lines[1]);
 }
+
+// ---- STRIAINFOBITRATE (LEDGER SR728): MediaInfo's bit rate from the btrt / the SPS HRD / the measured bytes (named tail block) ----
+/// H264ENCHRDMP4's (SR720) test timeline (tests/nle_export.rs `timeline()` / `sources()`): 25 fps, two synthetic reels, 35 ticks,
+/// exported through `stria::nle_export::export` into a fresh dir; returns (video.mp4, audio.wav) bytes.
+fn striainfobitrate_export(name: &str, enc: stria::nle_export::H264Encoder) -> (Vec<u8>, Vec<u8>) {
+    use timeline_core::{Clip, Kind, SourceId, Timeline};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    for t in 0..2 {
+        tl.tracks[t].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+    }
+    let tl = tl.split(0, 15).unwrap().split(1, 15).unwrap();
+    let mut src = stria::nle::Sources::new(&tl);
+    for (i, base) in [0u32, 1000].iter().enumerate() {
+        src.add(SourceId(i as u32), stria::nle::synth_source(*base, 50, 25)).unwrap();
+    }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrate").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    stria::nle_export::export(&tl, 0..35, &src, &dir, Box::new(enc), stria::nle_export::AudioOut::Wav).unwrap();
+    (std::fs::read(dir.join("video.mp4")).unwrap(), std::fs::read(dir.join("audio.wav")).unwrap())
+}
+
+/// The movie's btrt avgBitrate as demux_core reads it (SR720 writes it from the coded bytes).
+fn striainfobitrate_avg(mp4: &[u8]) -> u32 {
+    let d = gneiss_pal::dsp::demux::Demuxer::open(mp4.to_vec()).unwrap();
+    d.tracks()[0].btrt.expect("an H.264 export carries a btrt").2
+}
+
+/// STRIAINFOBITRATE (SR728): a CBR 400 kbit/s export with the HRD signalled shows the btrt's avg (the file's truth) and the SPS's
+/// declared rate in parentheses, on `MediaInfo.bitrate` and the `[STRIA] :: open:` line; its PCM WAV (no btrt, no SPS) shows the
+/// measured `~` form: the file's bits over its duration.
+#[test]
+fn striainfobitrate_cbr_hrd_and_wav() {
+    capture_logs();
+    let enc = stria::nle_export::H264Encoder::new(26, 10).with_bitrate(400, 25, 1).with_hrd(true);
+    let (mp4, wav) = striainfobitrate_export("cbr_hrd", enc);
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let cbr = p.info().bitrate.clone();
+    assert_eq!(cbr, format!("{} kb/s (HRD 400)", (avg + 500) / 1000));
+    let lines = my_log_lines("[STRIA] :: open:");
+    let line = lines.last().expect("the open line");
+    assert!(line.starts_with("[STRIA] :: open: video="), "{line}");
+    assert!(line.ends_with(&format!("bitrate=\"{cbr}\"")), "{line}");
+    let len = wav.len() as u128;
+    let p = Player::open(wav, Arc::new(ManualTime::new()), None, 60).unwrap();
+    let dur = p.info().duration_ns as u128;
+    assert!(dur > 0);
+    let wav_rate = p.info().bitrate.clone();
+    assert_eq!(wav_rate, format!("~{} kb/s", (len * 8 * 1_000_000_000 / dur + 500) / 1000));
+    assert!(my_log_lines("[STRIA] :: open:").last().unwrap().ends_with(&format!("bitrate=\"{wav_rate}\"")));
+    println!("striainfobitrate: cbr={cbr} wav={wav_rate}");
+}
+
+/// STRIAINFOBITRATE (SR728): a constant-QP export (no bucket: btrt (0, avg, avg), no HRD in the SPS) shows its avg alone.
+#[test]
+fn striainfobitrate_cqp() {
+    let (mp4, _) = striainfobitrate_export("cqp", stria::nle_export::H264Encoder::new(26, 10));
+    let avg = striainfobitrate_avg(&mp4) as u64;
+    assert!(avg > 0);
+    let p = Player::open(mp4, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().bitrate, format!("{} kb/s", (avg + 500) / 1000));
+    println!("striainfobitrate: cqp={}", p.info().bitrate);
+}
+
+/// STRIAINFOBITRATE (SR728): the five forms and the rounding (nearest kb/s).
+#[test]
+fn striainfobitrate_forms() {
+    use stria::media::bitrate_of;
+    assert_eq!(bitrate_of(Some((50_000, 400_000, 258_400)), Some(400_000), 9, 9), "258 kb/s (HRD 400)");
+    assert_eq!(bitrate_of(Some((0, 300_500, 300_500)), None, 9, 9), "301 kb/s");
+    assert_eq!(bitrate_of(Some((0, 300_499, 300_499)), None, 9, 9), "300 kb/s");
+    assert_eq!(bitrate_of(None, Some(400_000), 0, 0), "400 kb/s (HRD)");
+    assert_eq!(bitrate_of(Some((50_000, 400_000, 0)), Some(400_000), 0, 0), "400 kb/s (HRD)", "avg 0 falls through to the HRD");
+    assert_eq!(bitrate_of(Some((0, 0, 0)), None, 125_000, 1_000_000_000), "~1000 kb/s", "avg 0, no HRD: measured");
+    assert_eq!(bitrate_of(None, None, 0, 1_000_000_000), "");
+    assert_eq!(bitrate_of(None, None, 125_000, 0), "");
+}

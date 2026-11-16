@@ -886,3 +886,28 @@ pub fn qcomp_of(s: &str) -> Option<(i64, i64)> {
     }
     Some(((f * 100.0).round() as i64, 100))
 }
+
+// ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the one audio table, the video table's twin (named tail block) ----
+/// AAC-LC's kb/s when the word names none (`nle export --audio aac` / `--aac`, NLE6EXPORTAAC rmbp-ledger B960's 128).
+pub const DEFAULT_AAC_KBPS: u32 = 128;
+
+/// The audio words [`audio_named`] takes (`nle export --audio`'s, the editor face's `export` audio word); `aac` also as
+/// `aac:KBPS`.
+pub const AUDIO_NAMES: [&str; 4] = ["wav", "aac", "mp4", "none"];
+
+/// THE audio table by name (NLE5D-EXPORT-AUDIO-OPTIONS): `wav` [`AudioOut::Wav`], `mp4` [`AudioOut::Mp4`], `none`
+/// [`AudioOut::None`], `aac` [`AudioOut::Aac`] at [`DEFAULT_AAC_KBPS`], `aac:K` at K kb/s (K > 0). None for any other word
+/// (the encoder's own `Encoder::new` stays the authority on a rate it cannot code).
+pub fn audio_named(word: &str) -> Option<AudioOut> {
+    Some(match word.split_once(':') {
+        None => match word {
+            "wav" => AudioOut::Wav,
+            "mp4" => AudioOut::Mp4,
+            "aac" => AudioOut::Aac(DEFAULT_AAC_KBPS),
+            "none" => AudioOut::None,
+            _ => return None,
+        },
+        Some(("aac", k)) => AudioOut::Aac(k.parse::<u32>().ok().filter(|&k| k > 0)?),
+        Some(_) => return None,
+    })
+}

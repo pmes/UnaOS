@@ -191,16 +191,13 @@ pub struct Face {
     play: PlayAudio,
     /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
     export: Option<ExportJob>,
-    /// NLE5DEXPORTRANGE (SR717): the export range's in / out marks (ticks; `in` / `out` at the playhead, in < out).
-    mark_in: Option<i64>,
-    mark_out: Option<i64>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), mark_in: None, mark_out: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -2073,7 +2070,7 @@ pub struct ExportJob {
 }
 
 impl Face {
-    /// The `export` verb: `export [<dir>] [h264|png|i420|y4m|raw]` (default h264; a lone format word is the format, a lone
+    /// The `export` verb: `export [<dir>] [h264|png|i420|y4m|raw] [wav|aac[:KBPS]|mp4|none]` (default h264, wav audio: NLE5DEXPORTAUDIOOPTIONS SR722; a lone format word is the format, a lone
     /// other word the directory; no directory = `<document's dir>/<stem>-export`). Every outcome is the face's one message
     /// line `last_error`: a refusal (`export: busy (d/t)`, `export: no directory (no document path)`, `export: <dir>: <io>`,
     /// `export: unknown format ..`) at once; the result (a report, not an error) when [`Face::export_tick`] sees it finish.
@@ -2082,7 +2079,7 @@ impl Face {
         if words.next() != Some("export") {
             return None;
         }
-        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect();
+        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, audio) = export_audio_word(args);
         if let Some((d, t)) = self.export_progress() {
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
@@ -2105,15 +2102,15 @@ impl Face {
                 return Some(true);
             }
         };
-        if let Err(e) = self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }) {
+        if let Err(e) = audio.and_then(|a| self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }, a)) {
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
     }
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
-    /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `AudioOut::Wav` into `Container::Mp4` (`nle export`'s defaults).
+    /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `audio` (the verb's word, default `AudioOut::Wav`, NLE5DEXPORTAUDIOOPTIONS SR722) into `Container::Mp4` (`nle export`'s defaults).
     /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
-    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>) -> Result<(), String> {
+    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut) -> Result<(), String> {
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
         }
@@ -2141,7 +2138,7 @@ impl Face {
                     }
                     Ok(())
                 };
-                export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, AudioOut::Wav, Container::Mp4, &mut progress)
+                export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range });
@@ -2150,7 +2147,7 @@ impl Face {
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
     /// [`Face::cancel_export`]). The verb's own job is this with no hold.
     pub fn export_paused_at(&mut self, dir: &std::path::Path, fmt: &str, k: u64) -> Result<(), String> {
-        self.start_export(dir, fmt, Some(k), self.export_range())
+        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav)
     }
     /// True while an export's result has not been reported.
     pub fn exporting(&self) -> bool {
@@ -2232,7 +2229,7 @@ impl Face {
             _ => return None,
         };
         let ph = self.state.playhead;
-        let (mine, other) = if is_in { (self.mark_in, self.mark_out) } else { (self.mark_out, self.mark_in) };
+        let (a, b) = self.state.timeline.marks; let (mine, other) = if is_in { (a, b) } else { (b, a) }; // NLE5DRANGESAVE (SR723): the marks are the timeline's
         let set = if mine == Some(ph) {
             None
         } else {
@@ -2248,24 +2245,24 @@ impl Face {
                 _ => Some(ph),
             }
         };
-        if is_in { self.mark_in = set } else { self.mark_out = set }
+        if let Err(e) = self.state.set_marks(if is_in { (set, other) } else { (other, set) }) { self.last_error = Some(format!("{v}: {e}")); } // NLE5DRANGESAVE (SR723): one commit
         Some(true)
     }
     /// The marks `(in, out)` as set (either may be `None`).
     pub fn marks(&self) -> (Option<i64>, Option<i64>) {
-        (self.mark_in, self.mark_out)
+        self.state.timeline.marks // NLE5DRANGESAVE (SR723)
     }
     /// The range an `export` takes: `in..min(out, end)` when both marks are set; `None` (the whole timeline) otherwise.
     /// The range is empty when an edit shortened the timeline to the in mark or before it ([`Face::range_check`] refuses).
     pub fn export_range(&self) -> Option<std::ops::Range<i64>> {
-        match (self.mark_in, self.mark_out) {
+        match self.state.timeline.marks { // NLE5DRANGESAVE (SR723)
             (Some(a), Some(b)) => Some(a..b.min(self.state.timeline.end()).max(a)),
             _ => None,
         }
     }
     /// A marked range holding no tick of the timeline is refused by name (no directory made, no thread).
     fn range_check(&self, range: &Option<std::ops::Range<i64>>) -> Result<(), String> {
-        match (range, self.mark_in, self.mark_out) {
+        match (range, self.state.timeline.marks.0, self.state.timeline.marks.1) { // NLE5DRANGESAVE (SR723)
             (Some(r), Some(a), Some(b)) if r.is_empty() => Err(format!("the marks {a}..{b} are past the timeline's end {}", self.state.timeline.end())),
             _ => Ok(()),
         }
@@ -2289,4 +2286,24 @@ fn paint_marks(px: Vec<u8>, l: Layout, order: PixelOrder, marks: (Option<i64>, O
         c.rect(x, l.ruler_y as i64, x + 1, l.tracks_y as i64, view::GUIDE);
     }
     c.px
+}
+
+// ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the export verb's audio word through the one audio table (named tail block) ----
+/// The `export` verb's optional last word (`export [--all] [<dir>] [fmt] [audio]`): of two or three words, a last word the
+/// audio table ([`crate::nle_export::audio_named`]) takes is the audio; a third word it does not take is refused by name
+/// (`unknown audio <w> (wav|aac|mp4|none)`). Otherwise the words are SR694's / SR717's and the audio is `AudioOut::Wav`
+/// (the audio words and `VIDEO_NAMES` are disjoint, so every grammar the verb took before parses the same).
+fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String>) {
+    let named = args.last().and_then(|w| crate::nle_export::audio_named(w));
+    match (args.len(), named) {
+        (2 | 3, Some(a)) => {
+            args.pop();
+            (args, Ok(a))
+        }
+        (3, None) => {
+            let w = args.pop().unwrap_or_default();
+            (args, Err(format!("unknown audio {w} ({})", crate::nle_export::AUDIO_NAMES.join("|"))))
+        }
+        _ => (args, Ok(AudioOut::Wav)),
+    }
 }

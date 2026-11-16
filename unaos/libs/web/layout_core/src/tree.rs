@@ -571,7 +571,7 @@ pub fn build_taffy_tree<H: Host>(
             match a.trim().to_ascii_lowercase().as_str() {
                 "center" | "middle" => paint.text_align = Some(5),
                 "right" => paint.text_align = Some(6),
-                "left" => paint.text_align = Some(4),
+                "left" => paint.text_align = Some(7), // AETHERTEXTALIGNCODES (SR724): align=left is -webkit-left (7), not CSS left (4)
                 _ => {}
             }
         }
@@ -1184,7 +1184,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
         let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
-        if let Some(align) = effective.filter(|&a| a != 0 && a != 4) {
+        if let Some(align) = effective.filter(|&a| a != 0 && a != 4 && a != 7) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
                 let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
@@ -1852,7 +1852,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
         let mut size = inherited.clone();
         if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
             // AETHERCENTERLAYOUT (SR421): the inline formatter sees -webkit-center / -webkit-right as center / right.
-            size.text_align = match ta { 5 => 1, 6 => 2, a => a };
+            size.text_align = match ta { 5 => 1, 6 => 2, 7 => 4, a => a };
         }
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(tag) = dom_node.tag() {
@@ -3502,10 +3502,10 @@ mod img_alt_wrap_kat {
 /// taffy's default START is always the physical left). The filter in `propagate_text_align` admits no such code (and
 /// `Option::filter` never sees None), so this runs beside it: `place_narrow_blocks`' `_` arm gives END through `is_rtl`
 /// and records the write in `rule_align`, which SR686's `rule_align_undo` clears before the next prepass. The column's
-/// `justify_content` / `align_items` are never touched. Code 4 (`text-align: left`) is not admitted: it is also
-/// `align=left`, which Chromium keeps at the physical left (AETHER-RTL-BLOCK-LEFT owed, the 4 / 7 code split).
+/// `justify_content` / `align_items` are never touched. AETHERTEXTALIGNCODES (SR724): code 4 (`text-align: left`) is
+/// admitted (inline content only, so the blocks sit at the inline start); 7 (`align=left`, `-webkit-left`) is not.
 fn rtl_start_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, effective: Option<u8>) {
-    if !matches!(effective, None | Some(0)) {
+    if !matches!(effective, None | Some(0) | Some(4)) {
         return;
     }
     let Ok(st) = tree.taffy.style(id).cloned() else { return };

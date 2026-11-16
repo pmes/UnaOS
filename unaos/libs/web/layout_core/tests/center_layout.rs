@@ -314,8 +314,8 @@ fn rtl_column_starts_narrow_blocks_at_the_right() {
 // ---- AETHERRTLBLOCKSTART (LEDGER SR711): an rtl column with no / start text-align starts its narrow blocks at the right (named tail block) ----
 
 /// AETHERRTLBLOCKSTART (SR711, AETHER-RTL-BLOCK-START): with no text-align, or `text-align: start`, an rtl column puts a
-/// definite-width block at its inline start, the RIGHT edge (CSS 2.2 §10.3.3). `text-align: left` and `align=left` share
-/// code 4 and stay at the physical left (AETHER-RTL-BLOCK-LEFT owed); the column's direction decides, never the child's;
+/// definite-width block at its inline start, the RIGHT edge (CSS 2.2 §10.3.3). `text-align: left` (4) does too since SR724;
+/// `align=left` (7, -webkit-left) stays at the physical left; the column's direction decides, never the child's;
 /// a restyle to `direction: ltr` undoes the rule's align-self through SR686's `rule_align` (the block is back at 0).
 #[test]
 fn rtl_column_starts_narrow_blocks_with_no_align() {
@@ -337,7 +337,7 @@ fn rtl_column_starts_narrow_blocks_with_no_align() {
         ("dir=rtl, no text-align", col(&[("dir", "rtl"), ("style", "width: 300px")], &[]), 200.0),
         ("direction: rtl, no text-align", col(&[("style", "width: 300px; direction: rtl")], &[]), 200.0),
         ("dir=rtl text-align: start", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: start")], &[]), 200.0),
-        ("dir=rtl text-align: left (code 4, owed)", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: left")], &[]), 0.0),
+        ("dir=rtl text-align: left (inline start, SR724)", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: left")], &[]), 200.0),
         ("dir=rtl align=left", col(&[("dir", "rtl"), ("align", "left"), ("style", "width: 300px")], &[]), 0.0),
         ("a dir=rtl child in an ltr column", col(&[("style", "width: 300px")], &[("dir", "rtl")]), 0.0),
         ("ltr, no text-align", col(&[("style", "width: 300px")], &[]), 0.0),
@@ -359,4 +359,66 @@ fn rtl_column_starts_narrow_blocks_with_no_align() {
     layout_core::remeasure(&mut tree, &F);
     assert_eq!(align(&tree), None, "direction: ltr restyle: the rule's align-self is undone");
     assert_eq!(offset_in(&tree, &doc), 0.0, "direction: ltr restyle: the block is back at the left");
+}
+
+// ---- AETHERTEXTALIGNCODES (LEDGER SR724): CSS `left` (4) and the physical `-webkit-left` / `align=left` (7) split (named tail block) ----
+
+/// AETHERTEXTALIGNCODES (SR724, AETHER-RTL-BLOCK-LEFT, AETHER-RTL-WEBKIT-LEFT): CSS `text-align: left` aligns inline
+/// content only (CSS 2.2 §16.2), so in an rtl column a definite-width block sits at the inline start, the RIGHT edge;
+/// `align=left` and `-webkit-left` / `-moz-left` are Blink's physical left (code 7) and keep it at 0. In ltr all three
+/// leave it at 0; an auto-width block still fills (code 7 never writes the column's align_items); and the inline
+/// formatter reads 7 as left, like 4, where an rtl paragraph with no text-align starts its line at the right.
+#[test]
+fn left_and_webkit_left_split() {
+    let col = |col_attrs: &[(&'static str, &str)], kid_style: &str| {
+        let mut ca: Vec<(&'static str, &str)> = vec![("id", "col")];
+        ca.extend_from_slice(col_attrs);
+        page(vec![el("div", &ca, vec![el("div", &[("id", "n"), ("style", kid_style)], vec![text("ab")])])])
+    };
+    let place = |doc: &N| {
+        let tree = lay(doc, VW, 400.0);
+        let (cx, _, cw, _) = box_of(&tree, &doc.by_id("col"));
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("n"));
+        assert_eq!(cw, 300.0, "the column is 300 wide");
+        (x - cx, w)
+    };
+    let narrow = "width: 100px";
+    let cases: [(&str, N, f32); 10] = [
+        ("dir=rtl text-align: left", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: left")], narrow), 200.0),
+        ("dir=rtl align=left", col(&[("dir", "rtl"), ("align", "left"), ("style", "width: 300px")], narrow), 0.0),
+        ("dir=rtl -webkit-left", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: -webkit-left")], narrow), 0.0),
+        ("dir=rtl -moz-left", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: -moz-left")], narrow), 0.0),
+        ("direction: rtl -webkit-left", col(&[("style", "width: 300px; direction: rtl; text-align: -webkit-left")], narrow), 0.0),
+        ("ltr text-align: left", col(&[("style", "width: 300px; text-align: left")], narrow), 0.0),
+        ("ltr align=left", col(&[("align", "left"), ("style", "width: 300px")], narrow), 0.0),
+        ("ltr -webkit-left", col(&[("style", "width: 300px; text-align: -webkit-left")], narrow), 0.0),
+        ("dir=rtl align=left, auto width", col(&[("dir", "rtl"), ("align", "left"), ("style", "width: 300px")], ""), 0.0),
+        ("dir=rtl -webkit-left, auto width", col(&[("dir", "rtl"), ("style", "width: 300px; text-align: -webkit-left")], ""), 0.0),
+    ];
+    for (how, doc, want) in &cases {
+        let (x, w) = place(doc);
+        assert_eq!(x, *want, "{how}: the block's offset in the 300px column");
+        let auto = how.ends_with("auto width");
+        assert_eq!(w, if auto { 300.0 } else { 100.0 }, "{how}: the block's width");
+    }
+
+    // The inline formatter: text directly in a 300px rtl column.
+    let line_x = |style: &str, attrs: &[(&'static str, &str)]| {
+        let mut a: Vec<(&'static str, &str)> = vec![("id", "p"), ("dir", "rtl"), ("style", style)];
+        a.extend_from_slice(attrs);
+        let doc = page(vec![el("div", &a, vec![text("ab")])]);
+        let tree = lay(&doc, VW, 400.0);
+        tree.inline[&id_of(&tree, &doc.by_id("p"))]
+            .frags
+            .iter()
+            .find_map(|f| match f {
+                layout_core::inline::Frag::Text { x, .. } => Some(*x),
+                _ => None,
+            })
+            .expect("the column's text line")
+    };
+    assert!(line_x("width: 300px", &[]) > 100.0, "control: an rtl line with no text-align starts at the right");
+    assert_eq!(line_x("width: 300px; text-align: -webkit-left", &[]), 0.0, "-webkit-left: the line is at the left");
+    assert_eq!(line_x("width: 300px; text-align: left", &[]), 0.0, "left: the line is at the left");
+    assert_eq!(line_x("width: 300px", &[("align", "left")]), 0.0, "align=left: the line is at the left");
 }

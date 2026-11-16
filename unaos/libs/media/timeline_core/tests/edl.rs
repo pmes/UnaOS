@@ -329,3 +329,66 @@ fn nlexfadepower_audio_transitions_and_xfade_lines_are_refused_by_name() {
     assert_eq!(edl::parse(&video, 25), Err(EdlError::Syntax { line: 10 }));
     assert!(edl::parse(&video.replace("* UNA XFADE EQUAL\n", ""), 25).is_ok());
 }
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the `* UNA MARK` line (named tail block) ----
+
+/// CUT with `m` as the header's last line (line 6).
+fn nle5drangesave_at(m: &str) -> String {
+    CUT.replace("00:00:02:00\n\n", &format!("00:00:02:00\n{m}\n\n"))
+}
+
+#[test]
+fn nle5drangesave_the_mark_line_round_trips_byte_exact() {
+    let text = nle5drangesave_at("* UNA MARK 5 15");
+    let tl = edl::parse(&text, 25).unwrap();
+    assert_eq!(tl.marks, (Some(5), Some(15)));
+    let mut want = cut();
+    want.marks = (Some(5), Some(15));
+    assert_eq!(tl, want);
+    assert_eq!(edl::write(&tl, "CUT ONE").unwrap(), text);
+    // one mark alone: the other is `-`
+    let half = nle5drangesave_at("* UNA MARK - 15");
+    let tl = edl::parse(&half, 25).unwrap();
+    assert_eq!(tl.marks, (None, Some(15)));
+    assert_eq!(edl::write(&tl, "CUT ONE").unwrap(), half);
+    let tl = edl::parse(&nle5drangesave_at("* UNA MARK 5 -"), 25).unwrap();
+    assert_eq!(tl.marks, (Some(5), None));
+    // no marks: no MARK line, so every pinned EDL writes as before
+    assert_eq!(cut().marks, (None, None));
+    assert_eq!(edl::write(&cut(), "CUT ONE").unwrap(), CUT);
+}
+
+#[test]
+fn nle5drangesave_mark_refusals_are_named() {
+    for bad in ["* UNA MARK 15 5", "* UNA MARK 5 5", "* UNA MARK x 15", "* UNA MARK - -", "* UNA MARK -1 15", "* UNA MARK 5", "* UNA MARK 5 15 20"] {
+        assert_eq!(edl::parse(&nle5drangesave_at(bad), 25), Err(EdlError::Syntax { line: 6 }), "{bad}");
+    }
+    assert_eq!(edl::parse(&nle5drangesave_at("* UNA MARK 5 15\n* UNA MARK 5 15"), 25), Err(EdlError::Syntax { line: 7 }), "a second MARK line");
+    assert_eq!(cut().set_marks((Some(15), Some(5))), Err(EditError::Marks));
+    assert_eq!(cut().set_marks((Some(5), Some(5))), Err(EditError::Marks));
+    assert_eq!(cut().set_marks((Some(-1), None)), Err(EditError::Negative));
+    assert_eq!(cut().set_marks((None, Some(3))).map(|t| t.marks), Ok((None, Some(3))));
+}
+
+#[test]
+fn nle5drangesave_the_editors_mark_words_commit_and_write() {
+    use timeline_core::editor::EditorState;
+    let mut st = EditorState::open(CUT, 25).unwrap();
+    st.seek(5);
+    assert_eq!(st.verb("mark in"), Some(Ok(())));
+    st.seek(15);
+    assert_eq!(st.verb("mark out"), Some(Ok(())));
+    assert_eq!((st.timeline.marks, st.undo_depth()), ((Some(5), Some(15)), 2));
+    assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), nle5drangesave_at("* UNA MARK 5 15"));
+    assert_eq!(st.verb("mark out"), Some(Ok(())), "the same marks again");
+    assert_eq!(st.undo_depth(), 2, "commit nothing");
+    st.seek(2);
+    assert_eq!(st.verb("mark out"), Some(Err(EditError::Marks)));
+    assert_eq!(st.timeline.marks, (Some(5), Some(15)), "a refused mark leaves the marks");
+    assert!(st.undo());
+    assert_eq!(st.timeline.marks, (Some(5), None), "undo takes the out mark back");
+    assert_eq!(st.verb("mark clear"), Some(Ok(())));
+    assert_eq!(st.timeline.marks, (None, None));
+    assert_eq!(st.verb("mark sideways"), None, "not a mark word");
+    assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
+}
