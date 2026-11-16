@@ -161,17 +161,15 @@ pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'s
 
 /// The face an installed family NAME gives for `want` (resolution as [`db::FontDb::resolve_family`], then
 /// css-fonts-4 §5.2 selection and synthesis), or None when the family resolves to nothing.
-pub fn installed_face(name: &str, want: Style) -> Option<&'static Face> {
-    let d = db::db();
+pub fn installed_face_in(d: &db::FontDb, name: &str, want: Style) -> Option<&'static Face> {
     let fam = d.resolve_family(name)?;
     let (i, b, o) = d.select(&fam, want)?;
-    load_face_synth(d.faces.get(i)?, b, o)
+    load_face_styled(d.faces.get(i)?, b, o, want, None)
 }
 
 /// Platform fallback for one character (`gfx::GetFontForCharacter`): the first face in fontconfig's
 /// `sans-serif` order whose cmap has it, as the style-matched face of its family.
-pub fn platform_fallback(c: char, want: Style) -> Option<&'static Face> {
-    let d = db::db();
+pub fn platform_fallback_in(d: &db::FontDb, c: char, want: Style) -> Option<&'static Face> {
     for &i in d.fallback_order() {
         let info = &d.faces[i];
         if d.covers(i, c) != Some(true) {
@@ -180,7 +178,7 @@ pub fn platform_fallback(c: char, want: Style) -> Option<&'static Face> {
         let Some(f) = load_face(info) else { continue };
         let picked = d
             .select(&info.families[0], want)
-            .and_then(|(k, b, o)| load_face_synth(d.faces.get(k)?, b, o))
+            .and_then(|(k, b, o)| load_face_styled(d.faces.get(k)?, b, o, want, None))
             .filter(|g| g.font.glyph_index(c) != 0);
         return picked.or(Some(f));
     }
@@ -329,5 +327,91 @@ mod hostwght_tests {
         assert_eq!(axes_for(&font, want(50.0), None), vec![(*b"wght", 100.0)]);
         assert_eq!(axes_for(&font, want(400.0), Some(40.0)), vec![(*b"opsz", 32.0), (*b"wght", 400.0)]);
         assert!(axes_for(&font, want(400.0), Some(10.0)).contains(&(*b"opsz", 14.0)));
+    }
+}
+
+// ---- AETHERHOSTWGHTQUARTZITE (LEDGER SR716): text_host's own entry points on the instancing road (named tail block) ----
+
+/// The face an installed family NAME gives for `want` in the process database ([`installed_face_in`] over
+/// [`db::db`]): a variable face instanced at the weight through [`load_face_styled`] (AETHERHOSTWGHTQUARTZITE SR716).
+pub fn installed_face(name: &str, want: Style) -> Option<&'static Face> {
+    installed_face_in(db::db(), name, want)
+}
+
+/// Platform fallback for one character in the process database ([`platform_fallback_in`] over [`db::db`]), the
+/// style-matched face instanced through [`load_face_styled`] (AETHERHOSTWGHTQUARTZITE SR716).
+pub fn platform_fallback(c: char, want: Style) -> Option<&'static Face> {
+    platform_fallback_in(db::db(), c, want)
+}
+
+#[cfg(test)]
+mod hostwghtquartzite_tests {
+    use super::*;
+
+    /// A database over the one tree fixture face (`FontDb::from_faces`), and that face.
+    fn fixture_db(rel: &str) -> (db::FontDb, FaceInfo) {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel);
+        let info = db::faces_in_file(&p).into_iter().next().unwrap_or_else(|| panic!("{rel}: the tree's fixture face"));
+        (db::FontDb::from_faces(vec![info.clone()], crate::fontconfig::Config::default()), info)
+    }
+
+    fn want(weight: f32) -> Style {
+        Style { weight, ..Style::default() }
+    }
+
+    fn ink_h(f: &Face) -> u32 {
+        let m = raster::rasterize(f, f.font.glyph_index('H'), 32.0, 0).unwrap();
+        m.data.iter().map(|&v| v as u32).sum()
+    }
+
+    /// `installed_face_in` on the variable Inter: 400 is today's object, 600 a distinct instance with more ink in
+    /// `H`, 700 the instance with no synthetic bold (the old road emboldened the default instance).
+    #[test]
+    fn hostwghtquartzite_installed_face_instances() {
+        let (d, info) = fixture_db("fonts/inter/InterVariable.ttf");
+        let fam = info.families[0].clone();
+        let f400 = installed_face_in(&d, &fam, want(400.0)).unwrap();
+        assert!(std::ptr::eq(f400, load_face(&info).unwrap()), "a default-weight request is today's object");
+        let f600 = installed_face_in(&d, &fam, want(600.0)).unwrap();
+        assert_ne!(f600.id, f400.id);
+        assert!(f600.font.is_instanced() && !f600.synth_bold);
+        assert!(ink_h(f600) > ink_h(f400), "600 inks more than 400");
+        assert!(db::synthesis(info.style, want(700.0)).0, "the old road emboldened Inter at 700");
+        let f700 = installed_face_in(&d, &fam, want(700.0)).unwrap();
+        assert!(!f700.synth_bold);
+        assert!(std::ptr::eq(f700, load_face_styled(&info, true, false, want(700.0), None).unwrap()));
+    }
+
+    /// `platform_fallback_in` gives the style-matched face as the instance; at 400 today's object.
+    #[test]
+    fn hostwghtquartzite_platform_fallback_instances() {
+        let (d, info) = fixture_db("fonts/inter/InterVariable.ttf");
+        let g = platform_fallback_in(&d, 'H', want(700.0)).unwrap();
+        assert!(!g.synth_bold);
+        assert_ne!(g.id, load_face(&info).unwrap().id);
+        assert!(std::ptr::eq(g, load_face_styled(&info, true, false, want(700.0), None).unwrap()));
+        assert!(std::ptr::eq(platform_fallback_in(&d, 'H', want(400.0)).unwrap(), load_face(&info).unwrap()));
+    }
+
+    /// A static face returns the very `load_face_synth` object the pre-SR716 road gave, at every weight.
+    #[test]
+    fn hostwghtquartzite_static_face_unchanged() {
+        let (d, info) = fixture_db("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let fam = info.families[0].clone();
+        for w in [400.0, 700.0] {
+            let (b, o) = db::synthesis(info.style, want(w));
+            assert!(std::ptr::eq(installed_face_in(&d, &fam, want(w)).unwrap(), load_face_synth(&info, b, o).unwrap()), "{w}");
+        }
+    }
+
+    /// The public names are the `_in` bodies over the process database.
+    #[test]
+    fn hostwghtquartzite_process_db_delegates() {
+        if let Some(f) = installed_face("sans", want(700.0)) {
+            assert!(std::ptr::eq(f, installed_face_in(db::db(), "sans", want(700.0)).unwrap()));
+        }
+        if let Some(f) = platform_fallback('H', want(700.0)) {
+            assert!(std::ptr::eq(f, platform_fallback_in(db::db(), 'H', want(700.0)).unwrap()));
+        }
     }
 }
