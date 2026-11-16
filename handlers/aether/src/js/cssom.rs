@@ -1257,6 +1257,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
+    if prop == "caption-side" { return caption_side_computed(el); }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -1945,4 +1946,22 @@ pub fn normalize_for_test(prop: &str, value: &str) -> Option<String> {
         return None;
     }
     Some(b.serialize())
+}
+
+// ---- AETHERCAPTIONCSSOM (LEDGER SR686): getComputedStyle reports caption-side's used value (named tail block) ----
+
+/// AETHERCAPTIONCSSOM (SR686): `caption-side` as Chromium computes it (the specified keyword, inherited, initial top;
+/// a caption's align= is its presentation hint): the used value layout_core folded into `PaintStyle::caption_side`,
+/// read through its ONE walk (`layout_core::caption_side_used`) on the flushed tree. An element without a box
+/// (display: none) reads the cascaded value, else top.
+fn caption_side_computed(el: usize) -> String {
+    let used = with_layout(|f| {
+        let (tid, _) = f.tree.node_map.iter().find(|(_, n)| n.is_element() && n.id() == NodeId(el))?;
+        Some(layout_core::caption_side_used(&f.tree, *tid))
+    });
+    match used {
+        Some(true) => "bottom".to_string(),
+        Some(false) => "top".to_string(),
+        None => cascaded_value(el, "caption-side").unwrap_or_else(|| "top".to_string()),
+    }
 }
