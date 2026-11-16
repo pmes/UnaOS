@@ -214,3 +214,56 @@ fn caption_ua_centres_text() {
     let (x, _, _) = line(&lay(&inline, VW, 400.0), &inline);
     assert_eq!(x, 0.0, "style=\"text-align: left\" on the caption wins over the UA value");
 }
+
+// ---- AETHERCAPTIONCSSOM (LEDGER SR686): the centring rule's align-self is re-derived on a restyle (named tail block) ----
+
+/// AETHERCAPTIONCSSOM (SR686): Chromium re-derives -webkit-center's placement on every style recalc. A `td
+/// align=center` centres a nested table #t and 200px blocks #d / #a through `place_narrow_blocks`' align-self; a later
+/// restyle of the SAME tree (`apply_specs` + the in-place `remeasure`, anim's re-fold) to `text-align: left` undoes
+/// the rule's value: #d's align-self is none again, and #t's is not centre (table.rs's start) and the table sits at
+/// the cell's start. An author align-self folded by the same restyle (#a, even the value the rule had written) is kept.
+#[test]
+fn center_restyle_clears_rule_align_self() {
+    use layout_core::taffy::style::AlignSelf;
+    let doc = page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![el(
+            "tr",
+            &[],
+            vec![el(
+                "td",
+                &[("id", "cell"), ("align", "center")],
+                vec![
+                    el("table", &[("id", "t")], vec![el("tr", &[], vec![el("td", &[], vec![text("cell")])])]),
+                    el("div", &[("id", "d"), ("style", "width: 200px")], vec![text("ab")]),
+                    el("div", &[("id", "a"), ("style", "width: 200px")], vec![text("cd")]),
+                ],
+            )],
+        )],
+    )]);
+    let mut tree = lay(&doc, VW, 400.0);
+    let align = |tree: &Tree, id: &str| tree.taffy.style(id_of(tree, &doc.by_id(id))).unwrap().align_self;
+    for id in ["t", "d", "a"] {
+        assert_eq!(align(&tree, id), Some(AlignSelf::CENTER), "td align=center: the rule centres #{id}");
+    }
+
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut left = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("text-align", "left", &mut left, &cx);
+    let mut author = layout_core::css::SpecifiedStyle::<TH>::default();
+    author.align_self = Some(AlignSelf::CENTER);
+    let specs = [
+        (id_of(&tree, &doc.by_id("cell")), std::rc::Rc::new(left)),
+        (id_of(&tree, &doc.by_id("a")), std::rc::Rc::new(author)),
+    ];
+    layout_core::apply_specs(&mut tree, &specs);
+    layout_core::remeasure(&mut tree, &F);
+
+    assert_eq!(align(&tree, "d"), None, "text-align: left: the rule's align-self on #d is undone");
+    assert_ne!(align(&tree, "t"), Some(AlignSelf::CENTER), "text-align: left: the nested table is no longer centred");
+    let (cx0, _, _, _) = box_of(&tree, &doc.by_id("cell"));
+    let (tx, _, tw, _) = box_of(&tree, &doc.by_id("t"));
+    assert!(tw > 0.0 && (tx - (cx0 + 1.0)).abs() < 0.5, "the nested table sits at the cell's start (x {tx}, cell {cx0})");
+    assert_eq!(align(&tree, "a"), Some(AlignSelf::CENTER), "an author align-self folded by the restyle is kept");
+}
