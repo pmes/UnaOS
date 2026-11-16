@@ -1567,3 +1567,9 @@ exec-rmbp-aetherimgalt 5cccda556 wave36 cut70h
 exec-rmbp-aetherfilechosen 5cccda556 wave36 cut70h
 exec-rmbp-aetherimageinputelf 5cccda556 wave36 cut70h
 exec-rmbp-aetherfontdbcache 5cccda556 wave36 cut70h
+exec-rmbp-aetherimgelf 0971bc01c wave36 cut71h
+exec-rmbp-aethercaptioncssom 0971bc01c wave36 cut71h
+exec-rmbp-hevcperf 0971bc01c wave36 cut71h
+exec-rmbp-hevcintercip 0971bc01c wave36 cut71h
+exec-rmbp-nlerawexport 0971bc01c wave36 cut71h
+exec-rmbp-aetherhostwght 0971bc01c wave36 cut71h

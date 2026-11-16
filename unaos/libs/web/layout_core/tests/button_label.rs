@@ -148,3 +148,32 @@ fn image_box_has_no_edges() {
     assert_eq!((b("ix").2, b("ix").3), (b("sa").2, b("sa").3), "author padding and border still apply");
     assert!(layout_core::is_image_type(" Image ") && !layout_core::is_image_type("submit"));
 }
+
+// ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status text from its value (named tail block) ----
+
+#[test]
+fn file_status_width_follows_the_value() {
+    use layout_core::file_status;
+    assert_eq!(file_status(None, false, 1), "No file chosen");
+    assert_eq!(file_status(Some(""), true, 1), "No file chosen", "an empty value is no file");
+    assert_eq!(file_status(Some("C:\\fakepath\\"), false, 1), "No file chosen", "an empty basename is no file");
+    assert_eq!(file_status(Some("a.txt"), false, 0), "No file chosen", "count 0 is no file");
+    assert_eq!(file_status(Some("C:\\fakepath\\report.pdf"), false, 1), "report.pdf", "the basename after the last backslash");
+    assert_eq!(file_status(Some("/home/u/notes.md"), false, 1), "notes.md", "or after the last slash");
+    assert_eq!(file_status(Some("plain.png"), true, 1), "plain.png", "a plain name is its own basename");
+    assert_eq!(file_status(Some("a.txt"), true, 2), "2 files", "multiple with two files counts them");
+    assert_eq!(file_status(None, true, 3), "3 files");
+    assert_eq!(file_status(Some("a.txt"), false, 2), "a.txt", "without multiple the count is not shown");
+    // The test font: a character is half the size wide. At 4px the button (11 x 2 + its own 16 edges) + 4 + the status:
+    // a 5-char name gives 52, so the 34-digit floor (68) holds; a 30-char name gives 22 + 16 + 4 + 60 = 102.
+    let doc = page(vec![
+        lone("n", &[("type", "file"), ("style", "font-size: 4px")]),
+        lone("s", &[("type", "file"), ("style", "font-size: 4px"), ("value", "C:\\fakepath\\a.txt")]),
+        lone("l", &[("type", "file"), ("style", "font-size: 4px"), ("value", "C:\\fakepath\\abcdefghijklmnopqrstuvwxyz.pdf")]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let b = |id: &str| box_of(&tree, &doc.by_id(id));
+    assert_eq!(b("n").2, 70.0, "no value: No file chosen sizes the box (SR448's 70)");
+    assert_eq!(b("s").2, 68.0, "a short name falls to the 34-digit floor: {}", b("s").2);
+    assert_eq!(b("l").2, 102.0, "a long name widens the box to button + 4 + the name: {}", b("l").2);
+}

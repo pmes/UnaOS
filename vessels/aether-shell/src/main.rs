@@ -1079,7 +1079,7 @@ impl Coordinator {
 }
 
 fn main() {
-    let synapse = Synapse::new();
+    aether::fonts::register_db_cache(); let synapse = Synapse::new(); // AETHERFONTDBCACHE (SR684): before the chrome's first glyph
     // Stria's media service on the shell's bus: it answers the engine's `MediaPoster` /
     // `PlayMedia` / ... with `MediaOpened` / `MediaFrame` / `MediaEnded` / `MediaError`
     // (AETHERVIDEO, LEDGER SR39). Kept alive for the life of the process.

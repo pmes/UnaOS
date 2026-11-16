@@ -803,10 +803,10 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font
                 // edges (ua_control's file arm), so this is the whole border box and the inner button's own edges
                 // (`push_button_edges`) are inside it, the height the button's border box (line + 6).
                 "file" => {
-                    let (button, status) = file_label(attr("multiple").is_some());
+                    let (button, value) = (file_label(attr("multiple").is_some()).0, attr("value"));
                     let (b, p) = push_button_edges();
                     let (ew, eh) = (b.left + p.left + p.right + b.right, b.top + p.top + p.bottom + b.bottom);
-                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(status))), line + eh))
+                    Some((crate::fmath::ceil((34.0 * adv("0")).max(adv(button) + ew + 4.0 + adv(&*file_status(value.as_deref(), attr("multiple").is_some(), 1)))), line + eh))
                 }
                 // html.css: a fixed 50 x 27 swatch border box, font-independent. AETHERCOLORUAEDGES (SR458): over the color
                 // arm's own edges in ua_control (border 1px + padding 1px 2px = 6 x 4), so the content is html.css's 44 x 23.
@@ -1932,7 +1932,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
                     let h = attr_px("height").or(intrinsic.map(|(_, h)| h));
-                    if let (Some(w), Some(h)) = (w, h) {
+                    if let Some(wh) = img_alt_extent::<H, F>(tree, node_id, &size, fonts) { out.imgs.insert(node_id, wh); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
                         out.imgs.insert(node_id, (w, h));
                     }
                 }
@@ -3049,6 +3049,164 @@ fn abs_containing_block<H: Host>(tree: &LayoutTree<H>, parent: taffy::NodeId) ->
     }
     let (vw, vh) = tree.viewport;
     Some((0.0, 0.0, vw, vh))
+}
+
+// ---- AETHERIMGALT (LEDGER SR681): a failed img's alt-text fallback (named tail block) ----------------------------
+
+/// AETHERIMGALT (SR681): where an `<img>`'s image stands, as the host's image store says ([`Host::img_state`]):
+/// decoded, still on its way (a lazy image not yet fetched), or never coming (the fetch or decode failed, the URL
+/// was refused, no source). Only a FAILED image shows its alt text: Chromium builds the fallback content only once
+/// the load errors, so a loading image never flashes alt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImgState {
+    Loaded,
+    Pending,
+    Failed,
+}
+
+/// AETHERIMGALT (SR681): what a failed `<img>` renders instead of its image (Chromium's HTMLImageFallbackHelper).
+/// `InlineAlt`: an inline non-replaced element whose content is the text (its width / height dropped), sized by
+/// [`img_alt_extent`] as one text run. `BoxedAlt`: the img keeps its size as a clipped box holding the text; with
+/// `frame` it carries the 1px solid silver border and 1px padding and the 16px broken-image icon floats at its
+/// top-left (the host leaves the icon's slot empty: AETHER-IMG-BROKENICON owed), without `frame` (a fixed side
+/// under 18 px) neither.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImgFallback {
+    None,
+    InlineAlt(String),
+    BoxedAlt { text: String, frame: bool },
+}
+
+/// AETHERIMGALT (SR681): Chromium's rule for a failed img, pure. `alt` / `title` are the raw attributes (the text
+/// is HTMLImageElement::AltText: `alt` when the attribute exists, even empty, else `title`). `w` / `h`: None =
+/// `auto`, Some(None) = set but not a fixed px length, Some(Some(px)) = a fixed length (a width / height attribute
+/// or CSS). `aspect`: an author `aspect-ratio`. html_image_fallback_helper.cc: TreatImageAsReplaced (both sides
+/// set, or an aspect ratio and one side, AND quirks mode or an empty / missing alt; AtomicString::empty() is true
+/// for alt="") -> boxed, framed unless ImageSmallerThanAltImage (a fixed side < 18 px = the 16 px icon + 2);
+/// otherwise the img is inline text, nothing when that text is empty (ImageRepresentsNothing / the icon alone,
+/// owed). So in standards mode a SIZED img with a non-empty alt is inline text, its size dropped (AdjustHostStyle).
+pub fn img_fallback(
+    alt: Option<&str>,
+    title: Option<&str>,
+    state: ImgState,
+    w: Option<Option<f32>>,
+    h: Option<Option<f32>>,
+    aspect: bool,
+    quirks: bool,
+) -> ImgFallback {
+    if state != ImgState::Failed {
+        return ImgFallback::None;
+    }
+    let text = alt.or(title).unwrap_or("");
+    let dims = (w.is_some() && h.is_some()) || (aspect && (w.is_some() || h.is_some()));
+    if dims && (quirks || alt.is_none_or(|a| a.is_empty())) {
+        let small = h.flatten().is_some_and(|v| v < 18.0) || w.flatten().is_some_and(|v| v < 18.0);
+        return ImgFallback::BoxedAlt { text: text.to_string(), frame: !small };
+    }
+    if text.is_empty() { ImgFallback::None } else { ImgFallback::InlineAlt(text.to_string()) }
+}
+
+/// AETHERIMGALT (SR681): [`img_fallback`] for the box `id` of `tree`: an `<img>` only (an image input keeps SR461's
+/// `image_alt_label`), its state from [`Host::img_state`], each side from its width / height attribute else the
+/// box's taffy style (CSS), the author aspect ratio, and the document's [`is_quirks`]. The ONE call the img sizing
+/// rule (`img_alt_extent`) and the host's img paint both make.
+pub fn img_fallback_of<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> ImgFallback {
+    let Some(node) = tree.node_map.get(&id) else { return ImgFallback::None };
+    if node.tag().as_deref() != Some("img") {
+        return ImgFallback::None;
+    }
+    let state = H::img_state(node);
+    if state != ImgState::Failed {
+        return ImgFallback::None;
+    }
+    let style = tree.taffy.style(id).ok();
+    let axis = |name: &str, d: Option<Dimension>| -> Option<Option<f32>> {
+        match node.attr(name).and_then(|v| v.trim().parse::<f32>().ok()) {
+            Some(px) => Some(Some(px)),
+            None => d.filter(|d| !d.is_auto()).map(|d| d.into_option()),
+        }
+    };
+    let w = axis("width", style.map(|s| s.size.width));
+    let h = axis("height", style.map(|s| s.size.height));
+    let aspect = style.is_some_and(|s| s.aspect_ratio.is_some());
+    let (alt, title) = (node.attr("alt"), node.attr("title"));
+    img_fallback(alt.as_deref(), title.as_deref(), state, w, h, aspect, is_quirks(node))
+}
+
+/// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) measured as ONE
+/// line in the element's own run by `measure_text_run`, the measurer the painter's line breaker matches; None for
+/// every other img (today's sizing).
+fn img_alt_extent<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, id: taffy::NodeId, run: &TextRun, fonts: &F) -> Option<(f32, f32)> {
+    match img_fallback_of(tree, id) {
+        ImgFallback::InlineAlt(alt) => {
+            let text = H::transform_text(&alt, run.text_transform);
+            Some(measure_text_run(&TextRun { text, ..run.clone() }, f32::MAX, fonts))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod img_alt_kat {
+    use super::{img_fallback, ImgFallback, ImgState};
+
+    /// Unsized, failed, non-empty alt: inline text; a loading image: nothing yet.
+    #[test]
+    fn imgalt_inline_and_pending_kat() {
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, None, None, false, false), ImgFallback::InlineAlt("Logo".into()));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Pending, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Loaded, Some(Some(200.0)), Some(Some(100.0)), false, true), ImgFallback::None);
+    }
+
+    /// Standards mode drops a sized img with a non-empty alt to inline text; quirks mode boxes it.
+    #[test]
+    fn imgalt_sized_standards_vs_quirks_kat() {
+        let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, false), ImgFallback::InlineAlt("Logo".into()));
+        assert_eq!(img_fallback(Some("Logo"), None, ImgState::Failed, w, h, false, true), ImgFallback::BoxedAlt { text: "Logo".into(), frame: true });
+        // One side and an aspect ratio count as sized.
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, true, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        // One side alone does not.
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, None, false, false), ImgFallback::InlineAlt("T".into()));
+    }
+
+    /// Empty / missing alt: the title (alt missing only) in a box when sized; nothing when unsized and textless;
+    /// a fixed side under 18 px drops the frame.
+    #[test]
+    fn imgalt_empty_alt_and_small_kat() {
+        let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
+        assert_eq!(img_fallback(Some(""), Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
+        assert_eq!(img_fallback(None, Some("T"), ImgState::Failed, w, h, false, false), ImgFallback::BoxedAlt { text: "T".into(), frame: true });
+        assert_eq!(img_fallback(Some(""), None, ImgState::Failed, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback(None, None, ImgState::Failed, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(Some(16.0)), h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
+        // A percentage side is set but not fixed: never "small".
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(Some(10.0)), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: false });
+        assert_eq!(img_fallback(None, None, ImgState::Failed, Some(None), Some(None), false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true });
+    }
+}
+
+// ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status text from its value (named tail block) ----
+
+/// AETHERFILECHOSEN (SR682): the status text a file input shows after its Choose-File button (Chromium's
+/// LayoutFileUploadControl / FileInputType status): `"N files"` when `multiple` and `count` > 1 files are chosen, else the
+/// chosen file's name (the basename after the last `\` or `/`, so `C:\fakepath\report.pdf` shows `report.pdf`), else
+/// `file_label`'s "No file chosen" (an absent or empty value, an empty basename, or `count` 0). The ONE rule
+/// `control_intrinsic`'s file arm sizes the box by and both rings paint (render `paint_file_color`, AETHER.ELF
+/// `file_color`). Chromium ignores a file input's `value` attribute; with no picker the attribute is the stand-in source,
+/// one name (callers pass `count` 1), until a picker or the JS FileList feeds the status (AETHER-FILEPICKER,
+/// AETHER-FILECHOSEN-JSFILES owed).
+pub fn file_status<'a>(value: Option<&'a str>, multiple: bool, count: usize) -> alloc::borrow::Cow<'a, str> {
+    use alloc::borrow::Cow;
+    if multiple && count > 1 {
+        return Cow::Owned(alloc::format!("{count} files"));
+    }
+    let name = value.map(|v| v.rsplit(|c: char| c == '\\' || c == '/').next().unwrap_or(v)).unwrap_or("");
+    if name.is_empty() || count == 0 {
+        Cow::Borrowed(file_label(multiple).1)
+    } else {
+        Cow::Borrowed(name)
+    }
 }
 
 // ---- AETHERCAPTIONCSSOM (LEDGER SR686): caption-side's used value, top captions first, the centring mark (named tail block) ----
