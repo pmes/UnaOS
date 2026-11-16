@@ -472,6 +472,8 @@ pub struct Encoder {
     depth: u64,
     /// The previous frame's padded source luma (H264ENCSCENECUT SR680; empty until [`Config::scenecut`] runs).
     scene_prev: Plane,
+    /// The previous picture's un-guarded scene-cut threshold test (H264ENCSCENECUTFADE SR709): a run of firing pictures is one cut.
+    scene_fired: bool,
     /// The adaptive-quantisation state of the picture being coded (H264ENCAQ SR693; empty without [`Config::aq`]).
     pub(crate) aq: Aq,
 }
@@ -561,6 +563,7 @@ impl Encoder {
             bipred_idc,
             depth: num_reorder as u64,
             scene_prev: Plane::new(0, 0, 0),
+            scene_fired: false,
             aq: Aq::default(),
         })
     }
@@ -1089,14 +1092,14 @@ impl Encoder {
     /// Is the picture now in `src` (display index `display`) an IDR: `scheduled` (the GOP count), or under
     /// [`Config::scenecut`] a detected cut. None returns `scheduled` and does no work. Under Some the costs are skipped on a
     /// scheduled IDR, and `src`'s luma becomes the next picture's previous frame either way. A cut: inter x 100 >
-    /// (100 - k) x intra, or within min_keyint = gop / 4 of the last IDR, inter > intra.
+    /// (100 - k) x intra, or within min_keyint = gop / 4 of the last IDR, inter > intra. H264ENCSCENECUTFADE (SR709): not a cut when the previous picture's un-guarded threshold test also passed (a fade is one IDR at its first firing picture; a scheduled IDR leaves that state unchanged).
     pub(crate) fn scenecut_key(&mut self, display: u64, scheduled: bool) -> bool {
         let Some(k) = self.cfg.scenecut else { return scheduled };
         let mut cut = false;
         if !scheduled && !self.scene_prev.data.is_empty() {
             let (inter, intra) = self.scenecut_costs();
             let k = k.min(100) as u64;
-            cut = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { inter * 100 > (100 - k) * intra };
+            let fired = inter * 100 > (100 - k) * intra; let test = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { fired }; cut = test && !self.scene_fired; self.scene_fired = fired;
         }
         self.scene_prev.clone_from(&self.src[0]);
         scheduled || cut

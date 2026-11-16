@@ -174,3 +174,50 @@ fn d_motion_is_not_a_cut_and_keeps_the_pinned_bytes() {
     }
     assert_eq!(fnv(&samples), 0x1290_fbb5_41d1_0774, "Some(40) on the moving scene: the None pin (tests/rc.rs qp26 gop30)");
 }
+
+// ---- H264ENCSCENECUTFADE (LEDGER SR709): the gradual rule (named tail block) ----
+// A picture is a cut only if its test passes AND the previous picture's un-guarded threshold test did not: a run of changing
+// pictures (a fade, a dissolve, a brightness ramp) is ONE IDR at its first firing picture. The fixture is scene B's texture scaled
+// (a smooth gradient's intra cost is ~0, so any brightness step would fire the threshold and the slow-ramp case would say nothing).
+
+/// `texture(0)` with its luma scaled by `pct` / 100.
+fn scaled(pct: u32) -> [Vec<u8>; 3] {
+    let mut p = texture(0);
+    for v in p[0].iter_mut() {
+        *v = (*v as u32 * pct / 100) as u8;
+    }
+    p
+}
+
+#[test]
+fn e_a_fade_is_one_idr() {
+    let fade = |t: usize| if t < 10 { scaled(100) } else if t < 22 { scaled(100 - (t as u32 - 9) * 100 / 12) } else { scaled(0) };
+    let (aus, recons) = encode_all(cfg(Some(40), 0), 50, &fade);
+    let got = keys(&aus, 0);
+    let inside: Vec<u64> = got.iter().copied().filter(|d| (10..22).contains(d)).collect();
+    println!("scenecut e: fade 10..=21 to black keys {got:?} ({} inside the fade)", inside.len());
+    assert_eq!(inside.len(), 1, "a fade is ONE IDR at its first firing picture, not one per frame");
+    let c = inside[0];
+    assert_eq!(got, vec![0, c, c + 30], "the next scheduled IDR a GOP after the fade's");
+    decodes_to_recon("fade", &aus, &recons);
+}
+
+#[test]
+fn f_two_hard_cuts_three_apart_are_two_idrs() {
+    let src = |t: usize| if t < 10 { flat(50) } else if t < 13 { texture(0) } else { flat(200) };
+    let (aus, recons) = encode_all(cfg(Some(40), 0), 45, &src);
+    let got = keys(&aus, 0);
+    println!("scenecut f: cuts at 10 and 13 keys {got:?}");
+    assert_eq!(got, vec![0, 10, 13, 43], "a second hard cut after a static gap is a cut");
+    decodes_to_recon("two cuts", &aus, &recons);
+}
+
+#[test]
+fn g_slow_ramp_is_not_a_cut() {
+    let ramp = |t: usize| scaled(100 - 2 * t as u32);
+    let (aus, recons) = encode_all(cfg(Some(40), 0), 30, &ramp);
+    let got = keys(&aus, 0);
+    println!("scenecut g: 2 percent per frame keys {got:?}");
+    assert_eq!(got, vec![0], "a slow ramp below the threshold is no cut");
+    decodes_to_recon("ramp", &aus, &recons);
+}
