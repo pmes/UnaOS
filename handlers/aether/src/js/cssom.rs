@@ -45,7 +45,7 @@ pub const PROPERTIES: &[&str] = &[
     "content", "counter-increment", "counter-reset", "cursor", "direction", "display", "empty-cells", "fill",
     "filter", "flex", "flex-basis", "flex-direction", "flex-flow", "flex-grow", "flex-shrink", "flex-wrap",
     "float", "font", "font-family", "font-feature-settings", "font-kerning", "font-size", "font-stretch",
-    "font-style", "font-synthesis", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
+    "font-style", "font-synthesis", "font-synthesis-small-caps", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
     "grid-auto-flow", "grid-auto-rows", "grid-column", "grid-column-end", "grid-column-start", "grid-row",
     "grid-row-end", "grid-row-start", "grid-template", "grid-template-areas", "grid-template-columns",
     "grid-template-rows", "height", "hyphens", "image-rendering", "inline-size", "inset", "isolation",
@@ -363,6 +363,7 @@ fn longhands(sh: &str) -> Option<Vec<String>> {
         "border-image" => v(&BORDER_IMAGE),
         "gap" => v(&["row-gap", "column-gap"]),
         "overflow" => v(&["overflow-x", "overflow-y"]),
+        "font-synthesis" => v(&["font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps"]),
         "flex" => v(&["flex-grow", "flex-shrink", "flex-basis"]),
         "outline" => v(&["outline-color", "outline-style", "outline-width"]),
         "border-radius" => v(&["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"]),
@@ -576,6 +577,11 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
                 .collect()),
             None => Ok(vec![(prop.to_string(), serialize_generic(prop, v))]),
         },
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => {
+            let (w, s, c) = layout_core::css::parse_font_synthesis(prop, &css_core::serialize::to_css(tv)).ok_or(())?;
+            let kw = |b: bool| (if b { "auto" } else { "none" }).to_string();
+            Ok([("font-synthesis-weight", w), ("font-synthesis-style", s), ("font-synthesis-small-caps", c)].into_iter().filter_map(|(p, b)| Some((p.to_string(), kw(b?)))).collect())
+        }
         "word-wrap" => normalize_value("overflow-wrap", v).map(|x| vec![("overflow-wrap".into(), x)]).ok_or(()),
         _ => normalize_value(prop, v).map(|x| vec![(prop.to_string(), x)]).ok_or(()),
     }
@@ -618,6 +624,9 @@ fn shorthands_of(p: &str) -> Vec<&'static str> {
     }
     if matches!(p, "overflow-x" | "overflow-y") {
         out.push("overflow");
+    }
+    if matches!(p, "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps") {
+        out.push("font-synthesis");
     }
     if matches!(p, "flex-grow" | "flex-shrink" | "flex-basis") {
         out.push("flex");
@@ -715,6 +724,7 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             }
         }
         "flex" => format!("{} {} {}", vals[0], vals[1], vals[2]),
+        "font-synthesis" => font_synthesis_words(&vals)?,
         "outline" => side(vals[2], vals[1], vals[0]),
         "border-radius" => {
             if vals.iter().all(|v| *v == vals[0]) {
@@ -1230,7 +1240,7 @@ fn initial_value(p: &str) -> &'static str {
         "direction" => "ltr",
         "pointer-events" => "auto",
         "letter-spacing" | "word-spacing" => "normal",
-        "font-synthesis" => "weight style", "font-synthesis-weight" | "font-synthesis-style" => "auto",
+        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto",
         "min-width" | "min-height" => "0px",
         "margin-right" | "margin-bottom" | "margin-left" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
         "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
@@ -1258,7 +1268,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
-    if prop == "caption-side" { return caption_side_computed(el); }
+    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -1965,4 +1975,36 @@ fn caption_side_computed(el: usize) -> String {
         Some(false) => "top".to_string(),
         None => cascaded_value(el, "caption-side").unwrap_or_else(|| "top".to_string()),
     }
+}
+
+// ---- AETHERFONTSYNTHESISCSSOM (LEDGER SR764): getComputedStyle's font-synthesis recomposed from its longhands (named tail block) ----
+
+/// AETHERFONTSYNTHESISCSSOM (SR764): the computed `font-synthesis` is the shorthand serialization of its two longhands'
+/// computed values (each cascaded, inherited or initial on its own), in Chromium's canonical order (`weight style`,
+/// `weight`, `style`, `none`): an element that declares only `font-synthesis-weight: none` reads `style`, not the
+/// shorthand its parent computes.
+fn font_synthesis_computed(el: usize) -> String {
+    let mut b = Block::default();
+    for l in longhands("font-synthesis").unwrap_or_default() {
+        let value = computed_value(el, &l);
+        b.decls.push(Decl { name: l, value, important: false });
+    }
+    serialize_shorthand(&b, "font-synthesis").map(|x| x.0).unwrap_or_default()
+}
+
+// ---- AETHERFONTSYNTHESISSMALLCAPS (LEDGER SR772): the font-synthesis shorthand serialized over its three longhands (named tail block) ----
+
+/// AETHERFONTSYNTHESISSMALLCAPS (SR772): `font-synthesis` from its `weight` / `style` / `small-caps` longhands' values
+/// (in `longhands` order): each one that is `auto` names its keyword, in Chromium's canonical order (weight, style,
+/// small-caps); all three `none` is `none`; any other value (a mix with a CSS-wide keyword) has no shorthand.
+fn font_synthesis_words(vals: &[&str]) -> Option<String> {
+    let mut on = Vec::new();
+    for (k, v) in ["weight", "style", "small-caps"].iter().zip(vals.iter()) {
+        match *v {
+            "auto" => on.push(*k),
+            "none" => {}
+            _ => return None,
+        }
+    }
+    Some(if on.is_empty() { "none".to_string() } else { on.join(" ") })
 }
