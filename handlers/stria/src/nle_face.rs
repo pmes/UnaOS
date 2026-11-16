@@ -29,6 +29,7 @@
 //!   NLE2-MODS (LEDGER SR306): shift-add and the no-snap Alt / Option come on the press itself (`BrowserButton`'s
 //!   `mods`, bandy's `MOD_SHIFT` / `MOD_ALT`), so both faces have them and no keydown latch exists.
 //! * NLEHOSTSAVE (LEDGER SR677): `save` (button, `Ctrl+s` / `Meta+s`) writes the timeline through `edl::write` to the path the document was opened from.
+//! * NLEPLAYAUDIO (LEDGER SR676): a forward played tick is ONE `render` through `PlaySink` (the still, the meters, the mix to a `media::AudioOut` installed by [`Face::with_audio`]).
 
 use std::time::Duration;
 
@@ -186,13 +187,15 @@ pub struct Face {
     doc_path: Option<std::path::PathBuf>,
     /// NLEHOSTSAVE (SR677): the timeline as last opened or saved; [`Face::dirty`] is the current one differing from it.
     clean: Timeline,
+    /// NLEPLAYAUDIO (SR676): the play path (the device, the played still, where the last played render ended).
+    play: PlayAudio,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -231,7 +234,7 @@ impl Face {
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
-                self.rate = 1;
+                self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
             _ => match self.state.verb(v) {
@@ -271,10 +274,10 @@ impl Face {
         }
         let ph = self.state.playhead;
         if (self.rate > 0 && ph >= self.state.timeline.end()) || (self.rate <= 0 && ph <= 0) {
-            self.playing = false;
+            self.playing = false; self.sync_audio(); // NLEPLAYAUDIO (SR676)
             return true;
         }
-        self.feed_meters(ph, self.rate); self.state.nudge(self.rate);
+        if !self.play_tick(ph) { self.feed_meters(ph, self.rate); self.state.nudge(self.rate); } // NLEPLAYAUDIO (SR676): a forward played tick is ONE render, shown at its own playhead
         true
     }
     /// The canvas as painted now (the preview at the playhead rendered first). While a drag is live the drag's
@@ -473,17 +476,17 @@ impl Face {
         let r = match act {
             "shuttle+" => {
                 self.rate = if self.playing && self.rate > 0 { (self.rate * 2).min(SHUTTLE_MAX) } else { 1 };
-                self.playing = true;
+                self.playing = true; self.sync_audio(); // NLEPLAYAUDIO (SR676)
                 Ok(())
             }
             "shuttle-" => {
                 self.rate = if self.playing && self.rate < 0 { (self.rate * 2).max(-SHUTTLE_MAX) } else { -1 };
-                self.playing = true;
+                self.playing = true; self.sync_audio(); // NLEPLAYAUDIO (SR676)
                 Ok(())
             }
             "stop" => {
                 self.playing = false;
-                self.rate = 1;
+                self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
             "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch
@@ -873,7 +876,7 @@ mod tests {
         assert_eq!((face.playing, face.rate), (true, 1));
         gtk(&mut face, "l");
         assert_eq!(face.rate, 2);
-        assert!(face.tick());
+        assert!(face.tick() && face.tick()); // SR676: the first played tick shows the playhead's own range, the next steps by it
         assert_eq!(face.state.playhead, 2);
         gtk(&mut face, "k");
         assert!(!face.playing);
@@ -1561,7 +1564,7 @@ impl Face {
         let l = self.layout_for(role);
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
-        if role != Role::Tracks {
+        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1715,5 +1718,325 @@ impl Face {
         std::fs::write(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         self.clean = self.state.timeline.clone();
         Ok(text.len())
+    }
+}
+
+// ---- NLEPLAYAUDIO (LEDGER SR676): the face plays sound; a played tick renders once (named tail block) ----
+
+/// NLEPLAYAUDIO (SR676): the face's play path — the device (a `media::AudioOut`, `None` muted / headless / in tests), whether
+/// it is released (`live`: playing at rate 1), the playhead the last played render was shown at (`shown`) and where that
+/// render ended (`next`: the next played tick steps the playhead there first; a range that does not continue it flushes the
+/// ring and resets the meters, as `MixMeters::feed` resets them), and the still a played tick rendered, tagged by the
+/// playhead its paint shows (`pending`).
+#[derive(Default)]
+struct PlayAudio {
+    out: Option<Box<dyn crate::media::AudioOut>>,
+    live: bool,
+    next: Option<i64>,
+    shown: Option<i64>,
+    pending: Option<(i64, Option<Still>)>,
+    renders: u64,
+    pushed: u64,
+    run_base: u64,
+    run_pushed: u64,
+    rate: u32,
+}
+
+impl PlayAudio {
+    /// The played tick's still into `into` when it was rendered for `playhead` and no drag preview is painted (`live`); true
+    /// when taken (the paint then renders no `preview`).
+    fn take_still(&mut self, into: &mut Option<Still>, playhead: i64, live: bool) -> bool {
+        match self.pending.take() {
+            Some((at, s)) if live && at == playhead => {
+                *into = s;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the play path has done: renders through [`PlaySink`], PCM frames handed to the device, whether it is released.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayStats {
+    pub renders: u64,
+    pub pushed: u64,
+    pub live: bool,
+}
+
+/// NLEPLAYAUDIO (SR676): the ONE render of a played tick: the last frame is the face's still (what `preview` gave), the mix
+/// and each track's share feed the meters through `MixMeters`' own `RenderSink` (the pushes `MixMeters::feed` makes), and
+/// the mix goes to the device as stereo (`media::to_stereo`) when one is released.
+struct PlaySink<'a> {
+    meters: &'a mut MixMeters,
+    out: Option<&'a mut Box<dyn crate::media::AudioOut>>,
+    still: Option<Still>,
+    pushed: u64,
+}
+
+impl RenderSink for PlaySink<'_> {
+    fn frame(&mut self, _out_t: i64, width: u32, height: u32, rgba: &[u8]) {
+        self.still = Some(Still { width, height, rgba: rgba.to_vec() });
+    }
+    fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        RenderSink::pcm(&mut *self.meters, out_t, rate, channels, interleaved);
+        if let Some(o) = self.out.as_mut() {
+            let took = o.push(&crate::media::to_stereo(interleaved, channels as usize));
+            self.pushed += (took / 2) as u64;
+        }
+    }
+    fn taps_tracks(&self) -> bool {
+        true
+    }
+    fn track_pcm(&mut self, out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
+        RenderSink::track_pcm(&mut *self.meters, out_t, track, rate, channels, interleaved);
+    }
+}
+
+impl Face {
+    /// Play through `out` (a `media::resonance_out` feed at `rate` Hz): the render's audio rate is set to the device's
+    /// (`Sources::set_audio_rate`), the device starts paused and is released while playing at rate 1.
+    pub fn with_audio(mut self, mut out: Box<dyn crate::media::AudioOut>, rate: u32) -> Face {
+        out.set_paused(true);
+        self.sources.set_audio_rate(rate);
+        self.play.rate = rate;
+        self.play.out = Some(out);
+        self.play.live = false;
+        self.sync_audio();
+        self
+    }
+    /// What the play path has done.
+    pub fn played(&self) -> PlayStats {
+        PlayStats { renders: self.play.renders, pushed: self.play.pushed, live: self.play.live }
+    }
+    /// The device follows the transport: released while playing at rate 1; otherwise paused and its ring flushed (a
+    /// shuttle and reverse play are silent: NLE-SHUTTLE-AUDIO owed). A run's end logs what the device consumed, once.
+    fn sync_audio(&mut self) {
+        let want = self.playing && self.rate == 1;
+        if want == self.play.live {
+            return;
+        }
+        self.play.live = want;
+        let rate = self.play.rate;
+        let Some(o) = self.play.out.as_mut() else { return };
+        if want {
+            o.set_paused(false);
+            self.play.run_base = o.consumed();
+            self.play.run_pushed = self.play.pushed;
+        } else {
+            o.set_paused(true);
+            o.flush();
+            let frames = o.consumed().saturating_sub(self.play.run_base);
+            if frames > 0 || self.play.pushed > self.play.run_pushed {
+                log::info!("[STRIA] :: nle play audio rate={rate} frames={frames}");
+            }
+        }
+    }
+    /// One played forward tick at playhead `ph`: when the last played render was shown at `ph`, the playhead first steps to
+    /// where that render ended; then ONE render of `playhead..playhead + rate` (clamped to the end) through [`PlaySink`], shown
+    /// at that playhead (the frame, the line and the audio pushed are the same tick). The end stops play. False for a reverse
+    /// rate (the old path: `feed_meters` resets, the nudge, the paint renders `preview`). An error is `last_error` and resets
+    /// the meters; the paint then renders `preview`, as before, and the next tick still steps on.
+    fn play_tick(&mut self, ph: i64) -> bool {
+        if self.rate <= 0 {
+            return false;
+        }
+        self.play.pending = None;
+        if let (Some(at), Some(n)) = (self.play.shown, self.play.next) {
+            if at == ph {
+                self.state.seek(n);
+            }
+        }
+        let ph = self.state.playhead;
+        let end = (ph + self.rate).min(self.state.timeline.end());
+        self.play.shown = None;
+        if end <= ph {
+            self.playing = false;
+            self.sync_audio();
+            return true;
+        }
+        if self.play.next != Some(ph) {
+            self.meters.reset();
+            if let Some(o) = self.play.out.as_mut() {
+                o.flush();
+            }
+        }
+        let out = if self.play.live && self.rate == 1 { self.play.out.as_mut() } else { None };
+        let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0 };
+        let r = render(&self.state.timeline, ph..end, &self.sources, &mut sink);
+        let (still, pushed) = (sink.still, sink.pushed);
+        self.play.renders += 1;
+        self.play.pushed += pushed;
+        match r {
+            Ok(_) => self.play.pending = Some((ph, still)),
+            Err(e) => {
+                self.last_error = Some(format!("meters: {e}"));
+                self.meters.reset();
+            }
+        }
+        (self.play.shown, self.play.next) = (Some(ph), Some(end));
+        true
+    }
+}
+
+#[cfg(test)]
+mod playaudio_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::{SYNTH_RATE, synth_sample};
+    use gneiss_pal::dsp::video::TestPattern;
+    use std::sync::{Arc, Mutex};
+
+    /// What the recording device saw, in order.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Ev {
+        Push(Vec<f32>),
+        Paused(bool),
+        Flush,
+    }
+
+    /// The tests' `AudioOut`: records every call; takes every sample; `consumed` is what it took.
+    struct RecordingOut(Arc<Mutex<Vec<Ev>>>);
+
+    impl AudioOut for RecordingOut {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            self.0.lock().unwrap().push(Ev::Push(stereo.to_vec()));
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.0.lock().unwrap().iter().map(|e| if let Ev::Push(s) = e { s.len() as u64 / 2 } else { 0 }).sum()
+        }
+        fn flush(&mut self) {
+            self.0.lock().unwrap().push(Ev::Flush);
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.0.lock().unwrap().push(Ev::Paused(paused));
+        }
+    }
+
+    fn face() -> (Face, Arc<Mutex<Vec<Ev>>>) {
+        let (tl, src) = synth_fixture();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(RecordingOut(log.clone())), SYNTH_RATE);
+        (f, log)
+    }
+
+    fn pushes(log: &Arc<Mutex<Vec<Ev>>>) -> Vec<Vec<f32>> {
+        log.lock().unwrap().iter().filter_map(|e| if let Ev::Push(s) = e { Some(s.clone()) } else { None }).collect()
+    }
+
+    fn still_at(t: i64) -> Option<Still> {
+        let (tl, src) = synth_fixture();
+        preview(&tl, &src, t).unwrap()
+    }
+
+    /// NLEPLAYAUDIO M3: a played tick is ONE render; its paint takes the played still (no `preview` render), which is the
+    /// frame at the playhead the line shows: the first tick at 0, the next steps to 1.
+    #[test]
+    fn nleplayaudio_played_tick_renders_once() {
+        let (mut f, _) = face();
+        f.verb("play");
+        assert!(f.tick());
+        assert_eq!((f.state.playhead, f.played().renders), (0, 1), "the first played tick is shown at its own playhead");
+        assert!(f.play.pending.is_some());
+        let _ = f.frames();
+        assert!(f.play.pending.is_none(), "the paint took the played still");
+        assert_eq!(f.played().renders, 1);
+        assert_eq!(f.still().cloned(), still_at(0));
+        assert!(f.tick());
+        let _ = f.frames();
+        assert_eq!((f.state.playhead, f.played().renders), (1, 2));
+        assert_eq!(f.still().cloned(), still_at(1));
+        assert_eq!(TestPattern::read_counter(&f.still().unwrap().rgba, 64, 48), Some(14), "reel A, source tick 14");
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    }
+
+    /// NLEPLAYAUDIO M3: each played tick hands the device rate / fps frames (48000 / 25 = 1920), stereo, L = R = the mono
+    /// mix (reel A from source tick 13 at unity gain: the source's own samples).
+    #[test]
+    fn nleplayaudio_pcm_per_tick() {
+        let (mut f, log) = face();
+        f.verb("play");
+        f.tick();
+        f.tick();
+        let p = pushes(&log);
+        assert_eq!(p.len(), 2);
+        for (k, s) in p.iter().enumerate() {
+            assert!((s.len() as i64 / 2 - (SYNTH_RATE / 25) as i64).abs() <= 1, "{}", s.len());
+            for (i, fr) in s.chunks_exact(2).enumerate() {
+                assert_eq!(fr[0], fr[1]);
+                assert_eq!(fr[0], synth_sample(0, (13 + k as u64) * 1920 + i as u64) as f32 / 32768.0, "tick {k} frame {i}");
+            }
+        }
+        assert_eq!(f.played().pushed, 3840);
+    }
+
+    /// NLEPLAYAUDIO M3: the meters after two played ticks are `MixMeters::feed` of the same two ticks, bit for bit.
+    #[test]
+    fn nleplayaudio_meters_bit_for_bit() {
+        let (mut f, _) = face();
+        f.verb("play");
+        f.tick();
+        f.tick();
+        let (tl, src) = synth_fixture();
+        let mut m = MixMeters::default();
+        m.feed(&tl, 0..1, &src).unwrap();
+        m.feed(&tl, 1..2, &src).unwrap();
+        assert_eq!(f.meters().levels(), m.levels());
+        assert_eq!(f.meters().levels().len(), 2);
+    }
+
+    /// NLEPLAYAUDIO M3: the device starts paused, play releases it, stop pauses it then flushes; a shuttle past rate 1 is
+    /// silent (paused, flushed, nothing pushed on its tick); a face with no device plays and pushes nothing.
+    #[test]
+    fn nleplayaudio_pause_flushes() {
+        let (mut f, log) = face();
+        assert_eq!(*log.lock().unwrap(), vec![Ev::Paused(true)]);
+        f.verb("play");
+        assert_eq!(log.lock().unwrap().last(), Some(&Ev::Paused(false)));
+        assert!(f.played().live);
+        f.tick();
+        log.lock().unwrap().clear();
+        f.verb("play");
+        assert_eq!(*log.lock().unwrap(), vec![Ev::Paused(true), Ev::Flush]);
+        assert!(!f.played().live);
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserText("l".into()));
+        f.on(&SMessage::BrowserText("l".into()));
+        assert_eq!((f.playing, f.rate), (true, 2));
+        assert!(f.tick());
+        assert_eq!(*log.lock().unwrap(), vec![Ev::Paused(false), Ev::Paused(true), Ev::Flush], "the shuttle's tick pushes nothing");
+        assert_eq!((f.state.playhead, f.played().renders, f.played().pushed), (1, 2, 1920));
+
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        mute.verb("play");
+        assert!(mute.tick());
+        assert_eq!(mute.played(), PlayStats { renders: 1, pushed: 0, live: true });
+    }
+
+    /// NLEPLAYAUDIO M3: stopped, the line is the frame shown and the repaint is `preview`'s; a seek while playing repaints
+    /// with `preview` at the new tick, and the next played tick renders there (the meters and the ring restart).
+    #[test]
+    fn nleplayaudio_stopped_repaint_is_preview() {
+        let (mut f, log) = face();
+        f.verb("play");
+        f.tick();
+        f.tick();
+        f.verb("play");
+        let _ = f.frames();
+        assert_eq!((f.state.playhead, f.still().cloned()), (1, still_at(1)));
+        f.verb("play");
+        f.tick();
+        assert_eq!(f.state.playhead, 2, "a resumed run steps past the tick it showed");
+        f.state.seek(30);
+        let _ = f.frames();
+        assert_eq!(f.still().cloned(), still_at(30));
+        log.lock().unwrap().clear();
+        f.tick();
+        assert_eq!(f.state.playhead, 30);
+        assert_eq!(log.lock().unwrap().first(), Some(&Ev::Flush), "a range that does not continue flushes the ring");
+        let _ = f.frames();
+        assert_eq!(TestPattern::read_counter(&f.still().unwrap().rgba, 64, 48), Some(28));
     }
 }
