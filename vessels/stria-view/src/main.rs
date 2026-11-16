@@ -611,7 +611,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t}}}")).unwrap_or_default()
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"}}", face.export_audio().unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -640,5 +640,33 @@ mod exportrange_tests {
         assert_eq!((face.marks(), range_json(&face)), ((Some(5), None), String::new()));
         assert!(drive(&mut face, "ruler:15,out").is_empty());
         assert_eq!(range_json(&face), r#","range":[5,15]"#);
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the witness's export object names its audio (named tail block) ----
+#[cfg(test)]
+mod exportaudio_tests {
+    use super::*;
+
+    /// NLE5DEXPORTMESSAGEAUDIO (SR756): while an export runs the `"export"` object carries `"audio"` (the paused seam,
+    /// `Face::export_paused_at`, exports `png` with the default `wav`); once it is cancelled and joined the field is gone.
+    #[test]
+    fn nle5dexportmessageaudio_witness_export_audio_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nle5dexportmessageaudio-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        let t0 = std::time::Instant::now();
+        while face.export_progress() != Some((3, 35)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "reading {:?}", face.export_progress());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(export_json(&face), r#","export":{"done":3,"total":35,"audio":"wav"}"#);
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
