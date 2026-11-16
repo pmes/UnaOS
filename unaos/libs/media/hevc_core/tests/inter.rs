@@ -610,10 +610,10 @@ fn lost_picture_is_concealed_from_the_nearest_held_picture() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![2]);
-    assert_eq!(d.take_concealed(), vec![(2, 1)]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3]);
-    assert_frame(by_poc(&f, 3), &shifted(&i0, 8, 4), "P from the picture concealed from POC 1");
+    assert_frame(by_poc(&f, 3), &shifted(&shifted(&i0, 8, 4), 8, 4), "P from the picture concealed from POC 1, advanced by its motion");
 }
 
 /// IDR0 (the gradient), P2 (the gradient moved by (8, 4), references POC 0), P4 (skip-only, references the lost POC 1):
@@ -629,7 +629,7 @@ fn conceal_tie_takes_the_lower_poc() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![1]);
-    assert_eq!(d.take_concealed(), vec![(1, 0)]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0 }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -650,4 +650,123 @@ fn empty_dpb_keeps_the_generated_picture_grey() {
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1]);
     assert_frame(&f[0], &Img::new(|_, _| 128, |_, _| 128, |_, _| 128), "P from the grey generated reference");
+}
+
+// ---- HEVCERRORCONCEALMOTION (LEDGER SR710): the concealed picture projected along its source's motion (named tail block) ----
+
+/// IDR0 (the gradient), P2 (the gradient moved by (8, 4), references POC 0: the motion spans two POCs), P4 (skip-only,
+/// references the lost POC 3): POC 3 is concealed from the nearest held picture, POC 2, whose vector (32, 16) is
+/// rescaled by scale_mv to one POC (td 2, tb 1: (16, 8) quarter samples, (4, 2) samples, chroma (2, 1)), so P4 is P2
+/// advanced by (4, 2) and the note says projected. (SR700's first test is the one-POC case; its tie test the intra
+/// source's still copy.)
+#[test]
+fn conceal_projection_scales_by_poc_distance() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(4, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
+    assert_frame(by_poc(&f, 4), &shifted(&shifted(&i0, 8, 4), 4, 2), "P from the picture projected from POC 2 by half its vector");
+}
+
+// ---- HEVCCONCEALBIDIR (LEDGER SR721): a bi-predicted source block projected along both lists (named tail block) ----
+
+/// IDR0 (the gradient), P4 (skip-only: I0), B2 (StCurrBefore {0}, StCurrAfter {4}, two references per list: CTB 0 a
+/// 2Nx2N AMVP unit, PRED_BI with L0 mvd (32, 16) to POC 0 and L1 mvd (-64, 0) to POC 4, or PRED_L1 alone when `l1_only`;
+/// mvp 0 so mv = mvd; CTBs 1..3 skip-merge its motion), then P6 (skip-only, references only the lost POC 3). POC 3 is
+/// generated and concealed from POC 2 (POC 2 and POC 4 tie at one away; the lower conceals). Returns the decoder after
+/// the flush.
+fn bidir_conceal_stream(l1_only: bool) -> hevc_core::Decoder {
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&gradient(), true));
+    s.extend(picture(&p_slice(4, vec![(-4, true)]), skip_picture));
+    let bcfg = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 2,
+        neg: vec![(-2, true)],
+        pos: vec![(2, true)],
+        num_ref: Some((2, 2)),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    s.extend(picture(&bcfg, |mut e| {
+        e.split_cu(0, false);
+        e.cu_skip(0, false);
+        e.pred_inter();
+        e.part_mode_2nx2n();
+        e.merge_flag(false);
+        if l1_only {
+            // inter_pred_idc PRED_L1: bin 0 (ctxInc CtDepth 0) "0", then bin 1 (ctxInc 4) "1".
+            e.decision(hevc_core::tables::INTER_PRED_IDC, 0);
+            e.decision(hevc_core::tables::INTER_PRED_IDC + 4, 1);
+        } else {
+            e.pred_bi(0);
+            e.ref_idx(0, 2);
+            e.mvd([32, 16]);
+            e.mvp_flag(0);
+        }
+        e.ref_idx(0, 2);
+        e.mvd([-64, 0]);
+        e.mvp_flag(0);
+        e.rqt_root_cbf(false);
+        for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+            e.terminate(0);
+            e.split_cu(0, false);
+            e.cu_skip(inc, true);
+            if last {
+                break;
+            }
+        }
+        e.finish().out
+    }));
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    d
+}
+
+fn img_of(f: &Frame) -> Img {
+    Img { y: f.planes[0].clone(), cb: f.planes[1].clone(), cr: f.planes[2].clone() }
+}
+
+/// A bi-predicted source (B2) conceals the lost POC 3 along BOTH lists: L0 (32, 16) to POC 0 rescaled by td 2, tb 1 to
+/// (16, 8) quarter samples = (4, 2) samples; L1 (-64, 0) to POC 4 rescaled by td -2, tb 1 to (32, 0) = (8, 0) samples;
+/// the concealed picture (read through P6, its skip copy) is the 8-262 average (a + b + 1) >> 1 of the two whole-sample
+/// fetches from B2, every one of the sixteen 8x8 blocks is bi-directional, and it differs from either fetch alone.
+#[test]
+fn conceal_bidir_averages_both_projections() {
+    let mut d = bidir_conceal_stream(false);
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
+    let b2 = img_of(by_poc(&f, 2));
+    let (p, q) = (shifted(&b2, 4, 2), shifted(&b2, 8, 0));
+    let avg = |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u8).collect::<Vec<u8>>();
+    let want = Img { y: avg(&p.y, &q.y), cb: avg(&p.cb, &q.cb), cr: avg(&p.cr, &q.cr) };
+    assert_ne!(want.y, p.y, "the fixture's two projections must differ");
+    assert_ne!(want.y, q.y, "the fixture's two projections must differ");
+    assert_frame(by_poc(&f, 6), &want, "P from the picture concealed along both lists of B2");
+}
+
+/// A source block predicted from L1 alone (PRED_L1) projects along L1 only: (8, 0) samples, no bi-directional block.
+#[test]
+fn conceal_bidir_one_list_falls_back() {
+    let mut d = bidir_conceal_stream(true);
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order (no reordering in the SPS)");
+    assert_frame(by_poc(&f, 6), &shifted(&img_of(by_poc(&f, 2)), 8, 0), "P from the picture concealed along L1 of B2");
 }

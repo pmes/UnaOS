@@ -4671,4 +4671,64 @@ mod tests {
         assert_eq!(imgalt_ink(&engine, lw, lw + 16, t.floor() as usize, (t + sh).floor() as usize), 0, "w: line 1 starts after the icon");
         assert!(imgalt_ink(&engine, lw, lw + 16, (t + sh).ceil() as usize, (t + 2.0 * sh).floor() as usize) > 0, "w: line 2 is not indented");
     }
+
+    // ---- AETHERFILECHOSENJSFILES (LEDGER SR706): the script-set FileList feeds the file status and value (named tail block) ----
+
+    /// AETHERFILECHOSENJSFILES (SR706): a page that sets `input.files` from a DataTransfer (SR93's setter).
+    fn file_chosen_jsfiles_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="m2" multiple></div>
+            <div><input type="file" id="v2" multiple value="2 files"></div>
+            <div><input type="file" id="s2"></div>
+            <div><input type="file" id="v2s" value="2 files"></div>
+            <div><input type="file" id="o" value="old-name.txt"></div>
+            <div><input type="file" id="r" value="report.pdf"></div>
+            <div><input type="file" id="on" value="old-name.txt"></div>
+            <div><input type="file" id="n"></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("m2").files = list(["a.txt", "b.txt"]);
+              document.getElementById("s2").files = list(["a.txt", "b.txt"]);
+              document.getElementById("o").files = list(["report.pdf"]);
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILECHOSENJSFILES (SR706): the painted status reads the FileList first: two Files paint `2 files` (the same
+    /// status ink extent as the stand-in `value="2 files"` beside the same button) on a multiple input and on a non-multiple one (Blink's
+    /// FileStatusText goes by the list's length), one File `report.pdf` over `value="old-name.txt"` paints report.pdf's
+    /// extent, and an input with no FileList keeps SR682's attribute stand-in (old-name.txt, not No file chosen).
+    #[test]
+    fn file_chosen_jsfiles_paints_filelist() {
+        let mut engine = file_chosen_jsfiles_page();
+        let extent = |e: &mut crate::AetherEngine, id: &str| -> (usize, usize) {
+            let (_, end, cols) = file_status_ink(e, id);
+            assert!(!cols.is_empty(), "{id}: the status paints ink");
+            (cols[0] - end, cols[cols.len() - 1] - end)
+        };
+        let (m2, v2, s2, v2s) = (extent(&mut engine, "m2"), extent(&mut engine, "v2"), extent(&mut engine, "s2"), extent(&mut engine, "v2s"));
+        let (o, r, on, n) = (extent(&mut engine, "o"), extent(&mut engine, "r"), extent(&mut engine, "on"), extent(&mut engine, "n"));
+        assert_eq!(m2, v2, "two Files on a multiple input paint `2 files`");
+        assert_eq!(s2, v2s, "two Files on a non-multiple input paint `2 files` (beside the same Choose File button)");
+        assert_eq!(o, r, "the FileList's one name paints over the value attribute");
+        assert_ne!(o, on, "the value attribute is not painted once a FileList is set");
+        assert_ne!(on, n, "an input with no FileList keeps the attribute stand-in");
+    }
+
+    /// AETHERFILECHOSENJSFILES (SR706): `input.value` of a file input reads `C:\fakepath\` and the first selected file's
+    /// name (HTML filename mode, as Chromium), and the empty string with no FileList (the attribute is not the value).
+    #[test]
+    fn file_chosen_jsfiles_value_fakepath() {
+        let mut engine = file_chosen_jsfiles_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("document.getElementById('o').value").unwrap(), "C:\\fakepath\\report.pdf");
+        assert_eq!(js.eval_string("document.getElementById('m2').value").unwrap(), "C:\\fakepath\\a.txt");
+        assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
+        assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
+    }
 }
