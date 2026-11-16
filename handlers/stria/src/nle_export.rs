@@ -742,16 +742,9 @@ pub const VIDEO_NAMES: [&str; 5] = ["h264", "png", "i420", "y4m", "raw"];
 /// THE encoder table by name, with `nle export`'s defaults: `png` [`PngSequence`], `raw` [`RawSequence`], `i420`
 /// [`I420Raw`], `y4m` [`Y4m`] at the timeline's rate, `h264` [`H264Encoder`] at QP 26 with a one-second GOP (`tb` is the
 /// timeline's `1/fps`). None for any other word. (The encoders are not `Send`: build one on the thread that exports.)
+/// NLE5DCLITABLE (SR718): the face's defaults; [`video_named_with`] takes `nle export`'s options.
 pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
-    let (num, den) = (tb.num.max(1) as u32, tb.den.max(1) as u32);
-    Some(match name {
-        "png" => Box::new(PngSequence),
-        "raw" => Box::new(RawSequence),
-        "i420" => Box::new(I420Raw::default()),
-        "y4m" => Box::new(Y4m::new(den, num)),
-        "h264" => Box::new(H264Encoder::new(26, (den / num).max(1))),
-        _ => return None,
-    })
+    video_named_with(name, tb, H264Opts::default())
 }
 
 // ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
@@ -807,4 +800,56 @@ impl ExportSink {
         }
         Some((1, (buffer, max, avg)))
     }
+}
+
+// ---- NLE5DCLITABLE (LEDGER SR718): the encoder table's H.264 options (named tail block) ----
+/// The H.264 options of [`video_named_with`] (`nle export --qp --gop --bitrate --crf --scenecut --aq --hrd --two-pass`).
+/// Default = [`video_named`]'s: QP 26, a one-second GOP, constant QP, every coding option off.
+#[derive(Debug, Clone)]
+pub struct H264Opts {
+    /// The constant QP, or the rate controller's starting QP.
+    pub qp: u8,
+    /// The IDR period in frames; None = one second at the timeline's rate.
+    pub gop: Option<u32>,
+    /// A CBR target in kbit/s ([`H264Encoder::with_bitrate`]); with `two_pass_stats`, the two-pass mean.
+    pub bitrate: Option<u32>,
+    /// A constant quality ([`H264Encoder::with_quality`]); the bitrate wins when both are set (the CLI refuses both).
+    pub crf: Option<u8>,
+    /// [`H264Encoder::with_scenecut`].
+    pub scenecut: Option<u8>,
+    /// [`H264Encoder::with_aq`].
+    pub aq: Option<u8>,
+    /// [`H264Encoder::with_hrd`], read on the CBR arm only (not under a constant quality or a second pass).
+    pub hrd: bool,
+    /// The first pass's records: with `bitrate`, the second pass of a two-pass export ([`H264Encoder::with_two_pass`]).
+    pub two_pass_stats: Option<Vec<PicStat>>,
+}
+
+impl Default for H264Opts {
+    fn default() -> H264Opts {
+        H264Opts { qp: 26, gop: None, bitrate: None, crf: None, scenecut: None, aq: None, hrd: false, two_pass_stats: None }
+    }
+}
+
+/// THE encoder table by name with the H.264 options (NLE5D-CLI-TABLE): `png` [`PngSequence`], `raw` [`RawSequence`], `i420`
+/// [`I420Raw`], `y4m` [`Y4m`] at the timeline's rate, `h264` [`H264Encoder`] built as tools/nle built it: `new(qp, gop)`,
+/// scene cut, AQ, then one rate arm (two-pass, CBR with the HRD, constant quality, or constant QP). None for any other word.
+pub fn video_named_with(name: &str, tb: Timebase, opts: H264Opts) -> Option<Box<dyn VideoEncoder>> {
+    let (num, den) = (tb.num.max(1) as u32, tb.den.max(1) as u32);
+    Some(match name {
+        "png" => Box::new(PngSequence),
+        "raw" => Box::new(RawSequence),
+        "i420" => Box::new(I420Raw::default()),
+        "y4m" => Box::new(Y4m::new(den, num)),
+        "h264" => {
+            let e = H264Encoder::new(opts.qp, opts.gop.unwrap_or((den / num).max(1))).with_scenecut(opts.scenecut).with_aq(opts.aq);
+            Box::new(match (opts.bitrate, opts.crf, opts.two_pass_stats) {
+                (Some(k), _, Some(stats)) => e.with_two_pass(k, den, num, stats),
+                (Some(k), _, None) => e.with_hrd(opts.hrd).with_bitrate(k, den, num),
+                (None, Some(c), _) => e.with_quality(c, den, num),
+                (None, None, _) => e,
+            })
+        }
+        _ => return None,
+    })
 }

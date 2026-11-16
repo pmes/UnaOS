@@ -42,14 +42,14 @@
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, I420Raw, PngSequence, RawSequence, VideoEncoder, Y4m, export_as, export_png};
+use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, H264Opts, I420Raw, VIDEO_NAMES, VideoEncoder, Y4m, export_as, export_png, video_named_with};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"));
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -195,19 +195,8 @@ fn main() {
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
 fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, container: Container) {
-    let mut kept = None; let enc: Box<dyn VideoEncoder> = match video {
-        "png" => Box::new(PngSequence),
-        "raw" => Box::new(RawSequence),
-        "i420" => Box::new(I420Raw::default()),
-        "y4m" => Box::new(Y4m::new(tl.tb.den as u32, tl.tb.num as u32)),
-        "h264" => match (bitrate, crf) {
-            (Some(k), _) if two_pass.plans() => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_two_pass(k, tl.tb.den as u32, tl.tb.num as u32, pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container))),
-            (Some(k), _) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } // H264ENCTWOPASSFILE (SR719): the records' handle, written by `--pass 1`
-            (None, Some(c)) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_quality(c, tl.tb.den as u32, tl.tb.num as u32)),
-            (None, None) => Box::new(H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq)),
-        },
-        _ => usage(),
-    };
+    let two_pass_stats = match bitrate { Some(k) if two_pass.plans() && video == "h264" => Some(pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container)), _ => None }; // NLE5DCLITABLE (SR718): the planned pass of --two-pass / --pass 2 (H264ENCTWOPASSFILE SR719: `pass2_stats`, file tail), then the ONE table
+    let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats }).unwrap_or_else(|| usage()) }; // H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
     let aud = match audio {
         "wav" => AudioOut::Wav,
         "mp4" => AudioOut::Mp4,

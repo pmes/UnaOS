@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 17] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail)
+pub const VERBS: [&str; 19] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -191,13 +191,16 @@ pub struct Face {
     play: PlayAudio,
     /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
     export: Option<ExportJob>,
+    /// NLE5DEXPORTRANGE (SR717): the export range's in / out marks (ticks; `in` / `out` at the playhead, in < out).
+    mark_in: Option<i64>,
+    mark_out: Option<i64>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), mark_in: None, mark_out: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -232,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -1580,7 +1583,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
-        paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()) // NLEFACEEXPORT (SR694): the progress band over the ruler's foot
+        paint_marks(paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()) // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -2065,6 +2068,8 @@ pub struct ExportJob {
     handle: Option<std::thread::JoinHandle<Result<ExportReport, ExportError>>>,
     /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
     shown: u64,
+    /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
+    range: Option<std::ops::Range<i64>>,
 }
 
 impl Face {
@@ -2077,7 +2082,7 @@ impl Face {
         if words.next() != Some("export") {
             return None;
         }
-        let args: Vec<&str> = words.collect();
+        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect();
         if let Some((d, t)) = self.export_progress() {
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
@@ -2100,25 +2105,25 @@ impl Face {
                 return Some(true);
             }
         };
-        if let Err(e) = self.start_export(&dir, fmt, None) {
+        if let Err(e) = self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }) {
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
     }
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
-    /// (encoders are not `Send`), the whole timeline, `AudioOut::Wav` into `Container::Mp4` (`nle export`'s defaults).
+    /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `AudioOut::Wav` into `Container::Mp4` (`nle export`'s defaults).
     /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
-    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>) -> Result<(), String> {
+    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>) -> Result<(), String> {
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
         }
         if !VIDEO_NAMES.contains(&fmt) {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        self.range_check(&range)?; std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
         let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
-        let (tl, sources, path, fmt) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string());
+        let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), range.clone());
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
@@ -2136,16 +2141,16 @@ impl Face {
                     }
                     Ok(())
                 };
-                export_as_with(&tl, 0..tl.end(), &sources, &path, video, AudioOut::Wav, Container::Mp4, &mut progress)
+                export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, AudioOut::Wav, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0 });
+        self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
     /// [`Face::cancel_export`]). The verb's own job is this with no hold.
     pub fn export_paused_at(&mut self, dir: &std::path::Path, fmt: &str, k: u64) -> Result<(), String> {
-        self.start_export(dir, fmt, Some(k))
+        self.start_export(dir, fmt, Some(k), self.export_range())
     }
     /// True while an export's result has not been reported.
     pub fn exporting(&self) -> bool {
@@ -2192,7 +2197,7 @@ impl Face {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames, {} bytes -> {}", r.frames, r.bytes, j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes -> {}", r.frames, ticks_note(&j.range), r.bytes, j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2250,4 +2255,75 @@ impl Face {
         view::Text::text(&mut Labels(style), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, l.w as i32));
         c.px
     }
+}
+
+// ---- NLE5DEXPORTRANGE (LEDGER SR717): the in / out marks, the range an export takes, their ruler marks (named tail block) ----
+
+impl Face {
+    /// The `in` / `out` verbs: set that mark at the playhead; the same verb again at the same tick clears it. A mark that
+    /// would not keep in < out is refused by name and the marks are left as they were. `None` for any other word.
+    fn mark_verb(&mut self, v: &str) -> Option<bool> {
+        let is_in = match v {
+            "in" => true,
+            "out" => false,
+            _ => return None,
+        };
+        let ph = self.state.playhead;
+        let (mine, other) = if is_in { (self.mark_in, self.mark_out) } else { (self.mark_out, self.mark_in) };
+        let set = if mine == Some(ph) {
+            None
+        } else {
+            match other {
+                Some(o) if is_in && ph >= o => {
+                    self.last_error = Some(format!("in: tick {ph} is not before the out mark {o}"));
+                    return Some(true);
+                }
+                Some(o) if !is_in && ph <= o => {
+                    self.last_error = Some(format!("out: tick {ph} is not after the in mark {o}"));
+                    return Some(true);
+                }
+                _ => Some(ph),
+            }
+        };
+        if is_in { self.mark_in = set } else { self.mark_out = set }
+        Some(true)
+    }
+    /// The marks `(in, out)` as set (either may be `None`).
+    pub fn marks(&self) -> (Option<i64>, Option<i64>) {
+        (self.mark_in, self.mark_out)
+    }
+    /// The range an `export` takes: `in..min(out, end)` when both marks are set; `None` (the whole timeline) otherwise.
+    /// The range is empty when an edit shortened the timeline to the in mark or before it ([`Face::range_check`] refuses).
+    pub fn export_range(&self) -> Option<std::ops::Range<i64>> {
+        match (self.mark_in, self.mark_out) {
+            (Some(a), Some(b)) => Some(a..b.min(self.state.timeline.end()).max(a)),
+            _ => None,
+        }
+    }
+    /// A marked range holding no tick of the timeline is refused by name (no directory made, no thread).
+    fn range_check(&self, range: &Option<std::ops::Range<i64>>) -> Result<(), String> {
+        match (range, self.mark_in, self.mark_out) {
+            (Some(r), Some(a), Some(b)) if r.is_empty() => Err(format!("the marks {a}..{b} are past the timeline's end {}", self.state.timeline.end())),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The result line's range note: ` ticks <in>..<out>` for a marked export, nothing for the whole timeline.
+fn ticks_note(range: &Option<std::ops::Range<i64>>) -> String {
+    range.as_ref().map(|r| format!(" ticks {}..{}", r.start, r.end)).unwrap_or_default()
+}
+
+/// The in / out marks over a painted canvas: each set mark a 1 px column at its tick's x over the ruler's rows
+/// (`ruler_y .. tracks_y`), in timeline_core view's `GUIDE` (the export band's token). No mark set paints nothing.
+fn paint_marks(px: Vec<u8>, l: Layout, order: PixelOrder, marks: (Option<i64>, Option<i64>)) -> Vec<u8> {
+    if marks == (None, None) {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
+    for t in [marks.0, marks.1].into_iter().flatten() {
+        let x = l.x_of(t);
+        c.rect(x, l.ruler_y as i64, x + 1, l.tracks_y as i64, view::GUIDE);
+    }
+    c.px
 }
