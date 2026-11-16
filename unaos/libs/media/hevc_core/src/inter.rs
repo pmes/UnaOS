@@ -733,6 +733,38 @@ mod hevcconcealweightedbimixed_tests {
             }
         }
     }
+
+    /// HEVCCONCEALFORWARDBIINVERSE (SR784): `bi_explicit_inv` undoes 8-264 over two equal fetches: a sample L weighted by
+    /// (w0, o0) and (w1, o1) under one log2WD to q (unclipped) comes back within (1 << denom) / abs(w0 + w1) + 1, identity
+    /// weights give L exactly, a negative weight sum inverts, and w0 + w1 == 0 is the copy.
+    #[test]
+    fn bi_explicit_inv_undoes_bi_explicit() {
+        use super::{bi_explicit, bi_explicit_inv};
+        for bd in [8u32, 10] {
+            let shift1 = (14 - bd as i32).max(2) as u32;
+            let max = (1i32 << bd) - 1;
+            let denom = 6u32;
+            let lwd = denom + shift1;
+            for ((w0, o0), (w1, o1)) in [((64i32, 0i32), (64i32, 0i32)), ((48, 5), (16, -3)), ((100, 0), (-20, 7)), ((127, -20), (1, 3)), ((-80, 10), (16, 0))] {
+                let (t0, t1) = ((w0, o0 << (bd - 8), lwd), (w1, o1 << (bd - 8), lwd));
+                let bound = (1 << denom) / (w0 + w1).abs() + 1;
+                for l in 0..=max {
+                    let q = bi_explicit(l << shift1, l << shift1, t0, t1);
+                    if q < 0 || q > max {
+                        continue;
+                    }
+                    let back = bi_explicit_inv(q << shift1, t0, t1, bd);
+                    if (w0, o0, w1, o1) == (64, 0, 64, 0) {
+                        assert_eq!(back, l, "bd {bd}: identity weights are the copy");
+                    }
+                    assert!((back - l).abs() <= bound, "bd {bd} (w0 {w0}, o0 {o0}, w1 {w1}, o1 {o1}) L {l}: q {q} back {back}, bound {bound}");
+                }
+            }
+            for q in 0..=max {
+                assert_eq!(bi_explicit_inv(q << shift1, (32, 0, lwd), (-32, 0, lwd), bd), q, "bd {bd}: w0 + w1 == 0 is the copy");
+            }
+        }
+    }
 }
 
 // ---- HEVCCONCEALBIDIRECTFORWARD (LEDGER SR778): the inverse of 8-252 for the forward refinement (named tail block) ----
@@ -749,6 +781,28 @@ pub(crate) fn uni_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), bd: u32) 
     let shift1 = (14 - bd as i32).max(2) as u32;
     let num = (p as i64 - ((o0 as i64) << shift1)) << lwd.saturating_sub(shift1);
     let (n, d) = if w0 < 0 { (-num, -(w0 as i64)) } else { (num, w0 as i64) };
+    let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+    uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
+}
+
+// ---- HEVCCONCEALFORWARDBIINVERSE (LEDGER SR784): the equal-vector joint inverse of 8-264 for the forward refinement (named tail block) ----
+/// HEVCCONCEALFORWARDBIINVERSE (SR784): the inverse of [`bi_explicit`] over two equal fetches for dpb.rs's forward refinement
+/// (`conceal_fetch` with `inv`, both of the referencer C's lists on the lost picture L): C coded pred =
+/// floor((t + o0 + o1 + 1) / 2) with t = L * (w0 + w1) / 2^denom, so t lies in [2C - O - 1, 2C - O + 1) (O = o0 + o1) and the
+/// centred estimate is L ~ (2C - O) * 2^denom / (w0 + w1). On the 14-bit intermediate `p` of C (shift1 = Max(2, 14 - bitDepth),
+/// denom = log2WD - shift1): p' = ((p << (denom + 1)) - ((o0 + o1) << log2WD)) / (w0 + w1) rounded half away from zero, then
+/// 8-261's rounding (`uni_default`), clipped to `bd` (the [`uni_explicit_inv`] road). Exact for equal vectors; the caller hands
+/// the averaged fetch when they differ (HEVC-CONCEAL-FORWARD-BI-INVERSE-SPLIT owed). Identity weights give the copy;
+/// w0 + w1 == 0 is the copy.
+pub(crate) fn bi_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32), bd: u32) -> i32 {
+    let max = (1i32 << bd) - 1;
+    let w = w0 as i64 + w1 as i64;
+    if w == 0 {
+        return uni_default(p, bd).clamp(0, max);
+    }
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let num = ((p as i64) << (lwd.saturating_sub(shift1) + 1)) - ((o0 as i64 + o1 as i64) << lwd);
+    let (n, d) = if w < 0 { (-num, -w) } else { (num, w) };
     let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
     uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
 }
