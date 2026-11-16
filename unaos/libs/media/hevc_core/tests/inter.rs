@@ -1055,3 +1055,73 @@ fn conceal_weighted_bi_direct_falls_to_the_surviving_list() {
         assert_ne!(by_poc(&f, 6).planes[0], blend, "{what}: not the bi blend");
     }
 }
+
+// ---- HEVCCONCEALBIDIRECTFORWARD (LEDGER SR778): a weighted bi referencer with one long-term list refines the lost picture through the surviving list's inverse weights (named tail block) ----
+
+/// The SPS carries long_term_ref_pics_present_flag; the PPS weighted_pred_flag and weighted_bipred_flag. IDR0 (the
+/// gradient), P2 (references POC 0 with mv (6, 2), default table), C = B4 (StCurrBefore {3} with POC 2 kept unused, LtCurr
+/// {POC 0 by PocLsbLt 0}: L0 = L1 = [the lost POC 3, POC 0 long-term], two references per list; luma_log2_weight_denom 6,
+/// every L0 entry (48, 5), every L1 entry (16, -3); PRED_BI with one list to the long-term POC 0 (ref_idx 1, mvd (-64, 0))
+/// and the other to POC 3 (ref_idx 0, mvd (32, 16))), P5 (skip-only, references POC 3 alone, default table). POC 3 is
+/// generated and concealed from POC 2; when C ends, SR754's forward road re-projects it from C: `project_lists` drops the
+/// long-term list, `forward_only` keeps the list to POC 3, -mv = (-8, -4) samples fetched from C, and HEVCCONCEALBIDIRECTFORWARD
+/// applies the INVERSE of THAT list's (w, o) (C coded pred = w * L + o): p' = round half away (4096 (q - o) / w), L = (p' + 32)
+/// >> 6, clipped; chroma (default weights) the shifted samples. So P5 (the refined picture's skip copy) is that hand inverse
+/// of C moved back on every plane; it is neither the unweighted copy (SR754 before SR778) nor the inverse through the OTHER list.
+#[test]
+fn conceal_bi_direct_forward_refines_through_the_surviving_lists_inverse_weights() {
+    let i0 = gradient();
+    let (lt, st) = ([-64, 0], [32, 16]);
+    // (w, o) of each list: L0 (64 - 16, 5), L1 (64 - 48, -3).
+    let wo = [(48, 5), (16, -3)];
+    let inv = |r: &[u8], (w, o): (i32, i32)| {
+        r.iter()
+            .map(|&q| {
+                let n = 4096 * (q as i32 - o);
+                let (n, d) = if w < 0 { (-n, -w) } else { (n, w) };
+                let p = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+                ((p + 32) >> 6).clamp(0, 255) as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    for l1_lt in [false, true] {
+        let mut s = vps(false);
+        s.extend(nal(33, &sps_rbsp_ext(&sps_cfg(), &InterSps { long_term_refs: true, ..inter_sps(false) })));
+        s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, &PpsInter { weighted_pred: true, weighted_bipred: true, ..Default::default() })));
+        s.extend(idr(&i0, true));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [6, 2])));
+        let c = SliceCfg {
+            nal_type: 1,
+            slice_type: 0,
+            poc_lsb: 4,
+            neg: vec![(-1, true), (-2, false)],
+            pos: vec![],
+            lt_pocs: Some(vec![0]),
+            num_ref: Some((2, 2)),
+            weights: Some((6, vec![Some((-16, 5)), Some((-16, 5))])),
+            weights_l1: Some(vec![Some((-48, -3)), Some((-48, -3))]),
+            five_minus_max_num_merge_cand: 4,
+            deblocking_disabled: true,
+            ..Default::default()
+        };
+        let (refs, m0, m1) = if l1_lt { ([0, 1], st, lt) } else { ([1, 0], lt, st) };
+        s.extend(picture(&c, |e| bi_ref_body(e, 2, refs, m0, m1)));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(5, vec![(-2, true)]) }, skip_picture));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        let what = if l1_lt { "L1 long-term, L0 survives" } else { "L0 long-term, L1 survives" };
+        let (live, dead) = if l1_lt { (wo[0], wo[1]) } else { (wo[1], wo[0]) };
+        assert_eq!(d.take_generated_refs(), vec![3], "{what}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "{what}: every block of C refines");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "{what}: output in decoding order");
+        let back = shifted(&img_of(by_poc(&f, 4)), -8, -4);
+        let want = Img { y: inv(&back.y[..], live), cb: back.cb.clone(), cr: back.cr.clone() };
+        assert_ne!(inv(&back.y[..], live), inv(&back.y[..], dead), "{what}: the fixture's two lists' inverses must differ");
+        assert_ne!(want.y, back.y, "{what}: the fixture's inverse must differ from the copy");
+        assert_frame(by_poc(&f, 5), &want, &format!("{what}: P from the picture refined from C through the surviving list's inverse weights"));
+        assert_ne!(by_poc(&f, 5).planes[0], back.y, "{what}: not the unweighted copy of C");
+        assert_ne!(by_poc(&f, 5).planes[0], inv(&back.y[..], dead), "{what}: not the inverse through the other list's weights");
+    }
+}
