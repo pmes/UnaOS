@@ -395,6 +395,17 @@ impl layout_core::Host for AetherHost {
             .and_then(|s| crate::images::get(&s))
             .map(|i| (i.width() as f32, i.height() as f32))
     }
+    /// AETHERIMGALT (SR681): the page's eager images are fetched and decoded before `images::set_page`, so one absent
+    /// from the store has failed (fetch / decode error, refused, over the fetch cap, no source); a `loading=lazy` one
+    /// absent is still pending (`images::request_lazy` installs it later).
+    fn img_state(node: &NodeRef) -> layout_core::ImgState {
+        let Some(src) = crate::images::img_source(node, crate::images::SELECTION_VIEWPORT) else { return layout_core::ImgState::Failed };
+        if crate::images::get(&src).is_some() {
+            return layout_core::ImgState::Loaded;
+        }
+        let lazy = node.as_element().is_some_and(|e| crate::images::is_lazy(&e.attributes.borrow()));
+        if lazy { layout_core::ImgState::Pending } else { layout_core::ImgState::Failed }
+    }
     fn option_selected(node: &NodeRef) -> Option<bool> {
         crate::js::option_selectedness(node)
     }

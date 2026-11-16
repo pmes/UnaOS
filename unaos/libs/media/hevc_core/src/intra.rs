@@ -69,6 +69,9 @@ pub fn chroma_mode_422(mode: u32) -> u32 {
 pub struct IntraRext {
     pub smoothing_disabled: bool,
     pub boundary_filter_disabled: bool,
+    /// HEVCINTERCIP (SR688): constrained_intra_pred_flag (8.4.4.2.2: a neighbouring sample whose CuPredMode is not
+    /// MODE_INTRA is not available, and is substituted like any other unavailable sample).
+    pub constrained: bool,
 }
 
 /// Predict the nTbS x nTbS block (nTbS = 1 << log2) of component `c` whose top-left sample is (x0, y0) in that
@@ -101,7 +104,7 @@ pub fn predict_rext(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: 
         let plane = &pic.planes[c];
         for i in 0..total {
             let (xs, ys) = pos(i);
-            if pic.available(geo, xl, yl, xs * sw as i32, ys * sh as i32) {
+            if pic.available(geo, xl, yl, xs * sw as i32, ys * sh as i32) && cip_ok(pic, rext, xs * sw as i32, ys * sh as i32) {
                 avail[i] = true;
                 refs[i] = plane.at(xs as usize, ys as usize) as i32;
                 any = true;
@@ -239,4 +242,12 @@ pub fn predict_rext(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: 
             plane.set(x0 + x, y0 + y, pred[y * n + x] as u16);
         }
     }
+}
+
+// ---- HEVCINTERCIP (LEDGER SR688): constrained intra prediction's availability rule (named tail block) ----
+
+/// 8.4.4.2.2: with constrained_intra_pred_flag the neighbouring luma location (x, y) (already available by 6.4.1) is
+/// used only when its coding unit is intra ([`Picture::is_intra_at`]).
+fn cip_ok(pic: &Picture, rext: IntraRext, x: i32, y: i32) -> bool {
+    !rext.constrained || pic.is_intra_at(x as usize, y as usize)
 }

@@ -248,6 +248,11 @@ pub trait Host: Sized + Clone + core::fmt::Debug + Default + 'static {
     fn img_intrinsic(_node: &Self::Node) -> Option<(f32, f32)> {
         None
     }
+    /// AETHERIMGALT (SR681): whether an `<img>`'s image is decoded, still loading or never coming (`ImgState`); the
+    /// default (a host whose store does not say) is Loaded when `img_intrinsic` has it, else Pending: no alt fallback.
+    fn img_state(node: &Self::Node) -> crate::ImgState {
+        if Self::img_intrinsic(node).is_some() { crate::ImgState::Loaded } else { crate::ImgState::Pending }
+    }
     /// Script-set selectedness of an `<option>` (`None` = the attribute decides).
     fn option_selected(_node: &Self::Node) -> Option<bool> {
         None

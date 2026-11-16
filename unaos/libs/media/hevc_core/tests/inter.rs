@@ -475,3 +475,122 @@ fn inter_residual_through_rqt_root_cbf() {
     }
     assert_frame(by_poc(&f, 1), &want, "inter residual");
 }
+
+// ---- HEVCPERF (LEDGER SR687): fast MC equals the clamped oracle (named tail block) ----
+
+/// The crate's deterministic generator (tests/syntax.rs: the same LCG constants), 16 bits per draw.
+fn lcg(x: &mut u32) -> u32 {
+    *x = x.wrapping_mul(1103515245).wrapping_add(12345);
+    *x >> 16
+}
+
+/// A w x h plane of random `bd`-bit samples.
+fn rand_plane(w: usize, h: usize, bd: u32, seed: u32) -> hevc_core::picture::Plane {
+    let mut s = seed;
+    let mut p = hevc_core::picture::Plane::new(w, h, 0);
+    for v in p.data.iter_mut() {
+        *v = (lcg(&mut s) & ((1u32 << bd) - 1)) as u16;
+    }
+    p
+}
+
+/// Integer target positions of a block in a pw x ph plane: one interior, the four corners pushed past the picture,
+/// and the four edges (the clamp cases of the padded window).
+fn hevcperf_positions(pw: i32, ph: i32) -> [(i32, i32); 9] {
+    [(pw / 2 - 4, ph / 2 - 4), (-6, -6), (pw - 3, -6), (-6, ph - 3), (pw - 3, ph - 3), (pw / 2, -5), (-5, ph / 2), (pw - 2, ph / 2), (pw / 2, ph - 2)]
+}
+
+#[test]
+fn hevcperf_fast_mc_equals_the_clamped_oracle() {
+    use hevc_core::inter::{chroma_mc, chroma_mc_ref, luma_mc, luma_mc_ref};
+    for bd in [8u32, 10, 12, 16] {
+        let ry = rand_plane(40, 24, bd, 0x5eed ^ bd);
+        let rc = rand_plane(20, 12, bd, 0xc0de ^ bd);
+        for (w, h) in [(8, 8), (16, 4), (4, 8), (64, 64)] {
+            for (px, py) in hevcperf_positions(40, 24) {
+                for xf in 0..4 {
+                    for yf in 0..4 {
+                        let mv = [(px - 8) * 4 + xf, (py - 8) * 4 + yf];
+                        let (mut fast, mut slow) = (vec![0i32; (w * h) as usize], vec![0i32; (w * h) as usize]);
+                        luma_mc(&ry, 8, 8, mv, w, h, bd, &mut fast);
+                        luma_mc_ref(&ry, 8, 8, mv, w, h, bd, &mut slow);
+                        assert_eq!(fast, slow, "luma bd {bd} {w}x{h} at ({px},{py}) phase ({xf},{yf})");
+                    }
+                }
+            }
+        }
+        for (w, h) in [(4, 4), (8, 2), (2, 8), (32, 32)] {
+            for (px, py) in hevcperf_positions(20, 12) {
+                for xf in 0..8 {
+                    for yf in 0..8 {
+                        let mv = [(px - 4) * 8 + xf, (py - 4) * 8 + yf];
+                        let (mut fast, mut slow) = (vec![0i32; (w * h) as usize], vec![0i32; (w * h) as usize]);
+                        chroma_mc(&rc, 4, 4, mv, w, h, bd, &mut fast);
+                        chroma_mc_ref(&rc, 4, 4, mv, w, h, bd, &mut slow);
+                        assert_eq!(fast, slow, "chroma bd {bd} {w}x{h} at ({px},{py}) phase ({xf},{yf})");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The measurement (printed, not asserted): a 416x240 8-bit picture (the class-D conformance size; the conformance
+/// vectors SKIP offline) predicted as 16x16 luma / 8x8 chroma blocks over every phase, the border blocks pushed past
+/// the picture, through the clamped oracle and then the fast path.
+#[test]
+fn hevcperf_timing() {
+    use hevc_core::inter::{chroma_mc, chroma_mc_ref, luma_mc, luma_mc_ref};
+    use std::time::Instant;
+    let ry = rand_plane(416, 240, 8, 0x1234);
+    let rc = rand_plane(208, 120, 8, 0x4321);
+    // (plane, block size, frac mask, frac bits, the mc fn) for luma then chroma.
+    type Mc = fn(&hevc_core::picture::Plane, i32, i32, [i32; 2], i32, i32, u32, &mut [i32]);
+    let run = |luma: Mc, chroma: Mc| -> (f64, Vec<i32>) {
+        let mut all = Vec::new();
+        let t = Instant::now();
+        for (r, n, mask, bits, mc) in [(&ry, 16i32, 3i32, 2i32, luma), (&rc, 8, 7, 3, chroma)] {
+            let (bw, bh) = (r.w as i32 / n, r.h as i32 / n);
+            let mut out = vec![0i32; (n * n) as usize];
+            let mut k = 0i32;
+            for _round in 0..8 {
+                for by in 0..bh {
+                    for bx in 0..bw {
+                        let d = |b: i32, last: i32| if b == 0 { -10 } else if b == last { 10 } else { k % 7 - 3 };
+                        let mv = [(d(bx, bw - 1) << bits) + (k & mask), (d(by, bh - 1) << bits) + ((k >> bits) & mask)];
+                        mc(r, bx * n, by * n, mv, n, n, 8, &mut out);
+                        all.extend_from_slice(&out);
+                        k += 1;
+                    }
+                }
+            }
+        }
+        (t.elapsed().as_secs_f64() * 1000.0, all)
+    };
+    let (before, slow) = run(luma_mc_ref, chroma_mc_ref);
+    let (after, fast) = run(luma_mc, chroma_mc);
+    assert!(slow == fast, "fast path differs from the oracle on the timing picture");
+    println!("hevcperf: inter vectors {before:.1} -> {after:.1}");
+}
+
+// ---- HEVCINTERCIP (LEDGER SR688): a missing reference picture is generated (named tail block) ----
+
+/// 8.3.3.2: a stream whose first picture is the skip-only P1 (its IDR lost) names POC 0, which the DPB does not hold:
+/// POC 0 is generated (grey 128, intra), P1 copies it, P2 (references POC 1 and POC 0) finds both without a second
+/// generation, and only P1 and P2 are output.
+#[test]
+fn missing_reference_is_generated_and_decoding_continues() {
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(picture(&p_slice(1, vec![(-1, true)]), skip_picture));
+    s.extend(picture(&p_slice(2, vec![(-1, true), (-2, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the missing reference");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![0]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1, 2]);
+    let grey = Img::new(|_, _| 128, |_, _| 128, |_, _| 128);
+    for fr in &f {
+        assert_frame(fr, &grey, "P from the generated reference");
+    }
+}

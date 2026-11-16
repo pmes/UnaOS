@@ -28,7 +28,7 @@
 - hevc/DBLK_A_SONY_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/DBLK_A_SONY_3.zip 42486a48ea12d5ab6cd98ed2e2807cfe DBLK_A_SONY_3.bit
 - hevc/SAO_A_MediaTek_4.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/SAO_A_MediaTek_4.zip 272e694a2262a2b34f6248f787a4431d SAO_A_MediaTek_4.bit
 - hevc/WPP_A_ericsson_MAIN_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WPP_A_ericsson_MAIN_2.zip cd7e815eb47e8138fec2185d4de84304 WPP_A_ericsson_MAIN_2.bit
-# Refused by name: constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP).
+# constrained_intra_pred_flag in P / B slices decodes (HEVCINTERCIP SR688; it was refused by name as HEVCINTER-CIP).
 - hevc/CIP_A_Panasonic_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/CIP_A_Panasonic_3.zip 4cbf601ba98d63f642defab5eaa12c8d CIP_A_Panasonic_3/CIP_A_Panasonic_3.bit
 # Main 10 (HEVCMAIN10 SR311): the reference md5 is of yuv420p10le (two bytes per sample, low first).
 - hevc/WP_A_MAIN10_Toshiba_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/WP_A_MAIN10_Toshiba_3.zip c48e853010a234786dc87790d053b03a WP_A_MAIN10_Toshiba_3/WP_A_MAIN10_Toshiba_3.bit

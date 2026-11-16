@@ -483,7 +483,7 @@ pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
 fn caption(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     let tree = cx.tree;
     let (Some(n), Ok(l)) = (tree.node_map.get(&id), tree.taffy.layout(id)) else { return };
-    if n.tag().as_deref() != Some("input") {
+    if n.tag().as_deref() != Some("input") { if crate::style::img_like(n) { image_blit(cv, cx, id, x, y); } // AETHERIMGELF (SR685): an img's bitmap through the image input's blit; a failed img paints nothing (AETHER-IMG-ALT-ELF owed)
         return;
     }
     let ty = n.attr("type").unwrap_or_default();

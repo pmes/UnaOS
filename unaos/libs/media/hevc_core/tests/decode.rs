@@ -250,9 +250,11 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     b.trailing();
     b.u(0xff, 8);
     s.extend(nal(1, &b.out));
-    // HEVCINTER (SR216) decodes P slices: this one's RPS names POC 0, which was never decoded (8.3.2).
-    let err = Decoder::new().decode_annexb(&s).unwrap_err();
-    assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
+    // HEVCINTER (SR216) decodes P slices: this one's RPS names POC 0, which was never decoded (8.3.2); HEVCINTERCIP
+    // (SR688) generates it (8.3.3.2) instead of the missing-picture Invalid, whatever the slice data then does.
+    let mut d = Decoder::new();
+    let _ = d.decode_annexb(&s);
+    assert_eq!(d.take_generated_refs(), vec![0]);
 
     for (cfg, what) in [
         (SpsCfg { bit_depth: 13, ..Default::default() }, "13 bits (HEVCREXTTOOLS SR345: up to 16 decode)"),
@@ -470,4 +472,75 @@ fn picture_md5_sei_checks_the_decoded_picture() {
     };
     assert_eq!(checks(0), [(0, HashCheck::Match)]);
     assert_eq!(checks(1), [(0, HashCheck::Mismatch(1))]);
+}
+
+// ---- HEVCINTERCIP (LEDGER SR688): constrained intra prediction and generated reference pictures (named tail block) ----
+
+/// 8.4.4.2.2 with constrained_intra_pred_flag: the intra_predictors_kat block at (4, 4) whose left neighbour (the 4x4
+/// at (0, 4)) is inter-coded. Its left samples are not available, so the substitution fills p[-1][0..7] from the first
+/// available sample scanned from the bottom-left (the corner, 100): the prediction equals the plain prediction of a
+/// picture whose left column is 100. With the flag off the inter samples are read as before.
+#[test]
+fn constrained_intra_pred_substitutes_inter_neighbours() {
+    let setup = |left: [u16; 4]| {
+        let (_, _, geo, mut pic) = unit(16, 16, 4);
+        for (i, v) in left.iter().enumerate() {
+            pic.planes[0].set(3, 4 + i, *v);
+        }
+        for (i, v) in [50u16, 60, 70, 80].iter().enumerate() {
+            pic.planes[0].set(4 + i, 3, *v);
+        }
+        pic.planes[0].set(3, 3, 100);
+        (geo, pic)
+    };
+    let block = |pic: &Picture| (0..16).map(|i| pic.planes[0].at(4 + i % 4, 4 + i / 4)).collect::<Vec<u16>>();
+    for mode in [0u32, 1, 2, 10, 18, 26, 34] {
+        let (geo, mut cip) = setup([10, 20, 30, 40]);
+        let i = cip.idx4(3, 4);
+        cip.motion[i].pred = 1;
+        assert!(!cip.is_intra_at(3, 4) && cip.is_intra_at(3, 3) && cip.is_intra_at(4, 3));
+        let on = hevc_core::intra::IntraRext { constrained: true, ..Default::default() };
+        hevc_core::intra::predict_rext(&mut cip, &geo, 0, 4, 4, 2, mode, false, 8, on);
+        let (geo, mut want) = setup([100; 4]);
+        predict(&mut want, &geo, 0, 4, 4, 2, mode, false, 8);
+        assert_eq!(block(&cip), block(&want), "CIP mode {mode}");
+        if mode == 1 {
+            // DC: (4 + 50 + 60 + 70 + 80 + 4 * 100) >> 3 = 83; the corner (100 + 2 * 83 + 50 + 2) >> 2 = 79.
+            assert_eq!((cip.planes[0].at(6, 6), cip.planes[0].at(4, 4)), (83, 79));
+        }
+        // The flag off: the inter neighbour's samples are used (intra_predictors_kat's DC 45).
+        let (geo, mut off) = setup([10, 20, 30, 40]);
+        let i = off.idx4(3, 4);
+        off.motion[i].pred = 1;
+        hevc_core::intra::predict_rext(&mut off, &geo, 0, 4, 4, 2, mode, false, 8, Default::default());
+        let (geo, mut plain) = setup([10, 20, 30, 40]);
+        predict(&mut plain, &geo, 0, 4, 4, 2, mode, false, 8);
+        assert_eq!(block(&off), block(&plain), "CIP off mode {mode}");
+        if mode == 1 {
+            assert_eq!(off.planes[0].at(6, 6), 45);
+        }
+    }
+}
+
+/// 8.3.3.2: a generated picture is grey at its bit depths, intra everywhere, of the named POC and marking, and never
+/// waits for output.
+#[test]
+fn generated_reference_is_grey_intra_and_never_output() {
+    let (sps, _, geo, _) = unit(16, 16, 4);
+    let mut dpb = hevc_core::dpb::Dpb::default();
+    let i = dpb.generate_missing(5, true, &sps, &geo);
+    let sps10 = Sps { bit_depth_luma: 10, bit_depth_chroma: 10, ..sps.clone() };
+    let j = dpb.generate_missing(-3, false, &sps10, &geo);
+    assert_eq!((i, j), (0, 1));
+    assert_eq!(dpb.generated, vec![5, -3]);
+    for (k, poc, marking, grey) in [(i, 5, hevc_core::dpb::Marking::Long, 128u16), (j, -3, hevc_core::dpb::Marking::Short, 512)] {
+        let d = &dpb.pics[k];
+        assert_eq!((d.pic.poc, d.marking, d.output_needed, d.pic.output), (poc, marking, false, false));
+        assert_eq!((d.pic.planes[0].w, d.pic.planes[0].h, d.pic.planes[1].w, d.pic.planes[1].h), (16, 16, 8, 8));
+        assert!(d.pic.planes.iter().all(|p| p.data.iter().all(|&v| v == grey)), "POC {poc} grey {grey}");
+        assert!(d.pic.is_intra_at(0, 0) && d.pic.is_intra_at(15, 15));
+    }
+    let mut out = std::collections::VecDeque::new();
+    dpb.bump_all(&mut out);
+    assert!(out.is_empty(), "a generated picture is never output");
 }
