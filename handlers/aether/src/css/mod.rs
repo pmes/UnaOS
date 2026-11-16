@@ -1466,7 +1466,7 @@ fn property_supported(prop: &str) -> bool {
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
-            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction"
+            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style"
             | "text-shadow"
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"

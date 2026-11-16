@@ -117,7 +117,7 @@ pub fn select(family: &str, want: Style) -> Option<&'static Face> {
     select_all(family, want).into_iter().next()
 }
 
-fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Face {
+pub(super) fn synth_variant(face: &'static Face, bold: bool, oblique: bool) -> &'static Face {
     static V: OnceLock<Mutex<HashMap<(u32, bool, bool), &'static Face>>> = OnceLock::new();
     let m = V.get_or_init(|| Mutex::new(HashMap::new()));
     let mut m = m.lock().unwrap();
