@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -31,7 +31,7 @@
 //! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP); `--crf` (0..=51,
 //! H264ENCVBRCRF SR383) a constant quality instead (h264enc_core's `RcMode::Crf`), exclusive with `--bitrate`. `--scenecut [K]`
 //! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--pass 1 --stats <f>` / `--pass 2 --stats <f>` (H264ENCTWOPASSFILE SR719, with `--bitrate` and `--video h264`, x264's two-process form) split the two: pass 1 is the CBR export, its records written to `<f>` in h264enc_core's ONE stats text (`rc::write_stats`; `nle: two-pass pass1 pictures=<n> bytes=<b> stats=<f>`), pass 2 reads `<f>` (`rc::read_stats`, refused by name, and on an fps other than the timeline's; another picture count is rescaled to the range's, `rc::rescale_stats`, H264ENCTWOPASSRESCALE SR727, `nle: two-pass pass2 stats rescaled <m> -> <n>`) and plans the export from it (`nle: two-pass pass2 stats=<f> pictures=<n>`); `two_pass_of` / `pass2_stats` / `write_pass1`, file tail; `--hrd` (H264ENCHRD SR699, with `--bitrate`) signals the CBR bucket as the NAL HRD (VUI nal_hrd_parameters, buffering-period / pic-timing SEI, filler). `--audio aac` (or
-//! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
+//! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16 (`--audio aac:KBPS` another rate; the words are `nle_export::audio_named`'s, NLE5DEXPORTAUDIOOPTIONS SR722).
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
 //! `--png` (ADOPTPNG, LEDGER SR405) is `--video png`: the PNG sequence (`stria::nle_export::export_png`) read back per
@@ -49,7 +49,7 @@ use timeline_core::{Kind, Timeline, edl};
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"));
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -197,13 +197,7 @@ fn main() {
 fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, container: Container) {
     let two_pass_stats = match bitrate { Some(k) if two_pass.plans() && video == "h264" => Some(pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container)), _ => None }; // NLE5DCLITABLE (SR718): the planned pass of --two-pass / --pass 2 (H264ENCTWOPASSFILE SR719: `pass2_stats`, file tail), then the ONE table
     let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats }).unwrap_or_else(|| usage()) }; // H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
-    let aud = match audio {
-        "wav" => AudioOut::Wav,
-        "mp4" => AudioOut::Mp4,
-        "aac" => AudioOut::Aac(128),
-        "none" => AudioOut::None,
-        _ => usage(),
-    };
+    let aud = stria::nle_export::audio_named(audio).unwrap_or_else(|| usage()); // NLE5DEXPORTAUDIOOPTIONS (SR722): THE audio table
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
     let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else if matches!(video, "i420" | "y4m") { planar_export(tl, range, sources, dir, video, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
     if r.stand_in_audio > 0 { eprintln!("nle: audio stand-in reels={}", r.stand_in_audio); } // NLESTANDINAUDIOEDITOR (SR713): reels whose audio rendered as the silent stand-in
