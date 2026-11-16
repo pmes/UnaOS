@@ -1828,7 +1828,7 @@ impl<S: Sink> MkvStream<S> {
             b"avc1" => ("V_MPEG4/ISO/AVC", spec.config.clone()),
             b"sowt" => ("A_PCM/INT/LIT", Vec::new()),
             b"mp4a" if spec.config_box == Some(*b"esds") => {
-                ("A_AAC", crate::mp4::parse_esds(&spec.config).map(|(_, asc)| asc).map_err(|e| alloc::format!("mp4a: esds: {}", e))?)
+                ("A_AAC", crate::mp4::parse_esds(&spec.config).map(|(_, asc, _)| asc).map_err(|e| alloc::format!("mp4a: esds: {}", e))?)
             }
             b"mp4a" => ("A_AAC", spec.config.clone()),
             f => {

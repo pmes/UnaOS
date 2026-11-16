@@ -460,7 +460,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
             child(&boxes(data, w.body, w.end).ok()?, b"esds").copied()
         }) {
             Some(b) => {
-                let (oti, dsi) = parse_esds(&data[b.body..b.end])?;
+                let (oti, dsi, rates) = parse_esds(&data[b.body..b.end])?; track.btrt = track.btrt.or(Some(rates).filter(|&(_, max, avg)| max > 0 || avg > 0)); // STRIAINFOAUDIOBITRATE (SR742): no btrt child -> the DCD's same three
                 track.config = dsi;
                 match oti {
                     0x40 | 0x66 | 0x67 | 0x68 => Codec::Aac,
@@ -515,8 +515,8 @@ impl FourccString for String {
     }
 }
 
-/// ES_Descriptor (ISO/IEC 14496-1 §7.2.6.5) → (objectTypeIndication, DecoderSpecificInfo bytes).
-pub(crate) fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>), Error> {
+/// ES_Descriptor (ISO/IEC 14496-1 §7.2.6.5) → (objectTypeIndication, DecoderSpecificInfo bytes, the DecoderConfigDescriptor's (bufferSizeDB, maxBitrate, avgBitrate) in btrt's order; STRIAINFOAUDIOBITRATE SR742).
+pub(crate) fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>, (u32, u32, u32)), Error> {
     let mut r = Reader::new(b);
     full(&mut r)?;
     fn desc(r: &mut Reader) -> Result<(u8, usize), Error> {
@@ -552,7 +552,7 @@ pub(crate) fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>), Error> {
         return Err(Error::Invalid("esds without DecoderConfigDescriptor"));
     }
     let oti = r.u8()?;
-    r.skip(12)?; // streamType.., bufferSizeDB, maxBitrate, avgBitrate
+    r.skip(1)?; let rates = (r.u24()?, r.u32()?, r.u32()?); // streamType.., then bufferSizeDB, maxBitrate, avgBitrate
     let mut dsi = Vec::new();
     if !r.is_empty() {
         let (tag, len) = desc(&mut r)?;
@@ -560,7 +560,7 @@ pub(crate) fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>), Error> {
             dsi = r.bytes(len.min(r.remaining()))?.to_vec();
         }
     }
-    Ok((oti, dsi))
+    Ok((oti, dsi, rates))
 }
 
 /// Expand stts/ctts/stsc/stsz/stco/stss into a decode-order sample table.
