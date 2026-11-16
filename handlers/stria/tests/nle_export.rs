@@ -849,3 +849,18 @@ fn nle6utp1_nle_export_fixture_pin() {
 
 /// The fnv [`nle6utp1_nle_export_fixture_pin`] reads, measured on the copies before SR729.
 const NLE6UTP1_NLE_EXPORT_PIN: u64 = 0xe149_8435_238b_ff8e;
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the audio table's inverse round-trips (named tail block) ----
+
+#[test]
+fn nle5dexportmessageaudio_audio_word_is_the_table_inverse() {
+    use stria::nle_export::audio_word;
+    for w in AUDIO_NAMES.iter().copied().chain(["aac:96"]) {
+        let a = audio_named(w).expect(w);
+        assert_eq!(audio_word(&a), w, "{w}");
+        assert_eq!(audio_named(&audio_word(&a)), Some(a), "{w}");
+    }
+    assert_eq!(audio_word(&audio_named("aac:128").unwrap()), "aac", "the default rate spells as the bare word");
+    assert_eq!(audio_word(&AudioOut::Aac(DEFAULT_AAC_KBPS)), "aac");
+    println!("nle5dexportmessageaudio: {} words and aac:96 round-trip", AUDIO_NAMES.len());
+}
