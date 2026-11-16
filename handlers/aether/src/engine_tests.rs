@@ -4278,4 +4278,32 @@ mod tests {
         let (n, _, _) = caption_ink(&mut engine, "a");
         assert!(n > 0, "a: an image input with no image paints its alt text");
     }
+
+    // ---- AETHERCAPTIONCSSOM (LEDGER SR686): getComputedStyle(caption).captionSide (named tail block) ----
+
+    /// AETHERCAPTIONCSSOM (SR686): `getComputedStyle(el).captionSide` reports the used value layout_core folded, as
+    /// Chromium does: style="caption-side: bottom" and the align=bottom presentation hint read bottom, a bare caption
+    /// reads the initial top, and an author rule on the table is inherited by its bare caption.
+    #[test]
+    fn computed_caption_side_reports_used_value() {
+        let html = r#"<!doctype html><html><head><style>#t2 { caption-side: bottom }</style></head><body>
+            <table><caption id="s" style="caption-side: bottom">S</caption><tr><td>1</td></tr></table>
+            <table><caption id="a" align="bottom">A</caption><tr><td>2</td></tr></table>
+            <table><caption id="n">N</caption><tr><td>3</td></tr></table>
+            <table id="t2"><caption id="i">I</caption><tr><td>4</td></tr></table>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (id, want) in [("s", "bottom"), ("a", "bottom"), ("n", "top"), ("i", "bottom")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).captionSide"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed caption-side");
+        }
+    }
 }

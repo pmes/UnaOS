@@ -60,6 +60,8 @@ pub struct LayoutTree<H: Host> {
     /// horizontal margins, align-self); [`apply_specs`] and the in-place [`remeasure`] put them back before
     /// they fold or lay out again.
     bw_pending: blockwidth::Saved,
+    /// AETHERCAPTIONCSSOM (SR686): the boxes whose align-self `place_narrow_blocks` wrote, with the value (undone and re-derived by `rule_align_undo` at each `propagate_text_align`).
+    rule_align: NodeMap<taffy::style::AlignSelf>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -297,7 +299,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         measure_epoch: 0,
         kept_token: 0,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(),
     }
 }
 
@@ -647,23 +649,14 @@ pub fn caption_side_attr<N: DomNode>(node: &N) -> Option<bool> {
 /// AETHERCAPTIONSIDECSS (SR462): run once the cascade is folded (`apply_specs`), reading `PaintStyle::caption_side`
 /// (align= under style="" under the author cascade); the property inherits, so a caption's used value is the first
 /// one specified on itself or an ancestor box, top when none is. Idempotent: a second fold moves nothing.
+/// AETHERCAPTIONCSSOM (SR686): every caption is placed by side (`caption_sides_around`): top ones before the rows, bottom ones after, each in DOM order.
 fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
-    if !tree.paint_map.values().any(|p| p.caption_side == Some(true)) {
+    if !tree.node_map.values().any(|n| n.tag().as_deref() == Some("caption")) {
         return;
     }
-    let used_bottom = |tree: &LayoutTree<H>, id: taffy::NodeId| {
-        let mut cur = Some(id);
-        while let Some(b) = cur {
-            if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
-                return side;
-            }
-            cur = tree.taffy.parent(b);
-        }
-        false
-    };
     let mut below: BTreeMap<u64, Vec<taffy::NodeId>> = BTreeMap::new();
     for (id, n) in &tree.node_map {
-        if n.tag().as_deref() != Some("caption") || !used_bottom(tree, *id) {
+        if n.tag().as_deref() != Some("caption") {
             continue;
         }
         let Some(table) = tree.taffy.parent(*id) else { continue };
@@ -674,8 +667,8 @@ fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
     for (table, caps) in below {
         let table = taffy::NodeId::from(table);
         let kids = tree.taffy.children(table).unwrap_or_default();
-        let (moved, mut rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
-        rest.extend(moved);
+        let (moved, rest): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = kids.iter().copied().partition(|k| caps.contains(k));
+        let rest = caption_sides_around(tree, table, moved, rest);
         if rest != kids {
             let _ = tree.taffy.set_children(table, &rest);
         }
@@ -1225,7 +1218,7 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
             walk(tree, k, effective);
         }
     }
-    let root = tree.root_node;
+    rule_align_undo(tree); let root = tree.root_node;
     walk(tree, root, None);
 }
 
@@ -1252,7 +1245,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
             continue;
         }
         let mut n = kst;
-        n.align_self = Some(to);
+        n.align_self = Some(to); tree.rule_align.insert(k, to);
         let _ = tree.taffy.set_style(k, n);
     }
 }
@@ -1712,7 +1705,7 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         let node_id = *node_id;
         if let Ok(node_style_ref) = tree.taffy.style(node_id) {
             let mut node_style = node_style_ref.clone();
-            spec.fold_into(&mut node_style);
+            spec.fold_into(&mut node_style); if spec.align_self.is_some() { tree.rule_align.remove(&node_id); }
             let _ = tree.taffy.set_style(node_id, node_style);
         }
         match spec.position {
@@ -2546,7 +2539,7 @@ pub fn retarget<H: Host>(fresh: LayoutTree<H>, kept: &LayoutTree<H>, token: u64,
         measure_epoch: 0,
         kept_token: token,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(),
     }
 }
 
@@ -2637,7 +2630,7 @@ fn sync<H: Host>(twin: &mut LayoutTree<H>, kept: &mut LayoutTree<H>, prep: &Prep
     kept.col_frags = core::mem::take(&mut twin.col_frags);
     kept.fixed_at = core::mem::take(&mut twin.fixed_at);
     kept.measured = now;
-    kept.bw_pending = Vec::new();
+    kept.bw_pending = Vec::new(); kept.rule_align = core::mem::take(&mut twin.rule_align);
     kept.kept_token = 0;
     true
 }
@@ -3056,4 +3049,57 @@ fn abs_containing_block<H: Host>(tree: &LayoutTree<H>, parent: taffy::NodeId) ->
     }
     let (vw, vh) = tree.viewport;
     Some((0.0, 0.0, vw, vh))
+}
+
+// ---- AETHERCAPTIONCSSOM (LEDGER SR686): caption-side's used value, top captions first, the centring mark (named tail block) ----
+
+/// AETHERCAPTIONCSSOM (SR686): a box's used caption-side, true for bottom: the first `PaintStyle::caption_side` specified
+/// on the box itself or a box ancestor (align= under style="" under the author cascade; the property inherits), top
+/// when none is. The ONE walk `caption_side_order` and the host's `getComputedStyle` read.
+pub fn caption_side_used<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(b) = cur {
+        if let Some(side) = tree.paint_map.get(&b).and_then(|p| p.caption_side) {
+            return side;
+        }
+        cur = tree.taffy.parent(b);
+    }
+    false
+}
+
+/// AETHERCAPTIONCSSOM (SR686): a table's children as CSS 2.2 §17.4 places its captions: the top captions, the other
+/// children (in their order), the bottom captions. The captions keep their DOM order (their rank among the table
+/// node's own children), so a re-fold of a tree an earlier fold already reordered (anim's `apply_specs`) puts a caption
+/// whose side changed back where Chromium has it.
+fn caption_sides_around<H: Host>(tree: &LayoutTree<H>, table: taffy::NodeId, mut caps: Vec<taffy::NodeId>, rest: Vec<taffy::NodeId>) -> Vec<taffy::NodeId> {
+    if let Some(t) = tree.node_map.get(&table) {
+        let dom = t.children();
+        let rank = |c: &taffy::NodeId| tree.node_map.get(c).and_then(|n| dom.iter().position(|d| d.same(n))).unwrap_or(usize::MAX);
+        caps.sort_by_key(rank);
+    }
+    let (bottom, mut out): (Vec<taffy::NodeId>, Vec<taffy::NodeId>) = caps.into_iter().partition(|c| caption_side_used(tree, *c));
+    out.extend(rest);
+    out.extend(bottom);
+    out
+}
+
+/// AETHERCAPTIONCSSOM (SR686): undoes the align-self `place_narrow_blocks` wrote on the last run, so the walk that
+/// follows re-derives it from the text-align in force now (Chromium recomputes the centring on every style recalc):
+/// a box still holding the value the rule wrote goes back to none; one whose align-self moved since (an author value)
+/// keeps it. Every mark is dropped; the walk marks again what it writes.
+fn rule_align_undo<H: Host>(tree: &mut LayoutTree<H>) {
+    if tree.rule_align.is_empty() {
+        return;
+    }
+    let marked: Vec<(taffy::NodeId, taffy::style::AlignSelf)> = tree.rule_align.iter().map(|(k, v)| (*k, *v)).collect();
+    tree.rule_align.clear();
+    for (k, wrote) in marked {
+        let Ok(st) = tree.taffy.style(k) else { continue };
+        if st.align_self != Some(wrote) {
+            continue;
+        }
+        let mut st = st.clone();
+        st.align_self = None;
+        let _ = tree.taffy.set_style(k, st);
+    }
 }
