@@ -571,7 +571,7 @@ pub fn build_taffy_tree<H: Host>(
             match a.trim().to_ascii_lowercase().as_str() {
                 "center" | "middle" => paint.text_align = Some(5),
                 "right" => paint.text_align = Some(6),
-                "left" => paint.text_align = Some(4),
+                "left" => paint.text_align = Some(7), // AETHERTEXTALIGNCODES (SR724): align=left is -webkit-left (7), not CSS left (4)
                 _ => {}
             }
         }
@@ -1184,7 +1184,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
         let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
-        if let Some(align) = effective.filter(|&a| a != 0 && a != 4) {
+        if let Some(align) = effective.filter(|&a| a != 0 && a != 4 && a != 7) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
                 let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
@@ -1852,7 +1852,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
         let mut size = inherited.clone();
         if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
             // AETHERCENTERLAYOUT (SR421): the inline formatter sees -webkit-center / -webkit-right as center / right.
-            size.text_align = match ta { 5 => 1, 6 => 2, a => a };
+            size.text_align = match ta { 5 => 1, 6 => 2, 7 => 4, a => a };
         }
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(tag) = dom_node.tag() {
@@ -1932,7 +1932,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     let intrinsic = H::img_intrinsic(dom_node);
                     let w = attr_px("width").or(intrinsic.map(|(w, _)| w));
                     let h = attr_px("height").or(intrinsic.map(|(_, h)| h));
-                    if let Some(run) = img_alt_extent::<H>(tree, node_id, &size) { out.text.insert(node_id, run); } else if let (Some(w), Some(h)) = (w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
+                    if let Some(run) = img_alt_extent::<H>(tree, node_id, &size) { out.text.insert(node_id, run); } else if let (Some(w), Some(h)) = img_icon_box::<H>(tree, node_id, w, h) { // AETHERIMGALT (SR681): a failed img laid out as its inline alt text
                         out.imgs.insert(node_id, (w, h));
                     }
                 }
@@ -3084,7 +3084,7 @@ pub enum ImgFallback {
 /// set, or an aspect ratio and one side, AND quirks mode or an empty / missing alt; AtomicString::empty() is true
 /// for alt="") -> boxed, framed unless ImageSmallerThanAltImage (a fixed side < 18 px = the 16 px icon + 2);
 /// otherwise the img is inline text, nothing when that text is empty (ImageRepresentsNothing / the icon alone,
-/// owed). So in standards mode a SIZED img with a non-empty alt is inline text, its size dropped (AdjustHostStyle).
+/// src set: [`img_fallback_src`], SR714). So in standards mode a SIZED img with a non-empty alt is inline text, its size dropped (AdjustHostStyle).
 pub fn img_fallback(
     alt: Option<&str>,
     title: Option<&str>,
@@ -3130,7 +3130,7 @@ pub fn img_fallback_of<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> ImgF
     let h = axis("height", style.map(|s| s.size.height));
     let aspect = style.is_some_and(|s| s.aspect_ratio.is_some());
     let (alt, title) = (node.attr("alt"), node.attr("title"));
-    img_fallback(alt.as_deref(), title.as_deref(), state, w, h, aspect, is_quirks(node))
+    img_fallback_src(alt.as_deref(), title.as_deref(), node.attr("src").is_some_and(|s| !s.is_empty()), state, w, h, aspect, is_quirks(node))
 }
 
 /// AETHERIMGALT (SR681): an InlineAlt img's box: its alt text (text-transformed as a text leaf is) in the element's
@@ -3502,14 +3502,76 @@ mod img_alt_wrap_kat {
 /// taffy's default START is always the physical left). The filter in `propagate_text_align` admits no such code (and
 /// `Option::filter` never sees None), so this runs beside it: `place_narrow_blocks`' `_` arm gives END through `is_rtl`
 /// and records the write in `rule_align`, which SR686's `rule_align_undo` clears before the next prepass. The column's
-/// `justify_content` / `align_items` are never touched. Code 4 (`text-align: left`) is not admitted: it is also
-/// `align=left`, which Chromium keeps at the physical left (AETHER-RTL-BLOCK-LEFT owed, the 4 / 7 code split).
+/// `justify_content` / `align_items` are never touched. AETHERTEXTALIGNCODES (SR724): code 4 (`text-align: left`) is
+/// admitted (inline content only, so the blocks sit at the inline start); 7 (`align=left`, `-webkit-left`) is not.
 fn rtl_start_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, effective: Option<u8>) {
-    if !matches!(effective, None | Some(0)) {
+    if !matches!(effective, None | Some(0) | Some(4)) {
         return;
     }
     let Ok(st) = tree.taffy.style(id).cloned() else { return };
     if (crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st)) && is_rtl(tree, id) {
         place_narrow_blocks(tree, id, 0);
+    }
+}
+
+// ---- AETHERIMGALTICONONLY (LEDGER SR714): an unsized failed img with no alt and no title is the icon alone (named tail block) ----
+
+/// AETHERIMGALTICONONLY (SR714): [`img_fallback`] with the one input it lacks, whether the `src` attribute is set and
+/// non-empty (`src`, Chromium's `!SrcAttribute().empty()`; srcset does not count). html_image_fallback_helper.cc
+/// ImageRepresentsNothing: with no alt attribute and no title (AltText null) an img whose src is set represents text,
+/// so a failed one that is not treated as replaced shows the 16x16 broken-image icon ALONE (ShowBrokenImageIcon, margin
+/// 0, no border or padding on the container): `BoxedAlt { text: "", frame: false, icon: true }`, sized by
+/// [`img_icon_box`]. alt="" (src set or not) and alt absent with no src still represent nothing. `img_fallback` returns
+/// `None` for a failed img with alt and title both absent only on its not-replaced path, so this refines that one arm.
+#[allow(clippy::too_many_arguments)]
+pub fn img_fallback_src(
+    alt: Option<&str>,
+    title: Option<&str>,
+    src: bool,
+    state: ImgState,
+    w: Option<Option<f32>>,
+    h: Option<Option<f32>>,
+    aspect: bool,
+    quirks: bool,
+) -> ImgFallback {
+    match img_fallback(alt, title, state, w, h, aspect, quirks) {
+        ImgFallback::None if state == ImgState::Failed && src && alt.is_none() && title.is_none() => {
+            ImgFallback::BoxedAlt { text: String::new(), frame: false, icon: true }
+        }
+        f => f,
+    }
+}
+
+/// AETHERIMGALTICONONLY (SR714): the img sizing arm's (width, height) for box `id`: 16 x 16 (the fallback icon's own
+/// width / height attributes in Chromium's shadow tree) for the icon-only box [`img_fallback_src`] gives (SR702 sets
+/// `icon` with `frame`, so `icon && !frame` is that box alone), else the attribute / intrinsic `w`, `h` unchanged.
+fn img_icon_box<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, w: Option<f32>, h: Option<f32>) -> (Option<f32>, Option<f32>) {
+    match img_fallback_of(tree, id) {
+        ImgFallback::BoxedAlt { text, frame: false, icon: true } if text.is_empty() => (Some(16.0), Some(16.0)),
+        _ => (w, h),
+    }
+}
+
+#[cfg(test)]
+mod img_icon_only_kat {
+    use super::{img_fallback_src, ImgFallback, ImgState};
+
+    /// No alt, no title, src set, not replaced: the icon alone; alt="" or no src: nothing; sized: SR702's framed icon.
+    #[test]
+    fn img_icon_only_rule_kat() {
+        let icon = ImgFallback::BoxedAlt { text: "".into(), frame: false, icon: true };
+        let f = ImgState::Failed;
+        assert_eq!(img_fallback_src(None, None, true, f, None, None, false, false), icon);
+        // One side alone is still unsized (AdjustHostStyle drops it for an inline host).
+        assert_eq!(img_fallback_src(None, None, true, f, Some(Some(100.0)), None, false, false), icon);
+        assert_eq!(img_fallback_src(Some(""), None, true, f, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback_src(Some(""), None, false, f, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback_src(None, None, false, f, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback_src(None, None, true, ImgState::Pending, None, None, false, false), ImgFallback::None);
+        assert_eq!(img_fallback_src(None, None, true, ImgState::Loaded, None, None, false, false), ImgFallback::None);
+        let (w, h) = (Some(Some(200.0)), Some(Some(100.0)));
+        assert_eq!(img_fallback_src(None, None, true, f, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
+        assert_eq!(img_fallback_src(None, Some("T"), true, f, None, None, false, false), ImgFallback::InlineAlt("T".into()));
+        assert_eq!(img_fallback_src(Some("Logo"), None, true, f, None, None, false, false), ImgFallback::InlineAlt("Logo".into()));
     }
 }

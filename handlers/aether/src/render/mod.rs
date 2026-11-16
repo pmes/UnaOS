@@ -4486,7 +4486,7 @@ fn paint_img_alt(
                 fill_rect(cx, cy + 1.0, cx + 1.0, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
                 fill_rect(cx + cw - 1.0, cy + 1.0, cx + cw, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
             }
-            if icon && !inherited.text_hidden { paint_broken_icon(cx, cy, cw, ch, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
+            if icon && !inherited.text_hidden { let o = if frame { 0.0 } else { 2.0 }; paint_broken_icon(cx - o, cy - o, cw + 2.0 * o, ch + 2.0 * o, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, cx + 2.0 + 16.0, cy + 2.0, 1.0) } else { (text, cx, cy, 0.0) }
         }
     };

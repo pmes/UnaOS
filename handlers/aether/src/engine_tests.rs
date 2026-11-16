@@ -3937,6 +3937,8 @@ mod tests {
         assert!(qw > 0.0 && (ql + qw / 2.0 - (cl + cw / 2.0)).abs() <= 2.0, "the search field is centred in its align=center cell (field {ql} + {qw}, cell {cl} + {cw})");
         let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
         assert_eq!(ta, "-webkit-center", "<center>'s computed text-align is the UA's -webkit-center");
+        // AETHERTEXTALIGNCODES (SR724): align=left is Blink's -webkit-left (code 7), not CSS left.
+        assert_eq!(engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.querySelector('td[align=left]')).textAlign").unwrap(), "-webkit-left", "align=left's computed text-align is -webkit-left");
     }
 
     /// ABSSHRINK (LEDGER SR420): CSS 2.2 §10.3.7 — a `right: 8px` absolutely positioned pill with an auto width is
@@ -4666,6 +4668,33 @@ mod tests {
         assert_eq!(js.eval_string("document.getElementById('m2').value").unwrap(), "C:\\fakepath\\a.txt");
         assert_eq!(js.eval_string("document.getElementById('on').value").unwrap(), "");
         assert_eq!(js.eval_string("String(document.getElementById('m2').files.length)").unwrap(), "2");
+    }
+
+    // ---- AETHERIMGALTICONONLY (LEDGER SR714): an unsized failed img with no alt is the icon alone (named tail block) ----
+
+    /// AETHERIMGALTICONONLY (SR714): a failed, unsized img with a src and no alt or title shows Chromium's broken-image
+    /// icon ALONE (HTMLImageFallbackHelper's represents-text arm): a 16x16 box, the icon at its (0, 0) (the page outline
+    /// grey at icon pixel (1, 5)), no silver frame, nothing right of it; an img with neither src nor alt represents
+    /// nothing. (alt="" stays nothing: `img_empty_alt_paints_nothing`.)
+    #[test]
+    fn img_alt_icon_only_when_no_alt() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="o" src="missing.png"></div>
+            <div><img id="x"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (l, t, w, h) = imgalt_rect(&mut engine, "o");
+        assert!((w - 16.0).abs() <= 0.5 && (h - 16.0).abs() <= 0.5, "o: the icon box is 16x16 ({w}x{h})");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, l, l + 16, t, t + 16) > 0, "o: the icon paints");
+        assert_eq!(imgalt_px(&engine, l + 1, t + 5), (128, 128, 128), "o: the icon's page outline at the box's (1, 5)");
+        assert_eq!(imgalt_px(&engine, l, t), (255, 255, 255), "o: no frame");
+        assert_eq!(imgalt_painted(&engine, l + 16, 400, t, t + 16), 0, "o: nothing paints right of the icon");
+        let (_, _, xw, _) = imgalt_rect(&mut engine, "x");
+        assert!(xw <= 0.5, "x: no src and no alt takes no width ({xw})");
     }
 
     // ---- AETHERHOSTWGHTCOVERFACE (LEDGER SR725): the covering face draws a variable fallback at the asked weight (named tail block) ----

@@ -1186,7 +1186,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.justify = Some(taffy::style::JustifyContent::END);
                 style.paint.text_align = Some(6);
             }
-            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right — start/end
+            // AETHERTEXTALIGNCODES (SR724): -webkit-left (7, Blink's align=left) is the physical left: blocks stay left in rtl.
+            "-webkit-left" | "-moz-left" => {
+                style.justify = Some(taffy::style::JustifyContent::START);
+                style.paint.text_align = Some(7);
+            }
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right, 7 -webkit-left — start/end
             // resolve against `direction` (css-text-3 §6.1) where lines are placed (layout::inline).
             "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
