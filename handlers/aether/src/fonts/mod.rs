@@ -319,7 +319,7 @@ pub fn stack(sel: &FontSel) -> std::rc::Rc<Vec<&'static Face>> {
     }
     if faces.is_empty() {
         let d = db::db();
-        push(&mut faces, d.fallback_order().first().and_then(|&i| load_face(&d.faces[i])));
+        push(&mut faces, d.fallback_order().first().and_then(|&i| text_host::cover_face(&d.faces[i], want)));
     }
     let rc = std::rc::Rc::new(faces);
     STACKS.with(|c| {
@@ -358,7 +358,7 @@ pub fn fallback_for(c: char, sel: &FontSel) -> Option<&'static Face> {
         }
         let Some(f) = load_face(info) else { continue };
         let fam = info.families[0].clone();
-        found = d.select(&fam, sel.style()).and_then(|k| db_face(k, sel.style())).filter(|g| g.font.glyph_index(c) != 0).or(Some(f));
+        found = d.select(&fam, sel.style()).and_then(|k| db_face(k, sel.style())).filter(|g| g.font.glyph_index(c) != 0).or_else(|| text_host::cover_face(info, sel.style())).or(Some(f));
         break;
     }
     // FONTHINT (SR62): Chromium draws a platform-fallback face with the default render params (hinting off
