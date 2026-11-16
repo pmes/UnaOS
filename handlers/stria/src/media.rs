@@ -1253,7 +1253,7 @@ pub fn open_line(i: &MediaInfo) -> String {
 
 /// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (an audio-only file: its `~` rate alone; none: "").
 pub fn summary_line(i: &MediaInfo) -> String {
-    with_audio_part(summary_parts(&i.video, i.width, i.height, &i.video_profile, &i.bitrate), i) // STRIAINFOREEL (SR743): the ONE formatter (file tail)
+    summary_parts(&i.video, i.width, i.height, &i.video_profile, &i.bitrate, &i.audio_decoder, &i.audio_bitrate) // STRIAINFOREEL (SR743) / STRIAINFOREELAUDIO (SR761): the ONE formatter (file tail)
 }
 
 // ---- STRIAINFOAUDIOBITRATE (LEDGER SR742): MediaInfo's audio bit rate (named tail block) ----
@@ -1272,14 +1272,7 @@ pub fn pcm_bitrate(channels: u16, rate: u32, bits: u16) -> Option<u64> {
 fn audio_bitrate_of(audio: Option<&AudioSrc>, demux: Option<&Demuxer>, file_bytes: u64, duration_ns: u64) -> String {
     let exact = |bps: Option<u64>| bps.map(|b| (0u32, 0u32, b.min(u32::MAX as u64) as u32));
     match audio {
-        Some(AudioSrc::Track { track, .. }) => {
-            let pcm = match &track.codec {
-                gneiss_pal::dsp::demux::Codec::Pcm { bits, .. } => pcm_bitrate(track.channels, track.sample_rate, *bits),
-                _ => None,
-            };
-            let bytes = demux.and_then(|d| Some(d.track_samples(d.track_index(track.id)?).map(|s| s.size as u64).sum::<u64>())).unwrap_or(0);
-            bitrate_of(exact(pcm).or(track.btrt), None, bytes, track.duration_ns)
-        }
+        Some(AudioSrc::Track { track, .. }) => track_audio_bitrate(track, demux), // STRIAINFOREELAUDIO (SR761): the lifted Track arm (file tail)
         Some(AudioSrc::File { dec, .. }) => {
             let i = dec.info();
             let pcm = if i.codec == ac::Codec::Pcm { pcm_bitrate(i.channels, i.rate, i.bits) } else { None };
@@ -1289,22 +1282,43 @@ fn audio_bitrate_of(audio: Option<&AudioSrc>, demux: Option<&Demuxer>, file_byte
     }
 }
 
-/// SR734's video part, then ` | <audio decoder> <audio bit rate>` when the audio's rate is known; with no video the audio part
-/// alone (it says the audio's rate better than the file's `~`); no audio rate: the video part unchanged.
-fn with_audio_part(video_part: String, i: &MediaInfo) -> String {
-    if i.audio_bitrate.is_empty() {
-        return video_part;
-    }
-    let audio_part = [i.audio_decoder.as_str(), i.audio_bitrate.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
-    if i.video.is_empty() || video_part.is_empty() { audio_part } else { format!("{video_part} | {audio_part}") }
-}
-
 // ---- STRIAINFOREEL (LEDGER SR743): the person's media line from its parts (named tail block) ----
 // THE one formatter of the person's line: `summary_line` (the Player's MediaInfo, SR734) and `nle::Sources::summary` (an editor
-// reel, from the same `Track` facts the Player reads) both call it. Owed: STRIA-INFO-REEL-AUDIO (the audio part, one more part here).
+// reel, from the same `Track` facts the Player reads) both call it. STRIA-INFO-REEL-AUDIO BUILT by SR761 (the audio pair and SR742's ` | ` join, below).
 
-/// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (the size only when both sides are > 0).
-pub fn summary_parts(video: &str, width: u32, height: u32, profile: &str, bitrate: &str) -> String {
+/// `<video codec> <W>x<H> <profile tokens> <bit rate>`, empty parts dropped (the size only when both sides are > 0); then
+/// STRIAINFOREELAUDIO (SR761, SR742's rule): ` | <audio decoder> <audio bit rate>` when the audio's rate is known, the audio part
+/// alone with no video codec (it says the audio's rate better than the file's `~`); no audio rate: the video part unchanged.
+pub fn summary_parts(video: &str, width: u32, height: u32, profile: &str, bitrate: &str, audio: &str, audio_bitrate: &str) -> String {
     let size = if width > 0 && height > 0 { format!("{width}x{height}") } else { String::new() };
-    [video, size.as_str(), profile, bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ")
+    let video_part = [video, size.as_str(), profile, bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
+    if audio_bitrate.is_empty() {
+        return video_part;
+    }
+    let audio_part = [audio, audio_bitrate].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<&str>>().join(" ");
+    if video.is_empty() || video_part.is_empty() { audio_part } else { format!("{video_part} | {audio_part}") }
+}
+
+// ---- STRIAINFOREELAUDIO (LEDGER SR761): a reel's audio decoder token and rate from its Track (named tail block) ----
+// Both roads' audio part from the same facts: the Player (`audio_bitrate_of`'s Track arm, `MediaInfo::audio_decoder` from the decoder
+// it opened) and the editor (`nle::Sources::summary` over the reel's audio Track). Owed: STRIA-INFO-REEL-AUDIO-KERNEL (the kernel
+// NLE's reel line), STRIA-INFO-REEL-AUDIO-CACHE (name the decoder once per reel at `Sources::add`, not per summary).
+
+/// A container audio track's rate through THE rule (`bitrate_of`): PCM exact (channels x rate x bits), else the track's btrt / esds
+/// avg, else `~` the track's own sample bytes (from `demux`) over its span.
+pub fn track_audio_bitrate(track: &Track, demux: Option<&Demuxer>) -> String {
+    let pcm = match &track.codec {
+        gneiss_pal::dsp::demux::Codec::Pcm { bits, .. } => pcm_bitrate(track.channels, track.sample_rate, *bits),
+        _ => None,
+    };
+    let exact = pcm.map(|b| (0u32, 0u32, b.min(u32::MAX as u64) as u32));
+    let bytes = demux.and_then(|d| Some(d.track_samples(d.track_index(track.id)?).map(|s| s.size as u64).sum::<u64>())).unwrap_or(0);
+    bitrate_of(exact.or(track.btrt), None, bytes, track.duration_ns)
+}
+
+/// The decoder token a person reads for a container audio track: the registry's own decoder name (`audio_decoder_for`, the decoder
+/// `AudioSwap::open` wraps: "pcm", "aac-lc", "opus", ...), else AudioSwap's "stand-in" when no decoder fits. Builds and drops the
+/// decoder; logs nothing.
+pub fn track_audio_decoder(track: &Track, demux: &Demuxer) -> &'static str {
+    audio_decoder_for(track, Timing::of(demux, track)).map_or("stand-in", |d| d.name())
 }

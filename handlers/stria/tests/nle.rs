@@ -2036,3 +2036,43 @@ fn nle5drangekeys_lower_i_o_still_trim_the_clip() {
     assert_eq!((&face.state.timeline.tracks, face.marks()), (&want.timeline.tracks, (None, None)));
     println!("nle5drangekeys: i / o still trim");
 }
+
+// ---- STRIAINFOREELAUDIO (LEDGER SR761): an editor reel's line carries its audio part, equal to the Player's (named tail block) ----
+
+/// Rule: the synth reel's `Sources::summary` is the Player's `summary_line` of the same bytes INCLUDING the audio part: SR743's
+/// video half, ` | `, the mono PCM16 48 kHz track's exact `pcm 768 kb/s` (the decoder registry's name, `track_audio_bitrate`).
+#[test]
+fn striainforeelaudio_synth_reel_line_is_the_players_with_the_pcm_part() {
+    let bytes = synth_source(0, 50, 25);
+    let mut src = Sources::new(&Timeline::new(25));
+    src.add(SourceId(0), bytes.clone()).unwrap();
+    let s = src.summary(SourceId(0)).unwrap();
+    assert!(s.starts_with("utp1 64x48 ~") && s.ends_with(" kb/s | pcm 768 kb/s"), "{s}");
+    assert_eq!(s, striainforeel_player_line(bytes));
+    println!("striainforeelaudio: synth reel summary=\"{s}\"");
+}
+
+/// Rule: a video-only reel (tests/common's utp1 pattern, no audio track) has no audio part and is still the Player's line.
+#[test]
+fn striainforeelaudio_video_only_reel_has_no_audio_part() {
+    let bytes = pattern_mp4(64, 48, 25, 50, 10);
+    let mut src = Sources::new(&Timeline::new(25));
+    src.add(SourceId(0), bytes.clone()).unwrap();
+    let s = src.summary(SourceId(0)).unwrap();
+    assert!(s.starts_with("utp1 64x48 ") && !s.contains(" | "), "{s}");
+    assert_eq!(s, striainforeel_player_line(bytes));
+}
+
+/// Rule: the face's reel line (the message line's idle text, stria-view's `"reel"`) carries the audio part.
+#[test]
+fn striainforeelaudio_face_reel_line_carries_the_audio_part() {
+    use stria::nle_face::{EditorState, Face, PixelOrder};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let line = src.summary(SourceId(0)).unwrap();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    let r = face.reel_line().unwrap();
+    assert_eq!(r, format!("A: {line}"));
+    assert!(r.ends_with(" | pcm 768 kb/s"), "{r}");
+    println!("striainforeelaudio: face reel_line=\"{r}\"");
+}

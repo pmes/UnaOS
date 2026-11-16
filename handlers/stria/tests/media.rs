@@ -2060,3 +2060,31 @@ fn nle6utp1_media_fixtures_pin() {
 
 /// The fnvs [`nle6utp1_media_fixtures_pin`] reads, measured on the copies before SR729.
 const NLE6UTP1_MEDIA_PINS: [u64; 3] = [0x2e6e_eac9_e618_ef1c, 0x0c88_24d8_868e_6f16, 0x6ad1_ca03_875a_632c];
+
+// ---- STRIAINFOREELAUDIO (LEDGER SR761): SR742's AAC fixtures through the editor's road equal the Player's line (named tail block) ----
+/// The editor's line for `bytes` (`stria::nle::Sources::summary` of the reel opened by `Sources::add`).
+fn striainforeelaudio_reel_line(bytes: Vec<u8>) -> String {
+    let mut src = stria::nle::Sources::new(&timeline_core::Timeline::new(25));
+    src.add(timeline_core::SourceId(0), bytes).unwrap();
+    src.summary(timeline_core::SourceId(0)).unwrap()
+}
+
+/// STRIAINFOREELAUDIO (SR761): the utp1 pattern beside SR742's AAC track (esds avg 128 kb/s) reads the same on both roads,
+/// ending ` | aac-lc 128 kb/s`; the AAC track alone is `aac-lc 128 kb/s` on both; esds avg 0: both end in the same `~` rate.
+#[test]
+fn striainforeelaudio_aac_reel_line_is_the_players() {
+    let player = |b: Vec<u8>| stria::media::summary_line(Player::open(b, Arc::new(ManualTime::new()), None, 60).unwrap().info());
+    let video = build::test_pattern_track(1, 320, 240, 25, 50, 25);
+    let av = build::mp4(&[video, striainfoaudiobitrate_aac(128_000)], &Mp4Options::default());
+    let reel = striainforeelaudio_reel_line(av.clone());
+    assert!(reel.starts_with("utp1 320x240 ") && reel.ends_with(" | aac-lc 128 kb/s"), "{reel}");
+    assert_eq!(reel, player(av));
+    let alone = build::mp4(&[striainfoaudiobitrate_aac(128_000)], &Mp4Options::default());
+    assert_eq!(striainforeelaudio_reel_line(alone.clone()), "aac-lc 128 kb/s");
+    assert_eq!(player(alone), "aac-lc 128 kb/s");
+    let zero = build::mp4(&[striainfoaudiobitrate_aac(0)], &Mp4Options::default());
+    let reel0 = striainforeelaudio_reel_line(zero.clone());
+    assert!(reel0.starts_with("aac-lc ~") && reel0.ends_with(" kb/s"), "{reel0}");
+    assert_eq!(reel0, player(zero));
+    println!("striainforeelaudio: av reel=\"{reel}\" avg0 reel=\"{reel0}\"");
+}
