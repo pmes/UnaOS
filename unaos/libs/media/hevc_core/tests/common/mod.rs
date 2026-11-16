@@ -854,6 +854,8 @@ pub struct SliceCfg {
     pub weights: Option<(u32, Vec<Option<(i32, i32)>>)>,
     /// HEVCCONCEALWEIGHTEDBIMIXED (SR768): a B slice's l1 entries (weighted_bipred_flag), as `weights`; chroma flags all 0.
     pub weights_l1: Option<Vec<Option<(i32, i32)>>>,
+    /// HEVCCONCEALWEIGHTEDCHROMA (SR776): delta_chroma_log2_weight_denom and per l0 entry Some([(delta_chroma_weight, delta_chroma_offset); Cb, Cr]) or None; None: chroma flags 0.
+    pub chroma_weights: Option<(i32, Vec<Option<[(i32, i32); 2]>>)>,
     pub five_minus_max_num_merge_cand: u32,
     pub deblocking_disabled: bool,
 }
@@ -935,7 +937,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
         }
         if let Some((denom, ws)) = &c.weights {
             b.ue(*denom);
-            b.se(0); // delta_chroma_log2_weight_denom
+            b.se(c.chroma_weights.as_ref().map_or(0, |cw| cw.0)); // delta_chroma_log2_weight_denom
             let written = |i: usize| !s.weight_skip.get(i).copied().unwrap_or(false);
             for (i, w) in ws.iter().enumerate() {
                 if written(i) {
@@ -944,12 +946,12 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
             }
             for i in 0..ws.len() {
                 if written(i) {
-                    b.bit(0); // chroma_weight_l0_flag
+                    b.flag(chroma_l0(c, i).is_some()); // chroma_weight_l0_flag
                 }
             }
-            for (dw, off) in ws.iter().flatten() {
-                b.se(*dw);
-                b.se(*off);
+            for (i, w) in ws.iter().enumerate() {
+                if let Some((dw, off)) = w { b.se(*dw); b.se(*off); }
+                for (dw, doff) in chroma_l0(c, i).into_iter().flatten() { b.se(dw); b.se(doff); }
             }
             if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, w1); } }
         }
@@ -1180,4 +1182,11 @@ pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
         b.se(*dw);
         b.se(*off);
     }
+}
+
+// ---- HEVCCONCEALWEIGHTEDCHROMA (LEDGER SR776): an l0 entry's chroma weights (named tail block) ----
+/// HEVCCONCEALWEIGHTEDCHROMA (SR776): entry `i` of `c.chroma_weights` — [(delta_chroma_weight, delta_chroma_offset); Cb,
+/// Cr] when that l0 entry carries chroma_weight_l0_flag 1 (7.3.6.3), else None.
+pub fn chroma_l0(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
+    c.chroma_weights.as_ref().and_then(|cw| cw.1.get(i).copied().flatten())
 }

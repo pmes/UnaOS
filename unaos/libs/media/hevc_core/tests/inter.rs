@@ -960,3 +960,45 @@ fn conceal_weighted_bi_mixed_lists_use_one_log2wd() {
     assert_ne!(by_poc(&f, 6).planes[0], blend(&p, &q, 1, 3).y, "not the blend with the lists' weights swapped");
 }
 
+// ---- HEVCCONCEALWEIGHTEDCHROMA (LEDGER SR776): the concealed picture weighted on its chroma planes as its source's PUs were (named tail block) ----
+
+/// SR741's P shape with explicit chroma weights. The PPS carries weighted_pred_flag; IDR0 (the gradient), P2 (references
+/// POC 0 with mv (32, 16)), P4 (skip-only, references the lost POC 3 and keeps POC 2 unused; its one entry defaults: a
+/// copy), P5 (references POC 2 with mv (16, 8)). P2 and P5 carry SR741's luma fade (denom 6, LumaWeightL0[0] 32, offset
+/// 10) and chroma weights: delta_chroma_log2_weight_denom 1 (ChromaLog2WeightDenom 7), Cb delta_chroma_weight -32
+/// (ChromaWeight 96) delta_chroma_offset -12 (7-56: 128 - 12 - ((128 * 96) >> 7) = +20), Cr delta 32 (160), delta_chroma_offset 2
+/// (128 + 2 - 160 = -30). Whole-sample vectors, so 8.5.3.3.4.3 at log2WD 7 + 6 = 13 reads: Cb ((3s + 2) >> 2) + 20, Cr
+/// ((5s + 2) >> 2) - 30, luma ((s + 1) >> 1) + 10. POC 3 is concealed from POC 2 through `conceal_fetch` with planes 1
+/// and 2 weighted by their own (w, o, log2WD), so P4 (the concealed picture's copy) is exactly P5 and the hand equations
+/// on ALL THREE planes, and its chroma planes are not the default-chroma-weight projection.
+#[test]
+fn conceal_weighted_chroma_applies_the_source_chroma_weights() {
+    let i0 = gradient();
+    let fade = Some((6, vec![Some((-32, 10))]));
+    let chroma = Some((1, vec![Some([(-32, -12), (32, 2)])]));
+    let mut s = headers(false, true, &PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(idr(&i0, true));
+    s.extend(picture(&SliceCfg { weights: fade.clone(), chroma_weights: chroma.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+    s.extend(picture(&SliceCfg { weights: fade, chroma_weights: chroma, ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [16, 8])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
+    let weighted = |r: &Img| Img {
+        y: r.y.iter().map(|&v| ((v as i32 + 1) / 2 + 10).clamp(0, 255) as u8).collect(),
+        cb: r.cb.iter().map(|&v| (((3 * v as i32 + 2) >> 2) + 20).clamp(0, 255) as u8).collect(),
+        cr: r.cr.iter().map(|&v| (((5 * v as i32 + 2) >> 2) - 30).clamp(0, 255) as u8).collect(),
+    };
+    assert_frame(by_poc(&f, 2), &weighted(&shifted(&i0, 8, 4)), "P2: the gradient moved by (8, 4), luma (32, 10), Cb (96, +20), Cr (160, -30)");
+    let p2 = img_of(by_poc(&f, 2));
+    let p5 = img_of(by_poc(&f, 5));
+    assert_frame(by_poc(&f, 4), &p5, "P from the concealed picture equals the decoder's own weighted MC of P2 at (16, 8) on every plane");
+    assert_frame(by_poc(&f, 4), &weighted(&shifted(&p2, 4, 2)), "P from the concealed picture follows 8.5.3.3.4.3 with P2's luma and chroma weights");
+    let unit = shifted(&p2, 4, 2);
+    assert_ne!(by_poc(&f, 4).planes[1], unit.cb, "Cb is not the default-chroma-weight projection");
+    assert_ne!(by_poc(&f, 4).planes[2], unit.cr, "Cr is not the default-chroma-weight projection");
+}
