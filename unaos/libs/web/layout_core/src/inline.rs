@@ -307,7 +307,7 @@ fn atomic_box<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, id
             l.margin.top + l.border.top + l.padding.top + ((content_h - lh) / 2.0).floor().max(0.0) + m.a
         }
     } else {
-        h // replaced elements and boxes without line boxes: bottom margin edge
+        img_alt_baseline(tree, ctx, id, fallback).unwrap_or(h) // replaced elements and boxes without line boxes: bottom margin edge
     };
     (w, h, base)
 }
@@ -989,4 +989,20 @@ pub(crate) fn layout_all<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, t
     }
     tree.inline = layouts;
     heights
+}
+
+// ---- AETHERIMGALTBASELINE (LEDGER SR730): an InlineAlt img's baseline is its first alt line's (named tail block) ----
+
+/// AETHERIMGALTBASELINE (SR730): the baseline an InlineAlt img (SR681 / SR707 / SR726) gives the line, from its margin-box
+/// top: Chromium lays the alt as ordinary text inside a non-replaced inline, so the box sits on its FIRST line's text
+/// baseline, not on its bottom margin edge (the replaced-element rule `atomic_box` keeps for BoxedAlt, the icon-only box
+/// and real images: None here). Both painters draw the first alt line from the content-box top at
+/// `Fonts::baseline_offset` (host `paint_img_alt_lines` / `draw_text_from`, the ELF's `image_alt_lines`), which
+/// [`metrics`]' `off` is, in the img's own run ([`run_of`]: the alt run is the element's run with the alt text).
+fn img_alt_baseline<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, id: NodeId, fallback: &TextRun) -> Option<f32> {
+    if !matches!(crate::tree::img_fallback_of(tree, id), crate::tree::ImgFallback::InlineAlt(_)) {
+        return None;
+    }
+    let l = tree.taffy.layout(id).ok()?;
+    Some(l.margin.top + l.border.top + l.padding.top + metrics(ctx.fonts, run_of(ctx, id, fallback)).off)
 }

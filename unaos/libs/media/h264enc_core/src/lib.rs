@@ -478,7 +478,7 @@ pub struct Encoder {
     /// The previous frame's padded source luma (H264ENCSCENECUT SR680; empty until [`Config::scenecut`] runs).
     scene_prev: Plane,
     /// The previous picture's un-guarded scene-cut threshold test (H264ENCSCENECUTFADE SR709): a run of firing pictures is one cut.
-    scene_fired: bool,
+    scene_fired: bool, scene_quiet: Vec<u64>,
     /// The adaptive-quantisation state of the picture being coded (H264ENCAQ SR693; empty without [`Config::aq`]).
     pub(crate) aq: Aq,
     /// One record per coded picture (H264ENCTWOPASS SR698): [`Encoder::stats`], the first pass of a two-pass export.
@@ -572,7 +572,7 @@ impl Encoder {
             bipred_idc,
             depth: num_reorder as u64,
             scene_prev: Plane::new(0, 0, 0),
-            scene_fired: false,
+            scene_fired: false, scene_quiet: Vec::new(),
             aq: Aq::default(),
             stats: Vec::new(),
             hrd_bp: 0,
@@ -644,7 +644,7 @@ impl Encoder {
         let (b, gop) = (self.cfg.bframes.min(4) as u64, self.cfg.gop as u64);
         let (display, k) = (self.frames, (self.frames - self.idr_display) % gop);
         self.frames += 1;
-        if self.scenecut_key(display, k == 0) && k != 0 { return Ok(self.scenecut_group(display)); }
+        if self.cfg.scenecut.is_some() { return Ok(self.scenecut_window(display)); } if self.scenecut_key(display, k == 0) && k != 0 { return Ok(self.scenecut_group(display)); }
         if k != 0 && k % (b + 1) != 0 && k + 1 != gop {
             self.ahead.push((self.src.clone(), display));
             return Ok(Vec::new());
@@ -655,7 +655,7 @@ impl Encoder {
     /// Drain the held frames at the end of the stream (SR333): the last becomes a P anchor, the rest B.
     pub fn flush(&mut self) -> Result<Vec<Access>> {
         self.recons.clear();
-        let Some((planes, display)) = self.ahead.pop() else { return Ok(Vec::new()) };
+        if self.cfg.scenecut.is_some() { return Ok(self.scenecut_decide(true)); } let Some((planes, display)) = self.ahead.pop() else { return Ok(Vec::new()) };
         self.src = planes;
         Ok(self.group(Pic::P, display))
     }
@@ -1107,9 +1107,9 @@ impl Encoder {
         let Some(k) = self.cfg.scenecut else { return scheduled };
         let mut cut = false;
         if !scheduled && !self.scene_prev.data.is_empty() {
-            let (inter, intra) = self.scenecut_costs();
+            let (inter, intra) = self.scenecut_costs_of(&self.scene_prev);
             let k = k.min(100) as u64;
-            let fired = inter * 100 > (100 - k) * intra; let test = if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { fired }; cut = test && !self.scene_fired; self.scene_fired = fired;
+            let (fired, test) = self.scene_thresholds(inter, intra, display, k); cut = test && !self.scene_fired; self.scene_fired = fired;
         }
         self.scene_prev.clone_from(&self.src[0]);
         scheduled || cut
@@ -1118,17 +1118,17 @@ impl Encoder {
     /// (inter, intra) of the picture in `src`: per macroblock, the SAD against the previous source frame at the vector
     /// `me::search` finds (lam 0: pure SAD), and the cheapest Intra_16x16 SAD over the source's own neighbours (the intra
     /// decision's 16x16 half; its 4x4 half writes the reconstruction).
-    fn scenecut_costs(&self) -> (u64, u64) {
+    fn scenecut_costs_of(&self, prev: &Plane) -> (u64, u64) {
         let (mut inter, mut intra) = (0u64, 0u64);
         let mut pred = [0i32; 256];
         for mby in 0..self.mb_h {
             for mbx in 0..self.mb_w {
                 let (px, py) = (mbx * 16, mby * 16);
-                let mv = me::search(&self.src[0], &self.scene_prev, px, py, h264_core::picture::Mv::ZERO, 0);
+                let mv = me::search(&self.src[0], prev, px, py, h264_core::picture::Mv::ZERO, 0);
                 let (dx, dy) = (mv.x as i32 / 4, mv.y as i32 / 4);
                 for y in 0..16 {
                     for x in 0..16 {
-                        pred[y * 16 + x] = self.scene_prev.at((px + x) as i32 + dx, (py + y) as i32 + dy) as i32;
+                        pred[y * 16 + x] = prev.at((px + x) as i32 + dx, (py + y) as i32 + dy) as i32;
                     }
                 }
                 inter += self.sad(0, px, py, 16, &pred) as u64;
@@ -1284,5 +1284,115 @@ impl Encoder {
                 nals.push(filler);
             }
         }
+    }
+}
+
+// ---- H264ENCSCENECUTLOOKAHEAD (LEDGER SR732): x264's flash and chain rules over a lookahead of source pictures (named tail block) ----
+// x264 encoder/slicetype.c `scenecut()`: p0 the last decided picture, p1 = p0 + 1, the window to maxp1 = p0 + 1 + bframes (the
+// trellis form). FLASH: a curp1 in p1..=maxp1 that p0 -> curp1 does NOT cut to clears p0 + 1..=curp1 (the new scene returns to the
+// old). CHAIN: a curp0 in p0..maxp1 whose curp0 -> maxp1 still cuts is cleared (the scene keeps changing), so AAAAABBCCDDEEFFFF cuts
+// once, at the first F. Under scenecut + bframes `ahead` is the queue of UNDECIDED pictures: a group (the queue's front through its
+// next anchor by `push`'s k rule) is decided once bframes pictures past its anchor are queued (or at `flush`), and coded by `group` /
+// `scenecut_group`; `scene_quiet` holds the displays the rules cleared (x264's b_scenecut = 0), pruned as pictures are coded. The units
+// come out later; their pts / dts do not move. bframes 0 (`encode`) keeps SR680 / SR709's one-frame rule.
+impl Encoder {
+    /// Under [`Config::scenecut`] with `bframes`: the picture in `src` joins the lookahead queue and every decidable group is coded.
+    fn scenecut_window(&mut self, display: u64) -> Vec<Access> {
+        self.ahead.push((self.src.clone(), display));
+        self.scenecut_decide(false)
+    }
+
+    /// Decide and code every group the queue can decide; `end` (flush) decides the rest, the windows clipped at the stream's end
+    /// and a last group without an anchor closed by [`Encoder::flush`]'s rule (its last picture a P).
+    fn scenecut_decide(&mut self, end: bool) -> Vec<Access> {
+        let (b, gop) = (self.cfg.bframes.min(4) as usize, self.cfg.gop as u64);
+        let mut out = Vec::new();
+        loop {
+            let Some(d0) = self.ahead.first().map(|e| e.1) else { break };
+            let idr = self.idr_display;
+            if (d0 - idr) % gop == 0 {
+                let (planes, d) = self.ahead.remove(0);
+                self.scene_prev.clone_from(&planes[0]);
+                self.src = planes;
+                out.extend(self.group(Pic::Idr, d));
+                self.scene_quiet.retain(|&q| q > d);
+                continue;
+            }
+            let anchor = self.ahead.iter().position(|e| {
+                let k = (e.1 - idr) % gop;
+                k % (b as u64 + 1) == 0 || k + 1 == gop
+            });
+            let g = match anchor {
+                Some(g) => g,
+                None if end => self.ahead.len() - 1,
+                None => break,
+            };
+            if !end && self.ahead.len() <= g + b {
+                break;
+            }
+            let cut = self.scenecut_lookahead(g);
+            let rest = self.ahead.split_off(cut.unwrap_or(g) + 1);
+            let (planes, d) = self.ahead.pop().unwrap();
+            self.scene_prev.clone_from(&planes[0]);
+            self.src = planes;
+            out.extend(if cut.is_some() { self.scenecut_group(d) } else { self.group(Pic::P, d) });
+            self.ahead = rest;
+            self.scene_quiet.retain(|&q| q > d);
+        }
+        out
+    }
+
+    /// x264's FLASH and CHAIN over the queue for the candidates 0..=g, each against its previous picture (the first against
+    /// `scene_prev`) with its window to min(c + bframes, the queue's end): the queue index of the first cut, or None.
+    fn scenecut_lookahead(&mut self, g: usize) -> Option<usize> {
+        let mut q = core::mem::take(&mut self.ahead);
+        let (b, n) = (self.cfg.bframes.min(4) as usize, q.len());
+        let mut memo: Vec<(usize, usize, bool)> = Vec::new();
+        let mut cut = None;
+        for c in 0..=g {
+            let m = (c + b).min(n - 1);
+            for j in c..=m {
+                if !self.scene_cut(&mut q, &mut memo, c, j) {
+                    for t in c..=j {
+                        if !self.scene_quiet.contains(&q[t].1) {
+                            self.scene_quiet.push(q[t].1);
+                        }
+                    }
+                }
+            }
+            for p in c..m {
+                if self.scene_cut(&mut q, &mut memo, p + 1, m) && !self.scene_quiet.contains(&q[p].1) {
+                    self.scene_quiet.push(q[p].1);
+                }
+            }
+            if !self.scene_quiet.contains(&q[c].1) && self.scene_cut(&mut q, &mut memo, c, c) {
+                cut = Some(c);
+                break;
+            }
+        }
+        self.ahead = q;
+        cut
+    }
+
+    /// SR680's guarded test of queue picture `j` against queue picture `pi - 1` (`pi` 0: `scene_prev`), memoised per pair: `j`'s
+    /// luma is swapped into `src` for [`Encoder::scenecut_costs_of`] and back.
+    fn scene_cut(&mut self, q: &mut [([Plane; 3], u64)], memo: &mut Vec<(usize, usize, bool)>, pi: usize, j: usize) -> bool {
+        if let Some(&(_, _, v)) = memo.iter().find(|e| e.0 == pi && e.1 == j) {
+            return v;
+        }
+        let k = self.cfg.scenecut.unwrap_or(0).min(100) as u64;
+        core::mem::swap(&mut self.src[0], &mut q[j].0[0]);
+        let (inter, intra) = if pi == 0 { self.scenecut_costs_of(&self.scene_prev) } else { self.scenecut_costs_of(&q[pi - 1].0[0]) };
+        core::mem::swap(&mut self.src[0], &mut q[j].0[0]);
+        let v = self.scene_thresholds(inter, intra, q[j].1, k).1;
+        memo.push((pi, j, v));
+        v
+    }
+
+    /// SR680's threshold of a picture at `display` with these costs: (fired, the un-guarded inter x 100 > (100 - k) x intra;
+    /// test, inter > intra within min_keyint = gop / 4 of the last IDR, else fired).
+    fn scene_thresholds(&self, inter: u64, intra: u64, display: u64, k: u64) -> (bool, bool) {
+        let fired = inter * 100 > (100 - k) * intra;
+        (fired, if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { fired })
     }
 }

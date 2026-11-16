@@ -61,7 +61,7 @@ impl FakeStria {
                             video: "V_UNAOS/TESTPATTERN".into(),
                             audio: String::new(),
                             real_video: true,
-                            audio_clock: false,
+                            audio_clock: false, info: String::new(),
                         });
                         frame(&syn, &url, 0);
                         pos.insert(url, 0);
@@ -78,7 +78,7 @@ impl FakeStria {
                                     video: "V_UNAOS/TESTPATTERN".into(),
                                     audio: String::new(),
                                     real_video: true,
-                                    audio_clock: false,
+                                    audio_clock: false, info: String::new(),
                                 });
                                 0
                             }
@@ -445,7 +445,7 @@ fn controls_strip_paints_play_then_pause() {
 // AUDIOTRACK (LEDGER SR45): <audio controls>, mute, http(s) media through the cache.
 
 fn audio_opened(url: &str, duration_ns: u64) -> SMessage {
-    SMessage::MediaOpened { url: url.into(), duration_ns, width: 0, height: 0, video: String::new(), audio: "wav".into(), real_video: false, audio_clock: true }
+    SMessage::MediaOpened { url: url.into(), duration_ns, width: 0, height: 0, video: String::new(), audio: "wav".into(), real_video: false, audio_clock: true, info: String::new() }
 }
 
 /// RGB at (x, y) of the engine surface (BGRA).
@@ -663,7 +663,7 @@ fn nlesizeswitch_new_frame_size_moves_natural_and_fires_resize_once() {
     let node = e.media_elements()[0].node.clone();
     let _ = e.take_media_requests();
     let frame = |w: u32, h: u32, n: i64| SMessage::MediaFrame { url: url.clone(), pts_ns: n * FRAME_NS, width: w, height: h, rgba: TestPattern::render(w, h, n as u32), levels: vec![] };
-    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: W, height: H, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false });
+    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: W, height: H, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() });
     e.on_media_message(&frame(W, H, 0));
     e.on_media_message(&frame(W, H, 1));
     nlesizeswitch_settle(&mut e);
@@ -696,7 +696,7 @@ fn nlesizepolicy_reopen_at_another_size_fires_resize_once() {
     let url = e.media_elements()[0].url.clone();
     let node = e.media_elements()[0].node.clone();
     let _ = e.take_media_requests();
-    let opened = |w: u32, h: u32| SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: w, height: h, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false };
+    let opened = |w: u32, h: u32| SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: w, height: h, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false, info: String::new() };
     let frame = |w: u32, h: u32, n: i64| SMessage::MediaFrame { url: url.clone(), pts_ns: n * FRAME_NS, width: w, height: h, rgba: TestPattern::render(w, h, n as u32), levels: vec![] };
     e.on_media_message(&opened(W, H));
     e.on_media_message(&frame(W, H, 0));

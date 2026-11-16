@@ -27,22 +27,7 @@ use gneiss_pal::dsp::video::Frame;
 use resonance::{AudioGraph, BLOCK_SIZE, stream_pair_channels};
 use stria::media::{AudioOut, FrameSink, LEVEL_WINDOW_NS, Player, Tick};
 use stria::media_bus::MediaService;
-
-struct SharedFeed(Arc<Mutex<resonance::StreamFeed>>);
-impl AudioOut for SharedFeed {
-    fn push(&mut self, stereo: &[f32]) -> usize {
-        self.0.lock().unwrap().push(stereo)
-    }
-    fn consumed(&self) -> u64 {
-        self.0.lock().unwrap().consumed()
-    }
-    fn flush(&mut self) {
-        self.0.lock().unwrap().flush()
-    }
-    fn set_paused(&mut self, paused: bool) {
-        self.0.lock().unwrap().set_paused(paused)
-    }
-}
+mod common; use common::*; // NLE6-UTP1 (LEDGER SR729): tests/common, the ONE fixture / log / feed helper set the four binaries share
 
 #[derive(Default)]
 struct Meters {
@@ -382,4 +367,36 @@ fn mute_zeroes_the_device_while_the_clock_runs_on() {
         rig.step(&mut m, 48_000);
     }
     assert!(rig.l.iter().any(|&x| x != 0.0), "unmuted: sound (after the ring's queued zeros)");
+}
+
+// ---- NLE6UTP1 (LEDGER SR729): tests/common's ONE SharedFeed (named tail block) ----
+/// NLE6-UTP1 (SR729): stereo pushed through tests/common's `SharedFeed` (the AudioOut this file and tests/media.rs each
+/// carried a copy of) comes out of a 48 kHz graph sample for sample on both channels, and `flush` empties the ring so the
+/// next pulls are silence. (No byte builder here to pin by fnv: the feed's behaviour is the check.)
+#[test]
+fn nle6utp1_shared_feed_is_the_one_copy() {
+    let (src, feed) = stream_pair_channels(48_000, 2, 24_000);
+    let mut graph = AudioGraph::new(48_000.0);
+    graph.add_node(Box::new(src));
+    let mut out: Box<dyn AudioOut> = Box::new(SharedFeed(Arc::new(Mutex::new(feed))));
+    let frames = 4 * BLOCK_SIZE;
+    let ramp: Vec<f32> = (0..frames).map(|i| (i + 1) as f32 / 8192.0).collect();
+    let stereo: Vec<f32> = ramp.iter().flat_map(|&x| [x, -x]).collect();
+    assert_eq!(out.push(&stereo), stereo.len(), "the ring takes the whole ramp");
+    let (mut l, mut r) = (Vec::new(), Vec::new());
+    for _ in 0..8 {
+        let (bl, br) = graph.process_stereo();
+        l.extend(bl.iter().map(|&x| x as f32));
+        r.extend(br.iter().map(|&x| x as f32));
+    }
+    let first = l.iter().position(|&x| x != 0.0).expect("the ramp plays");
+    assert_eq!(&l[first..first + frames], &ramp[..], "left is the ramp, sample for sample");
+    let neg: Vec<f32> = ramp.iter().map(|&x| -x).collect();
+    assert_eq!(&r[first..first + frames], &neg[..], "right is the negated ramp");
+    out.push(&stereo);
+    out.flush();
+    for _ in 0..4 {
+        let (bl, br) = graph.process_stereo();
+        assert!(bl.iter().chain(br.iter()).all(|&x| x == 0.0), "flushed: silence");
+    }
 }

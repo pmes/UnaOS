@@ -33,7 +33,7 @@ fn opened(url: &str, duration_ns: u64, w: u32, h: u32) -> SMessage {
         video: if w > 0 { "V_VP8".into() } else { String::new() },
         audio: "A_VORBIS".into(),
         real_video: w > 0,
-        audio_clock: true,
+        audio_clock: true, info: String::new(),
     }
 }
 

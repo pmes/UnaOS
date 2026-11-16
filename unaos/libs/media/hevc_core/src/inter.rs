@@ -508,8 +508,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
             }
         }
         let max = (1i32 << bd) - 1;
-        // HEVCREXTTOOLS (SR345): shift1 Max(2, 14 - bitDepth), shift2 Max(3, 15 - bitDepth) (equal up to 12 bits).
-        let shift1 = (14 - bd as i32).max(2);
+        // HEVCREXTTOOLS (SR345): shift1 Max(2, 14 - bitDepth) in `uni_default`, shift2 Max(3, 15 - bitDepth) in `bi_default` (equal up to 12 bits).
         let out: Vec<i32> = match (&pred[0], &pred[1]) {
             (Some(a), Some(b)) => {
                 if weighted {
@@ -528,7 +527,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
                         .map(|&p| if lwd >= 1 { ((p * w0 + (1 << (lwd - 1))) >> lwd) + o0 } else { p * w0 + o0 })
                         .collect()
                 } else {
-                    a.iter().map(|&p| (p + (1 << (shift1 - 1))) >> shift1).collect()
+                    a.iter().map(|&p| uni_default(p, bd)).collect()
                 }
             }
             (None, None) => continue,
@@ -638,4 +637,13 @@ fn mc_block<const T: usize>(r: &Plane, xi: i32, yi: i32, fx: &[i32; T], fy: &[i3
 pub(crate) fn bi_default(p0: i32, p1: i32, bd: u32) -> i32 {
     let shift2 = (15 - bd as i32).max(3);
     (p0 + p1 + (1 << (shift2 - 1))) >> shift2
+}
+
+// ---- HEVCCONCEALSUBPEL (LEDGER SR733): the ONE default uni-prediction rounding (named tail block) ----
+/// HEVCCONCEALSUBPEL (SR733): 8-261, the default weighted sample prediction of one 14-bit intermediate `p` at sample
+/// depth `bd`: (p + offset1) >> shift1, shift1 = Max(2, 14 - bitDepth) (HEVCREXTTOOLS SR345). `predict_pu`'s uni arm
+/// and dpb.rs's fractional concealment (`conceal_fetch`) both round through it.
+pub(crate) fn uni_default(p: i32, bd: u32) -> i32 {
+    let shift1 = (14 - bd as i32).max(2);
+    (p + (1 << (shift1 - 1))) >> shift1
 }

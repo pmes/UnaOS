@@ -221,3 +221,42 @@ fn g_slow_ramp_is_not_a_cut() {
     assert_eq!(got, vec![0], "a slow ramp below the threshold is no cut");
     decodes_to_recon("ramp", &aus, &recons);
 }
+
+// ---- H264ENCSCENECUTLOOKAHEAD (LEDGER SR732): x264's flash and chain rules over a lookahead (named tail block) ----
+// Under `bframes` the encoder holds a group plus bframes pictures past its anchor before deciding it: a picture whose following
+// pictures return to the previous scene is a flash (x264 slicetype.c `scenecut()`'s FLASH loop, no IDR), and a run of changing
+// pictures cuts once at its first stable picture (the CHAIN loop). bframes 2: the VUI reorder depth 1, so a unit's display is pts - 1.
+
+#[test]
+fn h_bframes_flash_is_no_idr() {
+    let flash = |t: usize| if t == 10 { texture(0) } else { flat(50) };
+    let (aus, _) = encode_all(cfg(Some(40), 0), 45, &flash);
+    println!("scenecut h: bframes 0 (the one-frame rule) flash at 10 keys {:?}", keys(&aus, 0));
+    let (aus, recons) = encode_all(cfg(Some(40), 2), 45, &flash);
+    let got = keys(&aus, 1);
+    println!("scenecut h: bframes 2 flash at 10 keys {got:?}");
+    assert_eq!(got, vec![0, 30], "a one-frame flash inside the lookahead window codes no IDR");
+    decodes_to_recon("flash", &aus, &recons);
+}
+
+#[test]
+fn i_bframes_fade_cuts_at_the_first_stable_picture() {
+    let fade = |t: usize| if t < 10 { scaled(100) } else if t < 22 { scaled(100 - (t as u32 - 9) * 100 / 12) } else { scaled(0) };
+    let (aus, _) = encode_all(cfg(Some(40), 0), 50, &fade);
+    assert_eq!(keys(&aus, 0), vec![0, 17, 47], "bframes 0: SR709's one-frame form unchanged");
+    let (aus, recons) = encode_all(cfg(Some(40), 2), 50, &fade);
+    let got = keys(&aus, 1);
+    println!("scenecut i: bframes 2 fade 10..=21 to black keys {got:?}");
+    assert_eq!(got, vec![0, 21], "the fade's one IDR at its first stable picture, t = 21 (the first black frame)");
+    decodes_to_recon("fade bframes 2", &aus, &recons);
+}
+
+#[test]
+fn j_bframes_two_hard_cuts_three_apart_are_two_idrs() {
+    let src = |t: usize| if t < 10 { flat(50) } else if t < 13 { texture(0) } else { flat(200) };
+    let (aus, recons) = encode_all(cfg(Some(40), 2), 45, &src);
+    let got = keys(&aus, 1);
+    println!("scenecut j: bframes 2 cuts at 10 and 13 keys {got:?}");
+    assert_eq!(got, vec![0, 10, 13, 43], "two hard cuts stay two IDRs under the lookahead");
+    decodes_to_recon("two cuts bframes 2", &aus, &recons);
+}
