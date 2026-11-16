@@ -131,6 +131,8 @@ pub struct Picture {
     pub chroma: ChromaFormat,
     /// HEVCREXT (SR334): BitDepthC (to_frame narrows the chroma planes by it; the hash SEI reads it).
     pub bit_depth_c: u32,
+    /// HEVCCONCEALWEIGHTED (SR741): the first independent segment's pred_weight_table and high_precision_offsets_enabled_flag (dpb.rs `keep_weights`), read when this picture is a concealment source.
+    pub weights: Option<(crate::slice::PredWeights, bool)>,
 }
 
 impl Picture {
@@ -168,6 +170,7 @@ impl Picture {
             bit_depth: 8,
             chroma,
             bit_depth_c: 8,
+            weights: None,
         }
     }
 

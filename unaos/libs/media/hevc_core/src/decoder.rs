@@ -455,7 +455,7 @@ impl Decoder {
             let i = cur.pic.slices.len() - 1;
             (i as u32, cur.pic.slices[i].addr_rs)
         } else {
-            cur.pic.slices.push(SliceInfo {
+            crate::dpb::keep_weights(&mut cur.pic, &sh, &cur.sps); cur.pic.slices.push(SliceInfo {
                 addr_rs: sh.segment_address,
                 deblocking_disabled: sh.deblocking_filter_disabled_flag,
                 beta_offset_div2: sh.beta_offset_div2,
@@ -504,7 +504,7 @@ impl Decoder {
         }
         // C.5.2.3: every picture is stored (a reference even when not output), then bumped as the DPB requires.
         let (reorder, latency, _) = self.bump;
-        self.dpb.store(cur.pic, reorder, latency, &mut self.out);
+        self.dpb.store(cur.pic, reorder, latency, &mut self.out); self.dpb.conceal_forward();
     }
 
     /// C.5.2.4 "bumping" until nothing waits for output.

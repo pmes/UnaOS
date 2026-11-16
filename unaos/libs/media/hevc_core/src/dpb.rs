@@ -86,6 +86,10 @@ pub struct Dpb {
     /// HEVCERRORCONCEAL (SR700): generated pictures left grey because the nearest held picture's planes or bit depths
     /// differed from theirs.
     pub conceal_misfit: u32,
+    // ---- HEVCCONCEALFORWARD (LEDGER SR754): the concealed pictures awaiting their first referencer (named struct-tail block) ----
+    /// HEVCCONCEALFORWARD (SR754): the PicOrderCntVal of every picture [`Dpb::conceal_from`] concealed, until
+    /// [`Dpb::conceal_forward`] drains it at the next picture end (refined from that picture's motion).
+    pub forward: Vec<i32>,
 }
 
 impl Dpb {
@@ -375,7 +379,7 @@ impl Dpb {
             dst.data.copy_from_slice(&from.data);
         }
         let src_poc = s.poc;
-        let projected = self.conceal_motion(pic, src); let bidir_blocks = bidir_blocks(pic); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected, bidir_blocks });
+        let projected = self.conceal_motion(pic, src, None); let bidir_blocks = bidir_blocks(pic); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected, bidir_blocks, forward_blocks: 0 }); self.forward.push(pic.poc);
     }
 }
 
@@ -390,19 +394,22 @@ pub struct Concealed {
     pub projected: bool,
     /// HEVCCONCEALBIDIR (SR721): the 8x8 blocks projected along BOTH lists of a bi-predicted source block (averaged).
     pub bidir_blocks: u32,
+    /// HEVCCONCEALFORWARD (SR754): the 8x8 blocks re-projected from the first referencer's motion by [`Dpb::conceal_forward`].
+    pub forward_blocks: u32,
 }
 
 impl Dpb {
     /// HEVCERRORCONCEALMOTION (SR710): project the source picture `src` (POC s) along its own motion into the generated
     /// picture `pic` (POC c), over the still copy `conceal_from` already made. Source S predicted block x from reference
     /// R (POC r, the block's stored `ref_poc`) by mv: S(x) = R(x + mv), so the lost picture is C(x) ~ S(x + mv'), mv' =
-    /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), rounded to whole samples and fetched from S's own
-    /// planes through `luma_mc` / `chroma_mc`'s zero-fraction arm (nearest-edge clamped), per 8x8 block read at its
+    /// `scale_mv(mv, s - r, c - s)` (the TMVP POC-distance rescale), kept at quarter samples (HEVCCONCEALSUBPEL SR733) and
+    /// fetched from S's own planes through `luma_mc` / `chroma_mc`'s fractional filters (nearest-edge clamped), per 8x8 block read at its
     /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
     /// intra block copy (ref_poc == s); HEVCCONCEALBIDIR (SR721): each usable list projects (`project_lists`), two are averaged by
     /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
-    /// later picture's TMVP reads the projected vector. True when any block was projected.
-    fn conceal_motion(&self, pic: &mut Picture, src: usize) -> bool {
+    /// later picture's TMVP reads the projected vector. HEVCCONCEALWEIGHTED (SR741): a source coded with explicit weights (its kept
+    /// `Picture::weights`) weights each fetch by the source block's (w, o, log2WD) for that list and ref_idx. True when any block was projected.
+    fn conceal_motion(&self, pic: &mut Picture, src: usize, only: Option<i32>) -> bool {
         let s = &self.pics[src].pic;
         if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
             return false;
@@ -417,7 +424,7 @@ impl Dpb {
         for y in (0..h).step_by(8) {
             for x in (0..w).step_by(8) {
                 let m = s.motion[s.idx4(x as usize, y as usize)];
-                let cand = project_lists(&m, s.poc, pic.poc);
+                let cand = forward_only(project_lists(&m, s.poc, pic.poc), &m, only);
                 if cand == [None, None] {
                     continue;
                 }
@@ -433,7 +440,7 @@ impl Dpb {
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, &mut out);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().filter(|_| only.is_none()).map(|(pw, high)| [0, 1].map(|l| crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high))), &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
@@ -456,24 +463,26 @@ impl Dpb {
 // ---- HEVCCONCEALBIDIR (LEDGER SR721): a bi-predicted source block projected along both lists (named tail block) ----
 /// HEVCCONCEALBIDIR (SR721): the projected vector of each list of source block motion `m` (source POC `s_poc`, lost POC
 /// `c_poc`): a list that is used, not long-term and not intra block copy (its ref_poc is not the source's) gives
-/// `scale_mv(mv, s - r, c - s)` rounded to whole samples (SR710's rule, per list); an unusable list is `None`, so a block
+/// `scale_mv(mv, s - r, c - s)` kept at quarter samples (HEVCCONCEALSUBPEL SR733; SR710's rule, per list); an unusable list is `None`, so a block
 /// with one unusable list projects along the other alone.
 fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Option<[i32; 2]>; 2] {
     let mut cand = [None, None];
     for (l, slot) in cand.iter_mut().enumerate() {
         if m.uses(l) && !m.ref_lt[l] && m.ref_poc[l] != s_poc {
-            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc).map(|v| ((v + 2) >> 2) << 2));
+            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc));
         }
     }
     cand
 }
 
 /// HEVCCONCEALBIDIR (SR721): the cw x ch samples of component `c` at (cx, cy) fetched from the source plane `r` along each
-/// candidate of [`project_lists`] (whole-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub`) through
-/// `luma_mc` / `chroma_mc`'s zero-fraction arm, written to `out` at sample depth: two candidates averaged by inter.rs
-/// `bi_default` (8-262), one shifted down by shift3. A block is at most 8x8 in every plane (the stack buffer).
-fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, out: &mut [i32]) {
+/// candidate of [`project_lists`] (quarter-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub` as `predict_pu`) through
+/// `luma_mc` / `chroma_mc`'s fractional filters (HEVCCONCEALSUBPEL SR733), written to `out` at sample depth, clipped: two candidates averaged by inter.rs
+/// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261); HEVCCONCEALWEIGHTED (SR741): with `wp` (the source's explicit
+/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead. A block is at most 8x8 in every plane (the stack buffer).
+fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, out: &mut [i32]) {
     let n = (cw * ch) as usize;
+    let max = (1i32 << bd) - 1;
     let mut second = [0i32; 64];
     let mut got = 0;
     for mv in cand.iter().flatten() {
@@ -481,19 +490,18 @@ fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32,
         if c == 0 {
             crate::inter::luma_mc(r, cx, cy, *mv, cw, ch, bd, buf);
         } else {
-            let mvc = [((mv[0] * 2 / sub.0) >> 3) << 3, ((mv[1] * 2 / sub.1) >> 3) << 3];
+            let mvc = [mv[0] * 2 / sub.0, mv[1] * 2 / sub.1];
             crate::inter::chroma_mc(r, cx, cy, mvc, cw, ch, bd, buf);
         }
         got += 1;
     }
     if got == 2 {
         for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
-            *a = crate::inter::bi_default(*a, b, bd);
+            *a = match wp { Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
         }
     } else {
-        let shift3 = (14 - bd as i32).max(2);
         for a in out[..n].iter_mut() {
-            *a >>= shift3;
+            *a = match wp { Some(w) => crate::inter::uni_explicit(*a, w[cand[0].is_none() as usize]), None => crate::inter::uni_default(*a, bd) }.clamp(0, max);
         }
     }
 }
@@ -547,4 +555,76 @@ mod hevcconcealbidir_tests {
     fn an_intra_block_copy_list_falls_back_to_the_other() {
         assert_eq!(project_lists(&bi(false, 2), 2, 3), [Some([16, 8]), None]);
     }
+}
+
+// ---- HEVCCONCEALWEIGHTED (LEDGER SR741): the source picture's explicit weights kept for concealment (named tail block) ----
+/// HEVCCONCEALWEIGHTED (SR741): keep the pred_weight_table of picture `pic`'s first independent slice segment that carries
+/// one (slice.rs parses it only under weighted_pred_flag for P / weighted_bipred_flag for B, the gate `predict_pu` reads),
+/// with the SPS's high_precision_offsets_enabled_flag, so `conceal_motion` weights a projection from `pic` as its own PUs
+/// were weighted. A later segment's table does not replace it (HEVC-CONCEAL-WEIGHTED-SLICES, owed).
+pub(crate) fn keep_weights(pic: &mut Picture, sh: &SliceHeader, sps: &Sps) {
+    if pic.weights.is_none() {
+        pic.weights = sh.pred_weights.clone().map(|w| (w, sps.range_ext.high_precision_offsets_enabled_flag));
+    }
+}
+
+// ---- HEVCCONCEALFORWARD (LEDGER SR754): a concealed picture refined from its first referencer's motion (named tail block) ----
+impl Dpb {
+    /// HEVCCONCEALFORWARD (SR754): at a picture end, after `store` put the finished picture C last, re-project every
+    /// picture L waiting in `forward` (concealed since the previous picture end) from C's own motion: per 8x8 block of C
+    /// whose list references L, [`Dpb::conceal_motion`] with `only` L fetches C's reconstructed planes at
+    /// `scale_mv(mv, c - l, l - c)` = -mv (`project_lists`; distScaleFactor -256 for every td) and stores -mv to C as the
+    /// block's motion; every other block of L keeps its projection from the source S. C is only read: its samples (which
+    /// read L's S-projection) never change, so only pictures decoded after C read the refined L. `forward` is drained, so
+    /// each L is refined once, by the first picture finished after its concealment (HEVC-CONCEAL-FORWARD-DEPTH owed). C's
+    /// explicit weights are not applied (they map L to C: HEVC-CONCEAL-FORWARD-WEIGHTED owed). The untaken [`Concealed`]
+    /// note of L gets `forward_blocks` (a note taken before C's end keeps 0). Returns the blocks refined.
+    pub fn conceal_forward(&mut self) -> u32 {
+        let Some(c) = self.pics.len().checked_sub(1) else {
+            return 0;
+        };
+        let c_poc = self.pics[c].pic.poc;
+        let mut total = 0;
+        for poc in core::mem::take(&mut self.forward) {
+            let Some(l) = (0..c).find(|&i| self.pics[i].pic.poc == poc && self.pics[i].pic.slices.is_empty()) else {
+                continue;
+            };
+            let mut d = self.pics.remove(l);
+            let n = if self.conceal_motion(&mut d.pic, c - 1, Some(poc)) { forward_blocks(&d.pic, c_poc) } else { 0 };
+            self.pics.insert(l, d);
+            if let Some(r) = self.concealed.iter_mut().rev().find(|r| r.poc == poc) {
+                r.forward_blocks = n;
+            }
+            total += n;
+        }
+        total
+    }
+}
+
+/// HEVCCONCEALFORWARD (SR754): with `only` (the lost picture's PicOrderCntVal) keep the candidates of [`project_lists`]
+/// whose list references that picture (the source's other lists keep the earlier projection); `None` keeps all (SR710).
+fn forward_only(mut cand: [Option<[i32; 2]>; 2], m: &crate::picture::PuMotion, only: Option<i32>) -> [Option<[i32; 2]>; 2] {
+    if let Some(l) = only {
+        for (k, slot) in cand.iter_mut().enumerate() {
+            if m.ref_poc[k] != l {
+                *slot = None;
+            }
+        }
+    }
+    cand
+}
+
+/// HEVCCONCEALFORWARD (SR754): the 8x8 blocks of the refined picture `pic` whose top-left 4x4 motion is inter with
+/// ref_poc[0] the referencer's `c_poc` (written only by [`conceal_pu`] from [`Dpb::conceal_forward`]).
+fn forward_blocks(pic: &Picture, c_poc: i32) -> u32 {
+    let mut n = 0;
+    for y in (0..pic.height).step_by(8) {
+        for x in (0..pic.width).step_by(8) {
+            let m = pic.motion[pic.idx4(x, y)];
+            if m.pred != 0 && m.ref_poc[0] == c_poc {
+                n += 1;
+            }
+        }
+    }
+    n
 }
