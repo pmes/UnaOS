@@ -149,7 +149,7 @@ pub fn wrap_mv(v: i32) -> i32 {
 
 /// The POC-distance scaling of a motion vector (8-206 .. 8-211 / 8-183 .. 8-188): td and tb are the unclipped
 /// DiffPicOrderCnt values.
-fn scale_mv(mv: [i32; 2], td: i32, tb: i32) -> [i32; 2] {
+pub(crate) fn scale_mv(mv: [i32; 2], td: i32, tb: i32) -> [i32; 2] {
     let td = td.clamp(-128, 127);
     let tb = tb.clamp(-128, 127);
     if td == 0 {

@@ -530,10 +530,10 @@ impl Decoder {
     }
 
     // ---- HEVCERRORCONCEAL (LEDGER SR700): the concealment note (named tail block) ----
-    /// HEVCERRORCONCEAL (SR700): (generated PicOrderCntVal, source PicOrderCntVal) of every generated reference picture
+    /// HEVCERRORCONCEAL (SR700): the [`crate::dpb::Concealed`] note (generated / source PicOrderCntVal, projected: SR710) of every generated reference picture
     /// concealed from the DPB's nearest held picture since the last call, in generation order (a generated picture
     /// absent here stayed grey: the DPB was empty or the nearest picture did not fit).
-    pub fn take_concealed(&mut self) -> Vec<(i32, i32)> {
+    pub fn take_concealed(&mut self) -> Vec<crate::dpb::Concealed> {
         core::mem::take(&mut self.dpb.concealed)
     }
 }
