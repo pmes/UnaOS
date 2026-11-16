@@ -550,7 +550,7 @@ pub fn register_db_cache() {
 /// data directory in production, the process's test root in a re-rooted test (`storage::init_root`, a lib
 /// `TestRoot`, or a lib-test build's own process dir), so no test writes the index into the person's data dir.
 pub fn db_cache_dir() -> std::path::PathBuf {
-    crate::storage::root_dir().join("fonts")
+    cache_dir_for(crate::storage::root_dir(), crate::storage::root_is_platform(), db::default_cache_dir) // AETHERFONTDBCACHEONEDIR (SR746): the default in production
 }
 
 // ---- AETHERHOSTWGHT (LEDGER SR690): the installed-family face at the selection's weight / width instance (named tail block) ----
@@ -580,5 +580,75 @@ mod testroot_tests {
         drop(root);
         assert!(db_cache_dir().starts_with(process_dir()), "a lib-test build's default root is its process dir");
         assert!(!db_cache_dir().starts_with(&platform));
+    }
+}
+
+// ---- AETHERFONTDBCACHEONEDIR (LEDGER SR746): one font index dir for production, the root's for tests (named tail block) ----
+
+/// The font index dir rule [`db_cache_dir`] applies: on the PLATFORM root (production: no re-root, not a lib-test
+/// build, [`crate::storage::root_is_platform`]) text_host's shared default (`default`, i.e. `db::default_cache_dir`:
+/// `$XDG_CACHE_HOME/unaos/fonts`, the dir quartzite and every cold caller use), so a machine keeps ONE index of its
+/// installed faces; `<root>/fonts` when that default is unavailable (no XDG_CACHE_HOME / HOME) and always under a
+/// test or re-rooted root. `default` is called only on the platform branch: a test root never reads the env.
+pub fn cache_dir_for(
+    root: std::path::PathBuf,
+    is_platform: bool,
+    default: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if is_platform { default().unwrap_or_else(|| root.join("fonts")) } else { root.join("fonts") }
+}
+
+/// AETHERFONTDBCACHEONEDIR: the aether lib-test binary's boot registration — a pre-main constructor (the one
+/// linker-section constructor in the tree; its fallback, should a toolchain refuse it, is a cfg(test) shim `db`
+/// module that registers before delegating) that runs [`register_db_cache`] before any test thread starts, so every
+/// cold reach of `db::db()` (an Aether path or a text_host-internal one: `generic_family`, raster, line) indexes
+/// under the process's own dir (`storage::test_root::process_dir`), never the person's XDG cache.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+static LIBTEST_DB_CACHE: extern "C" fn() = libtest_db_cache;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+extern "C" fn libtest_db_cache() {
+    register_db_cache();
+}
+
+#[cfg(test)]
+mod onedir_tests {
+    use super::*;
+    use crate::storage::test_root::{process_dir, TestRoot};
+    use std::path::PathBuf;
+
+    /// The pure rule: platform takes the default, else (or when the default is unavailable) `<root>/fonts`;
+    /// the test-root branch never asks for the default.
+    #[test]
+    fn cache_dir_rule_kat() {
+        let root = PathBuf::from("/r");
+        let x = PathBuf::from("/xdg/unaos/fonts");
+        assert_eq!(cache_dir_for(root.clone(), false, || panic!("a test root never reads the default")), root.join("fonts"));
+        assert_eq!(cache_dir_for(root.clone(), true, || Some(x.clone())), x);
+        assert_eq!(cache_dir_for(root.clone(), true, || None), root.join("fonts"));
+    }
+
+    /// A lib-test build is never the platform root, guard held or not; under a TestRoot the dir is its `fonts/`.
+    #[test]
+    fn lib_test_root_is_never_platform() {
+        assert!(!crate::storage::root_is_platform());
+        let root = TestRoot::new("aether_onedir_kat");
+        assert!(!crate::storage::root_is_platform());
+        assert_eq!(db_cache_dir(), root.dir().join("fonts"));
+    }
+
+    /// The lib-test boot registration ran before any test: the process database's index dir is under the
+    /// process's own dir, never text_host's XDG default (whichever test reached `db()` first).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lib_test_db_indexes_under_process_dir() {
+        let dir = db::db().config.cache_dir.clone().expect("the lib-test build registers an index dir");
+        assert!(dir.starts_with(process_dir()), "{dir:?} is under the process dir");
+        if let Some(xdg) = db::default_cache_dir() {
+            assert!(!dir.starts_with(&xdg), "{dir:?} is never the person's XDG cache");
+        }
     }
 }

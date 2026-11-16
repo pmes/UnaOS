@@ -1063,7 +1063,7 @@ mod default_cache_tests {
         let cfg = || Config { dirs: vec![dir.join("fonts")], cache_dir: cache_dir.clone(), ..Config::default() };
         let a = FontDb::discover(cfg());
         assert_eq!(a.discover_cache(), "miss");
-        assert!(xdg.join("unaos/fonts").join(crate::db_cache::INDEX_FILE).is_file(), "store creates the dir and the index");
+        assert!(xdg.join("unaos/fonts").join(crate::db_cache::index_file(&cfg().dirs)).is_file(), "store creates the dir and the index");
         let b = FontDb::discover(cfg());
         assert_eq!(b.discover_cache(), "hit");
         assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
