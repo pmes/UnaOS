@@ -1573,3 +1573,10 @@ exec-rmbp-hevcperf 0971bc01c wave36 cut71h
 exec-rmbp-hevcintercip 0971bc01c wave36 cut71h
 exec-rmbp-nlerawexport 0971bc01c wave36 cut71h
 exec-rmbp-aetherhostwght 0971bc01c wave36 cut71h
+exec-rmbp-nletransitionface edf0bd25a wave36 cut72h
+exec-rmbp-nle3etrimstretch edf0bd25a wave36 cut72h
+exec-rmbp-h264encaq edf0bd25a wave36 cut72h
+exec-rmbp-nlefaceexport edf0bd25a wave36 cut72h
+exec-rmbp-aetherimgaltelf edf0bd25a wave36 cut72h
+exec-rmbp-aethertestroots edf0bd25a wave36 cut72h
+exec-rmbp-aetherfontdbcachecmap edf0bd25a wave36 cut72h

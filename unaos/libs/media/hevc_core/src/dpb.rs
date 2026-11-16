@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::picture::Picture;
-use crate::ps::Sps;
+use crate::ps::{Geometry, Sps};
 use crate::slice::{SliceHeader, SliceType};
 use crate::{Error, Frame, Result};
 
@@ -77,6 +77,8 @@ impl RefList {
 #[derive(Default)]
 pub struct Dpb {
     pub pics: Vec<DpbPic>,
+    /// HEVCINTERCIP (SR688): the PicOrderCntVal of every picture [`Dpb::generate_missing`] made, until taken.
+    pub generated: Vec<i32>,
 }
 
 impl Dpb {
@@ -101,8 +103,9 @@ impl Dpb {
 
     /// 8.3.2 for the current picture (PicOrderCntVal `poc`) whose first slice header is `sh`. An IRAP picture with
     /// NoRaslOutputFlag 1 first marks every picture unused. A picture of StCurrBefore / StCurrAfter / LtCurr that is
-    /// not in the DPB is an error (nothing is marked then); missing Foll pictures are allowed.
-    pub fn apply_rps(&mut self, sh: &SliceHeader, sps: &Sps, poc: i32, irap_no_rasl: bool) -> Result<Rps> {
+    /// not in the DPB is generated (8.3.3.2, [`Dpb::generate_missing`] at the picture geometry `geo`; HEVCINTERCIP
+    /// SR688); missing Foll pictures are allowed.
+    pub fn apply_rps(&mut self, sh: &SliceHeader, sps: &Sps, geo: &Geometry, poc: i32, irap_no_rasl: bool) -> Result<Rps> {
         if irap_no_rasl {
             self.unmark_all();
         }
@@ -135,7 +138,7 @@ impl Dpb {
         let mut keep_lt = Vec::new();
         let mut lt_curr_poc = Vec::new();
         for &e in lt_curr.iter() {
-            let i = find_lt(&self.pics, e).ok_or(Error::Invalid("reference picture set names a missing picture (8.3.2)"))?;
+            let i = find_lt(&self.pics, e).unwrap_or_else(|| self.generate_missing(e.0, true, sps, geo));
             keep_lt.push(i);
             lt_curr_poc.push(self.pics[i].pic.poc);
         }
@@ -149,7 +152,7 @@ impl Dpb {
         };
         let mut keep_st = Vec::new();
         for &p in before.iter().chain(after.iter()) {
-            keep_st.push(find_st(&self.pics, p).ok_or(Error::Invalid("reference picture set names a missing picture (8.3.2)"))?);
+            keep_st.push(find_st(&self.pics, p).unwrap_or_else(|| self.generate_missing(p, false, sps, geo)));
         }
         for &p in st_foll.iter() {
             if let Some(i) = find_st(&self.pics, p) {
@@ -306,4 +309,28 @@ pub fn list_entries(rps: &Rps, sh: &SliceHeader, list0: bool) -> Result<Vec<(i32
         l[last] = (c, true, true);
     }
     Ok(l)
+}
+
+// ---- HEVCINTERCIP (LEDGER SR688): 8.3.3.2 generated reference pictures (named tail block) ----
+impl Dpb {
+    /// 8.3.3.2: generate an unavailable reference picture — every sample 1 << (BitDepth - 1), CuPredMode MODE_INTRA
+    /// everywhere (the default motion: no temporal vector), PicOrderCntVal `poc`, PicOutputFlag 0 (never output) —
+    /// marked "used for long-term reference" when `long_term`, else short-term; its POC is noted in `generated`.
+    /// Returns its DPB index.
+    pub fn generate_missing(&mut self, poc: i32, long_term: bool, sps: &Sps, geo: &Geometry) -> usize {
+        let chroma = sps.chroma_format().unwrap_or(h264_core::ChromaFormat::Yuv420);
+        let mut pic = Picture::with_chroma(sps.width as usize, sps.height as usize, geo, chroma);
+        pic.planes[0].data.fill(1u16 << (sps.bit_depth_luma - 1));
+        let grey_c = 1u16 << (sps.bit_depth_chroma - 1);
+        pic.planes[1].data.fill(grey_c);
+        pic.planes[2].data.fill(grey_c);
+        pic.poc = poc;
+        pic.bit_depth = sps.bit_depth_luma;
+        pic.bit_depth_c = sps.bit_depth_chroma;
+        pic.output = false;
+        let marking = if long_term { Marking::Long } else { Marking::Short };
+        self.pics.push(DpbPic { pic, output_needed: false, latency: 0, marking });
+        self.generated.push(poc);
+        self.pics.len() - 1
+    }
 }

@@ -3,7 +3,7 @@
 //! output — every output picture (cropped, output order; yuv420p, or yuv420p10le at Main 10) hashed into one md5 equal
 //! to the listed one — and every decoded picture hash SEI (D.3.19: CRC, checksum and, since HEVCLEVELLINE SR368, MD5) must match its
 //! picture. The hand KATs (decode.rs, inter.rs, main10.rs, rext.rs) exercise each process once; these exercise their
-//! interactions. The constrained-intra-in-inter vector must be refused by name (HEVCINTER-CIP). Offline => SKIP (the
+//! interactions. The constrained-intra-in-inter vector decodes to its md5 (HEVCINTERCIP SR688). Offline => SKIP (the
 //! vectors are fetched by h264_core's fetcher, linked below, never committed; vectors.txt holds the rows and their
 //! provenance). The D.3.19 hash functions and the SEI parser have offline KATs at the foot. HEVCSCCTAIL (LEDGER SR365):
 //! the output md5 is crypto_core's MD5 (HEVCCONF-MD5; no host md5sum), and every vector decodes under
@@ -121,6 +121,7 @@ vectors!(
     dblk_a_sony_3 = "DBLK_A_SONY_3",
     sao_a_mediatek_4 = "SAO_A_MediaTek_4",
     wpp_a_ericsson_main_2 = "WPP_A_ericsson_MAIN_2",
+    cip_a_panasonic_3 = "CIP_A_Panasonic_3",
     // Main 10 (HEVCMAIN10 SR311).
     wp_a_main10_toshiba_3 = "WP_A_MAIN10_Toshiba_3",
     dblk_a_main10_vixs_4 = "DBLK_A_MAIN10_VIXS_4",
@@ -146,22 +147,6 @@ fn rext_vectors_decode_or_are_refused_by_name() {
                 None => eprintln!("SKIP {name}"),
             },
         }
-    }
-}
-
-#[test]
-fn constrained_intra_in_inter_slices_is_refused_by_name() {
-    let name = "CIP_A_Panasonic_3";
-    let Some(v) = fetch(name) else {
-        eprintln!("SKIP {name}");
-        return;
-    };
-    match decode_all(&v.stream) {
-        Err(Error::Unsupported(msg)) => {
-            assert!(msg.contains("HEVCINTER-CIP"), "{name}: refused for {msg:?}");
-            eprintln!("{name}: refused by name ({msg})");
-        }
-        other => panic!("{name} not refused: {:?}", other.map(|(f, _)| f.len())),
     }
 }
 
