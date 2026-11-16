@@ -4458,8 +4458,8 @@ mod presentrects_tests {
 /// font, line height and colour, over its content box (cx, cy, cw, ch). InlineAlt: the alt text as the one line
 /// `img_alt_extent` measured the box by. BoxedAlt (Chromium's alttext-container: overflow hidden, border-box):
 /// with `frame` the 1px solid silver (#c0c0c0) border on the box's edges, its 1px padding, and the text after the
-/// 16px broken-image icon's slot (the icon floats left at the padding box's corner; its pixels are owed,
-/// AETHER-IMG-BROKENICON), so at (cx + 2 + 16, cy + 2); without `frame` the text at (cx, cy). The text clips to the
+/// 16px broken-image icon's slot (the icon floats left at the padding box's corner; with `icon` its pixels are
+/// layout_core's `BROKEN_ICON`, `paint_broken_icon` SR702), so at (cx + 2 + 16, cy + 2); without `frame` the text at (cx, cy). The text clips to the
 /// container's padding box met with the running clip. One line, never wrapped (AETHER-IMG-ALT-INLINE-WRAP owed).
 #[allow(clippy::too_many_arguments)]
 fn paint_img_alt(
@@ -4474,7 +4474,7 @@ fn paint_img_alt(
     let (text, tx, ty, inset) = match layout_core::img_fallback_of(layout, node_id) {
         layout_core::ImgFallback::None => return,
         layout_core::ImgFallback::InlineAlt(t) => (t, cx, cy, 0.0),
-        layout_core::ImgFallback::BoxedAlt { text, frame } => {
+        layout_core::ImgFallback::BoxedAlt { text, frame, icon } => {
             if frame && cw >= 2.0 && ch >= 2.0 {
                 let silver = (192, 192, 192);
                 fill_rect(cx, cy, cx + cw, cy + 1.0, silver, 255, surface, width, height, damage_rects, clip);
@@ -4482,6 +4482,7 @@ fn paint_img_alt(
                 fill_rect(cx, cy + 1.0, cx + 1.0, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
                 fill_rect(cx + cw - 1.0, cy + 1.0, cx + cw, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
             }
+            if icon && !inherited.text_hidden { paint_broken_icon(cx, cy, cw, ch, surface, width, height, damage_rects, clip); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, cx + 2.0 + 16.0, cy + 2.0, 1.0) } else { (text, cx, cy, 0.0) }
         }
     };
@@ -4510,4 +4511,23 @@ fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -
         .unwrap_or((false, None));
     let status = layout_core::file_status(value.as_deref(), multiple, 1);
     crate::pdf::thumbs::ellipsize(adv, &status, avail.max(0.0) as f64).into_owned()
+}
+
+// ---- AETHERIMGBROKENICON (LEDGER SR702): the broken-image icon in a boxed alt's slot (named tail block) ----
+
+/// AETHERIMGBROKENICON (SR702): Chromium's broken-image icon for `paint_img_alt`'s BoxedAlt with `icon`: layout_core's
+/// ONE description `BROKEN_ICON`, each rect through `fill_rect` (opaque, in order), at the content box (cx, cy, cw, ch)
+/// plus 2, 2 (the padding box's corner plus the 1px padding), clipped as the alt text is: the container's padding box
+/// (the content box inset 1, overflow hidden) met with the running clip.
+#[allow(clippy::too_many_arguments)]
+fn paint_broken_icon(
+    cx: f32, cy: f32, cw: f32, ch: f32, surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)],
+    clip: Clip,
+) {
+    let clip = (clip.0.max(cx + 1.0), clip.1.max(cy + 1.0), clip.2.min(cx + cw - 1.0), clip.3.min(cy + ch - 1.0));
+    let (ox, oy) = (cx + 2.0, cy + 2.0);
+    for r in layout_core::BROKEN_ICON {
+        let (x0, y0) = (ox + r.x as f32, oy + r.y as f32);
+        fill_rect(x0, y0, x0 + r.w as f32, y0 + r.h as f32, r.fill, 255, surface, width, height, damage_rects, clip);
+    }
 }
