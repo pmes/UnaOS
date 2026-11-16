@@ -493,7 +493,7 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
     new.pdf = view; // PDF4KERNEL (B999)
     drop(html);
     let old = core::mem::replace(page, new);
-    old.free();
+    old.free(); image_inputs(page); // AETHERIMAGEINPUTELF (SR683): an image input's bitmap before lay, which sizes its box
     lay(page, fonts, app.w, app.h);
     app.scroll = 0.0;
     app.find = None;
@@ -828,7 +828,7 @@ pub extern "C" fn _start() -> ! {
     };
     drop(bytes);
     // The page owns its arena (`Page::open`); a navigation frees it after the layout tree that borrows it.
-    let mut page = Page::open(&html, String::from_utf8_lossy(path).into_owned(), app.w, app.h);
+    let mut page = Page::open(&html, String::from_utf8_lossy(path).into_owned(), app.w, app.h); image_inputs(&page); // AETHERIMAGEINPUTELF (SR683)
     drop(html);
     let mut fonts = txt::Fonts(RefCell::new(txt));
     lay(&mut page, &mut fonts, app.w, app.h);
@@ -1107,5 +1107,43 @@ fn open_arg(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
     match core::str::from_utf8(&b[..n]) {
         Ok(u) => chrome::open_arg_tab(app, page, fonts, u),
         Err(_) => Line::new(b":: AETHER: open_arg -> FAIL reason=not-utf8 n=").dec(n as i64).put(b" ::").wire(),
+    }
+}
+
+// ---- AETHERIMAGEINPUTELF (LEDGER SR683): an image input's src, fetched and decoded on the favicon's road (named tail block) ----
+
+/// AETHERIMAGEINPUTELF (SR683): the host's `collect_image_urls` image-input leg (AETHERIMAGEINPUTFETCH SR461) on this ring.
+/// Every element layout_core's ONE `is_image_input` admits (at most 30, the host's cap), its trimmed `src` (empty and
+/// `data:` skipped) resolved against the page as `favicon` resolves its icon, read through the same `fetch` (the volume
+/// or AETHERNET) and decoded by pixel_core; the bitmaps replace `style`'s store ALWAYS (an empty map on a page with
+/// none), before `lay`, so layout_core sizes the box by the decoded size (`ImgHost::img_intrinsic`) and paint.rs
+/// `image_blit` draws it; a failed or missing image leaves the AltText caption. Wire (only on a page with an image
+/// input): `:: AETHER: imginput -> n=<inputs> decoded=<k> fail=<n-k> ::`.
+fn image_inputs(page: &Page) {
+    let doc = page.doc;
+    let mut got: alloc::collections::BTreeMap<usize, pixel_core::Image> = alloc::collections::BTreeMap::new();
+    let (mut n, mut ok) = (0i64, 0i64);
+    for id in doc.descendants(html_core::Document::ROOT) {
+        if !layout_core::is_image_input(&style::N { doc, id }) {
+            continue;
+        }
+        if n >= 30 {
+            break;
+        }
+        n += 1;
+        let src = doc.element(id).and_then(|e| e.attr("src")).map(str::trim).filter(|s| !s.is_empty() && !s.starts_with("data:"));
+        let img = src
+            .and_then(|s| resolve(&page.path, s).ok())
+            .and_then(|(p, _)| fetch(&p).ok())
+            .and_then(|(bytes, _)| pixel_core::decode(&bytes).ok())
+            .filter(|i| i.width > 0 && i.height > 0 && i.rgba.len() >= (i.width as usize) * (i.height as usize) * 4);
+        if let Some(i) = img {
+            got.insert(id.0, i);
+            ok += 1;
+        }
+    }
+    style::set_images(doc, got);
+    if n > 0 {
+        Line::new(b":: AETHER: imginput -> n=").dec(n).put(b" decoded=").dec(ok).put(b" fail=").dec(n - ok).put(b" ::").wire();
     }
 }
