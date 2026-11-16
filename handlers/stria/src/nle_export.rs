@@ -144,12 +144,14 @@ impl VideoEncoder for RawSequence {
 /// NLE6EXPORT (rmbp-ledger B959): the glue is h264enc_core's `rgba::RgbaEncoder` (the kernel's `nle export` drives the same).
 pub struct H264Encoder {
     rgba: RgbaEncoder,
+    /// H264ENCTWOPASS (LEDGER SR698): the encoder's per-picture records, copied out at `flush` ([`H264Encoder::stats`]).
+    stats: std::rc::Rc<std::cell::RefCell<Vec<PicStat>>>,
 }
 
 impl H264Encoder {
     /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
     pub fn new(qp: u8, gop: u32) -> H264Encoder {
-        H264Encoder { rgba: RgbaEncoder::new(Config { qp, gop, ..Default::default() }) }
+        H264Encoder { rgba: RgbaEncoder::new(Config { qp, gop, ..Default::default() }), stats: Default::default() }
     }
 
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
@@ -185,7 +187,7 @@ impl VideoEncoder for H264Encoder {
         Ok(h264_units(self.rgba.push_rgba(width, height, rgba).map_err(ExportError::H264)?))
     }
     fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
-        Ok(h264_units(self.rgba.flush().map_err(ExportError::H264)?))
+        let u = self.rgba.flush().map_err(ExportError::H264)?; self.keep_stats(); Ok(h264_units(u)) // H264ENCTWOPASS (SR698): the records out
     }
     fn config(&self) -> VideoConfig {
         VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.rgba.avcc() }
@@ -741,4 +743,29 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
         "h264" => Box::new(H264Encoder::new(26, (den / num).max(1))),
         _ => return None,
     })
+}
+
+// ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
+/// h264enc_core's per-picture first-pass record (`rc::PicStat`), named here so a face needs no h264enc_core dependency.
+pub use h264enc_core::rc::PicStat;
+
+impl H264Encoder {
+    /// The second pass of a two-pass export (h264enc_core's `RcMode::TwoPass`, `nle export --two-pass`): a mean of `kbps` kbit/s
+    /// at `fps_num / fps_den` frames per second, each picture's start QP planned from the first pass's `stats` (its
+    /// [`H264Encoder::stats`] after an export of the same timeline). The caller runs the export twice.
+    pub fn with_two_pass(mut self, kbps: u32, fps_num: u32, fps_den: u32, stats: Vec<PicStat>) -> H264Encoder {
+        self.rgba.cfg.rate = Some(RateControl::two_pass(kbps, (fps_num, fps_den)));
+        self.rgba = self.rgba.with_two_pass(stats);
+        self
+    }
+
+    /// The per-picture records of this encoder's stream, filled when the export flushes it (the NLERAWEXPORT `size()` handle
+    /// idiom: `export_as` consumes the encoder, the handle outlives it).
+    pub fn stats(&self) -> std::rc::Rc<std::cell::RefCell<Vec<PicStat>>> {
+        self.stats.clone()
+    }
+
+    fn keep_stats(&self) {
+        *self.stats.borrow_mut() = self.rgba.stats().to_vec();
+    }
 }
