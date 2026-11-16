@@ -154,6 +154,8 @@ pub struct PaintStyle<H: Host> {
     pub font_rel: Option<Vec<(String, String)>>,
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style, Some(true) = auto.
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>,
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -311,7 +313,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None,
+            stretch: None, synth_weight: None, synth_style: None,
             word_spacing: None,
             rtl: None,
             text_shadows: None,
@@ -742,5 +744,26 @@ impl<H: Host> PaintStyle<H> {
         let o = self.transform_origin.unwrap_or([[0.0, 0.5], [0.0, 0.5]]);
         let (ox, oy) = (resolve_lp(o[0], w), resolve_lp(o[1], h));
         Some(mat_mul(mat_mul([1.0, 0.0, 0.0, 1.0, ox, oy], m), [1.0, 0.0, 0.0, 1.0, -ox, -oy]))
+    }
+}
+
+// ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): the inherited font-synthesis mask (named tail block) ----
+
+/// AETHERFONTSYNTHESISPROPERTY (SR750): the inherited font-synthesis mask's bits — set = that synthesis is `none`;
+/// 0 is the initial `weight style` (css-fonts-4 §6).
+pub const NO_SYNTH_WEIGHT: u8 = 1;
+pub const NO_SYNTH_STYLE: u8 = 2;
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): the font-synthesis mask this box carries given its parent's `inherited`
+    /// one: a declared longhand sets (`none`) or clears (`auto`) its bit, an undeclared one keeps the parent's
+    /// (font-synthesis is inherited).
+    pub fn no_synth(&self, inherited: u8) -> u8 {
+        let bit = |v: Option<bool>, b: u8, m: u8| match v {
+            Some(true) => m & !b,
+            Some(false) => m | b,
+            None => m,
+        };
+        bit(self.synth_style, NO_SYNTH_STYLE, bit(self.synth_weight, NO_SYNTH_WEIGHT, inherited))
     }
 }

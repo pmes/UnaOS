@@ -39,17 +39,19 @@ pub struct FontSel {
     pub italic: bool,
     /// font-stretch in percent.
     pub stretch: u16,
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): the font-synthesis mask (layout_core `NO_SYNTH_WEIGHT` / `NO_SYNTH_STYLE` bits set = `none`; 0 = `weight style`).
+    pub no_synth: u8,
 }
 
 impl Default for FontSel {
     fn default() -> Self {
-        FontSel { family: STANDARD, weight: 400, italic: false, stretch: 100 }
+        FontSel { family: STANDARD, weight: 400, italic: false, stretch: 100, no_synth: 0 }
     }
 }
 
 impl FontSel {
     pub fn new(family: u16, weight: u16, italic: bool) -> Self {
-        FontSel { family, weight, italic, stretch: 100 }
+        FontSel { family, weight, italic, stretch: 100, no_synth: 0 }
     }
     pub fn style(&self) -> Style {
         Style {
@@ -321,7 +323,7 @@ pub fn stack(sel: &FontSel) -> std::rc::Rc<Vec<&'static Face>> {
         let d = db::db();
         push(&mut faces, d.fallback_order().first().and_then(|&i| text_host::cover_face(&d.faces[i], want)));
     }
-    let rc = std::rc::Rc::new(faces);
+    let rc = std::rc::Rc::new(faces.into_iter().map(|f| synthesis_gate(f, sel.no_synth)).collect::<Vec<_>>());
     STACKS.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != generation {
@@ -403,7 +405,7 @@ pub fn run_faces(sel: &FontSel, text: &str) -> Vec<&'static Face> {
         if !needs_glyph(c) || faces.iter().any(|f| f.font.glyph_index(c) != 0) {
             continue;
         }
-        if let Some(f) = fallback_for(c, sel) {
+        if let Some(f) = fallback_for(c, sel).map(|f| synthesis_gate(f, sel.no_synth)) {
             if !faces[n..].iter().any(|x| x.id == f.id) {
                 faces.push(f);
             }
@@ -581,4 +583,23 @@ mod testroot_tests {
         assert!(db_cache_dir().starts_with(process_dir()), "a lib-test build's default root is its process dir");
         assert!(!db_cache_dir().starts_with(&platform));
     }
+}
+
+// ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): css-fonts-4 §6 font-synthesis gates the synthesized face (named tail block) ----
+
+/// AETHERFONTSYNTHESISPROPERTY (SR750): the face a run paints with under its font-synthesis mask — Chromium ANDs
+/// `SyntheticBoldAllowed()` / `SyntheticItalicAllowed()` into every road's synthetic decision (font_cache_skia.cc
+/// CreateFontPlatformData, the fallback and web-font roads); here the ONE gate over the faces [`stack`] and
+/// [`run_faces`]' fallback hand on. A face whose flags the mask leaves alone is returned itself (the default mask 0
+/// moves nothing); otherwise an installed face becomes its twin in text_host's loaded-face cache (the same object an
+/// unsynthesized selection loads, hinting kept: [`text_host::installed_twin`]) and an `@font-face` face or fallback
+/// twin its webfont `synth_variant`.
+pub fn synthesis_gate(face: &'static Face, no_synth: u8) -> &'static Face {
+    use layout_core::paint::{NO_SYNTH_STYLE, NO_SYNTH_WEIGHT};
+    let b = face.synth_bold && no_synth & NO_SYNTH_WEIGHT == 0;
+    let o = face.synth_oblique && no_synth & NO_SYNTH_STYLE == 0;
+    if b == face.synth_bold && o == face.synth_oblique {
+        return face;
+    }
+    text_host::installed_twin(face, b, o).unwrap_or_else(|| webfont::synth_variant(face, b, o))
 }

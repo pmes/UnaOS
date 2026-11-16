@@ -4755,4 +4755,100 @@ mod tests {
         assert_eq!(imgalt_ink(&engine, lw, lw + 16, t.floor() as usize, (t + sh).floor() as usize), 0, "w: line 1 starts after the icon");
         assert!(imgalt_ink(&engine, lw, lw + 16, (t + sh).ceil() as usize, (t + 2.0 * sh).floor() as usize) > 0, "w: line 2 is not indented");
     }
+
+    // ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): font-synthesis gates the synthesized face on every road (named tail block) ----
+
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): a page whose only face is the tree's static regular fixture (fontbidi_synth,
+    /// usWeightClass 400, roman) as an `@font-face` family, so 700 and italic are synthesized (the webfont road), one
+    /// 48px row per case; returns the engine and each row's pixels (the whole surface width, rows y..y+48).
+    fn font_synthesis_page() -> (crate::AetherEngine, std::collections::HashMap<&'static str, Vec<u8>>) {
+        let font = std::fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf"))
+            .expect("the tree's fontbidi_synth fixture");
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+              @font-face {{ font-family: SynthFix; src: url(file://{}); }}
+              div {{ margin: 0; height: 48px; line-height: 48px; font-family: SynthFix; font-size: 32px; white-space: nowrap }}
+            </style></head><body style="margin:0">
+              <div id="r400">HHHH</div>
+              <div id="b700" style="font-weight:700">HHHH</div>
+              <div id="n700" style="font-weight:700;font-synthesis:none">HHHH</div>
+              <div id="w700" style="font-weight:700;font-synthesis:weight">HHHH</div>
+              <div id="i400" style="font-style:italic">HHHH</div>
+              <div id="iw" style="font-style:italic;font-synthesis:weight">HHHH</div>
+              <div id="is700" style="font-style:italic;font-weight:700;font-synthesis:style">HHHH</div>
+              <div id="lw" style="font-weight:700;font-synthesis-weight:none">HHHH</div>
+              <section id="par" style="font-synthesis:none"><div id="inh"><span id="kid" style="font-weight:700">HHHH</span></div></section>
+            </body></html>"#,
+            font.display()
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let mut rows = std::collections::HashMap::new();
+        for id in ["r400", "b700", "n700", "w700", "i400", "iw", "is700", "lw", "inh"] {
+            let top = js_num(&mut engine, &format!("document.getElementById('{id}').getBoundingClientRect().top")).round() as usize;
+            let sw = engine.width as usize * 4;
+            rows.insert(id, engine.surface()[top * sw..(top + 48) * sw].to_vec());
+        }
+        (engine, rows)
+    }
+
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 as Chromium's `SyntheticBoldAllowed` / `SyntheticItalicAllowed`:
+    /// the default synthesizes (700 inks other than 400, italic other than upright); `none` paints the 400 row byte for
+    /// byte; `weight` keeps the bold and drops the oblique; `style` keeps the oblique and drops the bold; the
+    /// `font-synthesis-weight` longhand alone drops the bold; and the property inherits (a 700 span under a
+    /// `font-synthesis:none` ancestor paints the 400 row).
+    #[test]
+    fn font_synthesis_gates_the_synthesized_face() {
+        let (_, r) = font_synthesis_page();
+        assert!(r["r400"].chunks_exact(4).any(|p| p[0] < 128), "the fixture face paints ink");
+        assert_ne!(r["b700"], r["r400"], "default: 700 is synthetic bold");
+        assert_ne!(r["i400"], r["r400"], "default: italic is synthetic oblique");
+        assert_eq!(r["n700"], r["r400"], "font-synthesis:none: 700 paints the regular face");
+        assert_eq!(r["w700"], r["b700"], "font-synthesis:weight: the bold stays");
+        assert_eq!(r["iw"], r["r400"], "font-synthesis:weight: no oblique");
+        assert_eq!(r["is700"], r["i400"], "font-synthesis:style: the oblique stays, no bold");
+        assert_eq!(r["lw"], r["r400"], "font-synthesis-weight:none alone drops the bold");
+        assert_eq!(r["inh"], r["r400"], "font-synthesis inherits to a child span");
+    }
+
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): getComputedStyle reads the initial `weight style`, a declared value, and the
+    /// value inherited from an ancestor.
+    #[test]
+    fn font_synthesis_computed_style() {
+        let (mut engine, _) = font_synthesis_page();
+        for (id, want) in [("r400", "weight style"), ("n700", "none"), ("w700", "weight"), ("kid", "none")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('font-synthesis')"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed font-synthesis");
+        }
+    }
+
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): the installed road through the gate: the static fixture's synthetic-bold
+    /// object gated with `NO_SYNTH_WEIGHT` is the very `load_face` object (text_host's loaded-face cache, hinting kept),
+    /// the default mask and a style-only mask return it unchanged, and an oblique+bold face gated on weight is the
+    /// cache's oblique-only object.
+    #[test]
+    fn font_synthesis_gate_installed_twin() {
+        use crate::fonts::db;
+        use layout_core::paint::{NO_SYNTH_STYLE, NO_SYNTH_WEIGHT};
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's fontbidi_synth fixture");
+        let bold = crate::fonts::load_face_synth(&info, true, false).unwrap();
+        let plain = crate::fonts::load_face(&info).unwrap();
+        assert!(std::ptr::eq(crate::fonts::synthesis_gate(bold, 0), bold), "mask 0 moves nothing");
+        assert!(std::ptr::eq(crate::fonts::synthesis_gate(bold, NO_SYNTH_STYLE), bold), "a style-only mask keeps the bold");
+        let g = crate::fonts::synthesis_gate(bold, NO_SYNTH_WEIGHT);
+        assert!(std::ptr::eq(g, plain), "none: the unsynthesized loaded object");
+        assert!(text_host::is_installed(g));
+        let bo = crate::fonts::load_face_synth(&info, true, true).unwrap();
+        let o = crate::fonts::synthesis_gate(bo, NO_SYNTH_WEIGHT);
+        assert!(!o.synth_bold && o.synth_oblique && text_host::is_installed(o));
+        assert!(std::ptr::eq(o, crate::fonts::load_face_synth(&info, false, true).unwrap()), "the cache's oblique-only object");
+    }
 }
