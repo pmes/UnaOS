@@ -2076,3 +2076,37 @@ fn striainforeelaudio_face_reel_line_carries_the_audio_part() {
     assert!(r.ends_with(" | pcm 768 kb/s"), "{r}");
     println!("striainforeelaudio: face reel_line=\"{r}\"");
 }
+
+// ---- STRIAINFOREELSTRIP (LEDGER SR747): the face's message in a row of its own (named tail block) ----
+
+/// Rule: a labelled face paints its message inside the Layout's message row (`with_message`: 14 px cut from the preview band's
+/// foot, the ruler and tracks unmoved), the row is the view's BG with no message, and the preview rows above it carry no label
+/// ink (equal selected and deselected); the face's pointer geometry (`Face::layout`) carries no row.
+#[test]
+fn striainforeelstrip_face_message_has_a_row_of_its_own() {
+    use stria::nle_face::{EditorState, Face, Layout, MESSAGE_H, PixelOrder};
+    use timeline_core::view::BG;
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, true);
+    let l: Layout = face.layout();
+    assert_eq!((l.preview_h, l.message_h), (48, 0), "the pointer geometry has no row");
+    let m = l.with_message(true);
+    assert_eq!((m.preview_h, m.message_y, m.message_h, m.ruler_y, m.tracks_y), (34, 34, MESSAGE_H, l.ruler_y, l.tracks_y));
+    let band = |px: &[u8], y0: u32, y1: u32| -> Vec<[u8; 4]> {
+        let mut out = Vec::new();
+        for y in y0..y1 {
+            for x in 0..64u32 {
+                let i = ((y * m.w + x) * 4) as usize;
+                out.push([px[i], px[i + 1], px[i + 2], px[i + 3]]);
+            }
+        }
+        out
+    };
+    let bare = face.paint();
+    assert!(band(&bare, m.message_y, m.message_y + m.message_h).iter().all(|&p| p == BG), "no message: the row is BG");
+    face.state.select(0, 0).unwrap();
+    let sel = face.paint();
+    assert!(band(&sel, m.message_y, m.message_y + m.message_h).iter().any(|&p| p != BG), "the reel's line inks the row");
+    assert_eq!(band(&sel, 0, m.message_y), band(&bare, 0, m.message_y), "no label ink in the preview rows above the row");
+    println!("striainforeelstrip: face row={}+{} ruler_y={} preview_h={}", m.message_y, m.message_h, m.ruler_y, m.preview_h);
+}

@@ -1567,7 +1567,7 @@ impl Face {
     /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
-        let l = self.layout_for(role);
+        let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
@@ -2320,7 +2320,7 @@ fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String
 // clips at it), STRIA-INFO-REEL-HOVER (the summary on hover over an unselected clip).
 
 /// STRIAINFOREEL (SR743): the message line's height (px): a band shorter than this shows no message.
-pub const MESSAGE_H: u32 = 14;
+pub const MESSAGE_H: u32 = view::MESSAGE_H;
 
 impl Face {
     /// The selected clip's reel as a person reads it: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
@@ -2335,16 +2335,16 @@ impl Face {
     pub fn message_text(&self) -> Option<String> {
         self.last_error.clone().or_else(|| self.reel_line())
     }
-    /// The message over a painted canvas: one line at x 4, baseline `preview_h - 4`, clipped to the canvas width, through
+    /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
     fn paint_message(&self, px: Vec<u8>, l: Layout, role: Role) -> Vec<u8> {
         let Some(style) = self.labels.as_ref() else { return px };
-        if role == Role::Tracks || l.preview_h < MESSAGE_H {
+        if role == Role::Tracks || l.message_h < MESSAGE_H {
             return px;
         }
         let Some(text) = self.message_text() else { return px };
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
-        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, l.preview_h as f32 - 4.0, (0, l.w as i32));
+        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, l.w as i32));
         c.px
     }
 }
