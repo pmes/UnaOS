@@ -282,3 +282,20 @@ pub fn with_image<R>(node: &N, f: impl FnOnce(&pixel_core::Image) -> R) -> Optio
     }
     store.1.get(&node.id.0).map(f)
 }
+
+// ---- AETHERIMGELF (LEDGER SR685): an img rides the image input's store, fetch and blit (named tail block) ----
+
+/// AETHERIMGELF (SR685): whether `node` takes this ring's image road: an `<img>` or an element layout_core's ONE
+/// `is_image_input` admits (the pair layout_core's img sizing rule reads). The ONE predicate main.rs's fetch
+/// (through [`img_fetched`]) and paint.rs `caption`'s blit arm call.
+pub fn img_like(node: &N) -> bool {
+    node.doc.element(node.id).is_some_and(|e| e.local == "img") || layout_core::is_image_input(node)
+}
+
+/// AETHERIMGELF (SR685): [`img_like`] minus an `<img>` whose `loading` is lazy (the host's `images::is_lazy`: trimmed,
+/// ASCII case-insensitive "lazy"; `loading` is an img attribute, so an image input is never skipped). This ring has
+/// no lazy pass, so a lazy img is never fetched (AETHER-IMG-ELF-LAZY owed).
+pub fn img_fetched(node: &N) -> bool {
+    let lazy = node.doc.element(node.id).is_some_and(|e| e.local == "img" && e.attr("loading").is_some_and(|v| v.trim().eq_ignore_ascii_case("lazy")));
+    img_like(node) && !lazy
+}

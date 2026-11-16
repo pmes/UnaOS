@@ -1118,13 +1118,13 @@ fn open_arg(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
 /// or AETHERNET) and decoded by pixel_core; the bitmaps replace `style`'s store ALWAYS (an empty map on a page with
 /// none), before `lay`, so layout_core sizes the box by the decoded size (`ImgHost::img_intrinsic`) and paint.rs
 /// `image_blit` draws it; a failed or missing image leaves the AltText caption. Wire (only on a page with an image
-/// input): `:: AETHER: imginput -> n=<inputs> decoded=<k> fail=<n-k> ::`.
+/// input): `:: AETHER: images -> n=<inputs> decoded=<k> fail=<n-k> ::`.
 fn image_inputs(page: &Page) {
     let doc = page.doc;
     let mut got: alloc::collections::BTreeMap<usize, pixel_core::Image> = alloc::collections::BTreeMap::new();
     let (mut n, mut ok) = (0i64, 0i64);
     for id in doc.descendants(html_core::Document::ROOT) {
-        if !layout_core::is_image_input(&style::N { doc, id }) {
+        if !style::img_fetched(&style::N { doc, id }) { // AETHERIMGELF (SR685): imgs (not loading=lazy) with the image inputs
             continue;
         }
         if n >= 30 {
@@ -1144,6 +1144,6 @@ fn image_inputs(page: &Page) {
     }
     style::set_images(doc, got);
     if n > 0 {
-        Line::new(b":: AETHER: imginput -> n=").dec(n).put(b" decoded=").dec(ok).put(b" fail=").dec(n - ok).put(b" ::").wire();
+        Line::new(b":: AETHER: images -> n=").dec(n).put(b" decoded=").dec(ok).put(b" fail=").dec(n - ok).put(b" ::").wire();
     }
 }

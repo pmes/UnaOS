@@ -2892,7 +2892,7 @@ fn frame_walk(
                                 }
                             }
                         }
-                    }
+                    } else if tag == "img" { paint_img_alt(layout, node_id, box_sx, box_sy, layout_box, &inherited, surface, width, height, damage_rects, clip); } // AETHERIMGALT (SR681): a failed img paints its alt text
                 }
 
                 if tag == "canvas" {
@@ -4450,6 +4450,47 @@ mod presentrects_tests {
         let damages = e.render_frame();
         assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![(0, 0, 600, 400)], None), "a zoom change: whole");
     }
+}
+
+// ---- AETHERIMGALT (LEDGER SR681): a failed img's alt text (named tail block) ------------------------------------
+
+/// AETHERIMGALT (SR681): paints what layout_core's `img_fallback_of` says a failed `<img>` renders, in the element's
+/// font, line height and colour, over its content box (cx, cy, cw, ch). InlineAlt: the alt text as the one line
+/// `img_alt_extent` measured the box by. BoxedAlt (Chromium's alttext-container: overflow hidden, border-box):
+/// with `frame` the 1px solid silver (#c0c0c0) border on the box's edges, its 1px padding, and the text after the
+/// 16px broken-image icon's slot (the icon floats left at the padding box's corner; its pixels are owed,
+/// AETHER-IMG-BROKENICON), so at (cx + 2 + 16, cy + 2); without `frame` the text at (cx, cy). The text clips to the
+/// container's padding box met with the running clip. One line, never wrapped (AETHER-IMG-ALT-INLINE-WRAP owed).
+#[allow(clippy::too_many_arguments)]
+fn paint_img_alt(
+    layout: &LayoutTree, node_id: NodeId, box_sx: f32, box_sy: f32, layout_box: &taffy::Layout, inherited: &Inherited,
+    surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
+) {
+    let (bord, pad) = (layout_box.border, layout_box.padding);
+    let cx = box_sx + bord.left + pad.left;
+    let cy = box_sy + bord.top + pad.top;
+    let cw = (layout_box.size.width - bord.left - pad.left - bord.right - pad.right).max(0.0);
+    let ch = (layout_box.size.height - bord.top - pad.top - bord.bottom - pad.bottom).max(0.0);
+    let (text, tx, ty, inset) = match layout_core::img_fallback_of(layout, node_id) {
+        layout_core::ImgFallback::None => return,
+        layout_core::ImgFallback::InlineAlt(t) => (t, cx, cy, 0.0),
+        layout_core::ImgFallback::BoxedAlt { text, frame } => {
+            if frame && cw >= 2.0 && ch >= 2.0 {
+                let silver = (192, 192, 192);
+                fill_rect(cx, cy, cx + cw, cy + 1.0, silver, 255, surface, width, height, damage_rects, clip);
+                fill_rect(cx, cy + ch - 1.0, cx + cw, cy + ch, silver, 255, surface, width, height, damage_rects, clip);
+                fill_rect(cx, cy + 1.0, cx + 1.0, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
+                fill_rect(cx + cw - 1.0, cy + 1.0, cx + cw, cy + ch - 1.0, silver, 255, surface, width, height, damage_rects, clip);
+            }
+            if frame { (text, cx + 2.0 + 16.0, cy + 2.0, 1.0) } else { (text, cx, cy, 0.0) }
+        }
+    };
+    if text.is_empty() || inherited.text_hidden {
+        return;
+    }
+    let text = transform_text(&text, inherited.text_transform);
+    let clip = (clip.0.max(cx + inset), clip.1.max(cy + inset), clip.2.min(cx + cw - inset), clip.3.min(cy + ch - inset));
+    draw_text(&text, tx, ty, f32::MAX, &inherited.advancer(), inherited.line_height, inherited.color, false, surface, width, height, damage_rects, clip);
 }
 
 // ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status from its value, ellipsized to the box (named tail block) ----

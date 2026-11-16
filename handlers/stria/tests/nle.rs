@@ -1349,3 +1349,45 @@ fn nlexfadepower_equal_power_doubles_the_midpoint_power() {
     assert_eq!(derived, lin);
     println!("nlexfadepower: midpoint power eq/lin={ratio:.4} seeks={eq_seeks}");
 }
+
+// ── NLERAWEXPORT (LEDGER SR689): the raw planar exports on SR394's two-size reel (handlers.md §5 NLEPROBE-HDR's RAW-EXPORT) ──
+// `video.json` states ONE size, so under Adopt both raw planar forms refuse the second size by the converter crate's own
+// name, as the H.264 export does; under Letterbox the y4m stream's header states the reel's first size at 25 fps.
+
+#[test]
+fn nlerawexport_adopt_reel_refused_raw_planar() {
+    use stria::nle_export::{AudioOut, ExportError, I420Raw, VideoEncoder, Y4m, export};
+    use timeline_core::SizePolicy;
+    let _ = nlesizeswitch_lines("");
+    let Some(file) = nlesizeswitch_reel() else { return };
+    let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlerawexport");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
+    let encs: [(&str, Box<dyn VideoEncoder>); 2] = [("i420", Box::new(I420Raw::default())), ("y4m", Box::new(Y4m::new(25, 1)))];
+    for (name, enc) in encs {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = export(&adopt, 0..4, &src, &dir, enc, AudioOut::None).unwrap_err();
+        assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{name}: {e}");
+        assert!(e.to_string().contains("frame does not match"), "{name}: {e}");
+    }
+
+    let letterbox = tl.set_size_policy(SourceId(0), SizePolicy::Letterbox).unwrap();
+    let dir = root.join("letterbox");
+    std::fs::create_dir_all(&dir).unwrap();
+    let enc = Y4m::new(letterbox.tb.den as u32, letterbox.tb.num as u32);
+    let r = export(&letterbox, 0..4, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!(r.frames, 4);
+    let y4m = std::fs::read(dir.join("video.y4m")).unwrap();
+    let head: &[u8] = b"YUV4MPEG2 W768 H512 F25:1 Ip A1:1 C420jpeg\n";
+    assert!(y4m.starts_with(head), "{:?}", String::from_utf8_lossy(&y4m[..y4m.len().min(64)]));
+    let per = 768 * 512 * 3 / 2;
+    assert_eq!(y4m.len(), head.len() + 4 * (6 + per));
+    for i in 0..4 {
+        let at = head.len() + i * (6 + per);
+        assert_eq!(&y4m[at..at + 6], b"FRAME\n", "frame {i}: the FRAME marker");
+    }
+    println!("nlerawexport: adopt refused i420 + y4m (frame does not match); letterbox y4m 768x512 F25:1 x4 in {}", root.display());
+}
