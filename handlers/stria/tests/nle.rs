@@ -2130,3 +2130,104 @@ fn striainforeel_face_message_is_the_selected_reel_and_an_error_wins() {
     assert_eq!(strip(&face.paint()), bare);
     println!("striainforeel: face message=\"A: {line}\" preview_h={} rows={}", l.preview_h, MESSAGE_H);
 }
+
+// ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay — its rows, its toggle, the dismiss not applied, its paint (named tail block) ----
+use stria::nle_face::{HELP, Hit, KEYS, help_phrase, help_rows};
+
+fn nle5dkeyshelp_face(w: u32, h: u32, labels: bool) -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (w, h), PixelOrder::Rgba, labels)
+}
+
+/// The rows: one per KEYS action in KEYS order, every action has a non-empty phrase in HELP, and every KEYS row's key is
+/// in its action's row (`Space` for " "; an AppKit private-use alias only where the row names another key).
+#[test]
+fn nle5dkeyshelp_rows_cover_every_key() {
+    let mut acts: Vec<&str> = Vec::new();
+    for &(_, a) in KEYS {
+        if !acts.contains(&a) {
+            acts.push(a);
+        }
+    }
+    let rows = help_rows();
+    assert_eq!(rows.len(), acts.len());
+    for (i, &a) in acts.iter().enumerate() {
+        assert!(HELP.iter().any(|(x, _)| *x == a), "no phrase for {a}");
+        assert_eq!(rows[i].1, help_phrase(a));
+        assert!(!rows[i].1.is_empty(), "{a}");
+    }
+    for &(k, a) in KEYS {
+        let i = acts.iter().position(|x| *x == a).unwrap();
+        let first = k.chars().next().unwrap();
+        if k.chars().count() == 1 && ('\u{f700}'..='\u{f8ff}').contains(&first) {
+            assert!(!rows[i].0.is_empty(), "{a}: an alias with no named key");
+            continue;
+        }
+        let lab = if k == " " { "Space" } else { k };
+        assert!(rows[i].0.split(" / ").any(|x| x == lab), "{lab:?} not in {:?}", rows[i].0);
+    }
+    assert!(KEYS.contains(&("?", "help")));
+    println!("nle5dkeyshelp: rows={} keys={}", rows.len(), KEYS.len());
+}
+
+/// `?` (text) shows the help; a following `j` only dismisses it (no shuttle, the playhead still); `?` while shown hides it;
+/// a bare modifier and GTK's `Shift+question` are not taken and leave it shown; Escape dismisses; `help` is the one toggle.
+#[test]
+fn nle5dkeyshelp_keys_toggle_and_the_dismiss_is_not_applied() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let ph = f.state.playhead;
+    assert!(!f.help_shown());
+    assert!(!f.on(&bandy::SMessage::BrowserKey("?".into())), "a one-char BrowserKey alone is not taken");
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserText("j".into())));
+    assert_eq!((f.help_shown(), f.playing, f.rate, f.state.playhead), (false, false, 1, ph));
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(!f.on(&bandy::SMessage::BrowserKey("Shift+Shift_L".into())));
+    assert!(!f.on(&bandy::SMessage::BrowserKey("Shift+question".into())));
+    assert!(f.help_shown(), "an unbound key leaves the help shown");
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(!f.help_shown(), "? while shown hides it");
+    assert!(f.verb("help") && f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(!f.help_shown());
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    println!("nle5dkeyshelp: ? shows, j dismisses unapplied, Shift_L kept, Escape dismisses");
+}
+
+/// While shown, a press on a clip is taken and ignored (no drag), its release dismisses the help, the click after it is not
+/// applied (no seek, no selection).
+#[test]
+fn nle5dkeyshelp_click_dismisses_unapplied() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (x, y) = f.layout().point(0, 30);
+    assert!(matches!(f.layout().hit(&f.state.timeline, x, y), Hit::Clip(0, 2, _)));
+    assert!(f.verb("help"));
+    let (ph, sel) = (f.state.playhead, f.state.selection);
+    assert!(!f.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 }));
+    assert!(f.dragging().is_none());
+    assert!(f.on(&bandy::SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+    assert!(!f.help_shown());
+    f.on(&bandy::SMessage::BrowserClick(x, y, 0));
+    assert_eq!((f.state.playhead, f.state.selection), (ph, sel));
+    println!("nle5dkeyshelp: a click dismisses, playhead {ph} selection {sel:?} kept");
+}
+
+/// A labelled face paints the help over the timeline band (`ruler_y..h`) and nowhere else; a labels-off face paints
+/// byte-identical with the help on (no labels, no overlay).
+#[test]
+fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    let off = f.paint();
+    assert!(f.verb("help"));
+    let on = f.paint();
+    let cut = f.layout().ruler_y as usize * 640 * 4;
+    assert!(cut > 0 && cut < on.len());
+    assert_eq!(on[..cut], off[..cut], "the preview band is untouched");
+    assert_ne!(on[cut..], off[cut..], "the timeline band shows the help");
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let a = plain.paint();
+    assert!(plain.verb("help"));
+    assert_eq!(plain.paint(), a, "labels off: no overlay");
+    println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
+}
