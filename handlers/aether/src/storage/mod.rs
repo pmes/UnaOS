@@ -450,3 +450,12 @@ pub fn init_root(tmp: impl AsRef<Path>, name: &str) -> PathBuf {
     })
     .clone()
 }
+
+// ---- AETHERFONTDBCACHEONEDIR (LEDGER SR746): the platform root test (named tail block) ----
+
+/// True when [`root_dir`] is the PLATFORM data directory: no root override is set ([`set_root_dir`]: a lib
+/// `TestRoot`, an integration binary's [`init_root`]) and this is not a lib-test build (whose default root is
+/// `test_root::process_dir`). `fonts::db_cache_dir` hands text_host its shared default dir only then.
+pub fn root_is_platform() -> bool {
+    !cfg!(test) && root_override().lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}

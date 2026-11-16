@@ -1647,3 +1647,7 @@ nle5dkeyshelpbutton|exec-rmbp-nle5dkeyshelpbutton|/home/user/exec/nle5dkeyshelpb
 h264enctwopassqblurcli|exec-rmbp-h264enctwopassqblurcli|/home/user/exec/h264enctwopassqblurcli|cut cac1ec898|wave36 cut88h
 aetherfontdbcachekeyed|exec-rmbp-aetherfontdbcachekeyed|/home/user/exec/aetherfontdbcachekeyed|cut cac1ec898|wave36 cut88h
 hevcconcealweightedbimixed|exec-rmbp-hevcconcealweightedbimixed|/home/user/exec/hevcconcealweightedbimixed|cut cac1ec898|wave36 cut88h
+h264enctwopassqpstepruntime|exec-rmbp-h264enctwopassqpstepruntime|/home/user/exec/h264enctwopassqpstepruntime|cut 1a5748ebc|wave36 cut89h
+aetherfontdbcachesweep|exec-rmbp-aetherfontdbcachesweep|/home/user/exec/aetherfontdbcachesweep|cut 1a5748ebc|wave36 cut89h
+h264encpintrachroma|exec-rmbp-h264encpintrachroma|/home/user/exec/h264encpintrachroma|cut 1a5748ebc|wave36 cut89h
+aetherfontsynthesissmallcaps|exec-rmbp-aetherfontsynthesissmallcaps|/home/user/exec/aetherfontsynthesissmallcaps|cut 1a5748ebc|wave36 cut89h
