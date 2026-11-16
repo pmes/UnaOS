@@ -191,13 +191,15 @@ pub struct Face {
     play: PlayAudio,
     /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
     export: Option<ExportJob>,
+    /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
+    help: bool,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -205,7 +207,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -239,6 +241,7 @@ impl Face {
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
+            "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
             "slip-" | "slip+" | "slide-" | "slide+" => self.state.verb(&slipslide_word(v)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
@@ -373,6 +376,7 @@ pub const KEYS: &[(&str, &str)] = &[
     (".", "slip+"),
     ("<", "slide-"),
     (">", "slide+"),
+    ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -480,6 +484,7 @@ impl Face {
             return false;
         }
         let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
+        if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
         if VERBS.contains(&act) {
             return self.verb(act);
         }
@@ -1589,7 +1594,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
-        paint_marks(paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()) // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler
+        { let px = paint_marks(paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -2481,4 +2486,171 @@ fn slipslide_word(v: &str) -> String {
         None => (v.trim_end_matches('+'), 1),
     };
     format!("{word} {step}")
+}
+
+// ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay over the timeline band (named tail block) ----
+// `?` (a KEYS row) or the word `help` (`Face::verb`) toggles it; while shown the face paints `help_rows()` over the timeline
+// band (`Layout` ruler_y..h: the ruler and the tracks; the preview band's foot is the message line's) through the face's own
+// `Labels` hook, LABEL ink over a BG fill, only when labels are on, so every labels-off golden is byte-identical. One row per
+// KEYS action: its keys joined " / " (" " shown `Space`, the AppKit private-use aliases U+F700..=U+F8FF skipped: each names a
+// key another row of the same action names), its phrase from `HELP` (an action with no phrase shows the word itself, so a new
+// KEYS row is never missing). The band is 16 + 40 x rows px at every window size: the rows run in columns, each its own width,
+// as many as the canvas width holds, the last painted line `…` when rows remain. Stria's rule: the input that dismisses the
+// help is NOT applied — a key the face takes (a KEYS row, Escape included) only dismisses it, a press is taken and ignored and
+// its release (or click) dismisses; a key the face does not bind (a bare modifier, GTK's `Shift+question`) leaves it shown.
+// Owed: NLE5D-KEYS-HELP-KERNEL (the kernel Player paints the same table from EDIT_KEYS), NLE5D-KEYS-HELP-BUTTON (a `?` button).
+
+/// NLE5DKEYSHELP (SR744): each KEYS action as a person reads it.
+pub const HELP: &[(&str, &str)] = &[
+    ("shuttle-", "play backward (again: faster)"),
+    ("stop", "stop"),
+    ("shuttle+", "play forward (again: faster)"),
+    ("mark-in", "trim the clip's start to the playhead"),
+    ("mark-out", "trim the clip's end to the playhead"),
+    ("play", "play / pause"),
+    ("zoom+", "zoom in"),
+    ("zoom-", "zoom out"),
+    ("redo", "redo"),
+    ("delete", "delete the clip and close the gap"),
+    ("home", "go to the start"),
+    ("end", "go to the end"),
+    ("cancel", "cancel the drag or the export"),
+    ("undo", "undo"),
+    ("save", "save"),
+    ("nudge-", "move the selection one frame earlier"),
+    ("nudge+", "move the selection one frame later"),
+    ("[", "clip start one frame earlier"),
+    ("]", "clip start one frame later"),
+    ("mark in", "export from the playhead"),
+    ("mark out", "export up to the playhead"),
+    ("mark clear", "export the whole timeline"),
+    ("slip-", "slip the clip one frame back"),
+    ("slip+", "slip the clip one frame on"),
+    ("slide-", "slide the clip one frame earlier"),
+    ("slide+", "slide the clip one frame later"),
+    ("help", "show / hide this help"),
+];
+/// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
+const HELP_PAD: f32 = 4.0;
+/// NLE5DKEYSHELP (SR744): the gap between a row's keys and its phrase (px).
+const HELP_KEY_GAP: f32 = 12.0;
+/// NLE5DKEYSHELP (SR744): the gap between two columns (px).
+const HELP_COL_GAP: f32 = 16.0;
+
+/// The phrase for a KEYS action ([`HELP`]); the action word itself when it has none.
+pub fn help_phrase(act: &'static str) -> &'static str {
+    HELP.iter().find(|(a, _)| *a == act).map_or(act, |&(_, p)| p)
+}
+
+/// A KEYS name as the help shows it: `" "` is `Space`; an AppKit private-use key (U+F700..=U+F8FF) is not shown.
+fn key_label(k: &'static str) -> Option<&'static str> {
+    if k == " " {
+        return Some("Space");
+    }
+    let mut cs = k.chars();
+    match (cs.next(), cs.next()) {
+        (Some(c), None) if ('\u{f700}'..='\u{f8ff}').contains(&c) => None,
+        _ => Some(k),
+    }
+}
+
+/// The help's rows, one per KEYS action in KEYS order: `(its keys joined " / ", its phrase)`.
+pub fn help_rows() -> Vec<(String, &'static str)> {
+    let mut rows: Vec<(&'static str, String, &'static str)> = Vec::new();
+    for &(k, act) in KEYS {
+        let i = match rows.iter().position(|r| r.0 == act) {
+            Some(i) => i,
+            None => {
+                rows.push((act, String::new(), help_phrase(act)));
+                rows.len() - 1
+            }
+        };
+        if let Some(lab) = key_label(k) {
+            let keys = &mut rows[i].1;
+            if !keys.is_empty() {
+                keys.push_str(" / ");
+            }
+            keys.push_str(lab);
+        }
+    }
+    rows.into_iter().map(|(_, k, p)| (k, p)).collect()
+}
+
+impl Face {
+    /// The keys help is shown.
+    pub fn help_shown(&self) -> bool {
+        self.help
+    }
+    /// While the help shows, the pointer's buttons: a press is taken and ignored (no drag begins), its release or click
+    /// dismisses the help and is not applied (`Some(repaint)`); `None` for every other message, or with the help hidden.
+    fn help_input(&mut self, msg: &SMessage) -> Option<bool> {
+        if !self.help {
+            return None;
+        }
+        match msg {
+            SMessage::BrowserButton { down: true, .. } => {
+                self.buttons = true;
+                Some(false)
+            }
+            SMessage::BrowserButton { down: false, .. } => {
+                self.help = false;
+                Some(true)
+            }
+            SMessage::BrowserClick(..) if !self.buttons => {
+                self.help = false;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+    /// The help over a painted canvas: the timeline band (`ruler_y..h`) filled BG, then [`help_rows`] in columns through
+    /// [`Labels`]; unchanged with labels off, with the help hidden, or a band under one line.
+    fn paint_help(&self, px: Vec<u8>, l: Layout) -> Vec<u8> {
+        let Some(style) = self.labels.as_ref() else { return px };
+        if !self.help || l.ruler_y >= l.h {
+            return px;
+        }
+        let (ascent, descent, gap) = style.metrics();
+        let pitch = (ascent + descent + gap).max(1.0);
+        let top = l.ruler_y as f32 + HELP_PAD;
+        let per = ((l.h as f32 - top) / pitch).floor().max(0.0) as usize;
+        if per == 0 {
+            return px;
+        }
+        let rows = help_rows();
+        // The columns: (first row, keys width, phrase width), as many as the width holds, at least one.
+        let mut cols: Vec<(usize, f32, f32)> = Vec::new();
+        let (mut x, mut start) = (HELP_PAD, 0usize);
+        while start < rows.len() {
+            let chunk = &rows[start..(start + per).min(rows.len())];
+            let kw = chunk.iter().map(|r| style.width(&r.0)).fold(0.0f32, f32::max);
+            let pw = chunk.iter().map(|r| style.width(r.1)).fold(0.0f32, f32::max);
+            if !cols.is_empty() && x + kw + HELP_KEY_GAP + pw > l.w as f32 {
+                break;
+            }
+            cols.push((start, kw, pw));
+            x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
+            start += per;
+        }
+        let cut = start < rows.len();
+        let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
+        c.rect(0, l.ruler_y as i64, l.w as i64, l.h as i64, view::BG);
+        let mut lab = Labels(style);
+        let mut x = HELP_PAD;
+        for (ci, &(first, kw, pw)) in cols.iter().enumerate() {
+            let end = (first + per).min(rows.len());
+            let clip = (x as i32, (x + kw + HELP_KEY_GAP + pw).ceil().min(l.w as f32) as i32);
+            for (n, (keys, phrase)) in rows[first..end].iter().enumerate() {
+                let baseline = top + ascent + n as f32 * pitch;
+                if cut && ci + 1 == cols.len() && first + n + 1 == end {
+                    view::Text::text(&mut lab, &mut c, "…", x, baseline, clip);
+                } else {
+                    view::Text::text(&mut lab, &mut c, keys, x, baseline, clip);
+                    view::Text::text(&mut lab, &mut c, phrase, x + kw + HELP_KEY_GAP, baseline, clip);
+                }
+            }
+            x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
+        }
+        c.px
+    }
 }
