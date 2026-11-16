@@ -7,9 +7,12 @@
 //! run's `Encoder::stats` at the same rate: the two-pass total within 2% of the target, its P pictures' bits no more spread than
 //! CBR's, and both decode through h264_core to the reconstruction byte for byte; (c) `Encoder::stats` holds one record per coded
 //! picture with the access unit's bits and type, under B pictures and constant QP too; a plan needs `RcMode::TwoPass`.
+//! H264ENCTWOPASSFILE (LEDGER SR719): (d) the records round-trip byte-exact through `rc::write_stats` / `read_stats` (I, P and B);
+//! (e) a second pass planned from the read-back records codes the same bytes as one planned from the records in memory; (f) a
+//! truncated text, a wrong count, a wrong version, a bad kind and a tampered complexity refuse by name.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{PicStat, QP_MAX, QP_MIN, pass2_qps, step16};
+use h264enc_core::rc::{PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, pass2_qps, read_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -176,4 +179,86 @@ fn c_stats_one_record_per_picture() {
         (0..6).flat_map(|t| enc.encode(&frame(&scene(t))).unwrap().annexb()).collect::<Vec<u8>>()
     };
     assert_eq!(bytes(RateControl::two_pass(60, (FPS, 1))), bytes(RateControl::cbr(60, (FPS, 1))));
+}
+
+// ---- H264ENCTWOPASSFILE (LEDGER SR719): the first pass's records as text (named tail block) ----
+
+/// The CBR first pass of tests (b) at `kbps`: its records.
+fn first_pass(kbps: u32) -> Vec<PicStat> {
+    run(base(Some(RateControl::cbr(kbps, (FPS, 1)))), &[]).1
+}
+
+fn text_of(pics: &[PicStat]) -> String {
+    let mut s = String::new();
+    write_stats(pics, (FPS, 1), &mut s).unwrap();
+    s
+}
+
+#[test]
+fn d_stats_text_round_trips() {
+    // I and P from the CBR first pass; I, P and B from a reordered constant-QP stream.
+    let mut enc = Encoder::new(Config { bframes: 2, gop: 8, ..base(None) }).unwrap();
+    for t in 0..10 {
+        enc.push(&frame(&scene(t))).unwrap();
+    }
+    enc.flush().unwrap();
+    let with_b = enc.stats().to_vec();
+    assert!(with_b.iter().any(|p| p.kind == Pic::B));
+    for pics in [first_pass(60), with_b] {
+        let text = text_of(&pics);
+        assert!(text.starts_with(&format!("h264enc-stats v{STATS_VERSION} frames={} fps={FPS}/1\n", pics.len())), "{text}");
+        assert_eq!(text.lines().count(), pics.len() + 1);
+        let back = read_stats(&text).unwrap();
+        assert_eq!(back.fps, (FPS, 1));
+        assert_eq!(back.pics, pics);
+        assert_eq!(text_of(&back.pics), text, "write(read(text)) is the text byte for byte");
+    }
+}
+
+#[test]
+fn e_file_fed_pass2_equals_in_process() {
+    let bytes = |plan: &[PicStat]| {
+        let mut enc = Encoder::new(base(Some(RateControl::two_pass(60, (FPS, 1))))).unwrap().planned(plan).unwrap();
+        (0..N).flat_map(|t| enc.encode(&frame(&scene(t))).unwrap().annexb()).collect::<Vec<u8>>()
+    };
+    let stats = first_pass(60);
+    let read = read_stats(&text_of(&stats)).unwrap().pics;
+    let (mem, file) = (bytes(&stats), bytes(&read));
+    println!("twopass file pass2 bytes={} in-process bytes={}", file.len(), mem.len());
+    assert_eq!(file, mem, "a pass 2 from the stats text codes the in-process pass 2's bytes");
+}
+
+#[test]
+fn f_stats_refusals_by_name() {
+    let pics = first_pass(60);
+    let text = text_of(&pics);
+    let n = pics.len();
+    let lines: Vec<&str> = text.lines().collect();
+    let join = |l: &[String]| l.iter().map(|s| format!("{s}\n")).collect::<String>();
+    let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    // Truncated at a line end: the count; mid-line: that line.
+    assert_eq!(read_stats(&join(&owned[..n])), Err(StatsError::Count { header: n, lines: n - 1 }));
+    assert_eq!(read_stats(&text[..text.len() - 3]), Err(StatsError::Line(n + 1)));
+    // The header's count, version, shape.
+    let mut h = owned.clone();
+    h[0] = format!("h264enc-stats v{STATS_VERSION} frames={} fps={FPS}/1", n - 1);
+    assert_eq!(read_stats(&join(&h)), Err(StatsError::Count { header: n - 1, lines: n }));
+    h[0] = format!("h264enc-stats v{} frames={n} fps={FPS}/1", STATS_VERSION + 1);
+    assert_eq!(read_stats(&join(&h)), Err(StatsError::Header));
+    h[0] = format!("h264enc-stats v{STATS_VERSION} frames={n} fps={FPS}/0");
+    assert_eq!(read_stats(&join(&h)), Err(StatsError::Header));
+    assert_eq!(read_stats(""), Err(StatsError::Header));
+    // A kind other than I / P / B, a tampered complexity, a fifth field.
+    let mut k = owned.clone();
+    k[1].replace_range(0..1, "X");
+    let e = read_stats(&join(&k)).unwrap_err();
+    assert_eq!(e, StatsError::Line(2));
+    assert!(e.to_string().contains("bad line 2"), "{e}");
+    let mut c = owned.clone();
+    let f: Vec<u64> = c[2].split(' ').skip(1).map(|x| x.parse().unwrap()).collect();
+    c[2] = format!("{} {} {} {}", &owned[2][..1], f[0], f[1], f[2] + 1);
+    assert_eq!(read_stats(&join(&c)), Err(StatsError::Line(3)));
+    let mut x = owned.clone();
+    x[3].push_str(" 7");
+    assert_eq!(read_stats(&join(&x)), Err(StatsError::Line(4)));
 }
