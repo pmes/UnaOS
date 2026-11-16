@@ -667,3 +667,13 @@ impl VideoEncoder for Y4m {
         Layout::OneFile("y4m")
     }
 }
+
+// ---- H264ENCAQ (LEDGER SR693): the adaptive-quantisation option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// Adaptive quantisation per macroblock (h264enc_core's `Config::aq`, `nle export --aq [K]`): Some(k), k the strength in
+    /// tenths (10 = x264's 1.0); None = the pinned stream.
+    pub fn with_aq(mut self, k: Option<u8>) -> H264Encoder {
+        self.rgba.cfg.aq = k;
+        self
+    }
+}
