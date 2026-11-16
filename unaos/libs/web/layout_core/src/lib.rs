@@ -375,8 +375,8 @@ pub trait Fonts {
         ((lh - (a + d)) / 2.0).floor() + a
     }
     /// Breaks one run of an inline formatting context whose current line already holds `start_x` px
-    /// (`prior` = some of it is content). The default is [`lines::break_lines_from`] over [`Fonts::measure`].
-    fn break_lines(&self, text: &str, mode: &TextMode, adv: &Adv, max_w: f32, start_x: f32, prior: bool) -> Vec<Line> {
-        lines::break_lines_from(self, adv, text, mode, max_w, start_x, prior)
+    /// (`prior` = some of it is content); the first `first_n` lines (at least one) start at `start_x` (SR779: a float). The default is [`lines::break_lines_from`] over [`Fonts::measure`].
+    fn break_lines(&self, text: &str, mode: &TextMode, adv: &Adv, max_w: f32, start_x: f32, first_n: usize, prior: bool) -> Vec<Line> {
+        lines::break_lines_from(self, adv, text, mode, max_w, start_x, first_n, prior)
     }
 }

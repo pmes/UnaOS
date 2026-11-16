@@ -2843,7 +2843,7 @@ fn measure_text_run<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F)
         mode.white_space = 1;
     }
     let adv = run.advancer();
-    let lines = fonts.break_lines(&run.text, &mode, &adv, max_width, 0.0, false);
+    let lines = fonts.break_lines(&run.text, &mode, &adv, max_width, 0.0, 1, false);
     let widest = lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
     let lh = fonts.line_height(run.sel(), run.font_size, run.line_height);
     // A whitespace-only run that collapsed away is zero-sized.
@@ -3270,7 +3270,7 @@ fn rule_align_undo<H: Host>(tree: &mut LayoutTree<H>) {
 /// box's), read before pass 1 runs so `place_narrow_blocks` can keep a narrow block at an rtl column's inline start (the
 /// right edge, CSS 2.2 §10.3.3; taffy's START is always the physical left). A `dir` counts as set when `default_rtl`
 /// ignores the inherited value; anonymous boxes and text pass through to the parent.
-fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+pub fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
     let mut cur = Some(id);
     while let Some(b) = cur {
         if let Some(r) = tree.paint_map.get(&b).and_then(|p| p.rtl) {
@@ -3598,8 +3598,8 @@ fn img_alt_ids<H: Host>(tree: &LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<ta
 /// AETHERIMGALTINLINEICON (SR726): an InlineAlt img's (width, height): `measure_text_run` with the icon on the first
 /// line, the breaker's own `start_x` (the line already holds [`INLINE_ICON_ADVANCE`] px; `Line.width` excludes it, the
 /// next line starts at 0), so the widest line is the first line + the advance or a later line, and the box (icon
-/// included) stays inside the width SR707's `img_alt_cap` gives. Lines after the first are not indented (Chromium's
-/// float sits beside line 1 when the line is at least 16 px tall; AETHER-IMG-ALT-INLINE-ICON-FLOAT owed). A run with no
+/// included) stays inside the width SR707's `img_alt_cap` gives. Every line beside the 16 px float is indented, not only
+/// the first ([`icon_indents`], AETHERIMGALTINLINEICONFLOAT SR779: a line under 16 px tall indents line 2 too). A run with no
 /// face keeps `measure_text_run`'s rule (SR412).
 fn img_alt_measure<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) -> (f32, f32) {
     if !fonts.has_face(run.sel()) {
@@ -3609,8 +3609,8 @@ fn img_alt_measure<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) 
     if run.nowrap && mode.white_space == 0 {
         mode.white_space = 1;
     }
-    let lines = fonts.break_lines(&run.text, &mode, &run.advancer(), max_width, INLINE_ICON_ADVANCE, false);
-    let widest = lines.iter().enumerate().map(|(i, l)| if i == 0 { l.width + INLINE_ICON_ADVANCE } else { l.width }).fold(0.0f32, f32::max);
+    let n = icon_indents(fonts.line_height(run.sel(), run.font_size, run.line_height)); let lines = fonts.break_lines(&run.text, &mode, &run.advancer(), max_width, INLINE_ICON_ADVANCE, n, false);
+    let widest = lines.iter().enumerate().map(|(i, l)| if i < n { l.width + INLINE_ICON_ADVANCE } else { l.width }).fold(0.0f32, f32::max);
     let lh = fonts.line_height(run.sel(), run.font_size, run.line_height);
     (widest, lines.len().max(1) as f32 * lh)
 }
@@ -3640,12 +3640,69 @@ mod img_alt_inline_icon_kat {
         assert_eq!((wm, hm), (measure_text_run(&long, f32::MAX, &Mono).0 + 16.0, 16.0), "unbounded: one line + the icon");
         let (w, h) = img_alt_measure(&long, 120.0, &Mono);
         assert!(w <= 120.0 && w > 16.0, "the box with the icon fits the column: {w}");
-        let lines = Mono.break_lines(text, &TextMode::default(), &Adv::new(long.sel(), 16.0, 0.0), 120.0, INLINE_ICON_ADVANCE, false);
+        let lines = Mono.break_lines(text, &TextMode::default(), &Adv::new(long.sel(), 16.0, 0.0), 120.0, INLINE_ICON_ADVANCE, 1, false);
         assert!(lines.len() > 2 && lines[0].width + 16.0 <= 120.0, "line 1 shares the column with the icon");
         assert!(lines[1..].iter().all(|l| l.width <= 120.0), "later lines use the whole column");
         assert_eq!(h, lines.len() as f32 * 16.0, "the height is the lines");
         assert!(h >= measure_text_run(&long, 120.0, &Mono).1, "the indent never takes a line away");
         assert_eq!(img_alt_measure(&run("seventeen one"), 0.0, &Mono).0, 72.0 + 16.0, "min-content: the first word + the icon");
         assert_eq!(img_alt_measure(&run("one seventeen"), 0.0, &Mono).0, 72.0, "min-content: a wider later word");
+    }
+}
+
+// ---- AETHERIMGALTINLINEICONFLOAT (LEDGER SR779): the inline alt's icon is a 16 px float beside every line it spans (named tail block) ----
+
+/// AETHERIMGALTINLINEICONFLOAT (SR779): how many lines of an InlineAlt img's alt text sit beside the broken-image icon
+/// and so start [`INLINE_ICON_ADVANCE`] px in: Chromium's HTMLImageFallbackHelper floats the 16x16 icon (`float: left`
+/// for ltr, `right` otherwise, margin 0) and a float shortens every line box whose top is above its bottom, so at a
+/// `line_height` under 16 px line 2 is indented too: ceil(16 / line_height), at least 1 (1 for a zero, negative or NaN
+/// height). The measure (`img_alt_measure`) and both rings' paints (host `draw_text_from`, AETHER.ELF `image_alt_lines`)
+/// read this ONE count from their line height; in rtl the icon sits at the box's right edge and the same lines END
+/// 16 px early (their x is unchanged).
+pub fn icon_indents(line_height: f32) -> usize {
+    if line_height > 0.0 {
+        ((INLINE_ICON_ADVANCE / line_height).ceil() as usize).max(1)
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+mod img_alt_inline_icon_float_kat {
+    use super::img_alt_wrap_kat::Mono;
+    use super::{icon_indents, img_alt_measure, TextRun, INLINE_ICON_ADVANCE};
+    use crate::prelude::*;
+    use crate::{Adv, Fonts, TextMode};
+
+    /// A 16 px Mono run (8 px per char) on a `lh` px line (`line_height` -lh: px).
+    fn run(text: &str, lh: f32) -> TextRun {
+        TextRun { text: text.to_string(), font_size: 16.0, line_height: -lh, ..Default::default() }
+    }
+
+    /// The float's line count, the breaker's `first_n` and the measured box: at a 12 px line two lines start after the
+    /// icon (the third uses the whole column), at 16 px one (SR726's rule unchanged).
+    #[test]
+    fn img_alt_inline_icon_float_kat() {
+        assert_eq!(icon_indents(12.0), 2);
+        assert_eq!(icon_indents(16.0), 1);
+        assert_eq!(icon_indents(20.0), 1);
+        assert_eq!(icon_indents(8.0), 2);
+        assert_eq!(icon_indents(15.9), 2);
+        assert_eq!(icon_indents(0.0), 1);
+        let text = "aaaa bbbb cccc dddd eeee";
+        let adv = Adv::new(run(text, 12.0).sel(), 16.0, 0.0);
+        let two = Mono.break_lines(text, &TextMode::default(), &adv, 80.0, INLINE_ICON_ADVANCE, 2, false);
+        let texts: Vec<&str> = two.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["aaaa", "bbbb", "cccc dddd", "eeee"], "lines 1 and 2 beside the icon, line 3 the whole column");
+        assert!(two[..2].iter().all(|l| l.width + INLINE_ICON_ADVANCE <= 80.0), "the indented lines fit beside the icon");
+        let one = Mono.break_lines(text, &TextMode::default(), &adv, 80.0, INLINE_ICON_ADVANCE, 1, false);
+        let texts: Vec<&str> = one.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["aaaa", "bbbb cccc", "dddd eeee"], "first_n 1 is SR726's first-line-only rule");
+        assert_eq!(Mono.break_lines(text, &TextMode::default(), &adv, 80.0, INLINE_ICON_ADVANCE, 0, false), one, "first_n 0 holds line 1 as 1 does");
+        assert_eq!(img_alt_measure(&run(text, 12.0), 80.0, &Mono), (72.0, 4.0 * 12.0), "12 px lines: widest is line 3, four lines");
+        assert_eq!(img_alt_measure(&run(text, 16.0), 80.0, &Mono), (72.0, 3.0 * 16.0), "16 px lines: line 1 only, three lines");
+        assert_eq!(img_alt_measure(&run("seventeen one", 12.0), 0.0, &Mono).0, 72.0 + 16.0, "min-content: the first word + the icon");
+        assert_eq!(img_alt_measure(&run("one seventeen", 12.0), 0.0, &Mono).0, 72.0 + 16.0, "min-content at 12 px: line 2 is beside the icon too");
+        assert_eq!(img_alt_measure(&run("one seventeen", 16.0), 0.0, &Mono).0, 72.0, "min-content at 16 px: line 2 uses the whole column");
     }
 }

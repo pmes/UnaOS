@@ -703,7 +703,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                         continue;
                     }
                 }
-                let lines = ctx.fonts.break_lines(&run.text, &mode, &adv, line_w, cur_x, has_content);
+                let lines = ctx.fonts.break_lines(&run.text, &mode, &adv, line_w, cur_x, 1, has_content);
                 let preserved = matches!(mode.white_space, 2 | 3 | 5);
                 for (i, l) in lines.into_iter().enumerate() {
                     if i > 0 {
