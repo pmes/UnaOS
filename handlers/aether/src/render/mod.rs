@@ -13,6 +13,8 @@ struct Inherited {
     italic: bool,
     /// font-stretch, percent.
     stretch: u16,
+    /// AETHERFONTSYNTHESISPROPERTY (SR750): the inherited font-synthesis mask (`PaintStyle::no_synth`).
+    no_synth: u8,
     word_spacing: f32,
     /// direction: rtl
     rtl: bool,
@@ -45,7 +47,7 @@ use crate::layout::default_font_size;
 
 impl Inherited {
     fn sel(&self) -> FontSel {
-        FontSel { family: self.family, weight: self.weight, italic: self.italic, stretch: self.stretch }
+        FontSel { family: self.family, weight: self.weight, italic: self.italic, stretch: self.stretch, no_synth: self.no_synth }
     }
     /// The measurer/shaper of this text: face stack, size, spacing, direction.
     fn advancer(&self) -> Advancer {
@@ -477,6 +479,7 @@ fn root_inherited() -> Inherited {
         weight: 400,
         italic: false,
         stretch: 100,
+        no_synth: 0,
         word_spacing: 0.0,
         rtl: false,
         text_shadow: None,
@@ -1013,6 +1016,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(st) = spec.stretch {
         inherited.stretch = st;
     }
+    inherited.no_synth = spec.no_synth(inherited.no_synth);
     if let Some(ws) = spec.word_spacing {
         inherited.word_spacing = ws;
     }

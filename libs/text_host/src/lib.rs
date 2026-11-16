@@ -623,3 +623,29 @@ mod fallbacksynthstylematch_tests {
         }
     }
 }
+
+// ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): an installed face's twin with other synthesis flags (named tail block) ----
+
+/// AETHERFONTSYNTHESISPROPERTY (SR750): the loaded-face-cache twin of an installed `face` with the synthesis flags
+/// (`bold`, `oblique`): the same file, index and instance coords keyed with the new flags in the ONE loaded-face cache
+/// ([`load_face_synth`] / [`load_face_instance`]'s), so it keeps fontconfig's per-face hinting ([`is_installed`]) and,
+/// with both flags false, is the very object an unsynthesized selection loads; built from the same (instanced) font
+/// when that key is not loaded yet. None when `face` is not an installed face (`@font-face`, a fallback twin).
+pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<&'static Face> {
+    let mut m = faces_loaded().lock().ok()?;
+    let (path, index, _, _, coords) = m.iter().find(|(_, f)| f.id == face.id)?.0.clone();
+    let key = (path, index, bold, oblique, coords);
+    if let Some(f) = m.get(&key) {
+        return Some(*f);
+    }
+    let twin: &'static Face = Box::leak(Box::new(Face {
+        id: next_face_id(),
+        font: face.font,
+        synth_bold: bold,
+        synth_oblique: oblique,
+        family: face.family.clone(),
+        style: face.style,
+    }));
+    m.insert(key, twin);
+    Some(twin)
+}

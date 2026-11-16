@@ -1391,6 +1391,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.stretch = Some(p);
             }
         }
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" => apply_font_synthesis(prop, value, &mut style.paint),
         // css-text-3 §7.1
         "word-spacing" => {
             if value == "normal" {
@@ -2592,7 +2593,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset,
+        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
@@ -3480,3 +3481,52 @@ fn hex_color(hex: &str) -> Option<(u8, u8, u8)> {
     }
 }
 
+// ---- AETHERFONTSYNTHESISPROPERTY (LEDGER SR750): css-fonts-4 §6 font-synthesis and its weight / style longhands (named tail block) ----
+
+/// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 `font-synthesis: none | [weight || style || small-caps]` (the
+/// shorthand: a keyword it omits sets that longhand to `none`; `small-caps` is parsed and ignored, Aether has no
+/// small-caps synthesis) and the `font-synthesis-weight` / `font-synthesis-style` longhands (`auto | none`), into
+/// `PaintStyle::synth_weight` / `synth_style` (Some(true) = auto). `initial` is `weight style` / `auto`; an invalid
+/// value, `inherit` and `unset` change nothing (the property inherits). `font` does not reset it (css-fonts-4 §2.8's
+/// reset list omits it; Chromium's `font` longhands too).
+fn apply_font_synthesis<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
+    let v = value.trim().to_ascii_lowercase();
+    let auto = |s: &str| match s {
+        "auto" | "initial" => Some(true),
+        "none" => Some(false),
+        _ => None,
+    };
+    let (w, s) = match prop {
+        "font-synthesis-weight" => (auto(&v), None),
+        "font-synthesis-style" => (None, auto(&v)),
+        _ => match v.as_str() {
+            "initial" => (Some(true), Some(true)),
+            "none" => (Some(false), Some(false)),
+            _ => {
+                let (mut w, mut s, mut c) = (false, false, false);
+                for k in v.split_whitespace() {
+                    let seen = match k {
+                        "weight" => &mut w,
+                        "style" => &mut s,
+                        "small-caps" => &mut c,
+                        _ => return,
+                    };
+                    if *seen {
+                        return;
+                    }
+                    *seen = true;
+                }
+                if !(w || s || c) {
+                    return;
+                }
+                (Some(w), Some(s))
+            }
+        },
+    };
+    if w.is_some() {
+        paint.synth_weight = w;
+    }
+    if s.is_some() {
+        paint.synth_style = s;
+    }
+}

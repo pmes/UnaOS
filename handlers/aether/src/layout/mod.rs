@@ -484,7 +484,7 @@ impl layout_core::Dom for NodeRef {
 pub struct HostFonts;
 
 fn sel_of(s: FontSel) -> crate::fonts::FontSel {
-    crate::fonts::FontSel { family: s.family, weight: s.weight, italic: s.italic, stretch: s.stretch }
+    crate::fonts::FontSel { family: s.family, weight: s.weight, italic: s.italic, stretch: s.stretch, no_synth: 0 }
 }
 
 fn advancer_of(a: &Adv) -> crate::fonts::lines::Advancer {
