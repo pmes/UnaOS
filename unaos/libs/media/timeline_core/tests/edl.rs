@@ -205,3 +205,68 @@ fn nlesizepolicy_blit_policy_samples_by_the_place() {
     c.blit_fit(&s, 0, 0, 2, 2);
     assert_eq!(c.px.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect::<Vec<_>>(), paint(SizePolicy::Letterbox, Order::Rgba));
 }
+
+// ---- NLEWIPES (LEDGER SR679): the `* UNA EASE` line (named tail block) ----
+
+/// V1: A[0,20)@0, B[0,20)@20, a 5-tick dissolve on the cut eased `e`.
+fn nlewipes_eased(e: timeline_core::Ease) -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    let mut tl = tl.add_transition(0, 20, timeline_core::TransitionKind::Dissolve, 5).unwrap();
+    tl.tracks[0].transitions[0].ease = e;
+    tl
+}
+
+const NLEWIPES_EASED: &str = "TITLE: EASE
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE A 00:00:02:00
+* UNA SOURCE B 00:00:02:00
+
+001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20
+002  A        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20
+002  B        V     D    005 00:00:00:00 00:00:00:20 00:00:00:20 00:00:01:15
+* UNA EASE inout
+";
+
+#[test]
+fn nlewipes_the_ease_line_round_trips_byte_exact() {
+    use timeline_core::Ease;
+    let tl = nlewipes_eased(Ease::InOut);
+    let text = edl::write(&tl, "EASE").unwrap();
+    assert_eq!(text, NLEWIPES_EASED);
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!((back.tracks[0].transitions[0].ease, &back), (Ease::InOut, &tl));
+    assert_eq!(edl::write(&back, "EASE").unwrap(), text);
+    for e in [Ease::In, Ease::Out] {
+        let t = edl::write(&nlewipes_eased(e), "EASE").unwrap();
+        assert!(t.ends_with(&format!("* UNA EASE {}\n", e.name())), "{t}");
+        assert_eq!(edl::parse(&t, 25).unwrap(), nlewipes_eased(e));
+    }
+    // a linear transition writes no EASE line: the text is the one before NLEWIPES
+    assert_eq!(edl::write(&nlewipes_eased(Ease::Linear), "EASE").unwrap(), NLEWIPES_EASED.replace("* UNA EASE inout\n", ""));
+    // a to-black carries it after its BL line
+    let mut tb = Timeline::new(25);
+    let a = tb.add_source("A", 50);
+    tb.add_track(Kind::Video);
+    tb.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    let mut tb = tb.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 5).unwrap();
+    tb.tracks[0].transitions[0].ease = Ease::Out;
+    let t = edl::write(&tb, "TB").unwrap();
+    assert!(t.ends_with("002  BL       V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00\n* UNA EASE out\n"), "{t}");
+    assert_eq!(edl::parse(&t, 25).unwrap(), tb);
+}
+
+#[test]
+fn nlewipes_ease_refusals_are_named() {
+    // the EASE line is line 10; an unknown word, the word `linear`, a second EASE, and one under no transition line
+    let swap = |to: &str| NLEWIPES_EASED.replace("* UNA EASE inout\n", to);
+    assert_eq!(edl::parse(&swap("* UNA EASE bounce\n"), 25), Err(EdlError::Syntax { line: 10 }));
+    assert_eq!(edl::parse(&swap("* UNA EASE linear\n"), 25), Err(EdlError::Syntax { line: 10 }));
+    assert_eq!(edl::parse(&swap("* UNA EASE in\n* UNA EASE out\n"), 25), Err(EdlError::Syntax { line: 11 }));
+    let orphan = NLEWIPES_EASED.replace("001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n", "001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n* UNA EASE in\n");
+    assert_eq!(edl::parse(&orphan, 25), Err(EdlError::Syntax { line: 8 }));
+}

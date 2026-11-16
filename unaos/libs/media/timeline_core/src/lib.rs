@@ -171,6 +171,44 @@ pub enum WipeDir {
     ClockSix,
     /// NLE3cBLACK `W204` (clockWipe clockwiseNine): from nine o'clock.
     ClockNine,
+    /// NLEWIPES (LEDGER SR679) `W007` (fourBoxWipe cornersIn): four boxes growing from the four corners, each to its quadrant.
+    FourBoxCornersIn,
+    /// NLEWIPES `W023` (boxWipe topCenter): a box growing from the top edge's midpoint.
+    EdgeBoxTop,
+    /// NLEWIPES `W024` (boxWipe rightCenter): from the right edge's midpoint.
+    EdgeBoxRight,
+    /// NLEWIPES `W025` (boxWipe bottomCenter): from the bottom edge's midpoint.
+    EdgeBoxBottom,
+    /// NLEWIPES `W026` (boxWipe leftCenter): from the left edge's midpoint.
+    EdgeBoxLeft,
+    /// NLEWIPES `W043` (bowTieWipe vertical): triangles on the top and bottom edges closing to the hourglass at t = 1/2.
+    BowTieVertical,
+    /// NLEWIPES `W044` (bowTieWipe horizontal): triangles on the left and right edges.
+    BowTieHorizontal,
+    /// NLEWIPES `W045` (barnDoorWipe diagonalBottomLeft): a band opening about the bottom-left to top-right diagonal.
+    BarnDoorDiagonalBottomLeft,
+    /// NLEWIPES `W046` (barnDoorWipe diagonalTopLeft): a band opening about the top-left to bottom-right diagonal.
+    BarnDoorDiagonalTopLeft,
+    /// NLEWIPES `W047` (miscDiagonalWipe doubleBarnDoor): both diagonal bands at once.
+    DoubleBarnDoor,
+    /// NLEWIPES `W102` (irisWipe diamond): a centred diamond growing to the corners.
+    Diamond,
+    /// NLEWIPES `W119` (ellipseWipe circle): a centred circle growing to the corners.
+    Circle,
+    /// NLEWIPES `W205` (pinWheelWipe twoBladeVertical): two hands from twelve and six, clockwise.
+    PinWheelTwoVertical,
+    /// NLEWIPES `W206` (pinWheelWipe twoBladeHorizontal): two hands from three and nine, clockwise.
+    PinWheelTwoHorizontal,
+    /// NLEWIPES `W207` (pinWheelWipe fourBlade): four hands from twelve, three, six and nine, clockwise.
+    PinWheelFour,
+    /// NLEWIPES `W211` (fanWipe centerTop): a fan about the centre opening both ways from twelve o'clock.
+    FanCenterTop,
+    /// NLEWIPES `W212` (fanWipe centerRight): from three o'clock.
+    FanCenterRight,
+    /// NLEWIPES `W213` (doubleFanWipe fanOutVertical): two fans about the centre opening from twelve and six.
+    DoubleFanVertical,
+    /// NLEWIPES `W214` (doubleFanWipe fanOutHorizontal): from three and nine.
+    DoubleFanHorizontal,
 }
 
 impl WipeDir {
@@ -192,6 +230,25 @@ impl WipeDir {
             WipeDir::ClockThree => 202,
             WipeDir::ClockSix => 203,
             WipeDir::ClockNine => 204,
+            WipeDir::FourBoxCornersIn => 7,
+            WipeDir::EdgeBoxTop => 23,
+            WipeDir::EdgeBoxRight => 24,
+            WipeDir::EdgeBoxBottom => 25,
+            WipeDir::EdgeBoxLeft => 26,
+            WipeDir::BowTieVertical => 43,
+            WipeDir::BowTieHorizontal => 44,
+            WipeDir::BarnDoorDiagonalBottomLeft => 45,
+            WipeDir::BarnDoorDiagonalTopLeft => 46,
+            WipeDir::DoubleBarnDoor => 47,
+            WipeDir::Diamond => 102,
+            WipeDir::Circle => 119,
+            WipeDir::PinWheelTwoVertical => 205,
+            WipeDir::PinWheelTwoHorizontal => 206,
+            WipeDir::PinWheelFour => 207,
+            WipeDir::FanCenterTop => 211,
+            WipeDir::FanCenterRight => 212,
+            WipeDir::DoubleFanVertical => 213,
+            WipeDir::DoubleFanHorizontal => 214,
         }
     }
     pub fn from_code(code: u16) -> Option<WipeDir> {
@@ -211,6 +268,25 @@ impl WipeDir {
             202 => Some(WipeDir::ClockThree),
             203 => Some(WipeDir::ClockSix),
             204 => Some(WipeDir::ClockNine),
+            7 => Some(WipeDir::FourBoxCornersIn),
+            23 => Some(WipeDir::EdgeBoxTop),
+            24 => Some(WipeDir::EdgeBoxRight),
+            25 => Some(WipeDir::EdgeBoxBottom),
+            26 => Some(WipeDir::EdgeBoxLeft),
+            43 => Some(WipeDir::BowTieVertical),
+            44 => Some(WipeDir::BowTieHorizontal),
+            45 => Some(WipeDir::BarnDoorDiagonalBottomLeft),
+            46 => Some(WipeDir::BarnDoorDiagonalTopLeft),
+            47 => Some(WipeDir::DoubleBarnDoor),
+            102 => Some(WipeDir::Diamond),
+            119 => Some(WipeDir::Circle),
+            205 => Some(WipeDir::PinWheelTwoVertical),
+            206 => Some(WipeDir::PinWheelTwoHorizontal),
+            207 => Some(WipeDir::PinWheelFour),
+            211 => Some(WipeDir::FanCenterTop),
+            212 => Some(WipeDir::FanCenterRight),
+            213 => Some(WipeDir::DoubleFanVertical),
+            214 => Some(WipeDir::DoubleFanHorizontal),
             _ => None,
         }
     }
@@ -236,6 +312,8 @@ pub struct Transition {
     /// NLE3cBLACK (SR323): the incoming is BLACK (CMX `BL` incoming line): no clip starts at `at`; the outgoing's handle
     /// fades / wipes out to black over `at..at + dur`, the black filling that gap of the track. Never with `from_black`.
     pub to_black: bool,
+    /// NLEWIPES (SR679): the easing curve the schedule applies ONCE to the incoming's weight `t` (Linear: unchanged).
+    pub ease: Ease,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,18 +520,19 @@ impl Timeline {
 
     /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
     pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false })
+        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false, ease: Ease::Linear })
     }
 
     /// NLE3c: put a transition FROM BLACK on the clip starting at tick `at` of `track` (no clip may end there).
     pub fn add_transition_from_black(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false })
+        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false, ease: Ease::Linear })
     }
 
     /// The one body of the two `add_transition` ops: replace whatever sits at `x.at`, keep `at` order, validate.
     fn put_transition(&self, track: usize, x: Transition) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let tr = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        let x = tr.transitions.iter().find(|y| y.at == x.at).map_or(x, |y| Transition { ease: y.ease, ..x }); // NLEWIPES (SR679): a re-put keeps its ease
         tr.transitions.retain(|y| y.at != x.at);
         tr.transitions.push(x);
         tr.transitions.sort_by_key(|y| y.at);
@@ -736,7 +815,7 @@ impl Timeline {
     /// NLE3cBLACK (LEDGER SR323): put a transition TO BLACK on the clip ending at tick `at_end` of `track` (no clip may
     /// start there): ticks `at_end..at_end + dur` show the outgoing's handle mixed with black, in the track's gap.
     pub fn add_transition_to_black(&self, track: usize, at_end: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true })
+        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true, ease: Ease::Linear })
     }
 }
 
@@ -891,5 +970,162 @@ impl Timeline {
         let mut tl = self.clone();
         tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?.size_policy = p;
         Ok(tl)
+    }
+}
+
+// ---- NLEWIPES (LEDGER SR679): the transition's easing curve and the SMPTE codes refused by name (named tail block) ----
+
+/// NLEWIPES (LEDGER SR679): a transition's easing curve over the incoming's weight `t` (the schedule's [`schedule::Frac`]),
+/// applied ONCE where the schedule makes `t` (`vmix_for`, `black_step`), so the dissolve weight and every wipe mask in
+/// both callers of [`vmix::mix_step`] read the eased value. Exact rationals, no float. The EDL's `* UNA EASE` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ease {
+    /// `t` itself (the default; no EDL line).
+    #[default]
+    Linear,
+    /// `t^2` (`* UNA EASE in`).
+    In,
+    /// `1 - (1 - t)^2` (`* UNA EASE out`).
+    Out,
+    /// smoothstep `3 t^2 - 2 t^3` (`* UNA EASE inout`).
+    InOut,
+}
+
+impl Ease {
+    /// Every curve, in the EDL's word order.
+    pub const ALL: [Ease; 4] = [Ease::Linear, Ease::In, Ease::Out, Ease::InOut];
+    /// The eased weight of `t = num / den` as an exact fraction (Linear returns `t` unchanged, the same `Frac`).
+    pub fn apply(self, t: schedule::Frac) -> schedule::Frac {
+        let (n, d) = (t.num, t.den);
+        match self {
+            Ease::Linear => t,
+            Ease::In => schedule::Frac { num: n * n, den: d * d },
+            Ease::Out => schedule::Frac { num: 2 * n * d - n * n, den: d * d },
+            Ease::InOut => schedule::Frac { num: 3 * n * n * d - 2 * n * n * n, den: d * d * d },
+        }
+    }
+    /// The EDL word (`linear` is never written).
+    pub fn name(self) -> &'static str {
+        match self {
+            Ease::Linear => "linear",
+            Ease::In => "in",
+            Ease::Out => "out",
+            Ease::InOut => "inout",
+        }
+    }
+    /// The curve a word names (ASCII case ignored).
+    pub fn from_name(s: &str) -> Option<Ease> {
+        Ease::ALL.into_iter().find(|e| e.name().eq_ignore_ascii_case(s))
+    }
+}
+
+impl WipeDir {
+    /// NLEWIPES (LEDGER SR679): the published SMPTE 258M codes (W3C SMIL 3.0 Transition Effects, Table 1) that
+    /// [`WipeDir::from_code`] REFUSES, each by its SMIL type / subtype: the illustration fixes a parameter the name does not
+    /// (where the boxes start, a vee's depth, a zig-zag's teeth, a polygon's proportions, a sweep's pivot, a matrix grid).
+    pub const REFUSED: &'static [(u16, &'static str)] = &[
+        (8, "fourBoxWipe cornersOut"),
+        (48, "miscDiagonalWipe doubleDiamond"),
+        (61, "veeWipe down"),
+        (62, "veeWipe left"),
+        (63, "veeWipe up"),
+        (64, "veeWipe right"),
+        (65, "barnVeeWipe down"),
+        (66, "barnVeeWipe left"),
+        (67, "barnVeeWipe up"),
+        (68, "barnVeeWipe right"),
+        (71, "zigZagWipe leftToRight"),
+        (72, "zigZagWipe topToBottom"),
+        (73, "barnZigZagWipe vertical"),
+        (74, "barnZigZagWipe horizontal"),
+        (103, "triangleWipe up"),
+        (104, "triangleWipe right"),
+        (105, "triangleWipe down"),
+        (106, "triangleWipe left"),
+        (107, "arrowHeadWipe up"),
+        (108, "arrowHeadWipe right"),
+        (109, "arrowHeadWipe down"),
+        (110, "arrowHeadWipe left"),
+        (111, "pentagonWipe up"),
+        (112, "pentagonWipe down"),
+        (113, "hexagonWipe horizontal"),
+        (114, "hexagonWipe vertical"),
+        (120, "ellipseWipe horizontal"),
+        (121, "ellipseWipe vertical"),
+        (122, "eyeWipe horizontal"),
+        (123, "eyeWipe vertical"),
+        (124, "roundRectWipe horizontal"),
+        (125, "roundRectWipe vertical"),
+        (127, "starWipe fourPoint"),
+        (128, "starWipe fivePoint"),
+        (129, "starWipe sixPoint"),
+        (130, "miscShapeWipe heart"),
+        (131, "miscShapeWipe keyhole"),
+        (221, "singleSweepWipe clockwiseTop"),
+        (222, "singleSweepWipe clockwiseRight"),
+        (223, "singleSweepWipe clockwiseBottom"),
+        (224, "singleSweepWipe clockwiseLeft"),
+        (225, "doubleSweepWipe parallelVertical"),
+        (226, "doubleSweepWipe parallelDiagonal"),
+        (227, "doubleSweepWipe oppositeVertical"),
+        (228, "doubleSweepWipe oppositeHorizontal"),
+        (231, "fanWipe top"),
+        (232, "fanWipe right"),
+        (233, "fanWipe bottom"),
+        (234, "fanWipe left"),
+        (235, "doubleFanWipe fanInVertical"),
+        (236, "doubleFanWipe fanInHorizontal"),
+        (241, "singleSweepWipe clockwiseTopLeft"),
+        (242, "singleSweepWipe counterClockwiseBottomLeft"),
+        (243, "singleSweepWipe clockwiseBottomRight"),
+        (244, "singleSweepWipe counterClockwiseTopRight"),
+        (245, "doubleSweepWipe parallelDiagonalTopLeft"),
+        (246, "doubleSweepWipe parallelDiagonalBottomLeft"),
+        (251, "saloonDoorWipe top"),
+        (252, "saloonDoorWipe left"),
+        (253, "saloonDoorWipe bottom"),
+        (254, "saloonDoorWipe right"),
+        (261, "windshieldWipe right"),
+        (262, "windshieldWipe up"),
+        (263, "windshieldWipe vertical"),
+        (264, "windshieldWipe horizontal"),
+        (301, "snakeWipe topLeftHorizontal"),
+        (302, "snakeWipe topLeftVertical"),
+        (303, "snakeWipe topLeftDiagonal"),
+        (304, "snakeWipe topRightDiagonal"),
+        (305, "snakeWipe bottomRightDiagonal"),
+        (306, "snakeWipe bottomLeftDiagonal"),
+        (310, "spiralWipe topLeftClockwise"),
+        (311, "spiralWipe topRightClockwise"),
+        (312, "spiralWipe bottomRightClockwise"),
+        (313, "spiralWipe bottomLeftClockwise"),
+        (314, "spiralWipe topLeftCounterClockwise"),
+        (315, "spiralWipe topRightCounterClockwise"),
+        (316, "spiralWipe bottomRightCounterClockwise"),
+        (317, "spiralWipe bottomLeftCounterClockwise"),
+        (320, "parallelSnakesWipe verticalTopSame"),
+        (321, "parallelSnakesWipe verticalBottomSame"),
+        (322, "parallelSnakesWipe verticalTopLeftOpposite"),
+        (323, "parallelSnakesWipe verticalBottomLeftOpposite"),
+        (324, "parallelSnakesWipe horizontalLeftSame"),
+        (325, "parallelSnakesWipe horizontalRightSame"),
+        (326, "parallelSnakesWipe horizontalTopLeftOpposite"),
+        (327, "parallelSnakesWipe horizontalTopRightOpposite"),
+        (328, "parallelSnakesWipe diagonalBottomLeftOpposite"),
+        (329, "parallelSnakesWipe diagonalTopLeftOpposite"),
+        (340, "boxSnakesWipe twoBoxTop"),
+        (341, "boxSnakesWipe twoBoxBottom"),
+        (342, "boxSnakesWipe twoBoxLeft"),
+        (343, "boxSnakesWipe twoBoxRight"),
+        (344, "boxSnakesWipe fourBoxVertical"),
+        (345, "boxSnakesWipe fourBoxHorizontal"),
+        (350, "waterfallWipe verticalLeft"),
+        (351, "waterfallWipe verticalRight"),
+        (352, "waterfallWipe horizontalLeft"),
+        (353, "waterfallWipe horizontalRight"),
+    ];
+    /// NLEWIPES: the SMIL type / subtype of a published code [`WipeDir::from_code`] refuses (`None`: built, or not in the table).
+    pub fn refused(code: u16) -> Option<&'static str> {
+        WipeDir::REFUSED.iter().find(|r| r.0 == code).map(|r| r.1)
     }
 }
