@@ -1580,7 +1580,7 @@ fn rescale_ua_margins<H: Host>(tree: &mut LayoutTree<H>, sizes: &NodeMap<f32>) {
 /// opportunity, an atomic box's width — plus its own padding and border.
 fn min_content_width<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, id: taffy::NodeId, text: &NodeMap<TextRun>, fonts: &F) -> f32 {
     if let Some(run) = text.get(&id) {
-        return measure_text_run(run, 0.0, fonts).0;
+        return if is_img_alt(tree, id) { img_alt_measure(run, 0.0, fonts).0 } else { measure_text_run(run, 0.0, fonts).0 };
     }
     let Ok(l) = tree.taffy.layout(id) else { return 0.0 };
     let edges = l.padding.left + l.padding.right + l.border.left + l.border.right;
@@ -2026,7 +2026,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
 /// formatting contexts), then the restores. `restore_widths` false leaves the block-width placeholders applied and
 /// returns them (a kept tree: see [`remeasure_kept`]); true restores them and returns nothing.
 fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, fonts: &F, restore_widths: bool) -> blockwidth::Saved {
-    let Prep { text_info, img_info, media_info, elem_info, root_fs, writing_saved, widths, collapsed, pct_nodes, has_tables } = prep;
+    let Prep { text_info, img_info, media_info, elem_info, root_fs, writing_saved, widths, collapsed, pct_nodes, has_tables } = prep; let alt_ids = img_alt_ids(tree, &text_info);
     let viewport = Size {
         width: AvailableSpace::Definite(tree.viewport.0),
         height: AvailableSpace::Definite(tree.viewport.1),
@@ -2063,7 +2063,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
                     AvailableSpace::MinContent => 0.0,
                     AvailableSpace::MaxContent => vw_cap,
                 });
-                let (w, h) = measure_text_run(run, wrap_width, fonts);
+                let (w, h) = if alt_ids.contains(&node_id) { img_alt_measure(run, wrap_width, fonts) } else { measure_text_run(run, wrap_width, fonts) };
                 Size { width: known.width.unwrap_or(w), height: known.height.unwrap_or(h) }
             })
         });
@@ -3385,7 +3385,7 @@ mod img_broken_icon_kat {
 /// the saved values for `img_alt_uncap` (the `mc_saved` shape).
 fn img_alt_cap<H: Host>(tree: &mut LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<(taffy::NodeId, LengthPercentageAuto)> {
     let mut saved = Vec::new();
-    let alts: Vec<taffy::NodeId> = text.keys().copied().filter(|id| tree.node_map.get(id).is_some_and(|n| n.is_element())).collect();
+    let alts = img_alt_ids(tree, text);
     for id in alts {
         let placed = tree.paint_map.get(&id).is_some_and(|p| matches!(p.position_kind, Some(2 | 3)) || p.float.is_some_and(|f| f != 0));
         if placed || !is_inline_level(tree, id) {
@@ -3452,7 +3452,7 @@ mod img_alt_wrap_kat {
     use taffy::style::LengthPercentageAuto;
 
     /// 8 px per char, ascent 12 / descent 4 / no gap: a 16 px line.
-    struct Mono;
+    pub(super) struct Mono;
     impl Fonts for Mono {
         fn has_face(&self, _sel: FontSel) -> bool {
             true
@@ -3573,5 +3573,79 @@ mod img_icon_only_kat {
         assert_eq!(img_fallback_src(None, None, true, f, w, h, false, false), ImgFallback::BoxedAlt { text: "".into(), frame: true, icon: true });
         assert_eq!(img_fallback_src(None, Some("T"), true, f, None, None, false, false), ImgFallback::InlineAlt("T".into()));
         assert_eq!(img_fallback_src(Some("Logo"), None, true, f, None, None, false, false), ImgFallback::InlineAlt("Logo".into()));
+    }
+}
+
+// ---- AETHERIMGALTINLINEICON (LEDGER SR726): the broken-image icon before inline alt text (named tail block) ----
+
+/// AETHERIMGALTINLINEICON (SR726): how far an InlineAlt img's FIRST line of alt text starts after its inline start:
+/// Chromium's HTMLImageFallbackHelper puts the 16x16 broken-image icon (`width=16 height=16`, inline `margin: 0px`,
+/// ShowBrokenImageIcon's `float: left` flow-root) before the #alttext span, and the represents-text container carries no
+/// border or padding, so the text flows past a 16 px float. Both rings paint [`BROKEN_ICON`] there (SR702's helpers).
+pub const INLINE_ICON_ADVANCE: f32 = 16.0;
+
+/// AETHERIMGALTINLINEICON (SR726): `id` is an InlineAlt img: an ELEMENT key of the text map (`resolve` files text
+/// nodes and, through `img_alt_extent`, those imgs only; SR707's rule).
+fn is_img_alt<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
+    tree.node_map.get(&id).is_some_and(|n| n.is_element())
+}
+
+/// AETHERIMGALTINLINEICON (SR726): every InlineAlt img among the keys of `text` ([`is_img_alt`]).
+fn img_alt_ids<H: Host>(tree: &LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<taffy::NodeId> {
+    text.keys().copied().filter(|&id| is_img_alt(tree, id)).collect()
+}
+
+/// AETHERIMGALTINLINEICON (SR726): an InlineAlt img's (width, height): `measure_text_run` with the icon on the first
+/// line, the breaker's own `start_x` (the line already holds [`INLINE_ICON_ADVANCE`] px; `Line.width` excludes it, the
+/// next line starts at 0), so the widest line is the first line + the advance or a later line, and the box (icon
+/// included) stays inside the width SR707's `img_alt_cap` gives. Lines after the first are not indented (Chromium's
+/// float sits beside line 1 when the line is at least 16 px tall; AETHER-IMG-ALT-INLINE-ICON-FLOAT owed). A run with no
+/// face keeps `measure_text_run`'s rule (SR412).
+fn img_alt_measure<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) -> (f32, f32) {
+    if !fonts.has_face(run.sel()) {
+        return measure_text_run(run, max_width, fonts);
+    }
+    let mut mode = run.mode;
+    if run.nowrap && mode.white_space == 0 {
+        mode.white_space = 1;
+    }
+    let lines = fonts.break_lines(&run.text, &mode, &run.advancer(), max_width, INLINE_ICON_ADVANCE, false);
+    let widest = lines.iter().enumerate().map(|(i, l)| if i == 0 { l.width + INLINE_ICON_ADVANCE } else { l.width }).fold(0.0f32, f32::max);
+    let lh = fonts.line_height(run.sel(), run.font_size, run.line_height);
+    (widest, lines.len().max(1) as f32 * lh)
+}
+
+#[cfg(test)]
+mod img_alt_inline_icon_kat {
+    use super::img_alt_wrap_kat::Mono;
+    use super::{img_alt_measure, measure_text_run, TextRun, INLINE_ICON_ADVANCE};
+    use crate::prelude::*;
+    use crate::{Adv, Fonts, TextMode};
+
+    fn run(text: &str) -> TextRun {
+        TextRun { text: text.to_string(), font_size: 16.0, ..Default::default() }
+    }
+
+    /// The icon's 16 px before the alt: "Hello" (5 x 8 px on SR707's `Mono`) is 40 + 16 wide, one 16 px line; unbounded,
+    /// a long alt is its one line + 16; at a 120 px column the first line holds the icon and every line fits; the
+    /// min-content width is the first word + 16 or the widest later word.
+    #[test]
+    fn img_alt_inline_icon_kat() {
+        assert_eq!(INLINE_ICON_ADVANCE, 16.0);
+        assert_eq!(img_alt_measure(&run("Hello"), f32::MAX, &Mono), (40.0 + 16.0, 16.0), "one line, the icon before it");
+        assert_eq!(img_alt_measure(&run("Hello"), 120.0, &Mono), (56.0, 16.0), "a short alt in a column");
+        let text = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let long = run(text);
+        let (wm, hm) = img_alt_measure(&long, f32::MAX, &Mono);
+        assert_eq!((wm, hm), (measure_text_run(&long, f32::MAX, &Mono).0 + 16.0, 16.0), "unbounded: one line + the icon");
+        let (w, h) = img_alt_measure(&long, 120.0, &Mono);
+        assert!(w <= 120.0 && w > 16.0, "the box with the icon fits the column: {w}");
+        let lines = Mono.break_lines(text, &TextMode::default(), &Adv::new(long.sel(), 16.0, 0.0), 120.0, INLINE_ICON_ADVANCE, false);
+        assert!(lines.len() > 2 && lines[0].width + 16.0 <= 120.0, "line 1 shares the column with the icon");
+        assert!(lines[1..].iter().all(|l| l.width <= 120.0), "later lines use the whole column");
+        assert_eq!(h, lines.len() as f32 * 16.0, "the height is the lines");
+        assert!(h >= measure_text_run(&long, 120.0, &Mono).1, "the indent never takes a line away");
+        assert_eq!(img_alt_measure(&run("seventeen one"), 0.0, &Mono).0, 72.0 + 16.0, "min-content: the first word + the icon");
+        assert_eq!(img_alt_measure(&run("one seventeen"), 0.0, &Mono).0, 72.0, "min-content: a wider later word");
     }
 }
