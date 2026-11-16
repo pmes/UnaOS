@@ -55,7 +55,7 @@ impl TextStyle {
         }
         if faces.is_empty() {
             let d = crate::db::db();
-            push(d.fallback_order().first().and_then(|&i| crate::load_face(&d.faces[i])), &mut faces);
+            push(d.fallback_order().first().and_then(|&i| crate::cover_face(&d.faces[i], want)), &mut faces);
         }
         faces
     }
