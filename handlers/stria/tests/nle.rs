@@ -1934,3 +1934,345 @@ fn nle5drangesave_a_mark_is_one_undoable_commit() {
     assert_eq!((face.marks(), face.export_range()), ((None, None), None));
     println!("nle5drangesave: in / out / undo / redo / mark out / refused / clear");
 }
+
+// ---- NLE5DRANGEKEYS (LEDGER SR735): Shift+I / O / X bind the editor's mark words through the face's KEYS (named tail block) ----
+
+/// A key as GTK sends it and as stria-view's `--do key:<k>` token builds it (`BrowserKey` + `BrowserText` for one char).
+fn nle5drangekeys_press(face: &mut Face, k: &str) -> bool {
+    let a = face.on(&bandy::SMessage::BrowserKey(k.to_string()));
+    let b = face.on(&bandy::SMessage::BrowserText(k.to_string()));
+    a || b
+}
+
+/// Shift+I at 5 and Shift+O at 15 set the export marks through the editor's ONE `mark in` / `mark out` words (one
+/// commit each); an out key before the in mark is refused by the editor's name and leaves the marks; Shift+X (AppKit:
+/// the text alone) clears them in one commit, undone by Ctrl+z; a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle5drangekeys_shift_i_o_x_drive_the_editor_mark_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(5);
+    assert!(nle5drangekeys_press(&mut face, "I"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), None), 1));
+    face.state.seek(15);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.last_error.take()), ((Some(5), Some(15)), 2, None));
+    face.state.seek(2);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!(face.last_error.take().as_deref(), Some("mark out: the in mark is not before the out mark"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), Some(15)), 2), "a refused mark leaves the marks");
+    assert!(face.on(&bandy::SMessage::BrowserText("X".into())));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.export_range()), ((None, None), 3, None));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+z".into())));
+    assert_eq!(face.marks(), (Some(5), Some(15)), "undo restores the cleared marks");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("I".into())), "a one-char key is read from the text only");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("Shift+I".into())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle5drangekeys: I / O / refused / X / undo");
+}
+
+/// The lower-case `i` / `o` stay SR208's clip trims: the timeline is the one `EditorState::verb("mark-in" / "mark-out")`
+/// makes at the same ticks, and the export marks are untouched.
+#[test]
+fn nle5drangekeys_lower_i_o_still_trim_the_clip() {
+    let (tl, src) = synth_fixture();
+    let mut want = EditorState::new(tl.clone());
+    want.select_at(0, 12).unwrap();
+    want.seek(13);
+    assert_eq!(want.verb("mark-in"), Some(Ok(())));
+    want.seek(18);
+    assert_eq!(want.verb("mark-out"), Some(Ok(())));
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(13);
+    assert!(nle5drangekeys_press(&mut face, "i"));
+    face.state.seek(18);
+    assert!(nle5drangekeys_press(&mut face, "o"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_ne!(face.state.timeline, tl, "the trims moved the clip");
+    assert_eq!((&face.state.timeline.tracks, face.marks()), (&want.timeline.tracks, (None, None)));
+    println!("nle5drangekeys: i / o still trim");
+}
+
+// ---- NLE3ESLIPFACE (LEDGER SR737): the face's one-frame slip / slide words, their keys (named tail block) ----
+
+/// The SR694 face over NLE1's fixture (V1: A[13,23)@0 B[0,10)@10 A[23,33)@25) with B selected, and its twin editor.
+fn nle3eslipface_pair() -> (Face, EditorState, Timeline) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 12).unwrap();
+    (face, twin, tl)
+}
+
+/// Rule: `slip+` / `slip-` / `slide-` are SR704's `slip 1` / `slip -1` / `slide -1` (one frame = one tick at the
+/// timeline's `1/fps`) through THE dispatch: the face's timeline equals a twin editor's after the numbered word; a slide
+/// carries the butted neighbour's out edge; undo restores the timeline.
+#[test]
+fn nle3eslipface_words_are_one_frame_of_the_editor_verbs() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert!(face.verb("slip+"));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, 1, 11, 10), "the source window moved one frame");
+    assert!(face.verb("slip-"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("slide-"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(&face.state.timeline.tracks[0].clips[..2], &[Clip::new(a, 13, 22, 0), Clip::new(b, 0, 10, 9)], "the neighbour follows");
+    assert!(face.verb("slide+"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, twin.timeline, "undo takes back the slide+");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: slip+ = slip 1, slide- = slide -1, undo restores");
+}
+
+/// The four text keys `,` `.` `<` `>` send the words (the same timelines); a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle3eslipface_keys_send_the_words() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    assert!(!nle3eslipface_press_text_only(&mut face, ","), "a one-char BrowserKey alone is not taken");
+    assert!(nle5drangekeys_press(&mut face, "."));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ","));
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle5drangekeys_press(&mut face, "<"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ">"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: , . < > send slip- slip+ slide- slide+");
+}
+
+/// A one-char key as `BrowserKey` alone (the face reads one-char keys from `BrowserText` only).
+fn nle3eslipface_press_text_only(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.to_string()))
+}
+
+/// Rule: with nothing selected the words are taken and refused by the editor's name on the message line
+/// (`EditError::NoClip`'s text through `Face::verb`'s `{v}: {e}` road); the timeline does not move.
+#[test]
+fn nle3eslipface_no_selection_names_the_refusal() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    for v in ["slip-", "slip+", "slide-", "slide+"] {
+        assert!(VERBS.contains(&v), "{v}");
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("nle3eslipface: no selection -> slip+: {}", EditError::NoClip);
+}
+
+// ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay — its rows, its toggle, the dismiss not applied, its paint (named tail block) ----
+use stria::nle_face::{HELP, Hit, KEYS, help_phrase, help_rows};
+
+fn nle5dkeyshelp_face(w: u32, h: u32, labels: bool) -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (w, h), PixelOrder::Rgba, labels)
+}
+
+/// The rows: one per KEYS action in KEYS order, every action has a non-empty phrase in HELP, and every KEYS row's key is
+/// in its action's row (`Space` for " "; an AppKit private-use alias only where the row names another key).
+#[test]
+fn nle5dkeyshelp_rows_cover_every_key() {
+    let mut acts: Vec<&str> = Vec::new();
+    for &(_, a) in KEYS {
+        if !acts.contains(&a) {
+            acts.push(a);
+        }
+    }
+    let rows = help_rows();
+    assert_eq!(rows.len(), acts.len());
+    for (i, &a) in acts.iter().enumerate() {
+        assert!(HELP.iter().any(|(x, _)| *x == a), "no phrase for {a}");
+        assert_eq!(rows[i].1, help_phrase(a));
+        assert!(!rows[i].1.is_empty(), "{a}");
+    }
+    for &(k, a) in KEYS {
+        let i = acts.iter().position(|x| *x == a).unwrap();
+        let first = k.chars().next().unwrap();
+        if k.chars().count() == 1 && ('\u{f700}'..='\u{f8ff}').contains(&first) {
+            assert!(!rows[i].0.is_empty(), "{a}: an alias with no named key");
+            continue;
+        }
+        let lab = if k == " " { "Space" } else { k };
+        assert!(rows[i].0.split(" / ").any(|x| x == lab), "{lab:?} not in {:?}", rows[i].0);
+    }
+    assert!(KEYS.contains(&("?", "help")));
+    println!("nle5dkeyshelp: rows={} keys={}", rows.len(), KEYS.len());
+}
+
+/// `?` (text) shows the help; a following `j` only dismisses it (no shuttle, the playhead still); `?` while shown hides it;
+/// a bare modifier and GTK's `Shift+question` are not taken and leave it shown; Escape dismisses; `help` is the one toggle.
+#[test]
+fn nle5dkeyshelp_keys_toggle_and_the_dismiss_is_not_applied() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let ph = f.state.playhead;
+    assert!(!f.help_shown());
+    assert!(!f.on(&bandy::SMessage::BrowserKey("?".into())), "a one-char BrowserKey alone is not taken");
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserText("j".into())));
+    assert_eq!((f.help_shown(), f.playing, f.rate, f.state.playhead), (false, false, 1, ph));
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(!f.on(&bandy::SMessage::BrowserKey("Shift+Shift_L".into())));
+    assert!(!f.on(&bandy::SMessage::BrowserKey("Shift+question".into())));
+    assert!(f.help_shown(), "an unbound key leaves the help shown");
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(!f.help_shown(), "? while shown hides it");
+    assert!(f.verb("help") && f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(!f.help_shown());
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    println!("nle5dkeyshelp: ? shows, j dismisses unapplied, Shift_L kept, Escape dismisses");
+}
+
+/// While shown, a press on a clip is taken and ignored (no drag), its release dismisses the help, the click after it is not
+/// applied (no seek, no selection).
+#[test]
+fn nle5dkeyshelp_click_dismisses_unapplied() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (x, y) = f.layout().point(0, 30);
+    assert!(matches!(f.layout().hit(&f.state.timeline, x, y), Hit::Clip(0, 2, _)));
+    assert!(f.verb("help"));
+    let (ph, sel) = (f.state.playhead, f.state.selection);
+    assert!(!f.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 }));
+    assert!(f.dragging().is_none());
+    assert!(f.on(&bandy::SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+    assert!(!f.help_shown());
+    f.on(&bandy::SMessage::BrowserClick(x, y, 0));
+    assert_eq!((f.state.playhead, f.state.selection), (ph, sel));
+    println!("nle5dkeyshelp: a click dismisses, playhead {ph} selection {sel:?} kept");
+}
+
+/// A labelled face paints the help over the timeline band (`ruler_y..h`) and nowhere else; a labels-off face paints
+/// byte-identical with the help on (no labels, no overlay).
+#[test]
+fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    let off = f.paint();
+    assert!(f.verb("help"));
+    let on = f.paint();
+    let cut = f.layout().ruler_y as usize * 640 * 4;
+    assert!(cut > 0 && cut < on.len());
+    assert_eq!(on[..cut], off[..cut], "the preview band is untouched");
+    assert_ne!(on[cut..], off[cut..], "the timeline band shows the help");
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let a = plain.paint();
+    assert!(plain.verb("help"));
+    assert_eq!(plain.paint(), a, "labels off: no overlay");
+    println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
+}
+
+// ---- NLE3ESLIPSTEP (LEDGER SR752): Ctrl / Cmd chords step SLIP_STEP frames through SR737's words (named tail block) ----
+use stria::nle_face::SLIP_STEP;
+
+/// A chord as GTK sends it: `BrowserKey` alone (no `BrowserText` under Ctrl / Meta).
+fn nle3eslipstep_chord(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.to_string()))
+}
+
+/// Rule: `Ctrl+period` is SR704's `slip 10` through THE dispatch (the face's timeline equals a twin editor's), its Meta
+/// twin the same, `Ctrl+comma` the step back, and the word `slip+10` the key's own road.
+#[test]
+fn nle3eslipstep_ctrl_period_slips_ten_frames() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"));
+    assert_eq!(twin.verb("slip 10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, SLIP_STEP, 10 + SLIP_STEP, 10), "the source window moved SLIP_STEP frames");
+    assert!(nle3eslipstep_chord(&mut face, "Meta+period"));
+    assert_eq!(twin.verb("slip 10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+comma"));
+    assert!(nle3eslipstep_chord(&mut face, "Meta+comma"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("slip+10"));
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, SLIP_STEP, 10 + SLIP_STEP, 10), "the word is the key's road");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipstep: Ctrl+period = slip {SLIP_STEP}, Ctrl+comma = slip -{SLIP_STEP}");
+}
+
+/// Rule: `Ctrl+Shift+less` (GTK's name for Ctrl+<) is `slide -10` with both butted neighbours following; `Ctrl+Shift+greater`
+/// takes it back; the Meta twin is the same. Fixture: V1 A[0,20)@0 B[0,10)@20 A[23,33)@30 (both of B's cuts butted).
+#[test]
+fn nle3eslipstep_ctrl_less_slides_ten_with_neighbours() {
+    let (mut tl, src) = synth_fixture();
+    let (a, b) = (SourceId(0), SourceId(1));
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 20), Clip::new(a, 23, 33, 30)];
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 22).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 22).unwrap();
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+Shift+less"));
+    assert_eq!(twin.verb("slide -10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 13, 33, 20)], "both neighbours follow");
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+Shift+greater"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+less"));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+greater"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipstep: Ctrl+Shift+less = slide -{SLIP_STEP}, the neighbours follow");
+}
+
+/// Rule: a coarse slip past the source's end is refused by the editor's name (`OutOfSource` through `Face::verb`'s
+/// `{v}: {e}` road) and the timeline does not move. B[0,10) over a 50-tick source: four steps reach [40,50), the fifth is out.
+#[test]
+fn nle3eslipstep_slip_past_the_source_is_refused_by_name() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    for _ in 0..4 {
+        assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"));
+    }
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, 40, 50, 10));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let before = face.state.timeline.clone();
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"), "the key is taken");
+    assert_eq!(face.last_error.take(), Some(format!("slip+10: {}", EditError::OutOfSource)));
+    assert_eq!(face.state.timeline, before);
+    println!("nle3eslipstep: slip+10 at [40,50) -> {}", EditError::OutOfSource);
+}
+
+/// The eight chords are KEYS rows (no VERBS word, no button); the help names both chords of each word with a phrase; a
+/// count other than SLIP_STEP is not a face word; SR737's one-frame `.` still slips exactly one frame.
+#[test]
+fn nle3eslipstep_help_and_the_one_frame_keys() {
+    let chords = [
+        ("Ctrl+comma", "Meta+comma", "slip-10"),
+        ("Ctrl+period", "Meta+period", "slip+10"),
+        ("Ctrl+Shift+less", "Meta+Shift+less", "slide-10"),
+        ("Ctrl+Shift+greater", "Meta+Shift+greater", "slide+10"),
+    ];
+    let rows = help_rows();
+    for (c, m, w) in chords {
+        assert!(KEYS.contains(&(c, w)) && KEYS.contains(&(m, w)), "{w}");
+        assert!(!VERBS.contains(&w), "{w}: a key's word, no button");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|k| k == c)).expect("a help row");
+        assert!(row.0.split(" / ").any(|k| k == m), "{:?}", row.0);
+        assert_eq!(row.1, help_phrase(w));
+        assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
+    }
+    let (mut face, _twin, tl) = nle3eslipface_pair();
+    for v in ["slip+7", "slip+10x", "slide-010x", "slip10"] {
+        assert!(!face.verb(v), "{v} is not a face word");
+    }
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle5drangekeys_press(&mut face, "."));
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(SourceId(1), 1, 11, 10), "one frame, unchanged");
+    println!("nle3eslipstep: help rows={} keys={}", rows.len(), KEYS.len());
+}
