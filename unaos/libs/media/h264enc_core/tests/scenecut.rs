@@ -243,7 +243,7 @@ fn h_bframes_flash_is_no_idr() {
 fn i_bframes_fade_cuts_at_the_first_stable_picture() {
     let fade = |t: usize| if t < 10 { scaled(100) } else if t < 22 { scaled(100 - (t as u32 - 9) * 100 / 12) } else { scaled(0) };
     let (aus, _) = encode_all(cfg(Some(40), 0), 50, &fade);
-    assert_eq!(keys(&aus, 0), vec![0, 17, 47], "bframes 0: SR709's one-frame form unchanged");
+    assert_eq!(keys(&aus, 0), vec![0, 18, 48], "bframes 0: SR709's one-frame form; SR740's ramp holds 17 (bias 23, x264 0.230) and cuts at 18 (bias 24, x264 0.243)");
     let (aus, recons) = encode_all(cfg(Some(40), 2), 50, &fade);
     let got = keys(&aus, 1);
     println!("scenecut i: bframes 2 fade 10..=21 to black keys {got:?}");
@@ -259,4 +259,46 @@ fn j_bframes_two_hard_cuts_three_apart_are_two_idrs() {
     println!("scenecut j: bframes 2 cuts at 10 and 13 keys {got:?}");
     assert_eq!(got, vec![0, 10, 13, 43], "two hard cuts stay two IDRs under the lookahead");
     decodes_to_recon("two cuts bframes 2", &aus, &recons);
+}
+
+// ---- H264ENCSCENECUTBIAS (LEDGER SR740): x264's scenecut bias ramp (named tail block) ----
+// Past min_keyint = gop / 4 the cut's bias ramps from k / 4 to k at gop (x264 slicetype.c `scenecut_internal`), so a cut asks
+// less the longer the GOP runs; inside gop / 4 SR680's rule stands whole (the bias the full k, the test inter > intra).
+
+#[test]
+fn k_scenecut_bias_ramps_from_a_quarter_to_k() {
+    use h264enc_core::scenecut_bias;
+    for (since, want) in [(0, 40), (6, 40), (7, 10), (15, 20), (17, 23), (18, 24), (20, 26), (29, 38), (30, 40), (99, 40)] {
+        assert_eq!(scenecut_bias(40, since, 30), want, "k 40 gop 30 since {since}");
+    }
+    for (since, want) in [(0, 100), (1, 25), (2, 50), (3, 75), (4, 100)] {
+        assert_eq!(scenecut_bias(100, since, 4), want, "k 100 gop 4 since {since}");
+    }
+    assert_eq!(scenecut_bias(40, 0, 0), 40, "gop 0: SR680's un-guarded path, the full k");
+}
+
+#[test]
+fn l_a_medium_step_is_refused_at_mid_gop_and_admitted_late() {
+    let mut signature = None;
+    for lift in 10..=24u8 {
+        let mut admit = [false; 2];
+        for (i, s) in [15usize, 27].into_iter().enumerate() {
+            let src = move |t: usize| if t < s { texture(0) } else { texture(lift) };
+            let (aus, _) = encode_all(cfg(Some(40), 0), 40, &src);
+            let got = keys(&aus, 0);
+            assert!(got == vec![0, s as u64] || got == vec![0, 30], "lift {lift} step at {s}: keys {got:?}");
+            admit[i] = got == vec![0, s as u64];
+        }
+        println!("scenecut l: lift {lift}: step at 15 (gop / 2) {}, at 27 {}", if admit[0] { "admitted" } else { "refused" }, if admit[1] { "admitted" } else { "refused" });
+        assert!(!admit[0] || admit[1], "lift {lift}: a step admitted at 15 is admitted at 27 (the ramp asks less later)");
+        if !admit[0] && admit[1] && signature.is_none() {
+            signature = Some(lift);
+        }
+    }
+    let lift = signature.expect("some medium step is refused at gop / 2 and admitted at 27 (SR680's step had one threshold past gop / 4)");
+    println!("scenecut l: lift {lift} is refused at 15, admitted at 27");
+    let src = move |t: usize| if t < 27 { texture(0) } else { texture(lift) };
+    let (aus, recons) = encode_all(cfg(Some(40), 0), 40, &src);
+    assert_eq!(keys(&aus, 0), vec![0, 27]);
+    decodes_to_recon("medium step at 27", &aus, &recons);
 }

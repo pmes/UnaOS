@@ -1390,10 +1390,29 @@ impl Encoder {
         v
     }
 
-    /// SR680's threshold of a picture at `display` with these costs: (fired, the un-guarded inter x 100 > (100 - k) x intra;
-    /// test, inter > intra within min_keyint = gop / 4 of the last IDR, else fired).
+    /// SR680's threshold of a picture at `display` with these costs: (fired, the un-guarded inter x 100 > (100 - kk) x intra, kk the
+    /// [`scenecut_bias`] ramp (H264ENCSCENECUTBIAS SR740); test, inter > intra within min_keyint = gop / 4 of the last IDR, else fired).
     fn scene_thresholds(&self, inter: u64, intra: u64, display: u64, k: u64) -> (bool, bool) {
-        let fired = inter * 100 > (100 - k) * intra;
-        (fired, if display - self.idr_display < (self.cfg.gop / 4) as u64 { inter > intra } else { fired })
+        let since = display - self.idr_display; let fired = inter * 100 > (100 - scenecut_bias(k, since, self.cfg.gop)) * intra;
+        (fired, if since < (self.cfg.gop / 4) as u64 { inter > intra } else { fired })
     }
+}
+
+// ---- H264ENCSCENECUTBIAS (LEDGER SR740): x264's scenecut bias ramp (named tail block) ----
+// x264 encoder/slicetype.c `scenecut_internal`: f_bias = f_thresh_min + (f_thresh_max - f_thresh_min) x (i_gop_size -
+// i_keyint_min) / (i_keyint_max - i_keyint_min), f_thresh_min = f_thresh_max x 0.25, a cut where pcost >= (1 - f_bias) x icost:
+// the longer the GOP runs the less a cut must change. Here THE min keyint is gop / 4 (x264's default is keyint_max / 10: owed
+// H264ENC-SCENECUT-KEYINT-MIN), inside it the test keeps SR680's inter > intra floor (x264 runs k / 16 .. k / 4 there), the
+// comparison stays SR680's `>` (x264 `>=`) and the bias is an integer floor (at most 1 percent below x264's float). Inside gop / 4
+// both values stay SR680's: the bias is the full k (`fired`, which SR709's fade rule reads) beside the inter > intra test.
+
+/// The scene-cut bias in percent of intra for threshold `k` (percent), `since` pictures past the last IDR, GOP length `gop`:
+/// k below gop / 4 (SR680's un-guarded k: SR709's fade rule reads it there, beside the caller's inter > intra floor), then k / 4
+/// at gop / 4 rising linearly to k at gop, k at or after gop (gop 0 included). Integer, one division.
+pub fn scenecut_bias(k: u64, since: u64, gop: u32) -> u64 {
+    let (m, g) = ((gop / 4) as u64, gop as u64);
+    if since >= g || since < m {
+        return k;
+    }
+    k * ((g - m) + 3 * (since - m)) / (4 * (g - m))
 }
