@@ -390,7 +390,7 @@ pub fn amvp(pic: &Picture, geo: &Geometry, ctx: &InterCtx, sh: &SliceHeader, b: 
 /// 8.5.3.3.3.1: the w x h luma prediction samples (14-bit intermediates, predSamplesLX) of the block at (xp, yp) with
 /// motion vector `mv` (quarter samples) from reference plane `r`; reference samples outside the picture are the
 /// nearest edge samples.
-pub fn luma_mc(r: &Plane, xp: i32, yp: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
+pub fn luma_mc_ref(r: &Plane, xp: i32, yp: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
     let (xf, yf) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let (xi, yi) = (xp + (mv[0] >> 2), yp + (mv[1] >> 2));
     let shift1 = bd.min(12) as i32 - 8;
@@ -423,7 +423,7 @@ pub fn luma_mc(r: &Plane, xp: i32, yp: i32, mv: [i32; 2], w: i32, h: i32, bd: u3
 /// 8.5.3.3.3.2: the w x h chroma prediction samples of the chroma block at (xc, yc) (chroma samples) with the chroma
 /// motion vector `mv` in eighth chroma samples (mvCLX: = mvLX at 4:2:0; HEVCREXT SR334: the caller scales mvLX by
 /// 2 / SubWidthC, 2 / SubHeightC, 8.5.3.2.10).
-pub fn chroma_mc(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
+pub fn chroma_mc_ref(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
     let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
     let (xi, yi) = (xc + (mv[0] >> 3), yc + (mv[1] >> 3));
     let shift1 = bd.min(12) as i32 - 8;
@@ -550,4 +550,84 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
 /// quarter-sample vector floored to a multiple of 4).
 pub fn int_mv(v: [i32; 2]) -> [i32; 2] {
     [(v[0] >> 2) << 2, (v[1] >> 2) << 2]
+}
+
+// ---- HEVCPERF (LEDGER SR687): padded-window separable motion compensation (named tail block) ----
+
+/// 8.5.3.3.3.1: the w x h luma prediction samples (14-bit intermediates, predSamplesLX) of the block at (xp, yp) with
+/// motion vector `mv` (quarter samples) from reference plane `r`; reference samples outside the picture are the
+/// nearest edge samples. HEVCPERF (SR687): the padded-window separable path, [`mc_block`]; [`luma_mc_ref`] is the
+/// per-sample clamped oracle it equals bit for bit.
+pub fn luma_mc(r: &Plane, xp: i32, yp: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
+    let (xf, yf) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
+    mc_block::<8>(r, xp + (mv[0] >> 2), yp + (mv[1] >> 2), &LUMA_FILTER[xf], &LUMA_FILTER[yf], xf != 0, yf != 0, w, h, bd, out);
+}
+
+/// 8.5.3.3.3.2: the w x h chroma prediction samples of the chroma block at (xc, yc) with the chroma motion vector `mv`
+/// in eighth chroma samples (the caller scales mvLX, 8.5.3.2.10). HEVCPERF (SR687): [`mc_block`]; [`chroma_mc_ref`]
+/// is the per-sample clamped oracle it equals bit for bit.
+pub fn chroma_mc(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, bd: u32, out: &mut [i32]) {
+    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
+    mc_block::<4>(r, xc + (mv[0] >> 3), yc + (mv[1] >> 3), &CHROMA_FILTER[xf], &CHROMA_FILTER[yf], xf != 0, yf != 0, w, h, bd, out);
+}
+
+/// The T-tap fractional interpolation of a w x h block whose integer-sample top-left in `r` is (xi, yi): ONE clamped
+/// read per sample of the (w + T - 1) x (h + T - 1) window into a local buffer (the nearest-edge rule of 8.5.3.3.3),
+/// then clamp-free taps: an integer copy (<< shift3), a 1-D pass (>> shift1), or the separable 2-D form, the
+/// horizontal pass over every window row into an i32 intermediate at shift1 then the vertical pass at shift2 = 6
+/// (i32 because the parser accepts 16-bit depths, where the intermediate exceeds i16). `hx` / `hy`: the horizontal
+/// / vertical fraction is non-zero. The same tap reads, sums and shifts as the `_ref` oracles.
+fn mc_block<const T: usize>(r: &Plane, xi: i32, yi: i32, fx: &[i32; T], fy: &[i32; T], hx: bool, hy: bool, w: i32, h: i32, bd: u32, out: &mut [i32]) {
+    let shift1 = bd.min(12) as i32 - 8;
+    let shift3 = (14 - bd as i32).max(2);
+    let o = T / 2 - 1;
+    let (w, h) = (w.max(0) as usize, h.max(0) as usize);
+    let (pw, ph) = (w + T - 1, h + T - 1);
+    let (mx, my) = (r.w as i32 - 1, r.h as i32 - 1);
+    let (ox, oy) = (xi - o as i32, yi - o as i32);
+    let mut buf = vec![0i32; pw * ph + if hx && hy { w * ph } else { 0 }];
+    let (pad, tmp) = buf.split_at_mut(pw * ph);
+    for j in 0..ph {
+        let row = &r.data[(oy + j as i32).clamp(0, my) as usize * r.w..][..r.w];
+        for (i, p) in pad[j * pw..(j + 1) * pw].iter_mut().enumerate() {
+            *p = row[(ox + i as i32).clamp(0, mx) as usize] as i32;
+        }
+    }
+    match (hx, hy) {
+        (false, false) => {
+            for y in 0..h {
+                for x in 0..w {
+                    out[y * w + x] = pad[(y + o) * pw + x + o] << shift3;
+                }
+            }
+        }
+        (true, false) => {
+            for y in 0..h {
+                for x in 0..w {
+                    let s = &pad[(y + o) * pw + x..][..T];
+                    out[y * w + x] = (0..T).map(|i| fx[i] * s[i]).sum::<i32>() >> shift1;
+                }
+            }
+        }
+        (false, true) => {
+            for y in 0..h {
+                for x in 0..w {
+                    out[y * w + x] = (0..T).map(|i| fy[i] * pad[(y + i) * pw + x + o]).sum::<i32>() >> shift1;
+                }
+            }
+        }
+        (true, true) => {
+            for j in 0..ph {
+                for x in 0..w {
+                    let s = &pad[j * pw + x..][..T];
+                    tmp[j * w + x] = (0..T).map(|i| fx[i] * s[i]).sum::<i32>() >> shift1;
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    out[y * w + x] = (0..T).map(|n| fy[n] * tmp[(y + n) * w + x]).sum::<i32>() >> 6;
+                }
+            }
+        }
+    }
 }
