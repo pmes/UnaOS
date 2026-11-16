@@ -803,7 +803,7 @@ impl ExportSink {
 }
 
 // ---- NLE5DCLITABLE (LEDGER SR718): the encoder table's H.264 options (named tail block) ----
-/// The H.264 options of [`video_named_with`] (`nle export --qp --gop --bitrate --crf --scenecut --aq --hrd --two-pass`).
+/// The H.264 options of [`video_named_with`] (`nle export --qp --gop --bitrate --crf --scenecut --min-keyint --aq --hrd --two-pass`).
 /// Default = [`video_named`]'s: QP 26, a one-second GOP, constant QP, every coding option off.
 #[derive(Debug, Clone)]
 pub struct H264Opts {
@@ -819,6 +819,8 @@ pub struct H264Opts {
     pub scenecut: Option<u8>,
     /// [`H264Encoder::with_aq`].
     pub aq: Option<u8>,
+    /// [`H264Encoder::with_min_keyint`] (H264ENCSCENECUTKEYINTMIN SR757); read with `scenecut` only.
+    pub min_keyint: Option<u32>,
     /// [`H264Encoder::with_hrd`], read on the CBR arm only (not under a constant quality or a second pass).
     pub hrd: bool,
     /// The first pass's records: with `bitrate`, the second pass of a two-pass export ([`H264Encoder::with_two_pass`]).
@@ -831,7 +833,7 @@ pub struct H264Opts {
 
 impl Default for H264Opts {
     fn default() -> H264Opts {
-        H264Opts { qp: 26, gop: None, bitrate: None, crf: None, scenecut: None, aq: None, hrd: false, two_pass_stats: None, qcomp: None, cplxblur: None }
+        H264Opts { qp: 26, gop: None, bitrate: None, crf: None, scenecut: None, aq: None, min_keyint: None, hrd: false, two_pass_stats: None, qcomp: None, cplxblur: None }
     }
 }
 
@@ -846,7 +848,7 @@ pub fn video_named_with(name: &str, tb: Timebase, opts: H264Opts) -> Option<Box<
         "i420" => Box::new(I420Raw::default()),
         "y4m" => Box::new(Y4m::new(den, num)),
         "h264" => {
-            let e = H264Encoder::new(opts.qp, opts.gop.unwrap_or((den / num).max(1))).with_scenecut(opts.scenecut).with_aq(opts.aq);
+            let e = H264Encoder::new(opts.qp, opts.gop.unwrap_or((den / num).max(1))).with_scenecut(opts.scenecut).with_aq(opts.aq).with_min_keyint(opts.min_keyint);
             Box::new(match (opts.bitrate, opts.crf, opts.two_pass_stats) {
                 (Some(k), _, Some(stats)) => e.with_pass2_opts(pass2_of(opts.qcomp, opts.cplxblur)).with_two_pass(k, den, num, stats),
                 (Some(k), _, None) => e.with_hrd(opts.hrd).with_bitrate(k, den, num),
@@ -922,5 +924,15 @@ pub fn audio_word(audio: &AudioOut) -> String {
         AudioOut::None => "none".to_string(),
         AudioOut::Aac(DEFAULT_AAC_KBPS) => "aac".to_string(),
         AudioOut::Aac(k) => format!("aac:{k}"),
+    }
+}
+
+// ---- H264ENCSCENECUTKEYINTMIN (LEDGER SR757): the min-keyint option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// The scene cut's min keyint (h264enc_core's `Config::min_keyint`, x264's `--min-keyint`, `nle export --min-keyint N`):
+    /// Some(n) clamped to 1..=gop / 2 + 1 as x264 clamps; None = gop / 4, the pinned stream. Unread without a scene cut.
+    pub fn with_min_keyint(mut self, n: Option<u32>) -> H264Encoder {
+        self.rgba.cfg.min_keyint = n;
+        self
     }
 }
