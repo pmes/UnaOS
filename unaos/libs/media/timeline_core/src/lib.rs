@@ -1415,3 +1415,70 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide (named tail block) ----
+// A SLIP slides the clip's source window under a fixed timeline position and length: no timeline tick moves, so its
+// transitions and audio crossfades stay where they are (the source-edge matcher `moved_cut` is not run: the slip changes
+// the very edges it keys on); a slip that eats the outgoing handle under its out-edge transition is refused `Handle` by
+// `validate` (no fit on a slip). A SLIDE moves the clip along its track while the previous clip's out edge and the next
+// clip's in edge follow (trim_out's and trim_in's rules), so the track's length and the clip's content stay; the two
+// touched cuts' transitions and explicit audio crossfades shift by the same delta (`ripple_trim`'s direct shift: the
+// matcher would refuse them, both cuts' source edges change), then `fit_trimmed` fits them to their room and ONE
+// `validate` judges. A neighbour whose source cannot follow is `OutOfSource` (`in_source`, the window rule at both ends);
+// `Handle` stays the transition's room. `validate` stays the one gate.
+impl Timeline {
+    /// NLE3ESLIP: slip clip `idx` of `track` by `delta` source ticks: `src_in` and `src_out` both move, `at` and the
+    /// length stay. Refused `OutOfSource` when the window leaves the source at either end.
+    pub fn slip(&self, track: usize, idx: usize, delta: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let c = clip_mut(&mut tl, track, idx)?;
+        c.src_in = c.src_in.saturating_add(delta);
+        c.src_out = c.src_out.saturating_add(delta);
+        let now = *c;
+        tl.in_source(now)?;
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE3ESLIP: slide clip `idx` of `track` by `delta` timeline ticks: the butted previous clip's out point and the
+    /// butted next clip's in point follow (a side with no butted neighbour is a plain move there, judged `Overlap` /
+    /// `Negative` as `move_clip` is); the transitions and explicit audio crossfades on the two cuts move with them and fit.
+    pub fn slide(&self, track: usize, idx: usize, delta: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let c = *clip_mut(&mut tl, track, idx)?;
+        let (cut_in, cut_out) = (c.at, c.end());
+        let tr = &mut tl.tracks[track];
+        if let Some(p) = idx.checked_sub(1).and_then(|i| tr.clips.get_mut(i)).filter(|p| p.end() == cut_in) {
+            p.src_out = p.src_out.saturating_add(delta);
+        }
+        if let Some(n) = tr.clips.get_mut(idx + 1).filter(|n| n.at == cut_out) {
+            n.at = n.at.saturating_add(delta);
+            n.src_in = n.src_in.saturating_add(delta);
+        }
+        tr.clips[idx].at = cut_in.saturating_add(delta);
+        for x in tr.transitions.iter_mut().filter(|x| x.at == cut_in || x.at == cut_out) {
+            x.at = x.at.saturating_add(delta);
+        }
+        for x in tl.audio_xfades.iter_mut().filter(|x| x.track == track && (x.at == cut_in || x.at == cut_out)) {
+            x.at = x.at.saturating_add(delta);
+        }
+        for i in [idx.checked_sub(1), Some(idx + 1)].into_iter().flatten() {
+            if let Some(&n) = tl.tracks[track].clips.get(i) {
+                tl.in_source(n)?;
+            }
+        }
+        tl.fit_trimmed(track, idx);
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE3ESLIP: the one window judge of slip and slide: `OutOfSource` when `c`'s source window leaves its source at
+    /// either end (`src_in < 0` or `src_out` past the duration).
+    fn in_source(&self, c: Clip) -> Result<(), EditError> {
+        let s = self.source(c.src).ok_or(EditError::NoSource)?;
+        if c.src_in < 0 || c.src_out > s.duration {
+            return Err(EditError::OutOfSource);
+        }
+        Ok(())
+    }
+}

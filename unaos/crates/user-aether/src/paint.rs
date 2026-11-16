@@ -618,7 +618,7 @@ const ALT_FRAME: (u8, u8, u8) = (192, 192, 192);
 /// top-left is (`x`, `y`) and whose bitmap `image_blit` did not draw: what layout_core's ONE rule `img_fallback_of` says
 /// (its state from `ImgHost::img_state`), over the content box (cx, cy, cw, ch). InlineAlt: the alt as the one line
 /// `img_alt_extent` sized the box by, at (cx, cy). BoxedAlt with `frame`: the 1px silver border on the content box's edges
-/// (when it is at least 2 x 2), the text after the 16px icon's empty slot at (cx + 2 + 16, cy + 2), clipped 1px in;
+/// (when it is at least 2 x 2), the text after the 16px icon's slot (`broken_icon` SR702) at (cx + 2 + 16, cy + 2), clipped 1px in;
 /// without `frame` the text at (cx, cy). The text is text-transformed (`ink.tt`) and drawn in the element's font and
 /// inherited colour, its baseline the half-leading rule `Fonts::baseline_offset` under the inherited line height (`ink.lh`)
 /// as the host's `draw_lines`, clipped to the (inset) content box; one line, never wrapped (AETHER-IMG-ALT-INLINE-WRAP owed).
@@ -630,7 +630,7 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     let (alt, tx, ty, inset) = match layout_core::img_fallback_of(cx.tree, id) {
         layout_core::ImgFallback::None => return,
         layout_core::ImgFallback::InlineAlt(t) => (t, bx, by, 0.0),
-        layout_core::ImgFallback::BoxedAlt { text, frame } => {
+        layout_core::ImgFallback::BoxedAlt { text, frame, icon } => {
             if frame && bw >= 2.0 && bh >= 2.0 {
                 let c = rgb(ALT_FRAME);
                 let (x0, y0, x1, y1) = (fl(bx), fl(by), fl(bx + bw), fl(by + bh));
@@ -639,6 +639,7 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
                 cv.fill(x0, y0 + 1, 1, y1 - y0 - 2, c);
                 cv.fill(x1 - 1, y0 + 1, 1, y1 - y0 - 2, c);
             }
+            if icon { broken_icon(cv, bx, by, bw, bh); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, bx + 2.0 + 16.0, by + 2.0, 1.0) } else { (text, bx, by, 0.0) }
         }
     };
@@ -656,4 +657,21 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
             cv.blend(gx, gy, color, cov);
         }
     });
+}
+
+// ---- AETHERIMGBROKENICON (LEDGER SR702): the broken-image icon in a boxed alt's slot, the host's paint_broken_icon (named tail block) ----
+
+/// AETHERIMGBROKENICON (SR702): `image_alt`'s BoxedAlt with `icon`: layout_core's ONE description `BROKEN_ICON`, each
+/// rect through `Canvas::fill` (opaque, in order) at the content box (bx, by, bw, bh) plus 2, 2, each rect cut to the
+/// container's padding box (the content box inset 1) as the host's `paint_broken_icon` clips it.
+fn broken_icon(cv: &mut Canvas, bx: f32, by: f32, bw: f32, bh: f32) {
+    let (cx0, cy0, cx1, cy1) = (fl(bx) + 1, fl(by) + 1, fl(bx + bw) - 1, fl(by + bh) - 1);
+    let (ox, oy) = (fl(bx) + 2, fl(by) + 2);
+    for r in layout_core::BROKEN_ICON {
+        let (x0, y0) = ((ox + r.x as i32).max(cx0), (oy + r.y as i32).max(cy0));
+        let (x1, y1) = ((ox + r.x as i32 + r.w as i32).min(cx1), (oy + r.y as i32 + r.h as i32).min(cy1));
+        if x1 > x0 && y1 > y0 {
+            cv.fill(x0, y0, x1 - x0, y1 - y0, rgb(r.fill));
+        }
+    }
 }
