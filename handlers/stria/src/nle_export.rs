@@ -751,7 +751,7 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
 
 // ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
 /// h264enc_core's per-picture first-pass record (`rc::PicStat`), named here so a face needs no h264enc_core dependency.
-pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
+pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, rescale_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
 
 impl H264Encoder {
     /// The second pass of a two-pass export (h264enc_core's `RcMode::TwoPass`, `nle export --two-pass`): a mean of `kbps` kbit/s

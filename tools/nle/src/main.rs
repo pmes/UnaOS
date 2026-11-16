@@ -30,7 +30,7 @@
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
 //! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP); `--crf` (0..=51,
 //! H264ENCVBRCRF SR383) a constant quality instead (h264enc_core's `RcMode::Crf`), exclusive with `--bitrate`. `--scenecut [K]`
-//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--pass 1 --stats <f>` / `--pass 2 --stats <f>` (H264ENCTWOPASSFILE SR719, with `--bitrate` and `--video h264`, x264's two-process form) split the two: pass 1 is the CBR export, its records written to `<f>` in h264enc_core's ONE stats text (`rc::write_stats`; `nle: two-pass pass1 pictures=<n> bytes=<b> stats=<f>`), pass 2 reads `<f>` (`rc::read_stats`, refused by name, and on an fps or picture count other than the timeline's) and plans the export from it (`nle: two-pass pass2 stats=<f> pictures=<n>`); `two_pass_of` / `pass2_stats` / `write_pass1`, file tail; `--hrd` (H264ENCHRD SR699, with `--bitrate`) signals the CBR bucket as the NAL HRD (VUI nal_hrd_parameters, buffering-period / pic-timing SEI, filler). `--audio aac` (or
+//! (H264ENCSCENECUT SR680) codes an IDR at a detected scene cut, K the threshold in percent (default 40); `--aq [K]` (H264ENCAQ SR693) adaptive quantisation per macroblock, K the strength in tenths (default 10, x264's 1.0); `--two-pass` (H264ENCTWOPASS SR698, with `--bitrate`) exports twice: a CBR first pass into `<dir>/pass1/` (removed after; `pass1_stats`, file tail), then the H.264 export planned from its per-picture records. `--pass 1 --stats <f>` / `--pass 2 --stats <f>` (H264ENCTWOPASSFILE SR719, with `--bitrate` and `--video h264`, x264's two-process form) split the two: pass 1 is the CBR export, its records written to `<f>` in h264enc_core's ONE stats text (`rc::write_stats`; `nle: two-pass pass1 pictures=<n> bytes=<b> stats=<f>`), pass 2 reads `<f>` (`rc::read_stats`, refused by name, and on an fps other than the timeline's; another picture count is rescaled to the range's, `rc::rescale_stats`, H264ENCTWOPASSRESCALE SR727, `nle: two-pass pass2 stats rescaled <m> -> <n>`) and plans the export from it (`nle: two-pass pass2 stats=<f> pictures=<n>`); `two_pass_of` / `pass2_stats` / `write_pass1`, file tail; `--hrd` (H264ENCHRD SR699, with `--bitrate`) signals the CBR bucket as the NAL HRD (VUI nal_hrd_parameters, buffering-period / pic-timing SEI, filler). `--audio aac` (or
 //! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
@@ -344,15 +344,13 @@ fn two_pass_of(two_pass: TwoPass, pass: Option<u8>, stats: Option<String>, bitra
 fn pass2_stats(two_pass: &TwoPass, tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Vec<stria::nle_export::PicStat> {
     let TwoPass::Pass2(f) = two_pass else { return pass1_stats(tl, range, sources, dir, qp, gop, kbps, scenecut, aq, container) };
     let text = std::fs::read_to_string(f).unwrap_or_else(|e| die(format!("{f}: {e}")));
-    let s = stria::nle_export::read_stats(&text).unwrap_or_else(|e| die(format!("{f}: {e}")));
+    let mut s = stria::nle_export::read_stats(&text).unwrap_or_else(|e| die(format!("{f}: {e}")));
     let fps = (tl.tb.den as u32, tl.tb.num as u32);
     if s.fps != fps {
         die(format!("{f}: fps {}/{}, the timeline {}/{}", s.fps.0, s.fps.1, fps.0, fps.1));
     }
     let frames = (range.end - range.start).max(0) as usize;
-    if s.pics.len() != frames {
-        die(format!("{f}: {} pictures, the export range {frames} frames", s.pics.len()));
-    }
+    if s.pics.len() != frames { eprintln!("nle: two-pass pass2 stats rescaled {} -> {frames}", s.pics.len()); s.pics = stria::nle_export::rescale_stats(&s.pics, frames); } // H264ENCTWOPASSRESCALE (SR727): another picture count plans from the curve resampled to the range's (rc::rescale_stats), not refused
     eprintln!("nle: two-pass pass2 stats={f} pictures={}", s.pics.len());
     s.pics
 }
