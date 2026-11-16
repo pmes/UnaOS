@@ -1391,3 +1391,153 @@ fn nlerawexport_adopt_reel_refused_raw_planar() {
     }
     println!("nlerawexport: adopt refused i420 + y4m (frame does not match); letterbox y4m 768x512 F25:1 x4 in {}", root.display());
 }
+
+// ---- NLEFACEEXPORT (LEDGER SR694): the editor face's export verb, its progress seam, busy, Esc and the band (named tail block) ----
+
+fn nlefaceexport_dir(name: &str) -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlefaceexport").join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
+
+fn nlefaceexport_face(tl: Timeline, src: Sources) -> Face {
+    Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+}
+
+/// Wait (bounded) until the paused job's reading is `want`.
+fn nlefaceexport_until(face: &Face, want: (u64, u64)) {
+    let t0 = std::time::Instant::now();
+    while face.export_progress() != Some(want) {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60), "reading {:?}, want {want:?}", face.export_progress());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn nlefaceexport_png_completes_with_its_message() {
+    let dir = nlefaceexport_dir("png");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.exporting());
+    assert!(face.wait_export());
+    assert!(!face.exporting() && face.export_progress().is_none());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes -> {}", dir.display())), "{line}");
+    for n in 0..35 {
+        assert!(dir.join(format!("{n:06}.png")).is_file(), "frame {n}");
+    }
+    assert!(!dir.join("000035.png").exists());
+    println!("nlefaceexport: {line}");
+}
+
+#[test]
+fn nlefaceexport_progress_is_monotone_and_the_seam_is_byte_identical() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as, export_as_with};
+    let (tl, src) = synth_fixture();
+    let (a, b) = (nlefaceexport_dir("seam-plain"), nlefaceexport_dir("seam-ticked"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let plain = export_as(&tl, 0..tl.end(), &src, &a, Box::new(PngSequence), AudioOut::Wav, Container::Mp4).unwrap();
+    let mut seen = Vec::new();
+    let ticked = export_as_with(&tl, 0..tl.end(), &src, &b, Box::new(PngSequence), AudioOut::Wav, Container::Mp4, &mut |n, t| {
+        seen.push((n, t));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(plain, ticked, "the progress seam changes no byte");
+    assert_eq!(seen, (1..=35).map(|n| (n, 35)).collect::<Vec<_>>(), "one reading per frame, total the range");
+
+    let dir = nlefaceexport_dir("poll");
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    let (mut last, mut polls) = ((0u64, 0u64), 0u32);
+    while face.exporting() {
+        if let Some(p) = face.export_progress() {
+            assert!(p.0 >= last.0 && p.1 >= last.1 && p.0 <= 35 && (p.1 == 0 || p.1 == 35), "{p:?} after {last:?}");
+            last = p;
+            polls += 1;
+        }
+        face.export_tick();
+        std::thread::yield_now();
+    }
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: 35 frames, ")));
+    println!("nlefaceexport: seam {} frames fnv {:016x} == export_as; {polls} polls monotone to {last:?}", ticked.frames, ticked.fnv);
+}
+
+#[test]
+fn nlefaceexport_busy_then_esc_cancels_with_the_partial_files_named() {
+    let (dir, other) = (nlefaceexport_dir("busy"), nlefaceexport_dir("busy-other"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert!(face.verb(&format!("export {} png", other.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: busy (3/35)"));
+    assert!(!other.exists(), "a busy refusal makes nothing");
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running export");
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the cancel line");
+    assert_eq!(line, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    for n in 0..3 {
+        assert!(dir.join(format!("{n:06}.png")).is_file(), "partial frame {n}");
+    }
+    assert!(!dir.join("000003.png").exists(), "nothing encoded after the cancel");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc with nothing running takes nothing");
+    println!("nlefaceexport: {line}");
+}
+
+#[test]
+fn nlefaceexport_refusals_are_named() {
+    let root = nlefaceexport_dir("refused");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let bad = file.join("sub");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", bad.display())));
+    let line = face.last_error.take().unwrap();
+    assert!(line.starts_with(&format!("export: {}: ", bad.display())), "{line}");
+    assert!(!face.exporting());
+    assert!(face.verb("export"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: no directory (no document path)"));
+    assert!(face.verb(&format!("export {} gif", root.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown format gif (h264|png|i420|y4m|raw)"));
+    assert!(!face.exporting());
+    println!("nlefaceexport: refused {line}");
+}
+
+#[test]
+fn nlefaceexport_band_paints_only_while_running() {
+    let dir = nlefaceexport_dir("band");
+    let (mut tl, src) = synth_fixture();
+    for t in &mut tl.tracks {
+        t.clips.truncate(2); // A[13,23)@0, B[0,10)@10: 20 ticks, so frame 10 is half
+    }
+    let mut face = nlefaceexport_face(tl, src);
+    let idle = face.paint();
+    let l = face.layout();
+    face.export_paused_at(&dir, "png", 10).unwrap();
+    nlefaceexport_until(&face, (10, 20));
+    let shown = face.paint();
+    let band = (l.tracks_y - stria::nle_face::EXPORT_BAND_H)..l.tracks_y;
+    let mut lit = 0;
+    for y in 0..l.h {
+        for x in 0..l.w {
+            let i = ((y * l.w + x) * 4) as usize;
+            if band.contains(&y) && x < l.w / 2 {
+                assert_eq!(&shown[i..i + 4], &timeline_core::view::GUIDE, "band pixel ({x},{y})");
+                lit += 1;
+            } else {
+                assert_eq!(&shown[i..i + 4], &idle[i..i + 4], "pixel ({x},{y}) outside the band");
+            }
+        }
+    }
+    assert_eq!(lit, l.w / 2 * stria::nle_face::EXPORT_BAND_H);
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: cancelled at 10/20 frames")));
+    assert_eq!(stria::nle_face::fnv1a(&face.paint()), stria::nle_face::fnv1a(&idle), "no band once the export is reported");
+    println!("nlefaceexport: band {lit} px at 10/20 rows {band:?}");
+}
