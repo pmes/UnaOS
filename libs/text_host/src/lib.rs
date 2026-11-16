@@ -168,7 +168,7 @@ pub fn installed_face_in(d: &db::FontDb, name: &str, want: Style) -> Option<&'st
 }
 
 /// Platform fallback for one character (`gfx::GetFontForCharacter`): the first face in fontconfig's
-/// `sans-serif` order whose cmap has it, as the style-matched face of its family.
+/// `sans-serif` order whose cmap has it, as the style-matched face of its family; select's pick drawn under the fallback road's absolute synthesis rule ([`cover_face`], AETHERFALLBACKSYNTHSTYLEMATCH SR755).
 pub fn platform_fallback_in(d: &db::FontDb, c: char, want: Style) -> Option<&'static Face> {
     for &i in d.fallback_order() {
         let info = &d.faces[i];
@@ -178,7 +178,7 @@ pub fn platform_fallback_in(d: &db::FontDb, c: char, want: Style) -> Option<&'st
         let Some(f) = load_face(info) else { continue };
         let picked = d
             .select(&info.families[0], want)
-            .and_then(|(k, b, o)| load_face_styled(d.faces.get(k)?, b, o, want, None))
+            .and_then(|(k, _, _)| cover_face(d.faces.get(k)?, want)) // AETHERFALLBACKSYNTHSTYLEMATCH (SR755): Chromium's fallback road synthesizes by the absolute rule, never select's +200
             .filter(|g| g.font.glyph_index(c) != 0);
         return picked.or_else(|| cover_face(info, want)).or(Some(f));
     }
@@ -553,5 +553,73 @@ mod fallbacksynth_tests {
         assert!(g.synth_bold && !g.synth_oblique);
         assert!(std::ptr::eq(g, load_face_synth(&s, true, false).unwrap()));
         assert!(std::ptr::eq(platform_fallback_in(&d, 'H', want(400.0)).unwrap(), load_face(&s).unwrap()));
+    }
+}
+
+// ---- AETHERFALLBACKSYNTHSTYLEMATCH (LEDGER SR755): the style-matched fallback face under the absolute rule (named tail block) ----
+
+#[cfg(test)]
+mod fallbacksynthstylematch_tests {
+    use super::*;
+
+    const STATIC: &str = "unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf";
+
+    fn want(weight: f32) -> Style {
+        Style { weight, ..Style::default() }
+    }
+
+    /// The static regular fixture as family "StyleFam" with one face per weight in `weights` (one file relabelled, so
+    /// every face loads the same plain / synthetic objects; which face select picks is asserted on its index).
+    fn family(weights: &[f32]) -> (FaceInfo, db::FontDb) {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(STATIC);
+        let mut s = db::faces_in_file(&p).into_iter().next().expect("the tree's static fixture face");
+        s.families = vec!["StyleFam".to_string()];
+        let faces = weights.iter().map(|&w| FaceInfo { style: Style { weight: w, ..s.style }, ..s.clone() }).collect();
+        (s, db::FontDb::from_faces(faces, crate::fontconfig::Config::default()))
+    }
+
+    /// Regular 400 + Bold 700 under fallback: select's pick is fontconfig's closest weight (600 and 900 the Bold, 500 the
+    /// Regular) and none is synthesized, as Chromium (a bold face is never emboldened; 500 is below kBoldThreshold).
+    #[test]
+    fn fallbacksynthstylematch_two_weight_family() {
+        let (s, d) = family(&[400.0, 700.0]);
+        let plain = load_face(&s).unwrap();
+        for (w, k) in [(600.0, 1), (500.0, 0), (900.0, 1)] {
+            assert_eq!(d.select("StyleFam", want(w)).map(|p| p.0), Some(k), "{w}");
+            let g = platform_fallback_in(&d, 'H', want(w)).unwrap();
+            assert!(std::ptr::eq(g, plain) && !g.synth_bold && !g.synth_oblique, "{w}");
+        }
+    }
+
+    /// A one-weight Regular family at 600 is synthetic bold on the fallback road (moved by SR755: select's +200 left it
+    /// plain; Chromium's fontconfig regular face is not bold and 600 meets kBoldThreshold); at 500 plain.
+    #[test]
+    fn fallbacksynthstylematch_one_weight_regular() {
+        let (s, d) = family(&[400.0]);
+        let g = platform_fallback_in(&d, 'H', want(600.0)).unwrap();
+        assert!(g.synth_bold && !g.synth_oblique);
+        assert!(std::ptr::eq(g, load_face_synth(&s, true, false).unwrap()));
+        assert!(std::ptr::eq(platform_fallback_in(&d, 'H', want(500.0)).unwrap(), load_face(&s).unwrap()));
+    }
+
+    /// Regular 400 + DemiBold 600 asked at 700: select picks the 600 face, and the fallback road emboldens it (moved by
+    /// SR755: 700 is not more than 200 over 600; a 600 face is below fontconfig bold, so Chromium synthesizes).
+    #[test]
+    fn fallbacksynthstylematch_demibold_at_700() {
+        let (s, d) = family(&[400.0, 600.0]);
+        assert_eq!(d.select("StyleFam", want(700.0)).map(|p| p.0), Some(1));
+        let g = platform_fallback_in(&d, 'H', want(700.0)).unwrap();
+        assert!(g.synth_bold && std::ptr::eq(g, load_face_synth(&s, true, false).unwrap()));
+    }
+
+    /// The primary road (`installed_face_in`, select's +200) at 600 is unchanged: the two-weight family's Bold and the
+    /// one-weight family's Regular, both plain.
+    #[test]
+    fn fallbacksynthstylematch_primary_road_unchanged() {
+        for weights in [&[400.0, 700.0][..], &[400.0][..]] {
+            let (s, d) = family(weights);
+            let g = installed_face_in(&d, "StyleFam", want(600.0)).unwrap();
+            assert!(std::ptr::eq(g, load_face(&s).unwrap()) && !g.synth_bold, "{weights:?}");
+        }
     }
 }
