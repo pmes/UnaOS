@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 19] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail)
+pub const VERBS: [&str; 23] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "slip-", "slip+", "slide-", "slide+"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -191,16 +191,13 @@ pub struct Face {
     play: PlayAudio,
     /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
     export: Option<ExportJob>,
-    /// NLE5DEXPORTRANGE (SR717): the export range's in / out marks (ticks; `in` / `out` at the playhead, in < out).
-    mark_in: Option<i64>,
-    mark_out: Option<i64>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), mark_in: None, mark_out: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -242,6 +239,7 @@ impl Face {
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
+            "slip-" | "slip+" | "slide-" | "slide+" => self.state.verb(&slipslide_word(v)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
                 None => return false,
@@ -368,6 +366,13 @@ pub const KEYS: &[(&str, &str)] = &[
     ("\u{f703}", "nudge+"),
     ("[", "["),
     ("]", "]"),
+    ("I", "mark in"), // NLE5DRANGEKEYS (SR735): Shift+i / Shift+o / Shift+x (text) bind the editor's export-mark words
+    ("O", "mark out"),
+    ("X", "mark clear"),
+    (",", "slip-"), // NLE3ESLIPFACE (SR737): , / . slip and < / > (Shift+, / Shift+.) slide the selected clip one frame (text keys, like [ / ])
+    (".", "slip+"),
+    ("<", "slide-"),
+    (">", "slide+"),
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -494,7 +499,7 @@ impl Face {
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
-            "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch
+            "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" | "mark in" | "mark out" | "mark clear" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch; NLE5DRANGEKEYS (SR735): the export marks
             "cancel" => return self.drag.take().is_some() || self.cancel_export(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
@@ -2232,7 +2237,7 @@ impl Face {
             _ => return None,
         };
         let ph = self.state.playhead;
-        let (mine, other) = if is_in { (self.mark_in, self.mark_out) } else { (self.mark_out, self.mark_in) };
+        let (a, b) = self.state.timeline.marks; let (mine, other) = if is_in { (a, b) } else { (b, a) }; // NLE5DRANGESAVE (SR723): the marks are the timeline's
         let set = if mine == Some(ph) {
             None
         } else {
@@ -2248,24 +2253,24 @@ impl Face {
                 _ => Some(ph),
             }
         };
-        if is_in { self.mark_in = set } else { self.mark_out = set }
+        if let Err(e) = self.state.set_marks(if is_in { (set, other) } else { (other, set) }) { self.last_error = Some(format!("{v}: {e}")); } // NLE5DRANGESAVE (SR723): one commit
         Some(true)
     }
     /// The marks `(in, out)` as set (either may be `None`).
     pub fn marks(&self) -> (Option<i64>, Option<i64>) {
-        (self.mark_in, self.mark_out)
+        self.state.timeline.marks // NLE5DRANGESAVE (SR723)
     }
     /// The range an `export` takes: `in..min(out, end)` when both marks are set; `None` (the whole timeline) otherwise.
     /// The range is empty when an edit shortened the timeline to the in mark or before it ([`Face::range_check`] refuses).
     pub fn export_range(&self) -> Option<std::ops::Range<i64>> {
-        match (self.mark_in, self.mark_out) {
+        match self.state.timeline.marks { // NLE5DRANGESAVE (SR723)
             (Some(a), Some(b)) => Some(a..b.min(self.state.timeline.end()).max(a)),
             _ => None,
         }
     }
     /// A marked range holding no tick of the timeline is refused by name (no directory made, no thread).
     fn range_check(&self, range: &Option<std::ops::Range<i64>>) -> Result<(), String> {
-        match (range, self.mark_in, self.mark_out) {
+        match (range, self.state.timeline.marks.0, self.state.timeline.marks.1) { // NLE5DRANGESAVE (SR723)
             (Some(r), Some(a), Some(b)) if r.is_empty() => Err(format!("the marks {a}..{b} are past the timeline's end {}", self.state.timeline.end())),
             _ => Ok(()),
         }
@@ -2289,4 +2294,18 @@ fn paint_marks(px: Vec<u8>, l: Layout, order: PixelOrder, marks: (Option<i64>, O
         c.rect(x, l.ruler_y as i64, x + 1, l.tracks_y as i64, view::GUIDE);
     }
     c.px
+}
+
+// ---- NLE3ESLIPFACE (LEDGER SR737): the face's one-frame slip / slide words (named tail block) ----
+// A button or a key carries no number, so the face's four words are SR704's `slip <d>` / `slide <d>` at one frame: the
+// timeline's time base is `1/fps` (`Timeline::new`, its only constructor), so one frame is one tick, the step `nudge-` /
+// `nudge+` and `[` / `]` already take. `Face::verb` hands the rewritten word to THE dispatch (`EditorState::verb`).
+
+/// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks).
+fn slipslide_word(v: &str) -> String {
+    let (word, step) = match v.strip_suffix('-') {
+        Some(w) => (w, -1i64),
+        None => (v.trim_end_matches('+'), 1),
+    };
+    format!("{word} {step}")
 }
