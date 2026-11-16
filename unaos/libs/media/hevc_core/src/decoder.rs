@@ -504,7 +504,7 @@ impl Decoder {
         }
         // C.5.2.3: every picture is stored (a reference even when not output), then bumped as the DPB requires.
         let (reorder, latency, _) = self.bump;
-        self.dpb.store(cur.pic, reorder, latency, &mut self.out);
+        self.dpb.store(cur.pic, reorder, latency, &mut self.out); self.dpb.conceal_forward();
     }
 
     /// C.5.2.4 "bumping" until nothing waits for output.
