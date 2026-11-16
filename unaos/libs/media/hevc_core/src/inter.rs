@@ -671,3 +671,84 @@ pub(crate) fn uni_explicit(p: i32, (w0, o0, lwd): (i32, i32, u32)) -> i32 {
 pub(crate) fn bi_explicit(p0: i32, p1: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32)) -> i32 {
     (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)
 }
+
+// ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): one log2WD per component across both lists (named tail block) ----
+#[cfg(test)]
+mod hevcconcealweightedbimixed_tests {
+    use super::explicit_weight_of;
+    use crate::slice::{PredWeights, WeightList};
+    use alloc::vec;
+
+    /// 7-56 / 8.5.3.3.4.3: log2WD is luma_log2_weight_denom (or ChromaLog2WeightDenom) + shift1 for EITHER list, so
+    /// `bi_explicit` reading L0's log2WD (its L1 triple's `_`) is exact even when the two lists' weights and offsets differ.
+    #[test]
+    fn one_log2wd_per_component_across_both_lists() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 4,
+            l0: WeightList { luma: vec![(48, 5), (64, 0)], chroma: vec![[(20, 3), (12, -2)], [(16, 0), (16, 0)]] },
+            l1: WeightList { luma: vec![(16, -3), (64, 0)], chroma: vec![[(8, -5), (24, 7)], [(16, 0), (16, 0)]] },
+        };
+        for bd in [8u32, 10] {
+            for high in [false, true] {
+                for c in 0..3 {
+                    for r in 0..2i8 {
+                        let (a, b) = (explicit_weight_of(Some(&pw), c, 0, r, bd, high), explicit_weight_of(Some(&pw), c, 1, r, bd, high));
+                        let denom = if c == 0 { 6 } else { 4 };
+                        assert_eq!(a.2, b.2, "bd {bd} high {high} c {c} ref_idx {r}: one log2WD for both lists");
+                        assert_eq!(a.2, denom + (14 - bd).max(2), "bd {bd} high {high} c {c} ref_idx {r}: denom + shift1");
+                        if r == 0 {
+                            assert_ne!((a.0, a.1), (b.0, b.1), "bd {bd} high {high} c {c}: the table's lists really differ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// HEVCCONCEALBIDIRECTFORWARD (SR778): `uni_explicit_inv` undoes 8-252: a sample L weighted by (w, o, log2WD) to q
+    /// (unclipped) comes back within the rounding bound (1 << denom) / (2 |w|) + 1, and identity weights give L exactly.
+    #[test]
+    fn uni_explicit_inv_undoes_uni_explicit() {
+        use super::{uni_explicit, uni_explicit_inv};
+        for bd in [8u32, 10] {
+            let shift1 = (14 - bd as i32).max(2) as u32;
+            let max = (1i32 << bd) - 1;
+            let denom = 6u32;
+            for (w, o) in [(64i32, 0i32), (48, 5), (16, -3), (100, 0), (127, -20), (-32, 127)] {
+                let o = o << (bd - 8);
+                let wt = (w, o, denom + shift1);
+                let bound = (1 << denom) / (2 * w.abs()) + 1;
+                for l in 0..=max {
+                    let q = uni_explicit(l << shift1, wt);
+                    if q < 0 || q > max {
+                        continue;
+                    }
+                    let back = uni_explicit_inv(q << shift1, wt, bd);
+                    if (w, o) == (64, 0) {
+                        assert_eq!(back, l, "bd {bd}: identity weights are the copy");
+                    }
+                    assert!((back - l).abs() <= bound, "bd {bd} (w {w}, o {o}) L {l}: q {q} back {back}, bound {bound}");
+                }
+            }
+        }
+    }
+}
+
+// ---- HEVCCONCEALBIDIRECTFORWARD (LEDGER SR778): the inverse of 8-252 for the forward refinement (named tail block) ----
+/// HEVCCONCEALBIDIRECTFORWARD (SR778): the inverse of [`uni_explicit`] for dpb.rs's forward refinement (`conceal_fetch`
+/// with `inv`): the referencer C coded pred = w0 * L + o0, so the lost picture is L ~ (C - o0) * 2^denom / w0. On the 14-bit
+/// intermediate `p` of C (shift1 = Max(2, 14 - bitDepth), denom = log2WD - shift1): p' = ((p - (o0 << shift1)) << denom)
+/// / w0 rounded half away from zero, then 8-261's rounding (`uni_default`), clipped to `bd`. Identity weights (1 << denom, 0)
+/// give p' = p (the copy); w0 == 0 (C does not depend on L) is the copy.
+pub(crate) fn uni_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), bd: u32) -> i32 {
+    let max = (1i32 << bd) - 1;
+    if w0 == 0 {
+        return uni_default(p, bd).clamp(0, max);
+    }
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let num = (p as i64 - ((o0 as i64) << shift1)) << lwd.saturating_sub(shift1);
+    let (n, d) = if w0 < 0 { (-num, -(w0 as i64)) } else { (num, w0 as i64) };
+    let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+    uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
+}
