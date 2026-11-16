@@ -224,6 +224,8 @@ pub struct ExportReport {
     /// FNV-1a 64 over the rendered RGBA stream (`nle render`'s fnv).
     pub fnv: u64,
     pub pcm_frames: u64,
+    /// NLESTANDINAUDIOEDITOR (SR713): the render's [`crate::nle::RenderReport::stand_in_audio`] (reels on the silent audio stand-in).
+    pub stand_in_audio: u32,
 }
 
 #[derive(Debug)]
@@ -696,8 +698,8 @@ pub fn export_as_with(
     let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     sink.container = container;
     let total = if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 };
-    render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?;
-    sink.finish(tl.tb)
+    let rr = render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?; // NLESTANDINAUDIOEDITOR (SR713): the render report kept for its stand-in count
+    sink.finish(tl.tb).map(|e| ExportReport { stand_in_audio: rr.stand_in_audio, ..e }) // NLESTANDINAUDIOEDITOR (SR713)
 }
 
 /// The progress wrapper over [`ExportSink`]: every [`RenderSink`] call forwarded unchanged, then the reading.
@@ -771,5 +773,16 @@ impl H264Encoder {
 
     fn keep_stats(&self) {
         *self.stats.borrow_mut() = self.rgba.stats().to_vec();
+    }
+}
+
+// ---- H264ENCHRD (LEDGER SR699): the HRD option of the H.264 export (named tail block) ----
+impl H264Encoder {
+    /// Signal the rate controller's bucket as the NAL HRD (h264enc_core's `Config::hrd`, `nle export --bitrate K --hrd`): the
+    /// SPS VUI timing_info + nal_hrd_parameters, buffering-period / pic-timing SEI in the samples, CBR filler; false = the pinned
+    /// stream (and without a bit rate nothing is signalled).
+    pub fn with_hrd(mut self, on: bool) -> H264Encoder {
+        self.rgba.cfg.hrd = on;
+        self
     }
 }
