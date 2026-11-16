@@ -4433,12 +4433,12 @@ mod tests {
         engine.render_frame();
         let (_, _, sw, _) = imgalt_rect(&mut engine, "s");
         let (l, t, w, h) = imgalt_rect(&mut engine, "i");
-        assert!(sw > 10.0 && (w - sw).abs() <= 1.0, "i: the box is the alt text's width ({w} vs the span's {sw})");
+        assert!(sw > 10.0 && (w - sw - layout_core::INLINE_ICON_ADVANCE as f64).abs() <= 1.0, "i: the box is the alt text's width + the icon ({w} vs the span's {sw})"); // AETHERIMGALTINLINEICON (SR726): the icon before the text
         assert!(h > 8.0 && h < 40.0, "i: one line tall ({h})");
         let ink = imgalt_ink(&engine, l.floor() as usize, (l + w).ceil() as usize, t.floor() as usize, (t + h).ceil() as usize);
         assert!(ink > 0, "i: the alt text paints");
         let (_, _, zw, zh) = imgalt_rect(&mut engine, "z");
-        assert!((zw - sw).abs() <= 1.0 && zh < 40.0, "z: a standards-mode sized img with alt is inline text, not 200x100 ({zw}x{zh})");
+        assert!((zw - sw - layout_core::INLINE_ICON_ADVANCE as f64).abs() <= 1.0 && zh < 40.0, "z: a standards-mode sized img with alt is inline text, not 200x100 ({zw}x{zh})");
     }
 
     /// AETHERIMGALT (SR681): in quirks mode a sized failed img is a box of its size (TreatImageAsReplaced) with the 1px
@@ -4717,5 +4717,42 @@ mod tests {
         let gid = regular.font.glyph_index('H');
         let ink = |f: &crate::fonts::Face| raster::glyph(f, gid, 32.0, 0).map_or(0u64, |m| m.data.iter().map(|&v| v as u64).sum());
         assert!(ink(regular) < ink(bold), "the covering face inks at the asked weight");
+    }
+
+    // ---- AETHERIMGALTINLINEICON (LEDGER SR726): the broken-image icon before inline alt text (named tail block) ----
+
+    /// AETHERIMGALTINLINEICON (SR726): a failed, unsized img with alt="Hello" shows Chromium's 16x16 broken-image icon
+    /// before its text (HTMLImageFallbackHelper's represents-text arm: the icon floats left with margin 0): the box is
+    /// the span's width + 16, the icon's page outline grey sits at the box's (1, 5), no text ink lies under the icon and
+    /// the text paints after it; in a 120px column only the first line is indented (line 2 carries ink left of x + 16).
+    #[test]
+    fn img_alt_inline_icon_before_text() {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div><img id="i" src="missing.png" alt="Hello"></div>
+            <div><span id="s">Hello</span></div>
+            <div style="width:120px"><img id="w" src="missing.png" alt="{alt}"></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        let adv = layout_core::INLINE_ICON_ADVANCE as f64;
+        let (_, _, sw, sh) = imgalt_rect(&mut engine, "s");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "i");
+        assert!(sw > 10.0 && (w - sw - adv).abs() <= 1.0, "i: the box is the text's width + the icon ({w} vs {sw} + {adv})");
+        let (li, ti) = (l.round() as usize, t.round() as usize);
+        assert!(imgalt_painted(&engine, li, li + 16, ti, ti + 16) > 0, "i: the icon paints");
+        assert_eq!(imgalt_px(&engine, li + 1, ti + 5), (128, 128, 128), "i: the icon's page outline at the box's (1, 5)");
+        let (y0, y1) = (t.floor() as usize, (t + h).ceil() as usize);
+        assert_eq!(imgalt_ink(&engine, li, li + 16, y0, y1), 0, "i: no text under the icon");
+        assert!(imgalt_ink(&engine, li + 16, (l + w).ceil() as usize, y0, y1) > 0, "i: the text paints after the icon");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "w");
+        assert!(w <= 120.5 && h > sh * 1.5, "w: wraps inside the column ({w}x{h})");
+        let lw = l.round() as usize;
+        assert_eq!(imgalt_ink(&engine, lw, lw + 16, t.floor() as usize, (t + sh).floor() as usize), 0, "w: line 1 starts after the icon");
+        assert!(imgalt_ink(&engine, lw, lw + 16, (t + sh).ceil() as usize, (t + 2.0 * sh).floor() as usize) > 0, "w: line 2 is not indented");
     }
 }
