@@ -724,7 +724,7 @@ fn nle5dclitable_h264_table_is_the_cli_chain() {
         let (qp, gop, bitrate, crf, scenecut, aq, hrd, two_pass) = *s;
         let chain = nle5dclitable_fnv(Box::new(nle5dclitable_chain(*s, stats.clone())), &refr.frames);
         assert_eq!(chain, NLE5DCLITABLE_BEFORE[i], "set {i}: the old match's stream, pinned before SR718");
-        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()) };
+        let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: two_pass.then(|| stats.clone()), qcomp: None, cplxblur: None, qblur_q8: None };
         let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
         assert_eq!(table, chain, "set {i}: the table is the CLI's chain");
     }
@@ -739,7 +739,7 @@ const NLE5DCLITABLE_BEFORE: [u64; 8] = [
     0x3657_59b8_8c60_a4d0,
     0x3657_59b8_8c60_a4d0,
     0x050f_27c6_7cc3_2beb,
-    0xaae5_c049_c971_23c3, // H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x7aca_82b3_ce88_470a)
+    0xaae5_c049_c971_23c3, // H264ENCTWOPASSQCOMPCLI (SR753): SR736's default plan; RAW Pass2Opts codes SR718's 0x7aca_82b3_ce88_470a
 ];
 
 #[test]
@@ -756,6 +756,47 @@ fn nle5dclitable_video_named_is_the_default_options() {
     assert_eq!(face, 0x8318_f822_3505_f96b, "the face's h264 (SR694), pinned before SR718");
     assert_eq!(face, nle5dclitable_fnv(Box::new(H264Encoder::new(26, 25)), &refr.frames), "QP 26, a one-second GOP");
     assert!(video_named_with("vp9", tl.tb, H264Opts::default()).is_none());
+}
+
+// ---- H264ENCTWOPASSQCOMPCLI (LEDGER SR753): the table's qcomp / cplxblur against SR736's knob (named tail block) ----
+use stria::nle_export::{Pass2Opts, pass2_of, qcomp_of};
+
+/// Set 8 of [`NLE5DCLITABLE_SETS`] (the two-pass set) with `nle export --qcomp` / `--cplxblur`: the 9th set is x264's defaults
+/// spelled out (SR736's bytes: the identity pin), the 10th qcomp 1 (one P QP, twopass.rs m's CQP-like plan: other bytes).
+#[test]
+fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let stats = nle5dclitable_pass1(&refr.frames);
+    let (qp, gop, bitrate, crf, scenecut, aq, hrd, _) = NLE5DCLITABLE_SETS[7];
+    let opts = |qcomp, cplxblur| H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: Some(stats.clone()), qcomp, cplxblur, qblur_q8: None };
+    let chain = |p: Pass2Opts| H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_pass2_opts(p).with_two_pass(40, 25, 1, stats.clone());
+    let ninth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((3, 5)), Some(20))).unwrap(), &refr.frames);
+    assert_eq!(ninth, NLE5DCLITABLE_BEFORE[7], "set 9: qcomp 0.6 + cplxblur 20 are x264's defaults, set 8's bytes");
+    assert_eq!(ninth, nle5dclitable_fnv(Box::new(chain(Pass2Opts::default())), &refr.frames), "set 9: the knob's chain");
+    let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: false, ..Pass2Opts::default() };
+    assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x7aca_82b3_ce88_470a, "RAW plans SR698's QPs: SR718's pin before SR736");
+    let tenth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((1, 1)), None)).unwrap(), &refr.frames);
+    let knob = nle5dclitable_fnv(Box::new(chain(Pass2Opts { qcomp: (1, 1), ..Pass2Opts::default() })), &refr.frames);
+    assert_eq!(tenth, knob, "set 10: the table is the knob's chain");
+    assert_ne!(tenth, NLE5DCLITABLE_BEFORE[7], "set 10: qcomp 1 plans other QPs than the default");
+    assert_eq!(tenth, H264ENCTWOPASSQCOMPCLI_TENTH, "set 10: measured {tenth:#018x}");
+}
+
+/// The 10th set's fnv, measured on this tree by the arc's EXCEPTION run.
+const H264ENCTWOPASSQCOMPCLI_TENTH: u64 = 0x9b86_a3a8_5d39_7252;
+
+#[test]
+fn h264enctwopassqcompcli_qcomp_of() {
+    assert_eq!(qcomp_of("0.6"), Some((60, 100)));
+    assert_eq!(qcomp_of("1"), Some((100, 100)));
+    assert_eq!(qcomp_of("0"), Some((0, 100)));
+    for bad in ["1.5", "-0.1", "x", "NaN", "inf", ""] {
+        assert_eq!(qcomp_of(bad), None, "{bad}");
+    }
+    assert_eq!(pass2_of(None, None, None), Pass2Opts::default());
+    assert_eq!(pass2_of(Some((1, 1)), Some(0), None), Pass2Opts { qcomp: (1, 1), cplxblur: 0, ..Pass2Opts::default() });
 }
 
 // ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the one audio table against tools/nle's old audio match (named tail block) ----
@@ -849,3 +890,57 @@ fn nle6utp1_nle_export_fixture_pin() {
 
 /// The fnv [`nle6utp1_nle_export_fixture_pin`] reads, measured on the copies before SR729.
 const NLE6UTP1_NLE_EXPORT_PIN: u64 = 0xe149_8435_238b_ff8e;
+
+// ---- H264ENCTWOPASSQBLURCLI (LEDGER SR766): `--qblur F` through the table against SR736's knob (named tail block) ----
+use stria::nle_export::{QBLUR_MAX, qblur_of};
+
+#[test]
+fn h264enctwopassqblurcli_qblur_of() {
+    assert_eq!(QBLUR_MAX, 16.0);
+    assert_eq!(qblur_of("0.5"), Some(128));
+    assert_eq!(qblur_of("0"), Some(0));
+    assert_eq!(qblur_of("16"), Some(4096));
+    for bad in ["16.1", "-1", "nan", "inf", "x", ""] {
+        assert_eq!(qblur_of(bad), None, "{bad}");
+    }
+    assert_eq!(pass2_of(None, None, None), Pass2Opts::default());
+    assert_eq!(pass2_of(None, None, Some(0)), Pass2Opts { qblur_q8: 0, ..Pass2Opts::default() });
+}
+
+/// Set 8 of [`NLE5DCLITABLE_SETS`] (the two-pass set) through the table with `nle export --qblur` as Q8, and the knob's chain
+/// with the same [`Pass2Opts`]: (the table's fnv, the chain's fnv).
+fn h264enctwopassqblurcli_streams(qblur_q8: u32) -> (u64, u64) {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let stats = nle5dclitable_pass1(&refr.frames);
+    let (qp, gop, bitrate, crf, scenecut, aq, hrd, _) = NLE5DCLITABLE_SETS[7];
+    let opts = H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats: Some(stats.clone()), qcomp: None, cplxblur: None, qblur_q8: Some(qblur_q8) };
+    let table = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts).unwrap(), &refr.frames);
+    let knob = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_pass2_opts(Pass2Opts { qblur_q8, ..Pass2Opts::default() }).with_two_pass(40, 25, 1, stats.clone());
+    (table, nle5dclitable_fnv(Box::new(knob), &refr.frames))
+}
+
+/// The NAMED identity (seat ruling, SR766): on this 35-picture set x264's qblur 0.5 (Q8 128: a 3-picture window, the
+/// neighbours weighted exp(-4) against 1.0) nudges no planned QP past a rounding edge, so `--qblur 0` codes the Default plan's
+/// bytes (NLE5DCLITABLE_BEFORE[7]). A later blur change that moves this pin moves it consciously.
+#[test]
+fn h264enctwopassqblurcli_qblur_half_rounds_out_on_the_table_set() {
+    let (table, knob) = h264enctwopassqblurcli_streams(0);
+    assert_eq!(table, knob, "qblur 0: the table is the knob's chain");
+    assert_eq!(table, NLE5DCLITABLE_BEFORE[7], "qblur 0 == the Default (qblur 0.5) on the table set: {table:#018x}");
+}
+
+/// `--qblur 2` (Q8 512: a 9-picture window, the nearest neighbours weighted exp(-1/4) ~ 0.78): the non-identity stream, other
+/// bytes than the Default plan and than RAW (SR718's 0x7aca_82b3_ce88_470a), pinned as measured.
+#[test]
+fn h264enctwopassqblurcli_table_qblur_two_stream() {
+    let (table, knob) = h264enctwopassqblurcli_streams(512);
+    assert_eq!(table, knob, "qblur 2: the table is the knob's chain");
+    assert_ne!(table, NLE5DCLITABLE_BEFORE[7], "qblur 2 plans other QPs than the Default (qblur 0.5)");
+    assert_ne!(table, 0x7aca_82b3_ce88_470a, "qblur 2 is not RAW (cplxblur 20 and the GOP-mean I rule stay)");
+    assert_eq!(table, H264ENCTWOPASSQBLURCLI_QBLUR2, "qblur 2: measured {table:#018x}");
+}
+
+/// The qblur-2 stream's fnv, measured on this tree by the arc's EXCEPTION run.
+const H264ENCTWOPASSQBLURCLI_QBLUR2: u64 = 0x725b_239b_2b64_f04f;
