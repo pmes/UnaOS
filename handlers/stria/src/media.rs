@@ -127,6 +127,9 @@ pub struct MediaInfo {
     /// origin), in ns: > 0 when the audio track starts later than the video (the player fills
     /// that lead with silence so the device clock stays the media clock).
     pub audio_start_ns: i64,
+    /// STRIAINFOBITRATE (SR728): the stream's bit rate as a person reads it ([`bitrate_of`]: the MP4 btrt's avg, the H.264
+    /// SPS HRD rate in parentheses, else `~` the file's bytes over its duration; "" when none is known).
+    pub bitrate: String,
 }
 
 #[derive(Debug)]
@@ -315,7 +318,7 @@ impl Player {
     }
 
     fn open_from(bytes: Vec<u8>, pre: Option<Demuxer>, time: Arc<dyn TimeSource>, aout: Option<Box<dyn AudioOut>>, display_hz: u32) -> Result<Player, OpenError> {
-        let mut audio_note = String::new();
+        let mut audio_note = String::new(); let file_bytes = bytes.len() as u64; // STRIAINFOBITRATE (SR728): the measured rate's size (bytes moves into an audio file's source)
         let mut audio_start_ns = 0i64;
         let opened = match pre {
             Some(d) => Ok(d),
@@ -429,7 +432,9 @@ impl Player {
             sample_rate: if audio.is_some() { audio_rate } else { 0 },
             channels: if audio.is_some() { channels } else { 0 },
             audio_start_ns,
+            bitrate: bitrate_of(vtrack.as_ref().and_then(|t| t.btrt), vtrack.as_ref().and_then(gneiss_pal::dsp::video::hrd_bit_rate), file_bytes, duration_ns),
         };
+        log::info!("{}", open_line(&info)); // STRIAINFOBITRATE (SR728): the open wire
         let early = 500_000_000 / display_hz.max(1) as u64;
         let edit_map = edit_map_of(demux.as_ref(), vtrack.as_ref());
         Ok(Player {
@@ -1201,4 +1206,38 @@ impl Player {
             }
         }
     }
+}
+
+// ---- STRIAINFOBITRATE (LEDGER SR728): MediaInfo's bit rate (named tail block) ----
+// The forms, the file's truth first and the declared rate in parentheses (kb/s = nearest thousand bits per second):
+// btrt avg + SPS HRD "<avg> kb/s (HRD <rate>)", btrt avg "<avg> kb/s", HRD alone "<rate> kb/s (HRD)", else the measured
+// "~<file bits / duration> kb/s", else "". Owed: STRIA-INFO-BITRATE-WIRE (the kernel player), STRIA-INFO-BITRATE-LIVE (a live
+// stream: the last second), STRIA-INFO-AUDIO-BITRATE (the audio track's esds / btrt), STRIA-INFO-BITRATE-FACE (MediaOpened).
+
+/// bits per second as whole kb/s, rounded to nearest.
+fn kbps(bps: u64) -> u64 {
+    bps.saturating_add(500) / 1000
+}
+
+/// [`MediaInfo::bitrate`] from the video track's MP4 `btrt` (bufferSizeDB, maxBitrate, avgBitrate; SR720), its SPS's NAL HRD
+/// BitRate (SR708, through `gneiss_pal::dsp::video::hrd_bit_rate`), and the file's byte count over its duration.
+pub fn bitrate_of(btrt: Option<(u32, u32, u32)>, hrd_bps: Option<u64>, file_bytes: u64, duration_ns: u64) -> String {
+    let avg = btrt.map(|(_, _, avg)| avg as u64).filter(|&a| a > 0);
+    let hrd = hrd_bps.filter(|&r| r > 0);
+    match (avg, hrd) {
+        (Some(a), Some(r)) => format!("{} kb/s (HRD {})", kbps(a), kbps(r)),
+        (Some(a), None) => format!("{} kb/s", kbps(a)),
+        (None, Some(r)) => format!("{} kb/s (HRD)", kbps(r)),
+        (None, None) if file_bytes > 0 && duration_ns > 0 => {
+            let bps = (file_bytes as u128 * 8 * 1_000_000_000 / duration_ns as u128).min(u64::MAX as u128) as u64;
+            format!("~{} kb/s", kbps(bps))
+        }
+        (None, None) => String::new(),
+    }
+}
+
+/// The open wire: `[STRIA] :: open: video=<codec|-> audio=<codec|-> size=<w>x<h> duration_ns=<d> bitrate="<s>"`.
+pub fn open_line(i: &MediaInfo) -> String {
+    let or_dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
+    format!("[STRIA] :: open: video={} audio={} size={}x{} duration_ns={} bitrate=\"{}\"", or_dash(&i.video), or_dash(&i.audio), i.width, i.height, i.duration_ns, i.bitrate)
 }
