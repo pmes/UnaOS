@@ -911,3 +911,16 @@ pub fn audio_named(word: &str) -> Option<AudioOut> {
         Some(_) => return None,
     })
 }
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the audio table's inverse (named tail block) ----
+/// The word [`audio_named`] takes for `audio`, the table's inverse (`audio_named(&audio_word(&a)) == Some(a)`): `wav`,
+/// `mp4`, `none`, `aac` at [`DEFAULT_AAC_KBPS`], `aac:K` at any other rate. The editor face's export line names its audio by it.
+pub fn audio_word(audio: &AudioOut) -> String {
+    match *audio {
+        AudioOut::Wav => "wav".to_string(),
+        AudioOut::Mp4 => "mp4".to_string(),
+        AudioOut::None => "none".to_string(),
+        AudioOut::Aac(DEFAULT_AAC_KBPS) => "aac".to_string(),
+        AudioOut::Aac(k) => format!("aac:{k}"),
+    }
+}
