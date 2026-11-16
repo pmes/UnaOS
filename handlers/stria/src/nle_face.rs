@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 21] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail)
+pub const VERBS: [&str; 25] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -239,6 +239,7 @@ impl Face {
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
+            "slip-" | "slip+" | "slide-" | "slide+" => self.state.verb(&slipslide_word(v)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
                 None => return false,
@@ -368,6 +369,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("I", "mark in"), // NLE5DRANGEKEYS (SR735): Shift+i / Shift+o / Shift+x (text) bind the editor's export-mark words
     ("O", "mark out"),
     ("X", "mark clear"),
+    (",", "slip-"), // NLE3ESLIPFACE (SR737): , / . slip and < / > (Shift+, / Shift+.) slide the selected clip one frame (text keys, like [ / ])
+    (".", "slip+"),
+    ("<", "slide-"),
+    (">", "slide+"),
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -2462,4 +2467,18 @@ mod transitionface_tests {
         while face.state.undo() {}
         assert_eq!(face.state.timeline, tl0);
     }
+}
+
+// ---- NLE3ESLIPFACE (LEDGER SR737): the face's one-frame slip / slide words (named tail block) ----
+// A button or a key carries no number, so the face's four words are SR704's `slip <d>` / `slide <d>` at one frame: the
+// timeline's time base is `1/fps` (`Timeline::new`, its only constructor), so one frame is one tick, the step `nudge-` /
+// `nudge+` and `[` / `]` already take. `Face::verb` hands the rewritten word to THE dispatch (`EditorState::verb`).
+
+/// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks).
+fn slipslide_word(v: &str) -> String {
+    let (word, step) = match v.strip_suffix('-') {
+        Some(w) => (w, -1i64),
+        None => (v.trim_end_matches('+'), 1),
+    };
+    format!("{word} {step}")
 }

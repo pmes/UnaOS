@@ -1975,3 +1975,83 @@ fn nle_tests_scratch_under_the_pid_dir() {
     assert!(include_str!("common/mod.rs").contains(token), "tests/common is the one reader");
     println!("striatesttmpdirrest: scratch {} fresh {} inline reads {inline}", d.display(), f.display());
 }
+
+// ---- NLE3ESLIPFACE (LEDGER SR737): the face's one-frame slip / slide words, their keys (named tail block) ----
+
+/// The SR694 face over NLE1's fixture (V1: A[13,23)@0 B[0,10)@10 A[23,33)@25) with B selected, and its twin editor.
+fn nle3eslipface_pair() -> (Face, EditorState, Timeline) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 12).unwrap();
+    (face, twin, tl)
+}
+
+/// Rule: `slip+` / `slip-` / `slide-` are SR704's `slip 1` / `slip -1` / `slide -1` (one frame = one tick at the
+/// timeline's `1/fps`) through THE dispatch: the face's timeline equals a twin editor's after the numbered word; a slide
+/// carries the butted neighbour's out edge; undo restores the timeline.
+#[test]
+fn nle3eslipface_words_are_one_frame_of_the_editor_verbs() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert!(face.verb("slip+"));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, 1, 11, 10), "the source window moved one frame");
+    assert!(face.verb("slip-"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("slide-"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(&face.state.timeline.tracks[0].clips[..2], &[Clip::new(a, 13, 22, 0), Clip::new(b, 0, 10, 9)], "the neighbour follows");
+    assert!(face.verb("slide+"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, twin.timeline, "undo takes back the slide+");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: slip+ = slip 1, slide- = slide -1, undo restores");
+}
+
+/// The four text keys `,` `.` `<` `>` send the words (the same timelines); a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle3eslipface_keys_send_the_words() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    assert!(!nle3eslipface_press_text_only(&mut face, ","), "a one-char BrowserKey alone is not taken");
+    assert!(nle5drangekeys_press(&mut face, "."));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ","));
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle5drangekeys_press(&mut face, "<"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ">"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: , . < > send slip- slip+ slide- slide+");
+}
+
+/// A one-char key as `BrowserKey` alone (the face reads one-char keys from `BrowserText` only).
+fn nle3eslipface_press_text_only(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.to_string()))
+}
+
+/// Rule: with nothing selected the words are taken and refused by the editor's name on the message line
+/// (`EditError::NoClip`'s text through `Face::verb`'s `{v}: {e}` road); the timeline does not move.
+#[test]
+fn nle3eslipface_no_selection_names_the_refusal() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    for v in ["slip-", "slip+", "slide-", "slide+"] {
+        assert!(VERBS.contains(&v), "{v}");
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("nle3eslipface: no selection -> slip+: {}", EditError::NoClip);
+}
