@@ -1687,3 +1687,251 @@ fn nlestandinaudioeditor_an_ac3_reel_renders_on_the_silent_stand_in() {
     assert_eq!(normal.stand_in_audio, 0);
     println!("nlestandinaudioeditor: {} | stand_in_audio={} frames={} pcm={}", lines[0], r.stand_in_audio, r.frames, sink.pcm.len());
 }
+
+// ---- NLE5DEXPORTRANGE (LEDGER SR717): the face's in / out marks, the range `export` takes, their ruler marks (named tail block) ----
+
+/// The SR694 face over NLE1's fixture with the marks set at `a` and `b` through the verbs (the playhead back at 0).
+fn nle5dexportrange_face(a: i64, b: i64) -> Face {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(a);
+    assert!(face.verb("in"));
+    face.state.seek(b);
+    assert!(face.verb("out"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    face.state.seek(0);
+    face
+}
+
+#[test]
+fn nle5dexportrange_marked_png_writes_the_range() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as};
+    let (dir, by_hand) = (nlefaceexport_dir("range"), nlefaceexport_dir("range-by-hand"));
+    let mut face = nle5dexportrange_face(5, 15);
+    assert_eq!((face.marks(), face.export_range()), ((Some(5), Some(15)), Some(5..15)));
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 10 frames ticks 5..15, ") && line.ends_with(&format!(" bytes -> {}", dir.display())), "{line}");
+    for n in 0..10 {
+        assert!(dir.join(format!("{n:06}.png")).is_file(), "frame {n}");
+    }
+    assert!(!dir.join("000010.png").exists());
+    let (tl, src) = synth_fixture();
+    std::fs::create_dir_all(&by_hand).unwrap();
+    export_as(&tl, 5..15, &src, &by_hand, Box::new(PngSequence), AudioOut::Wav, Container::Mp4).unwrap();
+    for n in [0, 9] {
+        let f = format!("{n:06}.png");
+        assert_eq!(std::fs::read(dir.join(&f)).unwrap(), std::fs::read(by_hand.join(&f)).unwrap(), "{f} is export_as(5..15)'s");
+    }
+    println!("nle5dexportrange: {line}");
+}
+
+#[test]
+fn nle5dexportrange_marks_refuse_by_name_and_clear() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    face.state.seek(20);
+    assert!(face.verb("in"));
+    assert_eq!(face.last_error.take().as_deref(), Some("in: tick 20 is not before the out mark 15"));
+    assert_eq!(face.marks(), (None, Some(15)), "a refused in leaves the marks");
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.last_error.take()), ((Some(5), Some(15)), None));
+    face.state.seek(3);
+    assert!(face.verb("out"));
+    assert_eq!(face.last_error.take().as_deref(), Some("out: tick 3 is not after the in mark 5"));
+    assert_eq!(face.marks(), (Some(5), Some(15)));
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.export_range()), ((None, Some(15)), None), "in again at its tick clears it");
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert_eq!(face.marks(), (None, None), "out again at its tick clears it");
+    assert!(face.last_error.is_none());
+    println!("nle5dexportrange: refused in 20 past out 15, out 3 before in 5; cleared both");
+}
+
+#[test]
+fn nle5dexportrange_all_forces_the_whole_timeline() {
+    let dir = nlefaceexport_dir("range-all");
+    let mut face = nle5dexportrange_face(5, 15);
+    assert!(face.verb(&format!("export --all {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && !line.contains(" ticks "), "{line}");
+    assert!(dir.join("000034.png").is_file() && !dir.join("000035.png").exists());
+    assert_eq!(face.marks(), (Some(5), Some(15)), "--all leaves the marks");
+    println!("nle5dexportrange: --all {line}");
+}
+
+#[test]
+fn nle5dexportrange_marks_paint_two_ruler_columns() {
+    let (tl, src) = synth_fixture();
+    let mut idle = nlefaceexport_face(tl, src);
+    let mut face = nle5dexportrange_face(5, 15);
+    let (a, b) = (idle.paint(), face.paint());
+    let l = face.layout();
+    let cols = [l.x_of(5) as u32, l.x_of(15) as u32];
+    let mut lit = 0;
+    for y in 0..l.h {
+        for x in 0..l.w {
+            let i = ((y * l.w + x) * 4) as usize;
+            if (l.ruler_y..l.tracks_y).contains(&y) && cols.contains(&x) {
+                assert_eq!(&b[i..i + 4], &timeline_core::view::GUIDE, "mark pixel ({x},{y})");
+                lit += 1;
+            } else {
+                assert_eq!(&b[i..i + 4], &a[i..i + 4], "pixel ({x},{y}) outside the marks");
+            }
+        }
+    }
+    assert_eq!(lit, 2 * stria::nle_face::RULER_H);
+    println!("nle5dexportrange: marks {lit} px at columns {cols:?} rows {}..{}", l.ruler_y, l.tracks_y);
+}
+
+#[test]
+fn nle5dexportrange_shortened_timeline_clamps_or_refuses() {
+    let dir = nlefaceexport_dir("range-clamp");
+    let mut face = nle5dexportrange_face(5, 15);
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1); // A[13,23)@0: the timeline now ends at 10
+    }
+    assert_eq!(face.export_range(), Some(5..10));
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 5 frames ticks 5..10, "), "{line}");
+
+    let past = nlefaceexport_dir("range-past");
+    let mut face = nle5dexportrange_face(12, 15);
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1);
+    }
+    assert!(face.verb(&format!("export {} png", past.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: the marks 12..15 are past the timeline's end 10"));
+    assert!(!face.exporting() && !past.exists(), "a refused range makes nothing");
+    println!("nle5dexportrange: clamped {line}");
+}
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the marks live on the Timeline: saved with the document, reopened, undone (named tail block) ----
+
+#[test]
+fn nle5drangesave_marks_save_and_reopen_through_the_document() {
+    let (tl0, src) = synth_fixture();
+    let path = nlehostsave_dir("marks").join("cut.edl");
+    std::fs::write(&path, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let opened = edl::parse(&std::fs::read_to_string(&path).unwrap(), 25).unwrap();
+    assert_eq!(opened.marks, (None, None));
+    let mut face = Face::new(EditorState::new(opened), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert!(face.dirty(), "a mark dirties the document");
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline.marks, (Some(5), Some(15)));
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!face.dirty(), "clean after save");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\n* UNA MARK 5 15\n\n"), "the header's last line, before the first event: {text}");
+    assert_eq!(text.matches("* UNA MARK").count(), 1);
+    let (_, src2) = synth_fixture();
+    let reopened = Face::new(EditorState::open(&text, 25).unwrap(), src2, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    assert_eq!((reopened.marks(), reopened.export_range()), ((Some(5), Some(15)), Some(5..15)));
+    assert_eq!(reopened.state.timeline, face.state.timeline);
+    assert!(!reopened.dirty());
+    println!("nle5drangesave: saved {} bytes, reopened marks {:?}", text.len(), reopened.marks());
+}
+
+#[test]
+fn nle5drangesave_a_mark_is_one_undoable_commit() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), None), 1));
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), Some(15)), 2));
+    assert!(face.verb("undo"));
+    assert_eq!(face.marks(), (Some(5), None), "undo clears the out mark");
+    assert!(face.verb("undo"));
+    assert_eq!(face.marks(), (None, None), "undo clears the in mark");
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("redo"));
+    assert_eq!(face.marks(), (Some(5), None));
+    // the editor's words (THE dispatch the kernel face calls), through the face's fall-through
+    face.state.seek(15);
+    assert!(face.verb("mark out"));
+    assert_eq!((face.marks(), face.last_error.take()), ((Some(5), Some(15)), None));
+    face.state.seek(2);
+    assert!(face.verb("mark out"));
+    assert_eq!(face.last_error.take().as_deref(), Some("mark out: the in mark is not before the out mark"));
+    assert_eq!(face.marks(), (Some(5), Some(15)), "a refused mark leaves the marks");
+    assert!(face.verb("mark clear"));
+    assert_eq!((face.marks(), face.export_range()), ((None, None), None));
+    println!("nle5drangesave: in / out / undo / redo / mark out / refused / clear");
+}
+
+// ---- NLE5DRANGEKEYS (LEDGER SR735): Shift+I / O / X bind the editor's mark words through the face's KEYS (named tail block) ----
+
+/// A key as GTK sends it and as stria-view's `--do key:<k>` token builds it (`BrowserKey` + `BrowserText` for one char).
+fn nle5drangekeys_press(face: &mut Face, k: &str) -> bool {
+    let a = face.on(&bandy::SMessage::BrowserKey(k.to_string()));
+    let b = face.on(&bandy::SMessage::BrowserText(k.to_string()));
+    a || b
+}
+
+/// Shift+I at 5 and Shift+O at 15 set the export marks through the editor's ONE `mark in` / `mark out` words (one
+/// commit each); an out key before the in mark is refused by the editor's name and leaves the marks; Shift+X (AppKit:
+/// the text alone) clears them in one commit, undone by Ctrl+z; a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle5drangekeys_shift_i_o_x_drive_the_editor_mark_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(5);
+    assert!(nle5drangekeys_press(&mut face, "I"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), None), 1));
+    face.state.seek(15);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.last_error.take()), ((Some(5), Some(15)), 2, None));
+    face.state.seek(2);
+    assert!(nle5drangekeys_press(&mut face, "O"));
+    assert_eq!(face.last_error.take().as_deref(), Some("mark out: the in mark is not before the out mark"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(5), Some(15)), 2), "a refused mark leaves the marks");
+    assert!(face.on(&bandy::SMessage::BrowserText("X".into())));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.export_range()), ((None, None), 3, None));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+z".into())));
+    assert_eq!(face.marks(), (Some(5), Some(15)), "undo restores the cleared marks");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("I".into())), "a one-char key is read from the text only");
+    assert!(!face.on(&bandy::SMessage::BrowserKey("Shift+I".into())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle5drangekeys: I / O / refused / X / undo");
+}
+
+/// The lower-case `i` / `o` stay SR208's clip trims: the timeline is the one `EditorState::verb("mark-in" / "mark-out")`
+/// makes at the same ticks, and the export marks are untouched.
+#[test]
+fn nle5drangekeys_lower_i_o_still_trim_the_clip() {
+    let (tl, src) = synth_fixture();
+    let mut want = EditorState::new(tl.clone());
+    want.select_at(0, 12).unwrap();
+    want.seek(13);
+    assert_eq!(want.verb("mark-in"), Some(Ok(())));
+    want.seek(18);
+    assert_eq!(want.verb("mark-out"), Some(Ok(())));
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(13);
+    assert!(nle5drangekeys_press(&mut face, "i"));
+    face.state.seek(18);
+    assert!(nle5drangekeys_press(&mut face, "o"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_ne!(face.state.timeline, tl, "the trims moved the clip");
+    assert_eq!((&face.state.timeline.tracks, face.marks()), (&want.timeline.tracks, (None, None)));
+    println!("nle5drangekeys: i / o still trim");
+}
