@@ -639,7 +639,7 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
                 cv.fill(x0, y0 + 1, 1, y1 - y0 - 2, c);
                 cv.fill(x1 - 1, y0 + 1, 1, y1 - y0 - 2, c);
             }
-            if icon { broken_icon(cv, bx, by, bw, bh); } // AETHERIMGBROKENICON (SR702): the icon in its slot
+            if icon { let o = if frame { 0.0 } else { 2.0 }; broken_icon(cv, bx - o, by - o, bw + 2.0 * o, bh + 2.0 * o); } // AETHERIMGBROKENICON (SR702): the icon in its slot
             if frame { (text, bx + 2.0 + 16.0, by + 2.0, 1.0) } else { (text, bx, by, 0.0) }
         }
     };
