@@ -610,10 +610,10 @@ fn lost_picture_is_concealed_from_the_nearest_held_picture() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![2]);
-    assert_eq!(d.take_concealed(), vec![(2, 1)]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3]);
-    assert_frame(by_poc(&f, 3), &shifted(&i0, 8, 4), "P from the picture concealed from POC 1");
+    assert_frame(by_poc(&f, 3), &shifted(&shifted(&i0, 8, 4), 8, 4), "P from the picture concealed from POC 1, advanced by its motion");
 }
 
 /// IDR0 (the gradient), P2 (the gradient moved by (8, 4), references POC 0), P4 (skip-only, references the lost POC 1):
@@ -629,7 +629,7 @@ fn conceal_tie_takes_the_lower_poc() {
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
     assert_eq!(d.take_generated_refs(), vec![1]);
-    assert_eq!(d.take_concealed(), vec![(1, 0)]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false }]);
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
     assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
@@ -650,4 +650,29 @@ fn empty_dpb_keeps_the_generated_picture_grey() {
     let f = d.take_frames();
     assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1]);
     assert_frame(&f[0], &Img::new(|_, _| 128, |_, _| 128, |_, _| 128), "P from the grey generated reference");
+}
+
+// ---- HEVCERRORCONCEALMOTION (LEDGER SR710): the concealed picture projected along its source's motion (named tail block) ----
+
+/// IDR0 (the gradient), P2 (the gradient moved by (8, 4), references POC 0: the motion spans two POCs), P4 (skip-only,
+/// references the lost POC 3): POC 3 is concealed from the nearest held picture, POC 2, whose vector (32, 16) is
+/// rescaled by scale_mv to one POC (td 2, tb 1: (16, 8) quarter samples, (4, 2) samples, chroma (2, 1)), so P4 is P2
+/// advanced by (4, 2) and the note says projected. (SR700's first test is the one-POC case; its tie test the intra
+/// source's still copy.)
+#[test]
+fn conceal_projection_scales_by_poc_distance() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(4, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_frame(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
+    assert_frame(by_poc(&f, 4), &shifted(&shifted(&i0, 8, 4), 4, 2), "P from the picture projected from POC 2 by half its vector");
 }
