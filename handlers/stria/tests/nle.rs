@@ -2231,3 +2231,55 @@ fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
     assert_eq!(plain.paint(), a, "labels off: no overlay");
     println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
 }
+
+// ---- STRIAINFOREELAUDIO (LEDGER SR761): an editor reel's line carries its audio part, equal to the Player's (named tail block) ----
+
+/// Rule: the synth reel's `Sources::summary` is the Player's `summary_line` of the same bytes INCLUDING the audio part: SR743's
+/// video half, ` | `, the mono PCM16 48 kHz track's exact `pcm 768 kb/s` (the decoder registry's name, `track_audio_bitrate`).
+#[test]
+fn striainforeelaudio_synth_reel_line_is_the_players_with_the_pcm_part() {
+    let bytes = synth_source(0, 50, 25);
+    let mut src = Sources::new(&Timeline::new(25));
+    src.add(SourceId(0), bytes.clone()).unwrap();
+    let s = src.summary(SourceId(0)).unwrap();
+    assert!(s.starts_with("utp1 64x48 ~") && s.ends_with(" kb/s | pcm 768 kb/s"), "{s}");
+    assert_eq!(s, striainforeel_player_line(bytes));
+    println!("striainforeelaudio: synth reel summary=\"{s}\"");
+}
+
+/// Rule: a video-only reel (tests/common's utp1 pattern, no audio track) has no audio part and is still the Player's line.
+#[test]
+fn striainforeelaudio_video_only_reel_has_no_audio_part() {
+    let bytes = pattern_mp4(64, 48, 25, 50, 10);
+    let mut src = Sources::new(&Timeline::new(25));
+    src.add(SourceId(0), bytes.clone()).unwrap();
+    let s = src.summary(SourceId(0)).unwrap();
+    assert!(s.starts_with("utp1 64x48 ") && !s.contains(" | "), "{s}");
+    assert_eq!(s, striainforeel_player_line(bytes));
+}
+
+/// Rule: the face's reel line (the message line's idle text, stria-view's `"reel"`) carries the audio part.
+#[test]
+fn striainforeelaudio_face_reel_line_carries_the_audio_part() {
+    use stria::nle_face::{EditorState, Face, PixelOrder};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let line = src.summary(SourceId(0)).unwrap();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    let r = face.reel_line().unwrap();
+    assert_eq!(r, format!("A: {line}"));
+    assert!(r.ends_with(" | pcm 768 kb/s"), "{r}");
+    println!("striainforeelaudio: face reel_line=\"{r}\"");
+}
+
+// ---- NLE6UTP1SYNTH (LEDGER SR749): the host's synthetic reel is demux_core's (named tail block) ----
+/// NLE6UTP1SYNTH (SR749): `synth_source` is demux_core's `build::synth_reel` (the reel both rings build): the same bytes
+/// by both roads, pinned by FNV-1a 64 (read on the pre-move `synth_source`; demux_core's `synth_reel_kats` pins the same u64).
+#[test]
+fn nle6utp1synth_host_reel_is_demux_cores() {
+    let host = stria::nle_face::fnv1a(&synth_source(1000, 30, 25));
+    let core = stria::nle_face::fnv1a(&gneiss_pal::dsp::demux::build::synth_reel(1000, 30, 25, &Default::default()));
+    assert_eq!(host, 0xbabb_167e_432a_5e6b, "the pre-move synth_source bytes");
+    assert_eq!(host, core, "both roads build one reel");
+    println!("nle6utp1synth: synth_source(1000,30,25) fnv {host:#018x} == demux_core build::synth_reel");
+}
