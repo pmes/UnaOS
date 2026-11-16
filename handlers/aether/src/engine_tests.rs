@@ -4497,6 +4497,59 @@ mod tests {
         assert_eq!(imgalt_ink(&engine, l, l + 200, t, t + 100), 0, "p: no alt text yet");
     }
 
+    // ---- AETHERHOSTWGHT (LEDGER SR690): font-weight on a variable face paints its instance (named tail block) ----
+
+    /// AETHERHOSTWGHT (SR690): the face the installed-family roads give (`fonts::styled_face`, what `db_face` loads)
+    /// for the tree's Inter variable face at 600 is the wght 600 instance, not the 400 one: a distinct face, no
+    /// synthetic bold, more ink in `H`; at 700 (where `select` asks for synthetic bold) the axis reaches the weight and
+    /// no embolden path is taken. Through `styled_face` rather than a page: the process-wide font database holds no
+    /// installed variable face on the seat.
+    #[test]
+    fn font_weight_600_paints_the_instance() {
+        use crate::fonts::{db, raster};
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fonts/inter/InterVariable.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter variable face");
+        let at = |w: f32, bold: bool| {
+            let want = db::Style { weight: w, ..db::Style::default() };
+            crate::fonts::styled_face(&info, bold, false, want).expect("Inter loads")
+        };
+        let (regular, semibold, bold) = (at(400.0, false), at(600.0, false), at(700.0, true));
+        assert_ne!(regular.id, semibold.id, "600 is its own instance");
+        assert!(!regular.synth_bold && !semibold.synth_bold && !bold.synth_bold, "no embolden path on a wght face");
+        let gid = regular.font.glyph_index('H');
+        let ink = |f: &crate::fonts::Face| raster::glyph(f, gid, 32.0, 0).map_or(0u64, |m| m.data.iter().map(|&v| v as u64).sum());
+        let (r, s, b) = (ink(regular), ink(semibold), ink(bold));
+        assert!(r < s && s < b, "ink grows with the instanced weight: 400 {r}, 600 {s}, 700 {b}");
+    }
+
+    // ---- AETHERCAPTIONCSSOM (LEDGER SR686): getComputedStyle(caption).captionSide (named tail block) ----
+
+    /// AETHERCAPTIONCSSOM (SR686): `getComputedStyle(el).captionSide` reports the used value layout_core folded, as
+    /// Chromium does: style="caption-side: bottom" and the align=bottom presentation hint read bottom, a bare caption
+    /// reads the initial top, and an author rule on the table is inherited by its bare caption.
+    #[test]
+    fn computed_caption_side_reports_used_value() {
+        let html = r#"<!doctype html><html><head><style>#t2 { caption-side: bottom }</style></head><body>
+            <table><caption id="s" style="caption-side: bottom">S</caption><tr><td>1</td></tr></table>
+            <table><caption id="a" align="bottom">A</caption><tr><td>2</td></tr></table>
+            <table><caption id="n">N</caption><tr><td>3</td></tr></table>
+            <table id="t2"><caption id="i">I</caption><tr><td>4</td></tr></table>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (id, want) in [("s", "bottom"), ("a", "bottom"), ("n", "top"), ("i", "bottom")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).captionSide"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed caption-side");
+        }
+    }
+
     /// AETHERIMGBROKENICON (SR702): the broken-image icon shows only when the box has room for it (Chromium's
     /// ImageSmallerThanAltImage, 16 + 2 px): a 40x40 failed img with alt="" paints the icon (layout_core's
     /// `BROKEN_ICON`) in its slot; a 12x12 one paints nothing (no frame, no icon, no text).
