@@ -1771,3 +1771,61 @@ fn nle5dexportrange_shortened_timeline_clamps_or_refuses() {
     assert!(!face.exporting() && !past.exists(), "a refused range makes nothing");
     println!("nle5dexportrange: clamped {line}");
 }
+
+// ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the face's export takes an audio word through the one audio table (named tail block) ----
+
+#[test]
+fn nle5dexportaudiooptions_png_none_writes_no_audio() {
+    let (wav, none) = (nlefaceexport_dir("audio-default"), nlefaceexport_dir("audio-none"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", wav.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: 35 frames, ")));
+    assert!(wav.join("audio.wav").is_file(), "the default audio stays wav");
+    assert!(face.verb(&format!("export {} png none", none.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes -> {}", none.display())), "{line}");
+    for n in [0, 34] {
+        let f = format!("{n:06}.png");
+        assert_eq!(std::fs::read(none.join(&f)).unwrap(), std::fs::read(wav.join(&f)).unwrap(), "{f}: the frames do not move");
+    }
+    assert!(!none.join("000035.png").exists());
+    assert!(!none.join("audio.wav").exists() && !none.join("audio.mp4").exists(), "none writes no audio file");
+    println!("nle5dexportaudiooptions: none {line}");
+}
+
+#[test]
+fn nle5dexportaudiooptions_png_aac_writes_audio_mp4() {
+    use gneiss_pal::dsp::demux::{Codec, Demuxer, TrackKind};
+    let dir = nlefaceexport_dir("audio-aac");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png aac", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("000034.png").is_file() && !dir.join("audio.wav").exists(), "{line}");
+    let d = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
+    assert_eq!(d.tracks().len(), 1);
+    let t = &d.tracks()[0];
+    assert_eq!((t.kind, t.codec.clone()), (TrackKind::Audio, Codec::Aac), "one AAC-LC track");
+    println!("nle5dexportaudiooptions: aac {line}");
+}
+
+#[test]
+fn nle5dexportaudiooptions_unknown_audio_refused_by_name() {
+    let root = nlefaceexport_dir("audio-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png flac", root.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio flac (wav|aac|mp4|none)"));
+    assert!(face.verb(&format!("export {} png aac:x", root.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio aac:x (wav|aac|mp4|none)"));
+    assert!(!face.exporting() && !root.exists(), "a refused audio word makes nothing");
+    println!("nle5dexportaudiooptions: refused flac and aac:x by name");
+}
