@@ -4682,7 +4682,7 @@ mod tests {
             .eval_string(r#"(function () { var e = document.getElementById("cl"), k = e.files, n = k.length; e.value = ""; return [n, k.length, e.files.length, k[0] === undefined, k === e.files, JSON.stringify(e.value)].join(","); })()"#)
             .unwrap();
         assert_eq!(got, "2,0,0,true,true,\"\"");
-        engine.render_frame();
+        engine.tick(); engine.render_frame();
         let (cl, fresh) = (file_value_clear_extent(&mut engine, "cl"), file_value_clear_extent(&mut engine, "fresh"));
         assert_ne!(before, fresh, "two Files painted `2 files` before the clear");
         assert_eq!(cl, fresh, "the cleared input paints a fresh input's status");
@@ -4710,7 +4710,7 @@ mod tests {
             .eval_string(r#"(function () { document.getElementById("fm").reset(); return document.getElementById("in").files.length + "," + document.getElementById("out").files.length; })()"#)
             .unwrap();
         assert_eq!(got, "0,2");
-        engine.render_frame();
+        engine.tick(); engine.render_frame();
         let (inn, fresh) = (file_value_clear_extent(&mut engine, "in"), file_value_clear_extent(&mut engine, "fresh"));
         assert_eq!(inn, fresh, "the reset input paints a fresh input's status");
     }
