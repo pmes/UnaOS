@@ -329,6 +329,8 @@ pub struct Timeline {
     pub tracks: Vec<Track>,
     /// NLEXFADEPOWER (SR678): the explicit audio crossfades (CMX's A-only `D` event), ordered by `(track, at)`.
     pub audio_xfades: Vec<AudioXfade>,
+    /// NLE5DRANGESAVE (SR723): the export range's in / out marks (ticks; either may be unset), kept in the EDL as `* UNA MARK`.
+    pub marks: (Option<i64>, Option<i64>),
 }
 
 /// How [`Timeline::place`] makes room.
@@ -372,6 +374,8 @@ pub enum EditError {
     Rate,
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
+    /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
+    Marks,
 }
 
 impl core::fmt::Display for EditError {
@@ -391,6 +395,7 @@ impl core::fmt::Display for EditError {
             EditError::Gain => "gain out of range",
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
+            EditError::Marks => "the in mark is not before the out mark",
         })
     }
 }
@@ -408,7 +413,7 @@ pub trait SourceIndex {
 impl Timeline {
     /// An empty timeline at an integer frame rate (one tick = one frame).
     pub fn new(fps: u32) -> Timeline {
-        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new(), audio_xfades: Vec::new() }
+        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new(), audio_xfades: Vec::new(), marks: (None, None) }
     }
     /// The frame rate when the time base is `1/n`.
     pub fn fps(&self) -> Option<u32> {
@@ -1502,4 +1507,24 @@ fn fit_want(x: &mut Transition, rooms: &[(i64, Option<i64>)]) {
     let ask = x.want.unwrap_or(x.dur);
     x.dur = ask.min(r);
     x.want = (x.dur < ask).then_some(ask);
+}
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the export range's marks on the Timeline, the one in < out rule (named tail block) ----
+
+impl Timeline {
+    /// The timeline with its export marks `(in, out)` set (either may be `None`). Refused: a negative mark
+    /// (`EditError::Negative`); both set with `in >= out` (`EditError::Marks`). The EDL reader and the editor both call it.
+    pub fn set_marks(&self, m: (Option<i64>, Option<i64>)) -> Result<Timeline, EditError> {
+        if m.0.is_some_and(|t| t < 0) || m.1.is_some_and(|t| t < 0) {
+            return Err(EditError::Negative);
+        }
+        if let (Some(a), Some(b)) = m {
+            if a >= b {
+                return Err(EditError::Marks);
+            }
+        }
+        let mut tl = self.clone();
+        tl.marks = m;
+        Ok(tl)
+    }
 }

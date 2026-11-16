@@ -207,7 +207,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
-            if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+            mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
@@ -397,7 +397,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
     }
-    s.push('\n');
+    s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -589,5 +589,39 @@ fn want_line(x: Option<&Transition>) -> String {
     match x.and_then(|x| x.want.filter(|&w| w != x.dur)) {
         Some(w) => format!("* UNA WANT {w}\n"),
         None => String::new(),
+    }
+}
+
+// ---- NLE5DRANGESAVE (LEDGER SR723): the `* UNA MARK` line (named tail block) ----
+// `* UNA MARK <in> <out>` is the document's export range ([`crate::Timeline::marks`]): each word a tick or `-` for an unset
+// mark, written ONCE as the header's last line (after the FPS / SOURCE / SIZE lines, before the first event) and only when
+// a mark is set, so an EDL with no marks writes as before and a CMX reader skips it as a comment. Wrong word count, a word
+// that is neither an integer nor `-`, both `-`, a second MARK line, or marks [`crate::Timeline::set_marks`] refuses (a
+// negative tick, in >= out) are a syntax error.
+
+/// NLE5DRANGESAVE: a `* UNA MARK` line applied to the timeline being read; any other line is left alone.
+fn mark_comment(l: &str, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA MARK ") else { return Ok(()) };
+    let w: Vec<&str> = r.split_whitespace().collect();
+    if w.len() != 2 || tl.marks != (None, None) {
+        return Err(EdlError::Syntax { line });
+    }
+    let tick = |s: &str| -> Result<Option<i64>, EdlError> {
+        if s == "-" { Ok(None) } else { s.parse::<i64>().map(Some).map_err(|_| EdlError::Syntax { line }) }
+    };
+    let m = (tick(w[0])?, tick(w[1])?);
+    if m == (None, None) {
+        return Err(EdlError::Syntax { line });
+    }
+    *tl = tl.set_marks(m).map_err(|_| EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// NLE5DRANGESAVE: the header's `* UNA MARK` line (empty when no mark is set).
+fn mark_line(tl: &Timeline) -> String {
+    let word = |m: Option<i64>| m.map_or_else(|| String::from("-"), |t| format!("{t}"));
+    match tl.marks {
+        (None, None) => String::new(),
+        (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
 }
