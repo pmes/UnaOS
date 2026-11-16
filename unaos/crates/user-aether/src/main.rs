@@ -1122,7 +1122,7 @@ fn open_arg(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts) {
 fn image_inputs(page: &Page) {
     let doc = page.doc;
     let mut got: alloc::collections::BTreeMap<usize, pixel_core::Image> = alloc::collections::BTreeMap::new();
-    let (mut n, mut ok) = (0i64, 0i64);
+    let (mut n, mut ok) = (0i64, 0i64); let mut failed = alloc::collections::BTreeSet::new(); // AETHERIMGALTELF (SR695): the admitted nodes that got no bitmap
     for id in doc.descendants(html_core::Document::ROOT) {
         if !style::img_fetched(&style::N { doc, id }) { // AETHERIMGELF (SR685): imgs (not loading=lazy) with the image inputs
             continue;
@@ -1140,9 +1140,9 @@ fn image_inputs(page: &Page) {
         if let Some(i) = img {
             got.insert(id.0, i);
             ok += 1;
-        }
+        } else { failed.insert(id.0); } // AETHERIMGALTELF (SR695): admitted, no bitmap -> Failed (ImgHost::img_state)
     }
-    style::set_images(doc, got);
+    style::set_images(doc, got, failed); // AETHERIMGALTELF (SR695)
     if n > 0 {
         Line::new(b":: AETHER: images -> n=").dec(n).put(b" decoded=").dec(ok).put(b" fail=").dec(n - ok).put(b" ::").wire();
     }

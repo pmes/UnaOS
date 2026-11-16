@@ -257,9 +257,9 @@ pub struct FontDb {
     fallback: OnceLock<Vec<usize>>,
     /// AETHER-FONTDB-LAZY (SR419): the bytes `discover` read to build the index (0 for [`FontDb::from_faces`]).
     bytes_read: u64,
-    /// AETHERFONTDBFALLBACK (SR425): each face's `cmap` table alone, read on first need by [`FontDb::covers`]
-    /// (None = file unreadable, empty = no cmap), and the bytes those bounded reads took.
-    cmaps: Vec<OnceLock<Option<Box<[u8]>>>>,
+    /// AETHERFONTDBFALLBACK (SR425): each face's coverage from its `cmap` table alone, read on first need by [`FontDb::covers`]
+    /// (None = file unreadable, empty = no cmap), and the bytes those bounded reads took; AETHERFONTDBCACHECMAP (SR697): ranges, seeded from the index.
+    cmaps: Vec<OnceLock<Option<crate::db_cache::Coverage>>>,
     scan_bytes: AtomicU64,
     /// AETHERFONTDBCACHE (SR684): what the persisted index answered for this discovery (Off for [`FontDb::from_faces`]).
     cache: crate::db_cache::State,
@@ -275,7 +275,7 @@ impl FontDb {
             walk_dir(d, &mut files, 0);
         }
         files.dedup();
-        let (cached, cache) = crate::db_cache::load(&config, &files); // AETHERFONTDBCACHE (SR684): a hit skips the header reads
+        let (cached, seeds, cache) = crate::db_cache::load(&config, &files); // AETHERFONTDBCACHE (SR684): a hit skips the header reads
         let mut faces = Vec::new();
         let mut bytes_read = 0u64;
         for f in files.iter().filter(|_| cached.is_none()) {
@@ -292,7 +292,7 @@ impl FontDb {
             t0.elapsed().as_millis(),
             cache.as_str()
         );
-        let (cmaps, scan_bytes) = ((0..faces.len()).map(|_| OnceLock::new()).collect(), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425)
+        let (cmaps, scan_bytes) = (crate::db_cache::seed(faces.len(), seeds), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425); AETHERFONTDBCACHECMAP (SR697) seeds
         FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes, cache }
     }
 
@@ -570,13 +570,13 @@ pub fn face_cmap(path: &Path, index: u32) -> Option<(Vec<u8>, u64)> {
 }
 
 impl FontDb {
-    /// The face's cmap table bytes (empty when it has none), read once with [`face_cmap`].
-    fn cmap_of(&self, i: usize) -> Option<std::borrow::Cow<'_, [u8]>> {
-        let read = || -> Option<Box<[u8]>> {
+    /// The face's cmap coverage (empty when it has none), read once with [`face_cmap`] unless the index seeded it.
+    fn cmap_of(&self, i: usize) -> Option<std::borrow::Cow<'_, [(u32, u32)]>> {
+        let read = || -> Option<crate::db_cache::Coverage> {
             let f = self.faces.get(i)?;
-            let (t, n) = face_cmap(&f.path, f.index)?;
+            let (t, n) = crate::db_cache::read_coverage(&self.config, self.cache, f)?; // AETHERFONTDBCACHECMAP (SR697)
             self.scan_bytes.fetch_add(n, Ordering::Relaxed);
-            Some(t.into_boxed_slice())
+            Some(t)
         };
         match self.cmaps.get(i) {
             Some(cell) => cell.get_or_init(read).as_deref().map(std::borrow::Cow::Borrowed),
@@ -587,9 +587,7 @@ impl FontDb {
     /// Whether face `i` maps `c` (as `Font::glyph_index(c) != 0` would on the whole face); None when its file
     /// is unreadable.
     pub fn covers(&self, i: usize, c: char) -> Option<bool> {
-        let cmap = self.cmap_of(i)?;
-        let st = font_core::cmap::Cmap::parse(&cmap).and_then(|t| t.best());
-        Some(st.is_some_and(|st| st.unicode_glyph(c) != 0))
+        Some(crate::db_cache::covered(&self.cmap_of(i)?, c)) // AETHERFONTDBCACHECMAP (SR697): the held ranges
     }
 
     /// The bytes the bounded cmap reads have taken so far.
