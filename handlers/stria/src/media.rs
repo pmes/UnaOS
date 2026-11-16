@@ -336,7 +336,7 @@ impl Player {
                     None => audio_note = "no audio track".into(),
                     Some(t) => {
                         let timing = Timing::of(&demux, t);
-                        match audio_decoder_for(t, timing) {
+                        match AudioSwap::open(t, timing, vtrack.is_some()) {
                             Ok(d) => {
                                 let idx = demux.track_index(t.id).unwrap_or(0);
                                 let first = demux.track_samples(idx).map(|s| t.to_ns(s.pts)).min().unwrap_or(0) - timing.shift_ns;
@@ -733,7 +733,7 @@ impl Player {
         } else if let Some(AudioSrc::Track { track, dec }) = self.audio.as_mut() {
             if p.track == track.id {
                 match dec.decode(&p) {
-                    Ok(b) => self.queue_audio(b.pts_ns, b.sample_rate, b.channels, &b.samples),
+                    Ok(b) => { self.queue_audio(b.pts_ns, b.sample_rate, b.channels, &b.samples); self.audio_swap_info() }
                     Err(e) => log::warn!("[STRIA] :: audio decode: {e}"),
                 }
             }
@@ -1088,5 +1088,117 @@ impl Player {
         self.vswap.reseed(v, vt, d, ns);
         self.info.real_video = v.is_real();
         self.info.video_decoder = v.name().to_string();
+    }
+}
+
+// ---- NLESTANDINAUDIO (LEDGER SR703): the audio track's decoder-or-stand-in and its mid-stream swap (named tail block) ----
+/// NLESTANDINAUDIO (LEDGER SR703): the audio side of SWAPBACK ([`crate::decode_swap`]'s shape, not its code): a container
+/// audio track whose decoder is missing or refuses plays a SILENT stand-in — zeros at the decoder's rate and channels, each
+/// refused packet's own interval (`Packet::duration`), placed by [`Player`]'s one `queue_audio`, so the device keeps
+/// consuming and the audio clock stays the media clock while the video keeps its pace. One `audio decode: swapped to
+/// stand-in: <why>` line per swap. A refusing real decoder is RESET and parked (an erring packet adds nothing to the
+/// gapless trimmer's count, so without the reset every later block would be stamped one packet early; the reset re-anchors
+/// at the next packet's own pts); every later KEYFRAME packet is offered to it once, and when it decodes it plays again
+/// (one `audio decode: swapped back at <pts ns>` line). Every real-decoder error swaps (AAC conceals a damaged unit itself
+/// and never errs). No decoder at open = an open-time stand-in, never probed, and only beside a video track: a pure-audio
+/// stream with no decoder still fails its open (nothing would play), as does the bare-audio-file path. A seek un-parks
+/// (the real decoder is retried at the target, as SWAPBACKSEEK's reseed does). Tick thread only: no lock.
+pub struct AudioSwap {
+    /// The registry's decoder (playing, or parked while `on_stand_in`); None = the open-time stand-in.
+    real: Option<Box<dyn AudioTrackDecoder>>,
+    on_stand_in: bool,
+    rate: u32,
+    channels: u16,
+    timebase: gneiss_pal::dsp::demux::Timebase,
+    timing: Timing,
+}
+
+impl AudioSwap {
+    /// The ONE audio-track open: `audio_decoder_for` wrapped in the swap; with no decoder, the silent stand-in when
+    /// `has_video` and the track states its rate and channels (Opus plays at 48 kHz, as [`Player::probe_audio_rate`]), else
+    /// the registry's error.
+    pub fn open(track: &Track, timing: Timing, has_video: bool) -> Result<Box<dyn AudioTrackDecoder>, gneiss_pal::dsp::video::DecodeError> {
+        match audio_decoder_for(track, timing) {
+            Ok(d) => Ok(Box::new(AudioSwap { rate: d.sample_rate(), channels: d.channels(), real: Some(d), on_stand_in: false, timebase: track.timebase, timing })),
+            Err(e) => {
+                let rate = if track.codec == gneiss_pal::dsp::demux::Codec::Opus { 48_000 } else { track.sample_rate };
+                if !has_video || rate == 0 || track.channels == 0 {
+                    return Err(e);
+                }
+                log::warn!("[STRIA] :: audio decode: swapped to stand-in: {e}");
+                Ok(Box::new(AudioSwap { real: None, on_stand_in: true, rate, channels: track.channels, timebase: track.timebase, timing }))
+            }
+        }
+    }
+
+    /// True while the silent stand-in plays (parked real decoder, or none at open).
+    pub fn on_stand_in(&self) -> bool {
+        self.on_stand_in
+    }
+
+    /// The stand-in's block for `p`: zeros over the packet's interval on the presented timeline, cut at the track's end.
+    fn silence(&self, p: &Packet) -> gneiss_pal::dsp::audio_track::AudioBlock {
+        let pts_ns = self.timebase.to_ns(p.pts) - self.timing.shift_ns;
+        let mut dur_ns = self.timebase.to_ns(p.duration as i64);
+        if let Some(end) = self.timing.end_ns {
+            dur_ns = dur_ns.min(end - pts_ns);
+        }
+        let frames = ((dur_ns.max(0) as i128 * self.rate as i128 + 500_000_000) / 1_000_000_000) as usize;
+        gneiss_pal::dsp::audio_track::AudioBlock { pts_ns, sample_rate: self.rate, channels: self.channels, samples: vec![0.0; frames * self.channels.max(1) as usize] }
+    }
+}
+
+impl AudioTrackDecoder for AudioSwap {
+    fn name(&self) -> &'static str {
+        match &self.real {
+            Some(d) if !self.on_stand_in => d.name(),
+            _ => "stand-in",
+        }
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn decode(&mut self, p: &Packet) -> Result<gneiss_pal::dsp::audio_track::AudioBlock, gneiss_pal::dsp::video::DecodeError> {
+        if self.real.is_none() || (self.on_stand_in && !p.keyframe) {
+            return Ok(self.silence(p));
+        }
+        let Some(real) = self.real.as_mut() else { return Ok(self.silence(p)) };
+        match real.decode(p) {
+            Ok(b) => {
+                if self.on_stand_in {
+                    self.on_stand_in = false;
+                    log::info!("[STRIA] :: audio decode: swapped back at {}", self.timebase.to_ns(p.pts));
+                }
+                Ok(b)
+            }
+            Err(e) => {
+                real.reset();
+                if !self.on_stand_in {
+                    self.on_stand_in = true;
+                    log::warn!("[STRIA] :: audio decode: swapped to stand-in: {e}");
+                }
+                Ok(self.silence(p))
+            }
+        }
+    }
+    fn reset(&mut self) {
+        if let Some(r) = self.real.as_mut() {
+            r.reset();
+            self.on_stand_in = false;
+        }
+    }
+}
+
+/// NLESTANDINAUDIO (LEDGER SR703): `MediaInfo::audio_decoder` names the decoder that plays ("stand-in" while parked).
+impl Player {
+    fn audio_swap_info(&mut self) {
+        if let Some(AudioSrc::Track { dec, .. }) = self.audio.as_ref() {
+            if self.info.audio_decoder != dec.name() {
+                self.info.audio_decoder = dec.name().to_string();
+            }
+        }
     }
 }
