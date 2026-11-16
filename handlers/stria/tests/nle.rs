@@ -2116,3 +2116,105 @@ fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
     assert_eq!(plain.paint(), a, "labels off: no overlay");
     println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
 }
+
+// ---- NLE3ESLIPSTEP (LEDGER SR752): Ctrl / Cmd chords step SLIP_STEP frames through SR737's words (named tail block) ----
+use stria::nle_face::SLIP_STEP;
+
+/// A chord as GTK sends it: `BrowserKey` alone (no `BrowserText` under Ctrl / Meta).
+fn nle3eslipstep_chord(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.to_string()))
+}
+
+/// Rule: `Ctrl+period` is SR704's `slip 10` through THE dispatch (the face's timeline equals a twin editor's), its Meta
+/// twin the same, `Ctrl+comma` the step back, and the word `slip+10` the key's own road.
+#[test]
+fn nle3eslipstep_ctrl_period_slips_ten_frames() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"));
+    assert_eq!(twin.verb("slip 10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, SLIP_STEP, 10 + SLIP_STEP, 10), "the source window moved SLIP_STEP frames");
+    assert!(nle3eslipstep_chord(&mut face, "Meta+period"));
+    assert_eq!(twin.verb("slip 10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+comma"));
+    assert!(nle3eslipstep_chord(&mut face, "Meta+comma"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("slip+10"));
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, SLIP_STEP, 10 + SLIP_STEP, 10), "the word is the key's road");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipstep: Ctrl+period = slip {SLIP_STEP}, Ctrl+comma = slip -{SLIP_STEP}");
+}
+
+/// Rule: `Ctrl+Shift+less` (GTK's name for Ctrl+<) is `slide -10` with both butted neighbours following; `Ctrl+Shift+greater`
+/// takes it back; the Meta twin is the same. Fixture: V1 A[0,20)@0 B[0,10)@20 A[23,33)@30 (both of B's cuts butted).
+#[test]
+fn nle3eslipstep_ctrl_less_slides_ten_with_neighbours() {
+    let (mut tl, src) = synth_fixture();
+    let (a, b) = (SourceId(0), SourceId(1));
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 20), Clip::new(a, 23, 33, 30)];
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 22).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 22).unwrap();
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+Shift+less"));
+    assert_eq!(twin.verb("slide -10"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 13, 33, 20)], "both neighbours follow");
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+Shift+greater"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+less"));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+greater"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipstep: Ctrl+Shift+less = slide -{SLIP_STEP}, the neighbours follow");
+}
+
+/// Rule: a coarse slip past the source's end is refused by the editor's name (`OutOfSource` through `Face::verb`'s
+/// `{v}: {e}` road) and the timeline does not move. B[0,10) over a 50-tick source: four steps reach [40,50), the fifth is out.
+#[test]
+fn nle3eslipstep_slip_past_the_source_is_refused_by_name() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    for _ in 0..4 {
+        assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"));
+    }
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, 40, 50, 10));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let before = face.state.timeline.clone();
+    assert!(nle3eslipstep_chord(&mut face, "Ctrl+period"), "the key is taken");
+    assert_eq!(face.last_error.take(), Some(format!("slip+10: {}", EditError::OutOfSource)));
+    assert_eq!(face.state.timeline, before);
+    println!("nle3eslipstep: slip+10 at [40,50) -> {}", EditError::OutOfSource);
+}
+
+/// The eight chords are KEYS rows (no VERBS word, no button); the help names both chords of each word with a phrase; a
+/// count other than SLIP_STEP is not a face word; SR737's one-frame `.` still slips exactly one frame.
+#[test]
+fn nle3eslipstep_help_and_the_one_frame_keys() {
+    let chords = [
+        ("Ctrl+comma", "Meta+comma", "slip-10"),
+        ("Ctrl+period", "Meta+period", "slip+10"),
+        ("Ctrl+Shift+less", "Meta+Shift+less", "slide-10"),
+        ("Ctrl+Shift+greater", "Meta+Shift+greater", "slide+10"),
+    ];
+    let rows = help_rows();
+    for (c, m, w) in chords {
+        assert!(KEYS.contains(&(c, w)) && KEYS.contains(&(m, w)), "{w}");
+        assert!(!VERBS.contains(&w), "{w}: a key's word, no button");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|k| k == c)).expect("a help row");
+        assert!(row.0.split(" / ").any(|k| k == m), "{:?}", row.0);
+        assert_eq!(row.1, help_phrase(w));
+        assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
+    }
+    let (mut face, _twin, tl) = nle3eslipface_pair();
+    for v in ["slip+7", "slip+10x", "slide-010x", "slip10"] {
+        assert!(!face.verb(v), "{v} is not a face word");
+    }
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle5drangekeys_press(&mut face, "."));
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(SourceId(1), 1, 11, 10), "one frame, unchanged");
+    println!("nle3eslipstep: help rows={} keys={}", rows.len(), KEYS.len());
+}

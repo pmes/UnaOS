@@ -242,7 +242,7 @@ impl Face {
                 Ok(())
             }
             "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
-            "slip-" | "slip+" | "slide-" | "slide+" => self.state.verb(&slipslide_word(v)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail)
+            v if slipslide_word(v).is_some() => slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
                 None => return false,
@@ -376,6 +376,14 @@ pub const KEYS: &[(&str, &str)] = &[
     (".", "slip+"),
     ("<", "slide-"),
     (">", "slide+"),
+    ("Ctrl+comma", "slip-10"), // NLE3ESLIPSTEP (SR752): Ctrl / Cmd with , . < > step SLIP_STEP frames (GTK's names: the shifted keyval keeps its Shift+)
+    ("Meta+comma", "slip-10"),
+    ("Ctrl+period", "slip+10"),
+    ("Meta+period", "slip+10"),
+    ("Ctrl+Shift+less", "slide-10"),
+    ("Meta+Shift+less", "slide-10"),
+    ("Ctrl+Shift+greater", "slide+10"),
+    ("Meta+Shift+greater", "slide+10"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -485,7 +493,7 @@ impl Face {
         }
         let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
         if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
-        if VERBS.contains(&act) {
+        if VERBS.contains(&act) || slipslide_word(act).is_some() { // NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
         let r = match act {
@@ -2305,14 +2313,30 @@ fn paint_marks(px: Vec<u8>, l: Layout, order: PixelOrder, marks: (Option<i64>, O
 // A button or a key carries no number, so the face's four words are SR704's `slip <d>` / `slide <d>` at one frame: the
 // timeline's time base is `1/fps` (`Timeline::new`, its only constructor), so one frame is one tick, the step `nudge-` /
 // `nudge+` and `[` / `]` already take. `Face::verb` hands the rewritten word to THE dispatch (`EditorState::verb`).
+// NLE3ESLIPSTEP (LEDGER SR752): the coarse step is the same words with a `SLIP_STEP` count (`slip+10` -> `slip 10`), bound
+// to Ctrl / Cmd chords in KEYS, not VERBS (no button); any other count is not a face word (`slip <d>` takes free counts).
 
-/// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks).
-fn slipslide_word(v: &str) -> String {
-    let (word, step) = match v.strip_suffix('-') {
-        Some(w) => (w, -1i64),
-        None => (v.trim_end_matches('+'), 1),
+/// NLE3ESLIPSTEP (SR752): the coarse slip / slide step (frames = ticks), the Ctrl / Cmd chords' count.
+pub const SLIP_STEP: i64 = 10;
+
+/// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks);
+/// `slip-10` -> `slip -10` ... (the count exactly [`SLIP_STEP`]); None for any other word.
+fn slipslide_word(v: &str) -> Option<String> {
+    let (word, rest) = match v.strip_prefix("slip") {
+        Some(r) => ("slip", r),
+        None => ("slide", v.strip_prefix("slide")?),
     };
-    format!("{word} {step}")
+    let (sign, count) = match rest.as_bytes().first().copied()? {
+        b'-' => (-1i64, &rest[1..]),
+        b'+' => (1, &rest[1..]),
+        _ => return None,
+    };
+    let step = match count {
+        "" => 1,
+        c if c.bytes().all(|b| b.is_ascii_digit()) && c.parse::<i64>() == Ok(SLIP_STEP) => SLIP_STEP,
+        _ => return None,
+    };
+    Some(format!("{word} {}", sign * step))
 }
 
 // ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay over the timeline band (named tail block) ----
@@ -2355,6 +2379,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+", "slip the clip one frame on"),
     ("slide-", "slide the clip one frame earlier"),
     ("slide+", "slide the clip one frame later"),
+    ("slip-10", "slip the clip 10 frames back"), // NLE3ESLIPSTEP (SR752): the Ctrl / Cmd chords' SLIP_STEP words
+    ("slip+10", "slip the clip 10 frames on"),
+    ("slide-10", "slide the clip 10 frames earlier"),
+    ("slide+10", "slide the clip 10 frames later"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
