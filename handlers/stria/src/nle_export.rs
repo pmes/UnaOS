@@ -749,7 +749,7 @@ pub fn video_named(name: &str, tb: Timebase) -> Option<Box<dyn VideoEncoder>> {
 
 // ---- H264ENCTWOPASS (LEDGER SR698): the two-pass option of the H.264 export (named tail block) ----
 /// h264enc_core's per-picture first-pass record (`rc::PicStat`), named here so a face needs no h264enc_core dependency.
-pub use h264enc_core::rc::{PicStat, StatsError, StatsFile, read_stats, rescale_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too
+pub use h264enc_core::rc::{Pass2Opts, PicStat, StatsError, StatsFile, read_stats, rescale_stats, write_stats}; // H264ENCTWOPASSFILE (SR719): the records' text form too; H264ENCTWOPASSBLUR (SR736): the plan's options
 
 impl H264Encoder {
     /// The second pass of a two-pass export (h264enc_core's `RcMode::TwoPass`, `nle export --two-pass`): a mean of `kbps` kbit/s
@@ -852,4 +852,15 @@ pub fn video_named_with(name: &str, tb: Timebase, opts: H264Opts) -> Option<Box<
         }
         _ => return None,
     })
+}
+
+// ---- H264ENCTWOPASSBLUR (LEDGER SR736): the two-pass plan's options (named tail block) ----
+impl H264Encoder {
+    /// The options a two-pass export's second pass is planned with ([`H264Encoder::with_two_pass`]; h264enc_core's
+    /// `Encoder::planned_with`): x264's qcomp, complexity blur, QP blur and I rule. Without this call, x264's defaults
+    /// (`Pass2Opts::default()`); unread without a plan.
+    pub fn with_pass2_opts(mut self, opts: Pass2Opts) -> H264Encoder {
+        self.rgba = self.rgba.with_pass2_opts(opts);
+        self
+    }
 }
