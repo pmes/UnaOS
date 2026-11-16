@@ -671,3 +671,39 @@ pub(crate) fn uni_explicit(p: i32, (w0, o0, lwd): (i32, i32, u32)) -> i32 {
 pub(crate) fn bi_explicit(p0: i32, p1: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32)) -> i32 {
     (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)
 }
+
+// ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): one log2WD per component across both lists (named tail block) ----
+#[cfg(test)]
+mod hevcconcealweightedbimixed_tests {
+    use super::explicit_weight_of;
+    use crate::slice::{PredWeights, WeightList};
+    use alloc::vec;
+
+    /// 7-56 / 8.5.3.3.4.3: log2WD is luma_log2_weight_denom (or ChromaLog2WeightDenom) + shift1 for EITHER list, so
+    /// `bi_explicit` reading L0's log2WD (its L1 triple's `_`) is exact even when the two lists' weights and offsets differ.
+    #[test]
+    fn one_log2wd_per_component_across_both_lists() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 4,
+            l0: WeightList { luma: vec![(48, 5), (64, 0)], chroma: vec![[(20, 3), (12, -2)], [(16, 0), (16, 0)]] },
+            l1: WeightList { luma: vec![(16, -3), (64, 0)], chroma: vec![[(8, -5), (24, 7)], [(16, 0), (16, 0)]] },
+        };
+        for bd in [8u32, 10] {
+            for high in [false, true] {
+                for c in 0..3 {
+                    for r in 0..2i8 {
+                        let (a, b) = (explicit_weight_of(Some(&pw), c, 0, r, bd, high), explicit_weight_of(Some(&pw), c, 1, r, bd, high));
+                        let denom = if c == 0 { 6 } else { 4 };
+                        assert_eq!(a.2, b.2, "bd {bd} high {high} c {c} ref_idx {r}: one log2WD for both lists");
+                        assert_eq!(a.2, denom + (14 - bd).max(2), "bd {bd} high {high} c {c} ref_idx {r}: denom + shift1");
+                        if r == 0 {
+                            assert_ne!((a.0, a.1), (b.0, b.1), "bd {bd} high {high} c {c}: the table's lists really differ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
