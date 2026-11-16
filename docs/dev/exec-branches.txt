@@ -1612,3 +1612,10 @@ exec-rmbp-aetherimgaltinlineicon df4ca757d wave36 cut77h
 exec-rmbp-h264enctwopassrescale df4ca757d wave36 cut77h
 exec-rmbp-striainfobitrate df4ca757d wave36 cut77h
 exec-rmbp-nle6utp1 df4ca757d wave36 cut77h
+exec-rmbp-aetherimgaltbaseline 9dbb320a8 wave36 cut78h
+exec-rmbp-aetherfallbacksynth 9dbb320a8 wave36 cut78h
+exec-rmbp-h264encscenecutlookahead 9dbb320a8 wave36 cut78h
+exec-rmbp-hevcconcealsubpel 9dbb320a8 wave36 cut78h
+exec-rmbp-striainfobitrateface 9dbb320a8 wave36 cut78h
+exec-rmbp-nle5drangekeys 9dbb320a8 wave36 cut78h
+exec-rmbp-h264enctwopassblur 9dbb320a8 wave36 cut78h
