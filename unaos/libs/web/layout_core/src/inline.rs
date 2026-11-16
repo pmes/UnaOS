@@ -453,7 +453,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                         tb_atomics.push((h, base, va.0));
                         continue;
                     }
-                    let s = shift.get(parent).copied().unwrap_or(0.0) + atomic_shift(ctx, *parent, default_run, va, h, base);
+                    let s = shift.get(parent).copied().unwrap_or(0.0) + atomic_shift(ctx, *parent, default_run, va, h, base, img_alt_metrics(tree, ctx, *node, default_run));
                     top = top.min(s - base);
                     bottom = bottom.max(s + h - base);
                 }
@@ -543,7 +543,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                         7 => *y + line_h - h,
                         _ => {
                             let s = shift.get(parent).copied().unwrap_or(0.0)
-                                + atomic_shift(ctx, *parent, default_run, va, h, base);
+                                + atomic_shift(ctx, *parent, default_run, va, h, base, img_alt_metrics(tree, ctx, *node, default_run));
                             baseline + s - base
                         }
                     };
@@ -901,7 +901,8 @@ fn trailing_space_width<F: Fonts + ?Sized>(ctx: &Ctx<F>, node: NodeId, fallback:
 
 /// vertical-align shift (down = +) of an atomic box of margin height `h`
 /// whose baseline is `base` below its margin top, inside `parent`.
-fn atomic_shift<F: Fonts + ?Sized>(ctx: &Ctx<F>, parent: NodeId, fallback: &TextRun, va: (u8, f32), h: f32, base: f32) -> f32 {
+fn atomic_shift<F: Fonts + ?Sized>(ctx: &Ctx<F>, parent: NodeId, fallback: &TextRun, va: (u8, f32), h: f32, base: f32, alt: Option<(f32, f32)>) -> f32 {
+    let (h, base) = alt.unwrap_or((h, base)); // AETHERIMGALTVALIGN (SR748): an InlineAlt img aligns by its alt run's line box, as a span does
     let prun = run_of(ctx, parent, fallback);
     let pm = metrics(ctx.fonts, prun);
     match va.0 {
@@ -1000,9 +1001,22 @@ pub(crate) fn layout_all<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, t
 /// `Fonts::baseline_offset` (host `paint_img_alt_lines` / `draw_text_from`, the ELF's `image_alt_lines`), which
 /// [`metrics`]' `off` is, in the img's own run ([`run_of`]: the alt run is the element's run with the alt text).
 fn img_alt_baseline<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, id: NodeId, fallback: &TextRun) -> Option<f32> {
+    let (_, off) = img_alt_metrics(tree, ctx, id, fallback)?;
+    let l = tree.taffy.layout(id).ok()?;
+    Some(l.margin.top + l.border.top + l.padding.top + off)
+}
+
+// ---- AETHERIMGALTVALIGN (LEDGER SR748): an InlineAlt img's alignment box is its alt run's line box (named tail block) ----
+
+/// AETHERIMGALTVALIGN (SR748): the ONE source of an InlineAlt img's alt metrics: (line height, baseline below the line
+/// top) of its first alt line in the img's own run ([`metrics`]' `lh` and `off`), None for every other atomic. Chromium
+/// lays the alt inside a non-replaced inline box, whose `vertical-align` arms (blink `InlineLayoutStateStack::
+/// ApplyBaselineShift`: middle, text-top, text-bottom) read the box's own font metrics plus leading, never a replaced
+/// box's height, so [`atomic_shift`] rebinds its (h, base) to these; [`img_alt_baseline`] reads `off` from here too.
+fn img_alt_metrics<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F>, id: NodeId, fallback: &TextRun) -> Option<(f32, f32)> {
     if !matches!(crate::tree::img_fallback_of(tree, id), crate::tree::ImgFallback::InlineAlt(_)) {
         return None;
     }
-    let l = tree.taffy.layout(id).ok()?;
-    Some(l.margin.top + l.border.top + l.padding.top + metrics(ctx.fonts, run_of(ctx, id, fallback)).off)
+    let m = metrics(ctx.fonts, run_of(ctx, id, fallback));
+    Some((m.lh, m.off))
 }
