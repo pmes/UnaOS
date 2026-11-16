@@ -49,7 +49,7 @@ thread_local! {
 
 pub fn reset() {
     // The roots belonged to the previous page's VM (gone with it).
-    FILES.with(|s| s.borrow_mut().clear());
+    FILES.with(|s| s.borrow_mut().clear()); file_names_reset();
     INDETERMINATE.with(|s| s.borrow_mut().clear());
     SUBMITTING.with(|s| s.borrow_mut().clear());
     SELECTION.with(|s| s.borrow_mut().clear());
@@ -598,7 +598,7 @@ fn set_value(el: usize, v: &str) {
 fn input_value_get(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
     if input_type(el) == "file" {
-        return Ok(s(""));
+        return Ok(s(&file_value(el)));
     }
     Ok(s(&value_of(el)))
 }
@@ -758,7 +758,7 @@ fn files_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     }
     let v = arg(vm, ctx, 0);
     let Some(list) = this_tagged(vm, &v, T_FILELIST) else { return Ok(Value::Undefined) };
-    let files = filelist_files(vm, list);
+    let files = filelist_files(vm, list); file_names_record(vm, el, &files);
     let roots: Vec<usize> = files.into_iter().map(|f| root(vm, f)).collect();
     if let Some(old) = FILES.with(|f| f.borrow_mut().insert(el, roots)) {
         for r in old {
@@ -2602,4 +2602,54 @@ pub fn install(vm: &mut Vm) {
     }
     let _ = wrap;
     let _ = remove_attr;
+}
+
+// ---- AETHERFILECHOSENJSFILES (LEDGER SR706): the script-set FileList's names for the status and value (named tail block) ----
+
+thread_local! {
+    /// AETHERFILECHOSENJSFILES (SR706): the names of the File objects `FILES` holds per file input, mirrored by `files_set`
+    /// (the one writer of `FILES`; `reset` clears both) so the render and the `value` getter read them without a VM (a
+    /// File's name lives in the prelude's WeakMap, behind its `name` getter).
+    static FILE_NAMES: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
+}
+
+/// AETHERFILECHOSENJSFILES (SR706): records the names of `files`, the selection `files_set` just stored for `el` (a
+/// throwing or non-File entry names ""), and schedules the frame that repaints the status, as `store_value` does for a
+/// dirty value (form state, which no selector reads).
+fn file_names_record(vm: &mut Vm, el: usize, files: &[Value]) {
+    let mut names = Vec::with_capacity(files.len());
+    for f in files {
+        let name = match f {
+            Value::Object(o) => match get(vm, *o, "name") {
+                Ok(v) => vm.to_string(&v).map(|s| s.to_rust()).unwrap_or_default(),
+                Err(_) => String::new(),
+            },
+            _ => String::new(),
+        };
+        names.push(name);
+    }
+    FILE_NAMES.with(|n| n.borrow_mut().insert(el, names));
+    super::touch();
+    crate::css::note_change(page(|p| p.version), crate::css::Change::Attribute { el: el, name: "value".into(), old: None, new: None });
+}
+
+/// AETHERFILECHOSENJSFILES (SR706): the previous page's names go with its `FILES` roots.
+fn file_names_reset() {
+    FILE_NAMES.with(|n| n.borrow_mut().clear());
+}
+
+/// AETHERFILECHOSENJSFILES (SR706): the names of the files a file input's FileList holds (set by script through
+/// `input.files`), in order; empty when none is set or `node` is not this page's (layout and tests also run over
+/// documents no script saw: `control_value`'s guard). Read by the render's file status before the `value` stand-in.
+pub fn file_names(node: &crate::dom::NodeRef) -> Vec<String> {
+    if !page(|p| super::is_page_node(p, node)) {
+        return Vec::new();
+    }
+    FILE_NAMES.with(|n| n.borrow().get(&node.id().0).cloned()).unwrap_or_default()
+}
+
+/// AETHERFILECHOSENJSFILES (SR706): a file input's `value` in the filename mode (HTML §4.10.5.4): `C:\fakepath\` and the
+/// first selected file's name, else the empty string.
+fn file_value(el: usize) -> String {
+    FILE_NAMES.with(|n| n.borrow().get(&el).and_then(|v| v.first().cloned())).map(|f| format!("C:\\fakepath\\{f}")).unwrap_or_default()
 }
