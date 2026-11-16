@@ -35,6 +35,7 @@
 //! the tracks Surface under it) and the face splits over them (`Face::on_surfaces`); the window runs it, and the witness
 //! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
+//! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -249,7 +250,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let meters = meters_json(c, &face);
     let presses = presses_json(c, &presses);
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}{presses}{fnvs}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -259,7 +260,8 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         st.zoom,
         nle_face::fnv1a(&pixels),
         st.set.len(),
-        transition_json(&face)
+        transition_json(&face),
+        face.dirty()
     );
     0
 }
@@ -282,7 +284,7 @@ fn main() {
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
     if c.script.is_some() || c.out.is_some() || c.two || !windowed {
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels));
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)));
         std::process::exit(witness(&c, face));
     }
 
@@ -291,7 +293,7 @@ fn main() {
     let synapse = Synapse::new();
     {
         let rx = synapse.subscribe();
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true));
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new)));
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -427,6 +429,30 @@ mod tests {
         assert_eq!(lv.iter().map(|m| m.track).collect::<Vec<_>>(), vec![Some(1), None]);
         assert!((lv[1].peak_db + 13.56).abs() < 0.01, "{}", lv[1].peak_db);
     }
+
+    /// NLEHOSTSAVE M3: `save` is the verb's Input; with no document (the synth fixture) it refuses by name and the face
+    /// stays dirty after an edit; a path that cannot be written is refused naming the path.
+    #[test]
+    fn nlehostsave_witness_save_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face0 = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&face0, "save").as_deref(), Some([SMessage::Input { text, .. }]) if text == "save"));
+        let mut face = face0;
+        assert!(!face.dirty() && face.doc_path().is_none());
+        assert_eq!(drive(&mut face, "save"), vec!["save: no document path".to_string()]);
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        assert!(face.dirty());
+        assert_eq!(drive(&mut face, "save"), vec!["save: no document path".to_string()]);
+        assert!(face.dirty(), "a refused save leaves the face dirty");
+        let (_, src) = nle_face::synth_fixture();
+        let bad = std::path::Path::new("/nonexistent-nlehostsave/x.edl");
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(bad));
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        let errors = drive(&mut face, "save");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("save: /nonexistent-nlehostsave/x.edl: "), "{errors:?}");
+        assert!(face.dirty() && !bad.exists());
+    }
 }
 
 /// NLE3d (SR302): the witness's `transition` value: the selected transition and its thumbnail's size, or `null`.
@@ -478,6 +504,7 @@ fn transport() -> TetraNode {
         button("}", "Out +"),
         button("lift", "Lift"),
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
+        button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
     ])
 }
 
