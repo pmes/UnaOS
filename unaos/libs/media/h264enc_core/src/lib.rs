@@ -31,7 +31,7 @@
 //! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
-//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383) |
+//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383); TwoPass: CBR planned from a first pass's `Encoder::stats` (SR698) |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
 //! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
@@ -474,6 +474,8 @@ pub struct Encoder {
     scene_prev: Plane,
     /// The adaptive-quantisation state of the picture being coded (H264ENCAQ SR693; empty without [`Config::aq`]).
     pub(crate) aq: Aq,
+    /// One record per coded picture (H264ENCTWOPASS SR698): [`Encoder::stats`], the first pass of a two-pass export.
+    pub(crate) stats: Vec<rc::PicStat>,
 }
 
 impl Encoder {
@@ -562,6 +564,7 @@ impl Encoder {
             depth: num_reorder as u64,
             scene_prev: Plane::new(0, 0, 0),
             aq: Aq::default(),
+            stats: Vec::new(),
         })
     }
 
@@ -753,7 +756,7 @@ impl Encoder {
         // A B picture is not a reference (nal_ref_idc 0) unless it is the pyramid's middle (1, SR349).
         let slice = nal::nal_unit(if !bpic { 3 } else { reference as u8 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
-        self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
+        self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum()); self.note_stat(pic, slice_qp, &nals); // H264ENCTWOPASS (SR698): the picture's record
         self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
@@ -1172,18 +1175,7 @@ pub(crate) struct Aq {
 
 /// log2(max(e, 1)) with 4 fractional bits: the integer part by `ilog2`, the fraction by repeated squaring of the mantissa (Q16).
 fn log2_q4(e: u32) -> i64 {
-    let e = e.max(1);
-    let n = e.ilog2();
-    let mut y: u64 = ((e as u64) << 16) >> n;
-    let mut r = (n as i64) << 4;
-    for b in (0..4).rev() {
-        y = (y * y) >> 16;
-        if y >= 2 << 16 {
-            y >>= 1;
-            r |= 1 << b;
-        }
-    }
-    r
+    rc::log2_q16(e as u64) >> 12 // H264ENCTWOPASS (SR698): the ONE log2, its top four fraction bits
 }
 
 /// The adaptive-quantisation offsets of a picture (H264ENCAQ SR693): one per macroblock in raster order over the luma plane `y`
