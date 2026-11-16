@@ -112,6 +112,7 @@ impl layout_core::Host for ImgHost {
     type Node = N;
     type Gradient = ();
     type Shadow = ();
+    fn img_intrinsic(node: &N) -> Option<(f32, f32)> { with_image(node, |i| (i.width as f32, i.height as f32)) } // AETHERIMAGEINPUTELF (SR683): an image input's decoded size, layout_core's img rule
 }
 
 /// The box tree of the page.
@@ -256,4 +257,28 @@ pub fn compute(doc: &Document, vw: f32, vh: f32) -> Styled {
         customs.insert(id.0, mine);
     }
     out
+}
+
+// ---- AETHERIMAGEINPUTELF (LEDGER SR683): the page's decoded image-input bitmaps (named tail block) ----
+
+/// AETHERIMAGEINPUTELF (SR683): the open page's decoded image-input bitmaps by html_core node index, and the address of
+/// the document they belong to (a tab's other page never reads them). ONE writer, main.rs `image_inputs` (once per page
+/// open, before `lay`, replacing the map so the old page's bitmaps drop); readers `ImgHost::img_intrinsic` (layout_core's
+/// img sizing rule) and paint.rs `image_blit`, through [`with_image`] only. Single-threaded program: net.rs `NET`'s idiom.
+static mut IMAGES: (usize, BTreeMap<usize, pixel_core::Image>) = (0, BTreeMap::new());
+
+/// AETHERIMAGEINPUTELF (SR683): the bitmaps of `doc`'s image inputs replace the store (an empty map on a page with none).
+pub fn set_images(doc: &Document, m: BTreeMap<usize, pixel_core::Image>) {
+    // SAFETY: one thread; no reference into the store outlives a `with_image` call.
+    unsafe { *core::ptr::addr_of_mut!(IMAGES) = (doc as *const Document as usize, m) };
+}
+
+/// AETHERIMAGEINPUTELF (SR683): `f` over `node`'s decoded bitmap, when the store holds one for its document.
+pub fn with_image<R>(node: &N, f: impl FnOnce(&pixel_core::Image) -> R) -> Option<R> {
+    // SAFETY: one thread; the shared borrow ends with this call and no writer runs inside `f`.
+    let store = unsafe { &*core::ptr::addr_of!(IMAGES) };
+    if store.0 != node.doc as *const Document as usize {
+        return None;
+    }
+    store.1.get(&node.id.0).map(f)
 }
