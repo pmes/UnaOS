@@ -827,11 +827,13 @@ pub struct H264Opts {
     pub qcomp: Option<(i64, i64)>,
     /// x264's complexity blur of the planned pass in pictures ([`Pass2Opts::cplxblur`], SR753); None = x264's 20.
     pub cplxblur: Option<u32>,
+    /// x264's QP blur of the planned pass in Q8 ([`Pass2Opts::qblur_q8`], H264ENCTWOPASSQBLURCLI SR766); None = x264's 0.5 (128).
+    pub qblur_q8: Option<u32>,
 }
 
 impl Default for H264Opts {
     fn default() -> H264Opts {
-        H264Opts { qp: 26, gop: None, bitrate: None, crf: None, scenecut: None, aq: None, hrd: false, two_pass_stats: None, qcomp: None, cplxblur: None }
+        H264Opts { qp: 26, gop: None, bitrate: None, crf: None, scenecut: None, aq: None, hrd: false, two_pass_stats: None, qcomp: None, cplxblur: None, qblur_q8: None }
     }
 }
 
@@ -848,7 +850,7 @@ pub fn video_named_with(name: &str, tb: Timebase, opts: H264Opts) -> Option<Box<
         "h264" => {
             let e = H264Encoder::new(opts.qp, opts.gop.unwrap_or((den / num).max(1))).with_scenecut(opts.scenecut).with_aq(opts.aq);
             Box::new(match (opts.bitrate, opts.crf, opts.two_pass_stats) {
-                (Some(k), _, Some(stats)) => e.with_pass2_opts(pass2_of(opts.qcomp, opts.cplxblur)).with_two_pass(k, den, num, stats),
+                (Some(k), _, Some(stats)) => e.with_pass2_opts(pass2_of(opts.qcomp, opts.cplxblur, opts.qblur_q8)).with_two_pass(k, den, num, stats),
                 (Some(k), _, None) => e.with_hrd(opts.hrd).with_bitrate(k, den, num),
                 (None, Some(c), _) => e.with_quality(c, den, num),
                 (None, None, _) => e,
@@ -871,10 +873,10 @@ impl H264Encoder {
 
 // ---- H264ENCTWOPASSQCOMPCLI (LEDGER SR753): the two-pass plan's options from the table and the CLI (named tail block) ----
 /// The plan options of [`video_named_with`]'s two-pass arm: x264's defaults ([`Pass2Opts::default`]) with the given qcomp and
-/// complexity blur in place; `pass2_of(None, None)` is the Default, so a table call without them codes SR736's bytes.
-pub fn pass2_of(qcomp: Option<(i64, i64)>, cplxblur: Option<u32>) -> Pass2Opts {
+/// complexity blur (and SR766's QP blur) in place; `pass2_of(None, None, None)` is the Default, so a table call without them codes SR736's bytes.
+pub fn pass2_of(qcomp: Option<(i64, i64)>, cplxblur: Option<u32>, qblur_q8: Option<u32>) -> Pass2Opts {
     let d = Pass2Opts::default();
-    Pass2Opts { qcomp: qcomp.unwrap_or(d.qcomp), cplxblur: cplxblur.unwrap_or(d.cplxblur), ..d }
+    Pass2Opts { qcomp: qcomp.unwrap_or(d.qcomp), cplxblur: cplxblur.unwrap_or(d.cplxblur), qblur_q8: qblur_q8.unwrap_or(d.qblur_q8), ..d }
 }
 
 /// `nle export --qcomp F`'s parse: a finite fraction within 0.0..=1.0 as (round(F x 100), 100); None for anything else
@@ -910,4 +912,19 @@ pub fn audio_named(word: &str) -> Option<AudioOut> {
         Some(("aac", k)) => AudioOut::Aac(k.parse::<u32>().ok().filter(|&k| k > 0)?),
         Some(_) => return None,
     })
+}
+
+// ---- H264ENCTWOPASSQBLURCLI (LEDGER SR766): `nle export --qblur F`'s parse (named tail block) ----
+/// The largest `--qblur` taken: x264 accepts any non-negative qblur; 16 keeps `rc::blur_qscale`'s window ((qblur x 4) | 1
+/// pictures) at 65.
+pub const QBLUR_MAX: f64 = 16.0;
+
+/// `nle export --qblur F`'s parse: a finite number within 0.0..=[`QBLUR_MAX`] as Q8 (round(F x 256); 0.5 = 128, x264's
+/// default; 0 = no QP blur); None for anything else (the CLI refuses it by name).
+pub fn qblur_of(s: &str) -> Option<u32> {
+    let f: f64 = s.trim().parse().ok()?;
+    if !f.is_finite() || !(0.0..=QBLUR_MAX).contains(&f) {
+        return None;
+    }
+    Some((f * 256.0).round() as u32)
 }
