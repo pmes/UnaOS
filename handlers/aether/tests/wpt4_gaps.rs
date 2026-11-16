@@ -3,7 +3,7 @@
 //! the lifted directory's tests read back. The expected values are the specifications' (section cited per test).
 
 fn load_with(html: &str, budget_ms: u64) -> aether::AetherEngine {
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_html("http://127.0.0.1:8000/wpt4.html", html, true);
     if let Some(js) = engine.js_engine.as_mut() {
         aether::event_loop::settle(js, budget_ms);
@@ -257,4 +257,11 @@ R.push(t(b).responseXML.documentElement.localName);
 "#,
     );
     assert_eq!(got, "%C3%82%C3%B0|%EF%BF%BD%EF%BF%BD|%C3%82%C3%B0|%EF%BF%BD%EF%BF%BD|a|true|r");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "wpt4-gaps");
 }

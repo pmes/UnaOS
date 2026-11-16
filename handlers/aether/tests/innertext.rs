@@ -34,7 +34,7 @@ fn whole_document_selection_text_equals_chromium_inner_text() {
         let want = v["innerText"].as_str().unwrap();
         let path = data().join(name);
         let html = std::fs::read_to_string(&path).unwrap();
-        let mut engine = aether::AetherEngine::new();
+        init(); let mut engine = aether::AetherEngine::new();
         engine.handle_event(aether::api::events::Event::Resize(800, 600));
         engine.load_html(&format!("file://{}", path.display()), &html, true);
         engine.select_all();
@@ -52,4 +52,11 @@ fn whole_document_selection_text_equals_chromium_inner_text() {
         }
     }
     assert!(fails.is_empty(), "innerText differs on {fails:?}");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "innertext");
 }

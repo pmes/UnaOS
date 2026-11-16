@@ -236,7 +236,7 @@ impl EditorState {
     /// would overlap). The set and the primary follow their clips.
     pub fn move_set(&mut self, delta: i64) -> Result<(), EditError> {
         let primary = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.move_many(&self.set, delta)?;
+        let tl = match self.pair_pick() { Some((t, i)) => self.timeline.move_pair(t, i, delta)?, None => self.timeline.move_many(&self.set, delta)? };
         let at = |st: &EditorState, (t, i): (usize, usize)| st.timeline.tracks[t].clips[i].at + delta;
         let landed: Vec<(usize, i64)> = self.set.iter().map(|&p| (p.0, at(self, p))).collect();
         let p_at = (primary.0, at(self, primary));
@@ -361,6 +361,8 @@ impl EditorState {
             }
             "nudge-" => self.move_set(-1),
             "nudge+" => self.move_set(1),
+            _ if rtrim_words(v).is_some() => self.rtrim_verb(v),
+            _ if slipslide_words(v).is_some() => self.slipslide_verb(v),
             _ => return None,
         })
     }
@@ -448,4 +450,97 @@ impl EditorState {
             _ => Err(EditError::Policy),
         })
     }
+}
+
+// ---- NLE3ETRIMSTRETCH (LEDGER SR692): the ripple trim and the transitioned pair's move from the editor (named tail block) ----
+// `rtrim <in|out> <delta>` rides THE verb dispatch both faces call: the selected clip's edge moves by `delta` source ticks
+// through `Timeline::ripple_trim_in` / `ripple_trim_out` (later clips of its track follow; ONE commit). `move_set` moves a
+// set that is exactly a transitioned pair (two butted clips of one track with a two-clip transition on their cut) through
+// `Timeline::move_pair`, so the transition goes with them; any other set is `move_many` as before.
+impl EditorState {
+    /// The ripple twin of [`EditorState::trim`]: the selected clip's in or out point by `delta` source ticks, keeping its
+    /// start; the rest of its track follows.
+    pub fn ripple_trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let tl = match edge {
+            Edge::In => self.timeline.ripple_trim_in(track, idx, c.src_in + delta)?,
+            Edge::Out => self.timeline.ripple_trim_out(track, idx, c.src_out + delta)?,
+        };
+        self.commit(tl);
+        Ok(())
+    }
+    /// The set as a transitioned pair: `(track, outgoing index)` when it is exactly clips `i` and `i + 1` of one track,
+    /// butted, with a two-clip (not BL) transition on their cut.
+    fn pair_pick(&self) -> Option<(usize, usize)> {
+        let [(t, i), (u, j)] = self.set[..] else { return None };
+        let tr = self.timeline.tracks.get(t)?;
+        let (o, n) = (tr.clips.get(i)?, tr.clips.get(j)?);
+        let cut = o.end();
+        let ok = t == u && j == i + 1 && n.at == cut && tr.transitions.iter().any(|x| x.at == cut && !x.from_black && !x.to_black);
+        ok.then_some((t, i))
+    }
+    /// The `rtrim` words of [`EditorState::verb`].
+    fn rtrim_verb(&mut self, v: &str) -> Result<(), EditError> {
+        match rtrim_words(v) {
+            Some((edge, delta)) => self.ripple_trim(edge, delta),
+            None => Err(EditError::NoClip),
+        }
+    }
+}
+
+/// `rtrim in <delta>` / `rtrim out <delta>` (delta in source ticks, signed); any other shape is not this verb.
+fn rtrim_words(v: &str) -> Option<(Edge, i64)> {
+    let mut w = v.split_ascii_whitespace();
+    if w.next() != Some("rtrim") {
+        return None;
+    }
+    let edge = match w.next()? {
+        "in" => Edge::In,
+        "out" => Edge::Out,
+        _ => return None,
+    };
+    let delta = w.next()?.parse::<i64>().ok()?;
+    w.next().is_none().then_some((edge, delta))
+}
+
+// ---- NLE3ESLIP (LEDGER SR704): slip and slide from the editor (named tail block) ----
+// `slip <delta>` / `slide <delta>` ride THE verb dispatch both faces call (and the `--do` tokens): the selected clip slips
+// its source window (`Timeline::slip`) or slides along its track with its neighbours' edges following (`Timeline::slide`),
+// ONE commit each (undo restores the whole pre-op timeline); a refusal leaves the state and names its `EditError`.
+impl EditorState {
+    /// Slip the selected clip by `delta` source ticks (`Timeline::slip`).
+    pub fn slip_selected(&mut self, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.slip(track, idx, delta)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// Slide the selected clip by `delta` timeline ticks (`Timeline::slide`); the selection stays on it.
+    pub fn slide_selected(&mut self, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.slide(track, idx, delta)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `slip` / `slide` words of [`EditorState::verb`].
+    fn slipslide_verb(&mut self, v: &str) -> Result<(), EditError> {
+        match slipslide_words(v) {
+            Some((true, delta)) => self.slip_selected(delta),
+            Some((false, delta)) => self.slide_selected(delta),
+            None => Err(EditError::NoClip),
+        }
+    }
+}
+
+/// `slip <delta>` -> `(true, delta)`, `slide <delta>` -> `(false, delta)` (signed ticks); any other shape is not this verb.
+fn slipslide_words(v: &str) -> Option<(bool, i64)> {
+    let mut w = v.split_ascii_whitespace();
+    let slip = match w.next()? {
+        "slip" => true,
+        "slide" => false,
+        _ => return None,
+    };
+    let delta = w.next()?.parse::<i64>().ok()?;
+    w.next().is_none().then_some((slip, delta))
 }

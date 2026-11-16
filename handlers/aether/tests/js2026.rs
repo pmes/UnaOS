@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 fn load(url: &str, html: &str, budget_ms: u64) -> aether::AetherEngine {
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_html(url, html, true);
     if let Some(js) = engine.js_engine.as_mut() {
         aether::event_loop::settle(js, budget_ms);
@@ -198,4 +198,11 @@ fn intl_in_a_page() {
     let html = "<!doctype html><html><body><script>var out = [(1234.5).toLocaleString(), new Intl.DateTimeFormat().resolvedOptions().locale, new Date(Date.UTC(2024, 0, 15)).toLocaleDateString('en-US', {timeZone: 'UTC', month: 'short', day: 'numeric'}), new Intl.PluralRules('en', {type: 'ordinal'}).select(22)].join('|');</script></body></html>";
     let mut e = load("http://intl.test/", html, 500);
     assert_eq!(eval(&mut e, "out"), "1,234.5|en-US|Jan 15|two");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "js2026");
 }

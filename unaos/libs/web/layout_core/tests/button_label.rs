@@ -177,3 +177,28 @@ fn file_status_width_follows_the_value() {
     assert_eq!(b("s").2, 68.0, "a short name falls to the 34-digit floor: {}", b("s").2);
     assert_eq!(b("l").2, 102.0, "a long name widens the box to button + 4 + the name: {}", b("l").2);
 }
+
+// ---- AETHERIMAGEINPUTFACE (LEDGER SR701): an image input takes no ButtonFace (named tail block) ----
+
+/// AETHERIMAGEINPUTFACE (SR701): html.css paints ButtonFace on push buttons only; `input[type="image" i]` has no UA
+/// background (like a file input, SR463), so the tree's paint style for it carries none while the push types keep it.
+#[test]
+fn image_input_has_no_button_face() {
+    let doc = page(vec![
+        lone("img", &[("type", "image"), ("alt", "Go")]),
+        lone("pad", &[("type", " IMAGE "), ("alt", "Go")]),
+        lone("sub", &[("type", "submit")]),
+        lone("rst", &[("type", "reset")]),
+        lone("btn", &[("type", "button"), ("value", "Go")]),
+        lone("fil", &[("type", "file")]),
+        el("div", &[("style", "display: flex")], vec![el("button", &[("id", "tag")], vec![text("Go")])]),
+    ]);
+    let tree = lay(&doc, 800.0, 600.0);
+    let bg = |id: &str| tree.paint_map.get(&id_of(&tree, &doc.by_id(id))).and_then(|p| p.background);
+    assert_eq!(bg("img"), None, "an image input has no UA background");
+    assert_eq!(bg("pad"), None, "a padded, uppercase type=image is the same image input");
+    assert_eq!(bg("fil"), None, "a file input paints its face on the button sub-box only (SR463)");
+    for id in ["sub", "rst", "btn", "tag"] {
+        assert_eq!(bg(id), Some(layout_core::BUTTON_FACE), "#{id}: a push button keeps ButtonFace");
+    }
+}

@@ -11,7 +11,7 @@ const URL: &str = "http://webgl.test/";
 
 fn page(script: &str) -> AetherEngine {
     let html = format!("<!doctype html><html><body><canvas id=c width=64 height=64></canvas><script>{script}</script></body></html>");
-    let mut e = AetherEngine::new();
+    init(); let mut e = AetherEngine::new();
     e.load_html(URL, &html, true);
     if let Some(js) = e.js_engine.as_mut() {
         aether::event_loop::settle(js, 200);
@@ -123,4 +123,11 @@ fn surface_hand_off() {
          [c.toDataURL() !== blank.toDataURL(), bl, tr, st, tex, gl.getError()].join('|')",
     );
     assert_eq!(r, "true|255,0,0,255|0,0,255,255|true|40,50,60,255|0");
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "webgl");
 }

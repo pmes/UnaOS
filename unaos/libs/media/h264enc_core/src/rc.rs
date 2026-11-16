@@ -40,7 +40,7 @@
 //!   bit budget, no row modulation); the floor of every rate-controlled QP is [`crate::Config::qp_min`] (None = [`QP_MIN`]),
 //!   read through [`crate::Config::qp_floor`].
 //!
-//! Owed (handlers.md §5 H264ENC-RC): two-pass (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; HRD signalling of the bucket: H264ENCHRD SR699, this file's tail).
+//! Owed (handlers.md §5 H264ENC-RC): none of its own (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; two-pass: [`RcMode::TwoPass`], this file's H264ENCTWOPASS tail block, SR698; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699).
 
 use alloc::vec::Vec;
 
@@ -68,6 +68,9 @@ pub enum RcMode {
     /// Constant quality (H264ENCVBRCRF SR383), crf 0..=51: each picture's QP is the constant-QP rule's at base crf (B pictures
     /// their offset above), clamped to [`crate::Config::qp_floor`]..=51; `bits_per_second` is not read.
     Crf(u8),
+    /// Two-pass (H264ENCTWOPASS SR698): the CBR bucket at `bits_per_second`, each picture's start QP planned from a first pass's
+    /// [`PicStat`]s ([`crate::Encoder::planned`], x264's pass-2 allocation in [`pass2_qps`]); without a plan, [`RcMode::Cbr`].
+    TwoPass,
 }
 
 /// The rate control of a stream ([`crate::Config::rate`]); `fps_num / fps_den` pictures per second.
@@ -137,12 +140,14 @@ pub(crate) struct Rc {
     pic_qp: i32,
     /// The lowest and highest row QP of the picture.
     pub(crate) span: (i32, i32),
+    /// The two-pass plan (H264ENCTWOPASS SR698; None without [`crate::Encoder::planned`]).
+    pass2: Option<Pass2>,
 }
 
 impl Rc {
     pub(crate) fn new(rate: RateControl, gop: u32, start_qp: i32, floor: i32) -> Result<Rc> {
         let max = match rate.mode {
-            RcMode::Cbr | RcMode::Crf(_) => rate.bits_per_second,
+            RcMode::Cbr | RcMode::Crf(_) | RcMode::TwoPass => rate.bits_per_second,
             RcMode::Vbr { max_bits_per_second } => max_bits_per_second,
         };
         let budget_ok = match rate.mode {
@@ -177,6 +182,7 @@ impl Rc {
             target: 0,
             pic_qp: start_qp,
             span: (start_qp, start_qp),
+            pass2: None,
         })
     }
 
@@ -206,7 +212,7 @@ impl Rc {
         let share = (self.r as i128 * self.gop * [r16, 16, 8][t] / den) as i64;
         let mut target = share;
         match self.rate.mode {
-            RcMode::Cbr => {
+            RcMode::Cbr | RcMode::TwoPass => {
                 target += (self.plan - self.full) / 8;
                 target = target.min(self.buf - self.full).max(self.r / 8);
             }
@@ -230,7 +236,7 @@ impl Rc {
             self.last_qp
         };
         let (lo, hi) = ((refq - PIC_STEP).max(self.floor), (refq + PIC_STEP).min(QP_MAX));
-        let qp = if m.coded { (lo..=hi).find(|&q| m.predict(s, q) <= target as u128).unwrap_or(hi) } else { refq.max(self.floor) };
+        let qp = if m.coded { (lo..=hi).find(|&q| m.predict(s, q) <= target as u128).unwrap_or(hi) } else { refq.max(self.floor) }; let (share, target, qp) = self.pass2_pick(t, s, share, target, qp); // H264ENCTWOPASS (SR698): the plan's start QP
         self.t = t;
         self.rows = rows;
         self.s = s;
@@ -272,7 +278,7 @@ impl Rc {
         self.full = (self.full + b - self.r).max(0);
         self.plan += self.share - self.r;
         self.fmax = (self.fmax + b - self.rmax).max(0);
-        self.err += b - self.r;
+        self.err += b - self.r; self.pass2_note(b); // H264ENCTWOPASS (SR698)
     }
 
     /// Under [`RcMode::Crf`] (SR383) its base QP.
@@ -504,15 +510,206 @@ mod tests {
     }
 }
 
+// ---- H264ENCTWOPASS (LEDGER SR698): two-pass rate control (named tail block) ----
+// x264's pass 2 (encoder/ratecontrol.c `init_pass2`) in the rate model's own integers: the first pass records each coded picture
+// ([`PicStat`], `Encoder::note_stat` on `code`'s rc_update line); its complexity is bits x step16(SliceQPY), the R-Q relation
+// `Model::predict` already holds (bits x step = const for a picture), so a picture's bits at q are predicted complexity / step16(q).
+// [`pass2_qps`] gives each anchor a qscale ~ complexity^(1 - qcomp) (qcomp 0.6), an I picture the complexity of its next P (else the
+// previous) and [`IP_QP_OFFSET`] below it, a B picture its preceding anchor's QP + `B_QP_OFFSET`, and solves the scale by ONE
+// bisection so the predicted total meets the target. In the second pass [`RcMode::TwoPass`] keeps the CBR bucket: `Rc::picture`'s
+// QP line hands its choice to `pass2_pick`, which starts the picture at its planned QP moved by the remaining budget against the
+// remaining plan, then raises it while the type's model predicts more than the bucket's room; `row_qp` corrects the rows. Owed:
+// H264ENC-TWOPASS-FILE, H264ENC-TWOPASS-QCOMP, H264ENC-TWOPASS-KERNEL, H264ENC-TWOPASS-BLUR.
+
+/// One coded picture as the first pass saw it (H264ENCTWOPASS SR698): its type, its access unit's bits (every NAL unit), its
+/// SliceQPY and its complexity bits x [`step16`]`(qp)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PicStat {
+    pub kind: Pic,
+    pub bits: u64,
+    pub qp: i32,
+    pub complexity: u64,
+}
+
+/// x264's qcomp 0.6 as a fraction (3, 5): an anchor's qscale goes as complexity^(1 - 3/5). The knob is owed (H264ENC-TWOPASS-QCOMP).
+pub const QCOMP: (i64, i64) = (3, 5);
+/// An I picture's planned QP below its P neighbour's: x264's ip_factor 1.4 (6 x log2 1.4 = 2.9).
+pub const IP_QP_OFFSET: i32 = 3;
+
+/// log2(max(e, 1)) with 16 fractional bits: the integer part by `ilog2`, the fraction by repeated squaring of the Q16 mantissa
+/// (the tree's ONE log2: lib.rs `log2_q4` is its top four fraction bits).
+pub fn log2_q16(e: u64) -> i64 {
+    let e = e.max(1);
+    let n = e.ilog2();
+    let mut y: u64 = (((e as u128) << 16) >> n) as u64;
+    let mut r = (n as i64) << 16;
+    for b in (0..16).rev() {
+        y = (y * y) >> 16;
+        if y >= 2 << 16 {
+            y >>= 1;
+            r |= 1 << b;
+        }
+    }
+    r
+}
+
+/// The QP of a picture whose anchor complexity has log2 `l` (Q16) at scale log2 `s` (Q16), `off` below, clamped `floor..=51`:
+/// log2 step16(q) = 4 + (q - 4) / 6, so q = 6 (s + (1 - qcomp) l) - 20.
+fn plan_qp(s: i64, l: i64, off: i32, floor: i32) -> i32 {
+    let q16 = 6 * s + 6 * l * (QCOMP.1 - QCOMP.0) / QCOMP.1 - (20 << 16);
+    ((q16 + (1 << 15)) >> 16).saturating_sub(off as i64).clamp(floor as i64, QP_MAX as i64) as i32
+}
+
+/// The planned QP of every picture of a first pass (H264ENCTWOPASS SR698, x264's `init_pass2`) for `target_bits` over them all,
+/// each within `floor..=51`: the smallest scale whose predicted total (sum of complexity / step16(qp)) is at most the target.
+pub fn pass2_qps(stats: &[PicStat], target_bits: u64, floor: i32) -> Vec<i32> {
+    let logs: Vec<i64> = stats
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let a = if p.kind == Pic::Idr { stats[i + 1..].iter().chain(stats[..i].iter().rev()).find(|q| q.kind == Pic::P).unwrap_or(p) } else { p };
+            log2_q16(a.complexity)
+        })
+        .collect();
+    let at = |s: i64| -> Vec<i32> {
+        let mut out = Vec::with_capacity(stats.len());
+        let mut anchor: Option<i32> = None;
+        for (i, p) in stats.iter().enumerate() {
+            let q = match (p.kind, anchor) {
+                (Pic::B, Some(a)) => (a + B_QP_OFFSET).clamp(floor, QP_MAX),
+                (Pic::Idr, _) => plan_qp(s, logs[i], IP_QP_OFFSET, floor),
+                _ => plan_qp(s, logs[i], 0, floor),
+            };
+            if p.kind != Pic::B {
+                anchor = Some(q);
+            }
+            out.push(q);
+        }
+        out
+    };
+    let total = |q: &[i32]| -> u128 { stats.iter().zip(q).map(|(p, &q)| p.complexity as u128 / step16(q) as u128).sum() };
+    let (mut lo, mut hi) = (-(64i64 << 16), 64i64 << 16);
+    if total(&at(lo)) <= target_bits as u128 {
+        return at(lo);
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if total(&at(mid)) <= target_bits as u128 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    at(hi)
+}
+
+/// The second pass's plan ([`crate::Encoder::planned`]): per picture its type, planned QP and predicted bits; the pictures coded so
+/// far, their bits, and the target over the whole plan.
+#[derive(Debug, Clone)]
+struct Pass2 {
+    kinds: Vec<Pic>,
+    qps: Vec<i32>,
+    bits: Vec<u64>,
+    n: usize,
+    spent: i64,
+    total: i64,
+}
+
+impl Rc {
+    /// Under a plan, picture `t` (its index's type matching): (share, target, QP) from the plan, the remaining budget against the
+    /// remaining plan, and the bucket; otherwise the CBR choice unchanged.
+    fn pass2_pick(&self, t: usize, s: u64, share: i64, target: i64, qp: i32) -> (i64, i64, i32) {
+        let Some(p) = self.pass2.as_ref() else { return (share, target, qp) };
+        if p.n >= p.qps.len() || p.kinds[p.n] != [Pic::Idr, Pic::P, Pic::B][t] {
+            return (share, target, qp);
+        }
+        let rp = p.bits[p.n..].iter().sum::<u64>().max(1) as i64;
+        let rb = (p.total - p.spent).clamp(rp / 2, 2 * rp).max(1);
+        let share = (p.bits[p.n].max(1) as i128 * rb as i128 / rp as i128) as i64;
+        let off = ((6 * (log2_q16(rp as u64) - log2_q16(rb as u64)) + (1 << 15)) >> 16).clamp(-PIC_STEP as i64, PIC_STEP as i64) as i32;
+        let mut qp = (p.qps[p.n] + off).clamp(self.floor, QP_MAX);
+        let room = (self.buf - self.full).max(self.r / 8);
+        let m = self.types[t];
+        while m.coded && qp < QP_MAX && m.predict(s, qp) > room as u128 {
+            qp += 1;
+        }
+        (share, share.min(self.buf - self.full).max(self.r / 8), qp)
+    }
+
+    /// After a picture under a plan: its `bits` spent, the next index.
+    fn pass2_note(&mut self, bits: i64) {
+        if let Some(p) = self.pass2.as_mut() {
+            p.spent += bits;
+            p.n += 1;
+        }
+    }
+}
+
+impl RateControl {
+    /// H264ENCTWOPASS (SR698): two-pass at a mean of `kbps` kbit/s (x 1000, saturating) at `fps` as [`RateControl::cbr`] takes it;
+    /// the plan enters through [`crate::Encoder::planned`].
+    pub const fn two_pass(kbps: u32, fps: (u32, u32)) -> RateControl {
+        RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num: fps.0, fps_den: fps.1, mode: RcMode::TwoPass }
+    }
+}
+
+impl Encoder {
+    /// H264ENCTWOPASS (SR698): plan the second pass from a first pass's `stats` (the same frames, the same picture types in coding
+    /// order). An empty slice returns the encoder unchanged; a plan needs [`RcMode::TwoPass`] (else [`Error::Rate`]). The target is
+    /// `bits_per_second` x pictures x fps_den / fps_num.
+    pub fn planned(mut self, stats: &[PicStat]) -> Result<Encoder> {
+        if stats.is_empty() {
+            return Ok(self);
+        }
+        let Some(rc) = self.rc.as_mut().filter(|rc| rc.rate.mode == RcMode::TwoPass) else { return Err(Error::Rate) };
+        let rate = rc.rate;
+        let total = (rate.bits_per_second as u128 * stats.len() as u128 * rate.fps_den as u128 / rate.fps_num as u128) as u64;
+        let qps = pass2_qps(stats, total, rc.floor);
+        let bits = stats.iter().zip(&qps).map(|(p, &q)| p.complexity / step16(q)).collect();
+        rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64 });
+        Ok(self)
+    }
+
+    /// H264ENCTWOPASS (SR698): one record per coded picture, in coding order, under every rate mode.
+    pub fn stats(&self) -> &[PicStat] {
+        &self.stats
+    }
+
+    /// After picture `kind` at SliceQPY `qp`: its record from the access unit's NAL units.
+    pub(crate) fn note_stat(&mut self, kind: Pic, qp: i32, nals: &[Vec<u8>]) {
+        let bits: u64 = nals.iter().map(|n| n.len() as u64 * 8).sum();
+        self.stats.push(PicStat { kind, bits, qp, complexity: bits * step16(qp) });
+    }
+}
+
+#[cfg(test)]
+mod twopass_tests {
+    use super::*;
+
+    /// The ONE log2: AQ's Q4 is the top four fraction bits of the Q16.
+    #[test]
+    fn log2_q4_is_log2_q16_top_bits() {
+        for e in [0u32, 1, 2, 3, 5, 7, 100, 1000, 4095, 65_535, 1 << 20, 123_456_789, u32::MAX] {
+            assert_eq!(crate::log2_q4(e), log2_q16(e as u64) >> 12, "{e}");
+        }
+        assert_eq!(log2_q16(1 << 40), 40 << 16);
+    }
+
+    #[test]
+    fn two_pass_constructor_equals_the_literal() {
+        assert_eq!(RateControl::two_pass(200, (25, 1)), RateControl { bits_per_second: 200_000, fps_num: 25, fps_den: 1, mode: RcMode::TwoPass });
+    }
+}
+
 // ---- H264ENCHRD (LEDGER SR699): the bucket's HRD view (named tail block) ----
 // The HRD the stream signals IS this file's bucket: CBR `buf` / `full` drained at the mean rate (cbr_flag 1), VBR `bmax` / `fmax`
-// drained at the max rate (cbr_flag 0). The one correction: `r` is floor(bps x den / num), while a decoder drains the exact
+// drained at the max rate (cbr_flag 0); two-pass (SR698) keeps the CBR bucket and is signalled as it. The one correction: `r` is floor(bps x den / num), while a decoder drains the exact
 // rate, so after n pictures the CBR model is fuller than the decoder's mirror by floor(n X) - n r bits; `hrd_bucket` removes it.
 impl Rc {
     /// The bucket as hrd_parameters + timing_info (None under CRF: no bucket).
     pub(crate) fn hrd_params(&self) -> Option<crate::sps::Hrd> {
         let (bit_rate, cpb_size, cbr) = match self.rate.mode {
-            RcMode::Cbr => (self.rate.bits_per_second, self.buf as u32, true),
+            RcMode::Cbr | RcMode::TwoPass => (self.rate.bits_per_second, self.buf as u32, true),
             RcMode::Vbr { max_bits_per_second } => (max_bits_per_second, self.bmax as u32, false),
             RcMode::Crf(_) => return None,
         };
@@ -523,7 +720,7 @@ impl Rc {
     /// CBR: the exact-rate fullness and drain floor((n + 1) X) - floor(n X), X = bps x den / num; VBR: the max bucket's own.
     pub(crate) fn hrd_bucket(&self, n: u64) -> Option<(bool, i64, i64, i64, i64)> {
         match self.rate.mode {
-            RcMode::Cbr => {
+            RcMode::Cbr | RcMode::TwoPass => {
                 let (bps, den, num) = (self.rate.bits_per_second as i128, self.rate.fps_den as i128, self.rate.fps_num as i128);
                 let drained = |k: i128| k * bps * den / num;
                 let n = n as i128;

@@ -29,7 +29,7 @@ use super::downloads::{self, Download};
 
 /// Aether's per-user data directory.
 pub fn data_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "UnaOS", "Aether").map(|p| p.data_dir().to_path_buf())
+    Some(crate::storage::root_dir()) // AETHER-DATADIR-ONE (SR696): the one storage root, so a re-rooted process re-roots bookmarks
 }
 
 /// The bookmarks file.

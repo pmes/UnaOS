@@ -7,7 +7,7 @@
 //! the next frame, `ready` resolving with `pending` false after the engine's frame) and played again.
 
 fn load(url: &str, html: &str, budget_ms: u64) -> aether::AetherEngine {
-    let mut engine = aether::AetherEngine::new();
+    init(); let mut engine = aether::AetherEngine::new();
     engine.load_html(url, html, true);
     if let Some(js) = engine.js_engine.as_mut() {
         aether::event_loop::settle(js, budget_ms);
@@ -76,4 +76,11 @@ fn css_transition_pause_play_and_ready() {
     let got = eval(&mut e, "JSON.stringify([__log, __a.pending, __a.playState, __a.currentTime === __a.currentTime])");
     assert_eq!(got, r#"[["ready true false"],false,"paused",true]"#);
     assert_eq!(eval(&mut e, "__a.play(); JSON.stringify([__a.playState, __a.pending])"), r#"["running",true]"#);
+}
+
+// ---- AETHERTESTROOTS (LEDGER SR696): storage under the process root (named tail block) ----
+
+/// Re-roots this binary's storage (and the font index) under cargo's target tmp dir before its first engine.
+fn init() {
+    aether::storage::init_root(env!("CARGO_TARGET_TMPDIR"), "animations");
 }
