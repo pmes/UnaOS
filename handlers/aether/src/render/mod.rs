@@ -4496,8 +4496,9 @@ fn paint_img_alt(
 // ---- AETHERFILECHOSEN (LEDGER SR682): a file input's status from its value, ellipsized to the box (named tail block) ----
 
 /// AETHERFILECHOSEN (SR682): the status text `paint_file_color` draws after a file input's button: layout_core's ONE
-/// rule `file_status` over the element's `multiple` and `value` attributes (one name: Chromium ignores the attribute, the
-/// stand-in until a picker or the JS FileList feeds it, AETHER-FILEPICKER / AETHER-FILECHOSEN-JSFILES owed), fitted to
+/// rule `file_status` over the element's FileList set by script (AETHERFILECHOSENJSFILES SR706: `js::controls::file_names`,
+/// one name or `N files` by the list's length, Blink's FileStatusText) else its `multiple` and `value` attributes (one
+/// name: Chromium ignores the attribute, the stand-in until a picker feeds it, AETHER-FILEPICKER owed), fitted to
 /// `avail` px (the input's content right edge less the status origin) by the render's existing ellipsis,
 /// `pdf::thumbs::ellipsize` (whole when it fits, else cut with a trailing `…`).
 fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -> String {
@@ -4508,6 +4509,6 @@ fn file_status_fit(dom_node: &crate::dom::NodeRef, adv: &Advancer, avail: f32) -
             (a.get("multiple").is_some(), a.get("value").map(str::to_string))
         })
         .unwrap_or((false, None));
-    let status = layout_core::file_status(value.as_deref(), multiple, 1);
+    let names = crate::js::controls::file_names(dom_node); let status = if names.is_empty() { layout_core::file_status(value.as_deref(), multiple, 1) } else { layout_core::file_status(Some(&names[0]), multiple || names.len() > 1, names.len()) };
     crate::pdf::thumbs::ellipsize(adv, &status, avail.max(0.0) as f64).into_owned()
 }
