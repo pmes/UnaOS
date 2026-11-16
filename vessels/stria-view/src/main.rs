@@ -647,31 +647,6 @@ mod exportrange_tests {
     }
 }
 
-// ---- NLETRANSITIONFACE (LEDGER SR691): the Kind / Ease buttons, the `kind:` / `ease:` tokens and the JSON `ease` (named tail block) ----
-
-#[cfg(test)]
-mod transitionface_tests {
-    use super::*;
-
-    /// M3: `transition:T:I` selects the dissolve, `kind:W007` / `ease:inout` are timeline_core's verbs with their argument,
-    /// bare `kind` / `ease` (the buttons' words) cycle; the JSON value names the kind and the ease.
-    #[test]
-    fn nletransitionface_witness_kind_and_ease() {
-        let (tl, src) = nle_face::synth_fixture();
-        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
-        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
-        let errors = drive(&mut face, "transition:0:0,kind:W007,ease:inout");
-        assert!(errors.is_empty(), "{errors:?}");
-        let json = transition_json(&face);
-        assert!(json.contains(r#""kind":"W007","ease":"inout""#), "{json}");
-        assert!(drive(&mut face, "kind,ease").is_empty());
-        let json = transition_json(&face);
-        assert!(json.contains(r#""kind":"W021","ease":"linear""#), "{json}");
-        assert_eq!(face.state.undo_depth(), 4);
-        assert_eq!(drive(&mut face, "kind:W008"), vec![format!("kind W008: {}", timeline_core::EditError::Transition)]);
-    }
-}
-
 // ---- STRIAINFOREEL (LEDGER SR743): the witness's selected reel (named tail block) ----
 /// The witness's `"reel"` field, only while a clip is selected: the face's message idle text (`Face::reel_line`,
 /// `<reel>: <codec> <W>x<H> <profile> <bit rate>`); the default line is unchanged.
@@ -695,6 +670,31 @@ mod striainforeel_tests {
         let j = reel_json(&face);
         assert!(j.starts_with(",\"reel\":\"B: utp1 64x48 ~") && j.ends_with(" kb/s\""), "{j}");
         println!("striainforeel witness: {j}");
+    }
+}
+
+// ---- NLETRANSITIONFACE (LEDGER SR691): the Kind / Ease buttons, the `kind:` / `ease:` tokens and the JSON `ease` (named tail block) ----
+
+#[cfg(test)]
+mod transitionface_tests {
+    use super::*;
+
+    /// M3: `transition:T:I` selects the dissolve, `kind:W007` / `ease:inout` are timeline_core's verbs with their argument,
+    /// bare `kind` / `ease` (the buttons' words) cycle; the JSON value names the kind and the ease.
+    #[test]
+    fn nletransitionface_witness_kind_and_ease() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "transition:0:0,kind:W007,ease:inout");
+        assert!(errors.is_empty(), "{errors:?}");
+        let json = transition_json(&face);
+        assert!(json.contains(r#""kind":"W007","ease":"inout""#), "{json}");
+        assert!(drive(&mut face, "kind,ease").is_empty());
+        let json = transition_json(&face);
+        assert!(json.contains(r#""kind":"W021","ease":"linear""#), "{json}");
+        assert_eq!(face.state.undo_depth(), 4);
+        assert_eq!(drive(&mut face, "kind:W008"), vec![format!("kind W008: {}", timeline_core::EditError::Transition)]);
     }
 }
 
