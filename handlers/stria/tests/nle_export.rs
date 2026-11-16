@@ -580,3 +580,93 @@ fn h264_movie_mkv_round_trip() {
     assert_eq!(got, want_pcm(&tl, &src));
     assert!(Demuxer::open_indexed(mkv).unwrap().indexed(), "the Cues are found");
 }
+
+// ── NLERAWEXPORT (LEDGER SR689): the raw planar exports, i420 and y4m, over the ONE converter (handlers.md §5 NLE5b's NLE5-I420, NLEPROBE-HDR's RAW-EXPORT) ──
+
+/// The converter's planes of one 64x48 RGBA frame of the synth fixture, Y then Cb then Cr.
+fn nlerawexport_planes(rgba: &[u8]) -> Vec<u8> {
+    let f = I420::from_rgba(64, 48, rgba).unwrap();
+    [f.y, f.u, f.v].concat()
+}
+
+#[test]
+fn nlerawexport_i420_is_the_converter_planes() {
+    use stria::nle_export::I420Raw;
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("i420");
+    let enc = I420Raw::default();
+    let size = enc.size();
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!((r.frames, r.files), (35, 2));
+    assert_eq!(r.fnv, refr.fnv);
+    assert_eq!(size.get(), Some((64, 48)), "the latched size");
+    let raw = std::fs::read(dir.join("video.i420")).unwrap();
+    assert_eq!(raw.len(), 35 * 64 * 48 * 3 / 2, "frames x w x h x 3 / 2");
+    assert_eq!(raw[..64 * 48], I420::from_rgba(64, 48, &refr.frames[0]).unwrap().y[..], "frame 0's Y plane is the converter's");
+    let want: Vec<u8> = refr.frames.iter().flat_map(|f| nlerawexport_planes(f)).collect();
+    assert!(raw == want, "every frame's Y, Cb, Cr planes are the converter's, bit for bit");
+    let json = std::fs::read_to_string(dir.join("video.json")).unwrap();
+    assert_eq!(json, "{\"format\":\"i420\",\"fourcc\":\"I420\",\"w\":64,\"h\":48,\"fps_num\":25,\"fps_den\":1,\"frames\":35}\n");
+    assert_eq!(r.bytes, (raw.len() + json.len()) as u64);
+}
+
+#[test]
+fn nlerawexport_y4m_header_frames_planes() {
+    use stria::nle_export::{I420Raw, Y4m};
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("y4m");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(Y4m::new(tl.tb.den as u32, tl.tb.num as u32)), AudioOut::None).unwrap();
+    assert_eq!((r.frames, r.files), (35, 2));
+    assert_eq!(r.fnv, refr.fnv);
+    let i420_dir = fresh("y4m-i420");
+    export(&tl, 0..TICKS, &src, &i420_dir, Box::new(I420Raw::default()), AudioOut::None).unwrap();
+    let i420 = std::fs::read(i420_dir.join("video.i420")).unwrap();
+    let y4m = std::fs::read(dir.join("video.y4m")).unwrap();
+    let head: &[u8] = b"YUV4MPEG2 W64 H48 F25:1 Ip A1:1 C420jpeg\n";
+    assert!(y4m.starts_with(head), "{:?}", String::from_utf8_lossy(&y4m[..y4m.len().min(64)]));
+    let per = 64 * 48 * 3 / 2;
+    assert_eq!(y4m.len(), head.len() + 35 * (6 + per));
+    let mut rest = &y4m[head.len()..];
+    let mut n = 0;
+    while !rest.is_empty() {
+        assert!(rest.starts_with(b"FRAME\n"), "frame {n}: the FRAME marker");
+        assert!(rest[6..6 + per] == i420[n * per..(n + 1) * per], "frame {n}: the i420 export's planes");
+        rest = &rest[6 + per..];
+        n += 1;
+    }
+    assert_eq!(n, 35, "one FRAME per picture");
+    let json = std::fs::read_to_string(dir.join("video.json")).unwrap();
+    assert_eq!(json, "{\"format\":\"y4m\",\"fourcc\":\"I420\",\"w\":64,\"h\":48,\"fps_num\":25,\"fps_den\":1,\"frames\":35}\n");
+}
+
+#[test]
+fn nlerawexport_y4m_header_768x512_and_fps_reduced() {
+    use stria::nle_export::{VideoEncoder, Y4m};
+    let mut enc = Y4m::new(50, 2);
+    let black = vec![0u8; 768 * 512 * 4];
+    let per = 768 * 512 * 3 / 2;
+    let first = enc.encode(768, 512, &black).unwrap();
+    assert_eq!(first.len(), 1);
+    let head: &[u8] = b"YUV4MPEG2 W768 H512 F25:1 Ip A1:1 C420jpeg\n";
+    assert!(first[0].data.starts_with(head), "{:?}", String::from_utf8_lossy(&first[0].data[..64]));
+    assert_eq!(&first[0].data[head.len()..head.len() + 6], b"FRAME\n");
+    assert_eq!(first[0].data.len(), head.len() + 6 + per);
+    let next = enc.encode(768, 512, &black).unwrap();
+    assert!(next[0].data.starts_with(b"FRAME\n") && next[0].data.len() == 6 + per, "the header once");
+}
+
+#[test]
+fn nlerawexport_second_size_refused_by_name() {
+    use stria::nle_export::{ExportError, I420Raw, VideoEncoder, Y4m};
+    let encs: [Box<dyn VideoEncoder>; 2] = [Box::new(I420Raw::default()), Box::new(Y4m::new(25, 1))];
+    for mut enc in encs {
+        enc.encode(4, 4, &[0u8; 64]).unwrap();
+        let e = enc.encode(6, 6, &[0u8; 144]).unwrap_err();
+        assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{e}");
+        assert!(e.to_string().contains("frame does not match"), "{e}");
+    }
+}
