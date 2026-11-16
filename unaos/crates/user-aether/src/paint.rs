@@ -629,7 +629,7 @@ fn image_alt(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, x: f32, y: f32) {
     let bh = (l.size.height - l.border.top - l.padding.top - l.border.bottom - l.padding.bottom).max(0.0);
     let (alt, tx, ty, inset) = match layout_core::img_fallback_of(cx.tree, id) {
         layout_core::ImgFallback::None => return,
-        layout_core::ImgFallback::InlineAlt(t) => (t, bx, by, 0.0),
+        layout_core::ImgFallback::InlineAlt(t) => return image_alt_lines(cv, cx, id, ink, &t, bx, by, bw, bh),
         layout_core::ImgFallback::BoxedAlt { text, frame, icon } => {
             if frame && bw >= 2.0 && bh >= 2.0 {
                 let c = rgb(ALT_FRAME);
@@ -673,5 +673,38 @@ fn broken_icon(cv: &mut Canvas, bx: f32, by: f32, bw: f32, bh: f32) {
         if x1 > x0 && y1 > y0 {
             cv.fill(x0, y0, x1 - x0, y1 - y0, rgb(r.fill));
         }
+    }
+}
+
+// ---- AETHERIMGALTINLINEWRAP (LEDGER SR707): an InlineAlt img's alt text wrapped at its box width (named tail block) ----
+
+/// AETHERIMGALTINLINEWRAP (SR707): `image_alt`'s InlineAlt arm, the host's `paint_img_alt_lines` on this ring: the alt
+/// text (text-transformed, `ink.tt`) from the content box's origin (`bx`, `by`), broken by layout_core's
+/// `Fonts::break_lines` (the breaker `measure_text_run` sized the box with) at the box's UNROUNDED content width + 0.01,
+/// each line drawn as SR695 draws its one line: `fonts.draw` at the half-leading baseline (`Fonts::baseline_offset` under
+/// `ink.lh`) plus the line's index times `Fonts::line_height`, clipped to the content box (`bw` x `bh`).
+#[allow(clippy::too_many_arguments)]
+fn image_alt_lines(cv: &mut Canvas, cx: &Cx, id: NodeId, ink: &Ink, alt: &str, bx: f32, by: f32, bw: f32, bh: f32) {
+    if alt.is_empty() {
+        return;
+    }
+    let Ok(l) = cx.tree.taffy.layout(id) else { return };
+    let text = <ImgHost as layout_core::Host>::transform_text(alt, ink.tt);
+    let edges = l.border.left + l.padding.left + l.border.right + l.padding.right;
+    let wrap = (cx.tree.taffy.unrounded_layout(id).size.width.max(l.size.width) - edges).max(0.0) + 0.01;
+    let adv = layout_core::Adv::new(ink.sel, ink.size, 0.0);
+    let lines = layout_core::Fonts::break_lines(cx.fonts, &text, &layout_core::TextMode::default(), &adv, wrap.max(1.0), 0.0, false);
+    let lead = layout_core::Fonts::baseline_offset(cx.fonts, ink.sel, ink.size, ink.lh);
+    let lh = layout_core::Fonts::line_height(cx.fonts, ink.sel, ink.size, ink.lh);
+    let (px0, py0, px1, py1) = (bx, by, bx + bw, by + bh);
+    let color = ink.color;
+    for (i, line) in lines.iter().enumerate() {
+        let base = font_core::fmath::round(by + i as f32 * lh + lead);
+        cx.fonts.0.borrow_mut().draw(bx, base, &line.text, ink.sel, ink.size, color, &mut |gx, gy, cov| {
+            let (fx, fy) = (gx as f32, gy as f32);
+            if fx >= px0 && fx < px1 && fy >= py0 && fy < py1 {
+                cv.blend(gx, gy, color, cov);
+            }
+        });
     }
 }
