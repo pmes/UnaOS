@@ -191,16 +191,13 @@ pub struct Face {
     play: PlayAudio,
     /// NLEFACEEXPORT (SR694): the running export ([`ExportJob`]), cleared when its result is reported.
     export: Option<ExportJob>,
-    /// NLE5DEXPORTRANGE (SR717): the export range's in / out marks (ticks; `in` / `out` at the playhead, in < out).
-    mark_in: Option<i64>,
-    mark_out: Option<i64>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), mark_in: None, mark_out: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -2232,7 +2229,7 @@ impl Face {
             _ => return None,
         };
         let ph = self.state.playhead;
-        let (mine, other) = if is_in { (self.mark_in, self.mark_out) } else { (self.mark_out, self.mark_in) };
+        let (a, b) = self.state.timeline.marks; let (mine, other) = if is_in { (a, b) } else { (b, a) }; // NLE5DRANGESAVE (SR723): the marks are the timeline's
         let set = if mine == Some(ph) {
             None
         } else {
@@ -2248,24 +2245,24 @@ impl Face {
                 _ => Some(ph),
             }
         };
-        if is_in { self.mark_in = set } else { self.mark_out = set }
+        if let Err(e) = self.state.set_marks(if is_in { (set, other) } else { (other, set) }) { self.last_error = Some(format!("{v}: {e}")); } // NLE5DRANGESAVE (SR723): one commit
         Some(true)
     }
     /// The marks `(in, out)` as set (either may be `None`).
     pub fn marks(&self) -> (Option<i64>, Option<i64>) {
-        (self.mark_in, self.mark_out)
+        self.state.timeline.marks // NLE5DRANGESAVE (SR723)
     }
     /// The range an `export` takes: `in..min(out, end)` when both marks are set; `None` (the whole timeline) otherwise.
     /// The range is empty when an edit shortened the timeline to the in mark or before it ([`Face::range_check`] refuses).
     pub fn export_range(&self) -> Option<std::ops::Range<i64>> {
-        match (self.mark_in, self.mark_out) {
+        match self.state.timeline.marks { // NLE5DRANGESAVE (SR723)
             (Some(a), Some(b)) => Some(a..b.min(self.state.timeline.end()).max(a)),
             _ => None,
         }
     }
     /// A marked range holding no tick of the timeline is refused by name (no directory made, no thread).
     fn range_check(&self, range: &Option<std::ops::Range<i64>>) -> Result<(), String> {
-        match (range, self.mark_in, self.mark_out) {
+        match (range, self.state.timeline.marks.0, self.state.timeline.marks.1) { // NLE5DRANGESAVE (SR723)
             (Some(r), Some(a), Some(b)) if r.is_empty() => Err(format!("the marks {a}..{b} are past the timeline's end {}", self.state.timeline.end())),
             _ => Ok(()),
         }
