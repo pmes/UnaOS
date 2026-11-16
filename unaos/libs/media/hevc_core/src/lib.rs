@@ -64,7 +64,7 @@
 //! uni- and bi-prediction with default or explicit weights, the inter residual, short- and long-term references and
 //! deblocking bS 0 / 1 from motion.
 //!
-//! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), separate
+//! Refused by name ([`Error::Unsupported`]): separate
 //! colour planes and bit depths above 16 (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths; HEVCREXTTOOLS
 //! SR345 every range extension tool, monochrome and 16 bits; HEVCREXTSCC SR357 palette, intra block copy and the
 //! adaptive colour transform), and of the screen content coding extension (HEVCREXT-SCC) an SCC body behind the
