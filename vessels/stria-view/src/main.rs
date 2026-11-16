@@ -515,6 +515,7 @@ fn transport() -> TetraNode {
         button("export", "Export"), // NLEFACEEXPORT (SR694): exports beside the document (`<stem>-export/`, H.264), off the face's thread
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
+        button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
     ])
 }
 

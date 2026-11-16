@@ -1808,9 +1808,7 @@ fn striainfobitrate_export(name: &str, enc: stria::nle_export::H264Encoder) -> (
     for (i, base) in [0u32, 1000].iter().enumerate() {
         src.add(SourceId(i as u32), stria::nle::synth_source(*base, 50, 25)).unwrap();
     }
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrate").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_dir("striainfobitrate", name); // SR739: tests/common's per-pid scratch
     stria::nle_export::export(&tl, 0..35, &src, &dir, Box::new(enc), stria::nle_export::AudioOut::Wav).unwrap();
     (std::fs::read(dir.join("video.mp4")).unwrap(), std::fs::read(dir.join("audio.wav")).unwrap())
 }
@@ -1891,8 +1889,7 @@ const NLE6UTP1_MEDIA_PINS: [u64; 3] = [0x2e6e_eac9_e618_ef1c, 0x0c88_24d8_868e_6
 // ---- STRIAINFOBITRATEFACE (LEDGER SR734): MediaOpened carries the one-line summary (named tail block) ----
 /// Open `file` through the bus (`MediaPoster`) and return its `MediaOpened.info`.
 fn striainfobitrateface_bus_info(name: &str, file: &[u8]) -> String {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("striainfobitrateface");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = fresh_dir("striainfobitrateface", "bus"); // SR739: tests/common's per-pid scratch
     let path = dir.join(name);
     std::fs::write(&path, file).unwrap();
     let url = format!("file://{}", path.display());

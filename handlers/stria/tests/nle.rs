@@ -907,9 +907,7 @@ fn nlesizeswitch_two_size_reel_runs_and_exports_at_the_first_size() {
 
     // The host export: the encoder sees the first size only.
     use stria::nle_export::{AudioOut, H264Encoder, export};
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizeswitch");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::fresh_dir("nle", "nlesizeswitch"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let rep = export(&tl, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
     assert_eq!(rep.frames, 4);
     let out = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
@@ -1016,9 +1014,7 @@ fn nlesizepolicy_two_size_reel_under_each_policy() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("nle size switch reel=0 1280x720 adopted"), "{}", lines[0]);
     use stria::nle_export::{AudioOut, ExportError, H264Encoder, export};
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizepolicy");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::fresh_dir("nle", "nlesizepolicy"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let e = export(&adopt, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap_err();
     assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{e}");
     println!("nlesizepolicy: fill/stretch 768x512 x4 pinned, adopt 1280x720 frames 2-3, export refused: {e}");
@@ -1128,8 +1124,7 @@ fn adoptpng_two_size_reel_exports_png_frames_at_their_own_size() {
     let Some(file) = nlesizeswitch_reel() else { return };
     let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
     let native = nlesizepolicy_native(&file, &src);
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = common::scratch_dir("nle", "adoptpng"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, removed, not created
 
     let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
     let dir = root.join("adopt");
@@ -1179,9 +1174,7 @@ fn adoptpng_refused_dir_by_name() {
     let mut src = Sources::new(&tl);
     src.add(a, synth_source(0, 4, 25)).unwrap();
     // A path under a regular file: no directory can be made there, root or not (a mode bit would not stop root).
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng-refused");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let root = common::fresh_dir("nle", "adoptpng-refused"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, created empty
     let file = root.join("plain");
     std::fs::write(&file, b"not a directory").unwrap();
     let dir = file.join("frames");
@@ -1321,8 +1314,7 @@ fn nlerawexport_adopt_reel_refused_raw_planar() {
     let _ = nlesizeswitch_lines("");
     let Some(file) = nlesizeswitch_reel() else { return };
     let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
-    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlerawexport");
-    let _ = std::fs::remove_dir_all(&root);
+    let root = common::scratch_dir("nle", "nlerawexport"); // STRIA-TEST-TMPDIR-REST (SR739): a per-process subdir, removed, not created
 
     let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
     let encs: [(&str, Box<dyn VideoEncoder>); 2] = [("i420", Box::new(I420Raw::default())), ("y4m", Box::new(Y4m::new(25, 1)))];
@@ -1958,4 +1950,108 @@ fn nle5drangekeys_lower_i_o_still_trim_the_clip() {
     assert_ne!(face.state.timeline, tl, "the trims moved the clip");
     assert_eq!((&face.state.timeline.tracks, face.marks()), (&want.timeline.tracks, (None, None)));
     println!("nle5drangekeys: i / o still trim");
+}
+
+// ---- STRIATESTTMPDIRREST (LEDGER SR739): nle.rs's scratch dirs are tests/common's per-pid dirs (named tail block) ----
+/// STRIA-TEST-TMPDIR (SR729, SR739): `scratch_dir(g, n)` is `<target tmpdir>/<g>-<pid>/<n>`, removed and absent; `fresh_dir`
+/// is the same dir created empty; and no test binary but tests/common reads the target tmpdir itself, so the next inline
+/// fixed-path dir (the shared-target race SR729 fixed) reds here.
+#[test]
+fn nle_tests_scratch_under_the_pid_dir() {
+    let d = common::scratch_dir("x", "y");
+    let pid = format!("x-{}", std::process::id());
+    assert!(d.ends_with(std::path::Path::new(&pid).join("y")), "{}", d.display());
+    assert!(!d.exists(), "{}", d.display());
+    assert!(d.parent().and_then(|p| p.parent()).is_some_and(|t| t.is_dir()), "{}", d.display());
+    let f = common::fresh_dir("x", "z");
+    assert_eq!(f.parent(), d.parent());
+    assert!(f.is_dir() && std::fs::read_dir(&f).unwrap().next().is_none(), "{}", f.display());
+    let token = concat!("CARGO_TARGET", "_TMPDIR");
+    let bins = [("nle.rs", include_str!("nle.rs")), ("nle_export.rs", include_str!("nle_export.rs")), ("media.rs", include_str!("media.rs")), ("audio.rs", include_str!("audio.rs"))];
+    let inline: usize = bins.iter().map(|(_, s)| s.matches(token).count()).sum();
+    for (name, src) in bins {
+        assert_eq!(src.matches(token).count(), 0, "{name} reads the target tmpdir inline: use common::scratch_dir / fresh_dir");
+    }
+    assert!(include_str!("common/mod.rs").contains(token), "tests/common is the one reader");
+    println!("striatesttmpdirrest: scratch {} fresh {} inline reads {inline}", d.display(), f.display());
+}
+
+// ---- NLE3ESLIPFACE (LEDGER SR737): the face's one-frame slip / slide words, their keys (named tail block) ----
+
+/// The SR694 face over NLE1's fixture (V1: A[13,23)@0 B[0,10)@10 A[23,33)@25) with B selected, and its twin editor.
+fn nle3eslipface_pair() -> (Face, EditorState, Timeline) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 12).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 12).unwrap();
+    (face, twin, tl)
+}
+
+/// Rule: `slip+` / `slip-` / `slide-` are SR704's `slip 1` / `slip -1` / `slide -1` (one frame = one tick at the
+/// timeline's `1/fps`) through THE dispatch: the face's timeline equals a twin editor's after the numbered word; a slide
+/// carries the butted neighbour's out edge; undo restores the timeline.
+#[test]
+fn nle3eslipface_words_are_one_frame_of_the_editor_verbs() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (a, b) = (SourceId(0), SourceId(1));
+    assert!(face.verb("slip+"));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(b, 1, 11, 10), "the source window moved one frame");
+    assert!(face.verb("slip-"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("slide-"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(&face.state.timeline.tracks[0].clips[..2], &[Clip::new(a, 13, 22, 0), Clip::new(b, 0, 10, 9)], "the neighbour follows");
+    assert!(face.verb("slide+"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, twin.timeline, "undo takes back the slide+");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: slip+ = slip 1, slide- = slide -1, undo restores");
+}
+
+/// The four text keys `,` `.` `<` `>` send the words (the same timelines); a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn nle3eslipface_keys_send_the_words() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    assert!(!nle3eslipface_press_text_only(&mut face, ","), "a one-char BrowserKey alone is not taken");
+    assert!(nle5drangekeys_press(&mut face, "."));
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ","));
+    assert_eq!(face.state.timeline, tl);
+    assert!(nle5drangekeys_press(&mut face, "<"));
+    assert_eq!(twin.verb("slip -1"), Some(Ok(())));
+    assert_eq!(twin.verb("slide -1"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle5drangekeys_press(&mut face, ">"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipface: , . < > send slip- slip+ slide- slide+");
+}
+
+/// A one-char key as `BrowserKey` alone (the face reads one-char keys from `BrowserText` only).
+fn nle3eslipface_press_text_only(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.to_string()))
+}
+
+/// Rule: with nothing selected the words are taken and refused by the editor's name on the message line
+/// (`EditError::NoClip`'s text through `Face::verb`'s `{v}: {e}` road); the timeline does not move.
+#[test]
+fn nle3eslipface_no_selection_names_the_refusal() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    for v in ["slip-", "slip+", "slide-", "slide+"] {
+        assert!(VERBS.contains(&v), "{v}");
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("nle3eslipface: no selection -> slip+: {}", EditError::NoClip);
 }

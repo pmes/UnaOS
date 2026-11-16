@@ -4755,4 +4755,33 @@ mod tests {
         assert_eq!(imgalt_ink(&engine, lw, lw + 16, t.floor() as usize, (t + sh).floor() as usize), 0, "w: line 1 starts after the icon");
         assert!(imgalt_ink(&engine, lw, lw + 16, (t + sh).ceil() as usize, (t + 2.0 * sh).floor() as usize) > 0, "w: line 2 is not indented");
     }
+
+    // ---- AETHERIMGALTBASELINE (LEDGER SR730): an InlineAlt img sits on the line's text baseline (named tail block) ----
+
+    /// AETHERIMGALTBASELINE (SR730): a failed, unsized img with alt="Hello" beside a span "Hello" on one line: Chromium
+    /// lays the alt as ordinary inline text, so both words paint on ONE baseline (the bottom ink row of each "Hello", which
+    /// has no descender, is the same row), the img box's top is the span's top, and the line is one text line tall (the
+    /// replaced-element bottom-edge rule put the alt's baseline a descent above the span's and grew the line by it).
+    #[test]
+    fn img_alt_inline_on_the_text_baseline() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div id="d"><span id="s">Hello</span> <img id="i" src="missing.png" alt="Hello"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (sl, st, sw, sh) = imgalt_rect(&mut engine, "s");
+        let (il, it, iw, ih) = imgalt_rect(&mut engine, "i");
+        let (_, _, _, dh) = imgalt_rect(&mut engine, "d");
+        assert!(sw > 10.0 && iw > sw && il >= sl + sw, "the img follows the span on the line ({sl}+{sw} then {il}+{iw})");
+        assert!((it - st).abs() <= 2.0, "the img box's top is the span's top ({it} vs {st})");
+        assert!(dh < 24.0 && dh <= sh.max(ih) + 1.0, "one text line tall ({dh} vs span {sh} / img {ih})");
+        let y1 = (st.max(it) + sh.max(ih)).ceil() as usize + 4;
+        let bottom_ink = |e: &crate::AetherEngine, x0: usize, x1: usize| (0..y1).rev().find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0);
+        let sb = bottom_ink(&engine, sl.floor() as usize, (sl + sw).ceil() as usize).expect("the span paints");
+        let ix0 = (il + layout_core::INLINE_ICON_ADVANCE as f64).ceil() as usize + 1;
+        let ib = bottom_ink(&engine, ix0, (il + iw).ceil() as usize).expect("the img's alt paints");
+        assert!((sb as i64 - ib as i64).abs() <= 1, "both Hellos sit on one baseline (bottom ink rows {sb} vs {ib})");
+    }
 }
