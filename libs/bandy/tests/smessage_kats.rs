@@ -642,7 +642,7 @@ kat!(
         video: "av01".to_string(),
         audio: "".to_string(),
         real_video: false,
-        audio_clock: false,
+        audio_clock: false, info: String::new(),
     },
     r#"{"MediaOpened":{"url":"u","duration_ns":1000000000,"width":320,"height":240,"video":"av01","audio":"","real_video":false,"audio_clock":false}}"#
 );
