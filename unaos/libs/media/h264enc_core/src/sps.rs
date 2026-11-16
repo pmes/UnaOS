@@ -64,6 +64,8 @@ pub struct SeqParams {
     pub num_reorder: u32,
     /// H264ENCCOLOURHOST (SR377): VUI video_signal_type (primaries, transfer, matrix, full range); None writes the flag 0.
     pub colour: Option<(u8, u8, u8, bool)>,
+    /// H264ENCHRD (SR699): the rate controller's bucket as the VUI's timing_info + nal_hrd_parameters; None writes both flags 0.
+    pub hrd: Option<Hrd>,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -86,7 +88,7 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     let (profile, constraint) = if p.high { (PROFILE_HIGH, 0) } else if p.cabac || p.reorder { (PROFILE_MAIN, CONSTRAINT_MAIN) } else { (PROFILE_BASELINE, CONSTRAINT_FLAGS) };
     w.u(8, profile as u32);
     w.u(8, constraint as u32); // constraint_set0..5 flags + reserved_zero_2bits
-    w.u(8, level_idc(p.mb_w, p.mb_h) as u32);
+    w.u(8, hrd_level(level_idc(p.mb_w, p.mb_h), p.hrd, p.high) as u32);
     w.ue(0); // seq_parameter_set_id
     if p.high {
         w.ue(1); // chroma_format_idc: 4:2:0
@@ -131,9 +133,9 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
         w.u(8, matrix as u32); // matrix_coefficients (Table E-5)
     }
     w.flag(false); // chroma_loc_info_present_flag
-    w.flag(false); // timing_info_present_flag
-    w.flag(false); // nal_hrd_parameters_present_flag
-    w.flag(false); // vcl_hrd_parameters_present_flag
+    w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { timing_info(&mut w, &h); } // timing_info_present_flag (H264ENCHRD SR699: the HRD's clock)
+    w.flag(p.hrd.is_some()); if let Some(h) = p.hrd { hrd_parameters(&mut w, &h); } // nal_hrd_parameters_present_flag (H264ENCHRD SR699)
+    w.flag(false); if p.hrd.is_some() { w.flag(false); } // vcl_hrd_parameters_present_flag; low_delay_hrd_flag 0 under the NAL HRD (SR699)
     w.flag(false); // pic_struct_present_flag
     w.flag(true); // bitstream_restriction_flag
     w.flag(true); // motion_vectors_over_pic_boundaries_flag
@@ -284,4 +286,115 @@ fn pred_weight_table(w: &mut BitWriter, offsets: [i32; 2]) {
         }
         w.flag(false); // chroma_weight_lX_flag
     }
+}
+
+// ---- H264ENCHRD (LEDGER SR699): HRD parameters, buffering-period / pic-timing SEI and filler writers (named tail block) ----
+
+/// The hypothetical reference decoder the stream signals (E.1.2, one CPB): the rate controller's bucket (rc.rs `Rc::hrd_params`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hrd {
+    /// BitRate in bits/s (a multiple of 64: `RateControl::for_hrd`).
+    pub bit_rate: u32,
+    /// CpbSize in bits (a multiple of 64).
+    pub cpb_size: u32,
+    /// cbr_flag: the CBR bucket (filler pads it), else VBR's max-rate bucket.
+    pub cbr: bool,
+    /// num_units_in_tick / time_scale (E.2.1): fps_den / (2 fps_num), two ticks per frame.
+    pub num_units_in_tick: u32,
+    pub time_scale: u32,
+}
+
+/// timing_info (E.1.1): the tick and fixed_frame_rate_flag 1.
+fn timing_info(w: &mut BitWriter, h: &Hrd) {
+    w.u(32, h.num_units_in_tick); // num_units_in_tick
+    w.u(32, h.time_scale); // time_scale
+    w.flag(true); // fixed_frame_rate_flag
+}
+
+/// The largest scale s (0..=15) with `v` a whole multiple of 2^(base + s) (v > 0).
+fn hrd_scale(v: u32, base: u32) -> u32 {
+    let mut s = 0;
+    while s < 15 && base + s + 1 < 32 && v.is_multiple_of(1u32 << (base + s + 1)) {
+        s += 1;
+    }
+    s
+}
+
+/// hrd_parameters (E.1.2): one CPB (SchedSelIdx 0), the exact BitRate / CpbSize, the delay fields 24 bits long.
+fn hrd_parameters(w: &mut BitWriter, h: &Hrd) {
+    let (bs, cs) = (hrd_scale(h.bit_rate, 6), hrd_scale(h.cpb_size, 4));
+    w.ue(0); // cpb_cnt_minus1
+    w.u(4, bs); // bit_rate_scale
+    w.u(4, cs); // cpb_size_scale
+    w.ue((h.bit_rate >> (6 + bs)).max(1) - 1); // bit_rate_value_minus1[0]
+    w.ue((h.cpb_size >> (4 + cs)).max(1) - 1); // cpb_size_value_minus1[0]
+    w.flag(h.cbr); // cbr_flag[0]
+    w.u(5, 23); // initial_cpb_removal_delay_length_minus1
+    w.u(5, 23); // cpb_removal_delay_length_minus1
+    w.u(5, 23); // dpb_output_delay_length_minus1
+    w.u(5, 24); // time_offset_length
+}
+
+/// level_idc under the HRD: the lowest level of Table A-1, not below the frame-size `level`, whose MaxBR and MaxCPB x
+/// cpbBrNalFactor (Table A-2: 1200, High 1500) hold the signalled BitRate and CpbSize (A.3.1 item h); None returns `level`.
+fn hrd_level(level: u8, hrd: Option<Hrd>, high: bool) -> u8 {
+    const LIMITS: [(u8, u64, u64); 16] = [
+        (10, 64, 175), (11, 192, 500), (12, 384, 1000), (13, 768, 2000), (20, 2000, 2000), (21, 4000, 4000), (22, 4000, 4000), (30, 10000, 10000),
+        (31, 14000, 14000), (32, 20000, 20000), (40, 20000, 25000), (41, 50000, 62500), (42, 50000, 62500), (50, 135000, 135000), (51, 240000, 240000), (52, 240000, 240000),
+    ];
+    let Some(h) = hrd else { return level };
+    let f = if high { 1500 } else { 1200 };
+    for &(l, br, cpb) in &LIMITS {
+        if l >= level && h.bit_rate as u64 <= br * f && h.cpb_size as u64 <= cpb * f {
+            return l;
+        }
+    }
+    level.max(52)
+}
+
+/// One sei_message (7.3.2.3.1): payloadType and payloadSize as 0xFF runs plus the last byte, then the payload.
+fn sei_message(out: &mut Vec<u8>, ptype: usize, payload: &[u8]) {
+    for mut v in [ptype, payload.len()] {
+        while v >= 255 {
+            out.push(0xFF);
+            v -= 255;
+        }
+        out.push(v as u8);
+    }
+    out.extend_from_slice(payload);
+}
+
+/// The payload bytes of `w`, closed by the payload alignment (D.1.1: bit_equal_to_one then zeros) when not byte aligned.
+fn sei_payload(mut w: BitWriter) -> Vec<u8> {
+    if !w.bits().is_multiple_of(8) {
+        w.trailing();
+    }
+    w.finish()
+}
+
+/// sei_rbsp (7.3.2.3) of one access unit under the HRD: on an IDR (`bp` Some(initial_cpb_removal_delay in 90 kHz units)) a
+/// buffering_period (D.1.2: seq_parameter_set_id 0, the delay and a zero offset for the one NAL CPB), then the pic_timing
+/// (D.1.3: cpb_removal_delay and dpb_output_delay in ticks, pic_struct_present_flag 0); rbsp_trailing_bits.
+pub fn sei_rbsp(bp: Option<u32>, cpb_removal_delay: u32, dpb_output_delay: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(delay) = bp {
+        let mut w = BitWriter::new();
+        w.ue(0); // seq_parameter_set_id
+        w.u(24, delay); // initial_cpb_removal_delay[0]
+        w.u(24, 0); // initial_cpb_removal_delay_offset[0]
+        sei_message(&mut out, 0, &sei_payload(w));
+    }
+    let mut w = BitWriter::new();
+    w.u(24, cpb_removal_delay & 0xFF_FFFF); // cpb_removal_delay
+    w.u(24, dpb_output_delay & 0xFF_FFFF); // dpb_output_delay
+    sei_message(&mut out, 1, &sei_payload(w));
+    out.push(0x80); // rbsp_trailing_bits
+    out
+}
+
+/// filler_data_rbsp (7.3.2.12): `n` ff_bytes and rbsp_trailing_bits (the NAL unit is n + 2 bytes).
+pub fn filler_rbsp(n: usize) -> Vec<u8> {
+    let mut v = alloc::vec![0xFFu8; n];
+    v.push(0x80);
+    v
 }
