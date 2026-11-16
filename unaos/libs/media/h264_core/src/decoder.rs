@@ -58,7 +58,7 @@ pub struct Decoder {
     prev_ref_frame_num: u32,
     /// (width_mbs, height_mbs) of the frames in the DPB.
     dims: Option<(u32, u32)>,
-    rbsp: Vec<u8>,
+    rbsp: Vec<u8>, hrd: HrdNotes,
 }
 
 impl Default for Decoder {
@@ -81,7 +81,7 @@ impl Decoder {
             nal_length_size: 4,
             prev_ref_frame_num: 0,
             dims: None,
-            rbsp: Vec::new(),
+            rbsp: Vec::new(), hrd: HrdNotes::default(),
         }
     }
 
@@ -186,7 +186,8 @@ impl Decoder {
                 self.pps[id] = Some(p);
                 Ok(())
             }
-            nal::NAL_SEI | nal::NAL_AUD | nal::NAL_END_SEQ | nal::NAL_END_STREAM | 15..=18 => {
+            nal::NAL_SEI => { self.finish_picture(); self.sei(&data[1..]); Ok(()) }
+            nal::NAL_AUD | nal::NAL_END_SEQ | nal::NAL_END_STREAM | 15..=18 => {
                 self.finish_picture();
                 Ok(())
             }
@@ -641,4 +642,115 @@ fn reconstruct(ctx: &mut SliceCtx, ls: &LevelScale, addr: usize, mb: &Mb) -> Res
         }
     }
     Ok(())
+}
+
+// ---- H264COREHRD (LEDGER SR708): buffering_period / pic_timing SEI notes (named tail block) ----
+
+/// The HRD SEI messages read so far (drained by [`Decoder::take_hrd_notes`]) and the SPS the last buffering_period named.
+#[derive(Default)]
+struct HrdNotes {
+    notes: Vec<HrdNote>,
+    sps_id: Option<u32>,
+}
+
+/// One HRD SEI message (Annex D): which picture it precedes and what it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HrdNote {
+    /// The decode-order id the picture after the SEI takes (the decoder's picture counter; frames filling a frame_num gap
+    /// also take ids).
+    pub pic: i32,
+    /// The caller's tag at the SEI ([`Decoder::set_tag`]).
+    pub tag: i64,
+    pub kind: HrdKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HrdKind {
+    /// buffering_period (D.1.2): seq_parameter_set_id and, per SchedSelIdx, (initial_cpb_removal_delay,
+    /// initial_cpb_removal_delay_offset) of the NAL and the VCL HRD (empty when that HRD is absent).
+    BufferingPeriod { sps_id: u32, nal: Vec<(u32, u32)>, vcl: Vec<(u32, u32)> },
+    /// pic_timing (D.1.3): cpb_removal_delay and dpb_output_delay (present only under CpbDpbDelaysPresentFlag).
+    PicTiming { cpb_removal_delay: u32, dpb_output_delay: u32 },
+}
+
+impl Decoder {
+    /// sei_rbsp (7.3.2.3): every sei_message; buffering_period and pic_timing are noted, every other payload is skipped by
+    /// its size. A truncated or unreadable message ends the walk and notes nothing; a SEI is never an error.
+    fn sei(&mut self, payload: &[u8]) {
+        let mut rbsp = core::mem::take(&mut self.rbsp);
+        nal::unescape(payload, &mut rbsp);
+        let mut i = 0usize;
+        // more_rbsp_data: anything before the final rbsp_trailing_bits byte (0x80) starts another sei_message.
+        while i < rbsp.len() && !(i + 1 == rbsp.len() && rbsp[i] == 0x80) {
+            let mut field = || {
+                let mut v = 0usize;
+                while *rbsp.get(i)? == 0xFF {
+                    v += 255;
+                    i += 1;
+                }
+                v += *rbsp.get(i)? as usize;
+                i += 1;
+                Some(v)
+            };
+            let (Some(ty), Some(size)) = (field(), field()) else { break };
+            let Some(body) = rbsp.get(i..i + size) else { break };
+            i += size;
+            let kind = match ty {
+                0 => self.buffering_period(body),
+                1 => self.pic_timing(body),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.hrd.notes.push(HrdNote { pic: self.next_id, tag: self.tag, kind });
+            }
+        }
+        self.rbsp = rbsp;
+    }
+
+    /// buffering_period (D.1.2), read against the SPS it names.
+    fn buffering_period(&mut self, body: &[u8]) -> Option<HrdKind> {
+        let mut r = BitReader::new(body);
+        let sps_id = r.ue();
+        let sps = self.sps.get(sps_id as usize)?.as_ref()?;
+        let mut read = |h: Option<ps::Hrd>| {
+            let mut v = Vec::new();
+            if let Some(h) = h {
+                for _ in 0..h.cpb_cnt.min(32) {
+                    v.push((r.u(h.initial_cpb_removal_delay_len), r.u(h.initial_cpb_removal_delay_len)));
+                }
+            }
+            v
+        };
+        let nal = read(sps.nal_hrd);
+        let vcl = read(sps.vcl_hrd);
+        if r.overran() {
+            return None;
+        }
+        self.hrd.sps_id = Some(sps_id);
+        Some(HrdKind::BufferingPeriod { sps_id, nal, vcl })
+    }
+
+    /// pic_timing (D.1.3): the two delays, when the SPS's HRD makes them present (lengths from the NAL HRD, else the VCL's).
+    fn pic_timing(&self, body: &[u8]) -> Option<HrdKind> {
+        let h = self.hrd_sps().and_then(|s| s.nal_hrd.or(s.vcl_hrd))?;
+        let mut r = BitReader::new(body);
+        let cpb_removal_delay = r.u(h.cpb_removal_delay_len);
+        let dpb_output_delay = r.u(h.dpb_output_delay_len);
+        if r.overran() {
+            return None;
+        }
+        Some(HrdKind::PicTiming { cpb_removal_delay, dpb_output_delay })
+    }
+
+    /// The SPS a pic_timing is read against: the one the last buffering_period named (the active SPS of an HRD-conforming
+    /// stream, D.2.2), else the lowest-id SPS held.
+    fn hrd_sps(&self) -> Option<&Sps> {
+        let named = self.hrd.sps_id.and_then(|id| self.sps.get(id as usize)?.as_ref());
+        named.or_else(|| self.sps.iter().flatten().next())
+    }
+
+    /// The buffering_period / pic_timing messages read since the last call, in decoding order.
+    pub fn take_hrd_notes(&mut self) -> Vec<HrdNote> {
+        core::mem::take(&mut self.hrd.notes)
+    }
 }
