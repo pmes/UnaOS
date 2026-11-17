@@ -948,44 +948,6 @@ fn x_decoder_profile_tier_level() {
 
 // ---- HEVCCONCEALSUBPELCHROMA422 (LEDGER SR758): 4:2:2 / 4:4:4 fractional concealment pinned (named tail block) ----
 
-/// SR758: one residual-free P picture NAL over the four 16x16 CTBs (initType 1): with `mvd`, CTB 0 a 2Nx2N AMVP unit (no
-/// neighbours, no TMVP: mvp 0, so mv = mvd) and CTBs 1..3 skip coding units merging it (tests/inter.rs `amvp_then_merge`,
-/// (f) above); without, four skip coding units (tests/inter.rs `skip_picture`). No chroma syntax: the format enters through
-/// the SPS and the IDR's pcm sample counts only (HEVC-TESTKIT-PBODY-SHARED owes one shared copy in tests/common).
-fn conceal_p(cfg: &SliceCfg, mvd: Option<[i32; 2]>) -> Vec<u8> {
-    let mut e = CabacEnc::new(slice_header(cfg), 1, 26);
-    match mvd {
-        Some(mvd) => {
-            e.split_cu(0, false);
-            e.cu_skip(0, false);
-            e.pred_inter();
-            e.part_mode_2nx2n();
-            e.merge_flag(false);
-            e.mvd(mvd);
-            e.mvp_flag(0);
-            e.rqt_root_cbf(false);
-            for (inc, last) in [(0usize, false), (0, false), (2, true)] {
-                e.terminate(0);
-                e.split_cu(0, false);
-                e.cu_skip(inc, true);
-                if last {
-                    break;
-                }
-            }
-        }
-        None => {
-            for (k, inc) in [0usize, 1, 1, 2].into_iter().enumerate() {
-                e.split_cu(0, false);
-                e.cu_skip(inc, true);
-                if k < 3 {
-                    e.terminate(0);
-                }
-            }
-        }
-    }
-    nal(cfg.nal_type, &e.finish().out)
-}
-
 /// SR758: HEVCCONCEALSUBPEL's (SR733) shape at chroma_format_idc `idc`: IDR0 (four pcm CTBs of the non-linear `pat`: a
 /// linear ramp's filtered 1/8 and 2/8 fractions round alike, so a wrong (SubWidthC, SubHeightC) arm could hide), P2
 /// (references POC 0 with mv (6, 2)), P4 (skip-only, references the lost POC 3, keeps POC 2 unused), P5 (references POC 2
@@ -998,10 +960,9 @@ fn conceal_subpel_case(idc: u32) {
     let (sw, sh) = sub(idc);
     let mut s = head_fmt(idc, &InterSps { max_dec_pic_buffering_minus1: 4, ..Default::default() }, &PpsInter::default());
     let (w, h) = (32 / sw, 32 / sh);
-    let p = |poc: u32, neg: Vec<(i32, bool)>| SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: poc, neg, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
-    s.extend(conceal_p(&p(2, vec![(-2, true)]), Some([6, 2])));
-    s.extend(conceal_p(&p(4, vec![(-1, true), (-2, false)]), None));
-    s.extend(conceal_p(&p(5, vec![(-3, true)]), Some([3, 1])));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&p_slice(4, vec![(-1, true), (-2, false)]), skip_picture));
+    s.extend(picture(&p_slice(5, vec![(-3, true)]), |e| amvp_then_merge(e, [3, 1])));
     let mut d = Decoder::new();
     d.decode_annexb(&s).expect("decode past the lost picture");
     d.flush();
