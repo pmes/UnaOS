@@ -180,7 +180,7 @@ impl DevTools {
                     ));
                 }
                 let t = self.timeline.totals();
-                out.push(format!("{:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2}", "total", t.script_ms, t.style_ms, t.layout_ms, t.paint_ms));
+                out.push(format!("{:>6} {:>9.2} {:>9.2} {:>9.2} {:>9.2}", "total", t.script_ms, t.style_ms, t.layout_ms, t.paint_ms)); out.push(text_host::faces_report().line());
             }
             Panel::Accessibility => out.extend(accessibility::lines(engine, self.selected)),
         }

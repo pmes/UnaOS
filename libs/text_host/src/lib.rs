@@ -106,7 +106,7 @@ impl Face {
 
 /// The bytes of a font file, read once and kept for the process.
 fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
-    static FILES: OnceLock<Mutex<HashMap<PathBuf, Option<&'static [u8]>>>> = OnceLock::new();
+    use crate::FONT_FILES as FILES; // TEXTHOST-FACE-BYTES-WITNESS (SR1012): the same file cache, hoisted to the file tail so `files_loaded_bytes` reads it
     let m = FILES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(b) = m.lock().ok()?.get(path) {
         return *b;
@@ -1080,5 +1080,170 @@ mod facecache_eviction_tests {
         let b = faces_loaded_count();
         assert!(a <= len && len <= b && a > 0, "the count is the lock's len (the map never shrinks): {a} {len} {b}");
         assert!(std::mem::size_of::<Face>() <= 2048, "a Face is {} bytes inline", std::mem::size_of::<Face>());
+    }
+}
+
+// ---- TEXTHOSTFACEBYTESWITNESS (LEDGER SR1012): the face cache's count x bytes and its report line (named tail block) ----
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): `file_bytes`'s cache of font files (one leaked slice per path, None for an
+/// unreadable one), at the file tail so [`files_loaded_bytes`] reads it; `file_bytes` names it through a `use`.
+type FontFiles = Mutex<HashMap<PathBuf, Option<&'static [u8]>>>;
+static FONT_FILES: OnceLock<FontFiles> = OnceLock::new();
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the loaded-face cache (`faces_loaded`) and the font-file cache, counted by
+/// reading: `faces` entries, of which `instances` carry coords, in `families` instance families (the (file, index,
+/// synthetic bold, synthetic oblique) unit [`INSTANCES_MAX`] bounds); `face_bytes` the bytes those entries own
+/// ([`face_bytes`]); `files` font files read, `file_bytes` their leaked bytes (shared by every face of a file).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FacesReport {
+    pub faces: usize,
+    pub instances: usize,
+    pub families: usize,
+    pub face_bytes: usize,
+    pub files: usize,
+    pub file_bytes: usize,
+}
+
+impl FacesReport {
+    /// The report as one line (the devtools Performance panel's): `fonts: 23 faces (16 instances, 1 families) in
+    /// 51 KB + 1840 KB files (3)`, KB rounded to the nearest 1024 bytes.
+    pub fn line(&self) -> String {
+        let kb = |b: usize| (b + 512) / 1024;
+        format!(
+            "fonts: {} faces ({} instances, {} families) in {} KB + {} KB files ({})",
+            self.faces,
+            self.instances,
+            self.families,
+            kb(self.face_bytes),
+            kb(self.file_bytes),
+            self.files
+        )
+    }
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the bytes one loaded-face cache entry owns, by reading: the leaked `Face`
+/// (inline `Font`, which owns no buffer) and its family String's heap, the map's key (inline [`FaceKey`] + the
+/// PathBuf's and the coords Vec's heap) and value pointer, and `by_id`'s clone of the key and its u32. The hash
+/// tables' slot overhead and the allocator's rounding are not counted; the file bytes are [`files_loaded_bytes`]'s.
+fn face_bytes(face: &Face, key: &FaceKey) -> usize {
+    let key_bytes = std::mem::size_of::<FaceKey>() + key.0.capacity() + key.4.capacity() * std::mem::size_of::<i16>();
+    std::mem::size_of::<Face>() + face.family.capacity() + 2 * key_bytes + std::mem::size_of::<&Face>() + std::mem::size_of::<u32>()
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the face half of a [`FacesReport`] read off the held cache (the caller holds
+/// `faces_loaded`'s guard); families are counted without a set (an instance key counts when no earlier instance
+/// key shares its family). The file fields stay 0.
+fn report_of(l: &Loaded) -> FacesReport {
+    let inst = || l.map.keys().filter(|k| !k.4.is_empty());
+    let families =
+        inst().enumerate().filter(|(i, k)| !inst().take(*i).any(|j| j.0 == k.0 && j.1 == k.1 && j.2 == k.2 && j.3 == k.3)).count();
+    FacesReport {
+        faces: l.map.len(),
+        instances: inst().count(),
+        families,
+        face_bytes: l.map.iter().map(|(k, f)| face_bytes(f, k)).sum(),
+        files: 0,
+        file_bytes: 0,
+    }
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): (files read, their leaked bytes) off the held font-file cache.
+fn files_of(m: &HashMap<PathBuf, Option<&'static [u8]>>) -> (usize, usize) {
+    m.values().flatten().fold((0usize, 0usize), |(n, b), s| (n + 1, b + s.len()))
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the bytes of every font file read and kept for the process (`file_bytes`).
+pub fn files_loaded_bytes() -> usize {
+    FONT_FILES.get().and_then(|m| m.lock().ok()).map_or(0, |m| files_of(&m).1)
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the face cache's report: its face half under `faces_loaded`'s ONE lock, then
+/// its file half under the font-file cache's lock (taken one after the other, never nested), by reading only.
+pub fn faces_report() -> FacesReport {
+    let mut r = faces_loaded().lock().map(|l| report_of(&l)).unwrap_or_default();
+    let (files, file_bytes) = FONT_FILES.get().and_then(|m| m.lock().ok()).map_or((0, 0), |m| files_of(&m));
+    r.files = files;
+    r.file_bytes = file_bytes;
+    r
+}
+
+#[cfg(test)]
+mod facebytes_witness_tests {
+    use super::*;
+
+    /// Inter through a `fonts/..` path component (PathBuf equality keeps `..`, so these keys are this test's alone).
+    fn inter() -> FaceInfo {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts/..").join("fonts/inter/InterVariable.ttf");
+        db::faces_in_file(&p).into_iter().next().expect("the tree's Inter face")
+    }
+
+    /// K loads (the base, five weight instances, the synthetic-bold base: 7 keys of this path, 5 of them instances):
+    /// on ONE guard the report's counts are the map's own, its bytes the sum of `face_bytes`, the instances within
+    /// SR1004's bound; this path's 7 entries own between the by-length estimate x their count and 5 % over it; the
+    /// public report's count is at least this test's keys (the map never shrinks).
+    #[test]
+    fn facebytes_witness_report_kat() {
+        let info = inter();
+        load_face(&info).expect("Inter loads");
+        for w in [300.0, 500.0, 600.0, 700.0, 800.0] {
+            load_face_instance(&info, false, false, &[(*b"wght", w)]).expect("Inter instances");
+        }
+        load_face_synth(&info, true, false).expect("Inter synthetic bold");
+        {
+            let g = faces_loaded().lock().unwrap();
+            let r = report_of(&g);
+            assert_eq!(r.faces, g.map.len());
+            assert_eq!(r.instances, g.map.keys().filter(|k| !k.4.is_empty()).count());
+            let fams: std::collections::HashSet<(PathBuf, u32, bool, bool)> =
+                g.map.keys().filter(|k| !k.4.is_empty()).map(|k| (k.0.clone(), k.1, k.2, k.3)).collect();
+            assert_eq!(r.families, fams.len());
+            assert_eq!(r.face_bytes, g.map.iter().map(|(k, f)| face_bytes(f, k)).sum::<usize>());
+            assert!(r.instances <= r.families * INSTANCES_MAX, "SR1004's bound: {r:?}");
+            assert_eq!((r.files, r.file_bytes), (0, 0), "the face half carries no file bytes");
+            let mine: Vec<(&FaceKey, &&'static Face)> = g.map.iter().filter(|(k, _)| k.0 == info.path).collect();
+            assert_eq!(mine.len(), 7, "base + 5 instances + synthetic bold");
+            assert_eq!(mine.iter().filter(|(k, _)| !k.4.is_empty()).count(), 5);
+            let est: usize = mine
+                .iter()
+                .map(|(k, f)| {
+                    std::mem::size_of::<Face>()
+                        + f.family.len()
+                        + 2 * (std::mem::size_of::<FaceKey>() + k.0.as_os_str().len() + k.4.len() * 2)
+                        + std::mem::size_of::<&Face>()
+                        + std::mem::size_of::<u32>()
+                })
+                .sum();
+            let got: usize = mine.iter().map(|(k, f)| face_bytes(f, k)).sum();
+            assert!(est <= got && got * 100 <= est * 105, "7 entries own {got} bytes, estimate {est}");
+        }
+        let r = faces_report();
+        assert!(r.faces >= 7 && r.instances >= 5 && r.families >= 1 && r.face_bytes > 0, "{r:?}");
+        assert!(r.files >= 1 && r.file_bytes > 0, "Inter's file is counted: {r:?}");
+    }
+
+    /// The font-file cache's half: on ONE guard `files_of` is the sum of the leaked slices' lengths and their count;
+    /// Inter's entry is its file's length on disk; `files_loaded_bytes` holds at least it.
+    #[test]
+    fn facebytes_witness_files_kat() {
+        let info = inter();
+        load_face(&info).expect("Inter loads");
+        let disk = std::fs::metadata(&info.path).expect("Inter on disk").len() as usize;
+        {
+            let g = FONT_FILES.get().expect("a file was read").lock().unwrap();
+            let want = g.values().filter_map(|b| *b).fold((0usize, 0usize), |(n, s), b| (n + 1, s + b.len()));
+            assert_eq!(files_of(&g), want);
+            assert_eq!(g.get(&info.path).copied().flatten().map(|b| b.len()), Some(disk), "the leaked slice is the file");
+        }
+        assert!(files_loaded_bytes() >= disk);
+    }
+
+    /// The panel line's format, pinned on literal reports (KB to the nearest 1024 bytes).
+    #[test]
+    fn facebytes_witness_line_kat() {
+        let r = FacesReport { faces: 23, instances: 16, families: 1, face_bytes: 52_000, files: 3, file_bytes: 1_884_160 };
+        assert_eq!(r.line(), "fonts: 23 faces (16 instances, 1 families) in 51 KB + 1840 KB files (3)");
+        assert_eq!(FacesReport::default().line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 0 KB files (0)");
+        let r = FacesReport { face_bytes: 511, file_bytes: 512, ..FacesReport::default() };
+        assert_eq!(r.line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 1 KB files (0)");
     }
 }
