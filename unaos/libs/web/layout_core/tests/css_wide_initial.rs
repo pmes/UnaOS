@@ -1949,11 +1949,13 @@ fn border_color_stored_merge() {
 
 /// AETHERCSSBORDERCOLORSTORED (SR1058): `transparent` forgets a pending entry; `border: inherit` forgets the block's.
 /// SR1069 (flipped in place): a style creates the side (`border-width` alone no longer does).
+/// SR1112 (flipped in place): `transparent` is pended as a colour (black RGB, alpha 0 on that side), not forgotten.
 #[test]
 fn border_color_stored_transparent_and_inherit() {
     let s = styled(&[("border-top-color", "red"), ("border-top-color", "transparent"), ("border-width", "2px"), ("border-style", "solid")]);
-    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, STORED_GREY)));
-    assert_eq!(s.paint.currentcolor & 1, 1);
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, (0, 0, 0))), "SR1112: the pending transparent (was STORED_GREY)");
+    assert_eq!(s.paint.currentcolor & 1, 0, "SR1112: a colour, not currentcolor (was 1)");
+    assert_eq!(s.paint.border_alpha.expect("alpha")[0], Some(0.0), "SR1112: alpha 0 on the top");
     assert_eq!(styled(&[("border-color", "red"), ("border", "inherit")]).paint.border_pending, None);
 }
 
@@ -2251,4 +2253,124 @@ fn gap_shorthand_multicol_used_gap() {
     let base: &[(&str, &str)] = &[("width", "410px"), ("column-count", "2"), ("font-size", "20px")];
     assert_eq!(gap(&[base]), 20.0, "no gap: 1em (armed)");
     assert_eq!(gap(&[base, &[("gap", "30px")]]), 30.0, "gap: 30px is the 30px gutter");
+}
+
+// ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border: 2px solid transparent` keeps four 2px sides (black RGB) at alpha 0
+/// each (before SR1112 grey sides with no alpha: a grey frame), and the sides size the box in `fold_into`.
+#[test]
+fn border_transparent_keeps_shorthand_sides() {
+    use taffy::style::{LengthPercentage, Style};
+    let s = styled(&[("border", "2px solid transparent")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]));
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "alpha 0 on every side");
+    assert_eq!(s.paint.currentcolor & 0x0f, 0, "a colour, not currentcolor");
+    let s = styled(&[("border-left", "3px solid rgba(0, 0, 0, 0)")]);
+    assert_eq!(s.paint.border.expect("border")[3], Some((3.0, (0, 0, 0))), "a zero-alpha rgba is a colour too");
+    assert_eq!(s.paint.border_alpha, Some([None, None, None, Some(0.0)]), "the side shorthand writes its side only");
+    let mut st = Style::default();
+    styled(&[("border", "2px solid transparent")]).fold_into(&mut st);
+    assert_eq!(st.border.top, LengthPercentage::length(2.0), "the transparent side sizes the box");
+    let s = styled(&[("border", "2px solid transparent"), ("border", "1px solid")]);
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0); 4]), "a later shorthand resets the alpha with the colour");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-color: transparent` keeps the sides at alpha 0 (before SR1112
+/// `Some([None; 4])`); `border-top-color: transparent` makes the top alpha 0 and leaves the right opaque (before SR1112
+/// the top was dropped).
+#[test]
+fn border_transparent_keeps_per_side_alpha() {
+    use layout_core::css::border_side_alpha;
+    let s = styled(&[("border", "2px solid red"), ("border-color", "transparent")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]));
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]));
+    let s = styled(&[("border", "1px solid red"), ("border-top-color", "transparent")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((1.0, (0, 0, 0))), "the top is kept");
+    assert_eq!((border_side_alpha(&s.paint, 0), border_side_alpha(&s.paint, 1)), (0.0, 1.0), "top alpha 0, right alpha 1");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-top-color: transparent` on a side with no entry pends the colour,
+/// so a later `border-style: solid` creates the top at medium in it, alpha 0 (before SR1112 the entry was forgotten and
+/// the top came up currentcolor).
+#[test]
+fn border_transparent_keeps_pending_entry() {
+    let s = styled(&[("border-top-color", "transparent"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border_pending.expect("pending")[0], Some(((0, 0, 0), false)), "the entry is kept");
+    assert_eq!(s.paint.border.expect("border")[0], Some((3.0, (0, 0, 0))));
+    assert_eq!(s.paint.border_alpha.expect("alpha")[0], Some(0.0));
+    assert_eq!(s.paint.border.expect("border")[1], Some((3.0, STORED_GREY)), "the right side currentcolor");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the alpha merges per side across rules: a later `border-top-color: red`
+/// over `border: 2px solid transparent` makes only the top opaque (the reserve-space idiom's hover rule).
+#[test]
+fn border_transparent_keeps_merge_per_side() {
+    use layout_core::css::border_side_alpha;
+    let s = cascade(&[&[("border", "2px solid transparent")], &[("border-top-color", "red")]]);
+    let red = s.paint.border.expect("border")[0].expect("top").1;
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, red)), "the top recoloured, width kept");
+    assert_ne!(red, (0, 0, 0));
+    assert_eq!((border_side_alpha(&s.paint, 0), border_side_alpha(&s.paint, 1)), (1.0, 0.0), "top opaque, right still alpha 0");
+    let s = cascade(&[&[("border", "2px solid transparent")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0); 4]), "a later border-color: red makes every side opaque");
+}
+
+// ---- AETHERCSSOUTLINETRANSPARENT (LEDGER SR1119): outline-color reads an alpha-0 colour through SR1112's one road (named tail block) ----
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `outline-color` takes ANY colour at alpha 0 as `transparent` already was: the
+/// RGB through `border_rgb`, the alpha through `color_alpha` (before SR1119 `parse_color_str` refused the function
+/// spellings and the declaration was dropped: two spellings of one colour, one kept).
+#[test]
+fn outline_transparent_alpha_zero_colours() {
+    let oc = |v: &str| styled(&[("outline-color", v)]).paint.outline_color;
+    assert_eq!(oc("rgba(0, 0, 0, 0)"), Some(Some((0, 0, 0, 0))), "armed: rgba(0, 0, 0, 0) is transparent black");
+    assert_eq!(oc("rgba(255, 0, 0, 0)"), Some(Some((255, 0, 0, 0))), "armed: a zero-alpha rgba keeps its RGB");
+    assert_eq!(oc("rgb(255 0 0 / 0)"), Some(Some((255, 0, 0, 0))), "armed: the slash alpha");
+    assert_eq!(oc("hsla(0, 100%, 50%, 0)"), Some(Some((255, 0, 0, 0))), "armed: a zero-alpha hsla");
+    assert_eq!(oc("#ff000000"), Some(Some((255, 0, 0, 0))), "#rrggbb00 (hex was never refused)");
+    assert_eq!(oc("transparent"), Some(Some((0, 0, 0, 0))), "the keyword unchanged");
+    assert_eq!(oc("TRANSPARENT"), Some(Some((0, 0, 0, 0))), "case-insensitive");
+    assert_eq!(oc("rgba(255, 0, 0, 0.5)"), Some(Some((255, 0, 0, 128))), "a half alpha unchanged");
+    for v in ["bogus", "rgba(foo)", ""] {
+        assert_eq!(oc(v), None, "{v:?} is dropped");
+    }
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): the `outline` shorthand reads the colour word through the same road (before
+/// SR1119 an alpha-0 rgba dropped the whole shorthand), and a later `outline-color: rgba(255, 0, 0, 0)` replaces an
+/// earlier red (before SR1119 the red stayed and painted).
+#[test]
+fn outline_transparent_shorthand() {
+    use layout_core::paint::OUTLINE_SOLID;
+    let s = styled(&[("outline", "2px solid rgba(255, 0, 0, 0)")]);
+    assert_eq!(
+        (s.paint.outline_style, s.paint.outline_width, s.paint.outline_color),
+        (Some(OUTLINE_SOLID), Some(2.0), Some(Some((255, 0, 0, 0)))),
+        "armed: the shorthand keeps solid 2px at alpha 0"
+    );
+    let s = cascade(&[&[("outline", "2px solid red")], &[("outline-color", "rgba(255, 0, 0, 0)")]]);
+    assert_eq!(s.paint.outline_color, Some(Some((255, 0, 0, 0))), "armed: the later alpha-0 colour wins over red");
+    assert_eq!(s.paint.outline_style, Some(OUTLINE_SOLID), "the style kept");
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `caret-color` delegates to `outline_color_value`, so it follows: an alpha-0
+/// colour is `Some(Some((r, g, b, 0)))` (no caret paints), `invert` is still no caret-color value.
+#[test]
+fn outline_transparent_caret() {
+    let cc = |v: &str| styled(&[("caret-color", v)]).paint.caret_color;
+    assert_eq!(cc("rgba(0, 0, 0, 0)"), Some(Some((0, 0, 0, 0))), "armed: caret-color rgba(0, 0, 0, 0)");
+    assert_eq!(cc("hsla(0, 100%, 50%, 0)"), Some(Some((255, 0, 0, 0))), "armed: caret-color hsla alpha 0");
+    assert_eq!(cc("transparent"), Some(Some((0, 0, 0, 0))), "the keyword unchanged");
+    assert_eq!(cc("invert"), None, "invert is not a caret-color value");
+}
+
+/// AETHERCSSOUTLINETRANSPARENT (SR1119): `border_transparent` reads any colour the host reads at alpha 0, so `border:
+/// 2px solid hsla(0, 100%, 50%, 0)` keeps four 2px sides (RGB red) at alpha 0, as SR1112 does for rgba(.., 0) (before
+/// SR1119 the hsla word was no colour: grey sides, opaque).
+#[test]
+fn outline_transparent_border_hsla() {
+    let s = styled(&[("border", "2px solid hsla(0, 100%, 50%, 0)")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (255, 0, 0))); 4]), "armed: four 2px red-RGB sides");
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "armed: alpha 0 on every side");
 }
