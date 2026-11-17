@@ -36,7 +36,8 @@
 //! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 //! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
-//! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>}` after the other fields (the default line unchanged).
+//! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>,"audio":"<word>"[,"pass":<k>,"passes":<n>][,"eta_secs":<s>][,"stalled_secs":<s>]}` (the keys: [`EXPORT_JSON_KEYS`]) after the other fields (the default line unchanged).
+//! NLEFACEEXPORTJSONDOCOS (SR1118): every field of the line (its order, type, when it appears and the arc that added it) and the `--do` words are docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md; the keys every line carries are [`WITNESS_KEYS`].
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -61,7 +62,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE_HEAD: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: ";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -78,29 +79,29 @@ fn cli() -> Cli {
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
             "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
-            "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
+            "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(usage())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
-                let (w, h) = v.split_once('x').unwrap_or_else(|| die(USAGE.into()));
+                let (w, h) = v.split_once('x').unwrap_or_else(|| die(usage()));
                 c.size = (w.parse().unwrap_or(960), h.parse().unwrap_or(540));
             }
             "--src" => {
-                let v = a.next().unwrap_or_else(|| die(USAGE.into()));
-                let (r, p) = v.split_once('=').unwrap_or_else(|| die(USAGE.into()));
+                let v = a.next().unwrap_or_else(|| die(usage()));
+                let (r, p) = v.split_once('=').unwrap_or_else(|| die(usage()));
                 c.srcs.push((r.to_string(), p.to_string()));
             }
             "--do" => c.script = a.next(),
             "--out" => c.out = a.next(),
             "--help" | "-h" => {
-                eprintln!("{USAGE}");
+                eprintln!("{}", usage());
                 std::process::exit(0);
             }
             _ if !arg.starts_with('-') => c.edl = Some(arg),
-            _ => die(USAGE.into()),
+            _ => die(usage()),
         }
     }
     if (c.edl.is_none() && !c.synth) || (c.two && c.split) {
-        die(USAGE.into());
+        die(usage());
     }
     c
 }
@@ -133,6 +134,7 @@ fn editor_tree_for(two: bool) -> TetraNode {
 
 /// A `--do` token as the messages the window would send.
 fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
+    if script_word(tok).is_none() && !nle_face::VERBS.contains(&tok) { return None; } // NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the table gates the word and its arity, the arms below parse the values (file tail)
     let num = |s: &str| s.parse::<i64>().ok();
     let px = |s: &str| s.parse::<f64>().ok();
     let l: Layout = face.layout();
@@ -254,7 +256,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
-    println!(
+    witness_out(format!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
         st.timeline.tracks.len(),
@@ -268,7 +270,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         transition_json(&face),
         face.dirty(),
         if c.mute { ",\"audio\":\"none\"" } else { "" } // NLEPLAYAUDIO (SR676): the witness opens no device
-    );
+    ));
     0
 }
 
@@ -616,7 +618,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}{}}}", face.export_audio().unwrap_or_default(), face.export_pass().map(|(k, n)| format!(",\"pass\":{k},\"passes\":{n}")).unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled; NLEFACEEXPORTPASSJSON (SR1097): pass / passes after audio under two-pass
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -902,5 +904,384 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the witness's export object names the pass (named tail block) ----
+#[cfg(test)]
+mod exportpassjson_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTPASSJSON (SR1097): a two-pass export held at 50 of 70 (pass 2 of 2) carries `"pass":2,"passes":2` right
+    /// after `"audio"`; once it is cancelled and joined the object is gone. Single-pass heads are pinned byte-exact above.
+    #[test]
+    fn nlefaceexportpassjson_witness_two_pass_fields() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportpassjson-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.export_paused_plan(&dir, "h264", 50, nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+        let t0 = std::time::Instant::now();
+        while face.export_progress() != Some((50, 70)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(120), "reading {:?}", face.export_progress());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(face.export_pass(), Some((2, 2)));
+        let j = export_json(&face);
+        let head = j.split_once(",\"eta_secs\":").map_or(j.as_str(), |(h, _)| h);
+        assert_eq!(head.trim_end_matches('}'), r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2"#, "{j}");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportpassjson witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONSCHEMA (LEDGER SR1106): the witness's export object keys, listed once (named tail block) ----
+/// The keys of the witness's `"export"` object in the order [`export_json`] (the one writer) emits them. `done` / `total` /
+/// `audio` are always there while an export runs; `pass` / `passes` together only when the job has more than one pass
+/// (`Face::export_pass`); `eta_secs` while the face has an eta (`Face::export_eta`: from the first frame on);
+/// `stalled_secs` past the stall rule (`Face::export_stall`). The bench reads the line by these names.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const EXPORT_JSON_KEYS: [&str; 7] = ["done", "total", "audio", "pass", "passes", "eta_secs", "stalled_secs"];
+
+#[cfg(test)]
+mod exportjsonschema_tests {
+    use super::*;
+
+    /// The key names of one `export_json` line, in order (every value is a number or a comma-free quoted word).
+    fn keys_of(j: &str) -> Vec<String> {
+        let body = j.strip_prefix(",\"export\":{").and_then(|b| b.strip_suffix('}')).unwrap_or_else(|| panic!("not an export object: {j}"));
+        body.split(',').map(|kv| kv.split_once("\":").and_then(|(k, _)| k.strip_prefix('"')).unwrap_or_else(|| panic!("{kv} in {j}")).to_string()).collect()
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): the two-pass hold at 50 of 70 (SR1097's fixture), read once stalled (SR825's wait
+    /// shape: the flat 5 s from the start, the same 20 s ceiling), emits all seven keys in `EXPORT_JSON_KEYS`' order.
+    #[test]
+    fn nlefaceexportjsonschema_two_pass_stalled_walk() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonschema-walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_plan(&dir, "h264", 50, nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+        while face.export_progress() != Some((50, 70)) {
+            assert!(start.elapsed() < Duration::from_secs(120), "reading {:?}", face.export_progress());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = loop {
+            let j = export_json(&face);
+            if j.contains(",\"stalled_secs\":") {
+                break j;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "the paused two-pass job never carried stalled_secs: {j}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(keys_of(&j), EXPORT_JSON_KEYS, "{j}");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportjsonschema witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): a fresh single-pass job emits done / total / audio (no pass keys), a stalled_secs only
+    /// past the stall rule, each key in `EXPORT_JSON_KEYS`' order. NLEFACEEXPORTJSONZERO (SR1110): read at the k = 0 hold (before
+    /// the first frame, done 0, so no eta yet): exactly the three keys, where SR1106 held at 3 and had to accept eta_secs.
+    #[test]
+    fn nlefaceexportjsonschema_fresh_single_pass_keys() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonschema-fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = export_json(&face);
+        let keys = keys_of(&j);
+        let fresh = ["done", "total", "audio"];
+        if start.elapsed() < Duration::from_secs(4) {
+            assert_eq!(keys, fresh, "{j}");
+        } else {
+            assert!(keys == fresh || keys == ["done", "total", "audio", "stalled_secs"], "{j}");
+        }
+        let at: Vec<usize> = keys.iter().map(|k| EXPORT_JSON_KEYS.iter().position(|e| e == k).unwrap_or_else(|| panic!("{k} not in EXPORT_JSON_KEYS: {j}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{j}: out of EXPORT_JSON_KEYS order");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): seven names, none twice, and `keys_of` reads back a line of all seven.
+    #[test]
+    fn nlefaceexportjsonschema_keys_const() {
+        assert_eq!(EXPORT_JSON_KEYS.len(), 7);
+        let mut sorted = EXPORT_JSON_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 7, "a key listed twice");
+        let line = r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2,"eta_secs":3,"stalled_secs":6}"#;
+        assert_eq!(keys_of(line), EXPORT_JSON_KEYS);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONZERO (LEDGER SR1110): the witness's three-key export line before the first frame (named tail block) ----
+// `Face::start_export`'s progress closure is called once with reading 0 before the first frame, so `export_paused_at(.., 0)`
+// holds there: the line a page sees for the whole first frame of a real export (done 0, no eta: `eta_of` guards 0) is pinned.
+
+#[cfg(test)]
+mod exportjsonzero_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTJSONZERO (SR1110): a job held at k = 0 of 35 reads `,"export":{"done":0,"total":35,"audio":"wav"}` byte for
+    /// byte (read fresh, under SR825's stall window), has written no frame, and the object is gone once it is cancelled and joined.
+    #[test]
+    fn nlefaceexportjsonzero_three_key_line_byte_exact() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonzero-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = export_json(&face);
+        assert!(start.elapsed() < Duration::from_secs(4), "read under the stall window");
+        assert_eq!(j, r#","export":{"done":0,"total":35,"audio":"wav"}"#);
+        let written = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(written, 0, "held before the first frame: no frame file in {}", dir.display());
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportjsonzero witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONDOCOS (LEDGER SR1118): the witness line's top-level keys, listed once (named tail block) ----
+/// The keys every witness line carries, in the order [`witness`] (the one writer) emits them. The conditional keys follow
+/// them in this order: `meters`, `help`, `presses`, `surfaces`, `fnvs`, `export` (its keys: [`EXPORT_JSON_KEYS`]), `range`,
+/// `reel`, `audio`; docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md names each one's type, condition and arc.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const WITNESS_KEYS: [&str; 16] = ["playhead", "tracks", "clips", "selection", "clip", "playing", "rate", "undo", "zoom", "w", "h", "fnv", "errors", "set", "transition", "dirty"];
+
+/// The witness's one print: the line on stdout (a test build also keeps it in `WITNESS_LAST` for the schema walk).
+fn witness_out(line: String) {
+    #[cfg(test)]
+    {
+        WITNESS_LAST.with(|l| *l.borrow_mut() = line.clone());
+    }
+    println!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static WITNESS_LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+#[cfg(test)]
+mod witnessdocs_tests {
+    use super::*;
+
+    /// The depth-1 keys of the JSON object `j` starts with, in order, up to its close (strings skipped whole, so a `:` inside a
+    /// value is no key).
+    pub(super) fn top_keys(j: &str) -> Vec<String> {
+        let (b, mut keys, mut depth, mut i) = (j.as_bytes(), Vec::new(), 0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    if depth == 1 && b.get(i + 1) == Some(&b':') {
+                        keys.push(j[start..i].to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        keys
+    }
+
+    /// NLEFACEEXPORTJSONDOCOS (SR1118): the default synth line (the face as `main` builds it) carries exactly `WITNESS_KEYS`,
+    /// none twice and no `export`; a job held at k = 0 and cancelled by the script's Esc (still on the face: `export_tick`
+    /// runs only in `serve`) adds `export` last, its keys the first three of `EXPORT_JSON_KEYS`.
+    #[test]
+    fn nlefaceexportjsondocos_witness_keys() {
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: false, mute: false };
+        let face = |c: &Cli| { let (tl, src) = nle_face::synth_fixture(); route(c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, c.labels).with_doc(None)) };
+        assert_eq!(witness(&c, face(&c)), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        assert_eq!(top_keys(&line), WITNESS_KEYS, "{line}");
+        let mut sorted = WITNESS_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), WITNESS_KEYS.len(), "a key listed twice");
+        println!("nlefaceexportjsondocos witness: {line}");
+        let dir = std::env::current_exe().expect("the test binary").parent().expect("its directory").join("nlefaceexportjsondocos-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = Cli { script: Some("key:Escape".into()), ..c };
+        let mut held = face(&c);
+        held.export_paused_at(&dir, "png", 0).unwrap();
+        assert_eq!(witness(&c, held), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        let keys = top_keys(&line);
+        assert_eq!(keys[..WITNESS_KEYS.len()], WITNESS_KEYS, "{line}");
+        assert_eq!(keys[WITNESS_KEYS.len()..], ["export"], "{line}: export last");
+        let obj = line.split_once(",\"export\":").map(|(_, o)| o).unwrap_or_else(|| panic!("{line}"));
+        assert_eq!(top_keys(obj), &EXPORT_JSON_KEYS[..3], "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEWITNESSSCRIPTWORDSONETABLE (LEDGER SR1123): the --do words and the conditional keys, listed once (named tail block) ----
+/// The `--do` words besides the transport verbs (`nle_face::VERBS`): a word, or a prefix ending `:` that takes arguments, and
+/// its meaning, and its arity (the `:`-separated arguments after the word; [`NEST`]: the rest is a token). The gate, not the
+/// parser: [`script_word`] checks a token's word and arity here, the arms of [`token`] parse the values; [`usage`] renders
+/// the words, and the test below holds the parser to this table, the usage line and docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md §4 (regenerated from it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SCRIPT_WORDS: [(&str, &str, u8); 16] = [
+    ("at:", "at:<tick>:<track>, a click on that track at that tick", 2), ("ruler:", "ruler:<tick>, a click on the ruler", 1),
+    ("press:", "press:<x>:<y>, a button press at surface pixels", 2), ("move:", "move:<x>:<y>, the pointer moves there", 2),
+    ("release", "the button up and the click, at the last pointer", 0), ("key:", "key:<name>, the key as GTK sends it (key:space; key:Ctrl+a / key:Meta+a select all)", 1),
+    ("wheel:", "wheel:<n>, n notches at the last pointer (n > 0 zooms in)", 1), ("marquee:", "marquee:<x0>:<y0>:<x1>:<y1>, a press, a move and the release", 4),
+    ("shift:", "shift:<token>, the token with MOD_SHIFT on its presses (add to the set)", NEST), ("alt:", "alt:<token>, the token with MOD_ALT on its presses (no snapping)", NEST),
+    ("transition:", "transition:<track>:<idx>, a click on that transition (selects it)", 2), ("kind:", "kind:<code>, the selected transition's kind (D, W007 ...)", 1),
+    ("ease:", "ease:<name>, the selected transition's ease (linear, in, out, inout)", 1), ("meters", "feeds the meters the tick at the playhead (the line gains meters)", 0),
+    ("tick:", "tick:<n>, the face clock n times (playback steps, the hover dwell)", 1), ("aux:", "aux:<token>, the token on the other Surface (--two-surfaces: aux; --split: preview)", NEST),
+];
+/// The witness line's conditional keys in the order they follow [`WITNESS_KEYS`], each with the condition that adds it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const WITNESS_OPTIONAL_KEYS: [(&str, &str); 9] = [("meters", "the script has a meters token"), ("help", "the keys help shows"), ("presses", "--two-surfaces or --split"),
+    ("surfaces", "--split"), ("fnvs", "--split"), ("export", "an export job is on the face"), ("range", "both range marks set"), ("reel", "a clip selected or a dwelt hover"), ("audio", "--mute (the value none)")];
+
+#[cfg(test)]
+mod scriptwords_tests {
+    use super::*;
+
+    fn fresh() -> Face {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// NLEFACEWITNESSSCRIPTWORDSONETABLE (SR1123): every `SCRIPT_WORDS` word drives (a fresh face, its example) with no `bad token`
+    /// and is in USAGE; every `VERBS` word is a token; `bogus` is the parser's `_ =>` refusal (the page's §4 is this table).
+    #[test]
+    fn nlefacewitnessscriptwordsonetable_words_parse() {
+        for (w, _, _) in SCRIPT_WORDS {
+            let ex = match w { "at:" => "at:12:0", "ruler:" => "ruler:5", "press:" => "press:81:100", "move:" => "move:105:100", "release" => "release", "key:" => "key:j", "wheel:" => "wheel:1", "marquee:" => "marquee:316:85:1:155", "shift:" => "shift:press:228:100", "alt:" => "alt:release", "transition:" => "transition:0:0", "kind:" => "kind:W007", "ease:" => "ease:in", "meters" => "meters", "tick:" => "tick:1", "aux:" => "aux:release", _ => panic!("no example for {w}") };
+            let errors = drive(&mut fresh(), ex);
+            assert!(!errors.iter().any(|e| e.starts_with("bad token")), "{ex}: {errors:?}");
+            assert!(usage().contains(w), "{w} not in USAGE");
+        }
+        let face = fresh();
+        for v in nle_face::VERBS { assert!(token(&face, v).is_some(), "{v}"); }
+        assert!(token(&face, "bogus").is_none());
+        assert_eq!(drive(&mut fresh(), "bogus"), vec!["bad token bogus".to_string()]);
+        let mut words: Vec<&str> = SCRIPT_WORDS.iter().map(|(w, _, _)| *w).collect();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), SCRIPT_WORDS.len(), "a word listed twice");
+    }
+
+    /// NLEFACEWITNESSSCRIPTWORDSONETABLE (SR1123): nine distinct conditional keys, none a `WITNESS_KEYS` key; ONE run arms them
+    /// all (--split, --mute, a held export Esc cancels, marks, a selection, meters, help last) and the line is the two lists in order.
+    #[test]
+    fn nlefacewitnessscriptwordsonetable_optional_keys() {
+        let keys: Vec<&str> = WITNESS_OPTIONAL_KEYS.iter().map(|(k, _)| *k).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 9, "a key listed twice");
+        assert!(keys.iter().all(|k| !WITNESS_KEYS.contains(k)), "{keys:?}");
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: Some("ruler:5,in,ruler:15,out,at:12:0,meters,key:Escape,help".into()), out: None, labels: false, two: false, split: true, mute: true };
+        let dir = std::env::current_exe().expect("the test binary").parent().expect("its directory").join("nlefacewitnessscriptwordsonetable-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, c.labels).with_doc(None));
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        assert_eq!(witness(&c, face), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        let want: Vec<&str> = WITNESS_KEYS.iter().copied().chain(keys).collect();
+        assert_eq!(super::witnessdocs_tests::top_keys(&line), want, "{line}");
+        println!("nlefacewitnessscriptwordsonetable witness: {line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEWITNESSTABLEDRIVENPARSER (LEDGER SR1129): the --do table gates the parser and renders the usage line (named tail block) ----
+/// A [`SCRIPT_WORDS`] arity: the rest after the word is a whole token (`shift:` / `alt:` / `aux:`).
+pub const NEST: u8 = u8::MAX;
+
+/// The [`SCRIPT_WORDS`] row whose word heads `tok` (`<word>:` through its first `:`, else the whole token) and its arity, when
+/// the token carries that many `:`-separated arguments (a [`NEST`] row takes any rest); None otherwise. The VERBS are not rows.
+pub fn script_word(tok: &str) -> Option<(&'static str, u8)> {
+    let head = tok.find(':').map_or(tok, |i| &tok[..=i]);
+    let &(w, _, n) = SCRIPT_WORDS.iter().find(|(w, _, _)| *w == head)?;
+    (n == NEST || tok.split(':').count() - 1 == n as usize).then_some((w, n))
+}
+
+/// The usage line: [`USAGE_HEAD`], then `verbs, ` and the table's words.
+fn usage() -> String {
+    format!("{USAGE_HEAD}verbs, {})", SCRIPT_WORDS.iter().map(|(w, _, _)| *w).collect::<Vec<_>>().join(", "))
+}
+
+#[cfg(test)]
+mod tabledriven_tests {
+    use super::*;
+
+    /// NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the table gates `token` by word and arity (the VERBS beside it); the arms parse values.
+    #[test]
+    fn nlefacewitnesstabledrivenparser_gate() {
+        assert_eq!(script_word("at:12:0"), Some(("at:", 2)));
+        assert!(script_word("at:12").is_none() && script_word("release:1").is_none());
+        assert_eq!(script_word("release"), Some(("release", 0)));
+        assert_eq!(script_word("shift:at:12:0"), Some(("shift:", NEST)));
+        assert_eq!(script_word("key:Ctrl+a"), Some(("key:", 1)));
+        assert!(script_word("key:a:b").is_none(), "a key name carries no `:` (the one behaviour change: was BrowserKey(a:b))");
+        assert_eq!(script_word("wheel:-2"), Some(("wheel:", 1)));
+        assert_eq!(script_word("marquee:1:2:3:4"), Some(("marquee:", 4)));
+        assert!(script_word("help").is_none() && script_word("bogus").is_none());
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(token(&face, "help").is_some() && token(&face, "kind").is_some());
+        assert!(token(&face, "at:12").is_none() && token(&face, "shift:at:12").is_none() && token(&face, "bogus").is_none());
+        assert!(token(&face, "at:12:0").is_some() && token(&face, "shift:at:12:0").is_some());
+    }
+
+    /// NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the usage line's word list is the table; the head carries no script word.
+    #[test]
+    fn nlefacewitnesstabledrivenparser_usage() {
+        let u = usage();
+        assert!(u.starts_with(USAGE_HEAD) && u.contains("(SCRIPT: verbs, ") && u.ends_with(')'), "{u}");
+        for (w, _, _) in SCRIPT_WORDS {
+            assert!(u.contains(w), "{w} not in usage()");
+            assert!(!USAGE_HEAD.contains(w), "{w} in USAGE_HEAD");
+        }
     }
 }

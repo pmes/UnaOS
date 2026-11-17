@@ -1530,7 +1530,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             let mut color = (128, 128, 128); let mut alpha = 1.0f32;
             let mut got_any = false;
             for part in split_top_level(v) {
-                if let Some(px) = parse_px(part, cx).filter(|_| part.ends_with("px") || is_font_relative(part)) {
+                if let Some(px) = crate::paint::outline_width_keyword(part).or_else(|| parse_px(part, cx).filter(|_| part.ends_with("px") || is_font_relative(part))) {
                     width = px;
                     got_any = true;
                 } else if let Some(k) = border_style_code(part) {
@@ -1699,7 +1699,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => {
-            if let Some(w) = parse_px(value, cx) {
+            if let Some(w) = line_width(value, cx) {
                 let side = match prop {
                     "border-top-width" => 0,
                     "border-right-width" => 1,
@@ -1804,7 +1804,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             let mut color = (128, 128, 128); let mut alpha = 1.0f32;
             let mut got_any = false;
             for part in split_top_level(v) {
-                if let Some(px) = parse_px(part, cx).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.')) {
+                if let Some(px) = crate::paint::outline_width_keyword(part).or_else(|| parse_px(part, cx).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.'))) {
                     width = px;
                     got_any = true;
                 } else if let Some(k) = border_style_code(part) {
@@ -1854,7 +1854,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "border-width" => {
-            if let Some(w) = parse_px(value, cx) { border_width_store(&mut style.paint, crate::paint::CC_SIDES, Some(w)); } else { font_rel_undo(&mut style.paint, prop, &fr); }
+            if let Some(r) = parse_sides(value, |v| line_width(v, cx)) { for (i, w) in [r.top, r.right, r.bottom, r.left].into_iter().enumerate() { border_width_store(&mut style.paint, 1 << i, Some(w)); } } else { font_rel_undo(&mut style.paint, prop, &fr); } // SR1075
         }
         "border-style" => {} // stroke style is uniform; nothing to record
         // css-ui-4 §5.1: `[<url> [<x> <y>]?,]* <keyword>` — images are not loaded, so the fallback
@@ -5129,4 +5129,15 @@ pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>;
         }
     }
     a
+}
+
+// ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): <line-width> keywords and 1-4 border-width values (named tail block) ----
+
+/// AETHERCSSBORDERTHINTHICK (SR1075): css-backgrounds-3 §4.3 `<line-width> = <length> | thin | medium | thick`
+/// (Chromium 1px / 3px / 5px) through the existing keyword table [`crate::paint::outline_width_keyword`], else a length
+/// through [`parse_px`]. Read by `border-width` (each of its 1-4 values, expanded by `parse_sides`), the
+/// `border-<side>-width` longhands; the `border` / `border-<side>` shorthands take the same keyword road ahead of their
+/// numeric filter. Before SR1075 `thin` / `thick` were dropped and `border-width` took one value.
+fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
+    crate::paint::outline_width_keyword(value).or_else(|| parse_px(value, cx))
 }
