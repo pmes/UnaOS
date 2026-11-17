@@ -2205,3 +2205,71 @@ fn place_shorthands_in_skipped() {
         assert!(ALL_SKIPPED.contains(&n) && !ALL_LONGHANDS.contains(&n), "{n} is a skipped shorthand");
     }
 }
+
+// ---- AETHERCSSTEXTDECORATIONLINERESET (LEDGER SR1122): a declared text-decoration-line set replaces the earlier one (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): the (underline, line_through) pair a cascade of rules leaves.
+fn deco_lines(rules: &[&[(&str, &str)]]) -> (Option<bool>, Option<bool>) {
+    let s = cascade(rules);
+    (s.paint.underline, s.paint.line_through)
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): a later rule's `line-through` replaces an earlier `underline` whole
+/// (css-text-decor-3 §2.1: one value; Chromium paints only the strike). Before SR1122: (Some(true), Some(true)).
+#[test]
+fn text_decoration_line_reset_later_rule_replaces() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        assert_eq!(deco_lines(&[&[(p, "underline")], &[(p, "line-through")]]), (Some(false), Some(true)), "{p}: underline then line-through");
+        assert_eq!(deco_lines(&[&[(p, "line-through")], &[(p, "underline")]]), (Some(true), Some(false)), "{p}: line-through then underline");
+    }
+    assert_eq!(deco_lines(&[&[("text-decoration", "underline")], &[("text-decoration-line", "line-through")]]), (Some(false), Some(true)), "shorthand then longhand");
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): `none` writes both false (kept).
+#[test]
+fn text_decoration_line_reset_none() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        assert_eq!(deco_lines(&[&[(p, "underline line-through")], &[(p, "none")]]), (Some(false), Some(false)), "{p}: none");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): both words write both true, in either order.
+#[test]
+fn text_decoration_line_reset_both() {
+    for v in ["underline line-through", "line-through underline"] {
+        assert_eq!(deco_lines(&[&[("text-decoration-line", v)]]), (Some(true), Some(true)), "longhand {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration", v)]]), (Some(true), Some(true)), "shorthand {v}");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): css-text-decor-3 §2.4: the shorthand's omitted line is `none` (Chromium:
+/// `text-decoration: red` reads textDecorationLine `none`). Before SR1122 the flags were not written: (None, None).
+#[test]
+fn text_decoration_line_reset_shorthand_omitted_line() {
+    for v in ["red", "wavy", "wavy red 2px"] {
+        assert_eq!(deco_lines(&[&[("text-decoration", v)]]), (Some(false), Some(false)), "text-decoration: {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration", "underline")], &[("text-decoration", v)]]), (Some(false), Some(false)), "{v} after underline");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): the CSS-wide keywords write neither flag (no inherit bit for these two
+/// properties: AETHER-CSS-TEXT-DECORATION-LINE-CSSWIDE owed), so an earlier rule stands as before.
+#[test]
+fn text_decoration_line_reset_css_wide_untouched() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        for kw in ["inherit", "initial", "unset", "revert"] {
+            assert_eq!(deco_lines(&[&[(p, kw)]]), (None, None), "{p}: {kw}");
+            assert_eq!(deco_lines(&[&[(p, "underline")], &[(p, kw)]]), (Some(true), Some(false)), "{p}: {kw} after underline");
+        }
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): an invalid longhand (a non-line word, a repeated word, `none` beside a line)
+/// is dropped: no flag written, an earlier rule stands.
+#[test]
+fn text_decoration_line_reset_longhand_invalid_dropped() {
+    for v in ["red", "underline underline", "none underline", "wavy"] {
+        assert_eq!(deco_lines(&[&[("text-decoration-line", v)]]), (None, None), "text-decoration-line: {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration-line", "line-through")], &[("text-decoration-line", v)]]), (Some(false), Some(true)), "{v} after line-through");
+    }
+}
