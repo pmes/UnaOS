@@ -208,7 +208,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.source_ruler_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -280,7 +280,7 @@ impl Face {
         if !self.playing {
             return false;
         }
-        let ph = self.state.playhead;
+        if let Some(r) = self.source_tick() { return r; } let ph = self.state.playhead; // STRIASOURCEPLAY (SR9080): a loaded source plays through this same body over its reel (file tail)
         if (self.rate > 0 && ph >= self.state.timeline.end()) || (self.rate <= 0 && ph <= 0) {
             self.playing = false; self.sync_audio(); // NLEPLAYAUDIO (SR676)
             return true;
@@ -386,6 +386,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("Alt+s", "source"), // STRIASOURCEPLAY (SR9080): the source monitor's words as Alt chords (GTK's spelling)
+    ("Alt+u", "unload"),
+    ("Alt+Left", "src-prev"),
+    ("Alt+Right", "src-next"),
+    ("Alt+i", "src-in"),
+    ("Alt+o", "src-out"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -1591,7 +1597,7 @@ impl Face {
         if role == Role::Bin { return self.paint_bin(); } let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail); STRIAPROJECTBIN (SR885): the bin's own painter (file tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
-        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
+        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.shown_tick(), shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIASOURCEPLAY (SR9080): keyed on the source playhead while loaded
             self.still = match preview_shown(st, &self.sources) { // STRIASOURCEVIEWER (SR9045): a loaded source shows through the same frame road (file tail)
                 Ok(s) => s,
                 Err(e) => {
@@ -1601,7 +1607,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(paint_source_ruler(paint_in(st, l, self.order, self.labels.as_ref(), still), l, self.order, st), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIASOURCEPLAY (SR9080): the source ruler strip while loaded (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -2603,6 +2609,12 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("source", "load the clip's reel at the playhead (match frame)"), // STRIASOURCEPLAY (SR9080): the source monitor's words
+    ("unload", "unload the source"),
+    ("src-prev", "source one frame back"),
+    ("src-next", "source one frame on"),
+    ("src-in", "source in at its playhead"),
+    ("src-out", "source out at its playhead"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3476,8 +3488,8 @@ mod striabinmore_tests {
 
 /// The frame the preview shows: the loaded source's one-clip view at its tick 0, else the timeline at the playhead.
 fn preview_shown(st: &EditorState, sources: &Sources) -> Result<Option<Still>, RenderError> {
-    match st.source_view() {
-        Some(v) => preview(&v, sources, 0),
+    match st.source_reel() { // STRIASOURCEPLAY (SR9080): the reel the play road plays, at the source playhead
+        Some(v) => preview(&v, sources, st.shown_tick()),
         None => preview(&st.timeline, sources, st.playhead),
     }
 }
@@ -3570,5 +3582,217 @@ mod striasourceviewer_tests {
         assert_eq!(f.message_text().as_deref(), Some("source B 00:00:00:03  in 00:00:00:03  out --"));
         assert!(f.verb("src-out"));
         assert_eq!(f.message_text(), Some(format!("src-out: {}", EditError::Marks)), "the error first");
+    }
+}
+
+// ---- STRIASOURCEPLAY (LEDGER SR9080): the loaded source plays through the one play road; its ruler strip (named tail block) ----
+// While a source is loaded the transport (play / Space, J K L, stop) drives the SOURCE playhead: [`Face::source_tick`] runs
+// [`Face::tick`]'s own body ONCE over an editor holding timeline_core's `EditorState::source_reel` (the whole reel at tick 0,
+// so a reel tick is a source tick) seeked to the source playhead, then swaps the editor back and keeps where it got as the
+// source playhead. `play_tick`, `render` through `PlaySink`, the meters, the device and the end stop are the same code: a
+// second playhead, never a second play road; the timeline playhead stays. The paint keys a played still on
+// `EditorState::shown_tick`. A strip [`SRC_RULER_H`] px at the foot of the preview band shows the reel (its in / out range,
+// the marks, the source playhead) ONLY while a source is loaded, and a press on it seeks the source (the one-Surface face
+// and the split preview Surface, whose other pointer messages stay not taken). Unloaded: nothing painted, nothing taken.
+
+/// The source ruler strip's height (px), at the foot of the preview band.
+pub const SRC_RULER_H: u32 = 6;
+
+/// The source ruler strip's rows `y0..y1` on layout `l` (the preview band's foot, after its message row is taken); `None`
+/// on a band under two strips (Role::Tracks has none).
+fn src_ruler_band(l: Layout) -> Option<(i64, i64)> {
+    if l.preview_h < 2 * SRC_RULER_H {
+        return None;
+    }
+    Some(((l.preview_h - SRC_RULER_H) as i64, l.preview_h as i64))
+}
+
+/// The strip over `px` while `st` has a source loaded: the reel across the width (RULER), its marked range (in or 0 .. out
+/// or the duration, only when a mark is set) in TICK, each set mark a 1 px GUIDE line, the source playhead a 1 px PLAYHEAD
+/// line. Nothing loaded (or no band): `px` unchanged.
+fn paint_source_ruler(px: Vec<u8>, l: Layout, order: PixelOrder, st: &EditorState) -> Vec<u8> {
+    let Some(m) = st.source.as_ref() else { return px };
+    let Some(dur) = st.timeline.source(m.src).map(|s| s.duration.max(1)) else { return px };
+    let Some((y0, y1)) = src_ruler_band(l) else { return px };
+    let x_of = |t: i64| t.clamp(0, dur) * l.w as i64 / dur;
+    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
+    c.rect(0, y0, l.w as i64, y1, view::RULER);
+    if m.marks != (None, None) {
+        c.rect(x_of(m.marks.0.unwrap_or(0)), y0, x_of(m.marks.1.unwrap_or(dur)), y1, view::TICK);
+    }
+    for t in [m.marks.0, m.marks.1].into_iter().flatten() {
+        let x = x_of(t).min(l.w as i64 - 1);
+        c.rect(x, y0, x + 1, y1, GUIDE);
+    }
+    let x = x_of(m.at);
+    c.rect(x, y0, x + 1, y1, PLAYHEAD);
+    c.px
+}
+
+impl Face {
+    /// One playback tick of the loaded source: [`Face::tick`]'s body over an editor holding the reel at the source
+    /// playhead (no source loaded in it, so it does not come back here), the hover dwell kept as it was; the editor is
+    /// swapped back and the source playhead set to where the tick left the reel. `None` when nothing is loaded.
+    fn source_tick(&mut self) -> Option<bool> {
+        let reel = self.state.source_reel()?;
+        let at = self.state.source.as_ref()?.at;
+        let mut inner = EditorState::new(reel);
+        inner.seek(at);
+        let outer = std::mem::replace(&mut self.state, inner);
+        let hover = self.hover_ticks;
+        let r = self.tick();
+        self.hover_ticks = hover;
+        let got = self.state.playhead;
+        self.state = outer;
+        let _ = self.state.source_seek(got);
+        Some(r)
+    }
+    /// A press (a `BrowserButton` down, or a `BrowserClick` while the surface sends no buttons) on the source ruler strip
+    /// seeks the source to the tick under it and is taken: on the one-Surface face (Role::Whole) or on the split preview
+    /// Surface (Role::Preview). `None` for anything else, with nothing loaded, or while the help shows.
+    fn source_ruler_input(&mut self, msg: &SMessage) -> Option<bool> {
+        if self.help {
+            return None;
+        }
+        let src = self.state.source.as_ref()?.src;
+        let (x, y, n, button) = match *msg {
+            SMessage::BrowserButton { down: true, x, y, surface, .. } => (x, y, surface, true),
+            SMessage::BrowserClick(x, y, n) if !self.buttons => (x, y, n, false),
+            _ => return None,
+        };
+        let role = match self.split {
+            Some(s) if n == s.preview && s.preview != s.tracks => Role::Preview,
+            Some(_) => return None,
+            None if self.takes(msg) => Role::Whole,
+            None => return None,
+        };
+        let l = self.layout_for(role).with_message(self.labels.is_some());
+        let (y0, y1) = src_ruler_band(l)?;
+        if x < 0.0 || x >= l.w as f64 || y < y0 as f64 || y >= y1 as f64 {
+            return None;
+        }
+        let dur = self.state.timeline.source(src)?.duration;
+        if button {
+            self.buttons = true;
+        }
+        if let Err(e) = self.state.source_seek((x * dur as f64 / l.w as f64) as i64) {
+            self.last_error = Some(format!("source: {e}"));
+        }
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striasourceplay_tests {
+    use super::*;
+
+    fn plain(w: u32, h: u32) -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (w, h), PixelOrder::Rgba, false)
+    }
+
+    /// With B loaded, play steps the SOURCE playhead through the one play road (one render a tick, the paint shows that
+    /// render, equal to the stopped preview of the same source tick); the timeline playhead, the document and undo stay.
+    #[test]
+    fn striasourceplay_play_steps_the_source_not_the_timeline() {
+        let mut f = plain(320, 160);
+        f.state.seek(4);
+        let tl0 = f.state.timeline.clone();
+        assert!(f.verb("source B") && f.verb("play"));
+        assert!(f.playing);
+        for _ in 0..3 {
+            assert!(f.tick());
+        }
+        assert_eq!(f.state.source.as_ref().map(|m| m.at), Some(2), "three ticks show 0, 1, 2");
+        assert_eq!(f.played().renders, 3);
+        f.paint();
+        let played = f.still().cloned();
+        assert!(played.is_some());
+        let want = preview(&f.state.source_view().unwrap(), &f.sources, 0).unwrap();
+        assert_eq!(played, want, "the played render is B's frame 2");
+        assert_eq!((f.state.playhead, &f.state.timeline, f.state.undo_depth(), f.dirty()), (4, &tl0, 0, false));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert!(f.verb("play"));
+        assert!(!f.tick(), "paused: nothing moves");
+        assert_eq!(f.state.source.as_ref().map(|m| m.at), Some(2));
+    }
+
+    /// Play stops at the reel's last tick and the source playhead stays on it; unloaded, play is the timeline's again.
+    #[test]
+    fn striasourceplay_play_stops_at_the_reels_end() {
+        let mut f = plain(320, 160);
+        assert!(f.verb("source B"));
+        assert_eq!(f.state.source_seek(47), Ok(()));
+        assert!(f.verb("play"));
+        for _ in 0..8 {
+            f.tick();
+        }
+        assert!(!f.playing, "the reel's end stops play");
+        assert_eq!((f.state.source.as_ref().map(|m| m.at), f.state.playhead), (Some(49), 0));
+        assert!(f.verb("unload") && f.verb("play"));
+        assert!(f.tick());
+        assert!(f.state.playhead > 0 || f.played().renders > 0, "the timeline plays");
+    }
+
+    /// The strip paints only while a source is loaded, only on its rows; after unload the canvas is byte-identical.
+    #[test]
+    fn striasourceplay_ruler_paints_only_while_loaded() {
+        let mut f = plain(320, 160);
+        let off = f.paint();
+        let l = f.layout_for(Role::Whole).with_message(false);
+        let (y0, y1) = src_ruler_band(l).expect("a band");
+        assert!(f.verb("source A") && f.verb("src-next") && f.verb("src-in"));
+        assert_eq!(f.state.source_seek(40), Ok(()));
+        assert!(f.verb("src-out"));
+        let on = f.paint();
+        let row = |y: i64| y as usize * 320 * 4;
+        assert_eq!(on[row(y1)..], off[row(y1)..], "nothing under the strip");
+        let px = |x: usize| &on[row(y0) + x * 4..row(y0) + x * 4 + 4];
+        assert_eq!(px(319), view::RULER, "past out: the reel");
+        assert_eq!(px(100), view::TICK, "inside in..out: the range");
+        assert_eq!(px(40 * 320 / 50), PLAYHEAD, "the source playhead");
+        assert!(f.verb("unload"));
+        assert_eq!(f.paint(), off, "unloaded: byte-identical");
+    }
+
+    /// A press on the strip seeks the source (one Surface and the split preview Surface); above the strip, or with nothing
+    /// loaded, the press is not the strip's.
+    #[test]
+    fn striasourceplay_ruler_press_seeks_the_source() {
+        let mut f = plain(320, 160);
+        let l = f.layout_for(Role::Whole).with_message(false);
+        let (y0, _) = src_ruler_band(l).unwrap();
+        let press = |x: f64, y: f64, s: u32| SMessage::BrowserButton { down: true, x, y, mods: 0, surface: s };
+        assert_eq!(f.source_ruler_input(&press(160.0, y0 as f64 + 1.0, 0)), None, "nothing loaded");
+        assert!(f.verb("source B"));
+        assert!(f.on(&press(160.0, y0 as f64 + 1.0, 0)));
+        assert_eq!((f.state.source.as_ref().map(|m| m.at), f.state.playhead), (Some(25), 0));
+        assert_eq!(f.source_ruler_input(&press(160.0, y0 as f64 - 1.0, 0)), None, "above the strip");
+        let mut s = plain(320, 160).on_surfaces(0, 1);
+        assert!(s.verb("source B"));
+        let lp = s.layout_for(Role::Preview).with_message(false);
+        let (p0, _) = src_ruler_band(lp).unwrap();
+        assert!(s.on(&press(80.0, p0 as f64 + 1.0, 0)));
+        assert_eq!(s.state.source.as_ref().map(|m| m.at), Some(12));
+        assert!(!s.on(&press(80.0, 2.0, 0)), "the preview Surface's other presses stay not taken");
+    }
+
+    /// The six Alt chords (GTK's BrowserKey spelling) drive the source words; their one-char text is not taken by them.
+    #[test]
+    fn striasourceplay_alt_chords_drive_the_source_words() {
+        let mut f = plain(320, 160);
+        let key = |f: &mut Face, k: &str| assert!(f.on(&SMessage::BrowserKey(k.into())), "{k}");
+        assert!(f.state.select(0, 1).is_ok());
+        f.state.seek(13);
+        key(&mut f, "Alt+s");
+        assert_eq!(f.state.source.as_ref().map(|m| (m.src, m.at)), Some((timeline_core::SourceId(1), 3)), "match frame");
+        for k in ["Alt+Right", "Alt+i", "Alt+Right", "Alt+Right", "Alt+o", "Alt+Left"] {
+            key(&mut f, k);
+        }
+        assert_eq!(f.state.source.as_ref().map(|m| (m.at, m.marks)), Some((5, (Some(4), Some(6)))));
+        key(&mut f, "Alt+u");
+        assert_eq!(f.state.source, None);
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
     }
 }
