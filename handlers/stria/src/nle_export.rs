@@ -104,6 +104,7 @@ pub trait VideoEncoder {
     }
     /// H264ENCHRDMP4 (SR720): read at `finish`: Some((bufferSizeDB, maxBitrate)) = the MP4 sample entry carries a `btrt` (avg from the coded bytes); (0, 0) = no bucket (max = avg, buffer 0, ffmpeg's CRF form).
     fn bitrate_hint(&self) -> Option<(u32, u32)> { None }
+    fn out_size(&self, w: u32, h: u32) -> (u32, u32) { (w, h) } // STRIAPROXYMEDIA (SR882): the size a `w x h` frame is encoded at (the MP4 track's), [`HalfSize`]'s half (file tail)
 }
 
 /// A PNG per frame through pixel_core's writer (lossless RGBA, colour type 6).
@@ -366,7 +367,7 @@ impl ExportSink {
         for &b in rgba {
             self.report.fnv = (self.report.fnv ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
-        self.size = (w, h);
+        self.size = self.video.out_size(w, h); // STRIAPROXYMEDIA (SR882): the encoded size (a scaling encoder's), the track's
         if self.report.frames == 0 { self.colour = self.video.colour(self.reels); } // H264ENCCOLOURHOST (SR377): the file colour, fixed at the first frame
         let units = self.video.encode(w, h, rgba)?;
         self.store(units)?;
@@ -1080,5 +1081,46 @@ impl ExportPreset {
     pub fn words(&self) -> String {
         let knobs: String = [("crf", self.crf), ("aq", self.aq), ("scenecut", self.scenecut)].iter().filter_map(|(k, v)| v.map(|v| format!(" {k}={v}"))).collect();
         format!("{}: {} + {}{knobs}", self.name, self.video, self.audio)
+    }
+}
+
+// ---- STRIAPROXYMEDIA (LEDGER SR882): the half-size encoder a preview proxy is exported through (named tail block) ----
+/// STRIAPROXYMEDIA (LEDGER SR882): the proxy's size for a `w x h` frame: half each side, even, at least 2.
+pub fn half_size(w: u32, h: u32) -> (u32, u32) {
+    ((w / 2).max(2) & !1, (h / 2).max(2) & !1)
+}
+
+/// STRIAPROXYMEDIA (LEDGER SR882): any [`VideoEncoder`] fed each frame at [`half_size`]: the frame scaled through the editor's
+/// ONE fit (`timeline_core::view::Canvas::blit_fit`, yuv_core::scale's `nearest_rows` over the RGBA as a mono picture),
+/// over `FIELD`, then the inner encoder. [`VideoEncoder::out_size`] reports the half size, so the MP4 track states it.
+/// The export has no scale knob: a proxy is [`export_as_with`] over `HalfSize(video_named("h264", tb))`.
+pub struct HalfSize(pub Box<dyn VideoEncoder>);
+
+impl VideoEncoder for HalfSize {
+    fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
+        use timeline_core::view::{Canvas, FIELD, Order, Still};
+        let (dw, dh) = half_size(width, height);
+        let mut c = Canvas::new(dw, dh, Order::Rgba);
+        c.rect(0, 0, dw as i64, dh as i64, FIELD);
+        c.blit_fit(&Still { width, height, rgba: rgba.to_vec() }, 0, 0, dw, dh);
+        self.0.encode(dw, dh, &c.px)
+    }
+    fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
+        self.0.flush()
+    }
+    fn config(&self) -> VideoConfig {
+        self.0.config()
+    }
+    fn layout(&self) -> Layout {
+        self.0.layout()
+    }
+    fn colour(&mut self, reels: (u8, u8)) -> Option<Colour> {
+        self.0.colour(reels)
+    }
+    fn bitrate_hint(&self) -> Option<(u32, u32)> {
+        self.0.bitrate_hint()
+    }
+    fn out_size(&self, w: u32, h: u32) -> (u32, u32) {
+        half_size(w, h)
     }
 }

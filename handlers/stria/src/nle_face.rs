@@ -111,6 +111,7 @@ impl RenderSink for OneFrame {
         self.0 = Some(Still { width, height, rgba: rgba.to_vec() });
     }
     fn pcm(&mut self, _out_t: i64, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
+    fn proxy(&self) -> bool { true } // STRIAPROXYMEDIA (SR882): the preview decodes a source's attached proxy (file tail)
 }
 
 /// The frame tick `t` shows: `stria::nle::render` of `t..t+1` over the video tracks (the audio is not this face's).
@@ -155,7 +156,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 80] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail)
+pub const VERBS: [&str; 81] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -195,6 +196,7 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     help_query: Option<String>, // STRIAHELPSEARCH (SR874): `help <word>`'s query, the rows the help shows are THE help_rows filtered by it (file tail)
+    proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, // STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
@@ -212,7 +214,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -247,7 +249,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -336,8 +338,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.autosave_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() | face.autosave_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.autosave_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() || face.proxying() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAPROXYMEDIA (SR882): and a running proxy job; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() | face.autosave_tick() | face.proxy_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock // STRIAPROXYMEDIA (SR882): a finished proxy attaches and repaints
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1819,6 +1821,7 @@ struct PlaySink<'a> {
 }
 
 impl RenderSink for PlaySink<'_> {
+    fn proxy(&self) -> bool { true } // STRIAPROXYMEDIA (SR882): the played still decodes a source's attached proxy too
     fn frame(&mut self, _out_t: i64, width: u32, height: u32, rgba: &[u8]) {
         self.still = Some(Still { width, height, rgba: rgba.to_vec() });
     }
@@ -5386,5 +5389,153 @@ pub fn pan_line(pan_cq8: i8) -> String {
         0 => "pan: centre".to_string(),
         n if n < 0 => format!("pan: L {}", p.min(100)),
         _ => format!("pan: R {}", p.min(100)),
+    }
+}
+
+// ---- STRIAPROXYMEDIA (LEDGER SR882): the `proxy` verb — a half-size H.264 of a source, previewed from (named tail block) ----
+// `proxy` (VERBS, the Proxy button) takes the SELECTED clip's source: its file (the reel's path, [`Face::with_reel_paths`]:
+// stria-view's `--src`) renders ONCE through the one export door, `nle_export::export_as_with`, over the h264 table encoder
+// wrapped in `nle_export::HalfSize` (half each side through yuv_core's nearest_rows), off the face's thread on the export
+// door's shape (a job, two AtomicU64 readings, a join at the face's clock), into `<name>.proxy.mp4` beside the source, with a
+// `<name>.proxy.stamp` of the source's `<len> <mtime ns>` taken at the job's start. The finished proxy is attached to the
+// shared `Sources` (`Sources::set_proxy`); the preview's sinks then decode it, an export never does. A proxy whose stamp no
+// longer matches its source is STALE and rebuilt; one that matches is reused. View-only: no undo step, the document clean.
+// Owed: NLE-PROXY-OFF, NLE-PROXY-ALL, NLE-PROXY-CANCEL, NLE-PROXY-AUTO, NLE-PROXY-WATCH, NLE-PROXY-ADOPT, NLE-PROXY-AUDIO,
+// NLE-PROXY-SAVEFRAME (a saved frame of a proxied reel, through `preview`, is the proxy's).
+
+/// STRIAPROXYMEDIA (LEDGER SR882): one proxy render running off the face's thread; the thread returns the frames encoded.
+pub struct ProxyJob {
+    src: timeline_core::SourceId,
+    reel: String,
+    path: std::path::PathBuf,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<Result<u64, String>>>,
+}
+
+/// STRIAPROXYMEDIA (LEDGER SR882): the proxy, its stamp and its transient export directory beside source file `src`
+/// (`clip.mp4` -> `clip.proxy.mp4`, `clip.proxy.stamp`, `clip.proxy.d`).
+pub fn proxy_paths(src: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    (src.with_extension("proxy.mp4"), src.with_extension("proxy.stamp"), src.with_extension("proxy.d"))
+}
+
+/// STRIAPROXYMEDIA (LEDGER SR882): source file `src`'s stamp now: `<len> <mtime ns>\n`; `None` when it cannot be read.
+pub fn proxy_stamp(src: &std::path::Path) -> Option<String> {
+    let m = std::fs::metadata(src).ok()?;
+    let ns = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some(format!("{} {ns}\n", m.len()))
+}
+
+/// STRIAPROXYMEDIA (LEDGER SR882): the proxy beside `src` exists and its stamp equals the source's now (size and mtime);
+/// false = absent or STALE.
+pub fn proxy_fresh(src: &std::path::Path) -> bool {
+    let (proxy, stamp, _) = proxy_paths(src);
+    proxy.is_file() && proxy_stamp(src).is_some_and(|now| std::fs::read_to_string(stamp).is_ok_and(|s| s == now))
+}
+
+impl Face {
+    /// Each reel's source file (reel name, path), the files `proxy` renders from and writes beside.
+    pub fn with_reel_paths(mut self, paths: Vec<(String, std::path::PathBuf)>) -> Face {
+        self.reel_paths = paths;
+        self
+    }
+    /// True while a proxy job's result has not been reported.
+    pub fn proxying(&self) -> bool {
+        self.proxy.is_some()
+    }
+    /// The running proxy job's reading `(frames done, frames total)`.
+    pub fn proxy_progress(&self) -> Option<(u64, u64)> {
+        self.proxy.as_ref().map(|j| (j.done.load(Relaxed), j.total.load(Relaxed)))
+    }
+    /// The `proxy` verb: every outcome is the message line `proxy: ..` (`proxy: no clip selected`, `proxy: busy (d/t)`, or
+    /// `proxy: <reel>: <outcome>`).
+    fn proxy_verb(&mut self, v: &str) -> Option<bool> {
+        if v.trim() != "proxy" {
+            return None;
+        }
+        let Some(c) = self.state.selected() else {
+            self.last_error = Some("proxy: no clip selected".into());
+            return Some(true);
+        };
+        if let Some((d, t)) = self.proxy_progress() {
+            self.last_error = Some(format!("proxy: busy ({d}/{t})"));
+            return Some(true);
+        }
+        let reel = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |s| s.reel.clone());
+        let line = self.proxy_start(c.src, &reel).unwrap_or_else(|e| e);
+        self.last_error = Some(format!("proxy: {reel}: {line}"));
+        Some(true)
+    }
+    /// Reuse a fresh proxy (`reused <path>`) or start the job (`building (new|stale) -> <path>`); refused by name: `no source
+    /// path`, `<file>: unreadable`, `stale (the file changed since it was opened)`, `no video stream`, a `set_proxy` refusal.
+    fn proxy_start(&mut self, src: timeline_core::SourceId, reel: &str) -> Result<String, String> {
+        let file = self.reel_paths.iter().find(|(r, _)| r == reel).map(|(_, p)| p.clone()).ok_or("no source path")?;
+        let now = proxy_stamp(&file).ok_or_else(|| format!("{}: unreadable", file.display()))?;
+        if std::fs::metadata(&file).map(|m| m.len()).ok() != self.sources.byte_len(src) {
+            return Err("stale (the file changed since it was opened)".into());
+        }
+        let (proxy, stamp, work) = proxy_paths(&file);
+        if proxy_fresh(&file) {
+            let bytes = std::fs::read(&proxy).map_err(|e| format!("{}: {e}", proxy.display()))?;
+            self.sources.set_proxy(src, bytes).map_err(|e| e.to_string())?;
+            return Ok(format!("reused {}", proxy.display()));
+        }
+        let why = if proxy.exists() { "stale" } else { "new" };
+        let n = self.sources.video_ticks(src).ok_or("no video stream")?;
+        let mut tl = self.state.timeline.clone();
+        tl.tracks.clear();
+        let t = tl.add_track(Kind::Video);
+        tl.tracks[t].clips = vec![Clip::new(src, 0, n, 0)];
+        std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+        let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(n.max(0) as u64)));
+        let (d, tt, sources, out, dir) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&self.sources), proxy.clone(), work.clone());
+        let handle = std::thread::Builder::new()
+            .name("nle-proxy".into())
+            .spawn(move || -> Result<u64, String> {
+                let video: Box<dyn crate::nle_export::VideoEncoder> = Box::new(crate::nle_export::HalfSize(video_named("h264", tl.tb).expect("h264 is a VIDEO_NAMES word")));
+                let mut progress = |k: u64, of: u64| -> Result<(), ExportError> {
+                    d.store(k, Relaxed);
+                    tt.store(of, Relaxed);
+                    Ok(())
+                };
+                let r = export_as_with(&tl, 0..n, &sources, &dir, video, AudioOut::None, Container::Mp4, &mut progress).map_err(|e| e.to_string())?;
+                std::fs::rename(dir.join("video.mp4"), &out).map_err(|e| format!("{}: {e}", out.display()))?;
+                std::fs::write(&stamp, now).map_err(|e| format!("{}: {e}", stamp.display()))?;
+                let _ = std::fs::remove_dir_all(&dir);
+                Ok(r.frames)
+            })
+            .map_err(|e| format!("{}: {e}", work.display()))?;
+        self.proxy = Some(ProxyJob { src, reel: reel.to_string(), path: proxy.clone(), done, total, handle: Some(handle) });
+        Ok(format!("building ({why}) -> {}", proxy.display()))
+    }
+    /// One clock tick for the proxy job: a finished job attaches its proxy and reports; true then (the preview repaints).
+    pub fn proxy_tick(&mut self) -> bool {
+        if !self.proxy.as_ref().is_some_and(|j| j.handle.as_ref().is_some_and(|h| h.is_finished())) {
+            return false;
+        }
+        self.finish_proxy();
+        true
+    }
+    /// Block until the running proxy job ends and report it as [`Face::proxy_tick`] would; false when none runs.
+    pub fn wait_proxy(&mut self) -> bool {
+        if self.proxy.is_none() {
+            return false;
+        }
+        self.finish_proxy();
+        true
+    }
+    /// Join the job, attach the proxy (`Sources::set_proxy`) and put `proxy: <reel>: <n> frames -> <path>` (or the refusal)
+    /// on the message line.
+    fn finish_proxy(&mut self) {
+        let Some(mut j) = self.proxy.take() else { return };
+        let r = match j.handle.take().map(|h| h.join()) {
+            Some(Ok(Ok(frames))) => std::fs::read(&j.path)
+                .map_err(|e| format!("{}: {e}", j.path.display()))
+                .and_then(|b| self.sources.set_proxy(j.src, b).map_err(|e| e.to_string()))
+                .map(|()| format!("{frames} frames -> {}", j.path.display())),
+            Some(Ok(Err(e))) => Err(e),
+            _ => Err("the proxy thread panicked".to_string()),
+        };
+        self.last_error = Some(format!("proxy: {}: {}", j.reel, r.unwrap_or_else(|e| e)));
     }
 }
