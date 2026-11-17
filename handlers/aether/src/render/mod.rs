@@ -2388,12 +2388,12 @@ fn frame_walk(
         };
         if walk_mode() == 1 {
             // AETHERPAINTPERF: a transformed, filtered or clip-pathed group lands where its matrix sends it.
-            ink_add(INK_ALL);
+            let fx = filter_ink_open(tf.is_none() && shape.is_none(), filter.as_deref(), &fcx); // AETHERPAINTINDEXFILTEREXTENT (SR1158)
             draw_node_op(
                 node_id, abs_x, abs_y, inherited, layout, font, font_bold, surface, width, height, sx, sy,
                 damage_rects, clip,
             );
-            return;
+            filter_ink_close(fx, filter.as_deref(), &fcx); return;
         }
         let (w, h) = (lb.size.width, lb.size.height);
         let (ox, oy) = placed_origin(layout, node_id, abs_x, abs_y, &lb, width, height, sx, sy);
@@ -5019,4 +5019,39 @@ fn sticky_scrollport(
         }
     }
     (pl, pt, pl + cw, pt + ch, r, b)
+}
+
+// ---- AETHERPAINTINDEXFILTEREXTENT (LEDGER SR1158): a filter group's finite ink (named tail block) ----
+
+/// The index walk opens a group (`draw_node_body`'s group road): a plain filter (no transform, no clip-path) whose
+/// list has a computable reach (`layout_core::effects::filter_extent`) adds no ink now — its subtree ink is grown at
+/// [`filter_ink_close`] — and marks the call's own ink unbounded, so `relayout_damage` keeps the viewport for a box
+/// that changed inside the group (the group re-filters it: its pixels spread by the reach). Anything else adds the
+/// unbounded ink as before. True for the bounded road.
+fn filter_ink_open(plain: bool, filter: Option<&str>, cx: &layout_core::effects::FilterCx) -> bool {
+    let bounded = plain && filter.is_some_and(|f| layout_core::effects::filter_extent(f, cx, 0.0, 0.0, 0.0, 0.0).is_some());
+    if !bounded {
+        ink_add(INK_ALL);
+        return false;
+    }
+    INDEX.with(|x| {
+        if let Some(o) = x.borrow_mut().open.last_mut() {
+            o.1 = true;
+        };
+    });
+    true
+}
+
+/// The group's subtree is walked: on the bounded road its subtree ink (the open call's, own and descendants') becomes
+/// that ink through the filter list; an empty ink stays empty (a group that draws nothing paints nothing).
+fn filter_ink_close(bounded: bool, filter: Option<&str>, cx: &layout_core::effects::FilterCx) {
+    let Some(f) = filter.filter(|_| bounded) else { return };
+    INDEX.with(|x| {
+        let mut x = x.borrow_mut();
+        if let Some(top) = x.stack.last_mut() {
+            if top.0 < top.2 && top.1 < top.3 {
+                *top = layout_core::effects::filter_extent(f, cx, top.0, top.1, top.2, top.3).unwrap_or(INK_ALL);
+            }
+        }
+    });
 }

@@ -11065,11 +11065,11 @@ b</div>
         }
     }
 
-    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the same header under `filter: blur(2px)`: the filter group stays unbounded,
-    /// so the scroll damages the viewport (AETHER-PAINT-INDEX-FILTER-EXTENT owed).
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the same header under `filter: url(#f)`: the filter group stays unbounded,
+    /// so the scroll damages the viewport (AETHER-PAINT-INDEX-FILTER-URL-EXTENT owed).
     #[test]
     fn paint_index_text_shadow_filter_falls_back() {
-        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, "filter:blur(2px)"));
+        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, "filter:url(#f)"));
         e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
         assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
     }
@@ -11530,5 +11530,117 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginLeft"), "auto", "margin: 0 auto: margin-left");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
+    }
+
+    // ---- AETHERPAINTINDEXFILTEREXTENT (LEDGER SR1158): a blur() / drop-shadow() filter group's ink is finite (named tail block) ----
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): a 150px spacer, then `#fx`, a 100x100 blue box with `filter` = `f`, then a
+    /// 2000px filler; 400x300, body margin 0. The plain box's ink is (-2, 148, 102, 252).
+    fn filter_extent_engine(f: &str) -> crate::AetherEngine {
+        damage_rects_engine(&format!(
+            r#"<div style="height:150px"></div><div id="fx" style="width:100px;height:100px;background-color:rgb(0, 0, 255);filter:{f}"></div>
+        <div style="height:2000px"></div>"#
+        ))
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `#fx`'s subtree ink from the last frame.
+    fn filter_extent_ink(e: &crate::AetherEngine) -> Option<(f32, f32, f32, f32)> {
+        let t = tid_of(e.layout_tree.as_ref().expect("laid out"), "fx");
+        crate::render::subtree_ink(&[t]).0
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `filter: blur(5px)`: the ink is finite and is the box's ink grown by the
+    /// blur's reach (3σ = 15) on each side (armed: the filter group's ink was unbounded).
+    #[test]
+    fn scroll_damage_filter_extent_blur_ink_finite() {
+        let e = filter_extent_engine("blur(5px)");
+        assert_eq!(filter_extent_ink(&e), Some((-17.0, 133.0, 117.0, 267.0)), "the box grown by 15 (armed)");
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): a +10 scroll damages the exposed strip (0, 290, 400, 10), which misses the
+    /// blurred box's ink; the next frame's ink is finite and 10 rows up (armed), and the blitted frame equals a control
+    /// scrolled to 10 and repainted whole.
+    #[test]
+    fn scroll_damage_filter_extent_far_scroll_excludes() {
+        let mut e = filter_extent_engine("blur(5px)");
+        let ink = filter_extent_ink(&e).expect("finite ink (armed)");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert_eq!(e.damage_rects, vec![(0, 290, 400, 10)], "the strip alone");
+        assert!(ink.3 < 290.0, "the strip misses the box's ink {ink:?}");
+        e.render_frame();
+        assert_eq!(filter_extent_ink(&e), Some((-17.0, 123.0, 117.0, 257.0)), "the scrolled frame's ink, 10 rows up");
+        let mut c = filter_extent_engine("blur(5px)");
+        c.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        c.damage_rects.push((0, 0, 400, 300));
+        c.render_frame();
+        assert!(e.surface() == c.surface(), "the blitted frame equals a full repaint");
+    }
+
+    const FILTER_HOLDER: &str = "filter:blur(5px)";
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): SR1145's fixed 100x20 header under `filter: blur(5px)`: its ink is
+    /// (-17, -17, 117, 37), so a +50 scroll damages the strip and that rect clipped (its ghost off-screen) — not the
+    /// viewport (armed: the filter made the ink unbounded and the damage the viewport).
+    #[test]
+    fn scroll_damage_filter_extent_holder_damage() {
+        let mut e = damage_rects_engine(&shadow_holder_body(FILTER_HOLDER));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(crate::render::subtree_ink(&holders).0, Some((-17.0, -17.0, 117.0, 37.0)), "the header grown by 15");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 117, 37)], "+50: the strip and the blurred header (armed)");
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): THE pin: +50, +50, -30 with the blurred header over coloured rows: after
+    /// each blitted frame the whole surface equals a control engine scrolled there and repainted whole (the painter is
+    /// untouched and the finite ink holds every pixel the group paints), and the damage was not the viewport.
+    #[test]
+    fn scroll_damage_filter_extent_holder_pixels_match_full_repaint() {
+        let mut body = shadow_holder_body(FILTER_HOLDER);
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `drop-shadow(20px 20px 0 red)`: the ink is the box's ink unioned with
+    /// itself shifted (20, 20): (-2, 148, 102, 252) ∪ (18, 168, 122, 272).
+    #[test]
+    fn scroll_damage_filter_extent_drop_shadow() {
+        let e = filter_extent_engine("drop-shadow(20px 20px 0 red)");
+        assert_eq!(filter_extent_ink(&e), Some((-2.0, 148.0, 122.0, 272.0)), "the box and its shifted shadow");
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `blur(2px) drop-shadow(10px 0 3px red)` folds in order: the blur grows the
+    /// ink by 6 to (-8, 142, 108, 258), then the shadow unions it with itself shifted 10 right and grown by 9.
+    #[test]
+    fn scroll_damage_filter_extent_chain() {
+        let e = filter_extent_engine("blur(2px) drop-shadow(10px 0 3px red)");
+        assert_eq!(filter_extent_ink(&e), Some((-8.0, 133.0, 127.0, 267.0)), "blur, then the shadow");
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `grayscale(1)` (a colour matrix) has no reach: the ink is the box's.
+    #[test]
+    fn scroll_damage_filter_extent_grayscale() {
+        let e = filter_extent_engine("grayscale(1)");
+        assert_eq!(filter_extent_ink(&e), Some((-2.0, 148.0, 102.0, 252.0)), "the plain box ink");
+    }
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): `filter: url(#f)` (an SVG `<filter>`'s region) stays unbounded (pin;
+    /// AETHER-PAINT-INDEX-FILTER-URL-EXTENT owed).
+    #[test]
+    fn scroll_damage_filter_extent_url_unbounded() {
+        let e = filter_extent_engine("url(#f)");
+        assert_eq!(filter_extent_ink(&e), None, "url() keeps the ink unbounded");
     }
 }

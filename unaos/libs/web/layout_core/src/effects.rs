@@ -60,8 +60,8 @@ pub fn filter_margin(value: &str, cx: &FilterCx) -> f32 {
     let mut m = 0.0f64;
     for op in &list {
         match op {
-            FilterFn::Blur(sd) => m += 3.0 * sd.abs(),
-            FilterFn::DropShadow { dx, dy, sd, .. } => m += 3.0 * sd.abs() + dx.abs().max(dy.abs()),
+            FilterFn::Blur(sd) => m += blur_reach(*sd),
+            FilterFn::DropShadow { dx, dy, sd, .. } => m += blur_reach(*sd) + dx.abs().max(dy.abs()),
             _ => {}
         }
     }
@@ -357,4 +357,71 @@ pub fn filter_rgba_refs(
     }
     flush(layer, &mut pending, &mut ran);
     ran
+}
+
+// ---- AETHERPAINTINDEXFILTEREXTENT (LEDGER SR1158): the filter list's painted extent (named tail block) ----
+
+/// The reach of one Gaussian (Filter Effects 1 §13: its visible extent, 3σ), shared by [`filter_margin`] (the
+/// painter's layer padding) and [`filter_extent`] (the paint index's ink): svg_core's three-box blur spreads at most
+/// 3d/2 − 1 px for its box size d, never past 3σ.
+fn blur_reach(sd: f64) -> f64 {
+    3.0 * sd.abs()
+}
+
+/// The rect (x0, y0, x1, y1) the list can paint when its source lies in the given rect, folded in list order: a
+/// blur grows each side by its reach; a drop shadow unions the rect with itself shifted by the offset and grown by
+/// the shadow blur's reach; the colour matrices and transfers (brightness, contrast, grayscale, hue-rotate, invert,
+/// opacity, saturate, sepia) add nothing. None — unbounded here — for a list with a `url()` entry (an SVG
+/// `<filter>`'s region and primitives) or one that does not parse. Infinite sides stay infinite.
+pub fn filter_extent(value: &str, cx: &FilterCx, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<(f32, f32, f32, f32)> {
+    if value.to_ascii_lowercase().contains("url(") {
+        return None;
+    }
+    let list = ops(value, cx)?;
+    let k = cx.scale as f64;
+    let mut r = (x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+    for op in &list {
+        match op {
+            FilterFn::Blur(sd) => {
+                let g = blur_reach(*sd) * k;
+                r = (r.0 - g, r.1 - g, r.2 + g, r.3 + g);
+            }
+            FilterFn::DropShadow { dx, dy, sd, .. } => {
+                let g = blur_reach(*sd) * k;
+                let (sx, sy) = (dx * k, dy * k);
+                r = (r.0.min(r.0 + sx - g), r.1.min(r.1 + sy - g), r.2.max(r.2 + sx + g), r.3.max(r.3 + sy + g));
+            }
+            FilterFn::Url(_) => return None,
+            _ => {}
+        }
+    }
+    Some((r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32))
+}
+
+#[cfg(test)]
+mod filter_extent_tests {
+    use super::*;
+
+    /// AETHERPAINTINDEXFILTEREXTENT (SR1158): for each list the extent of a 100x100 box at (0, 0) lies inside the box
+    /// padded by [`filter_margin_box`] (the painter's layer padding) and its widest side reaches that padding exactly:
+    /// the index and the painter share one reach.
+    #[test]
+    fn filter_extent_agrees_with_filter_margin_box() {
+        let cx = FilterCx::default();
+        for (v, want) in [
+            ("blur(5px)", (-15.0, -15.0, 115.0, 115.0)),
+            ("drop-shadow(20px 20px 0 red)", (0.0, 0.0, 120.0, 120.0)),
+            ("blur(2px) drop-shadow(10px 0 3px red)", (-6.0, -15.0, 125.0, 115.0)),
+            ("grayscale(1)", (0.0, 0.0, 100.0, 100.0)),
+        ] {
+            let e = filter_extent(v, &cx, 0.0, 0.0, 100.0, 100.0).expect("a bounded list");
+            assert_eq!(e, want, "{v}");
+            let m = filter_margin_box(v, &cx, 100.0, 100.0);
+            assert!(e.0 >= -m && e.1 >= -m && e.2 <= 100.0 + m && e.3 <= 100.0 + m, "{v}: {e:?} inside the padding {m}");
+            let widest = (-e.0).max(-e.1).max(e.2 - 100.0).max(e.3 - 100.0);
+            assert_eq!(widest, m, "{v}: the widest side is the painter's padding");
+        }
+        assert_eq!(filter_extent("url(#f)", &cx, 0.0, 0.0, 100.0, 100.0), None, "url() stays unbounded");
+        assert_eq!(filter_extent("blur(2px) url(#f)", &cx, 0.0, 0.0, 100.0, 100.0), None, "url() anywhere in the list");
+    }
 }
