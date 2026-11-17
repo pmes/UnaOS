@@ -2729,7 +2729,7 @@ fn frame_walk(
                 // Rounded corners or a patterned border: the shape painter
                 // (render/boxpaint.rs) owns the background and the border.
                 let fancy = spec.radius.is_some_and(|r| r.iter().any(|&v| v != 0.0))
-                    || spec.border_style.is_some_and(|s| s.iter().any(|&v| v != 0));
+                    || spec.border_style.is_some_and(|s| s.iter().any(|&v| v != 0)) || spec.border.is_some_and(|b| sides_differ(&spec, layout_core::paint::border_ink(b, spec.currentcolor, inherited.color), inherited.color_alpha));
                 // AETHERRENDER3 (SR126): shadows and backgrounds per column fragment (one pass for an unfragmented box).
                 for &(box_sx, box_sy, bh, clip) in &deco_passes {
                     let x_start = (box_sx.max(0.0)) as u32;
@@ -3231,7 +3231,7 @@ fn frame_walk(
 
                 // A focused text field shows Chromium's focus ring (`:focus-visible` always matches a
                 // text field): 2px #101010 over the border box's outer edge.
-                let focused_field = is_control && focus_of(dom_node).is_some(); let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b, inherited.color_alpha)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
+                let focused_field = is_control && focus_of(dom_node).is_some(); let undropped = border; let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b, inherited.color_alpha)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
                 if focused_field {
                     border = Some([Some((2.0, (16, 16, 16))); 4]); border_a = 1.0;
                 }
@@ -3260,10 +3260,10 @@ fn frame_walk(
                         for i in 0..4 {
                             bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
                         }
-                        let bda = border_a;
+                        let bda = border_a; let ghost = undropped.and_then(|u| diagonal_ghost(&mut bs, u, styles)); // SR1147: the ghost lives only in this SIDES-ONLY call (background None below)
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             let a = a * bda;
-                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) || Some(c) == ghost {
                                 return;
                             }
                             if a >= 0.999 {
@@ -3274,7 +3274,7 @@ fn frame_walk(
                         };
                         boxpaint::paint(
                             box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
-                            bs, None, width, height, &mut blend_at,
+                            bs, None, width, height, &mut blend_at, // SR1147: background None: the ghost RGB is contained to this sides-only call
                         );
                     } else if let Some(sides) = border {
                         // Same rule as the background/image spans: x_start..end_x
@@ -3744,7 +3744,7 @@ fn frame_walk(
                             radius[2] = 0.0;
                         }
                         let rounded = radius.iter().any(|&r| r != 0.0)
-                            || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
+                            || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0)) || sides_differ(spec, sides.map(|s| s.map(|(w, c, _)| (w, c))), inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bga = layout_core::css::bg_alpha_ink(spec, inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bda = layout_core::css::border_visible(spec, &mut sides, inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
@@ -4862,4 +4862,42 @@ pub(crate) fn color_alpha_of(spec: &crate::layout::PaintStyle, tag: &str, parent
         return spec.color_alpha.unwrap_or(1.0);
     }
     layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, parent, |a| if tag == "a" || control_tag(tag) || tag == "html" { 1.0 } else { a })
+}
+
+// ---- AETHERCSSBORDERCORNERDIAGONAL (LEDGER SR1147): two-colour frames take the shape painter's diagonal corners (named tail block) ----
+
+/// AETHERCSSBORDERCORNERDIAGONAL (SR1147): true when two ADJACENT painted sides differ in (colour, alpha), so the corner
+/// between them must split on the diagonal (css-backgrounds-3 §4) and the frame goes to boxpaint; a one-colour frame keeps
+/// the plain rects. A side absent or of width 0 (after the `border-width` override) is not compared; every invisible
+/// (alpha 0) side compares equal to every other; width differences alone never trigger (their join is invisible).
+fn sides_differ(spec: &crate::layout::PaintStyle, sides: [Option<(f32, (u8, u8, u8))>; 4], ink_alpha: f32) -> bool {
+    let key = |i: usize| {
+        let (w, c) = sides[i]?;
+        let w = spec.border_width.and_then(|ws| ws[i]).unwrap_or(w);
+        let a = layout_core::css::border_side_alpha_ink(spec, i, ink_alpha);
+        (w > 0.0).then_some(if a > 0.0 { Some((c, a)) } else { None })
+    };
+    (0..4).any(|i| matches!((key(i), key((i + 1) % 4)), (Some(p), Some(q)) if p != q))
+}
+
+/// AETHERCSSBORDERCORNERDIAGONAL (SR1147): the block road's fancy border pass hands boxpaint each alpha-0 side that
+/// `border_visible` dropped back as a GHOST side (its real width, an RGB no visible side uses) so the visible
+/// neighbour owns only its diagonal half (the CSS triangle); the caller's closure skips the ghost RGB. A colour
+/// sentinel, contained: it exists only in the SIDES-ONLY boxpaint call (background None), never where a background
+/// paints (owed AETHER-BOXPAINT-SIDE-VISIBLE: boxpaint takes a per-side visibility). Some(ghost) iff a side was filled.
+fn diagonal_ghost(bs: &mut [boxpaint::Side; 4], undropped: [Option<(f32, (u8, u8, u8))>; 4], styles: [u8; 4]) -> Option<(u8, u8, u8)> {
+    let ghost = {
+        let used = |c: (u8, u8, u8)| bs.iter().any(|s| s.is_some_and(|s| s.1 == c));
+        [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12), (13, 14, 15)].into_iter().find(|&c| !used(c))?
+    };
+    let mut any = false;
+    for i in 0..4 {
+        if bs[i].is_none() {
+            if let Some((w, _)) = undropped[i].filter(|(w, _)| *w > 0.0) {
+                bs[i] = Some((w, ghost, styles[i]));
+                any = true;
+            }
+        }
+    }
+    any.then_some(ghost)
 }
