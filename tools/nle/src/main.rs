@@ -106,7 +106,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail)
+    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -142,7 +142,7 @@ fn main() {
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
                 srcs.push((r.to_string(), p.to_string()));
             }
-            _ => die(format!("{a}: unknown flag (nle export --help lists them)")),
+            _ => die(unknown_flag(a)), // NLECLIDIDYOUMEAN (SR816): the nearest arm within 2 by name, else SR801's text (file tail)
         }
     }
     let (tl, sources) = load(edl_path, fps, &srcs);
@@ -395,4 +395,79 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     let _ = w.flush();
     std::process::exit(code)
+}
+
+// ---- NLECLIDIDYOUMEAN (LEDGER SR816): the nearest arm / verb of an unknown word (named tail block) ----
+/// NLECLIDIDYOUMEAN (SR816): THE list of the option loop's arm words, in arm order (a tie names the first). SR799's
+/// `cli_usage_lists_every_flag` pins it equal to the arms its source scan finds, so a new arm without its word here reds.
+const FLAGS: [&str; 23] = [
+    "--fps", "--out", "--video", "--audio", "--aac", "--png", "--qp", "--gop", "--bitrate", "--mkv", "--crf", "--scenecut",
+    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--src",
+];
+
+/// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order.
+const VERBS: [&str; 7] = ["schedule", "render", "export", "size", "--make-src", "help", "--help"];
+
+/// NLECLIDIDYOUMEAN (SR816): the farthest a word may be from a candidate and still be named (git's autocorrect suggests
+/// within a bound too; ours is plain distance, ONE candidate).
+const NEAR: usize = 2;
+
+/// NLECLIDIDYOUMEAN (SR816): the optimal-string-alignment Damerau-Levenshtein distance over chars — an insertion, a
+/// deletion, a substitution or a swap of two neighbours each cost 1 (`--qbulr` -> `--qblur` is 1). Three rolling rows:
+/// the swap reads the row two back.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut back: Vec<usize> = vec![0; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = usize::from(a[i - 1] != b[j - 1]);
+            let mut d = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + sub);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d = d.min(back[j - 2] + 1);
+            }
+            cur[j] = d;
+        }
+        std::mem::swap(&mut back, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// NLECLIDIDYOUMEAN (SR816): THE nearest of `words` to `word` — the smallest [`edit_distance`] within [`NEAR`], the first
+/// in `words` on a tie; none within [`NEAR`] is `None`.
+fn nearest(word: &str, words: &[&'static str]) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for &w in words {
+        let d = edit_distance(word, w);
+        if d <= NEAR && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, w));
+        }
+    }
+    best.map(|(_, w)| w)
+}
+
+/// NLECLIDIDYOUMEAN (SR816): the option loop's unknown-flag refusal — `<a>: unknown flag; did you mean <f>?` when an arm
+/// is within [`NEAR`], else SR801's text byte-identical.
+fn unknown_flag(a: &str) -> String {
+    match nearest(a, &FLAGS) {
+        Some(f) => format!("{a}: unknown flag; did you mean {f}?"),
+        None => format!("{a}: unknown flag (nle export --help lists them)"),
+    }
+}
+
+/// NLECLIDIDYOUMEAN (SR816): a first word that is no verb but is within [`NEAR`] of one — `nle: <w>: unknown verb; did you
+/// mean <v>?` on stderr, then the usage (exit 2), before the option loop and the EDL are read. Otherwise nothing: the
+/// road is today's.
+fn verb_hint(args: &[String]) {
+    let Some(w) = args.first() else { return };
+    if VERBS.contains(&w.as_str()) {
+        return;
+    }
+    if let Some(v) = nearest(w, &VERBS) {
+        eprintln!("nle: {w}: unknown verb; did you mean {v}?");
+        usage()
+    }
 }

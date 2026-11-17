@@ -225,6 +225,7 @@ fn cli_usage_lists_every_flag() {
     for a in &scanned {
         assert!(has_word(&usage, a), "{a}: an arm with no word in the usage");
     }
+    let flags: Vec<&str> = src.split_once("const FLAGS: ").and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default(); let (mut f, mut sc) = (flags.clone(), scanned.clone()); f.sort(); sc.sort(); assert_eq!(f, sc, "NLECLIDIDYOUMEAN (SR816): main.rs FLAGS is the option loop's arms"); // NLECLIDIDYOUMEAN (SR816): the did-you-mean list cannot drift from the arms
     for w in ["--make-src", "nle schedule", "nle render", "nle export", "nle size"] {
         assert!(usage.contains(w), "{w} in the usage");
     }
@@ -276,5 +277,38 @@ fn cli_positional_refusals() {
         args.extend(srcs.iter().map(String::as_str));
         let (code, out, err) = nle(&args);
         assert_eq!((code, err.as_str(), out.as_str()), (1, format!("{want}\n").as_str(), ""), "{verb}");
+    }
+}
+
+// ---- NLECLIDIDYOUMEAN (LEDGER SR816): an unknown flag or verb names the nearest within 2 (named tail block) ----
+#[test]
+fn cli_unknown_word_did_you_mean() {
+    let (dir, edl, srcs) = fixture("didyoumean");
+    let near: [(&[&str], &str); 3] = [
+        (&["--qbulr", "2"], "nle: --qbulr: unknown flag; did you mean --qblur?"),
+        (&["--qp5"], "nle: --qp5: unknown flag; did you mean --qp?"),
+        (&["--zzzzzz"], "nle: --zzzzzz: unknown flag (nle export --help lists them)"), // none within 2: SR801's text unchanged
+    ];
+    for (i, (extra, want)) in near.iter().enumerate() {
+        let out = dir.join(format!("near{i}"));
+        let (code, stdout, err) = export(&edl, &srcs, &out, extra);
+        assert_eq!((code, err.as_str(), stdout.as_str()), (1, format!("{want}\n").as_str(), ""), "{extra:?}");
+        assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
+    }
+    // An unknown verb near one: the hint, then the usage, exit 2 — before the EDL is read.
+    let out = dir.join("verb");
+    let o = s(&out);
+    let mut full: Vec<&str> = vec!["exprot", edl.as_str()];
+    full.extend(srcs.iter().map(String::as_str));
+    full.extend(["--out", o.as_str()]);
+    let roads: [&[&str]; 2] = [&["exprot"], &full];
+    for road in roads {
+        let (code, stdout, err) = nle(road);
+        assert_eq!((code, stdout.as_str()), (2, ""), "{road:?}");
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 6, "{road:?}: the hint and five usage lines: {err}");
+        assert_eq!(lines[0], "nle: exprot: unknown verb; did you mean export?", "{road:?}");
+        assert_eq!(lines[1], USAGE_FIRST, "{road:?}");
+        assert!(!out.exists(), "{road:?}: nothing written");
     }
 }
