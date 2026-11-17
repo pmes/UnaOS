@@ -616,7 +616,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -783,7 +783,7 @@ mod exportaudio_tests {
             assert!(t0.elapsed() < std::time::Duration::from_secs(60), "reading {:?}", face.export_progress());
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let j = export_json(&face); let (head, eta) = j.split_once(",\"eta_secs\":").expect("eta while it runs"); assert_eq!(head, r#","export":{"done":3,"total":35,"audio":"wav""#); assert!(eta.strip_suffix('}').is_some_and(|n| n.parse::<u64>().is_ok()), "{j}"); // NLE5DEXPORTMESSAGEETA (SR796): the eta tail is timing-dependent; the head stays byte-exact
+        let j = export_json(&face); let (head, eta) = j.split_once(",\"eta_secs\":").expect("eta while it runs"); assert_eq!(head, r#","export":{"done":3,"total":35,"audio":"wav""#); assert!(eta.strip_suffix('}').and_then(|t| t.split(',').next()).is_some_and(|n| n.parse::<u64>().is_ok()), "{j}"); // NLE5DEXPORTMESSAGEETA (SR796): the eta tail is timing-dependent; the head stays byte-exact; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): eta_secs read by name (an optional stalled_secs after it)
         assert!(face.cancel_export());
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
@@ -849,7 +849,7 @@ mod exporteta_tests {
         let j = export_json(&face);
         let (head, eta) = j.split_once(",\"eta_secs\":").unwrap_or_else(|| panic!("no eta_secs in {j}"));
         assert_eq!(head, r#","export":{"done":3,"total":35,"audio":"wav""#);
-        let n: u64 = eta.strip_suffix('}').and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{j}"));
+        let n: u64 = eta.strip_suffix('}').and_then(|t| t.split(',').next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{j}")); // NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): eta_secs read by name (an optional stalled_secs after it)
         assert!(face.export_eta().is_some_and(|e| nle_face::eta_secs(e) >= n), "{j}: the paused eta only grows");
         assert!(face.cancel_export());
         assert!(face.wait_export());
@@ -869,5 +869,51 @@ mod exporteta_tests {
         assert_eq!(face.state.selection, Some((1, 1)));
         assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, -64);
         println!("striapan witness: pan:-0.5 -> pan_cq8 {}", face.state.timeline.tracks[1].clips[1].pan_cq8);
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWITNESS (LEDGER SR825): the witness's export object carries the stall seconds while stalled (named tail block) ----
+#[cfg(test)]
+mod exportstall_tests {
+    use super::*;
+
+    /// NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): a job paused at frame 3 of 35 carries no `"stalled_secs"` while fresh; past
+    /// SR817's flat 5 s (the mean road: no tick, so the time counts from the start) it carries `"stalled_secs":<n>`, n >= 5,
+    /// after `"eta_secs"` (`Face::export_stall` through `nle_face::eta_secs`); once cancelled and joined the object is gone.
+    #[test]
+    fn nle5dexportmessageetastallwitness_witness_stalled_secs_field() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nle5dexportmessageetastallwitness-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        while face.export_progress() != Some((3, 35)) {
+            assert!(start.elapsed() < Duration::from_secs(60), "reading {:?}", face.export_progress());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let fresh = export_json(&face);
+        if start.elapsed() < Duration::from_secs(4) {
+            assert!(!fresh.contains("stalled_secs"), "{fresh}: no stall before the flat 5 s");
+        }
+        let j = loop {
+            let j = export_json(&face);
+            if j.contains(",\"stalled_secs\":") {
+                break j;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "the paused job never carried stalled_secs: {j}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (head, stall) = j.split_once(",\"stalled_secs\":").expect("the stall key");
+        assert!(head.starts_with(r#","export":{"done":3,"total":35,"audio":"wav""#) && head.contains(",\"eta_secs\":"), "{j}: the key after eta_secs");
+        let n: u64 = stall.strip_suffix('}').and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{j}"));
+        assert!(n >= 5, "{j}: the stall in whole seconds, 5 or more");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nle5dexportmessageetastallwitness witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
