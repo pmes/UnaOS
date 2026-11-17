@@ -269,12 +269,12 @@ fn j_bframes_two_hard_cuts_three_apart_are_two_idrs() {
 fn k_scenecut_bias_ramps_from_a_quarter_to_k() {
     use h264enc_core::scenecut_bias;
     for (since, want) in [(0, 40), (6, 40), (7, 10), (15, 20), (17, 23), (18, 24), (20, 26), (29, 38), (30, 40), (99, 40)] {
-        assert_eq!(scenecut_bias(40, since, 30), want, "k 40 gop 30 since {since}");
+        assert_eq!(scenecut_bias(40, since, 30, 7), want, "k 40 gop 30 since {since}");
     }
     for (since, want) in [(0, 100), (1, 25), (2, 50), (3, 75), (4, 100)] {
-        assert_eq!(scenecut_bias(100, since, 4), want, "k 100 gop 4 since {since}");
+        assert_eq!(scenecut_bias(100, since, 4, 1), want, "k 100 gop 4 since {since}");
     }
-    assert_eq!(scenecut_bias(40, 0, 0), 40, "gop 0: SR680's un-guarded path, the full k");
+    assert_eq!(scenecut_bias(40, 0, 0, 0), 40, "gop 0: SR680's un-guarded path, the full k");
 }
 
 #[test]
@@ -301,4 +301,82 @@ fn l_a_medium_step_is_refused_at_mid_gop_and_admitted_late() {
     let (aus, recons) = encode_all(cfg(Some(40), 0), 40, &src);
     assert_eq!(keys(&aus, 0), vec![0, 27]);
     decodes_to_recon("medium step at 27", &aus, &recons);
+}
+
+// ---- H264ENCSCENECUTKEYINTMIN (LEDGER SR757): x264's --min-keyint as `Config::min_keyint` (named tail block) ----
+// None keeps gop / 4 (tests a-l above, their pins unchanged); Some(n) is clamped to 1..=gop / 2 + 1 as x264's validate_parameters
+// clamps. The costs are pure functions of the source pair and inter / intra is linear in the lift (a uniform offset on the LCG
+// texture), so each sweep's window is wider than one lift step and some lift falls in it.
+
+fn keyint_cfg(min_keyint: Option<u32>) -> Config {
+    Config { min_keyint, ..cfg(Some(40), 0) }
+}
+
+#[test]
+fn m_min_keyint_reads_as_x264_clamps() {
+    use h264enc_core::scenecut_bias;
+    let at = |gop: u32, min_keyint: Option<u32>| Config { gop, min_keyint, ..Default::default() }.min_keyint();
+    for (n, want) in [(None, 7), (Some(0), 1), (Some(3), 3), (Some(16), 16), (Some(17), 16), (Some(100), 16)] {
+        assert_eq!(at(30, n), want, "gop 30 min_keyint {n:?}");
+    }
+    assert_eq!((at(4, None), at(4, Some(9))), (1, 3), "gop 4: gop / 4, and gop / 2 + 1");
+    assert_eq!((at(0, None), at(0, Some(5))), (0, 1), "gop 0: gop / 4 = 0, a set value at least 1");
+    assert_eq!(Config::X264_MIN_KEYINT_DIV, 10, "x264's auto min keyint is keyint_max / 10 (capped at the frame rate)");
+    for (since, want) in [(2, 40), (3, 10), (15, 23), (29, 38), (30, 40)] {
+        assert_eq!(scenecut_bias(40, since, 30, 3), want, "k 40 gop 30 m 3 since {since}");
+    }
+    assert_eq!(scenecut_bias(40, 20, 30, 40), 40, "m past gop: the full k throughout");
+}
+
+/// Is a step from texture(0) to texture(`lift`) at frame `s` (40 frames, gop 30, Some(40)) an IDR under `min_keyint`?
+fn step_admitted(min_keyint: Option<u32>, lift: u8, s: usize) -> (bool, Vec<Access>, Vec<[Vec<u8>; 3]>) {
+    let src = move |t: usize| if t < s { texture(0) } else { texture(lift) };
+    let (aus, recons) = encode_all(keyint_cfg(min_keyint), 40, &src);
+    let got = keys(&aus, 0);
+    let cut: Vec<u64> = [0, s as u64, s as u64 + 30].into_iter().filter(|&k| k < 40).collect();
+    assert!(got == cut || got == vec![0, 30], "min_keyint {min_keyint:?} lift {lift} step at {s}: keys {got:?}");
+    (got == cut, aus, recons)
+}
+
+#[test]
+fn n_a_small_min_keyint_admits_a_step_sooner() {
+    // Frame 5: None (gop / 4 = 7) asks inter > intra; Some(2) asks the ramp's bias 13, inter x 100 > 87 x intra.
+    let mut signature = None;
+    for lift in 10..=24u8 {
+        let (none, _, _) = step_admitted(None, lift, 5);
+        let (two, _, _) = step_admitted(Some(2), lift, 5);
+        println!("scenecut n: lift {lift}: step at 5 None {}, Some(2) {}", if none { "admitted" } else { "refused" }, if two { "admitted" } else { "refused" });
+        assert!(!none || two, "lift {lift}: a step None admits at 5 Some(2) admits (its threshold is lower)");
+        if !none && two && signature.is_none() {
+            signature = Some(lift);
+        }
+    }
+    let lift = signature.expect("some step at 5 is refused by gop / 4's floor and admitted past Some(2)");
+    println!("scenecut n: lift {lift}: None refused, Some(2) admitted");
+    let (_, aus, recons) = step_admitted(Some(2), lift, 5);
+    decodes_to_recon("min_keyint 2 step at 5", &aus, &recons);
+}
+
+#[test]
+fn o_a_large_min_keyint_holds_a_step_and_clamps() {
+    // Frame 15: None (gop / 4 = 7) asks the ramp's bias 20, inter x 100 > 80 x intra; Some(16) (x264's ceiling gop / 2 + 1)
+    // still asks inter > intra there.
+    let mut signature = None;
+    for lift in 10..=24u8 {
+        let (none, _, _) = step_admitted(None, lift, 15);
+        let (big, _, _) = step_admitted(Some(16), lift, 15);
+        println!("scenecut o: lift {lift}: step at 15 None {}, Some(16) {}", if none { "admitted" } else { "refused" }, if big { "admitted" } else { "refused" });
+        assert!(!big || none, "lift {lift}: a step Some(16) admits at 15 None admits");
+        if none && !big && signature.is_none() {
+            signature = Some(lift);
+        }
+    }
+    let lift = signature.expect("some step at 15 is admitted by None's ramp and held by Some(16)'s floor");
+    let (_, big, recons) = step_admitted(Some(16), lift, 15);
+    let (clamped, hundred, _) = step_admitted(Some(100), lift, 15);
+    assert!(!clamped, "Some(100) holds the step too");
+    let bytes = |a: &[Access]| a.iter().map(Access::annexb).collect::<Vec<_>>();
+    assert_eq!(bytes(&hundred), bytes(&big), "Some(100) on gop 30 is x264's clamp, Some(16): the same bytes");
+    println!("scenecut o: lift {lift}: None admitted, Some(16) refused; Some(100) = Some(16)");
+    decodes_to_recon("min_keyint 16 step at 15", &big, &recons);
 }

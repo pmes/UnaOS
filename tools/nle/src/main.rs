@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -49,7 +49,7 @@ use timeline_core::{Kind, Timeline, edl};
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -115,7 +115,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
-    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let (mut qcomp, mut cplxblur) = (None::<(i64, i64)>, None::<u32>); // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
+    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let mut min_keyint = None::<u32>; let (mut qcomp, mut cplxblur) = (None::<(i64, i64)>, None::<u32>); // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -132,6 +132,7 @@ fn main() {
             "--mkv" => container = Container::Mkv,
             "--crf" => crf = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--scenecut" => scenecut = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 40 }),
+            "--min-keyint" => min_keyint = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())), // H264ENCSCENECUTKEYINTMIN (SR757): x264's --min-keyint, h264enc_core's `Config::min_keyint`
             "--two-pass" => two_pass = TwoPass::InProcess, // H264ENCTWOPASS (SR698): two exports, the second planned from the first
             "--pass" => pass = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())), // H264ENCTWOPASSFILE (SR719): x264's --pass 1|2
             "--stats" => stats = Some(it.next().unwrap_or_else(|| usage()).clone()), // H264ENCTWOPASSFILE (SR719): the first pass's records on disk
@@ -188,7 +189,7 @@ fn main() {
             }
             let two_pass = two_pass_of(two_pass, pass, stats, bitrate.is_some(), &video); // H264ENCTWOPASS (SR698) / H264ENCTWOPASSFILE (SR719): the mode and its refusals (file tail)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, aq, two_pass, hrd, qcomp, cplxblur, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, qcomp, cplxblur, container)
         }
         _ => usage(),
     }
@@ -196,9 +197,9 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, qcomp: Option<(i64, i64)>, cplxblur: Option<u32>, container: Container) {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, min_keyint: Option<u32>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, qcomp: Option<(i64, i64)>, cplxblur: Option<u32>, container: Container) {
     let two_pass_stats = match bitrate { Some(k) if two_pass.plans() && video == "h264" => Some(pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container)), _ => None }; // NLE5DCLITABLE (SR718): the planned pass of --two-pass / --pass 2 (H264ENCTWOPASSFILE SR719: `pass2_stats`, file tail), then the ONE table
-    let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, hrd, two_pass_stats, qcomp, cplxblur }).unwrap_or_else(|| usage()) }; // H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
+    let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_min_keyint(min_keyint).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint, hrd, two_pass_stats, qcomp, cplxblur }).unwrap_or_else(|| usage()) }; // H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
     let aud = stria::nle_export::audio_named(audio).unwrap_or_else(|| usage()); // NLE5DEXPORTAUDIOOPTIONS (SR722): THE audio table
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
     let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else if matches!(video, "i420" | "y4m") { planar_export(tl, range, sources, dir, video, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)

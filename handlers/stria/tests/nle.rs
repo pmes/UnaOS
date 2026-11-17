@@ -1397,7 +1397,7 @@ fn nlefaceexport_png_completes_with_its_message() {
     assert!(face.wait_export());
     assert!(!face.exporting() && face.export_progress().is_none());
     let line = face.last_error.take().expect("the message line");
-    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes -> {}", dir.display())), "{line}");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}"); // NLE5DEXPORTMESSAGEAUDIO (SR756): the words moved the pin
     for n in 0..35 {
         assert!(dir.join(format!("{n:06}.png")).is_file(), "frame {n}");
     }
@@ -1652,7 +1652,7 @@ fn nle5dexportrange_marked_png_writes_the_range() {
     assert!(face.verb(&format!("export {} png", dir.display())));
     assert!(face.wait_export());
     let line = face.last_error.take().expect("the message line");
-    assert!(line.starts_with("export: 10 frames ticks 5..15, ") && line.ends_with(&format!(" bytes -> {}", dir.display())), "{line}");
+    assert!(line.starts_with("export: 10 frames ticks 5..15, ") && line.ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}"); // NLE5DEXPORTMESSAGEAUDIO (SR756)
     for n in 0..10 {
         assert!(dir.join(format!("{n:06}.png")).is_file(), "frame {n}");
     }
@@ -1772,7 +1772,7 @@ fn nle5dexportaudiooptions_png_none_writes_no_audio() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.wait_export());
     let line = face.last_error.take().expect("the message line");
-    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes -> {}", none.display())), "{line}");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes, png, no audio -> {}", none.display())), "{line}"); // NLE5DEXPORTMESSAGEAUDIO (SR756)
     for n in [0, 34] {
         let f = format!("{n:06}.png");
         assert_eq!(std::fs::read(none.join(&f)).unwrap(), std::fs::read(wav.join(&f)).unwrap(), "{f}: the frames do not move");
@@ -1807,9 +1807,9 @@ fn nle5dexportaudiooptions_unknown_audio_refused_by_name() {
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl, src);
     assert!(face.verb(&format!("export {} png flac", root.display())));
-    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio flac (wav|aac|mp4|none)"));
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: unknown audio flac; the words are export "))); // NLE5DEXPORTMESSAGEAUDIO (SR756)
     assert!(face.verb(&format!("export {} png aac:x", root.display())));
-    assert_eq!(face.last_error.take().as_deref(), Some("export: unknown audio aac:x (wav|aac|mp4|none)"));
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("export: unknown audio aac:x; the words are export "))); // NLE5DEXPORTMESSAGEAUDIO (SR756)
     assert!(!face.exporting() && !root.exists(), "a refused audio word makes nothing");
     println!("nle5dexportaudiooptions: refused flac and aac:x by name");
 }
@@ -2418,4 +2418,154 @@ fn nle3eslipstep_help_and_the_one_frame_keys() {
     assert!(nle5drangekeys_press(&mut face, "."));
     assert_eq!(face.state.timeline.tracks[0].clips[1], Clip::new(SourceId(1), 1, 11, 10), "one frame, unchanged");
     println!("nle3eslipstep: help rows={} keys={}", rows.len(), KEYS.len());
+}
+
+// ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the video and audio words (named tail block) ----
+
+#[test]
+fn nle5dexportmessageaudio_aac_rate_is_named_on_the_line() {
+    let dir = nlefaceexport_dir("message-aac96");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png aac:96", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" bytes, png + aac:96 -> {}", dir.display())), "{line}");
+    assert!(dir.join("audio.mp4").is_file() && !dir.join("audio.wav").exists(), "{line}");
+    println!("nle5dexportmessageaudio: {line}");
+}
+
+#[test]
+fn nle5dexportmessageaudio_unknown_audio_names_both_tables() {
+    use stria::nle_export::{AUDIO_NAMES, VIDEO_NAMES};
+    let root = nlefaceexport_dir("message-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png flac", root.display())));
+    let e = face.last_error.take().expect("the refusal");
+    assert!(e.starts_with("export: unknown audio flac; the words are export [--all] [<dir>] ["), "{e}");
+    for w in VIDEO_NAMES.iter().chain(AUDIO_NAMES.iter()) {
+        assert!(e.contains(w), "{w} missing from {e}");
+    }
+    assert!(e.contains("aac[:KBPS]"), "{e}");
+    assert!(!face.exporting() && !root.exists(), "a refused audio word makes nothing");
+    assert!(face.verb(&format!("export {} png wav extra", root.display())));
+    let u = face.last_error.take().expect("the usage refusal");
+    assert_eq!(u, format!("export: usage: {}", &e["export: unknown audio flac; the words are ".len()..]), "one usage for both refusals");
+    println!("nle5dexportmessageaudio: {e}");
+}
+
+#[test]
+fn nle5dexportmessageaudio_running_job_names_its_audio() {
+    let dir = nlefaceexport_dir("message-running");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert_eq!(face.export_audio(), None);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert_eq!(face.export_audio().as_deref(), Some("wav"));
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    assert_eq!(face.export_audio(), None);
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: cancelled at 3/35 frames")));
+    println!("nle5dexportmessageaudio: the paused job named wav, then none");
+}
+
+// ---- NLE3ESLIPDRAG (LEDGER SR760): a Ctrl / Cmd drag slips on the clip body, slides on its trim handle (named tail block) ----
+use stria::nle_face::DragKind;
+
+/// A press / release as the surface sends it, carrying modifier bits (bandy's `MOD_*`).
+fn nle3eslipdrag_btn(down: bool, x: f64, y: f64, mods: u8) -> bandy::SMessage {
+    bandy::SMessage::BrowserButton { down, x, y, mods, surface: 0 }
+}
+
+/// Ctrl-press `(x, y)`, move 40 px by `dx`, release (Ctrl or Meta by `mods`).
+fn nle3eslipdrag_drag(face: &mut Face, x: f64, y: f64, dx: f64, mods: u8) {
+    face.on(&nle3eslipdrag_btn(true, x, y, mods));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + dx, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x + dx, y, mods));
+}
+
+/// Rule: a Ctrl-press on B's body (SR737's pair: V1 A[13,23)@0 B[0,10)@10 A[23,33)@25, 8 px a tick) dragged 40 px is a
+/// Slip of 5 ticks: during the drag the preview (`Drag::shown`) holds B's window at [5,15) while the committed timeline is
+/// unchanged; the release equals a twin editor's `slip 5` (THE op, one commit); undo restores; the Meta (Cmd) press is the same.
+#[test]
+fn nle3eslipdrag_ctrl_drag_on_the_body_slips() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let b = SourceId(1);
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    assert_eq!(l.tick_at(x + 40.0) - l.tick_at(x), 5, "40 px is 5 ticks at the face's zoom");
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx)), Some((DragKind::Slip, 1)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    let shown = face.dragging().and_then(|d| d.shown(&face.state)).map(|s| s.timeline.tracks[0].clips[1]);
+    assert_eq!(shown, Some(Clip::new(b, 5, 15, 10)), "the preview shows the slipped source window");
+    assert_eq!(face.state.timeline, tl, "nothing committed during the drag");
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(twin.verb("slip 5"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_SUPER);
+    assert_eq!(face.state.timeline, twin.timeline, "Cmd is Ctrl's twin");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipdrag: Ctrl-drag 40 px on B's body = slip 5");
+}
+
+/// Rule: a Ctrl-press on the selected B's in handle dragged 40 px is a Slide of 5 ticks (A's out edge follows), snapped
+/// as Move snaps: B's out edge lands on A@25 (the guide) — a twin's `slide 5`.
+#[test]
+fn nle3eslipdrag_ctrl_drag_on_the_handle_slides() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (a, b) = (SourceId(0), SourceId(1));
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 + 1.0, l.point(0, 15).1);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx)), Some((DragKind::Slide, 1)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((5, Some(25))));
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(twin.verb("slide 5"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert_eq!(&face.state.timeline.tracks[0].clips[..2], &[Clip::new(a, 13, 28, 0), Clip::new(b, 0, 10, 15)], "the neighbour follows");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("nle3eslipdrag: Ctrl-drag 40 px on B's in handle = slide 5");
+}
+
+/// Rule: a slip past the source (B[0,10) dragged 40 px left: src_in -5) is refused by name on the message line through
+/// the drag's `{e}` road; the preview is None during it, and the timeline and undo depth do not move.
+#[test]
+fn nle3eslipdrag_slip_past_the_source_is_refused_by_name() {
+    let (mut face, _twin, tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    face.on(&bandy::SMessage::BrowserMouseMove(x - 40.0, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.delta)), Some((DragKind::Slip, -5)));
+    assert!(face.dragging().and_then(|d| d.shown(&face.state)).is_none(), "a refused slip previews nothing");
+    face.on(&nle3eslipdrag_btn(false, x - 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(face.last_error.take(), Some(format!("drag: {}", EditError::OutOfSource)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("nle3eslipdrag: slip -5 at [0,10) -> {}", EditError::OutOfSource);
+}
+
+/// Rule: without Ctrl / Cmd the presses are today's: the body a Move (Alt alone the unsnapped Move, SR306), the handle a TrimIn.
+#[test]
+fn nle3eslipdrag_plain_presses_keep_move_and_trim() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::Move, true)));
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::Move, false)));
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(true, l.x_of(10) as f64 + 1.0, y, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TrimIn));
+    println!("nle3eslipdrag: plain body = Move, Alt body = unsnapped Move, plain handle = TrimIn");
 }

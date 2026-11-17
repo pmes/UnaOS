@@ -2246,7 +2246,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out",
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide",
     }
 }
 
@@ -2260,7 +2260,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
