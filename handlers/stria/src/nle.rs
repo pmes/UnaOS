@@ -622,7 +622,7 @@ fn mix_run(
             *seeks += 1;
         }
         let start = samples(tl.tb.to_ns(l.src_t), rate);
-        let pcm = slot.as_mut().expect("opened above").take_at(start, n, rate)?;
+        let pcm = take_rated(tl, run, li, slot.as_mut().expect("opened above"), start, n, rate)?; // STRIACLIPSPEED (SR829): a rated clip's layer through the same Sinc at the effective rate (file tail)
         mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
         if let Some(t) = taps.as_mut() {
             mix_into(&mut t[l.track], &pcm, l, n, ch.max(1) as usize); // NLE4C: the same terms, the master acc untouched
@@ -1066,4 +1066,37 @@ impl Sources {
         }
         s
     }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): audio at a clip's speed — the same resampler at the effective rate (named tail block) ----
+// THE rule: a layer of a clip at `rate_q16` is resampled by that rate through NLE4B's ONE converter (`Aud::take_at`,
+// audio_core's `resample::Sinc`): the run's `n` output samples are asked at the EFFECTIVE output rate
+// `eff = round(out_rate * 0x1_0000 / rate_q16)` Hz, so they cover `rate` times the 1x source span (pitch follows speed, as a
+// tape does; going faster is anti-aliased by the sinc's cutoff; `eff` equal to the source's rate is the plain sample copy).
+// The run's start is the layer's exact `src_t` at `eff`, so the < 1 Hz rounding of `eff` never accumulates past a run. A
+// crossfade's UNDER layer and a fade-to-silence tail play their 1x handle (the transition handle rule). The video needs no
+// arm: the schedule names `src_at(t)` and `Vid::show` decodes and drops forward (rate > 1) or holds the last frame (rate < 1).
+// A pitch-preserving stretch is owed (NLE-SPEED-PITCH-PRESERVE).
+
+/// STRIACLIPSPEED: the speed layer `li` of `run` plays at: 1x for an under layer or one no clip of its source covers at the
+/// run's first tick (a handle past the clip's end), else that clip's `rate_q16`.
+fn layer_rate(tl: &Timeline, run: &AudioRun, li: usize) -> u32 {
+    let Some(l) = run.layers.get(li) else { return 0x1_0000 };
+    if run.under(li) {
+        return 0x1_0000;
+    }
+    tl.clip_at(l.track, run.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or(0x1_0000, |c| c.rate_q16)
+}
+
+/// STRIACLIPSPEED: layer `li`'s `n` output samples at `rate`: exactly `take_at(start, n, rate)` at 1x, else `take_at` at the
+/// effective rate from the layer's `src_t`.
+#[allow(clippy::too_many_arguments)]
+fn take_rated(tl: &Timeline, run: &AudioRun, li: usize, a: &mut Aud, start: i64, n: i64, rate: u32) -> Result<Vec<f32>, RenderError> {
+    let q = layer_rate(tl, run, li);
+    if q == 0x1_0000 || q == 0 {
+        return a.take_at(start, n, rate);
+    }
+    let eff = ((rate as u64 * 0x1_0000 + q as u64 / 2) / q as u64).clamp(1, u32::MAX as u64) as u32;
+    let l = &run.layers[li];
+    a.take_at(samples(tl.tb.to_ns(l.src_t), eff), n, eff)
 }
