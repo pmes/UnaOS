@@ -3647,7 +3647,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" => "auto", // SR1014 fold: the branch's table row; SR1045 the offset's
+        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" if value.eq_ignore_ascii_case("initial") => "auto", // SR1116: unset reaches css_wide (inherited); SR1014 fold: the branch's table row; SR1045 the offset's
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -4346,9 +4346,10 @@ pub fn underline_position_code(v: &str) -> Option<u8> {
 }
 
 /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-offset` value (css-text-decor-4 §2.6) in the
-/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial` / `unset`, which SR832's table rewrites to it)
+/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial`, which SR832's table rewrites to it)
 /// is `Some(None)`; a length, negative allowed, is `Some(Some(px))` through [`parse_px`] (em at the parse context's
-/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number, `inherit` or anything else None.
+/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number or anything else None. SR1116: `inherit` /
+/// `unset` / `revert` never reach here: [`css_wide`] takes them through `INHERIT_UNDERLINE_OFFSET` (the `unset` literal stays, unreachable).
 fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {

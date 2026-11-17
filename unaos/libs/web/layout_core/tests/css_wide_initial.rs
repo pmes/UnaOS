@@ -1989,3 +1989,58 @@ fn alignment_words_safe_center_layout() {
     assert!((c - 75.0).abs() <= 0.5, "armed: center puts the child at 75: {c}");
     assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
 }
+
+// ---- AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (LEDGER SR1116): text-underline-offset is inherited: the css-wide keywords (named tail block) ----
+
+/// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): css-text-decor-4 §2.6 text-underline-offset is inherited, so
+/// `inherit` after a 5px rule writes `INHERIT_UNDERLINE_OFFSET` and drops the 5px (before SR1116: dropped, the 5px stood).
+#[test]
+fn underline_offset_inherit_keyword_sets_bit() {
+    use layout_core::paint::INHERIT_UNDERLINE_OFFSET;
+    let five: &[(&str, &str)] = &[("text-underline-offset", "5px")];
+    let s = cascade(&[five]);
+    assert_eq!(s.paint.underline_offset, Some(Some(5.0)), "5px (armed)");
+    assert!(!s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "a value is no inherit (armed)");
+    let s = cascade(&[five, &[("text-underline-offset", "inherit")]]);
+    assert_eq!(s.paint.underline_offset, None, "inherit after 5px drops the 5px");
+    assert!(s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "inherit writes the bit");
+}
+
+/// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): `unset` on an inherited property is `inherit` (css-cascade-4 §7.3.3):
+/// the bit, no value (armed: before SR1116 SR832's table rewrote it to `auto`, `Some(None)`).
+#[test]
+fn underline_offset_inherit_unset_inherits() {
+    use layout_core::paint::INHERIT_UNDERLINE_OFFSET;
+    let s = cascade(&[&[("text-underline-offset", "5px")], &[("text-underline-offset", "unset")]]);
+    assert_eq!(s.paint.underline_offset, None, "unset is no auto value");
+    assert!(s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "unset writes the inherit bit");
+    let s = cascade(&[&[("text-underline-offset", "5px")], &[("all", "unset")]]);
+    assert!(s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "all: unset reaches the offset as inherit");
+}
+
+/// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): `initial` is the initial value `auto` (`Some(None)`, no bit), alone and
+/// through `all: initial`; `revert` (no tag road) leaves the field None with no inherit bit, so the walks carry the parent's.
+#[test]
+fn underline_offset_inherit_initial_is_auto() {
+    use layout_core::paint::INHERIT_UNDERLINE_OFFSET;
+    for rule in [&[("text-underline-offset", "initial")][..], &[("all", "initial")][..]] {
+        let s = cascade(&[&[("text-underline-offset", "5px")], rule]);
+        assert_eq!(s.paint.underline_offset, Some(None), "{rule:?} after 5px is auto");
+        assert!(!s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "{rule:?} writes no inherit bit");
+    }
+    let s = cascade(&[&[("text-underline-offset", "5px")], &[("text-underline-offset", "revert")]]);
+    assert_eq!(s.paint.underline_offset, None, "revert drops the 5px");
+    assert!(!s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "revert is no explicit inherit");
+}
+
+/// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): an element's own 1px keeps 1px, and beats an earlier rule's inherit
+/// (the later value clears the bit through `merge_inherit`).
+#[test]
+fn underline_offset_inherit_own_value_wins() {
+    use layout_core::paint::INHERIT_UNDERLINE_OFFSET;
+    let s = cascade(&[&[("text-underline-offset", "1px")]]);
+    assert_eq!(s.paint.underline_offset, Some(Some(1.0)));
+    let s = cascade(&[&[("text-underline-offset", "inherit")], &[("text-underline-offset", "1px")]]);
+    assert_eq!(s.paint.underline_offset, Some(Some(1.0)), "a later 1px wins");
+    assert!(!s.paint.inherits(INHERIT_UNDERLINE_OFFSET), "a later 1px clears the bit");
+}

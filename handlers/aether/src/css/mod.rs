@@ -1310,7 +1310,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         text_align: u8,
         underline: bool,
         nowrap: bool, white_space: u8, list_style: u8, rtl: bool,
-        hidden: bool, ul_pos: u8, caret: Option<(u8, u8, u8, u8)>,
+        hidden: bool, ul_pos: u8, caret: Option<(u8, u8, u8, u8)>, ul_offset: Option<f32>,
     }
     fn num(v: f32) -> String {
         let a = (v as f64).abs(); let d = if a > 0.0 && a.is_finite() { (5 - a.log10().floor() as i32).clamp(0, 15) } else { 0 }; let k = 10f64.powi(d); let r = (v as f64 * k).round() / k; // SR1023: 6 significant digits (Blink's CSS number serialization)
@@ -1349,7 +1349,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false, ul_pos: 0, caret: None,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false, ul_pos: 0, caret: None, ul_offset: None,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1386,7 +1386,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); if let Some(p) = paint.underline_position { me.ul_pos = p; } if let Some(c) = paint.caret_color { me.caret = c; } // SR1108: deco_ink's ul_pos and caret_inherit, verbatim
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); if let Some(p) = paint.underline_position { me.ul_pos = p; } if let Some(c) = paint.caret_color { me.caret = c; } if let Some(o) = paint.underline_offset { me.ul_offset = o; } // SR1108: deco_ink's ul_pos and caret_inherit, verbatim
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1452,7 +1452,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 sstyle(1), sstyle(2), sstyle(3), // SR1103
                 scolor(0), scolor(1), scolor(2), // SR1104
                 layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
-                paint.underline_offset.flatten().map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), rgb(me.caret.map_or(me.color, |c| (c.0, c.1, c.2))), // SR1108
+                me.ul_offset.map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), rgb(me.caret.map_or(me.color, |c| (c.0, c.1, c.2))), // SR1108
             ];
             out.insert(id, values);
             inh.insert(id, me);
