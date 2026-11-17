@@ -858,7 +858,7 @@ impl EditorState {
     /// The `mute` / `solo` words of [`EditorState::verb`]; `None` for any other word.
     fn track_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         match v {
-            "mute" => Some(self.toggle_mute()),
+            "mute" => Some(self.toggle_mute()), "link-av" => Some(self.link_av_all()), // STRIALINKAUTOFUZZ (SR928): link_av over the whole timeline, one commit (file tail)
             "solo" => Some(self.toggle_solo()), "unlink-all" => Some(self.unlink_all()), // STRIALINKAUTO (SR911): every link in the timeline parted, one commit (file tail)
             _ => None,
         }
@@ -2991,5 +2991,22 @@ impl EditorState {
             Some(x) => alloc::format!("{} {}", x.dur, if x.curve == crate::Curve::EqualPower { "equal" } else { "linear" }),
             None => alloc::string::String::from("off"),
         })
+    }
+}
+
+// ---- STRIALINKAUTOFUZZ (LEDGER SR928): the `link-av` word (named tail block) ----
+// `Timeline::link_av` (exact pairs, then the near pass) over the current timeline as ONE commit through THE verb
+// dispatch (`link_verb`'s `link-av` arm): a document opened from an EDL has no auto-link. Nothing newly linked commits
+// nothing; no selection is needed; a selected clip that just got linked brings its mate into the set (as `select`).
+impl EditorState {
+    /// Link every V1 / A1 pair `Timeline::link_av` finds (one commit; none found commits nothing).
+    pub fn link_av_all(&mut self) -> Result<(), EditError> {
+        let tl = self.timeline.link_av();
+        if tl == self.timeline {
+            return Ok(());
+        }
+        self.commit(tl);
+        self.add_mates();
+        Ok(())
     }
 }

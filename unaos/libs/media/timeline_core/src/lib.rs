@@ -2838,7 +2838,34 @@ impl Timeline {
             tl.tracks[v].clips[i].group = g;
             tl.tracks[a].clips[j].group = g;
         }
-        tl
+        tl.link_av_near(v, a) // STRIALINKAUTOFUZZ (SR928): then the pairs one tick apart by rounding, mutually unique only (file tail)
+    }
+}
+
+// ---- STRIALINKAUTOFUZZ (LEDGER SR928): link_av's near pass, the V1 / A1 pairs one tick apart by rounding (named tail block) ----
+// `lay_edit_list` rounds each stream's edits in its own media timescale, so a picture and its sound can land one tick
+// apart in `at` and / or `len()`. After `link_av`'s exact pass, a still-unlinked V clip and A clip of the same source
+// within one tick in both are NEAR; a near pair links (one fresh group) only when each is the other's ONLY near
+// candidate. Two audio clips near one video clip, or two video clips near one audio clip, are all left unlinked.
+impl Timeline {
+    /// STRIALINKAUTOFUZZ: the near pass of [`Timeline::link_av`] on video track `v` and audio track `a`.
+    fn link_av_near(mut self, v: usize, a: usize) -> Timeline {
+        let near = |c: &Clip, o: &Clip| c.group == 0 && o.group == 0 && c.src == o.src && (o.at - c.at).abs() <= 1 && (o.len() - c.len()).abs() <= 1;
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for (i, c) in self.tracks[v].clips.iter().enumerate() {
+            let mut cand = self.tracks[a].clips.iter().enumerate().filter(|(_, o)| near(c, *o)).map(|(j, _)| j);
+            let (Some(j), None) = (cand.next(), cand.next()) else { continue };
+            let o = &self.tracks[a].clips[j];
+            if self.tracks[v].clips.iter().filter(|w| near(*w, o)).count() == 1 {
+                pairs.push((i, j));
+            }
+        }
+        for (i, j) in pairs {
+            let g = self.next_group();
+            self.tracks[v].clips[i].group = g;
+            self.tracks[a].clips[j].group = g;
+        }
+        self
     }
 }
 
