@@ -427,23 +427,10 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
                 "inset" => "top",
                 _ => "border-top-width",
             };
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_length_token(lp, c)).collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
+            plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token(lp, c))
         }
-        "border-style" => {
-            let vals: Option<Vec<String>> = split_values(v)
-                .iter()
-                .map(|c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|i| BORDER_STYLES.contains(&i.as_str())))
-                .collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
-        }
-        "border-color" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_color(std::slice::from_ref(c))).collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
-        }
+        "border-style" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|i| BORDER_STYLES.contains(&i.as_str()))),
+        "border-color" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_color(std::slice::from_ref(c))),
         "border-top" | "border-right" | "border-bottom" | "border-left" | "border" => {
             let (w, s, c) = parse_border_side(v, "border-top-width").ok_or(())?;
             let sides: Vec<&str> = if prop == "border" { SIDES.to_vec() } else { vec![&prop[7..]] };
@@ -469,27 +456,8 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             let (w, s, c) = parse_border_side(v, "outline-width").ok_or(())?;
             Ok(vec![("outline-color".into(), c), ("outline-style".into(), s), ("outline-width".into(), w)])
         }
-        "gap" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_length_token("row-gap", c)).collect();
-            let vals = vals.ok_or(())?;
-            match vals.len() {
-                1 => Ok(vec![("row-gap".into(), vals[0].clone()), ("column-gap".into(), vals[0].clone())]),
-                2 => Ok(vec![("row-gap".into(), vals[0].clone()), ("column-gap".into(), vals[1].clone())]),
-                _ => Err(()),
-            }
-        }
-        "overflow" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| ident_of(c).map(|i| i.to_ascii_lowercase())).collect();
-            let vals = vals.ok_or(())?;
-            if !vals.iter().all(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay")) {
-                return Err(());
-            }
-            match vals.len() {
-                1 => Ok(vec![("overflow-x".into(), vals[0].clone()), ("overflow-y".into(), vals[0].clone())]),
-                2 => Ok(vec![("overflow-x".into(), vals[0].clone()), ("overflow-y".into(), vals[1].clone())]),
-                _ => Err(()),
-            }
-        }
+        "gap" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("row-gap", c)),
+        "overflow" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"))),
         "flex" => {
             let parts = split_values(v);
             let num_of = |c: &CV| match c {
@@ -520,12 +488,8 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             Ok(vec![("flex-grow".into(), g), ("flex-shrink".into(), sh), ("flex-basis".into(), b)])
         }
         "border-radius" => {
-            let parts = split_values(v);
-            if parts.len() != 1 {
-                return Ok(vec![(prop.to_string(), serialize_generic(prop, v))]);
-            }
-            let x = normalize_length_token("border-top-left-radius", &parts[0]).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().map(|p| (p, x.clone())).collect())
+            if tv.iter().any(|c| matches!(c, CV::Token(Token::Delim('/')))) { return Ok(vec![(prop.to_string(), serialize_generic(prop, v))]); } // the `/` form stays opaque (owed AETHER-CSSOM-BORDER-RADIUS-SLASH)
+            plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("border-top-left-radius", c))
         }
         "background" => match normalize_color(tv) {
             Some(c) => Ok(longhands("background")
@@ -2542,5 +2506,165 @@ mod shorthand_table_serialize_tests {
         assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px", "margin"), "");
         assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px; margin-left: 1px !important", "margin"), "");
         assert_eq!(get("gap: 5px; column-gap: 6px !important", "gap"), "");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLEEXPAND (LEDGER SR1083): the plain n-value expansion through PLAIN_N (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLEEXPAND (SR1083): a [`PLAIN_N`] shorthand's n (SR1078's serialize lookup as a fn).
+fn plain_n(sh: &str) -> Option<u8> {
+    PLAIN_N.iter().find(|(s, _)| *s == sh).map(|&(_, n)| n)
+}
+
+/// The plain n-value expansion of a [`PLAIN_N`] shorthand: every token through the shorthand's own validator `one`
+/// (any refusal refuses the declaration), 1-4 values through [`four`] (n = 4) or the 1-2 collapse (n = 2), zipped
+/// with its [`SHORTHANDS`] longhands.
+fn plain_expand(prop: &str, n: u8, toks: &[CV], one: impl Fn(&CV) -> Option<String>) -> Result<Vec<(String, String)>, ()> {
+    let vals: Vec<String> = split_values(toks).iter().map(|c| one(c)).collect::<Option<Vec<String>>>().ok_or(())?;
+    let vals: Vec<String> = match (n, vals.len()) {
+        (4, _) => four(&vals).ok_or(())?.to_vec(),
+        (2, 1) => vec![vals[0].clone(), vals[0].clone()],
+        (2, 2) => vals,
+        _ => return Err(()),
+    };
+    Ok(longhands(prop).ok_or(())?.into_iter().zip(vals).collect())
+}
+
+#[cfg(test)]
+mod shorthand_table_expand_tests {
+    use super::*;
+
+    /// Four distinct valid tokens of a [`PLAIN_N`] shorthand (the first n are used).
+    fn sample(sh: &str) -> [&'static str; 4] {
+        match sh {
+            "border-style" => ["solid", "dotted", "dashed", "double"],
+            "border-color" => ["red", "lime", "blue", "yellow"],
+            "gap" => ["5px", "10px", "", ""],
+            "overflow" => ["hidden", "auto", "", ""],
+            _ => ["1px", "2px", "3px", "4px"],
+        }
+    }
+
+    fn values(sh: &str, k: usize) -> String {
+        sample(sh)[..k].join(" ")
+    }
+
+    fn expand_str(prop: &str, value: &str) -> Result<Vec<(String, String)>, ()> {
+        expand(prop, &css_core::parser::parse_component_values(value))
+    }
+
+    fn pairs(prop: &str, value: &str) -> Vec<(String, String)> {
+        expand_str(prop, value).unwrap_or_else(|_| panic!("{prop}: {value} expands"))
+    }
+
+    fn get(p: &[(String, String)], name: &str) -> String {
+        p.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn shorthand_table_expand_every_row_one_and_n() {
+        for &(sh, n) in PLAIN_N {
+            let n = n as usize;
+            let want = longhands(sh).unwrap();
+            let one = pairs(sh, sample(sh)[0]);
+            assert_eq!(one.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), want, "{sh}: one value names");
+            assert!(one.iter().all(|(_, v)| *v == one[0].1), "{sh}: one value is every longhand");
+            let all = pairs(sh, &values(sh, n));
+            assert_eq!(all.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), want, "{sh}: n values names");
+            for (i, (_, v)) in all.iter().enumerate() {
+                assert!(all[..i].iter().all(|(_, w)| w != v), "{sh}: n values are distinct");
+            }
+            assert_eq!(all.len(), n, "{sh}: n longhands");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_margin_two() {
+        let p = pairs("margin", "1px 2px");
+        assert_eq!((get(&p, "margin-top"), get(&p, "margin-bottom")), ("1px".to_string(), "1px".to_string()));
+        assert_eq!((get(&p, "margin-left"), get(&p, "margin-right")), ("2px".to_string(), "2px".to_string()));
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_style_two() {
+        let p = pairs("border-style", "solid none");
+        let got: Vec<&str> = p.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(got, ["solid", "none", "solid", "none"]);
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_color_three() {
+        let p = pairs("border-color", "red lime blue");
+        assert_eq!(p.len(), 4);
+        assert_eq!(get(&p, "border-left-color"), get(&p, "border-right-color"));
+        assert_ne!(get(&p, "border-top-color"), get(&p, "border-bottom-color"));
+        assert_ne!(get(&p, "border-top-color"), get(&p, "border-right-color"));
+    }
+
+    #[test]
+    fn shorthand_table_expand_gap_overflow_two() {
+        let p = pairs("gap", "5px 10px");
+        assert_eq!((get(&p, "row-gap"), get(&p, "column-gap")), ("5px".to_string(), "10px".to_string()));
+        let p = pairs("overflow", "hidden auto");
+        assert_eq!((get(&p, "overflow-x"), get(&p, "overflow-y")), ("hidden".to_string(), "auto".to_string()));
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_radius_four() {
+        let p = pairs("border-radius", "1px 2px 3px 4px");
+        let got: Vec<(&str, &str)> = p.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("border-top-left-radius", "1px"),
+                ("border-top-right-radius", "2px"),
+                ("border-bottom-right-radius", "3px"),
+                ("border-bottom-left-radius", "4px"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shorthand_table_expand_bad_token_refuses() {
+        for &(sh, n) in PLAIN_N {
+            let n = n as usize;
+            for bad in 0..n {
+                let mut toks: Vec<&str> = sample(sh)[..n].to_vec();
+                toks[bad] = "7";
+                let value = toks.join(" ");
+                let mut b = Block::parse("color: red");
+                let before = b.serialize();
+                assert!(!b.set(sh, &css_core::parser::parse_component_values(&value), false), "{sh}: {value} refused");
+                assert_eq!(b.serialize(), before, "{sh}: {value} leaves the block unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_too_many_refused() {
+        for &(sh, n) in PLAIN_N {
+            let s = sample(sh);
+            let value = if n == 4 { format!("{} {}", s.join(" "), s[0]) } else { format!("{} {} {}", s[0], s[1], s[0]) };
+            assert!(expand_str(sh, &value).is_err(), "{sh}: {value} refused");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_round_trip() {
+        for &(sh, n) in PLAIN_N {
+            let value = values(sh, n as usize);
+            let first = pairs(sh, &value);
+            let mut b = Block::default();
+            assert!(b.set(sh, &css_core::parser::parse_component_values(&value), false), "{sh}: {value} sets");
+            let s = b.get(sh);
+            assert_eq!(pairs(sh, &s), first, "{sh}: {value} -> {s} -> expand is identity");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_radius_slash_opaque() {
+        let p = pairs("border-radius", "1px / 2px");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0, "border-radius");
     }
 }
