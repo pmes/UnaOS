@@ -64,7 +64,7 @@
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
+//! Owed (handlers.md §5): rate control's (inside H264ENC-RC: rc.rs' Owed line), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
 //! H264ENC-DEBLOCK), intra / partitioned B macroblocks and adaptive B placement (inside H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
