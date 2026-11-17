@@ -247,6 +247,8 @@ pub struct PaintStyle<H: Host> {
     pub outline_color: Option<Option<(u8, u8, u8, u8)>>,
     /// `outline-offset` in px (§4.5; a negative offset draws the outline inside the border box).
     pub outline_offset: Option<f32>,
+    /// AETHERCSSCURRENTCOLORREST (SR849): bits 0-3 = border side [top, right, bottom, left] colour is `currentColor`, [`CC_BG`] = background-color is; the RGB in `border` / `background` is then a carrier the paint reads replace.
+    pub currentcolor: u8,
 }
 
 
@@ -356,6 +358,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_width: None,
             outline_color: None,
             outline_offset: None,
+            currentcolor: 0,
         }
     }
 }
@@ -992,4 +995,42 @@ pub fn line_height_length_px(mult: f32) -> f32 {
 /// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (a negative keeps today's clamp to 0.0).
 pub fn line_height_zero_or(raw: f32, encoded: f32) -> f32 {
     if raw == 0.0 { LINE_HEIGHT_ZERO } else { encoded }
+}
+
+// ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor marker (named tail block) ----
+
+/// The four border-side bits of [`PaintStyle::currentcolor`].
+pub const CC_SIDES: u8 = 15;
+/// The background-color bit of [`PaintStyle::currentcolor`].
+pub const CC_BG: u8 = 16;
+
+/// The border sides as painted: a side whose bit is set in `cc` takes the element's ink (css-color-4 §6.2
+/// `currentColor`, the computed `color`); the others keep their colour.
+pub fn border_ink(mut sides: [Option<(f32, (u8, u8, u8))>; 4], cc: u8, ink: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
+    for (i, side) in sides.iter_mut().enumerate() {
+        if cc & (1 << i) != 0 {
+            if let Some((_, c)) = side {
+                *c = ink;
+            }
+        }
+    }
+    sides
+}
+
+/// The background colour as painted: the element's ink when [`CC_BG`] is set in `cc`, else `c`.
+pub fn bg_ink(c: (u8, u8, u8), cc: u8, ink: (u8, u8, u8)) -> (u8, u8, u8) {
+    if cc & CC_BG != 0 { ink } else { c }
+}
+
+impl<H: Host> PaintStyle<H> {
+    /// merge_paint's carry: the side bits follow a later rule's `border` and [`CC_BG`] its `background` (the
+    /// fields' own later-wins copy when Some); a later rule with neither keeps the earlier bits.
+    pub fn merge_currentcolor(&mut self, src: &Self) {
+        if src.border.is_some() {
+            self.currentcolor = (self.currentcolor & !CC_SIDES) | (src.currentcolor & CC_SIDES);
+        }
+        if src.background.is_some() {
+            self.currentcolor = (self.currentcolor & !CC_BG) | (src.currentcolor & CC_BG);
+        }
+    }
 }

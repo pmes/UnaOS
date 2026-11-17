@@ -6702,4 +6702,94 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
         assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
     }
+
+    // ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor through the element's ink (named tail block) ----
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): one 40x20 box per row under a red parent, rows 12px apart: `#bb` `border: 2px
+    /// solid currentcolor`; `#bl` `border: 2px solid blue; border-left: 2px solid currentcolor`; `#bg` `color: blue;
+    /// background-color: currentcolor`; `#bc` `.x { border: 2px solid currentcolor } .x.y { color: rgb(0, 160, 0) }`;
+    /// `#bu` `border: 2px solid` (no colour: the initial currentcolor).
+    fn currentcolorrest_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .x { border: 2px solid currentcolor }
+            .x.y { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><div id="bb" style="width:40px;height:20px;margin:0;border:2px solid currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bl" style="width:40px;height:20px;margin:0;border:2px solid blue;border-left:2px solid currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bg" style="width:40px;height:20px;margin:0;color:blue;background-color:currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bc" class="x y" style="width:40px;height:20px;margin:0"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bu" style="width:40px;height:20px;margin:0;border:2px solid"></div></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn currentcolorrest_grey(c: (u8, u8, u8)) -> bool {
+        c == (128, 128, 128)
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `border: 2px solid currentcolor` paints the red parent's ink (no grey), and so
+    /// does an uncoloured `border: 2px solid` (the initial currentcolor, as Chromium); cssom reads rgb(255, 0, 0).
+    #[test]
+    fn currentcolorrest_border_paints_ink() {
+        let mut e = currentcolorrest_engine();
+        for id in ["bb", "bu"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 40, "#{id} paints a red border");
+            assert_eq!(css_wide_color_ink(&mut e, id, currentcolorrest_grey), 0, "#{id} paints no grey");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderLeftColor"), "rgb(255, 0, 0)", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `border-left: 2px solid currentcolor` after `border: 2px solid blue`: the left
+    /// edge is red, the top edge stays blue; cssom borderLeftColor rgb(255, 0, 0).
+    #[test]
+    fn currentcolorrest_border_one_side() {
+        let mut e = currentcolorrest_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "bl");
+        let left = imgalt_px(&e, (l + 1.0) as usize, (t + h / 2.0) as usize);
+        let top = imgalt_px(&e, (l + w / 2.0) as usize, (t + 1.0) as usize);
+        assert!(css_wide_red(left), "the left edge is the element's red ink: {left:?}");
+        assert!(css_wide_blue(top), "the top edge stays blue: {top:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "bl", "borderLeftColor"), "rgb(255, 0, 0)", "#bl: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `color: blue; background-color: currentcolor` fills blue (the fill is the
+    /// element's own text ink, css-color-4 §6.2), no red; cssom backgroundColor rgb(0, 0, 255).
+    #[test]
+    fn currentcolorrest_background_fill() {
+        let mut e = currentcolorrest_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "bg");
+        let mid = imgalt_px(&e, (l + w / 2.0) as usize, (t + h / 2.0) as usize);
+        assert!(css_wide_blue(mid), "the fill is blue: {mid:?}");
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_blue) > 400, "the box fills blue");
+        assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "no red");
+        assert_eq!(font_shorthand_cs(&mut e, "bg", "backgroundColor"), "rgb(0, 0, 255)", "#bg: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): paint-time resolution: `.x { border: 2px solid currentcolor }` with a later
+    /// `.x.y { color: rgb(0, 160, 0) }` paints a green border, no red; cssom borderLeftColor rgb(0, 160, 0).
+    #[test]
+    fn currentcolorrest_later_color_rule() {
+        let mut e = currentcolorrest_engine();
+        assert!(css_wide_color_ink(&mut e, "bc", css_wide_green) > 40, "#bc paints a green border");
+        assert_eq!(css_wide_color_ink(&mut e, "bc", css_wide_red), 0, "#bc paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "bc", "borderLeftColor"), "rgb(0, 160, 0)", "#bc: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): the canvas: `html { color: rgb(0, 160, 0); background-color: currentcolor }`
+    /// paints the canvas green far from the content (canvas_background through focusring's `current_color`).
+    #[test]
+    fn currentcolorrest_canvas() {
+        let html = r##"<!doctype html><html style="color:rgb(0, 160, 0);background-color:currentcolor"><body style="margin:0"><p>hi</p></body></html>"##;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let c = imgalt_px(&e, 390, 590);
+        assert!(css_wide_green(c), "the canvas is the root's green ink: {c:?}");
+    }
 }
