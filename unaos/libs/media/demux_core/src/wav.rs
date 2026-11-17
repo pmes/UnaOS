@@ -7,8 +7,8 @@
 //! Matroska arms produce (one `Codec::Pcm` audio track, packets of [`FRAMES`] sample frames), so its PCM decoder and mix
 //! need no second road. It is reached ONLY through [`Demuxer::open_wav`]: [`crate::probe`] and [`Demuxer::open`] stay
 //! WAV-blind, because a player plays a bare WAV through audio_core's own reader exactly when the demuxer refuses it.
-//! Accepted: `fmt ` tag 1 (16-bit integer), tag 3 (32-bit float), and WAVE_FORMAT_EXTENSIBLE whose SubFormat is one of
-//! those at full valid width; 1..=8 channels. Everything else is refused by name (`wav: ...`).
+//! Accepted: `fmt ` tag 1 (8-bit unsigned, 16 / 24 / 32-bit integer), tag 3 (32 / 64-bit float), and WAVE_FORMAT_EXTENSIBLE
+//! whose SubFormat is one of those at full valid width; 1..=8 channels; a `data` size 0 / 0xFFFFFFFF (streamed) runs to the end of the file (STRIAIMPORTWAVWIDE, SR920). Everything else is refused by name (`wav: ...`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -57,14 +57,14 @@ fn fmt_of(f: &[u8]) -> Result<(u16, bool, u16, u32), Error> {
         }
         let valid = le16(f, 18);
         if valid != 0 && valid != bits {
-            return Err(Error::Unsupported("wav: sample layout (16-bit integer or 32-bit float)"));
+            return Err(Error::Unsupported("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"));
         }
         tag = le16(f, 24); // the SubFormat GUID's first two bytes are the format tag
     }
     let float = match (tag, bits) {
-        (1, 16) => false,
-        (3, 32) => true,
-        (1, _) | (3, _) => return Err(Error::Unsupported("wav: sample layout (16-bit integer or 32-bit float)")),
+        (1, 8 | 16 | 24 | 32) => false,
+        (3, 32 | 64) => true,
+        (1, _) | (3, _) => return Err(Error::Unsupported("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)")),
         _ => return Err(Error::Unsupported("wav: compressed format tag")),
     };
     if !(1..=8).contains(&ch) {
@@ -97,6 +97,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
             }
             b"data" => {
                 let (bits, float, ch, rate) = fmt.ok_or(Error::Invalid("wav: no fmt chunk"))?;
+                let len = if len == 0 || len == 0xFFFF_FFFF { data.len() - body } else { len }; // STRIAIMPORTWAVWIDE (SR920): a streamed data size runs to the end of the file
                 if !body.checked_add(len).is_some_and(|e| e <= data.len()) {
                     return Err(Error::Invalid("wav: data chunk runs past the end of the file"));
                 }
