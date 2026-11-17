@@ -1971,7 +1971,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let px = pack(&view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()));
+    let px = pack(&view::paint_snap_badge(view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()), l, view::Order::Rgba, e.snap_off)); // STRIAKSNAPSHOW (SR9104): the snap-off badge, the host's painter (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -2261,7 +2261,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     }
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
-        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
+        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false }; if e.snap_off && timeline_core::view::snap_badge_hit(&l, x as f64, (y - y0) as f64) { let at = e.st.playhead; edit_snap(&mut e.snap_off, at); return true; } // STRIAKSNAPSHOW (SR9104): a press on the snap-off badge turns snap on, no drag (file tail)
         let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off), false) else { return false };
         d
     };
@@ -2680,7 +2680,7 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 
 /// `n`: flip the Player's snap default (`off`); nothing to save or seek, so `None`.
 fn edit_snap(off: &mut bool, at: i64) -> Option<u64> {
-    *off = !*off;
+    *off = !*off; BAND_DIRTY.store(true, Ordering::Release); // STRIAKSNAPSHOW (SR9104): a paused band repaints its snap-off badge (file tail)
     serial_println!("[nle] edit snap at={} snap={}", at, if *off { "off" } else { "on" });
     None
 }

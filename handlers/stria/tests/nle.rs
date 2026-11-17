@@ -3822,3 +3822,61 @@ fn striasnapnext_snap_line_is_a_note_held_until_the_next_input() {
     assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
     println!("striasnapnext: snap -> note snap: off held over a move and a zoom; snap -> snap: on; zoom+ clears");
 }
+
+// ---- STRIAKSNAPSHOW (LEDGER SR9104): the snap-off badge on the ruler follows the face's snap default; a press on it turns snap on (named tail block) ----
+
+/// Rule: the face paints timeline_core's `paint_snap_badge` over its tracks chain: nothing while snap is on, the badge's
+/// GUIDE frame inside `snap_badge_rect` while it is off, every pixel outside the box unchanged; `snap` again restores the
+/// first paint byte for byte; no undo step, not dirty.
+#[test]
+fn striaksnapshow_face_badge_follows_the_snap_word() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    let l = face.layout();
+    let (x0, y0, x1, y1) = timeline_core::view::snap_badge_rect(&l);
+    let at = |px: &[u8], x: i64, y: i64| {
+        let i = (y as usize * l.w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    };
+    let on = face.paint_role(stria::nle_face::Role::Whole);
+    assert_ne!(at(&on, x0, y0), timeline_core::view::GUIDE, "snap on: no badge");
+    assert!(face.verb("snap"));
+    let off = face.paint_role(stria::nle_face::Role::Whole);
+    assert_eq!(at(&off, x0, y0), timeline_core::view::GUIDE, "snap off: the badge's frame");
+    for y in 0..l.h as i64 {
+        for x in 0..l.w as i64 {
+            if !(x >= x0 && x < x1 && y >= y0 && y < y1) {
+                assert_eq!(at(&off, x, y), at(&on, x, y), "outside the badge at {x},{y}");
+            }
+        }
+    }
+    assert!(face.verb("snap"));
+    assert_eq!(face.paint_role(stria::nle_face::Role::Whole), on, "snap back on: the first paint");
+    assert_eq!((face.state.undo_depth(), face.dirty()), (0, false));
+    println!("striaksnapshow: badge at {x0},{y0}..{x1},{y1} only while snap is off");
+}
+
+/// Rule: while the badge shows, a press inside it runs `snap` (snap on, the note `snap: on`) and neither scrubs nor drags,
+/// and its release is no ruler click; with snap on the same spot is the ruler's and a press there is a Scrub drag.
+#[test]
+fn striaksnapshow_press_on_the_badge_turns_snap_on_without_a_scrub() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(3);
+    let l = face.layout();
+    let (x0, y0, x1, y1) = timeline_core::view::snap_badge_rect(&l);
+    let (x, y) = ((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0);
+    assert!(face.verb("snap"));
+    assert!(!face.snap_on());
+    assert!(face.on(&nle3eslipdrag_btn(true, x, y, 0)));
+    assert!(face.snap_on(), "the badge press turns snap on");
+    assert_eq!(face.note.as_deref(), Some("snap: on"));
+    assert!(face.dragging().is_none(), "no drag");
+    face.on(&nle3eslipdrag_btn(false, x, y, 0));
+    assert_eq!(face.state.playhead, 3, "no scrub on the press nor the release");
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Scrub), "snap on: the ruler's scrub");
+    face.on(&nle3eslipdrag_btn(false, x, y, 0));
+    assert_eq!((face.state.undo_depth(), face.dirty()), (0, false));
+    println!("striaksnapshow: badge press -> snap on, playhead stays 3; a second press scrubs");
+}
