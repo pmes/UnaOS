@@ -449,7 +449,7 @@ impl Face {
     }
     /// The pointer moved: a live drag follows it.
     fn hover(&mut self, x: f64, y: f64) -> bool {
-        self.pointer = Some((x, y));
+        if let Some(r) = self.hover_message(x, y) { return r; } // STRIAINFOREELHOVER (SR762): no drag: the pointer moves and the message follows the clip under it (file tail)
         let Some(d) = self.drag.as_mut() else { return false };
         let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
@@ -2341,10 +2341,10 @@ fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String
 pub const MESSAGE_H: u32 = view::MESSAGE_H;
 
 impl Face {
-    /// The selected clip's reel as a person reads it: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
+    /// The hovered clip's reel ([`Face::hovered_clip`], STRIAINFOREELHOVER SR762), else the selected clip's: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
-        let c = self.state.selected()?;
+        let c = self.hovered_clip().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
         let s = self.sources.summary(c.src)?;
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         Some(format!("{name}: {s}"))
@@ -2743,5 +2743,37 @@ impl Face {
     /// `"audio"` field).
     pub fn export_audio(&self) -> Option<String> {
         self.export.as_ref().map(|j| crate::nle_export::audio_word(&j.audio))
+    }
+}
+
+// ---- STRIAINFOREELHOVER (LEDGER SR762): the message names the clip under the pointer (named tail block) ----
+// Every editor names the hovered clip in its status line. The face keeps no hover state: the clip under the pointer is THE hit
+// test (`Layout::hit` through `Face::layout`, the geometry `press` / `click` use) at THE pointer (`Face::pointer`), read when
+// the message is (`reel_line`); a bare move asks a repaint only when that clip changed and labels are on (labels off: false, as
+// before). Owed: STRIA-INFO-REEL-HOVER-DELAY (a dwell before the hover line shows: the face has no timer),
+// STRIA-INFO-REEL-HOVER-KERNEL (the kernel face), STRIA-INFO-REEL-HOVER-WITNESS-DOC (stria-view's `reel_json` doc line).
+
+impl Face {
+    /// STRIAINFOREELHOVER (SR762): the clip under the pointer when it is not the selected one; `None` while a drag is live,
+    /// with no pointer, or over the ruler, an empty track spot, nothing, or the selected clip itself.
+    pub fn hovered_clip(&self) -> Option<(usize, usize)> {
+        if self.drag.is_some() {
+            return None;
+        }
+        let (x, y) = self.pointer?;
+        match self.layout().hit(&self.state.timeline, x, y) {
+            Hit::Clip(t, i, _) if self.state.selection != Some((t, i)) => Some((t, i)),
+            _ => None,
+        }
+    }
+    /// STRIAINFOREELHOVER (SR762): the pointer moved. A live drag: `None` ([`Face::hover`] goes on as before); else whether the
+    /// message changed (labels on and the hovered clip is another one).
+    fn hover_message(&mut self, x: f64, y: f64) -> Option<bool> {
+        let was = self.hovered_clip();
+        self.pointer = Some((x, y));
+        if self.drag.is_some() {
+            return None;
+        }
+        Some(self.labels.is_some() && self.hovered_clip() != was)
     }
 }
