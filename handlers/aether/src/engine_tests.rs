@@ -11531,4 +11531,113 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
     }
+
+    // ---- AETHERBIDIPLAINTEXT (LEDGER SR1160): unicode-bidi: plaintext takes its paragraph direction from the first strong character (named tail block) ----
+
+    /// AETHERBIDIPLAINTEXT (SR1160): 20px serif rows 12px apart in a 400px viewport: plaintext blocks beside their `dir=rtl`
+    /// and ltr references (same text), a plaintext block inside an rtl parent, neutral-only text, `<pre dir=auto>` (the UA
+    /// sheet's plaintext) beside `<pre dir=rtl>` / `<pre>`, and a plaintext block holding a 100px child block.
+    fn bidi_plaintext_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>div, pre { margin: 0 0 12px }</style></head><body style="margin:0;font:20px serif">
+            <div id="p1" style="unicode-bidi: plaintext">שלום world</div>
+            <div id="r1" dir="rtl">שלום world</div>
+            <div id="l1">שלום world</div>
+            <div id="p2" style="unicode-bidi: plaintext">hello שלום</div>
+            <div id="r2" dir="rtl">hello שלום</div>
+            <div id="l2">hello שלום</div>
+            <div dir="rtl"><div id="q" style="unicode-bidi: plaintext">hello שלום</div></div>
+            <div dir="rtl"><div id="nr" style="unicode-bidi: plaintext">123 !!</div></div>
+            <div id="rn" dir="rtl">123 !!</div>
+            <div id="nl" style="unicode-bidi: plaintext">123 !!</div>
+            <div id="ln">123 !!</div>
+            <pre id="pa" dir="auto">שלום world</pre>
+            <pre id="pr" dir="rtl">שלום world</pre>
+            <pre id="pl">שלום world</pre>
+            <div id="bx" style="unicode-bidi: plaintext">שלום world<div id="kid" style="width:100px">x</div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): the rightmost inked column of a mask (0 when it paints nothing).
+    fn bidi_plaintext_right_ink(m: &[Vec<bool>]) -> usize {
+        m.iter().filter_map(|r| r.iter().rposition(|&p| p)).max().unwrap_or(0)
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): `<div style="unicode-bidi: plaintext">שלום world</div>` takes base rtl from its first
+    /// strong character (R): it paints as the `dir=rtl` reference (right-aligned, the Hebrew word right of the Latin one),
+    /// far from the ltr one (armed: before SR1160 it was the ltr paint).
+    #[test]
+    fn bidi_plaintext_hebrew_first_rtl() {
+        let mut e = bidi_plaintext_engine();
+        let (p, r, l) = (unicode_bidi_mask(&mut e, "p1"), unicode_bidi_mask(&mut e, "r1"), unicode_bidi_mask(&mut e, "l1"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr references differ");
+        assert!(unicode_bidi_diff(&p, &r) * 4 < far, "plaintext Hebrew-first paints as dir=rtl: {} px off rtl, {} off ltr", unicode_bidi_diff(&p, &r), unicode_bidi_diff(&p, &l));
+        let w = p.first().map_or(0, |r| r.len());
+        assert!(bidi_plaintext_right_ink(&p) * 2 > w, "its ink reaches the right half ({} of {w})", bidi_plaintext_right_ink(&p));
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): Latin-first plaintext (`hello שלום`) stays ltr: it paints as the ltr reference (pin).
+    #[test]
+    fn bidi_plaintext_latin_first_ltr_pinned() {
+        let mut e = bidi_plaintext_engine();
+        let (p, r, l) = (unicode_bidi_mask(&mut e, "p2"), unicode_bidi_mask(&mut e, "r2"), unicode_bidi_mask(&mut e, "l2"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr references differ");
+        assert!(unicode_bidi_diff(&p, &l) * 4 < far, "plaintext Latin-first paints as ltr");
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): inside a `dir=rtl` parent, Latin-first plaintext takes base ltr (left-aligned, the
+    /// ltr reference's paint), not the inherited rtl (armed); its computed `direction` stays the inherited rtl.
+    #[test]
+    fn bidi_plaintext_rtl_parent_latin_first() {
+        let mut e = bidi_plaintext_engine();
+        let (q, r, l) = (unicode_bidi_mask(&mut e, "q"), unicode_bidi_mask(&mut e, "r2"), unicode_bidi_mask(&mut e, "l2"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(unicode_bidi_diff(&q, &l) * 4 < far, "Latin-first plaintext in an rtl parent paints ltr: {} px off ltr, {} off rtl", unicode_bidi_diff(&q, &l), unicode_bidi_diff(&q, &r));
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): text with no strong character (`123 !!`) keeps the element's own direction: rtl under
+    /// an rtl parent, ltr otherwise (pin).
+    #[test]
+    fn bidi_plaintext_neutrals_keep_parent() {
+        let mut e = bidi_plaintext_engine();
+        let (nr, rn, nl, ln) = (unicode_bidi_mask(&mut e, "nr"), unicode_bidi_mask(&mut e, "rn"), unicode_bidi_mask(&mut e, "nl"), unicode_bidi_mask(&mut e, "ln"));
+        let far = unicode_bidi_diff(&rn, &ln);
+        assert!(far > 0, "the rtl and ltr neutral references differ");
+        assert!(unicode_bidi_diff(&nr, &rn) * 4 < far, "neutral-only plaintext under rtl stays rtl");
+        assert!(unicode_bidi_diff(&nl, &ln) * 4 < far, "neutral-only plaintext under ltr stays ltr");
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): `<pre dir=auto>` is plaintext by the UA sheet (`unicode_bidi_tag` 5): Hebrew-first it
+    /// paints as `<pre dir=rtl>`, right-aligned (armed: before SR1160 it painted as the ltr `<pre>`).
+    #[test]
+    fn bidi_plaintext_pre_dir_auto() {
+        let mut e = bidi_plaintext_engine();
+        let (a, r, l) = (unicode_bidi_mask(&mut e, "pa"), unicode_bidi_mask(&mut e, "pr"), unicode_bidi_mask(&mut e, "pl"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr pre references differ");
+        assert!(unicode_bidi_diff(&a, &r) * 4 < far, "pre dir=auto Hebrew-first paints as pre dir=rtl");
+        let w = a.first().map_or(0, |r| r.len());
+        assert!(bidi_plaintext_right_ink(&a) * 2 > w, "its ink reaches the right half");
+    }
+
+    /// AETHERBIDIPLAINTEXT (SR1160): plaintext changes the paragraph direction, not the box's: a Hebrew-first plaintext
+    /// block's 100px child block stays at the inline-start x 0 (box placement reads `is_rtl`, never `mode.rtl`), and
+    /// getComputedStyle(direction) keeps the computed value (ltr on the Hebrew-first block, rtl on the Latin-first block
+    /// under an rtl parent).
+    #[test]
+    fn bidi_plaintext_box_direction_and_computed_unchanged() {
+        let mut e = bidi_plaintext_engine();
+        let (bx, kid) = (imgalt_rect(&mut e, "bx"), imgalt_rect(&mut e, "kid"));
+        assert!((kid.0 - bx.0).abs() <= 1.0 && (kid.2 - 100.0).abs() <= 1.0, "the child block stays at x 0, 100px wide: {kid:?} in {bx:?}");
+        for (id, want) in [("p1", "ltr"), ("q", "rtl"), ("bx", "ltr")] {
+            let got = e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).direction")).unwrap();
+            assert_eq!(got, want, "#{id}: computed direction");
+        }
+    }
 }
