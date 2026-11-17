@@ -4007,3 +4007,68 @@ fn striaautosavekeepread_keep_note_never_hides_an_error() {
     assert_eq!(face.last_error.take().as_deref(), Some("an earlier message"), "the keep note never replaces a standing message");
     assert_eq!(std::fs::read_to_string(autosave_keep_path(&doc)).unwrap(), old, "kept all the same");
 }
+
+// ---- STRIAAUTOSAVEMORE (LEDGER SR972): the kept autosave offered at open (named tail block) ----
+// SR913's kept `<stem>.autosave.1.edl` newer than the document is offered at open on SR883's message row, naming
+// `recover 1`; with the autosave also newer, both are offered on one line; an older kept file is not offered, and a
+// standing message is never replaced.
+
+/// A document of `tl0` dated 60 s past, with `tl0` split at 15 written as the autosave (`auto`) and / or the kept file
+/// (`kept`) now: the timeline, the sources, the document path, the split timeline.
+fn striaautosavemore_doc(name: &str, auto: bool, kept: bool) -> (Timeline, Sources, std::path::PathBuf, Timeline) {
+    let (tl0, src) = synth_fixture();
+    let doc = common::fresh_dir("striaautosavemore", name).join("cut.edl");
+    std::fs::write(&doc, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let tl1 = tl0.split(0, 15).unwrap();
+    if auto {
+        std::fs::write(autosave_path(&doc), edl::write(&tl1, "cut").unwrap()).unwrap();
+    }
+    if kept {
+        std::fs::write(autosave_keep_path(&doc), edl::write(&tl1, "cut").unwrap()).unwrap();
+    }
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&doc).unwrap().set_modified(past).unwrap();
+    (tl0, src, doc, tl1)
+}
+
+#[test]
+fn striaautosavemore_kept_newer_is_offered() {
+    let (tl0, src, doc, tl1) = striaautosavemore_doc("kept", false, true);
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    let offer = "autosave: cut.autosave.1.edl is newer than cut.edl; the word recover 1 loads it";
+    assert_eq!(face.last_error.take().as_deref(), Some(offer), "the kept file is offered at open");
+    assert_eq!(face.state.timeline, tl0, "nothing is applied without the word");
+    assert_eq!(face.state.undo_depth(), 0);
+    assert!(face.verb("recover 1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl1, "recover 1 applies the offered file");
+    assert_eq!(face.state.undo_depth(), 1, "one undo step");
+    assert!(face.dirty());
+    println!("striaautosavemore: offered \"{offer}\", recovered in one step");
+}
+
+#[test]
+fn striaautosavemore_both_offered_on_one_line() {
+    let (tl0, src, doc, tl1) = striaautosavemore_doc("both", true, true);
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    let offer = "autosave: cut.autosave.edl is newer than cut.edl; the word recover loads it; cut.autosave.1.edl too: the word recover 1 loads it";
+    assert_eq!(face.last_error.take().as_deref(), Some(offer), "both offered on one message-row line");
+    assert!(face.verb("recover"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl1, "bare recover still loads the autosave");
+    assert_eq!(face.autosaved(), Some(&tl1));
+}
+
+#[test]
+fn striaautosavemore_older_kept_not_offered() {
+    let (tl0, src, doc, _) = striaautosavemore_doc("older", false, true);
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+    std::fs::File::options().write(true).open(autosave_keep_path(&doc)).unwrap().set_modified(older).unwrap();
+    let face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    assert!(face.last_error.is_none(), "a kept file older than the document is not offered: {:?}", face.last_error);
+    let (tl0, src, doc, _) = striaautosavemore_doc("standing", false, true);
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.last_error = Some("an earlier message".into());
+    let face = face.with_doc(Some(doc.as_path()));
+    assert_eq!(face.last_error.as_deref(), Some("an earlier message"), "the offer never replaces a standing message");
+}

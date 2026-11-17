@@ -1716,7 +1716,7 @@ mod split_tests {
 impl Face {
     /// The face opened from `path` (`None`: no document, `save` refuses).
     pub fn with_doc(mut self, path: Option<&std::path::Path>) -> Face {
-        self.doc_path = path.map(std::path::Path::to_path_buf); self.offer_autosave();
+        self.doc_path = path.map(std::path::Path::to_path_buf); self.offer_autosave(); self.offer_kept_autosave();
         self
     }
     /// The path the document was opened from.
@@ -3207,11 +3207,7 @@ impl Face {
     fn offer_autosave(&mut self) {
         let Some(doc) = self.doc_path.clone() else { return };
         let path = autosave_path(&doc);
-        let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
-        let newer = match (modified(&path), modified(&doc)) {
-            (Ok(a), Ok(d)) => a > d,
-            _ => false,
-        };
+        let newer = autosave_newer(&doc, 0); // STRIAAUTOSAVEMORE (SR972): the one mtime rule (file tail)
         if newer {
             let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
             self.last_error = Some(format!("autosave: {} is newer than {}; the word recover loads it", name(&path), name(&doc)));
@@ -3311,5 +3307,42 @@ impl Face {
         }
         let name = keep.file_name().map_or_else(|| keep.display().to_string(), |n| n.to_string_lossy().into_owned());
         self.last_error = Some(format!("autosave: kept the older autosave as {name}"));
+    }
+}
+
+// ---- STRIAAUTOSAVEMORE (LEDGER SR972): the kept autosave offered at open (named tail block) ----
+// At open (`with_doc`), after SR883's offer, SR913's kept `<stem>.autosave.1.edl` strictly newer than the document (the
+// rename keeps the original autosave's mtime: an older session's autosave declined and the document never saved after
+// it) is offered on the same message row, naming SR933's word `recover 1`. Nothing is read or applied here. A standing
+// message that is not SR883's offer is never replaced. `autosave_newer` is the one mtime rule (SR883's offer reads it).
+// Owed: NLE-HOST-AUTOSAVE-KERNEL (the kernel Player's face).
+
+/// STRIAAUTOSAVEMORE (SR972): the autosave file of `generation` beside `doc` ([`autosave_generation_path`]) is strictly
+/// newer than `doc`; false when either is missing or the generation is refused.
+pub fn autosave_newer(doc: &std::path::Path, generation: usize) -> bool {
+    let Ok(path) = autosave_generation_path(doc, generation) else { return false };
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified());
+    match (modified(&path), modified(doc)) {
+        (Ok(a), Ok(d)) => a > d,
+        _ => false,
+    }
+}
+
+impl Face {
+    /// STRIAAUTOSAVEMORE (SR972): offer the kept autosave newer than the document: its own line, or appended to SR883's
+    /// offer (`...; <kept> too: the word recover 1 loads it`); any other standing message is left alone.
+    fn offer_kept_autosave(&mut self) {
+        let Some(doc) = self.doc_path.clone() else { return };
+        if !autosave_newer(&doc, 1) {
+            return;
+        }
+        let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let keep = autosave_keep_path(&doc);
+        let line = match self.last_error.take() {
+            None => format!("autosave: {} is newer than {}; the word recover 1 loads it", name(&keep), name(&doc)),
+            Some(offer) if offer.starts_with("autosave: ") => format!("{offer}; {} too: the word recover 1 loads it", name(&keep)),
+            Some(other) => other,
+        };
+        self.last_error = Some(line);
     }
 }
