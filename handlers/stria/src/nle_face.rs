@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "export-skip", "export-clear", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "export-skip", "export-clear", "export-list", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -388,6 +388,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
+    ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -2604,6 +2605,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("help", "show / hide this help"),
+    ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
 const HELP_PAD: f32 = 4.0;
@@ -3207,6 +3209,7 @@ impl Face {
                 self.last_error = Some(format!("export: dropped {n} waiting"));
                 Some(true)
             }
+            "export-list" => { self.last_error = Some(self.export_list()); Some(true) } // STRIAEXPORTQUEUELIST (SR932): the waiting requests on the message row, a view word (file tail)
             _ => None,
         }
     }
@@ -3215,5 +3218,32 @@ impl Face {
         let n = self.export_queue.len();
         self.export_queue.clear();
         n
+    }
+}
+
+// ---- STRIAEXPORTQUEUELIST (LEDGER SR932): the export queue read back on the message row (named tail block) ----
+// `export-list` (a third arm of SR914's `export_queue_verb`) puts the waiting requests on the message row: `export: <n>
+// waiting: <name> <fmt>, ...`, at most `EXPORT_LIST_SHOWN` entries then `, +<k> more`, or `export: nothing waiting`. A view
+// word: no `commit`, no undo step, no dirty document; the queue and the running job untouched. KEYS `E` (Shift+e, text:
+// GTK and AppKit both send it; AppKit drops Escape) keys SR914's `export-skip` through `Face::verb`.
+// Owed: NLE5D-EXPORT-QUEUE-LIST-RANGE (each request's range / audio word), NLE5D-EXPORT-QUEUE-ESC-GTK (a GTK `Shift+Escape` alias).
+
+/// STRIAEXPORTQUEUELIST (SR932): the most waiting requests `export-list` names; the rest are counted `+<k> more`.
+pub const EXPORT_LIST_SHOWN: usize = 3;
+
+impl Face {
+    /// The waiting export requests as one message line: `export: nothing waiting`, else `export: <n> waiting: <name> <fmt>,
+    /// ...` (the request directory's last component, else the whole path; at most [`EXPORT_LIST_SHOWN`], then `, +<k> more`).
+    pub fn export_list(&self) -> String {
+        let n = self.export_queue.len();
+        if n == 0 {
+            return "export: nothing waiting".to_string();
+        }
+        let names: Vec<String> = self.export_queue.iter().take(EXPORT_LIST_SHOWN).map(|r| {
+            let name = r.dir.file_name().map_or_else(|| r.dir.display().to_string(), |f| f.to_string_lossy().into_owned());
+            format!("{name} {}", r.fmt)
+        }).collect();
+        let more = if n > EXPORT_LIST_SHOWN { format!(", +{} more", n - EXPORT_LIST_SHOWN) } else { String::new() };
+        format!("export: {n} waiting: {}{more}", names.join(", "))
     }
 }

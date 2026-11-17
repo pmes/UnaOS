@@ -3869,6 +3869,97 @@ fn striaexportqueueskip_words_are_verbs_before_help() {
         assert!(VERBS.contains(&w), "{w}");
     }
     assert_eq!(VERBS.last(), Some(&"help"));
-    assert_eq!(&VERBS[VERBS.len() - 3..], &["export-skip", "export-clear", "help"]);
+    assert!(VERBS.contains(&"export-skip") && VERBS.contains(&"export-clear") && VERBS.last() == Some(&"help")); // STRIAEXPORTQUEUELIST (SR932): relaxed (siblings add words before help)
     println!("striaexportqueueskip: VERBS ends {:?}", &VERBS[VERBS.len() - 3..]);
+}
+
+// ---- STRIAEXPORTQUEUELIST (LEDGER SR932): the export queue read back, and `E` keys the skip (named tail block) ----
+
+fn striaexportqueuelist_name(d: &std::path::Path) -> String {
+    d.file_name().expect("a named scratch dir").to_string_lossy().into_owned()
+}
+
+#[test]
+fn striaexportqueuelist_lists_the_waiting() {
+    let (a, b, c) = (nlefaceexport_dir("list-a"), nlefaceexport_dir("list-b"), nlefaceexport_dir("list-c"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert!(face.verb(&format!("export {} h264", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    let tl = face.state.timeline.clone();
+    assert!(face.verb("export-list"));
+    let want = format!("export: 2 waiting: {} png, {} h264", striaexportqueuelist_name(&b), striaexportqueuelist_name(&c));
+    assert_eq!(face.last_error.take(), Some(want));
+    assert_eq!(face.export_queued(), 2, "the list leaves the queue");
+    assert!(face.exporting(), "the list leaves the running job");
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.state.undo_depth(), 0, "a view word pushes no undo step");
+    assert!(!face.dirty());
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(!b.exists() && !c.exists());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueuelist: two waiting listed");
+}
+
+#[test]
+fn striaexportqueuelist_nothing_waiting() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("export-list"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: nothing waiting"));
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.state.undo_depth(), 0);
+    assert!(!face.dirty() && !face.exporting());
+    println!("striaexportqueuelist: export: nothing waiting");
+}
+
+#[test]
+fn striaexportqueuelist_is_bounded() {
+    let a = nlefaceexport_dir("listmax-a");
+    let mut face = striaexportqueue_paused(&a);
+    let dirs: Vec<std::path::PathBuf> = (0..5).map(|n| nlefaceexport_dir(&format!("listmax-{n}"))).collect();
+    for d in &dirs {
+        assert!(face.verb(&format!("export {} png", d.display())));
+    }
+    assert_eq!(face.export_queued(), 5);
+    assert!(face.verb("export-list"));
+    let n: Vec<String> = dirs.iter().map(|d| striaexportqueuelist_name(d)).collect();
+    assert_eq!(stria::nle_face::EXPORT_LIST_SHOWN, 3);
+    assert_eq!(face.last_error.take(), Some(format!("export: 5 waiting: {} png, {} png, {} png, +2 more", n[0], n[1], n[2])));
+    assert!(face.cancel_export() && face.wait_export());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueuelist: five waiting, three named, +2 more");
+}
+
+#[test]
+fn striaexportqueuelist_key_skips() {
+    let rows = help_rows();
+    let row = rows.iter().find(|r| r.0.split(" / ").any(|k| k == "E")).expect("the E help row");
+    assert_eq!(row.1, help_phrase("export-skip"));
+    assert!(KEYS.contains(&("E", "export-skip")));
+    let (a, b) = (nlefaceexport_dir("listkey-a"), nlefaceexport_dir("listkey-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.verb("help"));
+    assert!(face.on(&bandy::SMessage::BrowserText("E".into())));
+    assert!(!face.help_shown(), "E while the help shows only dismisses it");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.export_progress(), Some((3, 35)), "no skip while dismissing");
+    assert!(face.on(&bandy::SMessage::BrowserText("E".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: skipping (1 waiting)"));
+    striaexportqueueskip_drain(&mut face);
+    let line = face.last_error.take().expect("B's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", b.display())), "{line}");
+    assert!(b.join("000034.png").is_file(), "B ran after the E skip");
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueuelist: E skipped A, B ran: \"{line}\"");
+}
+
+#[test]
+fn striaexportqueuelist_word_is_before_help() {
+    assert_eq!(&VERBS[VERBS.len() - 2..], &["export-list", "help"]);
+    println!("striaexportqueuelist: VERBS ends {:?}", &VERBS[VERBS.len() - 2..]);
 }
