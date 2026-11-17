@@ -1129,7 +1129,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
-    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); }
+    if report_covered(prop) { if let Some(s) = shorthand_computed(el, prop) { return s; } } if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -2965,8 +2965,8 @@ mod shorthand_computed_tests {
             ("a", "outline", ""),
             ("a", "background", ""),
             ("o", "overflow", "hidden visible"),
-            // A fully declared shorthand keeps the cascaded road (the composition sits at the fallback).
-            ("f", "margin", "1em"),
+            // SR1100: a fully declared box shorthand composes from its report columns before the cascaded road (Chromium's resolved px).
+            ("f", "margin", "16px"),
             ("p", "place-items", "center"),
             ("s", "font-synthesis", "style small-caps"),
         ] {
@@ -2974,6 +2974,63 @@ mod shorthand_computed_tests {
         }
         // AETHERCSSOMBOXSIDECOLUMNS (SR1096): every margin side has a report column, so the UA body margin composes as
         // Chromium reads it (it read `8px 0px 0px` while only margin-top had a column).
+        assert_eq!(read("document.body", "margin"), "8px", "body: computed margin");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDCOMPUTEDBEFORECASCADE (LEDGER SR1100): box shorthands compose from their report columns before the cascaded road (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDCOMPUTEDBEFORECASCADE (SR1100): a [`SHORTHANDS`] row whose longhands are ALL report columns
+/// (margin / padding / border-width since SR1096) — [`computed_value`] composes it through [`shorthand_computed`] before
+/// the cascaded road, so `margin: 1em` reads the resolved `16px`; every other row keeps SR1092's fallback position.
+fn report_covered(sh: &str) -> bool {
+    longhands(sh).is_some_and(|ls| ls.iter().all(|l| crate::css::REPORT_PROPS.contains(&l.as_str())))
+}
+
+#[cfg(test)]
+mod shorthand_computed_before_cascade_tests {
+    use super::*;
+
+    /// The structural pin: exactly the three box shorthands are covered by report columns.
+    #[test]
+    fn shorthand_computed_before_cascade_covered_rows() {
+        let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
+        assert_eq!(covered, vec!["border-width", "margin", "padding"]);
+        for sh in ["border-style", "gap", "inset", "overflow", "border-left", "font-synthesis", "not-a-shorthand"] {
+            assert!(!report_covered(sh), "{sh}: not covered");
+        }
+    }
+
+    #[test]
+    fn shorthand_computed_before_cascade_reads() {
+        let html = r#"<!doctype html><html><body><div id="m" style="margin: 1em"></div><div id="p" style="padding: 1em 2em"></div><div id="b" style="border-width: 0.125em; border-style: solid"></div><div id="t" style="margin-top: 5px"></div><div id="g" style="display: flex; gap: 1em"></div><div id="s" style="border-style: solid none"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let mut read = |target: &str, prop: &str| {
+            engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle({target}).getPropertyValue('{prop}')"))
+                .unwrap()
+        };
+        let by_id = |id: &str| format!("document.getElementById('{id}')");
+        for (id, prop, want) in [
+            // Armed: these read the declared text (`1em`, `1em 2em`, `0.125em`) while the composition sat at the fallback.
+            ("m", "margin", "16px"),
+            ("p", "padding", "16px 32px"),
+            ("b", "border-width", "2px"),
+            // Unchanged: a partly declared box shorthand composed before as well.
+            ("t", "margin", "5px 0px 0px"),
+            // Not covered: no row-gap / column-gap columns (owed AETHER-CSSOM-GAP-COLUMNS), no per-side style column
+            // (owed AETHER-CSSOM-BORDER-SIDE-STYLE-COLUMNS): the cascaded text stands.
+            ("g", "gap", "1em"),
+            ("s", "border-style", "solid none"),
+        ] {
+            assert_eq!(read(&by_id(id), prop), want, "#{id}: computed {prop}");
+        }
         assert_eq!(read("document.body", "margin"), "8px", "body: computed margin");
     }
 }
