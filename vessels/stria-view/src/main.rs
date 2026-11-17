@@ -170,7 +170,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         return Some(out);
     }
-    let parts: Vec<&str> = tok.split(':').collect();
+    if let Some(tc) = tok.strip_prefix("goto=") { return Some(vec![SMessage::Input { target: SURFACE.into(), text: format!("goto {tc}") }]); } let parts: Vec<&str> = tok.split(':').collect(); // STRIADROPFRAMEFACE (SR9078): `goto=<tc>` carries a timecode's colons verbatim
     let one = match parts.as_slice() {
         ["at", t, row] => {
             let (x, y) = l.point(row.parse().ok()?, num(t)?);
@@ -588,6 +588,7 @@ fn transport() -> TetraNode {
         button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
         button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
+        button("goto", "Go To"), // STRIADROPFRAMEFACE (SR9078): the bare press names `goto <timecode|frames>` (the witness: `goto=<tc>`)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -1149,7 +1150,7 @@ mod striatimecodedisplay_tests {
     #[test]
     fn striatimecodedisplay_button_and_json() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
-        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(2) else { panic!("no button") }; // STRIADROPFRAMEFACE (SR9078): `goto` sits between `tc` and `help`
         assert_eq!((id.as_str(), label.as_str()), ("tc", "TC"));
         let SMessage::Input { target, text } = action else { panic!("not an Input") };
         assert_eq!((target.as_str(), text.as_str()), (SURFACE, "tc"));
@@ -3464,3 +3465,32 @@ mod striaxformkeysease_tests {
     }
 }
 
+
+// ---- STRIADROPFRAMEFACE (LEDGER SR9078): `--do goto=<tc>` and the `goto` button (named tail block) ----
+
+#[cfg(test)]
+mod striadropframeface_tests {
+    use super::*;
+
+    /// `goto=<tc>` rides a timecode's colons verbatim: on a 30000/1001 base `goto=00:00:01;00` seeks to tick 30, a dropped
+    /// number is the face's one error naming it, the bare `goto` (the button's word) names its usage; no undo step, not dirty.
+    #[test]
+    fn striadropframeface_do_goto_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, action, .. }) = row.iter().rev().nth(1) else { panic!("no button") };
+        assert_eq!(id.as_str(), "goto");
+        assert!(matches!(action, SMessage::Input { target, text } if target == SURFACE && text == "goto"));
+        let (mut tl, src) = nle_face::synth_fixture();
+        tl.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut f, "goto=00:00:01;00").is_empty());
+        assert_eq!(f.state.playhead, 30);
+        let errors = drive(&mut f, "goto=00:01:00;00");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("goto: ") && errors[0].contains("dropped"), "{errors:?}");
+        assert_eq!(f.state.playhead, 30, "a refused entry does not move the playhead");
+        assert_eq!(drive(&mut f, "goto"), vec![String::from(nle_face::GOTO_USAGE)]);
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+        println!("striadropframeface witness: goto=00:00:01;00 -> 30; ;00 at minute 1 refused; bare goto -> usage");
+    }
+}

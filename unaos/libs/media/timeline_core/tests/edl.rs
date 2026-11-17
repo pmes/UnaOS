@@ -708,3 +708,48 @@ fn striaseqrateedl_seqrate_refused_by_name() {
     let titled = striaseqrateedl_at("* UNA TITLE A \"Hi\"\n* UNA SEQRATE A 12");
     assert_eq!(edl::parse(&titled, 25), Err(EdlError::Syntax { line: 6 }), "a title has no file");
 }
+
+// ---- STRIADROPFRAMEFACE (LEDGER SR9078): typed timecode entry (named tail block) ----
+
+fn striadropframeface_tl(num: u64, den: u64) -> Timeline {
+    let mut tl = Timeline::new(25);
+    tl.tb = timeline_core::Timebase { num, den };
+    tl
+}
+
+/// `edl::tc_entry` on a drop-frame base reads the drop-frame label (either separator) through `drop_tick`; a frame count is
+/// the tick; 59.94 skips four numbers; 23.976 reads non-drop at 24; 1/25 reads `parse_tc` at 25.
+#[test]
+fn striadropframeface_entry_reads_drop_frame() {
+    let df = striadropframeface_tl(1001, 30000);
+    assert_eq!(edl::tc_entry("00:01:00;02", &df), Ok(1800));
+    assert_eq!(edl::tc_entry("00:01:00:02", &df), Ok(1800), "a colon on a drop base is the drop-frame label");
+    assert_eq!(edl::tc_entry("00:10:00;00", &df), Ok(17982));
+    assert_eq!(edl::tc_entry(" 1800 ", &df), Ok(1800));
+    assert_eq!(edl::tc_entry("00:00:00;00", &df), Ok(0));
+    assert_eq!(edl::tc_entry("00:01:00;04", &striadropframeface_tl(1001, 60000)), Ok(3600));
+    assert_eq!(edl::tc_entry("00:00:02:00", &striadropframeface_tl(1001, 24000)), Ok(48));
+    assert_eq!(edl::tc_entry("00:00:01:00", &striadropframeface_tl(1, 25)), Ok(25));
+    for t in [0i64, 29, 30, 1799, 1800, 17981, 17982, 40_000] {
+        assert_eq!(edl::tc_entry(&edl::timecode_drop(t, 30), &df), Ok(t), "the readout's label reads back: {t}");
+    }
+}
+
+/// Refused, each by name: a dropped number (`;00` / `;01` at 30 off a tenth minute, `;03` at 60), a `;` off a drop-frame
+/// base, a frame field past the nominal, a misplaced `;`, and a text that is neither shape.
+#[test]
+fn striadropframeface_entry_refuses_by_name() {
+    let df = striadropframeface_tl(1001, 30000);
+    for s in ["00:01:00;00", "00:01:00;01", "00:59:00;01"] {
+        let e = edl::tc_entry(s, &df).unwrap_err();
+        assert!(e.starts_with(&format!("{s} is a dropped drop-frame number")) && e.contains(";00-;01"), "{e}");
+    }
+    let e = edl::tc_entry("00:01:00;03", &striadropframeface_tl(1001, 60000)).unwrap_err();
+    assert!(e.contains("dropped") && e.contains(";00-;03"), "{e}");
+    let e = edl::tc_entry("00:00:01;00", &striadropframeface_tl(1, 25)).unwrap_err();
+    assert_eq!(e, "00:00:01;00: `;` is drop-frame timecode, read only on a 29.97 / 59.94 timeline");
+    for s in ["00:00:01:30", "00;00:01:00", "abc", "", "00:00:01", "-5"] {
+        assert_eq!(edl::tc_entry(s, &df), Err(format!("{} is not HH:MM:SS:FF or a frame count", s.trim())), "{s:?}");
+    }
+    assert_eq!(edl::tc_entry("00:00:01:25", &striadropframeface_tl(1, 25)), Err(String::from("00:00:01:25 is not HH:MM:SS:FF or a frame count")));
+}

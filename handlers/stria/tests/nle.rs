@@ -4907,7 +4907,7 @@ fn striatimecodedisplay_face(labels: bool) -> Face {
 #[test]
 fn striatimecodedisplay_tc_cycles_as_a_view_word() {
     use stria::nle_face::TcUnit;
-    assert_eq!(&VERBS[VERBS.len() - 2..], &["tc", "help"]);
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["tc", "goto", "help"]); // STRIADROPFRAMEFACE (SR9078): `goto` before `help`
     let mut face = striatimecodedisplay_face(false);
     face.state.seek(12);
     let (tl, undo, sel) = (face.state.timeline.clone(), face.state.undo_depth(), face.state.selection);
@@ -14322,4 +14322,64 @@ fn striakxformkeys_p_keys_both_faces() {
     assert!(face.state.timeline.tracks[0].clips[1].xkeys.is_empty(), "P removes it");
     assert_eq!(face.state.undo_depth(), depth + 2);
     println!("striakxformkeys: p / P on both faces; undo {}", face.state.undo_depth());
+}
+
+// ---- STRIADROPFRAMEFACE (LEDGER SR9078): typed timecode entry on the face — `in` / `out <tc>` and `goto <tc>` (named tail block) ----
+
+/// On a 30000/1001 timeline `in 00:01:00;02` sets the in mark at tick 1800 (one undo step); `in 00:01:00;00` (a dropped
+/// number) is refused by name and leaves marks and undo depth; the same typed tick again keeps the mark (a typed entry
+/// sets, only the bare word toggles); `out 2000` takes a frame count.
+#[test]
+fn striadropframeface_marks_take_drop_frame_entry() {
+    let (mut tl, src) = synth_fixture();
+    tl.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("in 00:01:00;02"));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.last_error.take()), ((Some(1800), None), 1, None));
+    assert!(face.verb("in 00:01:00;00"));
+    let e = face.last_error.take().unwrap_or_default();
+    assert!(e.starts_with("in: 00:01:00;00 is a dropped drop-frame number"), "{e}");
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(1800), None), 1), "a refused entry moves nothing");
+    assert!(face.verb("in 00:01:00:02"));
+    assert_eq!((face.marks(), face.state.undo_depth(), face.last_error.take()), ((Some(1800), None), 1, None), "a typed tick sets, never clears");
+    assert!(face.verb("out 2000"));
+    assert_eq!((face.marks(), face.state.undo_depth()), ((Some(1800), Some(2000)), 2));
+    println!("striadropframeface: in 00:01:00;02 -> 1800; ;00 at minute 1 refused by name");
+}
+
+/// On a 1/25 timeline `out 00:00:02:00` marks tick 50; `out 00:00:02;00` is refused by name (drop-frame off an NTSC base).
+#[test]
+fn striadropframeface_non_drop_marks_refuse_semicolon() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("out 00:00:02:00"));
+    assert_eq!((face.marks(), face.last_error.take()), ((None, Some(50)), None));
+    assert!(face.verb("out 00:00:02;00"));
+    let e = face.last_error.take().unwrap_or_default();
+    assert!(e.starts_with("out: 00:00:02;00: `;` is drop-frame timecode"), "{e}");
+    assert_eq!(face.marks(), (None, Some(50)));
+}
+
+/// `goto` is a VERBS word right before `help`; `goto 00:00:01;00` on a 30000/1001 base seeks to 30 with no undo step and a
+/// clean document; a dropped number and a bare `goto` are refused by name and the playhead stays; a seek past the end clamps.
+#[test]
+fn striadropframeface_goto_seeks_as_a_view_word() {
+    assert_eq!(&VERBS[VERBS.len() - 2..], &["goto", "help"]);
+    let (mut tl, src) = synth_fixture();
+    tl.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+    let mut face = nlefaceexport_face(tl, src);
+    let before = face.state.timeline.clone();
+    assert!(face.verb("goto 00:00:01;00"));
+    assert_eq!((face.state.playhead, face.last_error.take()), (30, None));
+    assert!(face.verb("goto 00:01:00;01"));
+    assert!(face.last_error.take().unwrap_or_default().starts_with("goto: 00:01:00;01 is a dropped drop-frame number"));
+    assert_eq!(face.state.playhead, 30);
+    assert!(face.verb("goto"));
+    assert_eq!(face.last_error.take().as_deref(), Some(stria::nle_face::GOTO_USAGE));
+    assert!(face.verb("goto 12"));
+    assert_eq!(face.state.playhead, 12);
+    assert!(face.verb("goto 99999"));
+    assert_eq!(face.state.playhead, face.state.timeline.end(), "clamped as every seek");
+    assert_eq!((&face.state.timeline, face.state.undo_depth(), face.dirty()), (&before, 0, false));
+    println!("striadropframeface: goto 00:00:01;00 -> 30 on 29.97; dropped and bare refused by name");
 }

@@ -1929,3 +1929,42 @@ fn xease_line(c: &Clip) -> String {
         e => format!("* UNA XEASE {}\n", e.name()),
     }
 }
+
+// ---- STRIADROPFRAMEFACE (LEDGER SR9078): typed timecode entry (named tail block) ----
+// THE reader of a timecode a person types (the face's `in` / `out <tc>` and `goto <tc>`): a bare integer is a tick count;
+// on a 30000/1001 or 60000/1001 base `HH:MM:SS[:;]FF` is the drop-frame label (either separator, as `drop_read`) through
+// `drop_tick`, a dropped number refused by name; on any other base a `;` is refused by name and `parse_tc` reads at the
+// ruler's rate (`fps`, an NTSC base's nominal, else 25). Owed: NLE-TC-ENTRY-SIBLINGS (typed lengths that call `parse_tc`).
+
+/// STRIADROPFRAMEFACE (SR9078): the tick a typed `s` names on `tl` (`HH:MM:SS:FF`, drop-frame `HH:MM:SS;FF` on a drop-frame
+/// base, or a frame count); the refusal's text names why.
+pub fn tc_entry(s: &str, tl: &Timeline) -> Result<i64, String> {
+    let s = s.trim();
+    let shape = || format!("{s} is not HH:MM:SS:FF or a frame count");
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<i64>().map_err(|_| shape());
+    }
+    if let Some(k) = drop_nominal(tl.tb).filter(|_| tl.fps().is_none()) {
+        let last = s.rfind(|c: char| c == ':' || c == ';');
+        if s.find(';').is_some_and(|i| Some(i) != last) {
+            return Err(shape());
+        }
+        let p: Vec<&str> = s.split(|c: char| c == ':' || c == ';').collect();
+        if p.len() != 4 || p.iter().any(|x| x.is_empty() || x.len() > 4 || !x.bytes().all(|b| b.is_ascii_digit())) {
+            return Err(shape());
+        }
+        let n: Vec<i64> = p.iter().map(|x| x.parse::<i64>().unwrap_or(-1)).collect();
+        let nom = k as i64;
+        if n[1] >= 60 || n[2] >= 60 || n[3] >= nom || n.iter().any(|&x| x < 0) {
+            return Err(shape());
+        }
+        let skipped = nom / 15 - 1;
+        return drop_tick(((n[0] * 60 + n[1]) * 60 + n[2]) * nom + n[3], k)
+            .ok_or_else(|| format!("{s} is a dropped drop-frame number (no frame carries it: ;00-;{skipped:02} are skipped each minute but every tenth)"));
+    }
+    if s.contains(';') {
+        return Err(format!("{s}: `;` is drop-frame timecode, read only on a 29.97 / 59.94 timeline"));
+    }
+    let rate = tl.fps().or(ntsc_nominal(tl.tb)).unwrap_or(25).max(1);
+    parse_tc(s, rate, 0).map_err(|_| shape())
+}
