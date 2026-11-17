@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &clipped_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &clipped_json(&face) + &held_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -947,5 +947,44 @@ mod striameterclipverb_tests {
         assert_eq!((id.as_str(), label.as_str()), ("meters-reset", "Reset Meters"));
         let SMessage::Input { target, text } = action else { panic!("not an Input") };
         assert_eq!((target.as_str(), text.as_str()), (SURFACE, "meters-reset"));
+    }
+}
+
+// ---- STRIAMETERSMORE (LEDGER SR962): the witness's "held" — the meters' standing peak holds (named tail block) ----
+/// The witness's `"held"` field: each standing peak hold (`Face::meter_held`) as `{"track":<index or "master">,
+/// "peak":<held dBFS>}`, in hold order, only while any hold stands; the default line is unchanged.
+fn held_json(face: &Face) -> String {
+    let held = face.meter_held();
+    if held.is_empty() {
+        return String::new();
+    }
+    let all: Vec<String> = held
+        .iter()
+        .map(|&(k, db)| format!("{{\"track\":{},\"peak\":{db:.2}}}", k.map(|t| t.to_string()).unwrap_or_else(|| "\"master\"".into())))
+        .collect();
+    format!(",\"held\":[{}]", all.join(","))
+}
+
+#[cfg(test)]
+mod striametersmore_tests {
+    use super::*;
+
+    /// STRIAMETERSMORE M3: no hold, no field; +24 dB on track 1 played two ticks holds track 1 and the master;
+    /// `meters-reset` (through `--do`) clears the field.
+    #[test]
+    fn held_field_only_while_held() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(held_json(&face), "");
+        let (mut tl, src) = nle_face::synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "play,tick:2");
+        assert!(errors.is_empty(), "{errors:?}");
+        let j = held_json(&face);
+        assert!(j.starts_with(",\"held\":[") && j.contains("{\"track\":1,\"peak\":") && j.contains("{\"track\":\"master\",\"peak\":"), "{j}");
+        let errors = drive(&mut face, "meters-reset");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(held_json(&face), "");
     }
 }
