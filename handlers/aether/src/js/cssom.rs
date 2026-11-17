@@ -3205,8 +3205,8 @@ mod shorthand_computed_tests {
         ] {
             assert_eq!(read(&by_id(id), prop), want, "#{id}: computed {prop}");
         }
-        // Owed AETHER-CSSOM-BOX-SIDE-COLUMNS: the UA body margin reaches getComputedStyle only through the margin-top
-        // report column, so the other sides compose at their initial 0px (Chromium reads `8px`).
-        assert_eq!(read("document.body", "margin"), "8px 0px 0px", "body: computed margin");
+        // AETHERCSSOMBOXSIDECOLUMNS (SR1096): every margin side has a report column, so the UA body margin composes as
+        // Chromium reads it (it read `8px 0px 0px` while only margin-top had a column).
+        assert_eq!(read("document.body", "margin"), "8px", "body: computed margin");
     }
 }
