@@ -1313,13 +1313,7 @@ mod tests {
 // THE METERS (NLE4C, LEDGER SR301)
 // ---------------------------------------------------------------------------------------------------------------------
 
-/// The meter strip's width (px), at the canvas's right edge.
-pub const METER_W: u32 = 6;
-/// The strip's bottom: readings at or below this are an empty bar (linear in dB up to 0 dBFS).
-pub const METER_VIEW_DB: f64 = -60.0;
-const METER_BG: [u8; 4] = [0x10, 0x10, 0x14, 255];
-const METER_RMS: [u8; 4] = [0x40, 0xd0, 0x60, 255];
-const METER_PEAK: [u8; 4] = [0xff, 0xe0, 0x40, 255];
+pub use timeline_core::view::{METER_BG, METER_PEAK, METER_RMS, METER_VIEW_DB, METER_W}; // STRIAKMETER (SR9058): the strip's width, floor and colours live in timeline_core::view, both faces paint them (file tail)
 
 impl Face {
     /// Feed the meters the `n` played ticks from `from` (`stria::nle::MixMeters::feed`: the render of the whole timeline
@@ -1342,7 +1336,7 @@ impl Face {
     }
     /// What the strip paints: the meters while playing, nothing when stopped (never a frozen reading).
     fn meter_levels(&self) -> Vec<MeterLevel> {
-        if self.playing { self.meter_hold.shown(self.meters.levels()) } else { Vec::new() }
+        self.meter_hold.strip(self.playing, self.meters.levels()) // STRIAKMETER (SR9058): timeline_core's playing-or-nothing rule, both faces (file tail)
     }
 }
 
@@ -1350,25 +1344,7 @@ impl Face {
 /// x `w - METER_W - 1 .. w - 1`; the RMS filled from the bottom, the peak a 1 px line, both linear in dB over
 /// [`METER_VIEW_DB`]..0. No levels paint nothing.
 fn paint_meters(px: Vec<u8>, l: Layout, order: PixelOrder, levels: &[MeterLevel]) -> Vec<u8> {
-    if levels.is_empty() {
-        return px;
-    }
-    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
-    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
-    let frac = |db: f64| ((db - METER_VIEW_DB) / -METER_VIEW_DB).clamp(0.0, 1.0);
-    for lv in levels {
-        let Some((_, y0, _, y1)) = meter_rect(l, lv.track) else { continue }; // STRIAMETERSNEXT (SR996): NLE-METER-RECT-ONE, the one layout (file tail)
-        let span = (y1 - y0) as f64;
-        c.rect(x0, y0, x1, y1, METER_BG);
-        let fill = (frac(lv.rms_db) * span).round() as i64;
-        c.rect(x0, y1 - fill, x1, y1, METER_RMS);
-        let pk = (frac(lv.peak_db) * span).round() as i64;
-        if pk > 0 {
-            let y = (y1 - pk).max(y0);
-            c.rect(x0, y, x1, y + 1, METER_PEAK);
-        }
-    }
-    c.px
+    view::paint_meters(px, l, vo(order), levels) // STRIAKMETER (SR9058): the one strip, timeline_core::view (file tail)
 }
 
 #[cfg(test)]
@@ -3096,99 +3072,18 @@ impl Face {
 
 // ---- STRIAMETERSCLIPHOLD (LEDGER SR862): the meters' 2 s peak hold and the clip latch (named tail block) ----
 
-/// How long the strip's peak line stands at the highest reading, in seconds of the face clock (`2 * fps` ticks).
-pub const METER_HOLD_S: u32 = 2;
-/// A reading at or above this latches the clip cap: between the 16-bit rail (32767 / 32768 = -0.000265 dBFS, what
-/// `render` clamps a sum to) and the next code below it (32766 / 32768 = -0.00053 dBFS).
-pub const METER_CLIP_DB: f64 = -0.0003;
-const METER_CLIP: [u8; 4] = [0xff, 0x30, 0x30, 255];
-/// The clip cap's height (px) at the top of a latched meter.
-const METER_CLIP_H: i64 = 3;
-
-/// The face's display rule over the meters' readings: a held peak per meter (`(key, held dBFS, ticks left)`, the key
-/// `MeterLevel::track`) and the meters that reached the rail (latched until a click on that meter). Face thread only.
-#[derive(Debug, Clone, Default)]
-pub struct MeterHold {
-    held: Vec<(Option<usize>, f64, u32)>,
-    clipped: Vec<Option<usize>>,
-}
-
-impl MeterHold {
-    /// One face-clock tick: every hold ages by one (dropped at 0); then, when `levels` are given (playing), a reading
-    /// above its hold (or with none) holds for `ticks`, and a reading at [`METER_CLIP_DB`] latches its meter.
-    pub fn step(&mut self, levels: Option<&[MeterLevel]>, ticks: u32) {
-        self.held.retain_mut(|h| {
-            h.2 = h.2.saturating_sub(1);
-            h.2 > 0
-        });
-        for lv in levels.unwrap_or(&[]) {
-            match self.held.iter_mut().find(|h| h.0 == lv.track) {
-                Some(h) if lv.peak_db > h.1 => (h.1, h.2) = (lv.peak_db, ticks),
-                Some(_) => {}
-                None if ticks > 0 => self.held.push((lv.track, lv.peak_db, ticks)),
-                None => {}
-            }
-            if lv.peak_db >= METER_CLIP_DB && !self.clipped.contains(&lv.track) {
-                self.clipped.push(lv.track);
-            }
-        }
-    }
-    /// The readings as the strip shows them: each peak raised to its meter's standing hold (the identity with none).
-    pub fn shown(&self, mut levels: Vec<MeterLevel>) -> Vec<MeterLevel> {
-        for lv in &mut levels {
-            if let Some(h) = self.held.iter().find(|h| h.0 == lv.track) {
-                lv.peak_db = lv.peak_db.max(h.1);
-            }
-        }
-        levels
-    }
-    /// A hold still stands (the face clock must keep counting).
-    pub fn pending(&self) -> bool {
-        !self.held.is_empty()
-    }
-    /// The latched meters, in latch order.
-    pub fn clipped(&self) -> &[Option<usize>] {
-        &self.clipped
-    }
-    /// Clear one meter's latch; false when it was not latched.
-    pub fn unclip(&mut self, key: Option<usize>) -> bool {
-        let n = self.clipped.len();
-        self.clipped.retain(|k| *k != key);
-        self.clipped.len() != n
-    }
-}
-
-/// The rect `(x0, y0, x1, y1)` of meter `key` on `l`, as [`paint_meters`] lays it out (a track's inside its row, the
-/// master down the preview band); `None` where that meter has no bar.
-fn meter_rect(l: Layout, key: Option<usize>) -> Option<(i64, i64, i64, i64)> {
-    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
-    let (y0, y1) = match key {
-        Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
-        Some(_) => return None,
-        None => (1, l.preview_h as i64 - 1),
-    };
-    (y1 - y0 >= 2).then_some((x0, y0, x1, y1))
-}
+pub use timeline_core::view::{METER_CLIP, METER_CLIP_DB, METER_CLIP_H, METER_HOLD_S, MeterHold, meter_rect}; // STRIAKMETER (SR9058): the hold, the clip latch and the one meter layout live in timeline_core::view, both faces call them (file tail)
 
 /// The clip caps over a painted canvas: [`METER_CLIP`] across the top [`METER_CLIP_H`] px of each latched meter's rect,
 /// playing or stopped. No latch paints nothing.
 fn paint_meter_clips(px: Vec<u8>, l: Layout, order: PixelOrder, clipped: &[Option<usize>]) -> Vec<u8> {
-    if clipped.is_empty() {
-        return px;
-    }
-    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
-    for &key in clipped {
-        if let Some((x0, y0, x1, y1)) = meter_rect(l, key) {
-            c.rect(x0, y0, x1, (y0 + METER_CLIP_H).min(y1), METER_CLIP);
-        }
-    }
-    c.px
+    view::paint_meter_clips(px, l, vo(order), clipped) // STRIAKMETER (SR9058): the one clip cap paint, timeline_core::view (file tail)
 }
 
 impl Face {
     /// One face-clock tick of the meter hold: `METER_HOLD_S * fps` ticks, the readings taken only while playing.
     fn meter_hold_tick(&mut self) {
-        let ticks = METER_HOLD_S * self.state.timeline.fps().unwrap_or(25).max(1);
+        let ticks = view::meter_hold_ticks(self.state.timeline.fps()); // STRIAKMETER (SR9058): the one hold length, both faces (file tail)
         let levels = self.playing.then(|| self.meters.levels());
         self.meter_hold.step(levels.as_deref(), ticks);
     }
@@ -3325,14 +3220,6 @@ mod striameterscliphold_tests {
 
 // ---- STRIAMETERCLIPVERB (LEDGER SR902): the meters-reset word (named tail block) ----
 
-impl MeterHold {
-    /// Drop every peak hold and every clip latch (the `meters-reset` word).
-    pub fn clear(&mut self) {
-        self.held.clear();
-        self.clipped.clear();
-    }
-}
-
 impl Face {
     /// `meters-reset`: clear every clip latch and peak hold (`Some(true)`, a repaint; a view word: no undo step, the
     /// document not dirtied); `None` for any other word.
@@ -3394,13 +3281,6 @@ mod striameterclipverb_tests {
 }
 
 // ---- STRIAMETERSMORE (LEDGER SR962): the held peaks for the witness and the split preview's master latch click (named tail block) ----
-
-impl MeterHold {
-    /// The standing holds `(key, held dBFS)`, in hold order (the witness's `"held"`); empty with none.
-    pub fn held(&self) -> Vec<(Option<usize>, f64)> {
-        self.held.iter().map(|h| (h.0, h.1)).collect()
-    }
-}
 
 impl Face {
     /// The meters' standing peak holds `(key, held dBFS)` (`None` the master), in hold order.
@@ -3543,5 +3423,31 @@ mod striametersnext_tests {
         assert!(meter_rect(l, off).is_none());
         let none = [MeterLevel { track: off, peak_db: 0.0, rms_db: 0.0 }];
         assert_eq!(paint_meters(base.clone(), l, PixelOrder::Rgba, &none), base, "no rect paints nothing");
+    }
+}
+
+// ---- STRIAKMETER (LEDGER SR9058): the strip, hold and clip latch moved to timeline_core::view, both faces call them (named tail block) ----
+
+#[cfg(test)]
+mod striakmeter_tests {
+    use super::*;
+
+    /// M3: the host's strip and clip caps are timeline_core's, byte for byte, in both byte orders (the kernel Player's
+    /// band paints the same fns); the host's hold is the view's type.
+    #[test]
+    fn striakmeter_host_paints_the_view_strip() {
+        let mut st = EditorState::new(synth_fixture().0);
+        st.seek(15);
+        let l = Layout::of(320, 160, &st);
+        let base = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let levels = [MeterLevel { track: Some(1), peak_db: -6.0, rms_db: -30.0 }, MeterLevel { track: None, peak_db: 0.0, rms_db: -15.0 }];
+        let clipped = [Some(1), None];
+        for (po, vo) in [(PixelOrder::Rgba, Order::Rgba), (PixelOrder::Bgra, Order::Bgra)] {
+            assert_eq!(paint_meters(base.clone(), l, po, &levels), view::paint_meters(base.clone(), l, vo, &levels));
+            assert_eq!(paint_meter_clips(base.clone(), l, po, &clipped), view::paint_meter_clips(base.clone(), l, vo, &clipped));
+        }
+        let h: view::MeterHold = MeterHold::default();
+        assert!(h.strip(false, levels.to_vec()).is_empty());
+        assert_eq!(view::meter_hold_ticks(st.timeline.fps()), METER_HOLD_S * st.timeline.fps().unwrap_or(25).max(1));
     }
 }
