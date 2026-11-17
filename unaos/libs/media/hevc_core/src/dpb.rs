@@ -479,7 +479,7 @@ fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Optio
 /// candidate of [`project_lists`] (quarter-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub` as `predict_pu`) through
 /// `luma_mc` / `chroma_mc`'s fractional filters (HEVCCONCEALSUBPEL SR733), written to `out` at sample depth, clipped: two candidates averaged by inter.rs
 /// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261); HEVCCONCEALWEIGHTED (SR741): with `wp` (the source's explicit
-/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead; HEVCCONCEALBIDIRECTFORWARD (SR778): with `inv` (the forward road: `wp` is the referencer's) one candidate through inter.rs `uni_explicit_inv`, two by `bi_default` (HEVC-CONCEAL-FORWARD-BI-INVERSE owed). A block is at most 8x8 in every plane (the stack buffer).
+/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead; HEVCCONCEALBIDIRECTFORWARD (SR778): with `inv` (the forward road: `wp` is the referencer's) one candidate through inter.rs `uni_explicit_inv`, two (both lists on L) through inter.rs `bi_explicit_inv` over the averaged fetch (HEVCCONCEALFORWARDBIINVERSE SR784: the equal-vector joint inverse; HEVC-CONCEAL-FORWARD-BI-INVERSE-SPLIT owed), unweighted by `bi_default`. A block is at most 8x8 in every plane (the stack buffer).
 fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, inv: bool, out: &mut [i32]) {
     let n = (cw * ch) as usize;
     let max = (1i32 << bd) - 1;
@@ -497,7 +497,7 @@ fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32,
     }
     if got == 2 {
         for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
-            *a = match wp.filter(|_| !inv) { Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
+            *a = match wp { Some(w) if inv => crate::inter::bi_explicit_inv((*a + b + 1) >> 1, w[0], w[1], bd), Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
         }
     } else {
         for a in out[..n].iter_mut() {

@@ -1168,3 +1168,63 @@ fn conceal_bi_direct_forward_refines_through_the_surviving_lists_inverse_weights
         assert_ne!(by_poc(&f, 5).planes[0], inv(&back.y[..], dead), "{what}: not the inverse through the other list's weights");
     }
 }
+
+// ---- HEVCCONCEALFORWARDBIINVERSE (LEDGER SR784): a weighted bi referencer with both lists on the lost picture refines it through the joint inverse of 8-264 (named tail block) ----
+
+/// The PPS carries weighted_bipred_flag (the P pictures carry no table). IDR0 (the gradient), P2 (references POC 0 with mv
+/// (6, 2)), C = B4 (StCurrBefore {3} with POC 2 kept unused: L0 = L1 = [the lost POC 3], one reference per list;
+/// luma_log2_weight_denom 6, L0 (48, 5), L1 (16, -3); PRED_BI with BOTH lists to POC 3 at the EQUAL vector (32, 16)), P5
+/// (skip-only, references POC 3 alone). POC 3 is generated and concealed from POC 2; when C ends, SR754's forward road
+/// re-projects it from C with both candidates kept (`forward_only`: both lists reference POC 3), the two fetches of C at
+/// -mv = (-8, -4) samples are equal, and HEVCCONCEALFORWARDBIINVERSE applies the JOINT inverse of both lists' weights (C
+/// coded pred = (64L * 48 + 64L * 16 + ((5 - 3 + 1) << 12)) >> 13): p' = round half away (4096 (2q - 2) / 64), L = (p' + 32)
+/// >> 6, clipped; chroma (default weights) the shifted samples. So P5 (the refined picture's skip copy) is that hand joint
+/// inverse of C moved back on every plane; it is neither the unweighted 8-262 average (the copy of C) nor either list's
+/// uni inverse.
+#[test]
+fn conceal_forward_bi_inverse_joins_both_lists_weights() {
+    let i0 = gradient();
+    let st = [32, 16];
+    // (w, o) of each list: L0 (64 - 16, 5), L1 (64 - 48, -3).
+    let wo = [(48, 5), (16, -3)];
+    let round = |n: i32, d: i32| {
+        let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+        if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) }
+    };
+    let joint = |r: &[u8]| r.iter().map(|&q| ((round(4096 * (2 * q as i32 - (wo[0].1 + wo[1].1)), wo[0].0 + wo[1].0) + 32) >> 6).clamp(0, 255) as u8).collect::<Vec<u8>>();
+    let uni_inv = |r: &[u8], (w, o): (i32, i32)| r.iter().map(|&q| ((round(4096 * (q as i32 - o), w) + 32) >> 6).clamp(0, 255) as u8).collect::<Vec<u8>>();
+    let mut s = headers(false, true, &PpsInter { weighted_bipred: true, ..Default::default() });
+    s.extend(idr(&i0, true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    let c = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 4,
+        neg: vec![(-1, true), (-2, false)],
+        pos: vec![],
+        num_ref: Some((1, 1)),
+        weights: Some((6, vec![Some((-16, 5))])),
+        weights_l1: Some(vec![Some((-48, -3))]),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    s.extend(picture(&c, |e| bi_body(e, 1, st, st)));
+    s.extend(picture(&p_slice(5, vec![(-2, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "every block of C refines");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "output in decoding order");
+    let back = shifted(&img_of(by_poc(&f, 4)), -8, -4);
+    let want = Img { y: joint(&back.y[..]), cb: back.cb.clone(), cr: back.cr.clone() };
+    assert_ne!(want.y, back.y, "the fixture's joint inverse must differ from the copy");
+    assert_ne!(want.y, uni_inv(&back.y[..], wo[0]), "the fixture's joint inverse must differ from L0's uni inverse");
+    assert_ne!(want.y, uni_inv(&back.y[..], wo[1]), "the fixture's joint inverse must differ from L1's uni inverse");
+    assert_frame(by_poc(&f, 5), &want, "P from the picture refined from C through the joint inverse of both lists' weights");
+    assert_ne!(by_poc(&f, 5).planes[0], back.y, "not the unweighted 8-262 average (the copy of C)");
+    assert_ne!(by_poc(&f, 5).planes[0], uni_inv(&back.y[..], wo[0]), "not L0's uni inverse");
+    assert_ne!(by_poc(&f, 5).planes[0], uni_inv(&back.y[..], wo[1]), "not L1's uni inverse");
+}

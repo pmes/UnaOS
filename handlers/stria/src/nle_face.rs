@@ -2216,7 +2216,7 @@ impl Face {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed()), j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames), j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2722,11 +2722,11 @@ impl Face {
 
 // ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the words (named tail block) ----
 /// The result line's words for what was written: `<video> + <audio>` (the audio as the table spells it,
-/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775).
-fn export_words(video: &str, audio: AudioOut, wall: Duration) -> String {
+/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775), and ` (<r> fps)` ([`rate_words`], NLE5DEXPORTMESSAGERATE SR785).
+fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64) -> String {
     match audio {
-        AudioOut::None => format!("{video}, no audio in {}", wall_words(wall)),
-        a => format!("{video} + {} in {}", crate::nle_export::audio_word(&a), wall_words(wall)),
+        AudioOut::None => format!("{video}, no audio in {}{}", wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
+        a => format!("{video} + {} in {}{}", crate::nle_export::audio_word(&a), wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
     }
 }
 
@@ -2798,4 +2798,21 @@ pub fn wall_words(d: Duration) -> String {
     } else {
         format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
     }
+}
+
+// ---- NLE5DEXPORTMESSAGERATE (LEDGER SR785): the export's frames per second on the result line (named tail block) ----
+// `export_words` takes the frame count the line prints (`ExportReport.frames`, the ONE caller's `r.frames`) beside the
+// wall time and appends ` (<r> fps)` after ` in <t>`. Owed: NLE5D-EXPORT-MESSAGE-RATE-REALTIME (the rate as a multiple
+// of real time, `2.1x`, beside the fps).
+
+/// An export's speed as a person reads it (every encoder prints one: x264's `42.1 fps`): `frames` over `wall`, rounded
+/// half up in integer arithmetic on microseconds; 100 or more a whole number (`120 fps`, `500 fps`), below that one
+/// decimal (`43.8 fps`, `3.0 fps`, `0.3 fps`). `None` for 0 frames or a wall under 1 ms: such an export says nothing of speed.
+pub fn rate_words(frames: u64, wall: Duration) -> Option<String> {
+    if frames == 0 || wall < Duration::from_millis(1) {
+        return None;
+    }
+    let (f, us) = (frames as u128, wall.as_micros());
+    let tenths = (f * 20_000_000 + us) / (2 * us);
+    Some(if tenths >= 1000 { format!("{} fps", (f * 2_000_000 + us) / (2 * us)) } else { format!("{}.{} fps", tenths / 10, tenths % 10) })
 }
