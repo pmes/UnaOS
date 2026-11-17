@@ -2038,7 +2038,7 @@ mod striapanautomation_tests {
 /// there is no such clip.
 pub fn clip_alone(tl: &Timeline, track: usize, idx: usize) -> Option<(Timeline, std::ops::Range<i64>)> {
     let c = *tl.tracks.get(track)?.clips.get(idx)?;
-    let mut alone = tl.clone();
+    let mut alone = tl.clone(); alone.tracks.clear(); for t in &tl.tracks { alone.add_track(t.kind); } // STRIANORMALIZELUFSMORE (SR9086): every track rebuilt through the one Track literal, so mute / solo / track gain are at their defaults (file tail)
     for t in alone.tracks.iter_mut() {
         t.clips.clear();
         t.transitions.clear();
@@ -2262,3 +2262,8 @@ fn take_reversed(tl: &Timeline, run: &AudioRun, li: usize, sources: &Sources, sl
     let pcm = take_rated(tl, &fwd, li, slot.as_mut().expect("opened above"), samples(tl.tb.to_ns(lo), rate), n, rate)?;
     Ok(Some(pcm.chunks(ch.max(1) as usize).rev().flatten().copied().collect()))
 }
+
+// ---- STRIANORMALIZELUFSMORE (LEDGER SR9086): clip_alone measures a clip on a fresh track (named tail block) ----
+// `clip_alone` rebuilds every track through `Timeline::add_track` (the ONE `Track` literal) instead of clearing the clone's,
+// so a per-track flag (SR837's mute / solo, SR864's track gain, when they fold) is at its default: a clip on a muted
+// track is measured as if unmuted (NLE-NORMALIZE-LUFS-MUTE), with no field named here. The old clear loop is a no-op.
