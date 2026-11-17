@@ -1297,7 +1297,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     use std::collections::HashMap;
     #[derive(Clone)]
     struct Inh {
-        color: (u8, u8, u8),
+        color: (u8, u8, u8), color_alpha: f32,
         font_size: f32,
         weight: u16,
         italic: bool,
@@ -1344,7 +1344,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     let last = LAST_CASCADE.with(|l| l.borrow().clone());
     any.with_doc(|doc, _| {
         let root = Inh {
-            color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
+            color: (0, 0, 0), color_alpha: 1.0, font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
             text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
@@ -1382,7 +1382,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c }));
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); me.color_alpha = crate::render::color_alpha_of(&paint, tag, parent.color_alpha);
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1415,7 +1415,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let values = [
                 display.to_string(),
                 position.to_string(),
-                rgb(me.color),
+                css_core::color::Rgba { r: me.color.0 as f64, g: me.color.1 as f64, b: me.color.2 as f64, a: me.color_alpha as f64 }.serialize(),
                 paint.background.map(|c| rgb(layout_core::paint::bg_ink(c, paint.currentcolor, me.color))).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
                 px(font_size_used(&paint, me.font_size)),
                 me.weight.to_string(),

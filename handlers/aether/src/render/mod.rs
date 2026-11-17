@@ -6,7 +6,7 @@ use taffy::prelude::*;
 /// Inherited paint state carried down the box tree.
 #[derive(Clone, Copy)]
 struct Inherited {
-    color: (u8, u8, u8),
+    color: (u8, u8, u8), color_alpha: f32,
     font_size: f32,
     /// Computed font-weight.
     weight: u16,
@@ -476,7 +476,7 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
 /// The inherited paint state at the root of the box tree (the UA's initial values).
 fn root_inherited() -> Inherited {
     Inherited {
-        color: (0, 0, 0),
+        color: (0, 0, 0), color_alpha: 1.0,
         font_size: 16.0,
         weight: 400,
         italic: false,
@@ -636,7 +636,7 @@ fn plot_glyph_px(
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip, color: (u8, u8, u8),
     px: i32, py: i32, a: u8,
 ) {
-    if px < 0 || py < 0 {
+    let a = ink_alpha_scale(a); if px < 0 || py < 0 || a == 0 {
         return;
     }
     let (px, py) = (px as u32, py as u32);
@@ -1072,7 +1072,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
         (0, 0, 238) // UA default link blue
     } else if control_tag(tag) { layout_core::ua_colours(inherited.scheme).ink } else if tag == "html" { layout_core::ua_colours(inherited.scheme).canvastext } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
         inherited.color
-    })); deco_ink(inherited, tag, spec); // AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): after the colour write, so currentcolor is this element's ink
+    })); inherited.color_alpha = color_alpha_of(spec, tag, inherited.color_alpha); deco_ink(inherited, tag, spec); // AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): after the colour write, so currentcolor is this element's ink
 }
 
 /// Draws one line's worth of text with its baseline at `baseline_y` — an
@@ -3865,7 +3865,7 @@ fn frame_walk(
                         }
                         match sel_plan.get(&fi) {
                             None => {
-                                draw_glyph_run(text, ox, by, &adv, i.color, deco, i.shadows(layout), surface, width, height, damage_rects, child_clip);
+                                with_ink_alpha(i.color_alpha, || draw_glyph_run(text, ox, by, &adv, i.color, deco, i.shadows(layout), surface, width, height, damage_rects, child_clip));
                             }
                             Some(fs) => {
                                 // Inverse video: the highlight behind the glyphs (pixel-snapped, the line
@@ -3895,7 +3895,7 @@ fn frame_walk(
                                     (mid, crate::selection::HIGHLIGHT_TEXT, &[][..]),
                                 ] {
                                     if c.2 > c.0 {
-                                        draw_glyph_run(text, ox, by, &adv, color, deco, shadows, surface, width, height, damage_rects, c);
+                                        with_ink_alpha(if c == mid { 1.0 } else { i.color_alpha }, || draw_glyph_run(text, ox, by, &adv, color, deco, shadows, surface, width, height, damage_rects, c));
                                     }
                                 }
                             }
@@ -4822,4 +4822,44 @@ fn caret_ink(inherited: &Inherited, ink: (u8, u8, u8)) -> Option<((u8, u8, u8), 
         Some((_, _, _, 0)) => None,
         Some((r, g, b, a)) => Some(((r, g, b), a)),
     }
+}
+
+// ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha rides Inherited to the glyph pixel road (named tail block) ----
+
+thread_local! {
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the element text ink's alpha (255 opaque), scoped by [`with_ink_alpha`]
+    /// around the two element-text draws (a scoped thread-local on the FOCUS / TOP_PASS precedent, in place of a
+    /// parameter threaded through `draw_shaped`'s five callers); every other `draw_shaped` caller paints opaque.
+    static INK_ALPHA: std::cell::Cell<u8> = const { std::cell::Cell::new(255) };
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): runs `f` with the text ink at `alpha` (0..=1), then restores the previous.
+fn with_ink_alpha<R>(alpha: f32, f: impl FnOnce() -> R) -> R {
+    let k = (alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let prev = INK_ALPHA.with(|c| c.replace(k));
+    let r = f();
+    INK_ALPHA.with(|c| c.set(prev));
+    r
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one glyph coverage `a` (already through the ink's pre-blend) times the
+/// scoped ink alpha: the ONE multiply at the glyph pixel road (text shadows paint from their own mask, untouched, as
+/// Chromium: `color: transparent` text keeps its shadow).
+fn ink_alpha_scale(a: u8) -> u8 {
+    let k = INK_ALPHA.with(|c| c.get());
+    if k == 255 {
+        return a;
+    }
+    ((a as u16 * k as u16 + 127) / 255) as u8
+}
+
+/// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the inherited text colour's alpha, the ONE rule both walkers (this file's
+/// `inherit_element` and `css::computed_report`) call: an element's own `color` brings its alpha (css-color-4 §4: the
+/// pair moves together, so `color: red` under a half-alpha parent is opaque); no own colour inherits the parent's
+/// (`inherit` / `unset` / `currentcolor` cleared the pair), except the a / control / html tag roads, which are opaque.
+pub(crate) fn color_alpha_of(spec: &crate::layout::PaintStyle, tag: &str, parent: f32) -> f32 {
+    if spec.color.is_some() {
+        return spec.color_alpha.unwrap_or(1.0);
+    }
+    layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, parent, |a| if tag == "a" || control_tag(tag) || tag == "html" { 1.0 } else { a })
 }
