@@ -1539,7 +1539,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // CSS 2.2 §10.8.1: a <number> is inherited as the number (each
             // element multiplies its own font-size); a <length> or
             // <percentage> computes to an absolute length, inherited as is.
-            // Stored as > 0 multiplier, < 0 = -(px), 0 = normal.
+            // Stored as > 0 multiplier, < 0 = -(px), 0 = normal, paint::LINE_HEIGHT_ZERO = an author 0 (SR843).
             let v = value.trim();
             let (em, ..) = cx.font;
             if matches!(v, "inherit" | "unset") {
@@ -1548,11 +1548,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             let lh = if matches!(v, "normal" | "initial" | "revert") {
                 Some(0.0)
             } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(-(pct / 100.0 * em))
+                Some(crate::paint::line_height_zero_or(pct, -(pct / 100.0 * em)))
             } else if let Ok(n) = v.parse::<f32>() {
-                Some(n.max(0.0))
+                Some(crate::paint::line_height_zero_or(n, n.max(0.0)))
             } else {
-                parse_px(v, cx).map(|px| -px.max(0.0))
+                parse_px(v, cx).map(|px| crate::paint::line_height_zero_or(px, -px.max(0.0)))
             };
             match lh {
                 Some(f) => style.paint.line_height = Some(f),
