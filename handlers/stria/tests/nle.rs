@@ -7569,3 +7569,66 @@ fn striaproxymedia_verb_refusals() {
     assert_eq!(VERBS.last(), Some(&"help"));
     println!("striaproxymedia refusals: no clip selected; A: no source path; VERBS[{}] = proxy", VERBS.len() - 2);
 }
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): a placed clip over the track below, rendered through the one placement (named tail block) ----
+
+/// V1 A[0,30)@0 (utp1 counter 0), V2 B[0,10)@10 (counter 1000) placed at `pip` (the bottom-right quarter): an overlay
+/// frame is timeline_core's ONE `xform_frame` of the two sources' own frames (opaque: V2 placed straight into the rect),
+/// byte for byte; outside the rect V1's frame shows unchanged; outside the overlay V1 shows alone.
+#[test]
+fn striapositionscale_pip_renders_over_the_track_below() {
+    use timeline_core::schedule::Frac;
+    use timeline_core::{Crop, SizePolicy, Xform};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    let tl = tl.set_xform(1, 0, Xform::PIP).unwrap();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..30, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 30);
+    let rect = Xform::PIP.rect(64, 48);
+    for t in [10usize, 15, 19] {
+        let (top, under) = (TestPattern::render(64, 48, 1000 + t as u32 - 10), TestPattern::render(64, 48, t as u32));
+        let model = timeline_core::xform_frame(top.as_chunks::<4>().0, under.as_chunks::<4>().0, 64, 48, Crop::NONE, SizePolicy::Letterbox, Xform::PIP, Frac { num: 100, den: 100 }).into_flattened();
+        assert_eq!(sink.frames[t].1, model, "tick {t}");
+        assert_eq!(sink.frames[t].1[..rect.y * 64 * 4], under[..rect.y * 64 * 4], "tick {t}: above the rect is V1's own frame");
+        assert_ne!(sink.frames[t].1, under, "tick {t}: the rect holds V2");
+    }
+    let at = |t: usize| TestPattern::read_counter(&sink.frames[t].1, 64, 48);
+    assert_eq!((at(9), at(20), at(29)), (Some(9), Some(20), Some(29)));
+    let full = tl.set_xform(1, 0, Xform::NONE).unwrap();
+    let mut sink2 = Collect::default();
+    render(&full, 10..11, &src, &mut sink2).unwrap();
+    assert_eq!(sink2.frames[0].1, TestPattern::render(64, 48, 1000), "unplaced: V2's own frame");
+    println!("striapositionscale: frames={} seeks={} runup={} rect={}x{}@{},{}", r.frames, r.seeks, r.runup_frames, rect.w, rect.h, rect.x, rect.y);
+}
+
+/// The face's `pip` (a VERBS word, its button) reaches timeline_core's ONE verb dispatch: one undo step; a refusal is
+/// named on the message row with no undo step.
+#[test]
+fn striapositionscale_face_pip_is_one_undo_step() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    assert_eq!(VERBS[VERBS.len() - 2], "pip", "pip just before help");
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("pip"));
+    assert_eq!(face.last_error.take(), Some(format!("pip: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("pip"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.timeline, tl0.set_xform(0, 1, timeline_core::Xform::PIP).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("scale 600"));
+    assert_eq!(face.last_error.take(), Some(format!("scale 600: {}", EditError::Xform)));
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("pip"));
+    assert_eq!(face.last_error.take(), Some(format!("pip: {}", EditError::Kind)));
+    assert_eq!(face.state.undo_depth(), 1);
+}

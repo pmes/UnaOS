@@ -102,6 +102,8 @@ pub enum ScheduleError {
     NoKeyframe(SourceId),
     /// STRIAOPACITY (SR868): a non-opaque clip of this source over a transition or a second non-opaque layer (two layers only).
     Opacity(SourceId),
+    /// STRIAPOSITIONSCALE (SR879): a placed (picture-in-picture) clip of this source over a transition, or placed under another layer (two layers only).
+    Xform(SourceId),
 }
 
 impl core::fmt::Display for ScheduleError {
@@ -112,6 +114,7 @@ impl core::fmt::Display for ScheduleError {
             ScheduleError::OutOfSource(s) => write!(f, "clip past the end of source {}", s.0),
             ScheduleError::NoKeyframe(s) => write!(f, "source {} has no stream to seek", s.0),
             ScheduleError::Opacity(s) => write!(f, "source {} is not opaque over a transition or a second non-opaque layer (two layers only)", s.0),
+            ScheduleError::Xform(s) => write!(f, "source {} is placed (pip / scale) over a transition or under another layer (two layers only)", s.0),
         }
     }
 }
@@ -530,10 +533,10 @@ fn opacity_mix(
     m_next: &mut Option<(SourceId, i64)>,
 ) -> Result<Option<VideoMix>, ScheduleError> {
     let c = tl.tracks[ti].clips[ci];
-    if c.opacity == crate::OPAQUE {
+    if c.opacity == crate::OPAQUE && c.xform == crate::Xform::NONE { // STRIAPOSITIONSCALE (SR879): a placed clip is the two-layer case too
         return Ok(vmix);
     }
-    if vmix.is_some() {
+    if vmix.is_some() && c.xform != crate::Xform::NONE { return Err(ScheduleError::Xform(c.src)); } if vmix.is_some() { // STRIAPOSITIONSCALE (SR879): a placed clip over a transition, named
         return Err(ScheduleError::Opacity(c.src));
     }
     let lower = below(tl, ti, t);
@@ -546,7 +549,7 @@ fn opacity_mix(
         return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
     };
     let lc = tl.tracks[li].clips[lci];
-    if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+    if lc.xform != crate::Xform::NONE { return Err(ScheduleError::Xform(c.src)); } if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
         return Err(ScheduleError::Opacity(c.src));
     }
     let src_t = lc.src_in + (t - lc.at);

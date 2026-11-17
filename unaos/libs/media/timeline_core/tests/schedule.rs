@@ -246,3 +246,48 @@ fn striaopacity_validate_refuses_by_name() {
     assert_eq!(tl.set_opacity(&[(a, 0)], 100).map(|t| t.tracks[a].clips[0].opacity), Ok(100));
     assert_eq!(EditError::Opacity.to_string(), "opacity is a percent 0..=100, and video only");
 }
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): a placed (picture-in-picture) winner schedules the video track below (named tail block) ----
+
+/// An opaque placed V2 clip rides STRIAOPACITY's two-layer step: each overlay tick is V2's own step with a Dissolve mix of
+/// V1 at its own tick at weight 100/100 (the renderer places the top over it); unplaced, the same stack schedules as today.
+#[test]
+fn striapositionscale_placed_top_schedules_the_track_below() {
+    use timeline_core::schedule::Frac;
+    use timeline_core::{TransitionKind, Xform};
+    let g = Gop { dur: 50 };
+    let plain = striaopacity_stack(timeline_core::OPAQUE);
+    let tl = plain.set_xform(1, 0, Xform::PIP).unwrap();
+    let steps = schedule(&tl, 0..30, &g).unwrap();
+    for (t, s) in steps.iter().enumerate().take(20).skip(10) {
+        let m = s.vmix.expect("a placed tick carries the track below");
+        assert_eq!((s.src, s.src_t, s.track), (Some(SourceId(1)), t as i64 - 10, Some(1)));
+        assert_eq!((m.kind, m.src, m.src_t, m.t), (TransitionKind::Dissolve, Some(SourceId(0)), t as i64, Frac { num: 100, den: 100 }));
+        assert_eq!(m.seek, None, "tick {t}: the lower run continues");
+    }
+    assert!(steps[..10].iter().chain(&steps[20..]).all(|s| s.vmix.is_none()));
+    assert!(schedule(&plain, 0..30, &g).unwrap().iter().all(|s| s.vmix.is_none()), "unplaced: no mix, as today");
+    let mut alone = tl.clone();
+    alone.tracks[0].clips.clear();
+    let m = schedule(&alone, 10..11, &g).unwrap()[0].vmix.unwrap();
+    assert_eq!((m.src, m.seek, m.t), (None, None, Frac { num: 100, den: 100 }), "nothing below: over black");
+}
+
+/// Two layers only: a placed clip over a transition, or a placed clip under another layer, is refused as `Xform`.
+#[test]
+fn striapositionscale_refusals_are_named() {
+    use timeline_core::{TransitionKind, Xform};
+    let g = Gop { dur: 50 };
+    // a placed clip on a transition's cut: V2 B[0,10)@10 then B[10,15)@20 placed, a dissolve at 20
+    let mut tl = striaopacity_stack(timeline_core::OPAQUE);
+    tl.tracks[1].clips.push(Clip::new(SourceId(1), 20, 25, 20));
+    let tl = tl.add_transition(1, 20, TransitionKind::Dissolve, 3).unwrap().set_xform(1, 1, Xform::PIP).unwrap();
+    assert_eq!(schedule(&tl, 0..30, &g), Err(ScheduleError::Xform(SourceId(1))));
+    // a placed lower clip under a 50% top
+    let tl = striaopacity_stack(50).set_xform(0, 0, Xform::PIP).unwrap();
+    assert_eq!(schedule(&tl, 0..30, &g), Err(ScheduleError::Xform(SourceId(1))));
+    // a placed clip with nothing above it over a lower placed clip: V2 placed over V1 placed
+    let tl = striaopacity_stack(timeline_core::OPAQUE).set_xform(0, 0, Xform::PIP).unwrap().set_xform(1, 0, Xform::PIP).unwrap();
+    assert_eq!(schedule(&tl, 0..30, &g), Err(ScheduleError::Xform(SourceId(1))));
+    assert_eq!(ScheduleError::Xform(SourceId(1)).to_string(), "source 1 is placed (pip / scale) over a transition or under another layer (two layers only)");
+}

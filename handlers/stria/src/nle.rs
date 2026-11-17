@@ -730,7 +730,7 @@ fn vmix_frame(
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
     };
-    Ok(vmix_rgba(m.kind, m.t, &a, b, w, h))
+    Ok(xformed(tl, s, &a, b, w, h).unwrap_or_else(|| vmix_rgba(m.kind, m.t, &a, b, w, h))) // STRIAPOSITIONSCALE (SR879): a placed clip over the track below (file tail)
 }
 
 /// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
@@ -1138,7 +1138,7 @@ fn take_rated(tl: &Timeline, run: &AudioRun, li: usize, a: &mut Aud, start: i64,
 #[allow(clippy::too_many_arguments)]
 fn cropped(tl: &Timeline, track: Option<usize>, out_t: i64, outgoing: bool, rgba: Vec<u8>, w: u32, h: u32, fit: SizePolicy) -> Vec<u8> {
     let crop = track.map_or(timeline_core::Crop::NONE, |ti| tl.crop_at(ti, out_t, outgoing));
-    if crop == timeline_core::Crop::NONE {
+    if crop == timeline_core::Crop::NONE || (!outgoing && track.is_some_and(|ti| tl.xform_at(ti, out_t) != timeline_core::Xform::NONE)) { // STRIAPOSITIONSCALE (SR879): a placed clip's crop is applied inside its rect (xformed)
         return rgba;
     }
     let (px, _) = rgba.as_chunks::<4>();
@@ -1498,4 +1498,19 @@ impl Sources {
         }
         self.proxy.lock().ok()?.iter().find(|(s, _)| *s == id).map(|(_, m)| Arc::clone(m))
     }
+}
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): a placed clip's frame over the track below (named tail block) ----
+/// The RGBA a video step shows when its clip is placed (`Clip::xform`, picture-in-picture): the step's own frame `b`
+/// (`w x h`, uncropped: `cropped` leaves a placed clip's frame alone) with its crop, placed by its reel's policy into the
+/// placement's rect over the lower frame `a` (the schedule's outgoing: the track below, or black) at the step's mix weight,
+/// by timeline_core's ONE `xform_frame`. `None` when the step's clip is not placed (the mix as before).
+fn xformed(tl: &Timeline, s: &timeline_core::schedule::Step, a: &[u8], b: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let (ti, src, m) = (s.track?, s.src?, s.vmix?);
+    let xf = tl.xform_at(ti, s.out_t);
+    if xf == timeline_core::Xform::NONE {
+        return None;
+    }
+    let (top, under) = (b.as_chunks::<4>().0, a.as_chunks::<4>().0);
+    Some(timeline_core::xform_frame(top, under, w as usize, h as usize, tl.crop_at(ti, s.out_t, false), reel_fit(tl, src, false), xf, m.t).into_flattened())
 }

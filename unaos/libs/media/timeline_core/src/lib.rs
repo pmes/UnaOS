@@ -109,6 +109,7 @@ pub struct Clip {
     pub group: u32, // STRIACLIPLINK (SR863): the link group (0 = none): clips sharing a nonzero id select, move, delete and split together
     pub grade: Grade, // STRIACOLORLIFT (SR869): the clip's colour grade, IDENTITY = none (file tail)
     pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan, -128..=127 (0 = centre; -127 / -128 hard left, 127 hard right; schedule::pan_q16 is the law)
+    pub xform: Xform, // STRIAPOSITIONSCALE (SR879): the per-clip position / scale (picture-in-picture; Xform::NONE = the whole frame; file tail)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -117,7 +118,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0, grade: Grade::IDENTITY, pan_cq8: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0, grade: Grade::IDENTITY, pan_cq8: 0, xform: Xform::NONE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -402,6 +403,8 @@ pub enum EditError {
     /// STRIAOPACITY (SR868): an opacity above [`OPAQUE`] percent, or a non-opaque clip on an audio track.
     Opacity,
     Grade, // STRIACOLORLIFT (SR869): a grade value outside -1000..=1000, or the `color` word misshapen
+    /// STRIAPOSITIONSCALE (SR879): a placement off the frame (`x + s` or `y + s` past 1000, `s` 0) or a malformed `pip` / `scale` word.
+    Xform,
 }
 
 impl core::fmt::Display for EditError {
@@ -427,6 +430,7 @@ impl core::fmt::Display for EditError {
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
             EditError::Grade => "color is b c s, each in -1000..=1000",
+            EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
         })
     }
 }
@@ -2210,19 +2214,8 @@ pub fn crop_frame<T: Copy>(px: &[T], w: usize, h: usize, crop: Crop, fit: SizePo
     if w == 0 || h == 0 || px.len() < w * h {
         return px.to_vec();
     }
-    let k = crop.rect(w, h);
-    let p = fit.place(k.w, k.h, w, h);
     let mut out = alloc::vec![bar; w * h];
-    let (sx, sy) = (k.x + p.src.x, k.y + p.src.y);
-    let pic = yuv_core::Picture { w: p.src.w, h: p.src.h, y: &px[sy * w + sx..], u: &[], v: &[], y_stride: w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
-    if p.dst.w == 0 || p.dst.h == 0 || !yuv_core::scale::fits(&pic) {
-        return out;
-    }
-    let mut ry = alloc::vec![bar; p.dst.w];
-    yuv_core::scale::nearest_rows(&pic, p.dst.w, p.dst.h, &mut ry, &mut [], &mut [], |r, row| {
-        let o = (p.dst.y + r) * w + p.dst.x;
-        out[o..o + p.dst.w].copy_from_slice(&row.y[..p.dst.w]);
-    });
+    place_frame(px, w, h, crop, fit, &mut out, w, yuv_core::scale::Rect { w, h, x: 0, y: 0 }); // STRIAPOSITIONSCALE (SR879): the one placement fn (file tail)
     out
 }
 
@@ -2707,3 +2700,115 @@ mod striafreezeframe_tests {
     }
 }
 
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): the per-clip position / scale, THE placement fn and the picture-in-picture composite (named tail block) ----
+// A video clip's `xform` places its frame into a rect of the output frame: top-left (`x`, `y`) and side scale `s`, each in
+// 1/1000 of the frame (uniform: the rect keeps the frame's aspect), inside the frame. [`Xform::NONE`] is the whole frame (no
+// placement: byte-identical frames). A transformed clip rides STRIAOPACITY's two-layer schedule (the track below is the
+// step's outgoing `VideoMix`); the render's [`xform_frame`] places the top into the rect over the lower frame through ONE
+// [`place_frame`] (the crop pass's own placement, a destination rect instead of the whole frame) and mixes only the rect
+// with `vmix::mix_step` when not opaque. Stored in the EDL as `* UNA XFORM <x> <y> <s>` under its event (edl.rs). The
+// kernel Player refuses a transformed timeline by name (`xform-unsupported`, NLE-XFORM-KERNEL owed).
+
+/// A clip's placement: top-left `x`, `y` and side scale `s`, each in 1/1000 of the frame's width / height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Xform {
+    pub x: u16,
+    pub y: u16,
+    pub s: u16,
+}
+
+impl Default for Xform {
+    fn default() -> Xform {
+        Xform::NONE
+    }
+}
+
+impl Xform {
+    /// The whole frame (no placement).
+    pub const NONE: Xform = Xform { x: 0, y: 0, s: 1000 };
+    /// The `pip` word's preset: the bottom-right quarter, 1/40 of the frame in from the edges.
+    pub const PIP: Xform = Xform { x: 725, y: 725, s: 250 };
+    /// The rect stays inside the frame: `1 <= s`, `x + s <= 1000`, `y + s <= 1000`.
+    pub fn ok(self) -> bool {
+        self.s >= 1 && self.x as u32 + self.s as u32 <= 1000 && self.y as u32 + self.s as u32 <= 1000
+    }
+    /// The rect of a `w x h` frame (at least 1 x 1, inside the frame; `w`, `h` > 0).
+    pub fn rect(self, w: usize, h: usize) -> yuv_core::scale::Rect {
+        let side = |n: usize, o: u16| {
+            let x = (n * o as usize / 1000).min(n - 1);
+            (x, (n * self.s as usize / 1000).max(1).min(n - x))
+        };
+        let ((x, w), (y, h)) = (side(w, self.x), side(h, self.y));
+        yuv_core::scale::Rect { w, h, x, y }
+    }
+}
+
+/// THE placement: `crop`'s rect of the `w x h` frame `px` placed by `fit` ([`SizePolicy::place`]; Adopt places as
+/// Letterbox) into the rect `dst` of `out` (rows `ow` samples wide), sampled by yuv_core's ONE `nearest_rows`; the rest of
+/// `out` is left as it was. A frame shorter than `w * h`, an empty one, an empty `dst`, or a `dst` past `out` places nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn place_frame<T: Copy>(px: &[T], w: usize, h: usize, crop: Crop, fit: SizePolicy, out: &mut [T], ow: usize, dst: yuv_core::scale::Rect) {
+    if w == 0 || h == 0 || px.len() < w * h || dst.w == 0 || dst.h == 0 || dst.x + dst.w > ow || (dst.y + dst.h) * ow > out.len() {
+        return;
+    }
+    let k = crop.rect(w, h);
+    let p = fit.place(k.w, k.h, dst.w, dst.h);
+    let (sx, sy) = (k.x + p.src.x, k.y + p.src.y);
+    let pic = yuv_core::Picture { w: p.src.w, h: p.src.h, y: &px[sy * w + sx..], u: &[], v: &[], y_stride: w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
+    if p.dst.w == 0 || p.dst.h == 0 || !yuv_core::scale::fits(&pic) {
+        return;
+    }
+    let mut ry = alloc::vec![px[0]; p.dst.w];
+    yuv_core::scale::nearest_rows(&pic, p.dst.w, p.dst.h, &mut ry, &mut [], &mut [], |r, row| {
+        let o = (dst.y + p.dst.y + r) * ow + dst.x + p.dst.x;
+        out[o..o + p.dst.w].copy_from_slice(&row.y[..p.dst.w]);
+    });
+}
+
+/// THE picture-in-picture composite: the step's `top` frame (`w x h` RGBA, its `crop` placed by `fit`) in `xf`'s rect over
+/// the `under` frame (the track below, or black), at the top's weight `t` (the schedule's `VideoMix::t`, opacity / 100).
+/// Opaque (`t >= 1`): the top placed straight into the rect. Otherwise only the rect passes through `vmix::mix_step`'s
+/// Dissolve (the top placed into a copy of the rect's lower pixels, mixed over them). Outside the rect: `under`, byte for
+/// byte. Frames shorter than `w * h` come back as `under`.
+#[allow(clippy::too_many_arguments)]
+pub fn xform_frame(top: &[[u8; 4]], under: &[[u8; 4]], w: usize, h: usize, crop: Crop, fit: SizePolicy, xf: Xform, t: schedule::Frac) -> Vec<[u8; 4]> {
+    let mut out = under.to_vec();
+    if w == 0 || h == 0 || top.len() < w * h || under.len() < w * h {
+        return out;
+    }
+    let r = xf.rect(w, h);
+    if t.num >= t.den {
+        place_frame(top, w, h, crop, fit, &mut out, w, r);
+        return out;
+    }
+    let mut low: Vec<[u8; 4]> = (0..r.h).flat_map(|y| under[(r.y + y) * w + r.x..(r.y + y) * w + r.x + r.w].iter().copied()).collect();
+    let mut placed = low.clone();
+    place_frame(top, w, h, crop, fit, &mut placed, r.w, yuv_core::scale::Rect { w: r.w, h: r.h, x: 0, y: 0 });
+    vmix::mix_step(TransitionKind::Dissolve, t, low.as_flattened_mut(), placed.as_flattened(), r.w as u32, r.h as u32);
+    for y in 0..r.h {
+        let o = (r.y + y) * w + r.x;
+        out[o..o + r.w].copy_from_slice(&low[y * r.w..(y + 1) * r.w]);
+    }
+    out
+}
+
+impl Timeline {
+    /// The same timeline with clip `idx` of `track` placed by `xf` ([`Xform::NONE`] clears). Refused: no such track
+    /// (`NoTrack`) or clip (`NoClip`), an audio track (`Kind`), a rect off the frame (`Xform`).
+    pub fn set_xform(&self, track: usize, idx: usize, xf: Xform) -> Result<Timeline, EditError> {
+        if self.tracks.get(track).ok_or(EditError::NoTrack)?.kind != Kind::Video {
+            return Err(EditError::Kind);
+        }
+        if !xf.ok() {
+            return Err(EditError::Xform);
+        }
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.xform = xf;
+        Ok(tl)
+    }
+    /// The placement of the clip covering tick `t` on `track` ([`Xform::NONE`] when none).
+    pub fn xform_at(&self, track: usize, t: i64) -> Xform {
+        self.tracks.get(track).and_then(|tr| tr.clips.iter().find(|c| c.covers(t))).map_or(Xform::NONE, |c| c.xform)
+    }
+}
