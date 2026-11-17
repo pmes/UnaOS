@@ -48,7 +48,11 @@
 //!   then raised while the type's model predicts more than the bucket's room (`b_two_pass_lands_within_two_percent`, `z_first_p_held_against_the_seed`, `x_the_bucket_raise_wins_over_the_clamp`; all tests/twopass.rs).
 //!   The records as text: [`write_stats`] / [`read_stats`] (H264ENCTWOPASSFILE SR719, `d_stats_text_round_trips`); a pass 1 over another frame count: [`rescale_stats`] (H264ENCTWOPASSRESCALE SR727, `g_rescale_30_to_15_means_pairs`).
 //!
-//! Owed (handlers.md §5 H264ENC-RC): none of its own (scene-cut IDRs: lib.rs, SR680; per-MB activity masking: lib.rs H264ENCAQ, SR693; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699).
+//! - scene cuts and the GOP start: the detector is lib.rs' `Encoder::scenecut_key` (H264ENCSCENECUT SR680, x264's `scenecut_internal`; `scenecut_lookahead` under bframes), on by [`crate::Config::scenecut`]; a cut codes an IDR and the rate model resets nothing beyond it (H264ENCSCENECUTRCRESET SR834: on fixtures A flat -> texture, B static -> motion, C motion -> static the first P mispredicts the same at a scheduled IDR in the same place, so a detected-only reset is the wrong rule; `scenecut_rc_first_p_table`).
+//!   The first P after any IDR windows on the I QP + [`IP_QP_OFFSET`] (SR844, above) but predicts from the stale P model: of (a) the stale model, (b) the I's bits moved by the QP step, (c) the I model on the P's S', (d) (a) damped toward (c), none brings 12 of the 14 budget-binding runs within 2 QP of the oracle (a 7, b 2, c 6, d 7), so (a) stays (H264ENCRCFIRSTPPREDICTION SR1002, `firstp_prediction_table`).
+//!   The first B after an IDR (bframes 2 codes I B B P as I P B B, so `last_qp` is the first P's) takes the stale B model's QP from the second GOP on; the arm first P QP + [`B_QP_OFFSET`] fixes 2 of the 6 binding misses and worsens 5 of 12 runs, so the stale B stays (H264ENCRCFIRSTBOFFSET SR1010, `firstb_offset_table`); both residual mispredictions are H264ENC-RC-CPLX-WINDOW's (x264's stream-long rate factor).
+//!
+//! Owed (handlers.md §5 H264ENC-RC): H264ENC-RC-CPLX-WINDOW (above); the kernel export (`video/export.rs`) calls only [`RateControl::cbr`] / [`RateControl::crf`], no two-pass road (H264ENC-TWOPASS-KERNEL, owed with SR698); per-MB activity masking: lib.rs H264ENCAQ, SR693; HRD signalling of the bucket: this file's H264ENCHRD tail block, SR699.
 
 use alloc::vec::Vec;
 
