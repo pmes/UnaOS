@@ -556,8 +556,8 @@ impl layout_core::Fonts for HostFonts {
             None => size * 0.8,
         }
     }
-    fn break_lines(&self, text: &str, mode: &TextMode, adv: &Adv, max_w: f32, start_x: f32, prior: bool) -> Vec<Line> {
-        crate::fonts::lines::break_lines_from(&advancer_of(adv), text, &mode_of(mode), max_w, start_x, prior)
+    fn break_lines(&self, text: &str, mode: &TextMode, adv: &Adv, max_w: f32, start_x: f32, first_n: usize, prior: bool) -> Vec<Line> {
+        crate::fonts::lines::break_lines_from(&advancer_of(adv), text, &mode_of(mode), max_w, start_x, first_n, prior)
             .into_iter()
             .map(|l| Line { text: l.text, width: l.width })
             .collect()
