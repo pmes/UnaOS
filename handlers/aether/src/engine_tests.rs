@@ -10624,4 +10624,111 @@ b</div>
         }
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "the sample at #d's painted rows is #d");
     }
+
+    // ---- AETHERPAINTINDEXTEXTSHADOW (LEDGER SR1150): a text shadow's ink is the mask rect its painter allocates, not unbounded (named tail block) ----
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): a fixed 200x30 header (top-left, grey) holding the text "Header" with `shadow`
+    /// as its `text-shadow` and `extra` in its style, on a 2000px page.
+    fn text_shadow_holder_body(shadow: &str, extra: &str) -> String {
+        format!(
+            r#"<div style="position:fixed;top:0;left:0;width:200px;height:30px;background-color:rgb(200, 200, 200);font-size:16px;color:rgb(0, 0, 0);text-shadow:{shadow};{extra}">Header</div>
+        <div style="height:2000px"></div>"#
+        )
+    }
+
+    const TEXT_SHADOW_HOLDER: &str = "2px 2px 4px red";
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the holder's subtree ink is finite, and every pixel of the full repaint that
+    /// differs from the page background lies inside it (the header, its text and every shadow pixel).
+    fn text_shadow_ink_holds_painted(e: &crate::AetherEngine) -> usize {
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(holders.len(), 1, "one holder: the header");
+        let (ink, _) = crate::render::subtree_ink(&holders);
+        let ink = ink.expect("a text shadow leaves the ink finite (armed: unbounded before SR1150)");
+        let s = e.surface();
+        let px = |x: usize, y: usize| { let i = (y * 400 + x) * 4; (s[i], s[i + 1], s[i + 2]) };
+        let bg = px(399, 299);
+        let mut painted = 0;
+        for y in 0..300usize {
+            for x in 0..400usize {
+                if px(x, y) != bg {
+                    painted += 1;
+                    assert!(
+                        (x as f32) + 1.0 > ink.0 && (x as f32) < ink.2 && (y as f32) + 1.0 > ink.1 && (y as f32) < ink.3,
+                        "pixel ({x}, {y}) lies outside the ink {ink:?}"
+                    );
+                }
+            }
+        }
+        painted
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the blurred red shadow: the ink is finite and holds every painted pixel; the
+    /// header painted and some pixel inside it carries the shadow's red over the grey (the surface is BGRA: red at +2).
+    #[test]
+    fn paint_index_text_shadow_ink_finite_contains_painted() {
+        let e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, ""));
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+        let s = e.surface();
+        let reddish = (0..30usize).any(|y| (0..200usize).any(|x| { let i = (y * 400 + x) * 4; s[i + 2] > s[i + 1].saturating_add(20) }));
+        assert!(reddish, "the red text shadow shows in the header");
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): blur 0 and two layers (one up-left, one down-right): the ink is the union of
+    /// both layers' rects and holds every painted pixel.
+    #[test]
+    fn paint_index_text_shadow_blur_zero_two_layers() {
+        let e = damage_rects_engine(&text_shadow_holder_body("3px 3px 0 red, -4px -2px 0 blue", ""));
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): a +50 scroll keeps the blit: the damage is the 50-row strip and then rects
+    /// inside the header's ink clipped to the viewport — not the viewport (armed: the text shadow made the ink unbounded).
+    #[test]
+    fn paint_index_text_shadow_scroll_damage_is_strip_plus_header() {
+        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, ""));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        let ink = crate::render::subtree_ink(&holders).0.expect("finite ink");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "the viewport is not the damage (armed)");
+        assert_eq!(e.damage_rects.first(), Some(&(0, 250, 400, 50)), "the strip first");
+        assert!(e.damage_rects.len() >= 2, "the header is damaged too: {:?}", e.damage_rects);
+        for &(x, y, w, h) in &e.damage_rects[1..] {
+            assert!(
+                x as f32 >= ink.0.floor().max(0.0) && y as f32 >= ink.1.floor().max(0.0) && (x + w) as f32 <= ink.2.ceil() && (y + h) as f32 <= ink.3.ceil(),
+                "damage ({x}, {y}, {w}, {h}) lies inside the header ink {ink:?}"
+            );
+        }
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): THE pin: +50, +50, -30 with the shadowed header over coloured rows: after each
+    /// blitted frame the whole surface equals a control engine scrolled there and repainted whole (the shadow intact).
+    #[test]
+    fn paint_index_text_shadow_pixels_match_full_repaint() {
+        let mut body = text_shadow_holder_body(TEXT_SHADOW_HOLDER, "");
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the same header under `filter: blur(2px)`: the filter group stays unbounded,
+    /// so the scroll damages the viewport (AETHER-PAINT-INDEX-FILTER-EXTENT owed).
+    #[test]
+    fn paint_index_text_shadow_filter_falls_back() {
+        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, "filter:blur(2px)"));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
+    }
 }
