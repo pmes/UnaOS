@@ -11459,4 +11459,50 @@ b</div>
         assert_eq!(imgalt_px(&e, 10, 19), STICKY_NESTED_RED, "#h's last row");
         assert_ne!(imgalt_px(&e, 10, 20), STICKY_NESTED_RED, "below #h");
     }
+
+    // ---- AETHERSCROLLSTATESTUCKNESTED (LEDGER SR1155): the scroll-state query and the painter agree on stuck-ness (named tail block) ----
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): `#h`'s layout id, its document-space flow y (`box_origin`, no sticky hold)
+    /// and layout_core's `sticky_stuck` bit at the engine's page scroll and viewport.
+    fn sticky_scroll_state_stuck_probe(e: &crate::AetherEngine) -> (f32, u8) {
+        let t = e.layout_tree.as_ref().expect("laid out");
+        let id = t.node_map.iter().find(|(_, n)| layout_core::DomNode::attr(*n, "id").as_deref() == Some("h")).map(|(k, _)| *k).expect("#h has a box");
+        let vs = (e.scroll_x as f32, e.scroll_y as f32);
+        let flow = layout_core::scroll::box_origin(t, id, vs).expect("#h has an origin").1;
+        (flow, layout_core::scroll::sticky_stuck(t, id, vs, (e.width as f32, e.height as f32)))
+    }
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): SR1152's panel fixture at panel offsets 0, 20 and 300: the painter's first red
+    /// row in column 10 against `#h`'s flow y says whether the painter holds it; the query's bit says the same (flow 80 /
+    /// painted 80; flow 60 / painted 60; flow -220 / painted 50 = `stuck: top`).
+    #[test]
+    fn sticky_scroll_state_stuck_nested_agrees_with_painter() {
+        for (to, want_painted, want_stuck) in [(0.0, 80usize, 0u8), (20.0, 60, 0), (300.0, 50, css_core::container::TOP)] {
+            let mut e = sticky_nested_scroller_panel();
+            if to > 0.0 {
+                sticky_nested_scroller_wheel(&mut e, to);
+            }
+            let painted = (0..e.height as usize).find(|&y| imgalt_px(&e, 10, y) == STICKY_NESTED_RED).expect("#h is painted");
+            let (flow, stuck) = sticky_scroll_state_stuck_probe(&e);
+            assert_eq!(painted, want_painted, "painter at panel offset {to}");
+            assert_eq!(stuck, want_stuck, "query at panel offset {to} (armed at 300 for the nested scrollport)");
+            assert_eq!(stuck != 0, (painted as f32 - flow).abs() > 0.5, "painter and query agree at panel offset {to}");
+        }
+    }
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): SR1152's `overflow: hidden` panel, the PAGE scrolled 400px: the painter leaves
+    /// `#h` in the panel (rows 0..19 not red) and the query reads not stuck (armed: the viewport copy read `stuck: top`).
+    #[test]
+    fn sticky_scroll_state_stuck_nested_hidden_page_scroll() {
+        let mut e = sticky_nested_scroller_engine(
+            r#"<div style="height:50px"></div>"#,
+            "overflow:hidden;height:600px",
+            r#"<div style="height:30px"></div><div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div><div style="height:1000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert!((0..20usize).all(|y| imgalt_px(&e, 10, y) != STICKY_NESTED_RED), "the painter does not hold #h at the viewport");
+        assert_eq!(sticky_scroll_state_stuck_probe(&e).1, 0, "the query reads not stuck (armed: TOP before SR1155)");
+    }
 }
