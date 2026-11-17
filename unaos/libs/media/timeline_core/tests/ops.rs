@@ -2092,3 +2092,28 @@ fn strialinktrim_chain_mark_paints_only_when_linked() {
         assert_ne!(a[i..i + 4], view::LINK, "no mark unlinked");
     }
 }
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): a drag's undo entry named by its kind (named tail block) ----
+
+/// Every drag kind that commits names its undo entry with a `drag ` word within `WORD_MAX`; a marquee and a scrub commit
+/// nothing and have no word.
+#[test]
+fn striaundohistorydrag_drag_kind_words() {
+    use timeline_core::editor::WORD_MAX;
+    use timeline_core::view::DragKind;
+    let named = [
+        (DragKind::TrimIn, "drag trim in"),
+        (DragKind::TrimOut, "drag trim out"),
+        (DragKind::TransitionIn, "drag transition in"),
+        (DragKind::TransitionOut, "drag transition out"),
+        (DragKind::Move, "drag move"),
+        (DragKind::Slip, "drag slip"),
+        (DragKind::Slide, "drag slide"),
+    ];
+    for (k, w) in named {
+        assert_eq!(k.word(), Some(w), "{k:?}");
+        assert!(w.len() <= WORD_MAX, "{w}");
+    }
+    assert_eq!(DragKind::Marquee.word(), None);
+    assert_eq!(DragKind::Scrub.word(), None);
+}

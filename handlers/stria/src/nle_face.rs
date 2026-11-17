@@ -5243,7 +5243,7 @@ impl Face {
 impl Face {
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if v == "history" {
+        if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
             self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N));
             return true;
         }
@@ -6094,5 +6094,22 @@ impl Face {
             SMessage::BrowserPaste(_) => Some(self.key("Ctrl+v", false)),
             _ => None,
         }
+    }
+}
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): `history <n>` (named tail block) ----
+// `history <n>` lists the top n undo entries, newest first, on the one message line (SR876's `history_line`), n in
+// 1..=`UNDO_MAX` (the stack's own cap: bounded). Any other count is refused by name on the message line. View-only:
+// no commit, no dirty, no undo step. `history` alone keeps SR876's `HISTORY_N`.
+impl Face {
+    /// `history <n>`: the line, or the refusal; `None` for any other word.
+    fn history_rows_verb(&mut self, v: &str) -> Option<bool> {
+        let arg = v.strip_prefix("history ")?.trim();
+        let max = timeline_core::editor::UNDO_MAX;
+        self.last_error = Some(match arg.parse::<usize>() {
+            Ok(n) if (1..=max).contains(&n) => self.state.history_line(n),
+            _ => format!("history: {arg:?} is not a count 1..={max}"),
+        });
+        Some(true)
     }
 }
