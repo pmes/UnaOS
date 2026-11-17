@@ -669,6 +669,7 @@ impl EditorState {
 impl EditorState {
     /// The selected clip graded `g` (one commit; the same grade again commits nothing).
     pub fn set_grade(&mut self, g: crate::Grade) -> Result<(), EditError> {
+        if self.set.len() > 1 { return self.grade_set(|_| g); } // STRIAGRADENEXT (SR992): `color` grades every video member of the set (file tail)
         let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.grade == g {
@@ -723,6 +724,55 @@ impl EditorState {
             _ => &mut g.saturation,
         };
         *f = f.saturating_add(d);
-        Some(self.set_grade(g))
+        Some(self.grade_step_to(g)) // STRIAGRADENEXT (SR992): a set steps every video member by the same delta (file tail)
+    }
+}
+
+// ---- STRIAGRADENEXT (LEDGER SR992): the grade over the selection set (named tail block) ----
+// NLE-GRADE-SET: with more than one clip selected (NLE2c's `set`), `color b c s` grades every VIDEO member to that grade
+// and a step word moves every video member by the primary's step (the same delta, relative), each through SR869's
+// `Timeline::set_grade` on one clone and ONE `commit` (one undo step). Audio members are skipped (none left:
+// `EditError::Kind`); a member stepped past -1000..=1000 refuses the whole edit (`EditError::Grade`, not clamped); nothing
+// changed commits nothing. A set of one keeps SR869 / SR899's primary road unchanged.
+impl EditorState {
+    /// Every video member of the set graded `f(its grade)`, ONE commit (see the block head).
+    fn grade_set(&mut self, f: impl Fn(crate::Grade) -> crate::Grade) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = &self.timeline;
+        let picks: Vec<(usize, usize, crate::Grade)> = self
+            .set
+            .iter()
+            .filter(|&&(t, i)| tl.tracks.get(t).is_some_and(|tr| tr.kind == crate::Kind::Video && i < tr.clips.len()))
+            .map(|&(t, i)| (t, i, f(tl.tracks[t].clips[i].grade)))
+            .collect();
+        if picks.is_empty() {
+            return Err(EditError::Kind);
+        }
+        if picks.iter().all(|&(t, i, g)| tl.tracks[t].clips[i].grade == g) {
+            return Ok(());
+        }
+        let mut next = self.timeline.clone();
+        for &(t, i, g) in &picks {
+            next = next.set_grade(t, i, g)?;
+        }
+        self.commit(next);
+        Ok(())
+    }
+    /// A step word's grade `g` (the primary's stepped): one clip through `set_grade`, a set through [`grade_shift`].
+    fn grade_step_to(&mut self, g: crate::Grade) -> Result<(), EditError> {
+        if self.set.len() <= 1 {
+            return self.set_grade(g);
+        }
+        let was = self.selected().map_or(g, |c| c.grade);
+        self.grade_set(|o| grade_shift(o, was, g))
+    }
+}
+
+/// `o` moved by `to - was`, field by field (saturating; the range is `validate`'s to refuse).
+fn grade_shift(o: crate::Grade, was: crate::Grade, to: crate::Grade) -> crate::Grade {
+    crate::Grade {
+        brightness: o.brightness.saturating_add(to.brightness.saturating_sub(was.brightness)),
+        contrast: o.contrast.saturating_add(to.contrast.saturating_sub(was.contrast)),
+        saturation: o.saturation.saturating_add(to.saturation.saturating_sub(was.saturation)),
     }
 }
