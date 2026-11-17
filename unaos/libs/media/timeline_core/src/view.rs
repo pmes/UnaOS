@@ -350,7 +350,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_transitions(&mut c, l, st);
+    paint_xkeys(&mut c, l, st); paint_transitions(&mut c, l, st); // STRIAXFORMKEYSNAV (SR9069): a keyed clip's point marks (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -1187,5 +1187,25 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): a keyed clip's placement points marked on its body (named tail block) ----
+// One 3 px x 7 px [`XKEY`] mark centred on each point a clip shows ([`crate::Clip::point_ticks`]), at the body's vertical
+// middle, painted over the selection and under the transitions and the playhead. An unkeyed clip paints nothing here.
+
+/// A placement point's mark.
+pub const XKEY: [u8; 4] = [0xff, 0xff, 0xff, 255];
+
+/// Every keyed clip's point marks (nothing when no clip has points).
+fn paint_xkeys(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, track) in st.timeline.tracks.iter().enumerate() {
+        let ym = l.row_y(row) + ROW_H as i64 / 2;
+        for clip in track.clips.iter().filter(|cl| !cl.xkeys.is_empty()) {
+            for t in clip.point_ticks() {
+                let x = l.x_of(t);
+                c.rect(x - 1, ym - 3, x + 2, ym + 4, XKEY);
+            }
+        }
     }
 }

@@ -755,3 +755,80 @@ mod striaxformkeys {
         assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "a point with no event above");
     }
 }
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the playhead to a clip's placement points and their marks (named tail block) ----
+mod striaxformkeysnav {
+    use super::base;
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, Layout, Order, ROW_H, XKEY};
+    use timeline_core::{EditError, Timeline, XKeys, Xform};
+
+    /// Clip 1 of track 0 (B 20..30 at 10) with points on source ticks 22, 27 and 35 (35 lies past the clip's span).
+    fn keyed() -> Timeline {
+        let (tl, _, _) = base();
+        let k = XKeys::NONE.with(22, Xform::PIP).unwrap().with(27, Xform::NONE).unwrap().with(35, Xform::PIP).unwrap();
+        tl.set_xkeys(0, 1, k).unwrap()
+    }
+
+    #[test]
+    fn striaxformkeysnav_point_ticks_shown_only() {
+        let tl = keyed();
+        let c = tl.tracks[0].clips[1];
+        assert_eq!((c.point_tick(22), c.point_tick(35)), (12, 25), "the inverse of src_tick");
+        assert_eq!(c.src_tick(c.point_tick(27)), 27);
+        assert_eq!(c.point_ticks().collect::<Vec<_>>(), vec![12, 17], "a point outside the span is not shown");
+        assert_eq!(tl.tracks[0].clips[0].point_ticks().count(), 0, "an unkeyed clip shows none");
+    }
+
+    #[test]
+    fn striaxformkeysnav_nav_seeks_without_an_undo_step() {
+        let tl = keyed();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip next"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        st.seek(10);
+        assert_eq!(st.verb("pip prev"), Some(Err(EditError::XKey)), "no point before");
+        assert_eq!(st.playhead, 10);
+        assert_eq!(st.verb("pip next"), Some(Ok(())));
+        assert_eq!(st.playhead, 12);
+        assert_eq!(st.verb("pip next"), Some(Ok(())));
+        assert_eq!(st.playhead, 17);
+        assert_eq!(st.verb("pip next"), Some(Err(EditError::XKey)), "the point past the span is not a stop");
+        assert_eq!(st.playhead, 17);
+        assert_eq!(st.verb("pip prev"), Some(Ok(())));
+        assert_eq!(st.playhead, 12);
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0), "view-only: no commit");
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("pip prev"), Some(Err(EditError::XKey)), "an unkeyed clip has no stops");
+    }
+
+    #[test]
+    fn striaxformkeysnav_paint_marks_only_keyed_clips() {
+        let (tl0, _, _) = base();
+        let plain = EditorState::new(tl0);
+        let st = EditorState::new(keyed());
+        let (w, h) = (400u32, 200u32);
+        let a = view::paint(&plain, w, h, Order::Rgba, None, None);
+        let b = view::paint(&st, w, h, Order::Rgba, None, None);
+        let l = Layout::of(w, h, &st);
+        let ym = l.row_y(0) + ROW_H as i64 / 2;
+        let mut marked = Vec::new();
+        for t in [12i64, 17] {
+            let x = l.x_of(t);
+            for y in ym - 3..ym + 4 {
+                for xx in x - 1..x + 2 {
+                    marked.push((y * w as i64 + xx) as usize * 4);
+                }
+            }
+        }
+        for &i in &marked {
+            assert_eq!(&b[i..i + 4], &XKEY, "the mark's pixel at {i}");
+        }
+        for i in (0..a.len()).step_by(4) {
+            if !marked.contains(&i) {
+                assert_eq!(&a[i..i + 4], &b[i..i + 4], "outside the marks the paint is the unkeyed one at {i}");
+            }
+        }
+        assert_ne!(a, b);
+    }
+}

@@ -3823,7 +3823,7 @@ fn striapositionscale_face_pip_is_one_undo_step() {
 #[test]
 fn striaxformpresets_face_presets_and_placement_line() {
     use stria::nle_face::{EditorState, Face, PixelOrder, SURFACE, VERBS, synth_fixture};
-    assert_eq!(&VERBS[VERBS.len() - 3..], &["scale-", "scale+", "help"]);
+    assert_eq!(&VERBS[VERBS.len() - 5..VERBS.len() - 2], &["scale-", "scale+", "pip key"]); // STRIAXFORMKEYSNAV (SR9069): `pip key` / `pip unkey` now stand between scale+ and help
     let (tl0, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
     assert!(face.verb("scale+"));
@@ -3888,4 +3888,35 @@ fn striaxformkeys_face_key_note() {
     assert!(face.verb("pip key"));
     assert_eq!(face.last_error.take(), Some(format!("pip key: {}", timeline_core::EditError::XKey)));
     assert_eq!(face.state.undo_depth(), 3);
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the key / unkey buttons and the playhead to a clip's points (named tail block) ----
+/// STRIAXFORMKEYSNAV (SR9069): `pip key` / `pip unkey` are VERBS words just before `help` (their buttons); two points set
+/// through them, `pip prev` / `pip next` move the playhead between them with no undo step and the message row reads the
+/// placement shown there; no point that way is refused by name with the playhead unmoved.
+#[test]
+fn striaxformkeysnav_face_buttons_and_nav() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["pip key", "pip unkey", "help"]);
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.playhead = 11;
+    assert!(face.verb("pip tl"));
+    assert!(face.verb("pip key"));
+    face.state.playhead = 18;
+    assert!(face.verb("pip br"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.undo_depth(), 3);
+    assert!(face.verb("pip prev"));
+    assert_eq!((face.state.playhead, face.last_error.take()), (11, None));
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 25 y 25 scale 250 keys 2"));
+    assert!(face.verb("pip next"));
+    assert_eq!(face.state.playhead, 18);
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 725 y 725 scale 250 keys 2"));
+    assert!(face.verb("pip next"));
+    assert_eq!(face.last_error.take(), Some(format!("pip next: {}", timeline_core::EditError::XKey)));
+    assert_eq!((face.state.playhead, face.state.undo_depth()), (18, 3));
+    assert!(face.verb("pip unkey"));
+    assert_eq!(face.state.selected().map(|c| c.xkeys.len()), Some(1));
 }

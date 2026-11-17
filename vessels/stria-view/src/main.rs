@@ -187,7 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey" | "prev" | "next")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -520,7 +520,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("pip", "PiP"), // STRIAPOSITIONSCALE (SR879): the selected clip to the bottom-right quarter (THE `pip` verb)
-        button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
+        button("scale-", "Scale -"), button("scale+", "Scale +"), button("pip key", "Key"), button("pip unkey", "Unkey"), // STRIAXFORMKEYSNAV (SR9069): a placement point at the playhead set / removed; STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -1017,5 +1017,35 @@ mod striaxformkeys_tests {
         assert_eq!(face.state.selected().map(|c| c.xkeys.len()), Some(0));
         assert_eq!(drive(&mut face, "pip:unkey"), vec![format!("pip unkey: {}", timeline_core::EditError::XKey)]);
         assert_eq!(face.state.undo_depth(), 3);
+    }
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the witness's key / unkey buttons and point nav tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformkeysnav_tests {
+    use super::*;
+
+    /// STRIAXFORMKEYSNAV (SR9069): the Key / Unkey buttons stand just before help and fire `pip key` / `pip unkey`;
+    /// `pip:prev` / `pip:next` move the playhead between the selected clip's points with no undo step; no point that
+    /// way is refused by name.
+    #[test]
+    fn striaxformkeysnav_witness_nav_tokens() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let texts: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
+        assert_eq!(&texts[texts.len() - 3..], &["pip key".to_string(), "pip unkey".to_string(), "help".to_string()]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        face.state.playhead = 11;
+        assert!(drive(&mut face, "pip:tl,pip:key").is_empty());
+        face.state.playhead = 18;
+        assert!(drive(&mut face, "pip:br").is_empty());
+        let depth = face.state.undo_depth();
+        assert!(drive(&mut face, "pip:prev").is_empty());
+        assert_eq!((face.state.playhead, face.state.undo_depth()), (11, depth));
+        assert!(drive(&mut face, "pip:next").is_empty());
+        assert_eq!(face.state.playhead, 18);
+        assert_eq!(drive(&mut face, "pip:next"), vec![format!("pip next: {}", timeline_core::EditError::XKey)]);
+        assert_eq!(face.state.playhead, 18);
     }
 }

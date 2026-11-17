@@ -1953,3 +1953,18 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the timeline ticks a keyed clip shows its points at (named tail block) ----
+// A clip's placement points sit on SOURCE ticks ([`XKeys`]); [`Clip::point_tick`] maps one back to the timeline (the
+// inverse of [`Clip::src_tick`], rate 1) and [`Clip::point_ticks`] yields only the points the clip SHOWS (a trim can leave
+// a point outside the span). Read by the editor's `pip prev` / `pip next` and the painter's key marks.
+impl Clip {
+    /// The timeline tick source tick `src_t` shows at on this clip (rate 1).
+    pub fn point_tick(&self, src_t: i64) -> i64 {
+        self.at + (src_t - self.src_in)
+    }
+    /// The timeline ticks of the points this clip shows, ascending.
+    pub fn point_ticks(&self) -> impl Iterator<Item = i64> + '_ {
+        self.xkeys.iter().map(move |p| self.point_tick(p.0)).filter(move |&t| self.covers(t))
+    }
+}
