@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "tc", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "tc", "goto", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIADROPFRAMEFACE (SR9078): `goto <timecode|frames>` seeks the playhead (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2255,15 +2255,15 @@ fn paint_export(px: Vec<u8>, l: Layout, order: PixelOrder, frac: Option<f64>) ->
 impl Face {
     /// The `in` / `out` verbs: set that mark at the playhead; the same verb again at the same tick clears it. A mark that
     /// would not keep in < out is refused by name and the marks are left as they were. `None` for any other word.
-    fn mark_verb(&mut self, v: &str) -> Option<bool> {
+    fn mark_verb(&mut self, v: &str) -> Option<bool> { let (v, arg) = mark_arg(v);
         let is_in = match v {
             "in" => true,
             "out" => false,
             _ => return None,
         };
-        let ph = self.state.playhead;
+        let ph = match arg.map(|a| timeline_core::edl::tc_entry(a, &self.state.timeline)) { None => self.state.playhead, Some(Ok(t)) => t, Some(Err(m)) => { self.last_error = Some(format!("{v}: {m}")); return Some(true); } }; // STRIADROPFRAMEFACE (SR9078): `in` / `out <timecode|frames>` marks at the typed tick (file tail)
         let (a, b) = self.state.timeline.marks; let (mine, other) = if is_in { (a, b) } else { (b, a) }; // NLE5DRANGESAVE (SR723): the marks are the timeline's
-        let set = if mine == Some(ph) {
+        let set = if mine == Some(ph) && arg.is_none() { // STRIADROPFRAMEFACE (SR9078): a typed timecode always sets
             None
         } else {
             match other {
@@ -3315,5 +3315,58 @@ mod striatcthree_tests {
         assert_eq!(clock_ns(Timebase { num: 1001, den: 60000 }, 25), 16_683_333);
         assert_eq!(clock_ns(Timebase { num: 1, den: 25 }, 25), 40_000_000);
         assert_eq!(clock_ns(Timebase { num: 1, den: 30 }, 30), 1_000_000_000 / 30);
+    }
+}
+
+// ---- STRIADROPFRAMEFACE (LEDGER SR9078): typed timecode entry on the face — `in` / `out <tc>` and `goto <tc>` (named tail block) ----
+// `in` / `out <timecode|frames>` set that mark at the typed tick (`Face::mark_verb`'s three folds; a typed timecode always
+// sets, only the bare word toggles off) and `goto <timecode|frames>` seeks the playhead through `EditorState::seek` (a view
+// word: no commit, no undo step, not dirty). The text is read by `timeline_core::edl::tc_entry` (THE typed reader: drop-frame
+// `;` on a 29.97 / 59.94 base, a dropped number refused by name); a refusal is `last_error`, nothing moves. A bare `goto`
+// names its usage. Stria-view: the `goto` button, and `--do goto=<tc>` (the rest of the token verbatim, colons and all).
+
+/// STRIADROPFRAMEFACE (SR9078): `in <arg>` / `out <arg>` as (the word, its argument); any other text is `(v, None)`.
+fn mark_arg(v: &str) -> (&str, Option<&str>) {
+    match v.split_once(' ') {
+        Some((w @ ("in" | "out"), a)) => (w, Some(a.trim())),
+        _ => (v, None),
+    }
+}
+
+/// STRIADROPFRAMEFACE (SR9078): the bare `goto`'s message (a button press, or the word with no argument).
+pub const GOTO_USAGE: &str = "goto: usage: goto <timecode|frames>";
+
+impl Face {
+    /// `goto <timecode|frames>`: seeks the playhead to the typed tick (clamped to the timeline as every seek is). `None` for
+    /// any other word.
+    fn goto_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("goto") {
+            return None;
+        }
+        let args: Vec<&str> = words.collect();
+        match args.as_slice() {
+            [a] => match timeline_core::edl::tc_entry(a, &self.state.timeline) {
+                Ok(t) => self.state.seek(t),
+                Err(m) => self.last_error = Some(format!("goto: {m}")),
+            },
+            _ => self.last_error = Some(String::from(GOTO_USAGE)),
+        }
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striadropframeface_tests {
+    use super::*;
+
+    /// `mark_arg` splits only `in` / `out` with an argument; every other word passes through whole.
+    #[test]
+    fn striadropframeface_mark_arg_splits_only_marks() {
+        assert_eq!(mark_arg("in 00:01:00;02"), ("in", Some("00:01:00;02")));
+        assert_eq!(mark_arg("out  1800"), ("out", Some("1800")));
+        assert_eq!(mark_arg("in"), ("in", None));
+        assert_eq!(mark_arg("kind W007"), ("kind W007", None));
+        assert_eq!(mark_arg("tc frames"), ("tc frames", None));
     }
 }
