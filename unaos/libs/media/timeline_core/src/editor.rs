@@ -310,7 +310,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
+        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -2586,7 +2586,7 @@ impl EditorState {
     pub fn jump_targets(&self, j: Jump) -> Vec<i64> {
         match j {
             Jump::Cut => crate::view::snap_targets(self, &[], false),
-            Jump::Marker => self.timeline.markers.iter().map(|m| m.at).collect(),
+            Jump::Marker => self.marker_jump_targets(), // STRIAMARKERRANGES (SR9052): a range end is a target too (file tail)
         }
     }
     /// The playhead to the first target after it (`forward`, at most `timeline.end()`) or the last target before it,
@@ -4415,5 +4415,108 @@ mod striafreezethree_tests {
         let mut st = titled();
         assert_eq!(st.verb("retitle One\\nTwo"), Some(Ok(())));
         assert_eq!(st.timeline.source_by_reel("T1").and_then(|s| s.title.as_deref()), Some("One\nTwo"));
+    }
+}
+
+// ---- STRIAMARKERRANGES (LEDGER SR9052): range ends as marker jump targets; marks to a marker's range (named tail block) ----
+// A ranged marker (`Marker.len > 0`, SR984) has two jump targets for SR894's `marker-` / `marker+`: its `at` and its end
+// `at + len` (`marker_jump_targets`, the `Jump::Marker` list `jump` walks, sorted, one entry per tick). `marker marks` sets
+// the export marks (`Timeline::marks`) to the range of the last marker at or before the playhead through SR723's
+// `set_marks` (ONE commit, or none when the marks already equal it). Refused as `EditError::Marker` with no commit: no
+// marker at or before the playhead, or that marker is a point (`len == 0`).
+
+/// STRIAMARKERRANGES (SR9052): exactly the two words `marker marks` (whitespace trimmed).
+pub fn marker_marks_word(v: &str) -> bool {
+    let mut w = v.split_ascii_whitespace();
+    w.next() == Some("marker") && w.next() == Some("marks") && w.next().is_none()
+}
+
+impl EditorState {
+    /// The marker jump targets: every marker's `at` and every ranged marker's end `at + len`, sorted ascending, deduped.
+    pub fn marker_jump_targets(&self) -> Vec<i64> {
+        let mut t: Vec<i64> = self.timeline.markers.iter().flat_map(|m| core::iter::once(m.at).chain((m.len > 0).then_some(m.at + m.len))).collect();
+        t.sort_unstable();
+        t.dedup();
+        t
+    }
+    /// The export marks set to the range of the last marker at or before the playhead (SR723's `set_marks`: one commit,
+    /// or none when the marks already equal it). Refused: no such marker, or it is a point marker (`EditError::Marker`).
+    pub fn marks_to_marker(&mut self) -> Result<(), EditError> {
+        let m = self.timeline.marker_before(self.playhead).ok_or(EditError::Marker)?;
+        if m.len <= 0 {
+            return Err(EditError::Marker);
+        }
+        let (a, b) = (m.at, m.at + m.len);
+        self.set_marks((Some(a), Some(b)))
+    }
+    /// The `marker marks` word of [`EditorState::verb`]; `None` for any other word.
+    fn marker_marks_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        marker_marks_word(v).then(|| self.marks_to_marker())
+    }
+}
+
+#[cfg(test)]
+mod striamarkerranges_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// One 35-tick clip; marker A at 5 spanning 4 (end 9), marker B at 12 (a point).
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 35, 0)];
+        let tl = tl.mark(5, "A").unwrap().mark(12, "B").unwrap().range_marker(5, 4).unwrap();
+        EditorState::new(tl)
+    }
+
+    /// STRIAMARKERRANGES M3: a range end is a `marker+` / `marker-` stop between the markers; an end on the next marker's
+    /// tick is one target; a jump is not an undo step.
+    #[test]
+    fn striamarkerranges_range_end_is_a_jump_target() {
+        let mut st = state();
+        assert_eq!(st.jump_targets(Jump::Marker), alloc::vec![5, 9, 12]);
+        for want in [5, 9, 12, 12] {
+            assert_eq!(st.verb("marker+"), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        for want in [9, 5, 5] {
+            assert_eq!(st.verb("marker-"), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        assert_eq!(st.undo_depth(), 0, "a jump is not an undo step");
+        st.timeline = st.timeline.range_marker(5, 7).unwrap();
+        assert_eq!(st.jump_targets(Jump::Marker), alloc::vec![5, 12], "A's end on B's tick: one target");
+    }
+
+    /// STRIAMARKERRANGES M3: `marker marks` sets the export marks to the range of the marker at or before the playhead in
+    /// ONE undo step; again, nothing; at a point marker or before every marker, `Marker` and no step.
+    #[test]
+    fn striamarkerranges_marks_to_marker_is_one_commit() {
+        let mut st = state();
+        assert_eq!(st.verb("marker marks"), Some(Err(EditError::Marker)), "no marker at or before 0");
+        st.seek(7);
+        assert_eq!(st.verb("marker marks"), Some(Ok(())));
+        assert_eq!((st.timeline.marks, st.undo_depth()), ((Some(5), Some(9)), 1));
+        assert_eq!(st.verb("marker marks"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same marks commit nothing");
+        st.seek(20);
+        assert_eq!(st.verb("marker marks"), Some(Err(EditError::Marker)), "B is a point marker");
+        assert_eq!(st.undo_depth(), 1);
+        assert!(st.undo());
+        assert_eq!(st.timeline.marks, (None, None));
+    }
+
+    /// STRIAMARKERRANGES M3: the word parses exactly; no other parser takes it.
+    #[test]
+    fn striamarkerranges_word() {
+        assert!(marker_marks_word(" marker  marks "));
+        for v in ["marker marks x", "marks", "marker", "marker mark"] {
+            assert!(!marker_marks_word(v), "{v}");
+        }
+        assert_eq!(marker_word("marker marks"), None);
+        assert_eq!(marker_style_word("marker marks"), None);
+        assert_eq!(jump_word("marker marks"), None);
+        assert_eq!(mark_words("marker marks"), None);
     }
 }
