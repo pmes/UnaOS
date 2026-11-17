@@ -683,6 +683,8 @@ pub struct PpsInter {
     pub weighted_pred: bool,
     pub weighted_bipred: bool,
     pub lists_modification: bool,
+    /// HEVCCONCEALWEIGHTEDSLICES (SR1067): dependent_slice_segments_enabled_flag.
+    pub dependent_slices: bool,
 }
 
 pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
@@ -717,7 +719,7 @@ pub fn pps_rbsp_scc(c: &PpsCfg, x: &PpsInter, r: &PpsRext, scc: Option<&PpsScc>)
     let mut b = BitWriter::default();
     b.ue(0);
     b.ue(0);
-    b.bit(0); // dependent_slice_segments_enabled_flag
+    b.flag(x.dependent_slices); // dependent_slice_segments_enabled_flag
     b.bit(0); // output_flag_present_flag
     b.u(0, 3);
     b.flag(c.sign_hiding);
@@ -863,6 +865,9 @@ pub struct SliceCfg {
     pub chroma_weights_l1: Option<Vec<Option<[(i32, i32); 2]>>>,
     pub five_minus_max_num_merge_cand: u32,
     pub deblocking_disabled: bool,
+    /// HEVCCONCEALWEIGHTEDSLICES (SR1067): a segment after the first: (slice_segment_address, its Ceil(Log2(PicSizeInCtbsY)) bits,
+    /// dependent_slice_segment_flag when the PPS enables dependent segments); None: the first segment.
+    pub segment: Option<(u32, u32, Option<bool>)>,
 }
 
 pub fn slice_header(c: &SliceCfg) -> BitWriter {
@@ -874,11 +879,11 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
     let mut b = BitWriter::default();
     let irap = (16..=23).contains(&c.nal_type);
     let idr = c.nal_type == 19 || c.nal_type == 20;
-    b.bit(1); // first_slice_segment_in_pic_flag
+    b.flag(c.segment.is_none()); // first_slice_segment_in_pic_flag
     if irap {
         b.bit(0); // no_output_of_prior_pics_flag
     }
-    b.ue(0);
+    b.ue(0); if segment_head(&mut b, c) { b.trailing(); return b; }
     b.ue(c.slice_type);
     if !idr {
         b.u(c.poc_lsb as u64, 8);
@@ -1340,4 +1345,64 @@ pub fn bi_ref_body(mut e: CabacEnc, n: u32, refs: [u32; 2], m0: [i32; 2], m1: [i
 /// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion. [`bi_ref_body`] at refs (0, 0): the same bins.
 pub fn bi_body(e: CabacEnc, n: u32, m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
     bi_ref_body(e, n, [0, 0], m0, m1)
+}
+
+// ---- HEVCCONCEALWEIGHTEDSLICES (LEDGER SR1067): a picture coded as two slice segments (named tail block) ----
+
+/// HEVCCONCEALWEIGHTEDSLICES (SR1067): the fields 7.3.6.1 codes after slice_pic_parameter_set_id in a segment that is not the
+/// picture's first (`c.segment`): dependent_slice_segment_flag when the PPS enables it, then slice_segment_address. True for a
+/// dependent segment, whose header ends there (no tiles, no wavefronts, no header extension in the kit).
+pub fn segment_head(b: &mut BitWriter, c: &SliceCfg) -> bool {
+    let Some((addr, bits, dep)) = c.segment else {
+        return false;
+    };
+    if let Some(d) = dep {
+        b.flag(d);
+    }
+    b.u(addr as u64, bits);
+    dep == Some(true)
+}
+
+/// HEVCCONCEALWEIGHTEDSLICES (SR1067): one 32x32 picture of four 16x16 CTBs coded as TWO slice segments. Segment 1 (`top`) is
+/// CTB 0 a 2Nx2N AMVP unit (no neighbours, no TMVP: mvp 0, so mv = `mvd`) and CTB 1 a skip unit (ctxInc 0) merging it. Segment 2
+/// (`bottom` at slice_segment_address 2, 2 bits, `dep` its dependent_slice_segment_flag when the PPS codes it): independent, CTB 2
+/// its own AMVP unit at `mvd` (CTB 0 is another slice: unavailable) and CTB 3 a skip unit (ctxInc 0: CTB 2 not skipped, CTB 1
+/// unavailable) merging CTB 2; dependent (`dep` Some(true)), the contexts restored from the end of segment 1 (9.3.1
+/// TableStateIdxDs), CTB 2 a skip unit (ctxInc 0) merging CTB 0 above and CTB 3 one (ctxInc 2): `amvp_then_merge`'s bins split
+/// at CTB 2.
+pub fn two_segments(top: &SliceCfg, bottom: &SliceCfg, dep: Option<bool>, mvd: [i32; 2]) -> Vec<u8> {
+    let amvp = |e: &mut CabacEnc| {
+        e.split_cu(0, false);
+        e.cu_skip(0, false);
+        e.pred_inter();
+        e.part_mode_2nx2n();
+        e.merge_flag(false);
+        e.mvd(mvd);
+        e.mvp_flag(0);
+        e.rqt_root_cbf(false);
+    };
+    let skip = |e: &mut CabacEnc, inc: usize| {
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+    };
+    let mut e = CabacEnc::new(slice_header(top), init_type(top.slice_type), 26);
+    amvp(&mut e);
+    e.terminate(0);
+    skip(&mut e, 0);
+    let state = e.state;
+    let mut s = nal(top.nal_type, &e.finish().out);
+    let cfg = SliceCfg { segment: Some((2, 2, dep)), ..bottom.clone() };
+    let mut e = CabacEnc::new(slice_header(&cfg), init_type(top.slice_type), 26);
+    if dep == Some(true) {
+        e.state = state;
+        skip(&mut e, 0);
+        e.terminate(0);
+        skip(&mut e, 2);
+    } else {
+        amvp(&mut e);
+        e.terminate(0);
+        skip(&mut e, 0);
+    }
+    s.extend(nal(top.nal_type, &e.finish().out));
+    s
 }
