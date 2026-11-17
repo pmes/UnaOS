@@ -11531,4 +11531,128 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
     }
+
+    // ---- AETHERCSSOMNESTEDSCROLLERRECTS (LEDGER SR1154): CSSOM rects inside a scrolled panel read where the painter places them (named tail block) ----
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): 400x300, body margin 0: a 50px spacer, `#p` (position: relative, 200px tall,
+    /// overflow: auto) holding twenty 50px rows `#r0..#r19` (row k at content y 50k, document y 50 + 50k) and a fixed `#fx`
+    /// (top 5, left 300, 10x10), then a 2000px spacer `#tail`.
+    fn cssom_nested_scroller_rects_engine() -> crate::AetherEngine {
+        let rows: String = (0..20).map(|k| format!(r#"<div id="r{k}" style="height:50px"></div>"#)).collect();
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0">
+            <div id="top" style="height:50px"></div>
+            <div id="p" style="position:relative;height:200px;overflow:auto">{rows}<div id="fx" style="position:fixed;top:5px;left:300px;width:10px;height:10px"></div></div>
+            <div id="tail" style="height:2000px"></div>
+        </body></html>"#
+        );
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a wheel of `dy` with the pointer at viewport (`px`, `py`), then a repaint and
+    /// the shell's per-turn `tick` (the page scroll handed to the CSSOM).
+    fn cssom_nested_scroller_rects_wheel(e: &mut crate::AetherEngine, px: f64, py: f64, dy: f64) {
+        e.handle_event(crate::api::events::Event::MouseMove(px, py));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        e.tick();
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): unscrolled every rect is its flow place: `#r8` top 450 (50 + 8 x 50).
+    #[test]
+    fn cssom_nested_scroller_rects_unscrolled_flow_place() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "p").1, 50.0, "#p at document y 50");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 450.0, "#r8 at its flow place");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a wheel of 300 inside `#p` scrolls the panel (not the page); `#r8`'s
+    /// getBoundingClientRect() and getClientRects() read top 150 (Chromium: 50 + 400 - 300) and elementFromPoint(10, 160) is
+    /// `#r8` (armed: 450, and the point hit `#r2`'s old flow place, before SR1154).
+    #[test]
+    fn cssom_nested_scroller_rects_wheel_reads_painted_place() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel, not the page");
+        assert_eq!(js_num(&mut e, "document.getElementById('p').scrollTop"), 300.0, "#p scrolled 300");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 150.0, "#r8's bounding top moves with the panel (armed: 450 before SR1154)");
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').getClientRects()[0].top"), 150.0, "getClientRects follows the same conversion");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 160.0), "r8", "elementFromPoint at #r8's painted place (armed before SR1154)");
+        assert_eq!(imgalt_rect(&mut e, "p").1, 50.0, "the panel itself does not move");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the cache does not go stale on a SCRIPT scroll either: after
+    /// `p.scrollTop = 300` and one frame (the request lands in `scroll_frame`), `#r8` reads 150 (armed: 450 before SR1154).
+    #[test]
+    fn cssom_nested_scroller_rects_script_scroll_top() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 450.0, "read once unscrolled: the cache is warm");
+        e.js_engine.as_mut().unwrap().eval_string("document.getElementById('p').scrollTop = 300").unwrap();
+        e.tick();
+        assert_eq!(js_num(&mut e, "document.getElementById('p').scrollTop"), 300.0, "#p scrolled 300");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 150.0, "#r8 after a script scroll (armed: 450 before SR1154)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 160.0), "r8", "elementFromPoint follows");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): offsetTop is relative to the offsetParent (`#p`, positioned) in its content
+    /// space and does NOT take the scroll: `#r8`.offsetTop is 400 before and after the panel scrolls 300 (pin).
+    #[test]
+    fn cssom_nested_scroller_rects_offset_top_unchanged() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        let parent = e.js_engine.as_mut().unwrap().eval_string("String(document.getElementById('r8').offsetParent.id)").unwrap();
+        assert_eq!(parent, "p", "#r8's offsetParent is the positioned panel");
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').offsetTop"), 400.0, "unscrolled");
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').offsetTop"), 400.0, "the panel scrolled 300: unchanged");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the panel shift and the page scroll compose: panel 300, then a wheel of 100
+    /// over `#tail` scrolls the page, and `#r8` reads 450 - 300 - 100 = 50.
+    #[test]
+    fn cssom_nested_scroller_rects_page_scroll_composes() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 280.0, 100.0);
+        assert_eq!(e.scroll_y, 100.0, "the page scrolled 100");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 50.0, "#r8: panel and page scroll both subtracted");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the claim — with `#p` scrolled 300, the shell's hit test (the painter's
+    /// `content_shift`) and elementFromPoint (through `client_rect`) name the same row at three points inside the panel.
+    #[test]
+    fn cssom_nested_scroller_rects_shell_and_cssom_agree() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        for (x, y, want) in [(10.0, 60.0, "r6"), (10.0, 160.0, "r8"), (10.0, 240.0, "r9")] {
+            let shell = hit_sticky_origin_id(&e, x, y);
+            assert_eq!(shell, want, "the shell hits {want} at ({x}, {y})");
+            assert_eq!(bounding_sticky_from_point(&mut e, x, y), shell, "shell hit test and elementFromPoint agree at ({x}, {y})");
+        }
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): AETHER-CSSOM-HIT-SCROLLER-CLIP for the chain case — with `#p` scrolled 300, the
+    /// rows scrolled out of it have shifted rects outside its padding box (`#r5` over the spacer above at 0..50, `#r10` over
+    /// `#tail` below at 250..300, both in the positioned panel's layer above the flow): elementFromPoint there is NOT a row.
+    #[test]
+    fn cssom_nested_scroller_rects_hit_clipped_to_panel() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(imgalt_rect(&mut e, "r5").1, 0.0, "#r5's shifted rect lies over the spacer above the panel");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 20.0), "top", "above #p: the spacer, not the hidden #r5");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 270.0), "tail", "below #p: #tail, not the hidden #r10");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a fixed box inside the panel is placed against the viewport, so the panel's
+    /// shift does not move it: `#fx` reads top 5 before and after the panel scrolls 300 (the chain resets at a fixed box).
+    #[test]
+    fn cssom_nested_scroller_rects_fixed_inside_unchanged() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "fx").1, 5.0, "#fx at top: 5px");
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(imgalt_rect(&mut e, "fx").1, 5.0, "#fx ignores the panel's scroll");
+    }
 }
