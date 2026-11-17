@@ -34,7 +34,7 @@ pub fn install(vm: &mut Vm) {
         let m = vm.error_string(&e);
         crate::ledger::record_js(&format!("typed-om-prelude-failed:{}", super::clip(&m, 64)));
         eprintln!("[aether] typed om prelude failed: {m}");
-    }
+    } css_namespace_natives(vm);
 }
 
 const PRELUDE: &str = r#"
@@ -1611,3 +1611,53 @@ const PRELUDE: &str = r#"
     });
 })();
 "#;
+
+// ---- AETHERCSSOMCSSSUPPORTS (LEDGER SR1170): CSS.supports / CSS.escape natives on the CSS namespace (named tail block) ----
+
+/// AETHERCSSOMCSSSUPPORTS (SR1170): cssom-1 §6.7 / css-conditional-3 §7 — `supports` and `escape` as WebIDL namespace
+/// operations on the prelude's `CSS` object (beside the §5.1 unit factories), the natives below.
+fn css_namespace_natives(vm: &mut Vm) {
+    let g = vm.realm().global;
+    let Ok(Value::Object(ns)) = vm.get(g, &PropertyKey::from_str("CSS")) else { return };
+    super::idl::op(vm, ns, "supports", 1, css_supports);
+    super::idl::op(vm, ns, "escape", 1, css_escape);
+}
+
+/// `CSS.supports(property, value)` / `CSS.supports(conditionText)`: the overload by argument count, each argument
+/// ToString'd; the answer is the @supports oracle's (`crate::css::css_supports`). Never throws for a string.
+fn css_supports(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    super::idl::need(vm, ctx, 1, "CSS", "supports")?;
+    let a = super::idl::arg(vm, ctx, 0);
+    let a = super::idl::string(vm, &a)?;
+    let b = if ctx.argc >= 2 {
+        let v = super::idl::arg(vm, ctx, 1);
+        Some(super::idl::string(vm, &v)?)
+    } else {
+        None
+    };
+    Ok(Value::Bool(crate::css::css_supports(&a, b.as_deref())))
+}
+
+/// `CSS.escape(ident)`: cssom-1 §2.1 serialize an identifier.
+fn css_escape(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
+    super::idl::need(vm, ctx, 1, "CSS", "escape")?;
+    let v = super::idl::arg(vm, ctx, 0);
+    let s = super::idl::string(vm, &v)?;
+    let first = s.chars().next();
+    let lone = s.chars().count() == 1;
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '\0' => out.push('\u{FFFD}'),
+            '\u{1}'..='\u{1f}' | '\u{7f}' => out.push_str(&format!("\\{:x} ", c as u32)),
+            '0'..='9' if i == 0 || (i == 1 && first == Some('-')) => out.push_str(&format!("\\{:x} ", c as u32)),
+            '-' if i == 0 && lone => out.push_str("\\-"),
+            c if c as u32 >= 0x80 || c == '-' || c == '_' || c.is_ascii_alphanumeric() => out.push(c),
+            c => {
+                out.push('\\');
+                out.push(c);
+            }
+        }
+    }
+    Ok(super::idl::s(&out))
+}

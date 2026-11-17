@@ -1914,7 +1914,7 @@ impl layout_core::css::ProbeSink for SupportsProbe {
 /// engine's own hooks): `(display: grid)` is false, so a page's `not (display: grid)` fallback applies.
 fn declaration_supported(name: &str, value: &[css_core::CV]) -> bool {
     let name = name.to_ascii_lowercase();
-    property_supported(&name)
+    name.starts_with("--") || property_supported(&name)
         && layout_core::css::declaration_parses::<AetherHost, SupportsProbe>(&name, &value_text(value), &parse_cx())
 }
 
@@ -2019,4 +2019,28 @@ fn inset_font_rel(paint: &crate::layout::PaintStyle, side: usize, fs: f32, root_
 fn decoration_line_words(underline: bool, line_through: bool) -> String {
     let w: Vec<&str> = [(underline, "underline"), (line_through, "line-through")].into_iter().filter(|p| p.0).map(|p| p.1).collect();
     if w.is_empty() { "none".to_string() } else { w.join(" ") }
+}
+
+// ---- AETHERCSSOMCSSSUPPORTS (LEDGER SR1170): CSS.supports' entry to the @supports oracle (named tail block) ----
+
+/// AETHERCSSOMCSSSUPPORTS (SR1170): css-conditional-3 §7 `CSS.supports()` over the ONE oracle @supports uses
+/// ([`declaration_supported`]; no second list). `value` Some: the two-argument form, `property: value` (a value ending
+/// `!important` is not the property's grammar: false). None: `property` is conditionText, parsed and evaluated as a
+/// `<supports-condition>` (css_core `supports_condition`, `selector()` included, the cascade's own closure), else the
+/// same text wrapped in parentheses (a bare declaration); an unparsable text is false.
+pub(crate) fn css_supports(property: &str, value: Option<&str>) -> bool {
+    let decl = |d: &css_core::parser::Declaration| declaration_supported(&d.name, &d.value);
+    let Some(value) = value else {
+        let ns = css_core::selectors::Namespaces::default();
+        let eval = |t: &str| {
+            css_core::stylesheet::supports_condition(&css_core::parser::parse_component_values(t)).is_some_and(|c| c.evaluate(&ns, &decl))
+        };
+        return eval(property) || eval(&format!("({property})"));
+    };
+    let cvs = css_core::parser::parse_component_values(value);
+    let w: Vec<&css_core::CV> = cvs.iter().filter(|c| !c.is_whitespace()).collect();
+    let important = w.len() >= 2
+        && w[w.len() - 2].is_delim('!')
+        && matches!(w[w.len() - 1].ident(), Some(i) if i.eq_ignore_ascii_case("important"));
+    !important && declaration_supported(property, &cvs)
 }

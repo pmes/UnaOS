@@ -12553,4 +12553,105 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
+
+    // ---- AETHERCSSOMCSSSUPPORTS (LEDGER SR1170): CSS.supports and CSS.escape over the one @supports oracle (named tail block) ----
+    fn css_supports_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            #c { width: 10px; height: 10px }
+            @supports (--x: y) { #c { width: 50px } }
+        </style></head><body style="margin:0"><div id="c"></div></body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    fn css_supports_eval(e: &mut crate::AetherEngine, expr: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(expr).unwrap_or_else(|m| format!("threw: {m}"))
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): both operations exist on `CSS` (before SR1170: `undefined`, so a
+    /// feature-detecting script threw a TypeError on its first line).
+    #[test]
+    fn css_supports_typeof() {
+        let mut e = css_supports_engine();
+        assert_eq!(css_supports_eval(&mut e, "typeof CSS.supports"), "function");
+        assert_eq!(css_supports_eval(&mut e, "typeof CSS.escape"), "function");
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): `CSS.supports(property, value)` answers what `@supports (property: value)` answers.
+    /// `display: grid` is false and does not throw (armed: before SR1170 a TypeError): the one oracle drops it (SR1048
+    /// `supports_value_dropped_false`; Chromium true, Aether lays out no grid).
+    #[test]
+    fn css_supports_two_arg() {
+        let mut e = css_supports_engine();
+        for (p, v, want) in [
+            ("display", "grid", "false"),
+            ("display", "flex", "true"),
+            ("display", "bogus", "false"),
+            ("text-align-last", "justify", "true"),
+            ("--x", "anything", "true"),
+            ("color", "red !important", "false"),
+            ("color", "red", "true"),
+        ] {
+            assert_eq!(css_supports_eval(&mut e, &format!("String(CSS.supports('{p}', '{v}'))")), want, "CSS.supports('{p}', '{v}')");
+        }
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): `CSS.supports(conditionText)`: a `<supports-condition>`, else the text wrapped in
+    /// parentheses (a bare declaration); `selector(:has(a))` is true (css_core parses `:has`), a nested `:has` false; an
+    /// unparsable text is false, never a throw.
+    #[test]
+    fn css_supports_condition() {
+        let mut e = css_supports_engine();
+        for (t, want) in [
+            ("(display: flex) and (not (display: bogus))", "true"),
+            ("display: flex", "true"),
+            ("display", "false"),
+            ("selector(:has(a))", "true"),
+            ("selector(:has(:has(a)))", "false"),
+            ("(--x: y)", "true"),
+            ("(display: flex) and", "false"),
+            (")(", "false"),
+        ] {
+            assert_eq!(css_supports_eval(&mut e, &format!("String(CSS.supports('{t}'))")), want, "CSS.supports('{t}')");
+        }
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): ToString on the arguments (no throw for a non-string); no argument is the IDL arity
+    /// TypeError.
+    #[test]
+    fn css_supports_no_throw() {
+        let mut e = css_supports_engine();
+        assert_eq!(css_supports_eval(&mut e, "String(CSS.supports(1, 2))"), "false");
+        assert_eq!(css_supports_eval(&mut e, "try { CSS.supports(); 'none' } catch (x) { x.name }"), "TypeError");
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): the cascade reads the same oracle: `@supports (--x: y)` now applies (before SR1170
+    /// the custom property was not in the support set and #c stayed 10px).
+    #[test]
+    fn css_supports_custom_property_at_rule() {
+        let mut e = css_supports_engine();
+        assert_eq!(css_supports_eval(&mut e, "String(document.getElementById('c').offsetWidth)"), "50");
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): `CSS.escape` is cssom-1 §2.1 serialize an identifier.
+    #[test]
+    fn css_escape_serializes_identifier() {
+        let mut e = css_supports_engine();
+        assert_eq!(css_supports_eval(&mut e, r#"String(CSS.escape("a b#1") === "a\\ b\\#1")"#), "true");
+        assert_eq!(css_supports_eval(&mut e, r#"String(CSS.escape("1a") === "\\31 a")"#), "true");
+        assert_eq!(css_supports_eval(&mut e, r#"String(CSS.escape("-1") === "-\\31 ")"#), "true");
+        assert_eq!(css_supports_eval(&mut e, r#"String(CSS.escape("-") === "\\-")"#), "true");
+        assert_eq!(css_supports_eval(&mut e, r#"String(CSS.escape("_a-bé"))"#), "_a-b\u{e9}");
+    }
+
+    /// AETHERCSSOMCSSSUPPORTS (SR1170): the §5.1 unit factories on `CSS` are unchanged.
+    #[test]
+    fn css_supports_units_pin() {
+        let mut e = css_supports_engine();
+        assert_eq!(css_supports_eval(&mut e, "CSS.px(3).toString()"), "3px");
+        assert_eq!(css_supports_eval(&mut e, "CSS.percent(50).unit"), "percent");
+    }
 }
