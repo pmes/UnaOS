@@ -3629,7 +3629,7 @@ fn striaslipview_release_and_escape_clear_the_pair() {
     println!("striaslipview: release = one slip, then no pair; Esc = no pair");
 }
 
-/// Rule: only a valid video Slip shows the pair: a plain Move, a plain TrimIn, a Ctrl Slide, a refused slip (-5 at
+/// Rule: only a valid video Slip shows the pair: a plain Move, a plain TrimIn, a refused slip (-5 at
 /// B[0,10): `Drag::shown` None) and a slip on the audio track paint no pair, and the refused slip's paint falls back to
 /// today's playhead frame.
 #[test]
@@ -3641,7 +3641,6 @@ fn striaslipview_other_drags_show_no_pair() {
     for (px, py, dx, mods, what) in [
         (x, y, 40.0, 0, "Move"),
         (l.x_of(10) as f64 + 1.0, y, 16.0, 0, "TrimIn"),
-        (l.x_of(10) as f64 + 1.0, y, 16.0, bandy::MOD_CONTROL, "Slide"),
         (l.point(1, 15).0, l.point(1, 15).1, 40.0, bandy::MOD_CONTROL, "audio Slip"),
     ] {
         face.state.select_at(0, 12).unwrap();
@@ -3658,7 +3657,7 @@ fn striaslipview_other_drags_show_no_pair() {
     assert!(face.slip_view().is_none(), "a refused slip shows no pair");
     let (_, src) = synth_fixture();
     assert_eq!(face.still(), preview(&face.state.timeline, &src, 12).unwrap().as_ref(), "today's playhead frame");
-    println!("striaslipview: Move / TrimIn / Slide / audio slip / refused slip -> no pair");
+    println!("striaslipview: Move / TrimIn / audio slip / refused slip -> no pair");
 }
 
 /// Rule: the throttle: a second slip delta painted at once keeps the first pair and sets `slip_due`; the serve clock's
@@ -3724,4 +3723,136 @@ fn striaslipview_split_kats() {
     let (_, r) = striaslipview_halves(&s);
     assert_eq!((&r[0..4], &r[4..12], &r[12..16]), (&field[..], &[5u8; 8][..], &field[..]), "letterboxed: a 2x2 in a 4x2 cell");
     println!("striaslipview: slip_split KATs");
+}
+
+// ---- STRIASLIPVIEWMORE (LEDGER SR946): the slide drag's cuts, the word slips' hold, the witness size (named tail block) ----
+
+/// A FIELD-filled cell of `w` x `h` (the side `slip_split` leaves when its frame is missing).
+fn striaslipviewmore_field(w: u32, h: u32) -> Vec<u8> {
+    timeline_core::view::FIELD.repeat((w * h) as usize)
+}
+
+/// Rule: a Ctrl Slide on B's in handle (SR737's pair: A[13,23)@0 butted to B[0,10)@10, A@25 NOT butted) shows the frame
+/// the slide moves: the left cell is a twin's frame at `10 + d - 1` after `slide d` (A's new last frame), the right cell
+/// is FIELD (no butted next clip); nothing commits during the drag, and the release commits one slide.
+#[test]
+fn striaslipviewmore_slide_drag_shows_the_moving_cut_frames() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 + 1.0, l.point(0, 15).1);
+    striaslipview_press_move(&mut face, x, y, 16.0, bandy::MOD_CONTROL);
+    let d = face.dragging().map(|d| (d.kind, d.delta)).expect("a live drag");
+    assert_eq!(d.0, DragKind::Slide);
+    assert!(d.1 > 0, "slid later by {}", d.1);
+    face.paint();
+    assert_eq!(twin.verb(&format!("slide {}", d.1)), Some(Ok(())));
+    let (_, src) = synth_fixture();
+    let last_a = preview(&twin.timeline, &src, 10 + d.1 - 1).unwrap().expect("A's new last frame");
+    let pair = face.slip_view().cloned().expect("a pair during the slide");
+    assert_eq!((pair.width, pair.height), (last_a.width * 2, last_a.height));
+    let (left, right) = striaslipview_halves(&pair);
+    assert_eq!(left, last_a.rgba, "left = the previous clip's new last frame");
+    assert_eq!(right, striaslipviewmore_field(last_a.width, last_a.height), "right = FIELD: no butted next clip");
+    assert_eq!(face.state.timeline, tl, "nothing committed during the drag");
+    face.on(&nle3eslipdrag_btn(false, x + 16.0, y, bandy::MOD_CONTROL));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&twin.timeline, 1));
+    face.paint();
+    assert!(face.slip_view().is_none(), "released: no pair");
+    println!("striaslipviewmore: Ctrl slide {} on B -> left A's last frame at {}, right FIELD", d.1, 10 + d.1 - 1);
+}
+
+/// Rule: the word `slide+` on a clip butted on both sides (A@25 moved to 20) holds both cells: the previous clip's new
+/// last frame (tick 10) and the next clip's new first frame (tick 21), each a twin's frame after `slide 1`.
+#[test]
+fn striaslipviewmore_slide_word_both_neighbours() {
+    let (mut tl, src) = synth_fixture();
+    tl.tracks[0].clips[2].at = 20;
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_at(0, 12).unwrap();
+    let mut twin = EditorState::new(tl);
+    twin.select_at(0, 12).unwrap();
+    assert!(face.verb("slide+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    face.paint();
+    assert_eq!(twin.verb("slide 1"), Some(Ok(())));
+    let (prev, next) = striaslipview_frames(&twin.timeline, 10, 21);
+    assert_eq!(striaslipview_halves(face.slip_view().expect("the slide's pair")), (prev.rgba, next.rgba));
+    assert!(face.slip_held());
+    println!("striaslipviewmore: slide+ with both cuts butted -> frames at 10 and 21");
+}
+
+/// Rule: the word `slip+` holds the pair of the selected clip (a twin's frames at 10 and 19 after `slip 1`) with ONE undo
+/// step, the playhead frame not re-rendered while it shows; a zoom and a hover keep it; `undo` ends it.
+#[test]
+fn striaslipviewmore_word_slip_holds_its_pair() {
+    let (mut face, mut twin, _tl) = nle3eslipface_pair();
+    face.state.seek(12);
+    face.paint();
+    let before = face.still().cloned().expect("the playhead frame at 12");
+    assert!(face.verb("slip+"));
+    face.paint();
+    assert!(face.slip_held());
+    assert_eq!(twin.verb("slip 1"), Some(Ok(())));
+    let (first, last) = striaslipview_frames(&twin.timeline, 10, 19);
+    assert_eq!(striaslipview_halves(face.slip_view().expect("the word's pair")), (first.rgba, last.rgba));
+    assert_eq!(face.still(), Some(&before), "the playhead frame is not re-rendered while the pair shows");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&twin.timeline, 1), "one undo step");
+    face.on(&bandy::SMessage::BrowserZoom(1));
+    face.paint();
+    assert!(face.slip_view().is_some(), "a zoom keeps the pair");
+    face.on(&bandy::SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    face.paint();
+    assert!(face.slip_view().is_some(), "a hover keeps the pair");
+    assert!(face.verb("undo"));
+    face.paint();
+    assert!(face.slip_view().is_none() && !face.slip_held(), "undo ends the hold");
+    println!("striaslipviewmore: slip+ holds the pair; zoom / hover keep it; undo ends it");
+}
+
+/// Rule: the next action ends a word's hold and its pair: a seek, another selection, `play`, a press.
+#[test]
+fn striaslipviewmore_next_action_ends_the_hold() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    let actions: [(&str, fn(&mut Face, f64, f64)); 4] = [
+        ("seek", |f, _, _| f.state.seek(3)),
+        ("select", |f, _, _| f.state.select_at(0, 2).unwrap()),
+        ("play", |f, _, _| assert!(f.verb("play"))),
+        ("press", |f, x, y| {
+            f.on(&nle3eslipdrag_btn(true, x, y, 0));
+        }),
+    ];
+    for (what, act) in actions {
+        face.state.select_at(0, 12).unwrap();
+        assert!(face.verb("slip+"));
+        face.paint();
+        assert!(face.slip_view().is_some(), "{what}: the word's pair");
+        act(&mut face, x, y);
+        face.paint();
+        assert!(face.slip_view().is_none() && !face.slip_held(), "{what}: the hold ended");
+        if face.playing {
+            assert!(face.verb("play"));
+        }
+        if face.dragging().is_some() {
+            face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+        }
+    }
+    println!("striaslipviewmore: seek / select / play / press end the hold");
+}
+
+/// Rule: a refused word (`slip-` at B's source start: OutOfSource) changes nothing and holds no pair; a word slip on the
+/// audio track holds no pair (video only).
+#[test]
+fn striaslipviewmore_refused_and_audio_words_hold_no_pair() {
+    let (mut face, _twin, tl) = nle3eslipface_pair();
+    assert!(face.verb("slip-"));
+    assert!(face.last_error.take().is_some(), "refused by name");
+    face.paint();
+    assert!(face.slip_view().is_none() && !face.slip_held(), "a refused word holds nothing");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    face.state.select_at(1, 12).unwrap();
+    assert!(face.verb("slip+"));
+    face.paint();
+    assert!(face.slip_view().is_none(), "an audio clip shows no pair");
+    println!("striaslipviewmore: refused slip- and an audio slip+ -> no pair");
 }

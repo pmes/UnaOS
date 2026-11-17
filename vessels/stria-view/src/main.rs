@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &slip_json(&face); // STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -856,5 +856,34 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIASLIPVIEWMORE (LEDGER SR946): the witness reads the slip / slide pair's size (named tail block) ----
+/// The witness's `"slip"` field, only while the face shows a slip / slide pair (`Face::slip_view`, after the line's own
+/// paint); the default line is unchanged.
+fn slip_json(face: &Face) -> String {
+    face.slip_view().map(|s| format!(",\"slip\":\"{}x{}\"", s.width, s.height)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striaslipviewmore_tests {
+    use super::*;
+
+    /// STRIASLIPVIEWMORE (SR946): `at:12:0,slip+` (select B, slip it one frame) holds the pair, and after the witness's
+    /// paint (`Face::frames`) the field reads two synth frames side by side; no script: no field.
+    #[test]
+    fn striaslipviewmore_witness_slip_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.frames();
+        assert_eq!(slip_json(&face), "");
+        assert_eq!(drive(&mut face, "at:12:0,slip+"), Vec::<String>::new());
+        face.frames();
+        assert_eq!(slip_json(&face), ",\"slip\":\"128x48\"");
+        assert!(drive(&mut face, "undo").is_empty());
+        face.frames();
+        assert_eq!(slip_json(&face), "");
+        println!("striaslipviewmore witness: at:12:0,slip+ -> ,\"slip\":\"128x48\"; undo -> cleared");
     }
 }

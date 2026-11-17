@@ -195,13 +195,14 @@ pub struct Face {
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     slip_view: Option<SlipView>, // STRIASLIPVIEW (SR858): a slip drag's first / last frame pair, cached and throttled (file tail)
+    slip_hold: Option<SlipHold>, // STRIASLIPVIEWMORE (SR946): a word slip / slide's pair held until the next action (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, slip_view: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, slip_view: None, slip_hold: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -244,7 +245,7 @@ impl Face {
                 Ok(())
             }
             "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
-            v if slipslide_word(v).is_some() => slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
+            v if slipslide_word(v).is_some() => self.slip_word(v), // STRIASLIPVIEWMORE (SR946): the same call, then a slip / slide holds its pair (file tail); NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
                 None => return false,
@@ -3096,9 +3097,9 @@ impl Face {
         if role == Role::Tracks {
             return;
         }
-        let cur = match (self.drag, shown) {
+        self.slipmore_hold_check(); let cur = match (self.drag, shown) { // STRIASLIPVIEWMORE (SR946): a stale word hold goes first (file tail)
             (Some(d), Some(s)) if d.kind == DragKind::Slip => s.timeline.tracks.get(d.track).filter(|t| t.kind == Kind::Video).and_then(|t| t.clips.get(d.idx)).map(|c| ((d.track, d.idx, *c), &s.timeline)),
-            _ => None,
+            _ => slipmore_target(self.drag, shown, self.slip_hold.as_ref(), &self.state), // STRIASLIPVIEWMORE (SR946): a Slide drag, or a word slip / slide's hold (file tail)
         };
         let Some((key, tl)) = cur else {
             self.slip_view = None;
@@ -3115,12 +3116,12 @@ impl Face {
             }
         }
         let t0 = std::time::Instant::now();
-        let Some((one, c)) = slip_clip_timeline(tl, key.0, key.1) else {
+        let Some(cells) = slip_cells(tl, key.0, key.1, slipmore_slide(self.drag, self.slip_hold.as_ref())) else { // STRIASLIPVIEWMORE (SR946): a slip's two ticks or a slide's two neighbour edges (file tail)
             self.slip_view = None;
             return;
         };
         let mut pair: [Option<Still>; 2] = [None, None];
-        for (i, t) in [c.at, c.end() - 1].into_iter().enumerate() {
+        for (i, (one, t)) in cells.into_iter().enumerate().filter_map(|(i, c)| c.map(|c| (i, c))) { // STRIASLIPVIEWMORE (SR946): a missing side stays FIELD
             pair[i] = match preview(&one, &self.sources, t) {
                 Ok(s) => s,
                 Err(e) => {
@@ -3202,5 +3203,117 @@ mod striaslipview_tests {
         face.on(&SMessage::BrowserKey("Escape".into()));
         face.paint();
         assert!(face.slip_view.is_none(), "no drag: cleared");
+    }
+}
+
+// ---- STRIASLIPVIEWMORE (LEDGER SR946): the slide drag's cuts, the word slips' hold, the witness size (named tail block) ----
+// Three new SOURCES of SR858's one pair (`Face::slip_refresh`: its render through `preview`, its cache, its throttle and the
+// serve clock unchanged). A Ctrl / Cmd Slide drag (`DragKind::Slide`, `Drag::shown` valid, a video track) shows the two
+// frames a slide moves: the butted previous clip's new last frame (left) and the butted next clip's new first frame (right);
+// a side with no butted neighbour stays FIELD, neither: no pair. A word slip / slide (`slip-` .. `slide+10`, the keys and
+// buttons, through `Face::verb`'s one arm) holds its pair of the selected clip until the next action: the hold is a
+// snapshot condition (`slipmore_hold_check`), dropped with its pair when a drag is live, the face plays, or the timeline,
+// playhead or selection differ from the snapshot; zoom, hover, resize, the help and a refused word leave it. Only `slip` /
+// `slide` words hold (a sibling's `roll` words through the same arm hold nothing). The witness reads the pair's size
+// (stria-view `slip_json`). Owed: NLE3E-SLIP-VIEW-ASYNC, NLE3E-SLIP-VIEW-KERNEL, NLE3E-SLIP-VIEW-TIMECODE, NLE3E-SLIDE-VIEW-FOUR.
+
+/// STRIASLIPVIEWMORE (SR946): the state a word slip / slide left, its pair shown while the face still stands there.
+struct SlipHold {
+    slide: bool,
+    timeline: Timeline,
+    playhead: i64,
+    selection: Option<(usize, usize)>,
+}
+
+impl Face {
+    /// STRIASLIPVIEWMORE (SR946): a slip / slide word through THE dispatch (`slipslide_word` onto `EditorState::verb`, one
+    /// commit); on Ok a `slip` / `slide` word holds its pair (a refused word leaves the state and any hold as they were).
+    fn slip_word(&mut self, v: &str) -> Result<(), EditError> {
+        let r = slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip));
+        let slide = v.starts_with("slide");
+        if r.is_ok() && (slide || v.starts_with("slip")) {
+            self.slip_hold = Some(SlipHold { slide, timeline: self.state.timeline.clone(), playhead: self.state.playhead, selection: self.state.selection });
+        }
+        r
+    }
+    /// STRIASLIPVIEWMORE (SR946): the next action ends a hold: a live drag, playing, or a timeline / playhead / selection
+    /// other than the hold's drops it and its pair.
+    fn slipmore_hold_check(&mut self) {
+        let st = &self.state;
+        let stale = self.slip_hold.as_ref().is_some_and(|h| self.drag.is_some() || self.playing || h.playhead != st.playhead || h.selection != st.selection || h.timeline != st.timeline);
+        if stale {
+            self.slip_hold = None;
+            self.slip_view = None;
+        }
+    }
+    /// STRIASLIPVIEWMORE (SR946): a word slip / slide's pair is held (until the next action).
+    pub fn slip_held(&self) -> bool {
+        self.slip_hold.is_some()
+    }
+}
+
+/// STRIASLIPVIEWMORE (SR946): the pair's clip besides SR858's Slip drag: a valid Slide drag's shown clip, or with no drag a
+/// held word's selected clip; a video track only. The key is SR858's `(track, idx, clip)`.
+fn slipmore_target<'a>(drag: Option<Drag>, shown: Option<&'a EditorState>, hold: Option<&SlipHold>, st: &'a EditorState) -> Option<((usize, usize, Clip), &'a Timeline)> {
+    let (track, idx, tl) = match (drag, shown, hold) {
+        (Some(d), Some(s), _) if d.kind == DragKind::Slide => (d.track, d.idx, &s.timeline),
+        (None, _, Some(_)) => {
+            let (t, i) = st.selection?;
+            (t, i, &st.timeline)
+        }
+        _ => return None,
+    };
+    let c = *tl.tracks.get(track).filter(|t| t.kind == Kind::Video)?.clips.get(idx)?;
+    Some(((track, idx, c), tl))
+}
+
+/// STRIASLIPVIEWMORE (SR946): the pair shows a slide's cuts (a Slide drag, or a held `slide` word), else a slip's edges.
+fn slipmore_slide(drag: Option<Drag>, hold: Option<&SlipHold>) -> bool {
+    drag.map_or(hold.is_some_and(|h| h.slide), |d| d.kind == DragKind::Slide)
+}
+
+/// STRIASLIPVIEWMORE (SR946): the pair's two cells, each a one-clip timeline ([`slip_clip_timeline`]) and the tick to show.
+/// A slip: clip `idx`'s first (`at`) and last (`end - 1`) frame. A slide: the butted previous clip's last frame and the
+/// butted next clip's first; a side with no butted neighbour is `None`; neither: `None` (no pair).
+fn slip_cells(tl: &Timeline, track: usize, idx: usize, slide: bool) -> Option<[Option<(Timeline, i64)>; 2]> {
+    if !slide {
+        let (one, c) = slip_clip_timeline(tl, track, idx)?;
+        return Some([Some((one.clone(), c.at)), Some((one, c.end() - 1))]);
+    }
+    let tr = tl.tracks.get(track)?;
+    let c = *tr.clips.get(idx)?;
+    let prev = idx.checked_sub(1).filter(|&i| tr.clips[i].end() == c.at).and_then(|i| slip_clip_timeline(tl, track, i)).map(|(one, p)| (one, p.end() - 1));
+    let next = tr.clips.get(idx + 1).filter(|n| n.at == c.end()).and_then(|_| slip_clip_timeline(tl, track, idx + 1)).map(|(one, n)| (one, n.at));
+    (prev.is_some() || next.is_some()).then_some([prev, next])
+}
+
+#[cfg(test)]
+mod striaslipviewmore_tests {
+    use super::*;
+
+    /// The cell's (clip, tick): the one clip its timeline holds and the tick it shows.
+    fn cell(c: &Option<(Timeline, i64)>) -> Option<(Clip, i64)> {
+        c.as_ref().map(|(one, t)| {
+            assert_eq!((one.tracks.len(), one.tracks[0].clips.len()), (1, 1), "a one-clip timeline");
+            (one.tracks[0].clips[0], *t)
+        })
+    }
+
+    /// Rule: a slip's cells are the clip's own first and last frame; a slide's are the butted neighbours' moving edges (a
+    /// side with no butted neighbour None, neither None).
+    #[test]
+    fn striaslipviewmore_slip_cells_kats() {
+        let (mut tl, _src) = synth_fixture();
+        let (a, b) = (tl.tracks[0].clips[0], tl.tracks[0].clips[1]);
+        let s = slip_cells(&tl, 0, 1, false).expect("slip cells");
+        assert_eq!((cell(&s[0]), cell(&s[1])), (Some((b, 10)), Some((b, 19))));
+        let s = slip_cells(&tl, 0, 1, true).expect("A butts B");
+        assert_eq!((cell(&s[0]), cell(&s[1])), (Some((a, 9)), None), "A@25 is not butted to B's end 20");
+        assert!(slip_cells(&tl, 0, 2, true).is_none(), "A@25 butts nothing");
+        tl.tracks[0].clips[2].at = 20;
+        let n = tl.tracks[0].clips[2];
+        let s = slip_cells(&tl, 0, 1, true).expect("both butted");
+        assert_eq!((cell(&s[0]), cell(&s[1])), (Some((a, 9)), Some((n, 20))));
+        assert!(slip_cells(&tl, 0, 9, false).is_none() && slip_cells(&tl, 0, 9, true).is_none(), "no clip");
     }
 }
