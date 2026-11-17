@@ -1660,7 +1660,7 @@ impl Timeline {
 // step's outgoing `VideoMix`); the render's [`xform_frame`] places the top into the rect over the lower frame through ONE
 // [`place_frame`] (the crop pass's own placement, a destination rect instead of the whole frame) and mixes only the rect
 // with `vmix::mix_step` when not opaque. Stored in the EDL as `* UNA XFORM <x> <y> <s>` under its event (edl.rs). The
-// kernel Player refuses a transformed timeline by name (`xform-unsupported`, NLE-XFORM-KERNEL owed).
+// kernel Player composes a placed step through the same [`xform_frame`], by [`Timeline::place_step`] (STRIAKXFORM SR9011).
 
 /// A clip's placement: top-left `x`, `y` and side scale `s`, each in 1/1000 of the frame's width / height.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1792,5 +1792,27 @@ impl Xform {
         }
         let xf = Xform { x: x as u16, y: y as u16, s: s as u16 };
         xf.ok().then_some(xf)
+    }
+}
+
+// ---- STRIAKXFORM (LEDGER SR9011): a schedule step's placement, the one rule both faces call (named tail block) ----
+// A placed clip's step carries the track below as its outgoing `VideoMix` (STRIAOPACITY's two-layer schedule);
+// [`Timeline::place_step`] is THE rule that turns that step's two frames into what it shows: the clip's placement, its
+// crop and its source's size policy into [`xform_frame`]. Stria's render (nle.rs `xformed`) and the kernel Player's
+// transition mix (vplay.rs `edl_mix`) both call it, so neither face holds a copy of the step -> clip lookup or the fit.
+impl Timeline {
+    /// The frame video step `s` shows when its clip is placed: the step's own frame `top` and the lower frame `under` (the
+    /// step's outgoing: the track below, or black), both `w x h` RGBA, through [`xform_frame`] with the clip's
+    /// [`Timeline::xform_at`], its [`Timeline::crop_at`] and its source's [`SizePolicy`] (Letterbox when the source is
+    /// absent; Adopt places as Letterbox) at the mix weight `s.vmix.t`. `None` when the step has no track, no source, no
+    /// mix, or its clip is not placed (the caller mixes as before).
+    pub fn place_step(&self, s: &schedule::Step, under: &[[u8; 4]], top: &[[u8; 4]], w: usize, h: usize) -> Option<Vec<[u8; 4]>> {
+        let (ti, src, m) = (s.track?, s.src?, s.vmix?);
+        let xf = self.xform_at(ti, s.out_t);
+        if xf == Xform::NONE {
+            return None;
+        }
+        let fit = self.source(src).map_or(SizePolicy::Letterbox, |r| r.size_policy);
+        Some(xform_frame(top, under, w, h, self.crop_at(ti, s.out_t, false), fit, xf, m.t))
     }
 }
