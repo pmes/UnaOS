@@ -10767,3 +10767,34 @@ fn striaclipspeedmore_face_rspeed_ripples_where_speed_overlaps() {
     assert_eq!(face.state.timeline, tl, "undo restores");
     println!("striaclipspeedmore: rspeed 0.5 -> {ats:?}; speed 0.5 -> {}", EditError::Overlap);
 }
+
+// ---- STRIARIPPLEMORE (LEDGER SR953): the ripple across every track through the face's word road (named tail block) ----
+
+/// Rule: `rtrim-all out -3` on V1 clip 0 (A[13,23)@0) reaches timeline_core's verb through the face: V1 and A1 (whose
+/// clip 0 is V1's exact-span twin) ripple together: both clip 0s end at 7, V1's later clips move to 7 / 17, A1's to
+/// 7 / 22; ONE undo step restores; no message.
+#[test]
+fn striaripplemore_rtrim_all_moves_every_track() {
+    let (mut face, tl) = striarippletrim_face(0);
+    assert!(face.verb("rtrim-all out -3"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.ripple_all_out(0, 0, 20).unwrap());
+    let ats = |k: usize| face.state.timeline.tracks[k].clips.iter().map(|c| (c.at, c.end())).collect::<Vec<_>>();
+    assert_eq!(ats(0), vec![(0, 7), (7, 17), (17, 27)], "V1");
+    assert_eq!(ats(1), vec![(0, 7), (7, 17), (22, 32)], "A1 follows");
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striaripplemore: rtrim-all out -3 ripples V1 and A1 together");
+}
+
+/// Rule: a clip on another track straddling the edit point cannot stay in sync: V1 clip 2's `rtrim-all out 1` (its end
+/// 30 inside A1's 25..35) is refused by name on the message line; the timeline and undo depth do not move.
+#[test]
+fn striaripplemore_a_straddler_reads_on_the_message_row() {
+    let (mut face, tl) = striarippletrim_face(2);
+    assert!(face.verb("rtrim-all out 1"));
+    assert_eq!(face.last_error.take(), Some(format!("rtrim-all out 1: {}", EditError::Overlap)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("striaripplemore: rtrim-all out 1 over A1's 25..35 -> {}", EditError::Overlap);
+}

@@ -800,7 +800,7 @@ impl Drag {
         let one = [(self.track, self.idx)];
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
+            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail)
             DragKind::Scrub => {
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -3463,5 +3463,96 @@ mod striarollmore_tests {
         assert_eq!(d.trim_exclude(), alloc::vec![(0, 0), (0, 1)]);
         d.update(&st, x + 3.25 * z, y);
         assert_eq!((d.delta, d.guide), (3, Some(13)));
+    }
+}
+
+// ---- STRIARIPPLEMORE (LEDGER SR953): a ripple drag snaps the edge that moves (named tail block) ----
+// A ripple trim keeps the clip's start, so the edge that MOVES on the timeline is its out edge: by `+delta` for a ripple
+// TrimOut and by `-delta` for a ripple TrimIn (the in point eats the clip from inside). `snap_ripple` snaps that edge
+// (the pointer's edit point of a ripple trim-in does not move on the timeline, SR850 snapped it), and the later clips of
+// the track ride along with the edit, so their old edges are no snap targets; the other tracks and the playhead are.
+// This supersedes SR850's "snapping is the plain trim's"; a plain trim snaps as before.
+
+impl Drag {
+    /// STRIARIPPLEMORE: snap a ripple trim's moving edge (`c.end()`, moving `s * dx` with `s` = +1 out / -1 in); a hit
+    /// on target `t` sets `delta = s * (t - end)` and the guide at `t`.
+    fn snap_ripple(&mut self, st: &EditorState, x: f64) {
+        let l = self.layout;
+        let Some(tr) = st.timeline.tracks.get(self.track) else { return };
+        let Some(&c) = tr.clips.get(self.idx) else { return };
+        let s: i64 = if self.kind == DragKind::TrimIn { -1 } else { 1 };
+        let e = c.end();
+        let riders: Vec<(usize, usize)> =
+            tr.clips.iter().enumerate().filter(|&(i, n)| i == self.idx || n.at >= e).map(|(i, _)| (self.track, i)).collect();
+        let ex = l.x_of(e) as f64 + s as f64 * (x - self.origin.0);
+        if let Some(t) = snap_to(&l, &snap_targets(st, &riders, true), ex) {
+            self.delta = s * (t - e);
+            self.guide = Some(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ripple_more_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// A 40-tick source, V1 0..10 at 0, 10..20 at 10, 20..30 at 20 (butted), the view band `Role::Tracks` 320x56 (8 px
+    /// per tick, t0 0); clip `sel` selected; the y of row 0's centre.
+    fn fixture(sel: usize) -> (Timeline, EditorState, Layout, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10), Clip::new(a, 20, 30, 20)];
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, sel).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
+        (tl, st, l, y)
+    }
+
+    /// STRIARIPPLEMORE (SR953) M3: shift on clip 1's in handle (x 81, tick 10) dragged +29 px (raw +3): the moving edge is
+    /// the OUT edge 20 going left to x 131, 3 px from the playhead at 16, so it snaps there: delta +4 (the in point to 14,
+    /// the end to 16), the guide at 16; the release is `ripple_trim_in(0, 1, 14)`.
+    #[test]
+    fn ripple_in_snaps_the_out_edge() {
+        let (tl, mut st, l, y) = fixture(1);
+        st.seek(16);
+        let mut d = Drag::begin_with(&mut st.clone(), l, 81.0, y, true, false, false).unwrap();
+        assert_eq!((d.kind, d.ripple), (DragKind::TrimIn, true));
+        d.update(&st, 110.0, y);
+        assert_eq!((d.delta, d.guide), (4, Some(16)));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.ripple_trim_in(0, 1, 14).unwrap());
+        assert_eq!((st.timeline.tracks[0].clips[1].end(), st.timeline.tracks[0].clips[2].at), (16, 16));
+    }
+
+    /// STRIARIPPLEMORE (SR953) M3: clip 0's out handle (x 78, tick 9) dragged +75 px (raw +10): the plain trim snaps the
+    /// edge at x 155 to clip 1's end 20 (the guide at 20); the ripple does not (clip 1 and 2 ride along: no stale target),
+    /// so its delta is the raw +10 with no guide, and the release is `ripple_trim_out(0, 0, 20)`.
+    #[test]
+    fn ripple_out_ignores_the_riders_edges() {
+        let (tl, mut st, l, y) = fixture(0);
+        let mut p = Drag::begin_with(&mut st.clone(), l, 78.0, y, false, false, false).unwrap();
+        p.update(&st, 153.0, y);
+        assert_eq!((p.kind, p.ripple, p.delta, p.guide), (DragKind::TrimOut, false, 10, Some(20)));
+        let mut d = Drag::begin_with(&mut st.clone(), l, 78.0, y, true, false, false).unwrap();
+        d.update(&st, 153.0, y);
+        assert_eq!((d.kind, d.ripple, d.delta, d.guide), (DragKind::TrimOut, true, 10, None));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.ripple_trim_out(0, 0, 20).unwrap());
+    }
+
+    /// STRIARIPPLEMORE (SR953) M3: the no-snap modifier still unsnaps a ripple: the first test's drag reads the raw +3
+    /// with no guide, and the release is `ripple_trim_in(0, 1, 13)`.
+    #[test]
+    fn ripple_in_alt_unsnaps() {
+        let (tl, mut st, l, y) = fixture(1);
+        st.seek(16);
+        let mut d = Drag::begin_with(&mut st.clone(), l, 81.0, y, true, true, false).unwrap();
+        d.update(&st, 110.0, y);
+        assert_eq!((d.ripple, d.snap, d.delta, d.guide), (true, false, 3, None));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.ripple_trim_in(0, 1, 13).unwrap());
     }
 }
