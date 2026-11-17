@@ -40,7 +40,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 
 ## C. Video (nle.rs render + export)
 20. STRIACROP — per-clip crop (l / t / r / b in 1/1000 of the frame) applied in the render step before the size policy; verb `crop`; EDL `* UNA CROP`.
-21. STRIAPOSITIONSCALE — per-clip position / scale (picture-in-picture): the render blits the scaled source into the frame at (x, y); verbs `pip` / `scale`; EDL `* UNA XFORM`.
+21. [SR879 started] STRIAPOSITIONSCALE — per-clip position / scale (picture-in-picture): the render blits the scaled source into the frame at (x, y); verbs `pip` / `scale`; EDL `* UNA XFORM`.
 22. STRIAOPACITY — per-clip opacity for an upper video track over a lower one (measure `schedule`'s track priority and `vmix` first); EDL `* UNA ALPHA`.
 23. STRIACOLORLIFT — per-clip brightness / contrast / saturation (three i16 in 1/1000) as ONE per-pixel pass in the render step (RGBA); verb `color <b> <c> <s>`; EDL `* UNA COLOR`.
 24. STRIAFREEZEFRAME — `freeze` splits at the playhead and inserts a 2-s hold of the frame (a rate-0 clip once SR829 is in, else a generated still source like SR828: name which).
