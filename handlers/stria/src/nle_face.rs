@@ -4731,3 +4731,151 @@ mod striameterclipverb_tests {
         assert!(!face.dirty());
     }
 }
+
+// ---- STRIAFACEGOLDENS (LEDGER SR891): the face golden table at three sizes, one text file, the re-pin road (named tail block) ----
+// Seven labels-off RGBA scenes through the ONE painter (`paint` / `paint_in` -> timeline_core `view::paint_in`) at 320x160,
+// 1280x720 and 1920x1200, each hashed with `view::fnv1a`; the expected values live in ONE checked-in text file,
+// `tests/face_goldens.txt` (`name WxH hash`). `UNAOS_REPIN=1` makes the test rewrite that file from what it measures; a row
+// whose hash is `unpinned` prints its measured value and passes. Labels-on paints (the clip names, ruler timecodes, message
+// line, help overlay) lean on the host's installed font and are kept out. The six older consts stay where they are.
+
+#[cfg(test)]
+mod facegoldens_tests {
+    use super::*;
+
+    /// The three canvas sizes every scene is painted at.
+    const SIZES: [(u32, u32); 3] = [(320, 160), (1280, 720), (1920, 1200)];
+
+    /// The scenes, in the file's row order.
+    const SCENES: [&str; 7] = ["tracks", "set", "transitions", "to-black", "meters", "preview", "keys-tracks"];
+
+    fn table_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("face_goldens.txt")
+    }
+
+    fn state() -> (EditorState, Sources) {
+        let (tl, src) = synth_fixture();
+        (EditorState::new(tl), src)
+    }
+
+    /// One scene's RGBA paint on a `w` x `h` canvas: each older golden's set-up as its test has it, plus `preview` (the
+    /// frame at 15 scaled into the band) and `keys-tracks` (the kernel keys fixture's tracks band, view.rs `keys_state`).
+    fn scene(name: &str, w: u32, h: u32) -> Vec<u8> {
+        match name {
+            "tracks" => {
+                let (mut st, _) = state();
+                st.select(0, 1).unwrap();
+                st.seek(15);
+                paint(&st, w, h, PixelOrder::Rgba, None, None)
+            }
+            "set" => {
+                let (mut st, _) = state();
+                st.select(0, 0).unwrap();
+                st.select_add(0, 2).unwrap();
+                st.seek(15);
+                paint(&st, w, h, PixelOrder::Rgba, None, None)
+            }
+            "transitions" => {
+                let (mut st, _) = state();
+                let tl = st.timeline.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+                st.timeline = tl.add_transition_from_black(0, 0, TransitionKind::Wipe(WipeDir::Box), 3).unwrap();
+                st.select_transition(0, 1).unwrap();
+                st.seek(15);
+                paint(&st, w, h, PixelOrder::Rgba, None, None)
+            }
+            "to-black" => {
+                let (mut st, _) = state();
+                st.timeline = st.timeline.add_transition_to_black(0, 20, TransitionKind::Dissolve, 5).unwrap();
+                paint(&st, w, h, PixelOrder::Rgba, None, None)
+            }
+            "meters" => {
+                let mut st = EditorState::new(synth_fixture().0);
+                st.seek(15);
+                let l = Layout::of(w, h, &st);
+                let base = paint(&st, w, h, PixelOrder::Rgba, None, None);
+                let levels = [
+                    MeterLevel { track: Some(1), peak_db: -6.0, rms_db: -30.0 },
+                    MeterLevel { track: None, peak_db: 0.0, rms_db: -15.0 },
+                ];
+                paint_meters(base, l, PixelOrder::Rgba, &levels)
+            }
+            "preview" => {
+                let (mut st, src) = state();
+                st.seek(15);
+                let still = preview(&st.timeline, &src, 15).unwrap();
+                paint(&st, w, h, PixelOrder::Rgba, None, still.as_ref())
+            }
+            "keys-tracks" => {
+                let mut tl = Timeline::new(25);
+                let a = tl.add_source("NLEFXA", 40);
+                tl.add_track(Kind::Video);
+                tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+                let mut st = EditorState::new(tl.split(0, 8).unwrap());
+                st.select_at(0, 8).unwrap();
+                st.seek(8);
+                let l = Layout::of_role(Role::Tracks, w, h, &st);
+                paint_in(&st, l, PixelOrder::Rgba, None, None)
+            }
+            _ => panic!("striafacegoldens: no scene {name}"),
+        }
+    }
+
+    /// The file's rows: `name WxH hash`, blank and `#` lines skipped.
+    fn parse(text: &str) -> Vec<(String, (u32, u32), String)> {
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(f.len(), 3, "striafacegoldens: a row is `name WxH hash`: {line:?}");
+            let (w, h) = f[1].split_once('x').unwrap_or_else(|| panic!("striafacegoldens: size `WxH`: {line:?}"));
+            let size = (w.parse().expect("striafacegoldens: width"), h.parse().expect("striafacegoldens: height"));
+            rows.push((f[0].to_string(), size, f[2].to_string()));
+        }
+        rows
+    }
+
+    const HEADER: &str = "# STRIAFACEGOLDENS (LEDGER SR891): the face golden table, `name WxH hash` (FNV-1a 64, view::fnv1a).\n\
+# Labels-off RGBA paints through nle_face `paint` / `paint_in` (timeline_core view::paint_in); scenes in nle_face.rs `facegoldens_tests::scene`.\n\
+# Re-pin: UNAOS_REPIN=1 cargo test -p stria --lib striafacegoldens_table   (a hash of `unpinned` prints its value and passes)\n";
+
+    /// SR891: every scene at every size hashes to its row in `tests/face_goldens.txt`; `UNAOS_REPIN=1` rewrites the file.
+    #[test]
+    fn striafacegoldens_table() {
+        let mut got: Vec<(String, (u32, u32), String)> = Vec::new();
+        for name in SCENES {
+            for (w, h) in SIZES {
+                got.push((name.to_string(), (w, h), format!("{:016x}", fnv1a(&scene(name, w, h)))));
+            }
+        }
+        let path = table_path();
+        if std::env::var("UNAOS_REPIN").is_ok_and(|v| v == "1") {
+            let mut out = String::from(HEADER);
+            for (name, (w, h), hash) in &got {
+                out.push_str(&format!("{name} {w}x{h} {hash}\n"));
+            }
+            std::fs::write(&path, out).unwrap_or_else(|e| panic!("striafacegoldens: write {}: {e}", path.display()));
+            println!("striafacegoldens: repinned {} rows in {}", got.len(), path.display());
+            return;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("striafacegoldens: read {}: {e}", path.display()));
+        let want = parse(&text);
+        let mut bad = Vec::new();
+        for (name, (w, h), hash) in &got {
+            match want.iter().find(|r| &r.0 == name && r.1 == (*w, *h)) {
+                None => bad.push(format!("{name} {w}x{h} missing from the file (got {hash})")),
+                Some((_, _, x)) if x == "unpinned" => println!("striafacegoldens: unpinned {name} {w}x{h} {hash}"),
+                Some((_, _, x)) if x != hash => bad.push(format!("{name} {w}x{h} want {x} got {hash}")),
+                Some(_) => {}
+            }
+        }
+        for (name, (w, h), _) in &want {
+            if !got.iter().any(|r| &r.0 == name && r.1 == (*w, *h)) {
+                bad.push(format!("{name} {w}x{h} in the file but no scene paints it"));
+            }
+        }
+        assert!(bad.is_empty(), "striafacegoldens: {} row(s) off:\n{}", bad.len(), bad.join("\n"));
+    }
+}
