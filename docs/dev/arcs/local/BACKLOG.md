@@ -18,7 +18,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 ## A. Editing core (timeline_core lib.rs + nle_face.rs)
 1. STRIARIPPLETRIM — trim-in / trim-out with ripple (the following clips move by the trimmed amount) as a `trim-ripple` modifier on the existing trim drag (measure SR737's trim op; ONE op variant through the undo road); EDL unchanged.
 2. STRIAROLLEDIT — a roll edit on a cut (one drag moves the out of A and the in of B together; total length unchanged); the cut hit region (measure `Layout::hit` for an edge hit); verbs `roll-` / `roll+` by one frame.
-3. STRIAINSERTOVERWRITE — `insert` / `overwrite` of a source range at the playhead on the selected track (three-point editing: measure whether a source viewer exists; if not, the source range is the clip under the playhead's src range: name the rule).
+3. [SR852 started] STRIAINSERTOVERWRITE — `insert` / `overwrite` of a source range at the playhead on the selected track (three-point editing: measure whether a source viewer exists; if not, the source range is the clip under the playhead's src range: name the rule).
 4. STRIAMULTISELECT — shift-click adds to the selection, a marquee drag selects clips crossing the rectangle (`Layout::crossing` :110 EXISTS: wire it); every clip op applies to the whole selection (move / delete / gain).
 5. STRIACOPYPASTE — `copy` / `cut` / `paste` of the selection at the playhead (an in-face clipboard `Vec<Clip>`; paste on the selected track; overlaps refused by `validate`).
 6. STRIANUDGE — `,` / `.` move the selection by one frame, shift by ten (through move_clip + undo); the message row reads the new `at`.
