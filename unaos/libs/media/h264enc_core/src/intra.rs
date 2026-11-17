@@ -137,7 +137,7 @@ fn allowed_chroma(mode: u8, e: &Edges) -> bool {
 }
 
 impl Encoder {
-    /// Decide, code and reconstruct the intra macroblock (mbx, mby), and its score (the SAD + bias its I16 / NxN choice compared).
+    /// Decide, code and reconstruct the intra macroblock (mbx, mby), and its score (the SAD + bias its I16 / NxN choice compared, + its chroma mode's Cb + Cr SAD: H264ENCPINTRACHROMA SR771).
     pub(crate) fn intra_scored(&mut self, mbx: usize, mby: usize) -> (MbCode, u32) {
         let qp = self.qp;
         let q6 = (qp % 6) as usize;
@@ -257,7 +257,7 @@ impl Encoder {
             pred_chroma(best.1, &e[c], &mut preds[c]);
         }
         self.chroma_mb(mbx, mby, &preds, true, &mut code);
-        (code, best16.0.min(nxn))
+        (code, best16.0.min(nxn) + best.0)
     }
 
     /// H264ENC8X8 (SR322): the Intra_8x8 candidate of macroblock (mbx, mby), coded over the Intra_4x4
