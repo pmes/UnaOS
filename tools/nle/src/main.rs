@@ -535,14 +535,14 @@ fn bash_script(words: &str) -> String {
     for (f, v) in flag_values() {
         s.push_str(&format!("        {f}) w=\"{}\" ;;\n", v.join(" ")));
     }
-    s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
+    s.push_str(&bash_free()); s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
     s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
     s
 }
 
 /// NLECLICOMPLETIONSVALUES (SR847): zsh's `_arguments` argument of a valued flag, `:<name>:(<words>)`; empty for any other.
 fn zsh_value(flag: &str) -> String {
-    values_of(flag).map(|v| format!(":{}:({v})", flag.trim_start_matches('-'))).unwrap_or_default()
+    values_of(flag).map(|v| format!(":{}:({v})", flag.trim_start_matches('-'))).unwrap_or_else(|| zsh_arg(flag))
 }
 
 /// NLECLICOMPLETIONSVALUES (SR847): zsh's fourth positional — the size policies after `nle size <edl> <reel>`, files otherwise.
@@ -552,10 +552,58 @@ fn zsh_size() -> String {
 
 /// NLECLICOMPLETIONSVALUES (SR847): fish's ` -xa "<words>"` on a valued `-l` line (a value required, these words); empty for any other.
 fn fish_value(word: &str) -> String {
-    values_of(word).map(|v| format!(" -xa \"{v}\"")).unwrap_or_default()
+    values_of(word).map(|v| format!(" -xa \"{v}\"")).unwrap_or_else(|| fish_arg(word))
 }
 
 /// NLECLICOMPLETIONSVALUES (SR847): fish's size line — the policies as the fourth word after `nle size`.
 fn fish_size() -> String {
     format!("complete -c nle -n \"__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{}\"\n", size_words())
+}
+
+// ---- NLECLICOMPLETIONSFREE (LEDGER SR1005): what a flag word takes after it, parallel to FLAGS (named tail block) ----
+/// NLECLICOMPLETIONSFREE (SR1005): what the option loop reads after a flag word — `Bare` nothing, `Free` a required value with
+/// no word table (`value` / `num`), `Opt` an optional K (`--scenecut [K]` / `--aq [K]`: a peeked word taken only when it
+/// parses), `Words` a required value from [`flag_values`] (SR847).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arg {
+    Bare,
+    Free,
+    Opt,
+    Words,
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): THE kind of each [`FLAGS`] word, in FLAGS order (FLAGS stays the one word list). tests/cli.rs
+/// `cli_completions_free` pins it to each arm's own read (`value(&mut it, ..)` / `num(&mut it, ..)` / `it.clone().next()`).
+const FLAG_ARG: [Arg; 24] = [
+    Arg::Free, Arg::Free, Arg::Words, Arg::Words, Arg::Bare, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Bare, Arg::Free, Arg::Opt,
+    Arg::Free, Arg::Bare, Arg::Free, Arg::Free, Arg::Opt, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Free, Arg::Words, Arg::Free,
+];
+
+/// NLECLICOMPLETIONSFREE (SR1005): `flag`'s [`Arg`] by its place in [`FLAGS`]; `Bare` for a word not in it.
+fn arg_of(flag: &str) -> Arg {
+    FLAGS.iter().position(|f| *f == flag).map_or(Arg::Bare, |i| FLAG_ARG[i])
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): bash's `case $prev` arm of every `Free` flag — an empty word list (`-o default` still
+/// gives readline's filenames); empty when no flag is `Free`.
+fn bash_free() -> String {
+    let free: Vec<&str> = FLAGS.iter().copied().filter(|f| arg_of(f) == Arg::Free).collect();
+    if free.is_empty() { String::new() } else { format!("        {}) w=\"\" ;;\n", free.join("|")) }
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): zsh's argument of a flag with no word table — `Free` `:<name>: ` (a space action: the
+/// message, no matches), `Opt` `::<name>: ` (an optional argument); empty for a `Bare` flag.
+fn zsh_arg(flag: &str) -> String {
+    let name = flag.trim_start_matches('-');
+    match arg_of(flag) {
+        Arg::Free => format!(":{name}: "),
+        Arg::Opt => format!("::{name}: "),
+        Arg::Bare | Arg::Words => String::new(),
+    }
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): fish's ` -x` on a `Free` flag's `-l` line (a value required, no files, no `-a` words);
+/// empty otherwise (fish cannot say an optional value for a separate word, so `Opt` is a plain `-l`).
+fn fish_arg(word: &str) -> String {
+    if arg_of(word) == Arg::Free { " -x".to_string() } else { String::new() }
 }
