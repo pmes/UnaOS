@@ -1218,6 +1218,7 @@ pub struct XformDrag {
     pub at: (f64, f64),
     /// The primary's placement at the press.
     pub xf0: crate::Xform,
+    pub nosnap: bool, // STRIAXFORMHANDLES (SR9068): the press's no-snap modifier (Alt), as the body press reads it (file tail)
 }
 
 impl XformDrag {
@@ -1236,7 +1237,7 @@ impl XformDrag {
             return None;
         }
         let q = crate::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
-        let d = XformDrag { track, idx, q, corner: None, origin: (x, y), at: (x, y), xf0: clip.xform };
+        let d = XformDrag { track, idx, q, corner: None, origin: (x, y), at: (x, y), xf0: clip.xform, nosnap: false };
         let (x0, y0, x1, y1) = d.rect();
         let (x0, y0, x1, y1) = (x0 as f64, y0 as f64, x1 as f64, y1 as f64);
         let mut corner = None;
@@ -1263,13 +1264,13 @@ impl XformDrag {
         let fx = ((self.at.0 - self.origin.0) * 1000.0 / self.q.w.max(1) as f64) as i32;
         let fy = ((self.at.1 - self.origin.1) * 1000.0 / self.q.h.max(1) as f64) as i32;
         let (s, x, y) = (self.xf0.s as i32, self.xf0.x as i32, self.xf0.y as i32);
-        let Some(c) = self.corner else { return crate::Xform::clamped(s, x + fx, y + fy) };
+        let Some(c) = self.corner else { return self.snapped(crate::Xform::clamped(s, x + fx, y + fy), fx, fy) }; // STRIAXFORMHANDLES (SR9068): the frame snap (file tail)
         let (right, bottom) = (c & 1 != 0, c & 2 != 0);
         let d = ((if right { fx } else { -fx }) + (if bottom { fy } else { -fy })) / 2;
         let (ax, ay) = (if right { x } else { x + s }, if bottom { y } else { y + s });
         let room = (if right { 1000 - ax } else { ax }).min(if bottom { 1000 - ay } else { ay }).max(1);
         let t = (s + d).clamp(1, room);
-        crate::Xform::clamped(t, if right { ax } else { ax - t }, if bottom { ay } else { ay - t })
+        self.snapped(crate::Xform::clamped(t, if right { ax } else { ax - t }, if bottom { ay } else { ay - t }), fx, fy) // STRIAXFORMHANDLES (SR9068): the frame snap (file tail)
     }
     /// The drag would change the placement.
     pub fn moved(&self) -> bool {
@@ -1393,5 +1394,164 @@ mod striaxformthree_tests {
         let o = (y0 as usize * l.w as usize + x0 as usize) * 4;
         assert_eq!(&out[o..o + 4], &HANDLE);
         assert_eq!(d.shown(&st).and_then(|s| s.selected()).map(|c| c.xform), Some(Xform { x: 625, y: 725, s: 250 }));
+    }
+}
+
+// ---- STRIAXFORMHANDLES (LEDGER SR9068): corner handles on a placed clip and the frame snap (named tail block) ----
+// NLE-XFORM-DRAG-HANDLES: [`XformDrag::rest`] is SR9033's own press rule (`XformDrag::begin`) pressed at the centre of the
+// selected clip's placed rect, so the handles show exactly where a press would begin a placement drag (a placed, selected
+// video clip shown at the playhead by `schedule::top`); [`paint_xform_handles`] paints four [`XFORM_HANDLE`] px squares
+// in [`HANDLE`] on that rect's corners (inside [`XFORM_GRAB`], so a handle is where a corner press lands), and nothing
+// without a drag or a rest rect. NLE-XFORM-DRAG-SNAP: both returns of [`XformDrag::xform`] pass [`XformDrag::snapped`]:
+// within [`SNAP_PX`] (the timeline drag's tolerance, mapped to 1/1000 of the frame through `q`) a moved rect's left /
+// centre / right (top / middle / bottom) line lands on the frame's 0 / 500 / 1000, a scaled rect's moving corner edge
+// lands there with the opposite corner fixed; an axis snaps only when the pointer moved along it; `nosnap` (Alt at the
+// press, [`XformDrag::begin_nosnap`]) turns it off; the result passes THE clamp ([`crate::Xform::clamped`]) again.
+
+/// STRIAXFORMHANDLES (SR9068): the side (px) of a corner handle square on a placed clip's rect.
+pub const XFORM_HANDLE: i64 = 5;
+
+impl XformDrag {
+    /// STRIAXFORMHANDLES (SR9068): [`XformDrag::begin`] with the press's no-snap modifier.
+    pub fn begin_nosnap(st: &EditorState, l: Layout, sw: u32, sh: u32, x: f64, y: f64, nosnap: bool) -> Option<XformDrag> {
+        XformDrag::begin(st, l, sw, sh, x, y).map(|d| XformDrag { nosnap, ..d })
+    }
+    /// STRIAXFORMHANDLES (SR9068): the selected clip's placed rect at rest, by the press rule itself: [`XformDrag::begin`]
+    /// pressed at the rect's centre (`corner` None); `None` when no placed clip is selected at the playhead.
+    pub fn rest(st: &EditorState, l: Layout, sw: u32, sh: u32) -> Option<XformDrag> {
+        let clip = st.selected()?;
+        let q = crate::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
+        let probe = XformDrag { track: 0, idx: 0, q, corner: None, origin: (0.0, 0.0), at: (0.0, 0.0), xf0: clip.xform, nosnap: false };
+        let (x0, y0, x1, y1) = probe.rect();
+        let d = XformDrag::begin(st, l, sw, sh, (x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0)?;
+        Some(XformDrag { corner: None, ..d })
+    }
+    /// STRIAXFORMHANDLES (SR9068): `xf` (already clamped) snapped to the frame's edges / centre within [`SNAP_PX`], then
+    /// THE clamp again; `fx` / `fy` the pointer's travel in 1/1000 of the frame (an axis it did not move along never snaps).
+    fn snapped(&self, xf: crate::Xform, fx: i32, fy: i32) -> crate::Xform {
+        if self.nosnap {
+            return xf;
+        }
+        let tx = (SNAP_PX * 1000.0 / self.q.w.max(1) as f64) as i32;
+        let ty = (SNAP_PX * 1000.0 / self.q.h.max(1) as f64) as i32;
+        // The smallest `target - line` within `tol` over the lines and the frame's three lines.
+        fn near(lines: &[i32], tol: i32) -> Option<i32> {
+            let mut best: Option<i32> = None;
+            for &v in lines {
+                for t in [0, 500, 1000] {
+                    let d = t - v;
+                    if d.abs() <= tol && best.is_none_or(|b| d.abs() < b.abs()) {
+                        best = Some(d);
+                    }
+                }
+            }
+            best
+        }
+        let (s, x, y) = (xf.s as i32, xf.x as i32, xf.y as i32);
+        let Some(c) = self.corner else {
+            let dx = if fx != 0 { near(&[x, x + s / 2, x + s], tx).unwrap_or(0) } else { 0 };
+            let dy = if fy != 0 { near(&[y, y + s / 2, y + s], ty).unwrap_or(0) } else { 0 };
+            return crate::Xform::clamped(s, x + dx, y + dy);
+        };
+        let (right, bottom) = (c & 1 != 0, c & 2 != 0);
+        // The moving corner's edges; a delta toward the outside grows the side.
+        let sx = if fx != 0 { near(&[if right { x + s } else { x }], tx).map(|d| if right { d } else { -d }) } else { None };
+        let sy = if fy != 0 { near(&[if bottom { y + s } else { y }], ty).map(|d| if bottom { d } else { -d }) } else { None };
+        let px = |ds: i32, side: usize| (ds.abs() as i64) * side as i64;
+        let ds = match (sx, sy) {
+            (Some(a), Some(b)) => if px(a, self.q.w) <= px(b, self.q.h) { a } else { b },
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => return xf,
+        };
+        let (ax, ay) = (if right { x } else { x + s }, if bottom { y } else { y + s });
+        let room = (if right { 1000 - ax } else { ax }).min(if bottom { 1000 - ay } else { ay }).max(1);
+        let t = (s + ds).clamp(1, room);
+        crate::Xform::clamped(t, if right { ax } else { ax - t }, if bottom { ay } else { ay - t })
+    }
+}
+
+/// STRIAXFORMHANDLES (SR9068): four [`XFORM_HANDLE`] px [`HANDLE`] squares centred on the corners of `d`'s rect (the rest
+/// rect, or a live drag's dragged rect); `None` (or a canvas of another size) comes back untouched.
+pub fn paint_xform_handles(px: Vec<u8>, l: Layout, order: Order, d: Option<&XformDrag>) -> Vec<u8> {
+    let Some(d) = d else { return px };
+    if px.len() != l.w as usize * l.h as usize * 4 {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x0, y0, x1, y1) = d.rect();
+    let h = XFORM_HANDLE / 2;
+    for (cx, cy) in [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)] {
+        c.rect(cx - h, cy - h, cx - h + XFORM_HANDLE, cy - h + XFORM_HANDLE, HANDLE);
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod striaxformhandles_tests {
+    use super::*;
+    use crate::{Clip, Timeline, Xform};
+
+    /// SR9033's fixture: V1 A 0..20 at 0 placed at [`Xform::PIP`], A1 A 0..20; V1's clip selected, playhead 5; the band
+    /// 320 x 90 over a 160 x 90 still: `q` 160 x 90 at (80, 0), the PIP rect (196, 65)..(236, 87); the snap tolerance is
+    /// 37 (x) / 66 (y) thousandths.
+    fn fixture() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let tl = tl.set_xform(0, 0, Xform::PIP).unwrap();
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.playhead = 5;
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        (st, l)
+    }
+
+    /// A move lands the rect's centre on the frame's centre and its bottom on the frame's edge (an axis only once the
+    /// pointer moved along it); a corner lands its moving edge on the centre lines with the opposite corner fixed; Alt at
+    /// the press snaps nothing.
+    #[test]
+    fn striaxformhandles_snap_move_and_corner() {
+        let (st, l) = fixture();
+        let mut d = XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).unwrap();
+        d.update(162.0, 76.0);
+        assert_eq!(d.xform(), Xform { x: 375, y: 725, s: 250 }, "centre 513 -> 500; y kept (no vertical travel)");
+        d.update(162.0, 77.0);
+        assert_eq!(d.xform(), Xform { x: 375, y: 750, s: 250 }, "bottom 986 -> 1000");
+        let mut tl = XformDrag::begin(&st, l, 160, 90, 197.0, 66.0).unwrap();
+        assert_eq!(tl.corner, Some(0));
+        tl.update(162.0, 46.0);
+        assert_eq!(tl.xform(), Xform { x: 500, y: 500, s: 475 }, "505 -> 500, the bottom-right kept at 975");
+        let mut free = XformDrag::begin_nosnap(&st, l, 160, 90, 216.0, 76.0, true).unwrap();
+        free.update(162.0, 76.0);
+        assert_eq!(free.xform(), Xform { x: 388, y: 725, s: 250 }, "Alt: no snap");
+    }
+
+    /// The rest rect is the press rule's (placed, selected, at the playhead); the handles paint its four corners and
+    /// nothing else; no rest rect paints nothing.
+    #[test]
+    fn striaxformhandles_rest_and_handles_paint() {
+        let (st, l) = fixture();
+        let r = XformDrag::rest(&st, l, 160, 90).expect("a placed clip selected at the playhead");
+        assert_eq!((r.rect(), r.corner, r.moved()), ((196, 65, 236, 87), None, false));
+        let mut off = st.clone();
+        off.playhead = 30;
+        assert!(XformDrag::rest(&off, l, 160, 90).is_none(), "the clip not at the playhead");
+        let mut none = st.clone();
+        none.selection = None;
+        assert!(XformDrag::rest(&none, l, 160, 90).is_none(), "nothing selected");
+        let mut plain = st.clone();
+        plain.timeline = plain.timeline.set_xform(0, 0, Xform::NONE).unwrap();
+        assert!(XformDrag::rest(&plain, l, 160, 90).is_none(), "an unplaced clip");
+        let px = alloc::vec![0u8; l.w as usize * l.h as usize * 4];
+        assert_eq!(paint_xform_handles(px.clone(), l, Order::Rgba, None), px, "no rest rect: byte-identical");
+        let out = paint_xform_handles(px.clone(), l, Order::Rgba, Some(&r));
+        let at = |x: usize, y: usize| &out[(y * l.w as usize + x) * 4..(y * l.w as usize + x) * 4 + 4];
+        for (x, y) in [(196, 65), (235, 65), (196, 86), (235, 86)] {
+            assert_eq!(at(x, y), &HANDLE, "corner {x},{y}");
+        }
+        assert_eq!(at(216, 76), &[0u8; 4], "the rect's centre untouched");
     }
 }

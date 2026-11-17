@@ -1602,7 +1602,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(view::paint_xform_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(view::paint_xform_handles(view::paint_xform_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, role); // STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3183,7 +3183,7 @@ impl Face {
                 _ => None,
             };
         }
-        let SMessage::BrowserButton { down: true, x, y, .. } = *msg else { return None };
+        let SMessage::BrowserButton { down: true, x, y, mods, .. } = *msg else { return None }; // STRIAXFORMHANDLES (SR9068): mods carries the no-snap modifier
         if self.help {
             return None;
         }
@@ -3193,10 +3193,31 @@ impl Face {
             self.still = preview(&self.state.timeline, &self.sources, self.state.playhead).ok().flatten();
         }
         let (sw, sh) = self.still.as_ref().map(|s| (s.width, s.height))?;
-        self.xform_drag = Some(view::XformDrag::begin(&self.state, l, sw, sh, x, y)?);
+        self.xform_drag = Some(view::XformDrag::begin_nosnap(&self.state, l, sw, sh, x, y, mods & bandy::MOD_ALT != 0)?); // STRIAXFORMHANDLES (SR9068): Alt at the press snaps nothing, the body press's rule (`press`)
         self.xform_note = None;
         self.buttons = true;
         if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
         Some(true)
+    }
+}
+
+// ---- STRIAXFORMHANDLES (LEDGER SR9068): the placed clip's corner handles on the preview picture (named tail block) ----
+// NLE-XFORM-DRAG-HANDLES on the face: `paint_role`'s paint line hands [`Face::xform_handles`] to timeline_core's
+// `view::paint_xform_handles`: the live placement drag (its dragged rect), else `view::XformDrag::rest` over the painted
+// state, the layout the press reads and the preview still's size; nothing on the tracks Surface or under the help. A
+// rest rect exists only for a placed, selected video clip shown at the playhead, so every other paint is byte-identical.
+// NLE-XFORM-DRAG-SNAP's off switch: `xform_drag_on`'s press reads Alt (`bandy::MOD_ALT`) as the body press does.
+
+impl Face {
+    /// STRIAXFORMHANDLES (SR9068): the rect whose corners carry handles on `role`'s paint of `st` over layout `l`.
+    fn xform_handles(&self, st: &EditorState, l: Layout, role: Role) -> Option<view::XformDrag> {
+        if role == Role::Tracks || self.help {
+            return None;
+        }
+        if let Some(d) = self.xform_drag {
+            return Some(d);
+        }
+        let s = self.still.as_ref()?;
+        view::XformDrag::rest(st, l, s.width, s.height)
     }
 }
