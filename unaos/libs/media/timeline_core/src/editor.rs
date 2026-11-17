@@ -1001,7 +1001,7 @@ pub const JUMP_KEYS: [(u8, &str); 2] = [(b';', "marker-"), (b'\'', "marker+")];
 
 /// STRIAKMARKERJUMP (SR9064): the jump word a key byte names ([`JUMP_KEYS`]); `None` for any other byte.
 pub fn jump_key(b: u8) -> Option<&'static str> {
-    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
+    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| cut_jump_key(b)) // STRIAKCUTJUMP (LEDGER SR9091): Up / Down the cut jumps (file tail)
 }
 
 #[cfg(test)]
@@ -1033,6 +1033,60 @@ mod striakmarkerjump_tests {
             assert_eq!(st.playhead, want);
         }
         for want in [5, 5] {
+            assert_eq!(st.verb(back), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        assert_eq!(st.timeline, tl0);
+        assert!(!st.undo(), "a jump key is not an undo step");
+    }
+}
+
+// ---- STRIAKCUTJUMP (LEDGER SR9091): the clip-edge jump keys both faces bind (named tail block) ----
+// One key means one word on both faces: Up / Down are SR894's `cut-` / `cut+` (view words through `EditorState::verb`).
+// The kernel Player gets the arrows as single bytes (una_abi `KEY_UP` 0x1F / `KEY_DOWN` 0x1E; player.rs `key_route`
+// hands every byte but Space / Left / Right to `edit_post`) and reads them through [`jump_key`]; the host face gets the
+// named keys (`Up` / `Down`) through its KEYS slice, which a test (stria tests/nle.rs) ties to this table. timeline_core
+// does not link una_abi: vplay.rs asserts the bytes at compile time.
+
+/// STRIAKCUTJUMP (SR9091): `(Player byte, host key name, word)` of the clip-edge jump words.
+pub const CUT_JUMP_KEYS: [(u8, &str, &str); 2] = [(0x1F, "Up", "cut-"), (0x1E, "Down", "cut+")];
+
+/// STRIAKCUTJUMP (SR9091): the cut jump word a Player byte names ([`CUT_JUMP_KEYS`]); `None` for any other byte.
+pub fn cut_jump_key(b: u8) -> Option<&'static str> {
+    CUT_JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.2)
+}
+
+#[cfg(test)]
+mod striakcutjump_tests {
+    use super::*;
+    use crate::Kind;
+
+    #[test]
+    fn striakcutjump_arrow_bytes_name_the_cut_words() {
+        assert_eq!(jump_key(0x1F).and_then(jump_word), Some((Jump::Cut, false)));
+        assert_eq!(jump_key(0x1E).and_then(jump_word), Some((Jump::Cut, true)));
+        assert_eq!(jump_key(b';').and_then(jump_word), Some((Jump::Marker, false)));
+        assert_eq!(jump_key(b'\'').and_then(jump_word), Some((Jump::Marker, true)));
+        for b in [0x1Cu8, 0x1D, 0x1B, b'm', 0u8] {
+            assert_eq!(cut_jump_key(b), None, "{b}");
+            assert_eq!(jump_key(b), None, "{b}");
+        }
+    }
+
+    #[test]
+    fn striakcutjump_arrow_key_jumps_through_the_one_dispatch() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 30, 10)];
+        let mut st = EditorState::new(tl);
+        let tl0 = st.timeline.clone();
+        let (back, fwd) = (jump_key(0x1F).unwrap(), jump_key(0x1E).unwrap());
+        for want in [10, 30, 30] {
+            assert_eq!(st.verb(fwd), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        for want in [10, 0, 0] {
             assert_eq!(st.verb(back), Some(Ok(())));
             assert_eq!(st.playhead, want);
         }
