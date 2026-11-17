@@ -8955,6 +8955,40 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "cn", "lineHeight"), "normal");
     }
 
+    // ---- AETHERCSSBORDERCOLORONEROAD (LEDGER SR1098): border-color takes ONE road; a colour creates no side (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): two 40x20 boxes, rows 12px apart, under a green body ink: `#oa` `border: 2px
+    /// solid; border-top-style: none; border-color: red`; `#ob` `border-top-style: solid; border-color: red`.
+    fn border_color_one_road_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="oa" style="width:40px;height:20px;border:2px solid;border-top-style:none;border-color:red"></div>
+            <div id="ob" style="width:40px;height:20px;border-top-style:solid;border-color:red"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §4.3 a colour creates no side: `#oa` paints no top edge
+    /// (before SR1098 the one-value road re-created a 2px red top), its left edge red (armed); `#ob` paints its top red
+    /// (armed) and no other edge (before SR1098 a fabricated 3px red frame on the three styleless sides).
+    #[test]
+    fn border_color_one_road_paints() {
+        let mut e = border_color_one_road_engine();
+        let a = border_side_color_edges(&mut e, "oa");
+        assert!(!css_wide_red(a[0]), "#oa: no top edge: {:?}", a[0]);
+        assert!(css_wide_red(a[3]), "armed: #oa's left edge is red: {:?}", a[3]);
+        let b = border_side_color_edges(&mut e, "ob");
+        assert!(css_wide_red(b[0]), "armed: #ob's top is red: {:?}", b[0]);
+        for (i, c) in b.iter().enumerate().skip(1) {
+            assert!(!css_wide_red(*c), "#ob: side {i} paints no red: {c:?}");
+        }
+    }
+
     // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
 
     /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a

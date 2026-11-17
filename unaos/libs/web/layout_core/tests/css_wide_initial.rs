@@ -1904,7 +1904,7 @@ fn border_color_stored_absent_entry_and_existing() {
     let s = styled(&[("border-top", "2px blue"), ("border-color", "red")]);
     assert_eq!(s.paint.border, Some([Some((2.0, red)), None, None, None]), "no style in the block: the top only");
     let s = styled(&[("border-top", "2px solid"), ("border-color", "red")]);
-    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((3.0, red)), Some((3.0, red)), Some((3.0, red))]), "a style word: created at medium 3px (SR1069; was 1px)");
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), None, None, None]), "SR1098 (re-pinned in place): css-backgrounds-3 §4.3 a colour creates no side, the three styleless sides stay absent (was three 3px red sides)");
     let s = styled(&[("border", "1px solid blue"), ("border-color", "red")]);
     assert_eq!(s.paint.border, Some([Some((1.0, red)); 4]), "the existing road");
 }
@@ -2362,7 +2362,7 @@ fn border_color_sides_of(v: &str) -> [Option<(f32, (u8, u8, u8))>; 4] {
     styled(&[("border", "2px solid blue"), ("border-color", v)]).paint.border.expect("sides")
 }
 
-/// AETHERCSSBORDERCOLORSIDES (SR1085): one colour keeps the old all-sides road; the per-side road with the colour four
+/// AETHERCSSBORDERCOLORSIDES (SR1085): one colour (SR1098: now the same per-side road, the identity trivially kept); the colour four
 /// times writes the same `border` / `border_style` / `border_alpha` / `sys_border` on a sided block, and the same
 /// `border` / `border_pending` on a styleless one.
 #[test]
@@ -2424,4 +2424,68 @@ fn border_color_sides_system_colors() {
     assert_eq!(sys(&[("border", "2px solid blue"), ("border-color", "CanvasText Canvas")]), Some((k, 0b0101)), "the first keyword");
     assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red CanvasText")]), Some((k, 0b1010)), "the earlier keyword goes");
     assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red blue")]), None, "plain colours clear the slot");
+}
+
+// ---- AETHERCSSBORDERCOLORONEROAD (LEDGER SR1098): border-color takes ONE road for 1-4 colours (named tail block) ----
+
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §3.2 `border-color` sets all four colour longhands, so the
+/// pending store is written for every side, present ones included: one value and the value four times end with ONE
+/// store; armed: a side made None and then re-styled comes back in the stored colour (before SR1098 the per-side road
+/// stored nothing for a present side, so it came back grey).
+#[test]
+fn border_color_one_road_store() {
+    let (r, b, g) = (stored_rgb("red"), stored_rgb("blue"), stored_rgb("green"));
+    let pend = |v: &str| styled(&[("border", "2px solid blue"), ("border-color", v)]).paint.border_pending;
+    assert_eq!(pend("red"), pend("red red red red"), "one store");
+    assert_eq!(pend("red"), Some([Some((r, false)); 4]), "four red entries on a sided block");
+    assert_eq!(pend("red blue"), Some([Some((r, false)), Some((b, false)), Some((r, false)), Some((b, false))]));
+    let s = styled(&[("border", "2px solid blue"), ("border-color", "red green"), ("border-top-style", "none"), ("border-top-style", "solid")]);
+    assert_eq!(s.paint.border.expect("sides")[0], Some((2.0, r)), "armed: the top comes back red");
+    assert_eq!(s.paint.border.expect("sides")[1], Some((2.0, g)), "the right stays green");
+}
+
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): each side writes ITS live currentcolor bit (the mixed value the old one-value
+/// road could not express); an absent side carries no live bit (its pending entry carries the answer, and creation sets
+/// the bit from it): `border-color: currentcolor` on a frameless block leaves the bits 0 (was CC_SIDES).
+#[test]
+fn border_color_one_road_bits() {
+    use layout_core::paint::CC_SIDES;
+    let cc = |v: &str| styled(&[("border", "2px solid blue"), ("border-color", v)]).paint.currentcolor;
+    assert_eq!(cc("currentcolor red currentcolor red"), 0b0101, "top and bottom only");
+    assert_eq!(cc("currentcolor"), CC_SIDES, "armed: all four");
+    let s = styled(&[("border-color", "currentcolor")]);
+    assert_eq!(s.paint.currentcolor, 0, "no side, no live bit");
+    assert_eq!(s.paint.border_pending, Some([Some((STORED_GREY, true)); 4]), "the entries carry the answer");
+}
+
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §4.2-4.3 a colour never creates a side (SR1014's per-side
+/// rule): before SR1098 the one-value road re-created every absent side whenever the block's `border_style` was Some.
+#[test]
+fn border_color_one_road_no_revive() {
+    let r = stored_rgb("red");
+    let s = styled(&[("border", "2px solid"), ("border-top-style", "none"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([None, Some((2.0, r)), Some((2.0, r)), Some((2.0, r))]), "the top stays None (was 2px red)");
+    let s = styled(&[("border", "2px solid"), ("border-style", "none"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([None; 4]), "border-style: none stays (was four red sides)");
+    let s = styled(&[("border-top-style", "solid"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((3.0, r)), None, None, None]), "the top only (was a fabricated 3px red frame)");
+}
+
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): what the one-value road did and the one road still does: a styleless colour
+/// pends four entries, `transparent` drops the frame (in the block and over an earlier rule: the UA quiet button), one
+/// system keyword takes all four slot bits, an invalid value is ignored; armed: `transparent transparent` now drops the
+/// frame too (before SR1098 the per-side road left `border` None).
+#[test]
+fn border_color_one_road_as_before() {
+    let r = stored_rgb("red");
+    let s = styled(&[("border-color", "red")]);
+    assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some((r, false)); 4])));
+    assert_eq!(styled(&[("border-color", "transparent")]).paint.border, Some([None; 4]), "transparent");
+    assert_eq!(styled(&[("border-color", "transparent transparent")]).paint.border, Some([None; 4]), "armed: two tokens");
+    let c = cascade(&[&[("border", "1px solid black")], &[("border-color", "transparent")]]);
+    assert_eq!(c.paint.border, Some([None; 4]), "over an earlier rule's frame");
+    let k = system_color_index("canvastext").expect("canvastext");
+    assert_eq!(styled(&[("border-color", "CanvasText")]).paint.sys_border, Some((k, 0b1111)), "one keyword, four sides");
+    let s = styled(&[("border", "2px solid CanvasText"), ("border-color", "bogus")]);
+    assert_eq!(s.paint.sys_border, Some((k, 0b1111)), "an invalid value keeps the slot (the old road cleared it)");
 }
