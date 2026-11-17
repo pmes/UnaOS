@@ -1530,3 +1530,7 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAKSEQ (LEDGER SR9065): the image-sequence reel's shared rules (named tail block) ----
+/// STRIAKSEQ (LEDGER SR9065): the sequence reel's formats, file names, the Player's reel directory and the upright decode.
+pub mod seq;
