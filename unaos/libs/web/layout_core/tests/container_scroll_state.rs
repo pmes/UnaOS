@@ -188,3 +188,65 @@ fn scroll_state_stuck_nested_panel() {
     assert_eq!(box_of(&t2, &doc.by_id("skn")).2, 50.0, "stuck: top inside the scrolled panel");
     assert_ne!(box_of(&t2, &doc.by_id("nkn")).2, 60.0, "not scroll-state(stuck) does not apply");
 }
+
+// ---- AETHERSTICKYOUTERHOLD (LEDGER SR1167): a sticky box inside a stuck sticky box reads its stuck-ness at its painted place (named tail block) ----
+
+/// AETHERSTICKYOUTERHOLD (SR1167): 800x600, the page scrolled 300: a 100px spacer, the sticky `top: 0` section `#sc`
+/// (300px) holding a 20px block, `pad`px and the sticky `top: 40px` sub-header `#sb` (20px, a scroll-state container with
+/// `.sk` / `.nk` kids), then 2000px. `#sb` 20 into the section: under the section's hold it sits at 320, holds at 340,
+/// `stuck: top` (PINNED: the unheld read was TOP too). `#sb` 120 into the section: it rides at 420, below its 340 target:
+/// not stuck (armed: the unheld origin 220 read TOP), so `not scroll-state(stuck)` applies (armed).
+#[test]
+fn sticky_outer_hold_query_two_levels() {
+    let sheet = css_core::stylesheet::parse_stylesheet(SHEET);
+    let env = css_core::media::Environment::viewport(800.0, 600.0);
+    let supports = |_: &css_core::parser::Declaration| true;
+    let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
+    let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
+    let mut rules = css_core::cascade::RuleSet::new();
+    rules.add_sheet(&sheet, css_core::cascade::Origin::Author, &cond);
+    let (vs, vp) = ((0.0, 300.0), (800.0, 600.0));
+    for (pad, want_held, want_stuck) in [(0u32, 320.0f32, TOP), (100, 420.0, 0u8)] {
+        let pad_style = format!("height: {pad}px");
+        let doc = page(vec![
+            el("div", &[("style", "height: 100px")], vec![]),
+            el(
+                "div",
+                &[("id", "sc"), ("style", "position: sticky; top: 0px; height: 300px")],
+                vec![
+                    el("div", &[("style", "height: 20px")], vec![]),
+                    el("div", &[("style", pad_style.as_str())], vec![]),
+                    el(
+                        "div",
+                        &[("id", "sb"), ("style", "position: sticky; top: 40px; height: 20px; container-type: scroll-state")],
+                        vec![el("div", &[("id", "skb"), ("class", "sk")], vec![]), el("div", &[("id", "nkb"), ("class", "nk")], vec![])],
+                    ),
+                ],
+            ),
+            el("div", &[("style", "height: 2000px")], vec![]),
+        ]);
+        let first = cascade_sheet(&doc, &rules, None, 800.0, 600.0);
+        let t1 = lay_styled(&doc, &first, 800.0, 600.0);
+        let sb = id_of(&t1, &doc.by_id("sb"));
+        assert_eq!(scroll::box_origin_held(&t1, sb, vs, vp).map(|o| o.1), Some(want_held), "#sb under the section's hold (pad {pad})");
+        assert_eq!(scroll::sticky_stuck(&t1, sb, vs, vp), want_stuck, "#sb stuck-ness at its painted place (pad {pad}; armed at 100)");
+        let query = |e: &N, c: &ContainerRule| -> bool {
+            let mut cur = DomNode::parent(e);
+            while let Some(a) = cur {
+                if let Some((tid, _)) = t1.node_map.iter().find(|(_, n)| n.id == a.id) {
+                    if t1.paint_map.get(tid).and_then(|p| p.container_scroll) == Some(true) {
+                        let st = scroll::scroll_state(&t1, *tid, vs, vp);
+                        return c.evaluate_full(None, &|_| None, Some(&st)) == Tri::True;
+                    }
+                }
+                cur = DomNode::parent(&a);
+            }
+            false
+        };
+        let second = cascade_sheet(&doc, &rules, Some(&query), 800.0, 600.0);
+        let t2 = lay_styled(&doc, &second, 800.0, 600.0);
+        let stuck = want_stuck != 0;
+        assert_eq!(box_of(&t2, &doc.by_id("skb")).2 == 50.0, stuck, "scroll-state(stuck: top) on #sb (pad {pad})");
+        assert_eq!(box_of(&t2, &doc.by_id("nkb")).2 == 60.0, !stuck, "not scroll-state(stuck) on #sb (pad {pad}; armed at 100)");
+    }
+}

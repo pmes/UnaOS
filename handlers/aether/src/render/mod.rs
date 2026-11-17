@@ -4972,7 +4972,7 @@ fn sticky_scrollport(
         Some(((bx, by), (shx, shy))) => (abs_x - shx - bx, abs_y - shy - by),
         None => (0.0, 0.0),
     };
-    let held = if sticky_scroller(layout, node_id).is_some() { d } else { (0.0, 0.0) };
+    let held = sticky_scroller(layout, node_id).map_or((0.0, 0.0), |s| layout_core::scroll::sticky_shift(layout, s, vs, (width as f32, height as f32))); // AETHERSTICKYOUTERHOLD (SR1167): an inner scroller's port moves by the scroller's OWN painted shift, not the parent's outer hold
     let (pl, pt, pr, pb, cl, ct, cr, cb) = layout_core::scroll::sticky_scrollport(layout, node_id, vs, (width as f32, height as f32));
     (pl + held.0, pt + held.1, pr + held.0, pb + held.1, cl + d.0, ct + d.1, cr + d.0, cb + d.1)
 }
