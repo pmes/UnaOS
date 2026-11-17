@@ -2365,105 +2365,6 @@ fn nle6utp1synth_host_reel_is_demux_cores() {
     println!("nle6utp1synth: synth_source(1000,30,25) fnv {host:#018x} == demux_core build::synth_reel");
 }
 
-// ---- NLE5DEXPORTMESSAGEDURATION (LEDGER SR775): the export's wall time on the result line (named tail block) ----
-
-/// The wall-time grammar of `stria::nle_face::wall_words`: `D.D s` (under 10 s), `S s` (10..59), `M min SS s` (1..59
-/// minutes), `H h MM min` (an hour or more).
-fn nle5dexportmessageduration_grammar(t: &str) -> bool {
-    let two = |x: &str| x.len() == 2 && x.parse::<u32>().is_ok_and(|n| n < 60);
-    let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
-    match nle5dexportmessagerate_unrated(t).unwrap_or("?").split(' ').collect::<Vec<_>>().as_slice() { // NLE5DEXPORTMESSAGERATE (SR785): an optional ` (<r> fps)` tail
-        [x, "s"] => match x.split_once('.') {
-            Some((a, b)) => num(a) && a.parse::<u32>().is_ok_and(|n| n < 10) && b.len() == 1 && num(b),
-            None => num(*x) && x.parse::<u32>().is_ok_and(|n| (10..60).contains(&n)),
-        },
-        [m, "min", ss, "s"] => num(*m) && m.parse::<u32>().is_ok_and(|n| (1..60).contains(&n)) && two(*ss),
-        [h, "h", mm, "min"] => num(*h) && h.parse::<u32>().is_ok_and(|n| n >= 1) && two(*mm),
-        _ => false,
-    }
-}
-
-/// A finished export's result line without its ` in <t>` (the last ` in ` before ` -> <dir>`), the time checked against
-/// the grammar; panics when the line carries none (every finished line does).
-fn nle5dexportmessageduration_unwalled(line: &str) -> String {
-    let arrow = line.rfind(" -> ").unwrap_or_else(|| panic!("no ` -> <dir>` in {line}"));
-    let head = &line[..arrow];
-    let i = head.rfind(" in ").unwrap_or_else(|| panic!("no ` in <t>` in {line}"));
-    let t = &head[i + 4..];
-    assert!(nle5dexportmessageduration_grammar(t), "{t:?} is not a wall time in {line}");
-    format!("{}{}", &head[..i], &line[arrow..])
-}
-
-#[test]
-fn nle5dexportmessageduration_wall_words_kat() {
-    use stria::nle_face::wall_words;
-    use std::time::Duration;
-    let ms = Duration::from_millis;
-    for (d, want) in [
-        (ms(0), "0.0 s"),
-        (ms(800), "0.8 s"),
-        (ms(9_999), "9.9 s"),
-        (ms(10_000), "10 s"),
-        (ms(12_400), "12 s"),
-        (ms(59_900), "59 s"),
-        (ms(60_000), "1 min 00 s"),
-        (ms(65_000), "1 min 05 s"),
-        (ms(3_599_900), "59 min 59 s"),
-        (ms(3_600_000), "1 h 00 min"),
-        (ms(3_720_000), "1 h 02 min"),
-        (ms(90_000_000), "25 h 00 min"),
-    ] {
-        assert_eq!(wall_words(d), want, "{d:?}");
-        assert!(nle5dexportmessageduration_grammar(want), "{want}");
-    }
-    for bad in ["10.0 s", "60 s", "1 min 5 s", "0 min 05 s", "0 h 02 min", "12s", "1 h 2 min"] {
-        assert!(!nle5dexportmessageduration_grammar(bad), "{bad}");
-    }
-    println!("nle5dexportmessageduration: wall_words 12 KAT rows, 7 refused shapes");
-}
-
-#[test]
-fn nle5dexportmessageduration_finished_line_names_its_time() {
-    let dir = nlefaceexport_dir("duration-png");
-    let (tl, src) = synth_fixture();
-    let mut face = nlefaceexport_face(tl, src);
-    assert!(face.verb(&format!("export {} png", dir.display())));
-    assert!(face.last_error.is_none(), "{:?}", face.last_error);
-    assert!(face.wait_export());
-    let line = face.last_error.clone().expect("the message line");
-    assert!(line.starts_with("export: 35 frames, ") && line.contains(" bytes, png + wav in "), "{line}");
-    assert!(line.ends_with(&format!(" -> {}", dir.display())), "{line}");
-    assert!(nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}");
-    let standing = face.paint();
-    face.last_error = None;
-    assert_eq!(face.paint(), standing, "labels off: the message paints nothing");
-    println!("nle5dexportmessageduration: {line}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn nle5dexportmessageduration_refusals_carry_no_time() {
-    let has_time = |l: &str| l.match_indices(" in ").any(|(i, _)| l[i + 4..].starts_with(|c: char| c.is_ascii_digit()));
-    let dir = nlefaceexport_dir("duration-refused");
-    let (tl, src) = synth_fixture();
-    let mut face = nlefaceexport_face(tl, src);
-    assert!(face.verb(&format!("export {} png wav extra", dir.display())));
-    let usage = face.last_error.take().expect("the usage refusal");
-    assert!(usage.starts_with("export: usage: ") && !has_time(&usage), "{usage}");
-    assert!(face.verb(&format!("export {} gif", dir.display())));
-    let fmt = face.last_error.take().expect("the format refusal");
-    assert!(fmt.starts_with("export: unknown format gif") && !has_time(&fmt), "{fmt}");
-    face.export_paused_at(&dir, "png", 3).unwrap();
-    nlefaceexport_until(&face, (3, 35));
-    assert!(face.cancel_export());
-    assert!(face.wait_export());
-    let cancel = face.last_error.take().expect("the cancel line");
-    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
-    assert!(!has_time(&cancel), "{cancel}");
-    println!("nle5dexportmessageduration: usage / unknown format / cancel carry no wall time");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 // ---- NLE3ESLIPSTEP (LEDGER SR752): Ctrl / Cmd chords step SLIP_STEP frames through SR737's words (named tail block) ----
 use stria::nle_face::SLIP_STEP;
 
@@ -2801,13 +2702,112 @@ fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String 
     src.summary(face.state.timeline.tracks[0].clips[i].src).unwrap()
 }
 
+// ---- NLE5DEXPORTMESSAGEDURATION (LEDGER SR775): the export's wall time on the result line (named tail block) ----
+
+/// The wall-time grammar of `stria::nle_face::wall_words`: `D.D s` (under 10 s), `S s` (10..59), `M min SS s` (1..59
+/// minutes), `H h MM min` (an hour or more).
+fn nle5dexportmessageduration_grammar(t: &str) -> bool {
+    let two = |x: &str| x.len() == 2 && x.parse::<u32>().is_ok_and(|n| n < 60);
+    let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    match nle5dexportmessagerate_unrated(t).unwrap_or("?").split(' ').collect::<Vec<_>>().as_slice() { // NLE5DEXPORTMESSAGERATE (SR785): an optional ` (<r> fps)` tail
+        [x, "s"] => match x.split_once('.') {
+            Some((a, b)) => num(a) && a.parse::<u32>().is_ok_and(|n| n < 10) && b.len() == 1 && num(b),
+            None => num(*x) && x.parse::<u32>().is_ok_and(|n| (10..60).contains(&n)),
+        },
+        [m, "min", ss, "s"] => num(*m) && m.parse::<u32>().is_ok_and(|n| (1..60).contains(&n)) && two(*ss),
+        [h, "h", mm, "min"] => num(*h) && h.parse::<u32>().is_ok_and(|n| n >= 1) && two(*mm),
+        _ => false,
+    }
+}
+
+/// A finished export's result line without its ` in <t>` (the last ` in ` before ` -> <dir>`), the time checked against
+/// the grammar; panics when the line carries none (every finished line does).
+fn nle5dexportmessageduration_unwalled(line: &str) -> String {
+    let arrow = line.rfind(" -> ").unwrap_or_else(|| panic!("no ` -> <dir>` in {line}"));
+    let head = &line[..arrow];
+    let i = head.rfind(" in ").unwrap_or_else(|| panic!("no ` in <t>` in {line}"));
+    let t = &head[i + 4..];
+    assert!(nle5dexportmessageduration_grammar(t), "{t:?} is not a wall time in {line}");
+    format!("{}{}", &head[..i], &line[arrow..])
+}
+
+#[test]
+fn nle5dexportmessageduration_wall_words_kat() {
+    use stria::nle_face::wall_words;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    for (d, want) in [
+        (ms(0), "0.0 s"),
+        (ms(800), "0.8 s"),
+        (ms(9_999), "9.9 s"),
+        (ms(10_000), "10 s"),
+        (ms(12_400), "12 s"),
+        (ms(59_900), "59 s"),
+        (ms(60_000), "1 min 00 s"),
+        (ms(65_000), "1 min 05 s"),
+        (ms(3_599_900), "59 min 59 s"),
+        (ms(3_600_000), "1 h 00 min"),
+        (ms(3_720_000), "1 h 02 min"),
+        (ms(90_000_000), "25 h 00 min"),
+    ] {
+        assert_eq!(wall_words(d), want, "{d:?}");
+        assert!(nle5dexportmessageduration_grammar(want), "{want}");
+    }
+    for bad in ["10.0 s", "60 s", "1 min 5 s", "0 min 05 s", "0 h 02 min", "12s", "1 h 2 min"] {
+        assert!(!nle5dexportmessageduration_grammar(bad), "{bad}");
+    }
+    println!("nle5dexportmessageduration: wall_words 12 KAT rows, 7 refused shapes");
+}
+
+#[test]
+fn nle5dexportmessageduration_finished_line_names_its_time() {
+    let dir = nlefaceexport_dir("duration-png");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.clone().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" bytes, png + wav in "), "{line}");
+    assert!(line.ends_with(&format!(" -> {}", dir.display())), "{line}");
+    assert!(nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}");
+    let standing = face.paint();
+    face.last_error = None;
+    assert_eq!(face.paint(), standing, "labels off: the message paints nothing");
+    println!("nle5dexportmessageduration: {line}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageduration_refusals_carry_no_time() {
+    let has_time = |l: &str| l.match_indices(" in ").any(|(i, _)| l[i + 4..].starts_with(|c: char| c.is_ascii_digit()));
+    let dir = nlefaceexport_dir("duration-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png wav extra", dir.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    assert!(usage.starts_with("export: usage: ") && !has_time(&usage), "{usage}");
+    assert!(face.verb(&format!("export {} gif", dir.display())));
+    let fmt = face.last_error.take().expect("the format refusal");
+    assert!(fmt.starts_with("export: unknown format gif") && !has_time(&fmt), "{fmt}");
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    assert!(!has_time(&cancel), "{cancel}");
+    println!("nle5dexportmessageduration: usage / unknown format / cancel carry no wall time");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- NLE5DEXPORTMESSAGERATE (LEDGER SR785): the export's frames per second on the result line (named tail block) ----
 
 /// The rate grammar of `stria::nle_face::rate_words`: `N fps` (a whole number, 100 or more) or `A.D fps` (A under 100,
 /// one decimal digit), no leading zeros.
 fn nle5dexportmessagerate_grammar(r: &str) -> bool {
     let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
-    let Some(n) = r.strip_suffix(" fps") else { return false };
+    let Some(n) = nle5dexportmessageraterealtime_unmultiplied(r).strip_suffix(" fps") else { return false }; // NLE5DEXPORTMESSAGERATEREALTIME (SR794): an optional `, <m>x` tail
     match n.split_once('.') {
         Some((a, d)) => num(a) && a.parse::<u32>().is_ok_and(|v| v < 100) && d.len() == 1 && num(d),
         None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 100),
@@ -2839,12 +2839,12 @@ fn nle5dexportmessagerate_rate_words_kat() {
         (1, ms(1), "1000 fps"),
     ];
     for (f, d, want) in rows {
-        assert_eq!(rate_words(f, d).as_deref(), Some(want), "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)).as_deref(), Some(want), "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794): no rate, no multiple
         assert!(nle5dexportmessagerate_grammar(want), "{want}");
     }
     let nones = [(0, ms(800)), (10, ms(0)), (10, us(999))];
     for (f, d) in nones {
-        assert_eq!(rate_words(f, d), None, "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)), None, "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794)
     }
     let bad = ["044 fps", "99 fps", "100.0 fps", "3 fps", "3.25 fps", "43.8fps"];
     for b in bad {
@@ -2898,4 +2898,424 @@ fn nle5dexportmessagerate_refusals_carry_no_rate() {
     assert!(!cancel.contains(" fps)"), "{cancel}");
     println!("nle5dexportmessagerate: usage / unknown format / cancel carry no rate");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- NLE5DEXPORTMESSAGERATEREALTIME (LEDGER SR794): the export's speed as a multiple of real time (named tail block) ----
+
+/// The multiple grammar of `stria::nle_face::realtime_words`: `Nx` (a whole number, 10 or more), `A.Dx` (A 1..9, one
+/// decimal digit) or `0.DDx` (two decimal digits), no leading zeros.
+fn nle5dexportmessageraterealtime_grammar(m: &str) -> bool {
+    let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    let Some(n) = m.strip_suffix('x') else { return false };
+    match n.split_once('.') {
+        None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 10),
+        Some((a, d)) if d.len() == 1 => num(a) && a.parse::<u32>().is_ok_and(|v| (1..10).contains(&v)) && digits(d),
+        Some((a, d)) => a == "0" && d.len() == 2 && digits(d),
+    }
+}
+
+/// A rate with its optional `, <m>x` tail split off when the tail is in the grammar; else the rate as given.
+fn nle5dexportmessageraterealtime_unmultiplied(r: &str) -> &str {
+    match r.split_once(", ") {
+        Some((h, m)) if nle5dexportmessageraterealtime_grammar(m) => h,
+        _ => r,
+    }
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_kat() {
+    use stria::nle_face::{rate_words, realtime_words};
+    use std::time::Duration;
+    let (ms, us) = (Duration::from_millis, Duration::from_micros);
+    let rows = [
+        (35, ms(800), (25, 1), "1.8x"),
+        (1000, ms(2_000), (25, 1), "20x"),
+        (10, ms(1_000), (25, 1), "0.40x"),
+        (30, ms(1_001), (30_000, 1_001), "1.0x"),
+        (19, ms(2_000), (1, 1), "9.5x"),
+        (999, ms(100_000), (1, 1), "10x"),
+    ];
+    for (f, d, fps, want) in rows {
+        assert_eq!(realtime_words(f, d, fps).as_deref(), Some(want), "{f} frames in {d:?} at {fps:?}");
+        assert!(nle5dexportmessageraterealtime_grammar(want), "{want}");
+    }
+    let nones = [(0, ms(800), (25, 1)), (35, ms(800), (25, 0)), (35, ms(800), (0, 1)), (35, us(999), (25, 1))];
+    for (f, d, fps) in nones {
+        assert_eq!(realtime_words(f, d, fps), None, "{f} frames in {d:?} at {fps:?}");
+    }
+    assert_eq!(rate_words(35, ms(800), (25, 1)).as_deref(), Some("43.8 fps, 1.8x"));
+    assert_eq!(rate_words(35, ms(800), (25, 0)).as_deref(), Some("43.8 fps"), "no rate: the fps alone");
+    let bad = ["01.8x", "1.80x", "10.0x", "9x", "0.4x", "1.8 x"];
+    for b in bad {
+        assert!(!nle5dexportmessageraterealtime_grammar(b), "{b}");
+    }
+    assert!(nle5dexportmessagerate_grammar("43.8 fps, 1.8x") && !nle5dexportmessagerate_grammar("43.8 fps, 1.80x"));
+    assert!(nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 1.8x)") && !nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 9x)"));
+    println!("nle5dexportmessageraterealtime: realtime_words {} KAT rows, {} None, {} refused shapes", rows.len(), nones.len(), bad.len());
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_finished_line_names_its_multiple() {
+    let dir = nlefaceexport_dir("realtime-png");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.clone().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" bytes, png + wav in "), "{line}");
+    let arrow = line.rfind(" -> ").expect("the dir");
+    let head = &line[..arrow];
+    let t = &head[head.rfind(" in ").expect("the time") + 4..];
+    let (wall, paren) = t.split_once(" (").unwrap_or_else(|| panic!("no ` (<r> fps, <m>x)` in {line}"));
+    let (rate, m) = paren.strip_suffix(')').and_then(|p| p.split_once(", ")).unwrap_or_else(|| panic!("no `, <m>x` in {line}"));
+    assert!(nle5dexportmessagerate_grammar(rate) && rate.ends_with(" fps"), "{rate:?} is not a rate in {line}");
+    assert!(nle5dexportmessageraterealtime_grammar(m), "{m:?} is not a multiple in {line}");
+    assert!(nle5dexportmessageduration_grammar(wall), "{wall:?} in {line}");
+    assert!(nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}");
+    let standing = face.paint();
+    face.last_error = None;
+    assert_eq!(face.paint(), standing, "labels off: the message paints nothing");
+    println!("nle5dexportmessageraterealtime: {line}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_refusals_carry_none() {
+    let dir = nlefaceexport_dir("realtime-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png wav extra", dir.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    assert!(usage.starts_with("export: usage: ") && !usage.contains("x)"), "{usage}");
+    assert!(face.verb(&format!("export {} gif", dir.display())));
+    let fmt = face.last_error.take().expect("the format refusal");
+    assert!(fmt.starts_with("export: unknown format gif") && !fmt.contains("x)"), "{fmt}");
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    println!("nle5dexportmessageraterealtime: usage / unknown format / cancel carry no multiple");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- NLE5DEXPORTMESSAGEETA (LEDGER SR796): a running export's remaining time from the rate so far (named tail block) ----
+
+#[test]
+fn nle5dexportmessageeta_eta_words_kat() {
+    use stria::nle_face::{eta_secs, eta_words};
+    use std::time::Duration;
+    let (s, ms, us) = (Duration::from_secs, Duration::from_millis, Duration::from_micros);
+    let rows = [
+        (10, 35, s(2), "~5 s"),
+        (1, 100, s(1), "~1:39"),
+        (1, 10_000, s(1), "~2:46:39"),
+        (35, 35, s(2), "~0 s"),
+        (1, 2, ms(400), "~0 s"),
+        (1, 2, ms(600), "~1 s"),
+        (1, 2, ms(59_600), "~1:00"),
+        (1, 2, ms(3_599_500), "~1:00:00"),
+    ];
+    for (d, t, e, want) in rows {
+        assert_eq!(eta_words(d, t, e).as_deref(), Some(want), "eta_words({d}, {t}, {e:?})");
+    }
+    let nones = [(0, 35, s(2)), (10, 35, Duration::ZERO), (10, 35, us(999))];
+    for (d, t, e) in nones {
+        assert_eq!(eta_words(d, t, e), None, "eta_words({d}, {t}, {e:?}): no estimate yet");
+    }
+    assert_eq!(eta_secs(ms(1_500)), 2);
+    assert_eq!(eta_secs(ms(1_499)), 1);
+    println!("nle5dexportmessageeta: eta_words {} KAT rows, {} None, eta_secs half up", rows.len(), nones.len());
+}
+
+#[test]
+fn nle5dexportmessageeta_export_eta_runs_only_while_exporting() {
+    use stria::nle_face::eta_words;
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("eta-running");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert_eq!(face.export_eta(), None, "no export: no eta");
+    let t0 = std::time::Instant::now();
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let e1 = face.export_eta().expect("an eta while the paused job runs");
+    assert!(e1 >= Duration::from_millis(2) * 32 / 3, "{e1:?}: at least 32 frames x 2 ms / 3");
+    assert!(e1 <= t0.elapsed() * 32 / 3, "{e1:?}: at most the rate since before the job started");
+    assert!(eta_words(3, 35, t0.elapsed()).is_some_and(|w| w.starts_with('~')));
+    std::thread::sleep(Duration::from_millis(2));
+    let e2 = face.export_eta().expect("still running");
+    assert!(e2 >= e1, "{e2:?} < {e1:?}: paused, done is fixed and the elapsed grows");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    assert_eq!(face.export_eta(), None, "finished: no eta");
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    println!("nle5dexportmessageeta: paused at 3/35 the eta read {e1:?} then {e2:?}, none after");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageeta_labels_off_paint_is_unmoved() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("eta-paint");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let (e1, a) = (face.export_eta(), face.paint());
+    std::thread::sleep(Duration::from_millis(5));
+    let (e2, b) = (face.export_eta(), face.paint());
+    assert!(e1.is_some() && e2 > e1, "{e1:?} -> {e2:?}: the eta moved");
+    assert_eq!(a, b, "labels off: the eta paints nothing; the band is the fraction only");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    println!("nle5dexportmessageeta: labels-off paint byte-identical across eta {e1:?} -> {e2:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- NLE5DEXPORTMESSAGEETABAND (LEDGER SR803): the running export's line on the message line (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetaband_export_line_kat() {
+    use stria::nle_face::export_line;
+    let rows = [
+        (3, 35, Some("~12 s"), "export: 3 / 35 ~12 s"),
+        (0, 35, None, "export: 0 / 35"),
+        (35, 35, Some("~0 s"), "export: 35 / 35 ~0 s"),
+        (0, 0, None, "export: starting"),
+    ];
+    for (d, t, e, want) in rows {
+        assert_eq!(export_line(d, t, e.map(String::from)), want, "export_line({d}, {t}, {e:?})");
+    }
+    println!("nle5dexportmessageetaband: export_line {} KAT rows", rows.len());
+}
+
+/// The eta part of a running line: `<n> s`, `m:ss` or `h:mm:ss` (SR796's `eta_words` grades without the tilde).
+fn nle5dexportmessageetaband_eta_shaped(tail: &str) -> bool {
+    match tail.strip_suffix(" s") {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => !tail.is_empty() && tail.contains(':') && tail.bytes().all(|b| b.is_ascii_digit() || b == b':'),
+    }
+}
+
+#[test]
+fn nle5dexportmessageetaband_paused_face_reads_the_export_line() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("etaband-line");
+    let (tl, src) = synth_fixture();
+    let reel = format!("A: {}", src.summary(SourceId(0)).unwrap());
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, true);
+    let l = face.layout();
+    assert!(l.message_h > 0, "labels on: the message row exists");
+    let strip = |px: &[u8]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in l.message_y..l.message_y + l.message_h {
+            let row = (y * l.w) as usize * 4;
+            out.extend_from_slice(&px[row..row + 64 * 4]);
+        }
+        out
+    };
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.message_text().as_deref(), Some(reel.as_str()));
+    let before = strip(&face.paint());
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let line = face.message_text().expect("the running export's line");
+    let tail = line.strip_prefix("export: 3 / 35 ~").unwrap_or_else(|| panic!("{line}: the export wins over the selected reel"));
+    assert!(nle5dexportmessageetaband_eta_shaped(tail), "{line}: the eta part");
+    assert_ne!(strip(&face.paint()), before, "the export line inks the message row");
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over the export");
+    assert_eq!(face.last_error.take().as_deref(), Some("split: no such clip"));
+    assert!(face.message_text().is_some_and(|m| m.starts_with("export: 3 / 35 ~")), "the export line again");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.message_text(), Some(cancel.clone()), "the finished line (SR694's cancel) wins after the job");
+    assert_eq!(face.last_error.take(), Some(cancel));
+    assert_eq!(face.message_text().as_deref(), Some(reel.as_str()), "after the cancel line: SR743's reel line");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Labels off: the message row paints nothing, so the paused paint is the idle paint outside the band rows.
+    let odir = nlefaceexport_dir("etaband-off");
+    let (tl, src) = synth_fixture();
+    let mut off = nlefaceexport_face(tl, src);
+    let lo = off.layout();
+    let idle = off.paint();
+    off.export_paused_at(&odir, "png", 3).unwrap();
+    nlefaceexport_until(&off, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(off.message_text().is_some_and(|m| m.starts_with("export: 3 / 35 ~")));
+    let shown = off.paint();
+    let band = (lo.tracks_y - stria::nle_face::EXPORT_BAND_H)..lo.tracks_y;
+    for y in (0..lo.h).filter(|y| !band.contains(y)) {
+        let r = (y * lo.w * 4) as usize..((y + 1) * lo.w * 4) as usize;
+        assert_eq!(&shown[r.clone()], &idle[r], "labels off: row {y} unmoved by the export line");
+    }
+    assert!(off.cancel_export() && off.wait_export());
+    let _ = std::fs::remove_dir_all(&odir);
+    println!("nle5dexportmessageetaband: paused line \"{line}\"; error wins; cancel then the reel line; labels off unmoved");
+}
+
+#[test]
+fn nle5dexportmessageetaband_tick_repaints_when_the_eta_word_moves() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("etaband-tick");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    face.export_tick();
+    let w = face.message_text().expect("the running line");
+    let t0 = std::time::Instant::now();
+    while face.message_text().as_ref() == Some(&w) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the paused eta never moved past {w}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(face.export_progress(), Some((3, 35)), "done never moved");
+    assert!(face.export_tick(), "the eta word moved with done fixed: the tick repaints");
+    let moved = face.message_text();
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let _ = face.last_error.take();
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetaband: tick repaints {w} -> {moved:?} at 3/35");
+}
+
+// ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetasmooth_eta_of_rate_kat() {
+    use stria::nle_face::eta_of_rate;
+    use std::time::Duration;
+    let e = eta_of_rate(32, 10.0, Duration::ZERO).expect("32 frames at 10 fps");
+    assert_eq!(e.as_millis(), 3200, "{e:?}: 32 / 10 = 3.2 s");
+    assert_eq!(eta_of_rate(0, 10.0, Duration::ZERO), Some(Duration::ZERO), "nothing left: no time left");
+    for r in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(eta_of_rate(32, r, Duration::ZERO), None, "rate {r}: no estimate");
+    }
+    println!("nle5dexportmessageetasmooth: eta_of_rate 32 @ 10 fps = {e:?}; rate 0 / negative / NaN / inf -> None");
+}
+
+#[test]
+fn nle5dexportmessageetasmooth_ema_step_kat() {
+    use stria::nle_face::{ETA_TAU, ema_step};
+    let one = ema_step(0.0, 1.0, ETA_TAU, ETA_TAU);
+    assert!((one - (1.0 - (-1.0f64).exp())).abs() < 1e-12, "{one}: dt = tau moves 1 - 1/e of the step");
+    assert_eq!(ema_step(4.0, 9.0, 0.0, ETA_TAU), 4.0, "dt 0 keeps prev");
+    let step = ema_step(1.0, 10.0, 3.0 * ETA_TAU, ETA_TAU);
+    assert!(step > 9.5, "{step}: 1 -> 10 fps after 3 x tau sits above 9.5");
+    let thrice = ema_step(ema_step(ema_step(1.0, 10.0, ETA_TAU, ETA_TAU), 10.0, ETA_TAU, ETA_TAU), 10.0, ETA_TAU, ETA_TAU);
+    assert!((thrice - step).abs() < 1e-12, "{thrice} vs {step}: three tau steps are one 3 x tau step (the time rule)");
+    let mut sixty = 1.0;
+    for _ in 0..60 {
+        sixty = ema_step(sixty, 10.0, 1.0 / 60.0, ETA_TAU);
+    }
+    let mut twentyfive = 1.0;
+    for _ in 0..25 {
+        twentyfive = ema_step(twentyfive, 10.0, 1.0 / 25.0, ETA_TAU);
+    }
+    assert!((sixty - twentyfive).abs() < 1e-9, "{sixty} vs {twentyfive}: one second at 60 Hz or 25 Hz smooths the same");
+    println!("nle5dexportmessageetasmooth: ema_step tau {one:.6}, 3 tau {step:.6}, 1 s at 60 / 25 Hz {sixty:.9}");
+}
+
+#[test]
+fn nle5dexportmessageetasmooth_scripted_slow_start() {
+    use stria::nle_face::{ema_sample, eta_of_rate, eta_words, eta_words_of};
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let started = t0 - Duration::from_secs(2);
+    let total = 1000u64;
+    let mut st = (0.0, (started, 0u64));
+    st = ema_sample(st.0, st.1, 0, t0);
+    assert_eq!(st, (0.0, (started, 0)), "no move: unchanged");
+    st = ema_sample(st.0, st.1, 1, t0);
+    assert_eq!(st, (0.0, (t0, 1)), "the first move (the 2 s warm-up) only records");
+    st = ema_sample(st.0, st.1, 2, t0 + ms(1000));
+    assert!((st.0 - 1.0).abs() < 1e-9, "{}: the second move seeds 1 fps", st.0);
+    let mut now = t0 + ms(1000);
+    let mut done = 2;
+    for _ in 0..30 {
+        now += ms(100);
+        done += 10;
+        st = ema_sample(st.0, st.1, done, now);
+    }
+    assert_eq!(st.1, (now, 302));
+    let same = ema_sample(st.0, st.1, 302, now + ms(100));
+    assert_eq!(same, st, "a tick with done fixed changes nothing: the paused job keeps its rate");
+    let smooth = eta_of_rate(total - done, st.0, Duration::ZERO).expect("an EMA eta");
+    let elapsed = now - started;
+    let mean = elapsed * (total - done) as u32 / done as u32;
+    assert!(smooth < mean, "{smooth:?} >= {mean:?}: after the fast run the EMA eta sits under the mean's");
+    assert!(st.0 > 50.0 && st.0 < 100.0, "{}: between the mean and the true 100 fps", st.0);
+    assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
+    println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALL (LEDGER SR811): a stalled export's eta grows by the overdue time (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetastall_eta_of_rate_kat() {
+    use stria::nle_face::eta_of_rate;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let near = |d: Option<Duration>, want: Duration| d.is_some_and(|d| d.abs_diff(want) < ms(1));
+    assert_eq!(eta_of_rate(32, 10.0, Duration::ZERO).map(|d| d.as_millis()), Some(3200), "no stall: 32 / 10 = 3.2 s");
+    assert_eq!(eta_of_rate(32, 10.0, ms(50)).map(|d| d.as_millis()), Some(3200), "50 ms is under one 100 ms frame: no overdue");
+    let late = eta_of_rate(32, 10.0, ms(2100));
+    assert!(near(late, ms(5200)), "{late:?}: 3.2 s + (2.1 s - 0.1 s) overdue");
+    let left0 = eta_of_rate(0, 10.0, ms(5000));
+    assert!(near(left0, ms(4900)), "{left0:?}: nothing left but stalled 5 s: the overdue alone (the export is not done)");
+    for r in [0.0, f64::NAN] {
+        assert_eq!(eta_of_rate(32, r, ms(5000)), None, "rate {r}: no estimate, stalled or not");
+    }
+    let base = eta_of_rate(32, 10.0, Duration::ZERO).unwrap();
+    let (a, b, c) = (eta_of_rate(32, 10.0, ms(3000)).unwrap(), eta_of_rate(32, 10.0, ms(4000)).unwrap(), eta_of_rate(32, 10.0, ms(5000)).unwrap());
+    assert!(base <= a && a < b && b < c, "{base:?} {a:?} {b:?} {c:?}: the eta grows with the stall and never drops under the unstalled one");
+    println!("nle5dexportmessageetastall: 32 @ 10 fps: 0 / 50 ms -> 3.2 s, 2.1 s -> {late:?}; 0 left stalled 5 s -> {left0:?}");
+}
+
+#[test]
+fn nle5dexportmessageetastall_scripted_stall() {
+    use stria::nle_face::{ema_sample, eta_of_rate, eta_words_of};
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    // SR808's slow-start script by hand: a 2 s warm-up, the second move seeds 1 fps, then 30 x (100 ms, +10 frames).
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let started = t0 - Duration::from_secs(2);
+    let total = 1000u64;
+    let mut st = (0.0, (started, 0u64));
+    st = ema_sample(st.0, st.1, 1, t0);
+    st = ema_sample(st.0, st.1, 2, t0 + ms(1000));
+    let mut now = t0 + ms(1000);
+    let mut done = 2;
+    for _ in 0..30 {
+        now += ms(100);
+        done += 10;
+        st = ema_sample(st.0, st.1, done, now);
+    }
+    assert!(st.0 > 50.0 && st.0 < 100.0, "{}: SR808's EMA after the fast run", st.0);
+    // The stall: 5 s with done fixed leaves the rate and the last move alone.
+    let at = now + Duration::from_secs(5);
+    let stalled = ema_sample(st.0, st.1, done, at);
+    assert_eq!(stalled, st, "a stall changes neither the rate nor the last move");
+    let since = at - stalled.1.0;
+    assert_eq!(since, Duration::from_secs(5));
+    let fresh = eta_of_rate(total - done, st.0, Duration::ZERO).expect("the EMA eta");
+    let late = eta_of_rate(total - done, st.0, since).expect("the stalled eta");
+    // The arc's "- 0.1 s" assumed 10 fps; the frame interval is 1 / rate at the script's EMA (50..100 fps).
+    let want = fresh.as_secs_f64() + 5.0 - 1.0 / st.0;
+    assert!((late.as_secs_f64() - want).abs() < 1e-3, "{late:?} vs {want}: the EMA eta + 5 s - 1 / rate ({:.4} s, one frame at the EMA rate)", 1.0 / st.0);
+    assert_ne!(eta_words_of(late), eta_words_of(fresh), "the stalled word moved");
+    assert!(late > fresh, "{late:?} <= {fresh:?}");
+    println!("nle5dexportmessageetastall: EMA {:.2} fps: eta {fresh:?} -> {late:?} after a 5 s stall ({} -> {})", st.0, eta_words_of(fresh), eta_words_of(late));
 }
