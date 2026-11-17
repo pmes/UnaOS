@@ -2878,3 +2878,99 @@ fn link_exclude(st: &EditorState, kind: DragKind, track: usize, idx: usize, excl
     }
     v
 }
+// ---- STRIAPERFDRAGSHOWN (LEDGER SR936): the drag preview kept until the drag or the state it reads changes (named tail block) ----
+
+/// STRIAPERFDRAGSHOWN (SR936): [`Drag::shown`] kept across paints. The key is the drag and the five fields of the state
+/// `shown` reads (`timeline`, `selection`, `set`, `playhead`, `zoom`); while they are equal the kept preview is handed out
+/// (a refcount bump), else `Drag::shown` replays ONCE and the result (a refusal's `None` too) is kept. `replays` counts
+/// the replays (the tests' witness, not a wall time).
+#[derive(Debug, Default)]
+pub struct DragShown {
+    key: Option<(Drag, Timeline, Option<(usize, usize)>, Vec<(usize, usize)>, i64, u32)>,
+    shown: Option<alloc::sync::Arc<EditorState>>,
+    pub replays: u64,
+}
+
+impl DragShown {
+    /// The preview of `d` over `st` (`None`: no drag, nothing moved, or the op refuses). No drag drops what was kept.
+    pub fn get(&mut self, d: Option<&Drag>, st: &EditorState) -> Option<alloc::sync::Arc<EditorState>> {
+        let Some(d) = d else {
+            self.clear();
+            return None;
+        };
+        if let Some((kd, tl, sel, set, ph, zoom)) = &self.key {
+            if kd == d && *sel == st.selection && *ph == st.playhead && *zoom == st.zoom && *set == st.set && *tl == st.timeline {
+                return self.shown.clone();
+            }
+        }
+        self.replays += 1;
+        self.shown = d.shown(st).map(alloc::sync::Arc::new);
+        self.key = Some((*d, st.timeline.clone(), st.selection, st.set.clone(), st.playhead, st.zoom));
+        self.shown.clone()
+    }
+    /// Forget the kept preview (the next [`DragShown::get`] replays); `replays` is kept.
+    pub fn clear(&mut self) {
+        self.key = None;
+        self.shown = None;
+    }
+}
+
+#[cfg(test)]
+mod striaperfdragshown_tests {
+    use super::*;
+    use crate::Clip;
+
+    /// NLEFXA 0..20 at 0 and NLEFXA 20..30 at 20 (butted), a 40-tick source, the view band `Role::Tracks` 320x56.
+    fn fixture() -> (EditorState, Layout, f64, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 20)];
+        let st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        (st, l, z, y)
+    }
+
+    /// STRIAPERFDRAGSHOWN (SR936) M3: one replay per (drag, state) value; a moved pointer, a moved playhead and a fresh
+    /// drag after none each replay once; the kept preview is `Drag::shown`'s.
+    #[test]
+    fn striaperfdragshown_get_replays_once_per_drag_value() {
+        let (mut st, l, z, y) = fixture();
+        let x = l.x_of(25) as f64 + z / 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap();
+        assert_eq!(d.kind, DragKind::Move);
+        d.update(&st, x + 3.0 * z, y);
+        let mut c = DragShown::default();
+        let want = d.shown(&st).expect("the move previews");
+        for _ in 0..3 {
+            assert_eq!(c.get(Some(&d), &st).as_deref(), Some(&want));
+        }
+        assert_eq!(c.replays, 1, "three paints, one replay");
+        d.update(&st, x + 4.0 * z, y);
+        assert_eq!(c.get(Some(&d), &st).as_deref(), d.shown(&st).as_ref());
+        assert_eq!(c.replays, 2, "the pointer moved");
+        st.playhead = 5;
+        let got = c.get(Some(&d), &st).expect("previews");
+        assert_eq!((got.playhead, c.replays), (d.shown(&st).unwrap().playhead, 3), "the playhead is a key field");
+        assert!(c.get(None, &st).is_none());
+        assert_eq!(c.replays, 3, "no drag, no replay");
+        assert!(c.get(Some(&d), &st).is_some());
+        assert_eq!(c.replays, 4, "a released drag left nothing kept");
+    }
+
+    /// STRIAPERFDRAGSHOWN (SR936) M3: a refused slip (the first clip's source window past 0) is kept as `None`.
+    #[test]
+    fn striaperfdragshown_refused_op_is_cached() {
+        let (mut st, l, z, y) = fixture();
+        let x = l.x_of(5) as f64 + z / 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, true).unwrap();
+        assert_eq!(d.kind, DragKind::Slip);
+        d.update(&st, x - 3.0 * z, y);
+        assert_eq!(d.delta, -3);
+        let mut c = DragShown::default();
+        assert!(c.get(Some(&d), &st).is_none());
+        assert!(c.get(Some(&d), &st).is_none());
+        assert_eq!(c.replays, 1, "the refusal is kept");
+    }
+}
