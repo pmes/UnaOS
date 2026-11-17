@@ -3592,3 +3592,73 @@ fn striazoomtofit_face_fits_the_window() {
     assert_eq!(clean(&face), (0, false, true));
     println!("striazoomtofit: 320 px fit 9 @0, sel B 32 @10, set 16 @0; 20 px fit 1 @0; undo 0, clean");
 }
+
+// ---- STRIAZOOMFITKEYS (LEDGER SR907): `\` / `|` fit keys, their help rows, the refit on a resize (named tail block) ----
+
+/// The window's resize, as the surface sends it.
+fn striazoomfitkeys_resize(f: &mut Face, w: u32) -> bool {
+    f.on(&bandy::SMessage::BrowserResize(w, 160, 0))
+}
+
+/// `\` (text) fits the timeline, `|` (text) the selection, through the VERBS words; a lone `BrowserKey("\\")` is not
+/// taken; the help names both keys with their phrases (Shift+Z stays redo).
+#[test]
+fn striazoomfitkeys_keys_fit_and_the_help_names_them() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(KEYS.contains(&("\\", "zoom-fit")) && KEYS.contains(&("|", "zoom-sel")) && KEYS.contains(&("Z", "redo")));
+    assert!(!face.on(&bandy::SMessage::BrowserKey("\\".into())), "a one-char BrowserKey alone is not taken");
+    assert_eq!(face.state.zoom, 8);
+    assert!(face.on(&bandy::SMessage::BrowserText("\\".into())));
+    assert_eq!((face.state.zoom, face.layout().t0), (9, 0));
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserText("|".into())));
+    assert_eq!((face.state.zoom, face.layout().t0), (32, 10));
+    assert_eq!(face.last_error, None);
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.timeline == tl), (0, false, true));
+    let rows = help_rows();
+    for (k, w) in [("\\", "zoom-fit"), ("|", "zoom-sel")] {
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(HELP.iter().any(|(a, _)| *a == w) && row.1 != w, "{w}: a phrase, not the word");
+    }
+    println!("striazoomfitkeys: \\ fit 9 @0, | sel 32 @10; help rows {}", rows.len());
+}
+
+/// A resize after a fit fits again at the new width (the timeline, then the selection); after `zoom+` or a wheel zoom a
+/// resize leaves the zoom; a refit the emptied set refuses reports once, the next resize is silent; never an undo step.
+#[test]
+fn striazoomfitkeys_resize_refits_only_after_a_fit() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let clean = |f: &Face| (f.state.undo_depth(), f.dirty(), f.state.timeline == tl);
+    assert!(face.verb("zoom-fit"));
+    assert!(striazoomfitkeys_resize(&mut face, 640));
+    assert_eq!((face.state.zoom, face.layout().t0), (18, 0), "640 / 35");
+    assert!(striazoomfitkeys_resize(&mut face, 480));
+    assert_eq!(face.state.zoom, 13, "the refit holds across resizes");
+    assert!(face.verb("zoom+"));
+    let z = face.state.zoom;
+    assert!(striazoomfitkeys_resize(&mut face, 320));
+    assert_eq!(face.state.zoom, z, "a zoom word ended the fit");
+    assert!(face.verb("zoom-fit"));
+    assert_eq!(face.state.zoom, 9);
+    assert!(face.zoom_at(1, 0.0));
+    let z = face.state.zoom;
+    assert!(striazoomfitkeys_resize(&mut face, 640));
+    assert_eq!(face.state.zoom, z, "a wheel zoom ended the fit");
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("zoom-sel"));
+    assert_eq!((face.state.zoom, face.layout().t0), (64, 10));
+    assert!(striazoomfitkeys_resize(&mut face, 320));
+    assert_eq!((face.state.zoom, face.layout().t0), (32, 10), "the selection refit");
+    assert_eq!(face.last_error, None);
+    face.state.deselect();
+    assert!(striazoomfitkeys_resize(&mut face, 640));
+    assert_eq!(face.last_error.take(), Some(format!("zoom-sel: {}", EditError::NoClip)));
+    assert_eq!(face.state.zoom, 32, "a refused refit leaves the zoom");
+    assert!(striazoomfitkeys_resize(&mut face, 480));
+    assert_eq!(face.last_error, None, "reported once");
+    assert_eq!(clean(&face), (0, false, true));
+    println!("striazoomfitkeys: fit 640->18 480->13; zoom+ / wheel end it; sel 64 -> 32; refusal once");
+}
