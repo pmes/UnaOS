@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "pip", "scale-", "scale+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail)
+pub const VERBS: [&str; 33] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "pip", "scale-", "scale+", "pip left", "pip right", "pip up", "pip down", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -195,13 +195,14 @@ pub struct Face {
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     xform_note: Option<String>, // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word, until the next message (file tail)
+    xform_drag: Option<view::XformDrag>, // STRIAXFORMTHREE (SR9033): the live placement drag on the preview picture (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, xform_note: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, xform_note: None, xform_drag: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -209,7 +210,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } self.xform_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if let Some(r) = self.xform_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.xform_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -1589,7 +1590,7 @@ impl Face {
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
-        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
+        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state)).or_else(|| self.xform_drag.as_ref().and_then(|d| d.shown(&self.state))); // STRIAXFORMTHREE (SR9033): a live placement drag shows its clip at the dragged rect (timeline_core view.rs tail)
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
@@ -1601,7 +1602,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(view::paint_xform_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3112,10 +3113,90 @@ impl Face {
         }
         match self.state.verb(v)? {
             Ok(()) => {
-                self.xform_note = self.state.selected().map(|c| format!("pip: x {} y {} scale {}", c.xform.x, c.xform.y, c.xform.s));
+                self.xform_note = self.state.selected().map(|c| placement_note(&c)); // STRIAXFORMTHREE (SR9033): the one placement line (file tail)
             }
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
+        Some(true)
+    }
+}
+
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the placement drag on the preview picture and its routing (named tail block) ----
+// NLE-XFORM-DRAG on the face: `Face::on`'s first line hands every message here first. A press on a PLACED primary's rect in
+// the preview picture (the split face's preview Surface, or an unsplit face's preview band through `takes`) begins
+// timeline_core's `view::XformDrag` over the layout the face paints that band with (`layout_for(..).with_message(..)`)
+// and the preview still's size (`self.still`, else ONE `preview` call: THE frame road); while live, that Surface's moves
+// update it, its release commits ONCE (`XformDrag::finish`: `EditorState::set_xform`; the message row then reads the
+// placement through [`placement_note`], SR938's line; a refusal is `last_error` as `xform-drag: <e>`), Escape drops it;
+// the one-Surface face keeps its `pointer` through them as `press` / `release` do. Anything else (no drag, a press off a
+// placed rect, the help shown) returns `None`: the old road, unchanged. At the fold this call follows SR962's meter click
+// and precedes SR960's `crop_drag_on` on the same line; SR960's `CropDrag::begin` refuses a placed primary (the seat's
+// fold guard), so a placed clip's press is this drag's and an unplaced clip's picture edge is the crop drag's.
+// NLE-XFORM-NUDGE-BUTTON: `pip left` / `pip right` / `pip up` / `pip down` are VERBS words (their buttons in stria-view),
+// SR975's nudge words through the one `Face::verb` road (`xform_note_verb`).
+
+/// STRIAXFORMTHREE (SR9033): THE placement line the message row reads after a placement edit (`pip: x 725 y 725 scale 250`).
+fn placement_note(c: &Clip) -> String {
+    format!("pip: x {} y {} scale {}", c.xform.x, c.xform.y, c.xform.s)
+}
+
+impl Face {
+    /// STRIAXFORMTHREE (SR9033): the live placement drag on the preview picture.
+    pub fn xform_dragging(&self) -> Option<&view::XformDrag> {
+        self.xform_drag.as_ref()
+    }
+    /// The role of the preview picture a message belongs to: split, the preview Surface's `Preview`; unsplit, `Whole` for a
+    /// message this face takes; `None` otherwise.
+    fn xform_drag_surface(&self, msg: &SMessage) -> Option<Role> {
+        match self.split {
+            Some(s) => (msg.surface() == Some(s.preview) && s.preview != s.tracks).then_some(Role::Preview),
+            None => self.takes(msg).then_some(Role::Whole),
+        }
+    }
+    /// The placement drag's messages (`Some(repaint)`); `None` hands the message on to [`Face::on`]'s road.
+    fn xform_drag_on(&mut self, msg: &SMessage) -> Option<bool> {
+        if self.xform_drag.is_some() {
+            return match msg {
+                SMessage::BrowserMouseMove(x, y, _) if self.xform_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let d = self.xform_drag.as_mut()?;
+                    let before = d.xform();
+                    d.update(*x, *y);
+                    Some(d.xform() != before)
+                }
+                SMessage::BrowserButton { down: false, x, y, .. } if self.xform_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let mut d = self.xform_drag.take()?;
+                    d.update(*x, *y);
+                    let moved = d.moved();
+                    match d.finish(&mut self.state) {
+                        Ok(()) if moved => self.xform_note = self.state.selected().map(|c| placement_note(&c)),
+                        Ok(()) => {}
+                        Err(e) => self.last_error = Some(format!("xform-drag: {e}")),
+                    }
+                    Some(true)
+                }
+                SMessage::BrowserKey(k) if k == "Escape" => {
+                    self.xform_drag = None;
+                    Some(true)
+                }
+                _ => None,
+            };
+        }
+        let SMessage::BrowserButton { down: true, x, y, .. } = *msg else { return None };
+        if self.help {
+            return None;
+        }
+        let role = self.xform_drag_surface(msg)?;
+        let l = self.layout_for(role).with_message(self.labels.is_some());
+        if self.still.is_none() {
+            self.still = preview(&self.state.timeline, &self.sources, self.state.playhead).ok().flatten();
+        }
+        let (sw, sh) = self.still.as_ref().map(|s| (s.width, s.height))?;
+        self.xform_drag = Some(view::XformDrag::begin(&self.state, l, sw, sh, x, y)?);
+        self.xform_note = None;
+        self.buttons = true;
+        if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
         Some(true)
     }
 }

@@ -520,7 +520,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("pip", "PiP"), // STRIAPOSITIONSCALE (SR879): the selected clip to the bottom-right quarter (THE `pip` verb)
-        button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
+        button("scale-", "Scale -"), button("scale+", "Scale +"), button("pip left", "PiP <"), button("pip right", "PiP >"), button("pip up", "PiP ^"), button("pip down", "PiP v"), // STRIAXFORMTHREE (SR9033): the selected clip's placement nudged a step (SR975's words); STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -994,5 +994,30 @@ mod striaxformmore_tests {
         assert!(drive(&mut face, "pip:up,pip:up").is_empty());
         assert_eq!(drive(&mut face, "pip:up"), vec![format!("pip up: {}", timeline_core::EditError::Xform)]);
         assert_eq!(face.state.undo_depth(), 5);
+    }
+}
+
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the nudge buttons on the transport row (named tail block) ----
+#[cfg(test)]
+mod striaxformthree_tests {
+    use super::*;
+
+    /// STRIAXFORMTHREE (SR9033): the four nudge buttons stand just before the help button, each firing its VERBS word,
+    /// which moves the selected placed clip one step (one undo step each).
+    #[test]
+    fn striaxformthree_witness_nudge_buttons() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => String::new() }).collect();
+        assert_eq!(&ids[ids.len() - 5..], &["pip left", "pip right", "pip up", "pip down", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,pip").is_empty());
+        for b in &row[row.len() - 5..row.len() - 1] {
+            let TetraNode::Button { action, .. } = b else { panic!("not a button") };
+            assert!(face.on(action));
+        }
+        assert_eq!(face.last_error, None);
+        assert_eq!(face.state.undo_depth(), 5);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform::PIP));
     }
 }
