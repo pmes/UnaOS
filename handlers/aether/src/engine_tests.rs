@@ -9827,6 +9827,175 @@ b</div>
         assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
     }
 
+    // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
+    /// `rgba(0, 0, 0, 0.5)` with an inheriting span `#hfs`, `#tr` `transparent`, `#pr` a half-alpha parent of a
+    /// `color: red` span `#prc`, `#bd` half-alpha text in a `4px solid currentcolor` frame, `#sh` transparent text with
+    /// a red `text-shadow`.
+    fn color_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { font-size: 20px; line-height: 30px; margin: 0 0 10px; width: 300px }
+            </style></head><body>
+            <div id="op" style="color:#000"><span id="ops">MMMM</span></div>
+            <div id="hf" style="color:rgba(0, 0, 0, 0.5)"><span id="hfs">MMMM</span></div>
+            <div id="tr" style="color:transparent"><span id="trs">MMMM</span></div>
+            <div id="pr" style="color:rgba(0, 0, 0, 0.5)"><span id="prc" style="color:red">MMMM</span></div>
+            <div id="bd" style="color:rgba(0, 0, 0, 0.5);border:4px solid currentcolor"><span>MMMM</span></div>
+            <div id="sh" style="color:transparent;text-shadow:2px 2px 0 red"><span id="shs">MMMM</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the darkest channel of any pixel in element `id`'s rect, and the count of
+    /// pixels in it that are not white.
+    fn color_alpha_ink(e: &mut crate::AetherEngine, id: &str) -> (u8, usize) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize).min(sh));
+        let (mut dark, mut n) = (255u8, 0usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (r, g, b) = imgalt_px(e, x, y);
+                dark = dark.min(r.min(g).min(b));
+                if (r, g, b) != (255, 255, 255) {
+                    n += 1;
+                }
+            }
+        }
+        (dark, n)
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): half-alpha text paints at half ink (its darkest pixel ~127 where the opaque
+    /// control's is ~0; before SR1126 both were opaque), and transparent text paints no ink while its span keeps the
+    /// control's box (the run is measured and laid out; only the glyph pixels are skipped).
+    #[test]
+    fn color_alpha_paints_half_and_none() {
+        let mut e = color_alpha_engine();
+        let (op_dark, op_n) = color_alpha_ink(&mut e, "ops");
+        assert!(op_n > 20 && op_dark < 30, "the opaque control paints black ink: darkest {op_dark}, {op_n} px");
+        let (hf_dark, hf_n) = color_alpha_ink(&mut e, "hfs");
+        assert!(hf_n > 20, "the half-alpha text paints ink: {hf_n} px");
+        assert!((110..=150).contains(&hf_dark), "armed: the half-alpha text's darkest pixel is half ink: {hf_dark}");
+        assert_eq!(color_alpha_ink(&mut e, "trs").1, 0, "armed: transparent text paints no ink");
+        let (ow, oh) = (imgalt_rect(&mut e, "ops").2, imgalt_rect(&mut e, "ops").3);
+        let (tw, th) = (imgalt_rect(&mut e, "trs").2, imgalt_rect(&mut e, "trs").3);
+        assert_eq!((tw, th), (ow, oh), "transparent text keeps its laid-out box");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): `color: red` under a half-alpha parent is opaque red (the alpha is part of
+    /// the colour value, so the child's own colour resets it), and transparent text keeps its text-shadow (the shadow
+    /// paints from its own mask in its own colour, as Chromium's blur-text idiom).
+    #[test]
+    fn color_alpha_child_reset_and_shadow() {
+        let mut e = color_alpha_engine();
+        assert!(css_wide_color_ink(&mut e, "prc", css_wide_red) > 10, "the red child paints opaque red");
+        assert!(css_wide_color_ink(&mut e, "shs", css_wide_red) > 10, "transparent text keeps its red shadow");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the `color` column reads the alpha (Chromium's strings): `rgba(0, 0, 0,
+    /// 0.5)`, the inheriting span the same, `rgba(0, 0, 0, 0)` for transparent, `rgb(255, 0, 0)` for the reset child
+    /// (before SR1126 `rgb(0, 0, 0)` for the first three).
+    #[test]
+    fn color_alpha_cssom_column() {
+        let mut e = color_alpha_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "op", "color"), "rgb(0, 0, 0)", "the opaque control");
+        assert_eq!(font_shorthand_cs(&mut e, "hf", "color"), "rgba(0, 0, 0, 0.5)", "armed: the half alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "hfs", "color"), "rgba(0, 0, 0, 0.5)", "armed: the span inherits the alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "tr", "color"), "rgba(0, 0, 0, 0)", "armed: transparent");
+        assert_eq!(font_shorthand_cs(&mut e, "prc", "color"), "rgb(255, 0, 0)", "the child's own colour is opaque");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): a `currentcolor` border under half-alpha text still paints the opaque RGB
+    /// (pinned: AETHER-CSS-CURRENTCOLOR-ALPHA owed; Chromium paints it at half alpha).
+    #[test]
+    fn color_alpha_currentcolor_border_opaque_owed() {
+        let mut e = color_alpha_engine();
+        let (l, t, _, _) = imgalt_rect(&mut e, "bd");
+        assert_eq!(imgalt_px(&e, l as usize + 1, t as usize + 1), (0, 0, 0), "owed: the currentcolor frame is opaque black");
+    }
+
+    // ---- AETHERCSSCONTAINERUNITSREAPPLYKIND (LEDGER SR1136): ONE refold tail for both re-resolutions, seeded with the paint fields fold_into reads (named tail block) ----
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): 400x300, from y 0: `#q` a `container-type: size` 200px-tall
+    /// container holding a 20px control and `#s` sticky `top: 10cqh`; then three 100px-wide 50px-tall both-edges
+    /// gutter scrollers — `#g` `padding-left: 1em`, `#gp` `padding-left: 16px`, `#gn` no padding and `width: 10em`
+    /// (each holding a 20px child `#gc` / `#gpc` / `#gnc`); then `#iq` a `container-type: inline-size; width: 10em`
+    /// container whose child `#ic` is `width: 100cqw`; then a 2000px spacer.
+    fn reapply_kind_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .sc { overflow: auto; scrollbar-gutter: stable both-edges; height: 50px }
+            .k { height: 20px }
+            </style></head><body style="margin:0">
+            <div id="q" style="container-type:size;height:200px"><div class="k"></div><div id="s" class="k" style="position:sticky;top:10cqh"></div></div>
+            <div id="g" class="sc" style="width:100px;padding-left:1em"><div id="gc" class="k"></div></div>
+            <div id="gp" class="sc" style="width:100px;padding-left:16px"><div id="gpc" class="k"></div></div>
+            <div id="gn" class="sc" style="width:10em"><div id="gnc" class="k"></div></div>
+            <div id="iq" style="container-type:inline-size;width:10em"><div id="ic" class="k" style="width:100cqw"></div></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): unscrolled, the sticky `#s` with a container-unit inset sits at its
+    /// normal-flow y 20 (css-position-3 §3.4). Before SR1136 `reresolve_container_units` folded `top: 10cqh` (20px of
+    /// the 200px container) into taffy as a relative offset (40).
+    #[test]
+    fn reapply_kind_sticky_cqh_normal_flow() {
+        let mut e = reapply_kind_engine();
+        assert_eq!(imgalt_rect(&mut e, "q").1, 0.0, "#q: the container at the top");
+        assert_eq!(imgalt_rect(&mut e, "s").1, 20.0, "#s: sticky top: 10cqh sits at its normal-flow y (armed: 40 before SR1136)");
+    }
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): a both-edges gutter scroller with `padding-left: 1em` keeps its
+    /// start-edge gutter on the font-relative re-resolution: content x = 10 (gutter) + 16 (1em). Before SR1136 the
+    /// re-applied padding overwrote the first fold's 26 with 16 and the fresh spec had no overflow to re-add the gutter.
+    #[test]
+    fn reapply_kind_gutter_em_padding() {
+        let mut e = reapply_kind_engine();
+        let dx = imgalt_rect(&mut e, "gc").0 - imgalt_rect(&mut e, "g").0;
+        assert_eq!(dx, 26.0, "#gc: gutter 10 + padding 1em = 26 (armed: 16 before SR1136)");
+    }
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): the control — `padding-left: 16px` (no re-resolution of its own
+    /// padding) reads the same 26 as the em box.
+    #[test]
+    fn reapply_kind_gutter_px_padding_control() {
+        let mut e = reapply_kind_engine();
+        let dx = imgalt_rect(&mut e, "gpc").0 - imgalt_rect(&mut e, "gp").0;
+        assert_eq!(dx, 26.0, "#gpc: gutter 10 + padding 16px = 26");
+    }
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): a both-edges scroller re-resolved for `width: 10em` with NO
+    /// padding-left keeps ONE start gutter (10): the seed skips overflow / scrollbar-gutter there, since the first
+    /// fold's gutter is still the node's padding and a seeded fold would add it again (20).
+    #[test]
+    fn reapply_kind_gutter_no_padding_em_width() {
+        let mut e = reapply_kind_engine();
+        let dx = imgalt_rect(&mut e, "gnc").0 - imgalt_rect(&mut e, "gn").0;
+        assert_eq!(dx, 10.0, "#gnc: one start gutter, never two");
+    }
+
+    /// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): a `container-type: inline-size; width: 10em` container still
+    /// answers its child's `width: 100cqw` at 160px (container_type is read from the paint map by the query walk,
+    /// not seeded into the refold).
+    #[test]
+    fn reapply_kind_inline_size_cqw() {
+        let mut e = reapply_kind_engine();
+        assert_eq!(imgalt_rect(&mut e, "iq").2, 160.0, "#iq: 10em");
+        assert_eq!(imgalt_rect(&mut e, "ic").2, 160.0, "#ic: 100cqw of the 160px container");
+    }
+
     // ---- AETHERCSSCONTAINSIZEMINHEIGHT (LEDGER SR1140): size containment keeps a declared min-height (named tail block) ----
 
     /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): the height of `#want` in a page with body margin 0 laid out by the cascade.
