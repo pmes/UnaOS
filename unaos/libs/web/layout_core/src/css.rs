@@ -1130,14 +1130,15 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // `clear` (CSS 2.2 §9.5.2) is consumed only by a generated clearfix box (`layout::generated`);
         // a real element's clearance is still unimplemented, so it stays ledgered.
         "clear" => {
+            // SR1039 fold: `property:clear` is the "unimplemented property" record @supports reads; the arm parses
+            // the value, so it records the UNHANDLED value only (a real element's clearance stays owed: `clear-value:`).
             style.paint.clear = match value {
                 "none" => Some(0),
                 "left" | "inline-start" => Some(1),
                 "right" | "inline-end" => Some(2),
                 "both" => Some(3),
-                _ => style.paint.clear,
+                _ => { if !is_neutral_keyword(value) { H::record_css(&format!("clear-value:{}", clip(value))); } style.paint.clear }
             };
-            H::record_css("property:clear");
         }
         "float" => match value {
             "left" => {
@@ -1938,37 +1939,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // with the SAME value grammar. Only these are aliased: the old
         // `-webkit-box-*` flexbox properties (box-flex/box-align/box-pack)
         // take different values and stay honestly unimplemented.
-        other
-            if other
-                .strip_prefix("-webkit-")
-                .or_else(|| other.strip_prefix("-moz-"))
-                .or_else(|| other.strip_prefix("-ms-"))
-                .or_else(|| other.strip_prefix("-o-"))
-                .is_some_and(|base| {
-                    matches!(
-                        base,
-                        "box-sizing" | "background-size" | "background-position"
-                            | "background-repeat" | "align-items" | "align-content"
-                            | "align-self" | "justify-content" | "flex-direction"
-                            | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
-                            | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
-                            | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
-                            | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
-                            | "backface-visibility" | "perspective" | "perspective-origin"
-                            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
-                            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
-                            | "column-rule-style" | "column-rule-color" | "column-span" | "box-decoration-break"
-                            | "writing-mode" | "text-orientation"
-                    )
-                }) =>
-        {
-            let base = other
-                .trim_start_matches("-webkit-")
-                .trim_start_matches("-moz-")
-                .trim_start_matches("-ms-")
-                .trim_start_matches("-o-");
-            apply_declaration(base, value, style, cx);
-        }
+        other if vendor_alias_base(other).is_some() => apply_declaration(vendor_alias_base(other).unwrap_or(other), value, style, cx), // SR1039: the list is vendor_alias_base's
         other => {
             if !apply_logical(other, value, style, cx) {
                 H::record_css(&format!("property:{}", other));
@@ -4556,4 +4527,37 @@ fn caret_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
         return None;
     }
     outline_color_value::<H>(v)
+}
+
+// ---- AETHERCSSSUPPORTSLIST (LEDGER SR1039): the vendor-alias spellings, ONE list the arm and @supports both ask (named tail block) ----
+
+/// AETHERCSSSUPPORTSLIST (SR1039): the unprefixed property a `-webkit-` / `-moz-` / `-ms-` / `-o-` spelling aliases,
+/// when this engine implements it with the SAME value grammar (moved out of [`apply_declaration`]'s alias arm, which
+/// calls it). Only these are aliased: the old `-webkit-box-*` flexbox properties (box-flex / box-align / box-pack) take
+/// different values and stay honestly unimplemented. None = not an alias spelling (aether's `@supports` asks this too).
+pub fn vendor_alias_base(prop: &str) -> Option<&str> {
+    let base = prop
+        .strip_prefix("-webkit-")
+        .or_else(|| prop.strip_prefix("-moz-"))
+        .or_else(|| prop.strip_prefix("-ms-"))
+        .or_else(|| prop.strip_prefix("-o-"))?;
+    if matches!(
+        base,
+        "box-sizing" | "background-size" | "background-position"
+            | "background-repeat" | "align-items" | "align-content"
+            | "align-self" | "justify-content" | "flex-direction"
+            | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
+            | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
+            | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
+            | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
+            | "backface-visibility" | "perspective" | "perspective-origin"
+            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
+            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
+            | "column-rule-style" | "column-rule-color" | "column-span" | "box-decoration-break"
+            | "writing-mode" | "text-orientation"
+    ) {
+        Some(base)
+    } else {
+        None
+    }
 }

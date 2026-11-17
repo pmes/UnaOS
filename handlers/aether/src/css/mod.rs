@@ -1444,65 +1444,34 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     out
 }
 
-/// Properties this engine genuinely implements (the honest support set
-/// for @supports; extend when apply_declaration grows an arm).
+/// Properties this engine genuinely implements (the honest support set for @supports). AETHERCSSSUPPORTSLIST (SR1039):
+/// never hand-kept — the names layout_core's parser takes: every `apply_declaration` arm (SR1021's `ALL_LONGHANDS` +
+/// `ALL_SKIPPED`, which its scan pins to the arms), a vendor spelling through `vendor_alias_base` (the alias arm's
+/// own list), and [`ROAD_PROPS`]. The value is not checked (AETHER-CSS-SUPPORTS-VALUE owed).
 fn property_supported(prop: &str) -> bool {
-    matches!(
-        prop,
-        "display" | "flex-direction" | "width" | "height" | "padding" | "margin"
-            | "padding-top" | "padding-right" | "padding-bottom" | "padding-left"
-            | "margin-top" | "margin-right" | "margin-bottom" | "margin-left"
-            | "position" | "top" | "left" | "right" | "bottom" | "text-align" | "justify-content"
-            | "font" | "align-items" | "align-content"
-            | "background-color" | "background" | "background-image" | "color"
-            | "background-size" | "background-position" | "background-repeat"
-            | "object-fit" | "object-position"
-            // Alpha-stencil masks really are implemented (render::draw_node),
-            // so the component idiom `@supports (mask-image: none)` must take
-            // the mask branch, not the background-image fallback branch.
-            | "mask" | "mask-image" | "mask-size" | "mask-position" | "mask-repeat"
-            | "-webkit-mask" | "-webkit-mask-image" | "-webkit-mask-size"
-            | "-webkit-mask-position" | "-webkit-mask-repeat"
-            | "font-size" | "font-weight" | "line-height" | "visibility"
-            | "max-width" | "max-height" | "min-width" | "min-height"
-            | "overflow" | "overflow-x" | "overflow-y"
-            | "border" | "outline" | "outline-width" | "outline-style" | "outline-color" | "outline-offset" | "border-color" | "border-width" | "border-style"
-            | "border-top" | "border-right" | "border-bottom" | "border-left"
-            | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
-            | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
-            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" | "font-variant" | "font-variant-caps"
-            | "text-shadow"
-            | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
-            | "gap" | "row-gap" | "column-gap"
-            | "cursor"
-            | "content" | "counter-reset" | "counter-increment" | "counter-set" | "quotes"
-            // AETHERSTYLE2 (SR95)
-            | "inset" | "aspect-ratio" | "transform" | "transform-origin" | "translate" | "rotate" | "scale"
-            | "clip-path" | "inline-size" | "block-size" | "min-inline-size" | "min-block-size"
-            | "max-inline-size" | "max-block-size" | "margin-inline" | "margin-block" | "margin-inline-start"
-            | "margin-inline-end" | "margin-block-start" | "margin-block-end" | "padding-inline"
-            | "padding-block" | "padding-inline-start" | "padding-inline-end" | "padding-block-start"
-            | "padding-block-end" | "inset-inline" | "inset-block" | "inset-inline-start" | "inset-inline-end"
-            | "inset-block-start" | "inset-block-end"
-            // AETHERSTYLE3 (SR103)
-            | "filter" | "backdrop-filter" | "-webkit-filter" | "-webkit-backdrop-filter"
-            | "overflow-inline" | "overflow-block"
-            | "columns" | "column-count" | "column-width" | "column-fill" | "column-rule"
-            | "column-rule-width" | "column-rule-style" | "column-rule-color"
-            | "writing-mode" | "text-orientation"
-            | "container" | "container-type" | "container-name" | "contain"
-            | "transition" | "transition-property" | "transition-duration" | "transition-timing-function"
-            | "transition-delay" | "transition-behavior" | "animation" | "animation-name" | "animation-duration"
-            | "animation-timing-function" | "animation-delay" | "animation-iteration-count"
-            | "animation-direction" | "animation-fill-mode" | "animation-play-state"
-            // AETHERSTYLE3C (SR122)
-            | "column-span" | "box-decoration-break" | "-webkit-box-decoration-break"
-            | "text-combine-upright" | "-webkit-text-combine"
-            | "scroll-margin" | "scroll-margin-top" | "scroll-margin-right" | "scroll-margin-bottom"
-            | "scroll-margin-left" | "scroll-margin-block" | "scroll-margin-inline" | "scroll-margin-block-start"
-            | "scroll-margin-block-end" | "scroll-margin-inline-start" | "scroll-margin-inline-end"
-    )
+    let base = layout_core::css::vendor_alias_base(prop).unwrap_or(prop);
+    [layout_core::css::ALL_LONGHANDS, layout_core::css::ALL_SKIPPED, ROAD_PROPS].iter().any(|l| l.contains(&base))
 }
+
+/// AETHERCSSSUPPORTSLIST (SR1039): the names layout_core parses on its two roads that are not `apply_declaration` arms:
+/// the transition / animation road (`layout_core::anim::apply_declaration`, entered before the arm match) and the
+/// logical road (`apply_logical`, behind the `other =>` arm: the flow-relative sizes and the margin / padding / inset /
+/// border inline / block names).
+const ROAD_PROPS: &[&str] = &[
+    "transition", "transition-property", "transition-duration", "transition-timing-function", "transition-delay",
+    "transition-behavior", "animation", "animation-name", "animation-duration", "animation-timing-function",
+    "animation-delay", "animation-iteration-count", "animation-direction", "animation-fill-mode", "animation-play-state",
+    "inline-size", "block-size", "min-inline-size", "min-block-size", "max-inline-size", "max-block-size",
+    "margin-inline", "margin-inline-start", "margin-inline-end", "margin-block", "margin-block-start", "margin-block-end",
+    "padding-inline", "padding-inline-start", "padding-inline-end", "padding-block", "padding-block-start", "padding-block-end",
+    "inset-inline", "inset-inline-start", "inset-inline-end", "inset-block", "inset-block-start", "inset-block-end",
+    "border-inline", "border-inline-width", "border-inline-style",
+    "border-inline-start", "border-inline-start-width", "border-inline-start-style",
+    "border-inline-end", "border-inline-end-width", "border-inline-end-style",
+    "border-block", "border-block-width", "border-block-style",
+    "border-block-start", "border-block-start-width", "border-block-start-style",
+    "border-block-end", "border-block-end-width", "border-block-end-style",
+];
 
 
 thread_local! {
@@ -1833,5 +1802,64 @@ fn unicode_bidi_word(c: u8) -> &'static str {
         4 => "isolate-override",
         5 => "plaintext",
         _ => "normal",
+    }
+}
+
+// ---- AETHERCSSSUPPORTSLIST (LEDGER SR1039): @supports reads layout_core's parse lists (named tail block) ----
+
+#[cfg(test)]
+mod supports_list_tests {
+    use super::{apply_declaration, property_supported, SpecifiedStyle, ROAD_PROPS};
+    use layout_core::css::{ALL_LONGHANDS, ALL_SKIPPED};
+
+    /// AETHERCSSSUPPORTSLIST (SR1039): names the hand-kept list lacked now answer true (SR1018, SR1014, SR1016, SR1021,
+    /// the logical border road, a vendor alias, the anim road).
+    #[test]
+    fn supports_gains() {
+        for p in [
+            "text-decoration-color", "border-top-color", "border-left-color", "align-content", "direction", "all",
+            "opacity", "z-index", "box-shadow", "float", "border-inline-start-width", "-webkit-transform",
+            "-webkit-filter", "-moz-box-sizing", "transition", "animation-name",
+        ] {
+            assert!(property_supported(p), "@supports ({p}: ..) answers true");
+        }
+    }
+
+    /// AETHERCSSSUPPORTSLIST (SR1039): an unknown name, a vendor spelling the alias arm does not take
+    /// (`-webkit-text-decoration-color`: AETHER-CSS-VENDOR-ALIAS-TEXT-DECORATION-COLOR owed), and the old
+    /// `-webkit-box-*` flexbox answer false.
+    #[test]
+    fn supports_rejects() {
+        for p in ["bogus-prop", "-webkit-text-decoration-color", "-webkit-box-flex", "text-decoration-thickness-x"] {
+            assert!(!property_supported(p), "@supports ({p}: ..) answers false");
+        }
+    }
+
+    /// AETHERCSSSUPPORTSLIST (SR1039): every name of SR1021's two lists (every arm) answers true.
+    #[test]
+    fn supports_list_reads_parse_lists() {
+        assert!(ALL_LONGHANDS.len() > 140 && ALL_SKIPPED.len() > 50, "the lists are SR1021's");
+        for p in ALL_LONGHANDS.iter().chain(ALL_SKIPPED.iter()).chain(ROAD_PROPS.iter()) {
+            assert!(property_supported(p), "listed {p:?} answers true");
+        }
+    }
+
+    /// AETHERCSSSUPPORTSLIST (SR1039): the drift pin through the parser itself: no name @supports answers true for
+    /// reaches layout_core's unknown-property record (`property:<name>`); armed by `bogus-prop`, which does.
+    #[test]
+    fn supports_never_lies() {
+        let unknown = |p: &str| -> bool {
+            crate::ledger::reset();
+            let mut s = SpecifiedStyle::default();
+            apply_declaration(p, "1px", &mut s);
+            crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Css, &format!("property:{p}"))
+        };
+        assert!(unknown("bogus-prop"), "armed: an unknown name records property:");
+        let aliases = ["-webkit-transform", "-webkit-filter", "-moz-box-sizing", "-webkit-box-decoration-break"];
+        for p in ALL_LONGHANDS.iter().chain(ALL_SKIPPED.iter()).chain(ROAD_PROPS.iter()).chain(aliases.iter()) {
+            assert!(property_supported(p), "{p:?} answers true");
+            assert!(!unknown(*p), "@supports answers true for {p:?} but the parser records it unknown");
+        }
+        crate::ledger::reset();
     }
 }
