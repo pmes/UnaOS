@@ -208,13 +208,14 @@ pub struct Face {
     snap_off: bool, // STRIASNAPTOGGLE (SR892): the drag snap default is off (the `snap` word flips it; Alt at the press inverts it) (file tail)
     autosave: Autosave, // STRIAAUTOSAVE (SR883): what `<stem>.autosave.edl` holds and the edits / ticks since it was written (file tail)
     keymap: Keymap, // STRIAKEYBOARDMAP (SR886): the key overlay over KEYS, consulted first ([`Face::with_keys`], file tail)
+    zoom_fit: Option<(bool, u32, Option<(i64, i64)>)>, // STRIAZOOMFITKEYS (SR907): the last fit (sel, zoom, view); a resize refits while it still holds (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -227,7 +228,7 @@ impl Face {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
             SMessage::BrowserResize(w, h, _) if *w > 0 && *h > 0 && (*w, *h) != self.canvas => {
-                self.canvas = (*w, *h);
+                self.canvas = (*w, *h); self.refit_on_resize(); // STRIAZOOMFITKEYS (SR907): refit while the last view word was a fit (file tail)
                 true
             }
             SMessage::BrowserButton { down: true, x, y, mods, .. } => self.press(*x, *y, *mods),
@@ -407,6 +408,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
     ("(", "roll-"), (")", "roll+"), ("Ctrl+Shift+parenleft", "roll-10"), ("Meta+Shift+parenleft", "roll-10"), ("Ctrl+Shift+parenright", "roll+10"), ("Meta+Shift+parenright", "roll+10"), // STRIAROLLKEYS (SR893): ( / ) roll the cut at the selected clip's out edge one frame; Ctrl / Cmd + Shift + ( / ) SLIP_STEP frames (names by analogy to SR752)
     ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
+    ("\\", "zoom-fit"), ("|", "zoom-sel"), // STRIAZOOMFITKEYS (SR907): `\` / `|` (Shift+\, text) fit the timeline / the selection (Shift+Z is redo)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2627,6 +2629,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("mark", "drop a marker at the playhead"), // STRIAMARKERS (SR835)
     ("roll-", "roll the cut one frame earlier"), ("roll+", "roll the cut one frame later"), ("roll-10", "roll the cut 10 frames earlier"), ("roll+10", "roll the cut 10 frames later"), // STRIAROLLKEYS (SR893)
     ("tc", "playhead readout: off / timecode / frames / seconds"), // STRIATCSET (SR908)
+    ("zoom-fit", "fit the whole timeline in the window"), ("zoom-sel", "fit the selection in the window"), // STRIAZOOMFITKEYS (SR907)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3539,7 +3542,7 @@ impl Face {
         }
         let w = self.layout().w;
         match self.state.fit(w, v == "zoom-sel") {
-            Ok(t0) => self.view = Some((t0, self.state.playhead)),
+            Ok(t0) => { self.view = Some((t0, self.state.playhead)); self.fit_mark(v) }
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
         Some(true)
@@ -5772,5 +5775,28 @@ mod striatcset_tests {
         for w in ["Frames", "", "fps", "tc"] {
             assert_eq!(tc_unit_of(w), None, "{w:?}");
         }
+    }
+}
+
+// ---- STRIAZOOMFITKEYS (LEDGER SR907): fit keys and the refit on resize (named tail block) ----
+// `\` and `|` are KEYS rows naming the VERBS words `zoom-fit` / `zoom-sel` (Shift+Z, the usual fit key, is redo here), so
+// they reach `fit_verb` through `Face::key`'s VERBS road; HELP names both. A successful fit remembers `(sel, zoom, view)`;
+// the tracks resize arm of `Face::on` refits at the new width while the zoom and the view still equal what the fit set
+// (every other view word, the wheel, `BrowserZoom`, `zoom-` / `zoom+` / `zoom0`, changes one of them). The memory is taken
+// before the refit: a refused refit (the set emptied) reports once through `fit_verb`'s own road and is not repeated. A view
+// change: no undo step, the document not dirtied. Owed: NLE-ZOOMFIT-KEYS-KERNEL (the Player's EDIT_KEYS byte, after its fit).
+
+impl Face {
+    /// Remember the fit word `v` just applied, with the zoom and the view it set.
+    fn fit_mark(&mut self, v: &str) {
+        self.zoom_fit = Some((v == "zoom-sel", self.state.zoom, self.view));
+    }
+    /// After a tracks resize: fit again at the new width when the last view word was a fit (its zoom and view still hold).
+    fn refit_on_resize(&mut self) {
+        let Some((sel, zoom, view)) = self.zoom_fit.take() else { return };
+        if zoom != self.state.zoom || view != self.view {
+            return;
+        }
+        self.fit_verb(if sel { "zoom-sel" } else { "zoom-fit" });
     }
 }
