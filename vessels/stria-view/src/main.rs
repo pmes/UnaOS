@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &clipped_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -517,7 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
+        button("meters-reset", "Reset Meters"), button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
 
@@ -902,5 +902,50 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAMETERCLIPVERB (LEDGER SR902): the meters-reset button and the witness's "clipped" (named tail block) ----
+/// The witness's `"clipped"` field: the latched meters (track index, `"master"`), in latch order, only while any latch
+/// stands (`Face::meter_clipped`); the default line is unchanged.
+fn clipped_json(face: &Face) -> String {
+    let keys = face.meter_clipped();
+    if keys.is_empty() {
+        return String::new();
+    }
+    let all: Vec<String> = keys.iter().copied().map(|k| k.map(|t| t.to_string()).unwrap_or_else(|| "\"master\"".into())).collect();
+    format!(",\"clipped\":[{}]", all.join(","))
+}
+
+#[cfg(test)]
+mod striameterclipverb_tests {
+    use super::*;
+
+    /// STRIAMETERCLIPVERB M3: no latch, no field; +24 dB on track 1 played two ticks latches track 1 and the master;
+    /// `meters-reset` (the button's word, through `--do`) clears the field.
+    #[test]
+    fn clipped_field_only_while_latched() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(clipped_json(&face), "");
+        let (mut tl, src) = nle_face::synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "play,tick:2");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(clipped_json(&face), r#","clipped":[1,"master"]"#);
+        let errors = drive(&mut face, "meters-reset");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(clipped_json(&face), "");
+    }
+
+    /// STRIAMETERCLIPVERB M3: the Reset Meters button sits immediately before `?`, firing the face's `meters-reset`.
+    #[test]
+    fn reset_button_sits_before_help() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.get(row.len() - 2) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("meters-reset", "Reset Meters"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "meters-reset"));
     }
 }

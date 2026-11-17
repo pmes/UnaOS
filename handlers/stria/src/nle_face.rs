@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "meters-reset", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3325,5 +3325,75 @@ mod striameterscliphold_tests {
         let n = METER_HOLD_S * 25;
         assert!((0..n).all(|_| !face.tick()), "an idle hold asks no repaint");
         assert!(!face.meter_hold_pending());
+    }
+}
+
+// ---- STRIAMETERCLIPVERB (LEDGER SR902): the meters-reset word (named tail block) ----
+
+impl MeterHold {
+    /// Drop every peak hold and every clip latch (the `meters-reset` word).
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.clipped.clear();
+    }
+}
+
+impl Face {
+    /// `meters-reset`: clear every clip latch and peak hold (`Some(true)`, a repaint; a view word: no undo step, the
+    /// document not dirtied); `None` for any other word.
+    fn meter_reset_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "meters-reset" {
+            return None;
+        }
+        self.meter_hold.clear();
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striameterclipverb_tests {
+    use super::*;
+
+    fn clipping_face() -> Face {
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// M3: +24 dB latches track 1 and the master and sets holds; `meters-reset` clears both, pushes no undo step,
+    /// does not dirty the document or move the timeline, and the stopped paint is a never-latched face's.
+    #[test]
+    fn striameterclipverb_reset_clears_latches_and_holds() {
+        let mut face = clipping_face();
+        let mut never = clipping_face();
+        face.verb("play");
+        face.tick();
+        face.tick();
+        face.verb("play");
+        assert!(!face.playing);
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        assert!(face.meter_hold_pending());
+        let (undo, dirty, tl, ph) = (face.state.undo_depth(), face.dirty(), face.state.timeline.clone(), face.state.playhead);
+        assert!(face.verb("meters-reset"));
+        assert!(face.meter_clipped().is_empty());
+        assert!(!face.meter_hold_pending());
+        assert_eq!((face.state.undo_depth(), face.dirty(), &face.state.timeline), (undo, dirty, &tl));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        never.state.seek(ph);
+        assert_eq!(face.paint(), never.paint(), "a reset strip paints as one that never latched");
+    }
+
+    /// M3: the word sits immediately before `help` (help last); with no latch it is taken and changes no pixel.
+    #[test]
+    fn striameterclipverb_word_sits_before_help() {
+        assert_eq!(VERBS[VERBS.len() - 2], "meters-reset");
+        assert_eq!(VERBS.last(), Some(&"help"));
+        let (tl, src) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let before = face.paint();
+        assert!(face.verb("meters-reset"));
+        assert_eq!(face.paint(), before);
+        assert_eq!(face.state.undo_depth(), 0);
+        assert!(!face.dirty());
     }
 }
