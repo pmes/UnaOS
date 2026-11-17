@@ -340,6 +340,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         tl = tl.set_size_policy(id, p).map_err(EdlError::Edit)?;
     }
     track_flags(text, &mut tl)?; // STRIATRACKMUTESOLO (SR837): the `* UNA MUTE` / `* UNA SOLO` lines, once the tracks exist (file tail)
+    track_gains(text, &mut tl)?; // STRIATRACKGAIN (SR864): the `* UNA TGAIN` lines, once the tracks exist (file tail)
     tl.validate().map_err(EdlError::Edit)?;
     Ok(tl)
 }
@@ -402,6 +403,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
     s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push('\n'); s.insert_str(s.len() - 1, &tracks_line(tl)); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     s.insert_str(s.len() - 1, &flag_lines(tl, "MUTE", |t| t.muted)); // STRIATRACKMUTESOLO (SR837): the muted tracks' `* UNA MUTE` lines, before the header's blank line (file tail)
     s.insert_str(s.len() - 1, &flag_lines(tl, "SOLO", |t| t.solo)); // STRIATRACKMUTESOLO (SR837): the soloed tracks' `* UNA SOLO` lines (file tail); STRIAMARKERS (SR835): one `* UNA MARKER` line per marker after it (file tail); STRIATRACKADDREMOVE (SR856): `* UNA TRACKS` when a kind has an empty trailing track (file tail)
+    s.insert_str(s.len() - 1, &tgain_lines(tl)); // STRIATRACKGAIN (SR864): the gained tracks' `* UNA TGAIN` lines, last in the header (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -762,19 +764,24 @@ mod striatitleclip_tests {
 fn flag_lines(tl: &Timeline, word: &str, pick: fn(&crate::Track) -> bool) -> String {
     let mut s = String::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
-        let carried = tl.tracks[ti..].iter().any(|u| u.kind == t.kind && !u.clips.is_empty());
-        if !pick(t) || !carried {
-            continue;
-        }
-        let num = tl.track_number(ti).unwrap_or(1);
-        let k = if t.kind == Kind::Video { "V" } else { "A" };
-        if num == 1 {
-            s.push_str(&format!("* UNA {word} {k}\n"));
-        } else {
-            s.push_str(&format!("* UNA {word} {k}{num}\n"));
+        if let Some(ch) = carried_ch(tl, ti).filter(|_| pick(t)) {
+            s.push_str(&format!("* UNA {word} {ch}\n"));
         }
     }
     s
+}
+
+/// STRIATRACKMUTESOLO / STRIATRACKGAIN (SR864, lifted here so both header writers share it): track `ti`'s event channel
+/// word (`V`, `V2`, `A`, `A2` ...) when the EDL carries the track (a track of its kind at or after it holds a clip: the
+/// reader makes tracks up to the highest channel an event names); `None` for a track the reader would not re-create.
+fn carried_ch(tl: &Timeline, ti: usize) -> Option<String> {
+    let t = tl.tracks.get(ti)?;
+    if !tl.tracks[ti..].iter().any(|u| u.kind == t.kind && !u.clips.is_empty()) {
+        return None;
+    }
+    let num = tl.track_number(ti).unwrap_or(1);
+    let k = if t.kind == Kind::Video { "V" } else { "A" };
+    Some(if num == 1 { String::from(k) } else { format!("{k}{num}") })
 }
 
 /// STRIATRACKMUTESOLO: the post-pass over `text` applying every `* UNA MUTE` / `* UNA SOLO` line to `tl` (its two arms).
@@ -1083,4 +1090,97 @@ fn tracks_line(tl: &Timeline) -> String {
         return String::new();
     }
     format!("* UNA TRACKS {nv} {na}\n")
+}
+
+// ---- STRIATRACKGAIN (LEDGER SR864): the `* UNA TGAIN` line (named tail block) ----
+// `* UNA TGAIN <ch> <cdb>` sets a track's [`crate::Track::gain_cdb`] (centi-dB, like `* UNA GAIN`); `<ch>` is the event
+// channel word (SR837's shape: `carried_ch` writes it, `channel` reads it). One line per carried track whose gain is not
+// 0, in track order, written last in the header (after the MUTE / SOLO lines, before the blank line), so an EDL with no
+// track gain writes as before and `write(parse(write(tl)))` stays byte-identical. Read once the tracks exist; refused as a
+// syntax error: not exactly two words, an unknown channel, a channel naming no track, a gain that is not an integer or is
+// outside the clip range, the same track twice.
+
+/// STRIATRACKGAIN: the header's `* UNA TGAIN <ch> <cdb>\n` lines.
+fn tgain_lines(tl: &Timeline) -> String {
+    let mut s = String::new();
+    for (ti, t) in tl.tracks.iter().enumerate() {
+        if let Some(ch) = carried_ch(tl, ti).filter(|_| t.gain_cdb != 0) {
+            s.push_str(&format!("* UNA TGAIN {ch} {}\n", t.gain_cdb));
+        }
+    }
+    s
+}
+
+/// STRIATRACKGAIN: the post-pass over `text` applying every `* UNA TGAIN` line to `tl`.
+fn track_gains(text: &str, tl: &mut Timeline) -> Result<(), EdlError> {
+    let mut seen: Vec<usize> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let Some(r) = raw.trim().strip_prefix("* UNA TGAIN ") else { continue };
+        let w: Vec<&str> = r.split_whitespace().collect();
+        if w.len() != 2 {
+            return Err(EdlError::Syntax { line });
+        }
+        let (kind, num) = channel(w[0]).ok_or(EdlError::Syntax { line })?;
+        let ti = (0..tl.tracks.len()).filter(|&t| tl.tracks[t].kind == kind).nth(num - 1).ok_or(EdlError::Syntax { line })?;
+        let cdb: i32 = w[1].parse().map_err(|_| EdlError::Syntax { line })?;
+        if seen.contains(&ti) {
+            return Err(EdlError::Syntax { line });
+        }
+        seen.push(ti);
+        *tl = tl.set_track_gain(ti, cdb).map_err(|_| EdlError::Syntax { line })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod striatrackgain_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for k in [Kind::Video, Kind::Audio, Kind::Audio] {
+            let t = tl.add_track(k);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        }
+        tl
+    }
+
+    /// M3: A2 at -6.02 dB and A at +3 dB round trip; the lines sit last in the header (after SR837's MUTE); the second
+    /// write is byte-identical; a timeline with no track gain writes no line (the goldens' bytes).
+    #[test]
+    fn striatrackgain_edl_round_trip() {
+        let plain = write(&tl(), "T").unwrap();
+        assert!(!plain.contains("* UNA TGAIN"));
+        let g = tl().set_track_gain(2, -602).unwrap().set_track_gain(1, 300).unwrap().set_track_flags(2, true, false).unwrap();
+        let text = write(&g, "T").unwrap();
+        assert!(text.contains("* UNA MUTE A2\n* UNA TGAIN A 300\n* UNA TGAIN A2 -602\n\n001"), "{text}");
+        let back = parse(&text, 25).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(write(&back, "T").unwrap(), text);
+        let only = tl().set_track_gain(2, -602).unwrap();
+        assert_eq!(plain.replace("\n\n001", "\n* UNA TGAIN A2 -602\n\n001"), write(&only, "T").unwrap(), "only the one line differs");
+    }
+
+    /// M3: each refusal names its line; an empty trailing track's gain is not written (the reader would not make it).
+    #[test]
+    fn striatrackgain_edl_refusals() {
+        let text = write(&tl(), "T").unwrap();
+        let with = |extra: &str| parse(&text.replace("\n\n001", &format!("\n{extra}\n\n001")), 25);
+        let at = text.lines().position(|l| l.is_empty()).unwrap() + 1;
+        assert_eq!(with("* UNA TGAIN"), Ok(tl()), "no space after the word: not this line (a comment)");
+        assert_eq!(with("* UNA TGAIN A"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN A -600 1"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN X -600"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN A3 -600"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN A -6.0"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN A 2401"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA TGAIN A2 -600\n* UNA TGAIN A2 -300"), Err(EdlError::Syntax { line: at + 1 }));
+        assert_eq!(with("* UNA TGAIN A1 -600").map(|t| t.tracks[1].gain_cdb), Ok(-600));
+        let mut empty = tl();
+        let t = empty.add_track(Kind::Audio);
+        empty = empty.set_track_gain(t, -600).unwrap();
+        assert_eq!(write(&empty, "T").unwrap(), write(&tl(), "T").unwrap());
+    }
 }

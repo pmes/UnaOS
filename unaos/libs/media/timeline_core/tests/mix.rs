@@ -320,3 +320,34 @@ fn nlexfadepower_a_bl_transition_fades_its_audio_from_and_to_silence() {
         assert_eq!(&edl::parse(&text, 25).unwrap(), tl);
     }
 }
+
+// ---- STRIATRACKGAIN (LEDGER SR864): every audio layer carries its clip's gain plus its track's (named tail block) ----
+
+/// M3: the two Layer sites follow `Timeline::heard_cdb`: two_tracks' A1 at -300 / A2 at -602 put -300 / -602 on their
+/// layers (A2's clip at -100 makes -702); the dissolve's UNDER layer (the outgoing) carries it too; the run boundaries,
+/// sources, seeks and envelopes, and the video schedule, are what they were; a track at 0 dB gives byte-identical runs.
+#[test]
+fn striatrackgain_layers_carry_the_track_gain() {
+    let tl = two_tracks();
+    let base = audio_runs(&tl, 0..20, &Gop).unwrap();
+    let mut g = tl.set_track_gain(0, -300).unwrap().set_track_gain(1, -602).unwrap();
+    g = g.set_gain(1, 0, -100).unwrap();
+    let runs = audio_runs(&g, 0..20, &Gop).unwrap();
+    assert_eq!(runs.len(), base.len());
+    for (r, b) in runs.iter().zip(&base) {
+        assert_eq!((r.out_t, r.len, r.layers.len()), (b.out_t, b.len, b.layers.len()));
+        for (l, m) in r.layers.iter().zip(&b.layers) {
+            assert_eq!((l.track, l.src, l.src_t, l.seek, l.env), (m.track, m.src, m.src_t, m.seek, m.env));
+            assert_eq!(l.gain_cdb, if l.track == 0 { -300 } else { -702 });
+        }
+    }
+    assert_eq!(schedule(&g, 0..20, &Gop).unwrap(), schedule(&tl, 0..20, &Gop).unwrap());
+    assert_eq!(audio_runs(&tl.set_track_gain(1, 0).unwrap(), 0..20, &Gop).unwrap(), base);
+    let x = xfade().set_gain(1, 0, -200).unwrap().set_track_gain(1, -400).unwrap();
+    let runs = audio_runs(&x, 0..60, &Gop).unwrap();
+    let (under, inc) = (runs[1].layers[0], runs[1].layers[1]);
+    assert!(runs[1].under(0) && !runs[1].under(1));
+    assert_eq!((under.src, under.gain_cdb, inc.src, inc.gain_cdb), (SourceId(0), -600, SourceId(1), -400));
+    assert_eq!(x.set_track_gain(1, 0).unwrap().set_gain(1, 0, 0).unwrap(), xfade());
+}
+

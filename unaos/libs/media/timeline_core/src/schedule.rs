@@ -185,7 +185,7 @@ pub struct Layer {
     /// Seek here (ns from the source's start, a sync point) before decoding this layer; `None` when it continues the
     /// same track's previous layer.
     pub seek: Option<i64>,
-    /// The clip's gain, centi-dB.
+    /// The clip's gain plus its track's ([`Timeline::heard_cdb`], STRIATRACKGAIN SR864), centi-dB.
     pub gain_cdb: i32,
     /// The fade envelope (Q16, [`ENV_ONE`] = full) at the run's first tick and at its end edge; linear between.
     pub env: [u32; 2],
@@ -268,7 +268,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                     let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, c.src_at(end))); // STRIACLIPSPEED (SR829): where the run's source ends at the clip's rate (1x: src_t + (end - t))
-                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: c.gain_cdb, env });
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
                 }
                 None => (next[ti], xnext[ti]) = (None, None),
             }
@@ -375,7 +375,7 @@ fn under_layer(
     *xnext = Some((o.src, src_t + (end - t)));
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: o.gain_cdb, env: [fall(t), fall(end)] })
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose

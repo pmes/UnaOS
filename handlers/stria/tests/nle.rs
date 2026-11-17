@@ -5375,3 +5375,67 @@ fn striatrackaddremove_face_buttons_add_and_remove() {
     assert_eq!(face.state.timeline, tl0);
     println!("striatrackaddremove: A+ -> 3 tracks, saved with * UNA TRACKS 1 2; track- -> removed V (3 clips); undo; A2 removed");
 }
+
+// ---- STRIATRACKGAIN (LEDGER SR864): a track's gain through the render's mix and the face's word (named tail block) ----
+
+/// Two audio tracks over reels S0 (base 0) and S1 (base 1000), 50 ticks each: A1 S0[0,20)@0 at clip gain `c1`, A2
+/// S1[0,20)@0 at clip gain `c2`, track gains `t1` / `t2`; rendered 0..20.
+fn striatrackgain_pcm(c1: i32, c2: i32, t1: i32, t2: i32) -> Vec<f32> {
+    let mut tl = Timeline::new(25);
+    let (a, b) = (tl.add_source("S0", 50), tl.add_source("S1", 50));
+    for (src, c) in [(a, c1), (b, c2)] {
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = vec![Clip::new(src, 0, 20, 0).gained(c)];
+    }
+    let tl = tl.set_track_gain(0, t1).unwrap().set_track_gain(1, t2).unwrap();
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    let mut sink = Pcm::default();
+    render(&tl, 0..20, &src, &mut sink).unwrap();
+    sink.pcm
+}
+
+/// M3 (the mix follows with no mix edit): a unity clip on a -6.02 dB track renders sample for sample like a -6.02 dB
+/// clip on a unity track (the Layer carries the sum); the gains multiply (clip -3 dB on a track -3.02 dB = -6.02 dB);
+/// A2's track gain leaves A1's term alone; a track at 0 dB renders the bytes it rendered before.
+#[test]
+fn striatrackgain_render_mix_follows_the_track() {
+    let plain = striatrackgain_pcm(0, 0, 0, 0);
+    assert_eq!(plain.len(), 20 * PER);
+    assert_eq!(striatrackgain_pcm(0, 0, -602, 0), striatrackgain_pcm(-602, 0, 0, 0), "track gain == clip gain");
+    assert_eq!(striatrackgain_pcm(-300, 0, -302, 0), striatrackgain_pcm(-602, 0, 0, 0), "they add in dB");
+    assert_eq!(striatrackgain_pcm(0, 0, 0, -1200), striatrackgain_pcm(0, -1200, 0, 0), "A2's alone");
+    assert_ne!(striatrackgain_pcm(0, 0, 0, -1200), plain);
+    let half = striatrackgain_pcm(0, -14_400, -602, -14_400);
+    for (j, got) in half.iter().enumerate() {
+        let v = synth_sample(0, j as u64) as f32;
+        assert!((got * 32768.0 - v / 2.0).abs() <= 1.0 + v / 1000.0 + 1.0, "sample {j}: {} vs {}", got * 32768.0, v / 2.0);
+    }
+    println!("striatrackgain render: -6.02 dB track == -6.02 dB clip over {} samples", plain.len());
+}
+
+/// M3: the face's word through `Face::verb` (timeline_core's dispatch) sets the selected clip's track in one undo step and
+/// the saved EDL carries it; with nothing selected the refusal is named on the message line and the timeline stays.
+#[test]
+fn striatrackgain_face_word_and_refusal() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(VERBS.contains(&"track-gain"));
+    assert!(face.verb("track-gain -6"));
+    assert_eq!(face.last_error.take(), Some(format!("track-gain -6: {}", EditError::NoTrack)));
+    assert_eq!(face.state.timeline, tl);
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("track-gain -6"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (-600, 1));
+    let text = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(text.contains("* UNA TGAIN A -600\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline);
+    assert!(face.verb("track-gain x"));
+    assert_eq!(face.last_error.take(), Some(format!("track-gain x: {}", EditError::Gain)));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striatrackgain face: track-gain -6 -> A1 -600 cdB, saved as * UNA TGAIN A -600; no selection -> {}", EditError::NoTrack);
+}
+

@@ -189,6 +189,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
+        ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -533,6 +534,7 @@ fn transport() -> TetraNode {
         button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
+        button("track-gain", "Track 0 dB"), // STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1198,3 +1200,31 @@ mod striatrackaddremove_tests {
         assert!(["track+ video", "track+ audio", "track-"].iter().all(|w| nle_face::VERBS.contains(w)));
     }
 }
+
+// ---- STRIATRACKGAIN (LEDGER SR864): the `track-gain:<dB>` token and the Track 0 dB button (named tail block) ----
+
+#[cfg(test)]
+mod striatrackgain_tests {
+    use super::*;
+
+    /// M3: `at:12:1,track-gain:-6` selects the A1 clip and sets A1's gain (one undo step, the clip's own gain untouched);
+    /// the button's bare word puts it back to unity; with nothing selected the word is refused by name on the message road.
+    #[test]
+    fn striatrackgain_witness_token_and_button() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == "track-gain")));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:1,track-gain:-6");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.timeline.tracks[0].gain_cdb, face.state.undo_depth()), (-600, 0, 1));
+        assert!(face.state.timeline.tracks[1].clips.iter().all(|c| c.gain_cdb == 0));
+        assert!(drive(&mut face, "track-gain").is_empty());
+        assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (0, 2));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut none = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut none, "track-gain:-6"), vec![format!("track-gain -6: {}", timeline_core::EditError::NoTrack)]);
+        println!("striatrackgain witness: track-gain:-6 -> A1 -600 cdB; Track 0 dB -> 0; no selection -> {}", timeline_core::EditError::NoTrack);
+    }
+}
+

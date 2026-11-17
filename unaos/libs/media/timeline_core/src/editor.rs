@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1587,5 +1587,100 @@ impl EditorState {
             "track+ audio" => Some(self.add_track(crate::Kind::Audio)),
             _ => None,
         }
+    }
+}
+
+// ---- STRIATRACKGAIN (LEDGER SR864): `track-gain` on the selected clip's track through the one commit (named tail block) ----
+// The word rides THE verb dispatch both faces call. RULE (SR837's): it acts on the SELECTED clip's track; with nothing
+// selected it is refused `EditError::NoTrack`. `track-gain <dB>` sets the track's gain (SR838's `cdb_of`: decimal dB,
+// rounded half away from zero), bare `track-gain` puts it back to unity (the stria-view button). A word that is not a
+// number, an extra word, or a gain outside the clip range is refused `EditError::Gain`; the state stays. Each change is ONE
+// `commit` (undo-able; it dirties the document, and `edl::write` saves it as `* UNA TGAIN`); the same gain commits nothing.
+impl EditorState {
+    /// The selected clip's track's gain set to `cdb` centi-dB (`Timeline::set_track_gain`, ONE commit; the same gain
+    /// commits nothing).
+    pub fn set_selected_track_gain(&mut self, cdb: i32) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoTrack)?;
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        if t.gain_cdb == cdb {
+            return Ok(());
+        }
+        let tl = self.timeline.set_track_gain(track, cdb)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `track-gain` word of [`EditorState::verb`]; `None` for any other word.
+    fn track_gain_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("track-gain") {
+            return None;
+        }
+        if self.selection.is_none() {
+            return Some(Err(EditError::NoTrack));
+        }
+        Some(match (w.next(), w.next()) {
+            (None, _) => self.set_selected_track_gain(0),
+            (Some(db), None) => cdb_of(db).map_or(Err(EditError::Gain), |cdb| self.set_selected_track_gain(cdb)),
+            _ => Err(EditError::Gain),
+        })
+    }
+}
+
+#[cfg(test)]
+mod striatrackgain_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// A1: A 0..20 at 0, A2: A 0..20 at 0; the clip on A2 selected.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for _ in 0..2 {
+            let t = tl.add_track(Kind::Audio);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        let mut st = EditorState::new(tl);
+        st.select(1, 0).unwrap();
+        st
+    }
+
+    /// M3: `track-gain -6` sets the selected clip's track (not the other, not the clip) in ONE undo step; the same value
+    /// again pushes none; bare `track-gain` is unity; undo / redo walk it.
+    #[test]
+    fn striatrackgain_verb_sets_through_one_commit() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("track-gain -6"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[1].gain_cdb, st.timeline.tracks[0].gain_cdb, st.timeline.tracks[1].clips[0].gain_cdb), (-600, 0, 0));
+        assert_eq!(st.undo_depth(), 1);
+        assert_eq!(st.verb("track-gain -6.0"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same gain commits nothing");
+        assert_eq!(st.verb("track-gain 2.5"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[1].gain_cdb, st.undo_depth()), (250, 2));
+        assert_eq!(st.verb("track-gain"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[1].gain_cdb, st.undo_depth()), (0, 3));
+        st.undo();
+        assert_eq!(st.timeline.tracks[1].gain_cdb, 250);
+        st.undo();
+        st.undo();
+        assert_eq!(st.timeline, tl0);
+        st.redo();
+        assert_eq!(st.timeline.tracks[1].gain_cdb, -600);
+    }
+
+    /// M3: each refusal by name, the state and the undo depth untouched.
+    #[test]
+    fn striatrackgain_verb_refusals() {
+        let mut none = state();
+        none.selection = None;
+        let tl0 = none.timeline.clone();
+        assert_eq!(none.verb("track-gain -6"), Some(Err(EditError::NoTrack)));
+        assert_eq!(none.verb("track-gain"), Some(Err(EditError::NoTrack)));
+        let mut st = state();
+        for bad in ["track-gain x", "track-gain 1 2", "track-gain 30", "track-gain -145", "track-gain inf"] {
+            assert_eq!(st.verb(bad), Some(Err(EditError::Gain)), "{bad}");
+        }
+        assert_eq!((&st.timeline, st.undo_depth(), &none.timeline), (&tl0, 0, &tl0));
+        assert_eq!(st.verb("track-gainx"), None, "not this word");
     }
 }
