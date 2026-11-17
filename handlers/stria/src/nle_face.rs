@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    laid: Option<String>, // STRIAINSERTMARKSKEYS (SR924): the last laid insert's line (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, laid: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.laid_clear(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -386,6 +387,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("w", "insert"), // STRIAINSERTMARKSKEYS (SR924): w / d insert / overwrite at the playhead, W / D (Shift, text) into the in / out marks
+    ("d", "overwrite"),
+    ("W", "insert-marked"),
+    ("D", "overwrite-marked"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2360,7 +2365,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.laid.clone()).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2602,6 +2607,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("insert", "insert the clip's source at the playhead"), // STRIAINSERTMARKSKEYS (SR924): the insert words' keys
+    ("overwrite", "overwrite at the playhead with the clip's source"),
+    ("insert-marked", "insert the clip's source into the in / out marks"),
+    ("overwrite-marked", "overwrite the in / out marks with the clip's source"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3095,5 +3104,51 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYS (LEDGER SR924): keys for the insert words and the laid line (named tail block) ----
+// KEYS `w` / `d` / `W` / `D` bind `insert` / `overwrite` / `insert-marked` / `overwrite-marked` (HELP phrases beside them);
+// each word goes through timeline_core's ONE dispatch (`EditorState::verb`, one commit). A laid insert leaves a note on the
+// message line, read by `message_text` after the export line: `<word>: <reel> <length> at <record in>` (timecode at the
+// timeline's rate, frames for a non-integer timebase), cleared by the next taken input (a word, a click, a press, a bound key).
+// It is not `last_error` (the witness counts that as an error). Owed: NLE-INSERT-LAID-TC (SR872's `tc` mode), NLE-INSERT-KERNEL.
+
+impl Face {
+    /// The four insert words: timeline_core's dispatch, then the laid line (`Some(true)`); `None` for any other word.
+    fn laid_verb(&mut self, v: &str) -> Option<bool> {
+        let w = v.split_ascii_whitespace().next()?;
+        if !matches!(w, "insert" | "overwrite" | "insert-marked" | "overwrite-marked") {
+            return None;
+        }
+        match self.state.verb(v)? {
+            Ok(()) => self.laid = self.laid_line(w),
+            Err(e) => {
+                self.laid = None;
+                self.last_error = Some(format!("{v}: {e}"));
+            }
+        }
+        Some(true)
+    }
+    /// The selected (laid) clip as `<word>: <reel> <length> at <record in>`; `None` with no clip selected.
+    fn laid_line(&self, w: &str) -> Option<String> {
+        let c = self.state.selected()?;
+        let fps = self.state.timeline.fps();
+        let tc = |t: i64| fps.map_or_else(|| t.to_string(), |f| timeline_core::edl::timecode(t, f));
+        let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
+        Some(format!("{w}: {name} {} at {}", tc(c.len()), tc(c.at)))
+    }
+    /// The laid line stands until the next taken input: a word, a click, a press, or a key the face binds (GTK's
+    /// `BrowserKey` twin of a text key is not one).
+    fn laid_clear(&mut self, msg: &SMessage) {
+        let taken = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } => true,
+            SMessage::BrowserKey(k) => k.chars().count() != 1 && KEYS.iter().any(|(name, _)| *name == k.as_str()),
+            SMessage::BrowserText(t) => t.chars().count() == 1 && KEYS.iter().any(|(name, _)| *name == t.as_str()),
+            _ => false,
+        };
+        if taken {
+            self.laid = None;
+        }
     }
 }

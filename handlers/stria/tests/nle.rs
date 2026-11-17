@@ -3668,7 +3668,7 @@ fn striainsertoverwrite_face_words_are_place_at_the_playhead() {
         assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "{word}: only the target track moves");
         assert_eq!(face.state.selected(), Some(Clip::new(SourceId(1), 0, 10, 15)));
         assert_eq!(face.state.playhead, 25);
-        assert!(face.message_text().is_some_and(|m| m.starts_with("B: ")), "{:?}", face.message_text());
+        assert_eq!(face.message_text(), Some(format!("{word}: B 00:00:00:10 at 00:00:00:15")), "the laid line"); // STRIAINSERTMARKSKEYS (SR924)
         assert!(face.verb("undo"));
         assert_eq!(face.state.timeline, tl, "{word}: one undo");
     }
@@ -3718,7 +3718,7 @@ fn striainsertmarks_face_words_fill_the_marked_range() {
         assert_eq!(face.state.timeline, marked.place(0, Clip::new(SourceId(1), 0, 4, 5), mode).unwrap(), "{word}");
         assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "{word}: only the target track moves");
         assert_eq!((face.state.selected(), face.state.playhead), (Some(Clip::new(SourceId(1), 0, 4, 5)), 9));
-        assert!(face.message_text().is_some_and(|m| m.starts_with("B: ")), "{:?}", face.message_text());
+        assert_eq!(face.message_text(), Some(format!("{word}: B 00:00:00:04 at 00:00:00:05")), "the laid line"); // STRIAINSERTMARKSKEYS (SR924)
         assert!(face.verb("undo"));
         assert_eq!(face.state.timeline, marked, "{word}: one undo");
     }
@@ -3740,4 +3740,71 @@ fn striainsertmarks_face_refusals_by_name() {
     assert_eq!(face.last_error.take(), Some(format!("insert-marked now: {}", EditError::InsertForm)));
     assert_eq!(face.state.timeline, tl);
     println!("striainsertmarks: no marks -> insert-marked: {}", EditError::NoMarks);
+}
+
+// ---- STRIAINSERTMARKSKEYS (LEDGER SR924): keys for the insert words and the laid line on the message row (named tail block) ----
+
+/// `w` / `d` / `W` / `D` are KEYS rows for the four insert words, each a VERBS word with a HELP phrase of its own; the help
+/// shows each key on its word's row.
+#[test]
+fn striainsertmarkskeys_keys_rows_and_phrases() {
+    let rows = help_rows();
+    for (k, w) in [("w", "insert"), ("d", "overwrite"), ("W", "insert-marked"), ("D", "overwrite-marked")] {
+        assert!(KEYS.contains(&(k, w)), "{k} -> {w}");
+        assert!(VERBS.contains(&w), "{w}: the face word");
+        assert!(HELP.iter().any(|(a, _)| *a == w), "{w}: a phrase");
+        assert_ne!(help_phrase(w), w, "{w}: a phrase, not the word");
+        let row = rows.iter().find(|r| r.1 == help_phrase(w)).expect("a help row");
+        assert!(row.0.split(" / ").any(|x| x == k), "{k} not in {:?}", row.0);
+    }
+    println!("striainsertmarkskeys: KEYS w d W D -> insert overwrite insert-marked overwrite-marked; help rows={}", rows.len());
+}
+
+/// In 5, out 9, B selected: the text key `W` lays B 0..4 at 5 on V1 through the one dispatch (one undo step) and the
+/// message row names it `insert-marked: B 00:00:00:04 at 00:00:00:05` (no error); the next bound key (`k`) clears it back
+/// to the reel line. `D` with the marks cleared is refused by the editor's name and leaves no laid line.
+#[test]
+fn striainsertmarkskeys_shift_w_fills_the_marks_and_names_it() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    face.state.seek(9);
+    assert!(face.verb("out"));
+    let marked = tl.set_marks((Some(5), Some(9))).unwrap();
+    assert!(nle5drangekeys_press(&mut face, "W"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, marked.place(0, Clip::new(SourceId(1), 0, 4, 5), timeline_core::Mode::Insert).unwrap());
+    assert_eq!(face.message_text().as_deref(), Some("insert-marked: B 00:00:00:04 at 00:00:00:05"));
+    assert!(nle5drangekeys_press(&mut face, "k"));
+    assert!(face.message_text().is_some_and(|m| m.starts_with("B: ")), "{:?}", face.message_text());
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, marked, "one undo");
+    assert!(face.verb("mark clear"));
+    let before = face.state.timeline.clone();
+    assert!(nle5drangekeys_press(&mut face, "D"));
+    assert_eq!(face.last_error.take(), Some(format!("overwrite-marked: {}", EditError::NoMarks)));
+    assert_eq!(face.state.timeline, before);
+    assert!(!face.message_text().is_some_and(|m| m.starts_with("overwrite-marked")), "{:?}", face.message_text());
+    println!("striainsertmarkskeys: in 5 out 9, W -> insert-marked: B 00:00:00:04 at 00:00:00:05; D unmarked -> {}", EditError::NoMarks);
+}
+
+/// B selected, playhead 15: `w` inserts and `d` overwrites B 0..10 there, each naming `<word>: B 00:00:00:10 at
+/// 00:00:00:15`; GTK's `BrowserKey("w")` alone (the twin of the text key) is not taken and changes nothing.
+#[test]
+fn striainsertmarkskeys_w_d_at_the_playhead() {
+    for (k, word, mode) in [("w", "insert", timeline_core::Mode::Insert), ("d", "overwrite", timeline_core::Mode::Overwrite)] {
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl.clone(), src);
+        face.state.select(0, 1).unwrap();
+        face.state.seek(15);
+        assert!(!face.on(&bandy::SMessage::BrowserKey(k.to_string())), "{k}: a one-char BrowserKey is not taken");
+        assert_eq!(face.state.timeline, tl);
+        assert!(nle5drangekeys_press(&mut face, k), "{k}");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert_eq!(face.state.timeline, tl.place(0, Clip::new(SourceId(1), 0, 10, 15), mode).unwrap(), "{word}");
+        assert_eq!(face.message_text(), Some(format!("{word}: B 00:00:00:10 at 00:00:00:15")));
+    }
+    println!("striainsertmarkskeys: w / d at 15 -> insert / overwrite: B 00:00:00:10 at 00:00:00:15");
 }
