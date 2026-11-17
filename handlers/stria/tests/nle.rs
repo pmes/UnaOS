@@ -12807,3 +12807,46 @@ fn striagapsthree_note_keep_and_close_sync() {
     assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl.close_gaps_sync().unwrap(), 1));
     println!("striagapsthree: VERBS[{i}] = close-sync; V1 {:?}", face.state.timeline.tracks[0].clips);
 }
+// ---- STRIAEXPORTQUEUETHREE (LEDGER SR9042): GTK's Shift+Escape keys export-skip (named tail block) ----
+
+/// GTK's `Shift+Escape` skips the running export through the `export-skip` word: the queue is kept (unlike Esc) and B runs;
+/// while the help shows it only dismisses; with nothing running it names that.
+#[test]
+fn striaexportqueuethree_shift_escape_skips() {
+    let (a, b) = (nlefaceexport_dir("three-a"), nlefaceexport_dir("three-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.verb("help"));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Shift+Escape".into())));
+    assert!(!face.help_shown(), "Shift+Escape while the help shows only dismisses it");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.export_progress(), Some((3, 35)), "no skip while dismissing");
+    assert!(face.on(&bandy::SMessage::BrowserKey("Shift+Escape".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: skipping (1 waiting)"));
+    assert_eq!(face.export_queued(), 1, "the skip keeps the queue");
+    striaexportqueueskip_drain(&mut face);
+    let line = face.last_error.take().expect("B's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", b.display())), "{line}");
+    assert!(b.join("000034.png").is_file(), "B ran after the Shift+Escape skip");
+    assert!(face.on(&bandy::SMessage::BrowserKey("Shift+Escape".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export-skip: no export running"));
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueuethree: Shift+Escape skipped A, B ran: \"{line}\"");
+}
+
+/// The export-skip help row names both keys; Escape stays cancel; the name never arrives as text.
+#[test]
+fn striaexportqueuethree_help_row_names_both_keys() {
+    assert!(KEYS.contains(&("Shift+Escape", "export-skip")));
+    assert!(KEYS.contains(&("Escape", "cancel")));
+    let rows = help_rows();
+    let row = rows.iter().find(|r| r.1 == help_phrase("export-skip")).expect("the export-skip help row");
+    assert_eq!(row.0, "E / Shift+Escape");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(!face.on(&bandy::SMessage::BrowserText("Shift+Escape".into())), "a multi-char name is never text");
+    println!("striaexportqueuethree: help row {:?}", row);
+}

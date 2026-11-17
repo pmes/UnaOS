@@ -466,6 +466,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+Shift+B", "crop-b-"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
+    ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -9480,3 +9481,8 @@ impl Face {
         true
     }
 }
+
+// ---- STRIAEXPORTQUEUETHREE (LEDGER SR9042): GTK's Shift+Escape keys export-skip (named tail block) ----
+// GTK names Shift+Esc `Shift+Escape` (a BrowserKey, no BrowserText); one KEYS row keys SR914's `export-skip` word through
+// `Face::key` -> `Face::verb` -> `export_queue_verb`, so the queue is kept and the next request starts. Esc stays cancel-all
+// (`cancel_export`); AppKit drops Escape, `E` is its key. The help row (`help_rows`) reads `E / Shift+Escape`. No new fn.
