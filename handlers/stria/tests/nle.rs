@@ -8001,3 +8001,22 @@ fn striagapsblack_face_names_the_removed_fades() {
     assert_eq!(face.state.timeline, tl.insert_gap(0, 10, 25).unwrap());
     println!("striagapsblack: VERBS[{i}] = gap; V1 after gap at 10: {:?}", face.state.timeline.tracks[0].clips);
 }
+
+// ---- STRIALINKTRIM (LEDGER SR910): the face's slip button carries the link mates (named tail block) ----
+#[test]
+fn strialinktrim_face_slip_word() {
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.clone();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 2).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    assert!(face.verb("link"));
+    face.state.deselect();
+    face.state.select(0, 2).unwrap();
+    assert!(face.verb("slip+"));
+    assert_eq!(face.last_error.take(), None);
+    let want = tl0.set_group(&[(0, 2), (1, 2)], 1).unwrap().slip(0, 2, 1).unwrap().slip(1, 2, 1).unwrap();
+    assert_eq!(face.state.timeline, want, "picture and sound slipped together");
+    assert_eq!(face.state.undo_depth(), 2, "link, slip: one step each");
+    println!("strialinktrim: linked pair slipped to src_in {}", face.state.timeline.tracks[1].clips[2].src_in);
+}

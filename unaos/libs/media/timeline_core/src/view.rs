@@ -356,7 +356,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_grade_badges(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail)
+    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -2633,5 +2633,28 @@ mod striatrackgainstep_tests {
         let mut off = st.clone();
         off.timeline = off.timeline.set_track_gain(1, 0).unwrap();
         assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "0 dB: the unity paint, byte for byte");
+    }
+}
+
+// ---- STRIALINKTRIM (LEDGER SR910): the chain mark on a linked clip's body (named tail block) ----
+// Every clip with a nonzero `group` whose body is at least 16 px wide carries two overlapping 1 px rings (5x4 px each,
+// 3 px apart) at its top-right, in [`LINK`]; an unlinked clip paints nothing here, so every golden is unchanged. The
+// host face and the kernel view band both reach it through [`paint_in`].
+/// The chain mark's colour.
+pub const LINK: [u8; 4] = [0x9a, 0xe6, 0xff, 255];
+
+/// The chain mark of every linked clip in view (see the block comment).
+fn paint_links(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, track) in st.timeline.tracks.iter().enumerate() {
+        let y0 = l.row_y(row);
+        for clip in track.clips.iter().filter(|k| k.group != 0) {
+            let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+            if x1 - x0 < 16 || x1 <= 0 || x0 >= l.w as i64 {
+                continue;
+            }
+            let (xa, ya) = (x1 - 12, y0 + 4);
+            c.frame(xa, ya, xa + 5, ya + 4, LINK);
+            c.frame(xa + 3, ya, xa + 8, ya + 4, LINK);
+        }
     }
 }

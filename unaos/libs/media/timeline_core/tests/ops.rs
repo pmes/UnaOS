@@ -1120,13 +1120,13 @@ fn striacliplink_delete_and_lift_take_the_group() {
 }
 
 #[test]
-fn striacliplink_trim_is_the_primary_only() {
+fn striacliplink_trim_carries_the_group() {
     let tl = striacliplink_linked();
     let mut st = EditorState::new(tl.clone());
     st.select(0, 0).unwrap();
     st.trim(Edge::Out, -2).unwrap();
-    assert_eq!(st.timeline, tl.trim_out(0, 0, 8).unwrap());
-    assert_eq!((st.timeline.tracks[1].clips[0].src_out, st.timeline.tracks[0].clips[0].group), (10, 1), "the mate stays; the id stays");
+    assert_eq!(st.timeline, tl.trim_out(0, 0, 8).unwrap().trim_out(1, 0, 8).unwrap());
+    assert_eq!((st.timeline.tracks[1].clips[0].src_out, st.timeline.tracks[0].clips[0].group), (8, 1), "the mate follows (STRIALINKTRIM SR910); the id stays");
 }
 
 #[test]
@@ -1980,4 +1980,115 @@ fn striagapsblack_editor_bare_gap_is_one_second() {
     st.deselect();
     assert_eq!(st.verb("gap"), Some(Err(EditError::NoClip)));
     assert_eq!(st.timeline, k);
+}
+
+// ---- STRIALINKTRIM (LEDGER SR910): linked trims, ripple trims and slips, all-or-nothing, and the chain mark (named tail block) ----
+use timeline_core::view::{self, Drag, DragKind, Layout, Order, ROW_H};
+
+/// `trim` (and the `]` word) on one member trims every mate by the same source delta; ONE undo step each.
+#[test]
+fn strialinktrim_trim_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    st.trim(Edge::Out, -2).unwrap();
+    let one = tl.trim_out(0, 0, 8).unwrap().trim_out(1, 0, 8).unwrap();
+    assert_eq!(st.timeline, one);
+    assert_eq!(st.verb("]"), Some(Ok(())));
+    let two = one.trim_in(0, 0, 1).unwrap().trim_in(1, 0, 1).unwrap();
+    assert_eq!(st.timeline, two);
+    assert_eq!((st.timeline.tracks[1].clips[0].src_in, st.timeline.tracks[1].clips[0].at), (1, 1), "the mate's in moved with its start");
+    assert_eq!(st.undo_depth(), 2, "one step per trim");
+    assert!(st.undo());
+    assert_eq!(st.timeline, one);
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl, "one undo restores both members");
+}
+
+/// `rtrim out -2` on one member ripple-trims every mate: each track's later clip follows.
+#[test]
+fn strialinktrim_ripple_trim_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("rtrim out -2"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.ripple_trim_out(1, 0, 8).unwrap().ripple_trim_out(0, 0, 8).unwrap());
+    assert_eq!((st.timeline.tracks[0].clips[1].at, st.timeline.tracks[1].clips[1].at), (8, 8), "both tracks rippled");
+    assert_eq!(st.undo_depth(), 1);
+}
+
+/// `slip 3` on one member slips every mate's source window by the same delta.
+#[test]
+fn strialinktrim_slip_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("slip 3"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.slip(0, 0, 3).unwrap().slip(1, 0, 3).unwrap());
+    assert_eq!((st.timeline.tracks[0].clips[0].src_in, st.timeline.tracks[1].clips[0].src_in), (3, 3));
+    assert_eq!(st.undo_depth(), 1);
+}
+
+/// A mate that cannot follow refuses the whole edit (nothing committed); an unlinked clip trims exactly as the trunk did.
+#[test]
+fn strialinktrim_refusal_is_all_or_nothing() {
+    let mut tl = striacliplink_base();
+    tl.tracks[1].clips[0] = Clip { src_in: 90, src_out: 100, ..tl.tracks[1].clips[0] };
+    let tl = tl.set_group(&[(0, 0), (1, 0)], 1).unwrap();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("slip 5"), Some(Err(EditError::OutOfSource)), "the mate would leave its source");
+    assert_eq!(st.verb("rtrim out 1"), Some(Err(EditError::OutOfSource)), "the mate's out would pass its source");
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0), "nothing committed");
+    let base = striacliplink_base();
+    let mut st = EditorState::new(base.clone());
+    st.select(0, 0).unwrap();
+    st.trim(Edge::Out, -2).unwrap();
+    assert_eq!(st.timeline, base.trim_out(0, 0, 8).unwrap(), "group 0: the trunk's single-clip trim");
+    assert_eq!(st.timeline.tracks[1].clips[0].src_out, 10);
+}
+
+/// A drag on a member's out handle (no snap) previews and commits the linked trim: `Drag::finish` rides `trim`.
+#[test]
+fn strialinktrim_drag_trim_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let want = tl.trim_out(0, 0, 8).unwrap().trim_out(1, 0, 8).unwrap();
+    let mut st = EditorState::new(tl);
+    st.select(0, 0).unwrap();
+    let l = Layout::of(400, 240, &st);
+    let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+    let x = l.x_of(10) as f64 - 2.0;
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap();
+    assert_eq!(d.kind, DragKind::TrimOut);
+    d.update(&st, x - 2.0 * z, y);
+    assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the preview shows both members trimmed");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!((&st.timeline, st.undo_depth()), (&want, 1));
+}
+
+/// The chain mark: an unlinked timeline paints exactly as before (no mark); linked, the picture differs only inside
+/// each linked body's mark box, whose top-left pixel is `LINK`.
+#[test]
+fn strialinktrim_chain_mark_paints_only_when_linked() {
+    let (w, h) = (400u32, 240u32);
+    let base = EditorState::new(striacliplink_base());
+    let linked = EditorState::new(striacliplink_linked());
+    let l = Layout::of(w, h, &base);
+    let a = view::paint(&base, w, h, Order::Rgba, None, None);
+    let b = view::paint(&linked, w, h, Order::Rgba, None, None);
+    let boxes: Vec<(i64, i64)> = (0..2).map(|row| (l.x_of(10) - 12, l.row_y(row) + 4)).collect();
+    let in_box = |x: i64, y: i64| boxes.iter().any(|&(bx, by)| x >= bx && x < bx + 8 && y >= by && y < by + 4);
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let i = ((y * w as i64 + x) * 4) as usize;
+            if a[i..i + 4] != b[i..i + 4] {
+                assert!(in_box(x, y), "a pixel outside the mark boxes changed at ({x}, {y})");
+            }
+        }
+    }
+    for &(bx, by) in &boxes {
+        let i = ((by * w as i64 + bx) * 4) as usize;
+        assert_eq!(b[i..i + 4], view::LINK, "the mark on each linked body");
+        assert_ne!(a[i..i + 4], view::LINK, "no mark unlinked");
+    }
 }
