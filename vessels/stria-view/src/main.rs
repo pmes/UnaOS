@@ -134,7 +134,7 @@ fn editor_tree_for(two: bool) -> TetraNode {
 
 /// A `--do` token as the messages the window would send.
 fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
-    if script_word(tok).is_none() && !nle_face::VERBS.contains(&tok) { return None; } // NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the table gates the word and its arity, the arms below parse the values (file tail)
+    script_word(tok)?; // NLEFACEWITNESSTABLEDRIVENPARSER (SR1129) / NLEFACEWITNESSVERBSINTABLE (SR1132): ONE gate, the table and the verbs through script_word, the arms below parse the values (file tail)
     let num = |s: &str| s.parse::<i64>().ok();
     let px = |s: &str| s.parse::<f64>().ok();
     let l: Layout = face.layout();
@@ -188,7 +188,6 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
     Some(vec![one])
@@ -1239,10 +1238,10 @@ mod scriptwords_tests {
 pub const NEST: u8 = u8::MAX;
 
 /// The [`SCRIPT_WORDS`] row whose word heads `tok` (`<word>:` through its first `:`, else the whole token) and its arity, when
-/// the token carries that many `:`-separated arguments (a [`NEST`] row takes any rest); None otherwise. The VERBS are not rows.
+/// the token carries that many `:`-separated arguments (a [`NEST`] row takes any rest); None otherwise. A token that is no row's word is answered by nle_face::VERBS (the whole token, arity 0; SR1132).
 pub fn script_word(tok: &str) -> Option<(&'static str, u8)> {
     let head = tok.find(':').map_or(tok, |i| &tok[..=i]);
-    let &(w, _, n) = SCRIPT_WORDS.iter().find(|(w, _, _)| *w == head)?;
+    let Some(&(w, _, n)) = SCRIPT_WORDS.iter().find(|(w, _, _)| *w == head) else { return nle_face::VERBS.iter().find(|v| **v == tok).map(|v| (*v, 0)); }; // NLEFACEWITNESSVERBSINTABLE (SR1132): a transport verb, arity 0
     (n == NEST || tok.split(':').count() - 1 == n as usize).then_some((w, n))
 }
 
@@ -1266,7 +1265,7 @@ mod tabledriven_tests {
         assert!(script_word("key:a:b").is_none(), "a key name carries no `:` (the one behaviour change: was BrowserKey(a:b))");
         assert_eq!(script_word("wheel:-2"), Some(("wheel:", 1)));
         assert_eq!(script_word("marquee:1:2:3:4"), Some(("marquee:", 4)));
-        assert!(script_word("help").is_none() && script_word("bogus").is_none());
+        assert!(script_word("bogus").is_none() && script_word("help") == Some(("help", 0)), "SR1132: help is a verb, arity 0");
         let (tl, src) = nle_face::synth_fixture();
         let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert!(token(&face, "help").is_some() && token(&face, "kind").is_some());
@@ -1283,5 +1282,25 @@ mod tabledriven_tests {
             assert!(u.contains(w), "{w} not in usage()");
             assert!(!USAGE_HEAD.contains(w), "{w} in USAGE_HEAD");
         }
+    }
+}
+
+// ---- NLEFACEWITNESSVERBSINTABLE (LEDGER SR1132): the verbs answered by script_word, the dead help arm gone (named tail block) ----
+#[cfg(test)]
+mod verbsintable_tests {
+    use super::*;
+
+    /// NLEFACEWITNESSVERBSINTABLE (SR1132): `script_word` answers a VERBS token whole at arity 0 (a verb takes no argument); `help`
+    /// reaches the VERBS arm with the message the deleted `["help"]` arm built.
+    #[test]
+    fn nlefacewitnessverbsintable_gate() {
+        assert_eq!((script_word("play"), script_word("help"), script_word("kind")), (Some(("play", 0)), Some(("help", 0)), Some(("kind", 0))));
+        assert_eq!(script_word("kind:W007"), Some(("kind:", 1)));
+        assert!(script_word("play:1").is_none() && script_word("bogus").is_none());
+        for v in nle_face::VERBS { assert_eq!(script_word(v), Some((v, 0)), "{v}"); }
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(format!("{:?}", token(&face, "help")), format!("{:?}", Some(vec![SMessage::Input { target: SURFACE.into(), text: "help".to_string() }])));
+        assert!(token(&face, "play:1").is_none());
     }
 }
