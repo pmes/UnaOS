@@ -61,7 +61,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -204,7 +204,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { token(face, tok) } {
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -788,6 +788,39 @@ mod exportaudio_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAINFOREELHOVERDELAY (LEDGER SR789): the witness's tick:N token (named tail block) ----
+/// `tick:<n>`: [`Face::tick`] n times (the face clock `serve` runs: playback steps and the hover dwell), no messages; any
+/// other token is `None` (so `tick:x` stays a bad token).
+fn tick_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
+    let n = tok.strip_prefix("tick:")?.parse::<u32>().ok()?;
+    for _ in 0..n {
+        face.tick();
+    }
+    Some(Vec::new())
+}
+
+#[cfg(test)]
+mod striainforeelhoverdelay_tests {
+    use super::*;
+
+    /// STRIAINFOREELHOVERDELAY M3: with B selected, `move:` over A then `tick:<HOVER_DWELL - 1>` still carries B's reel; one
+    /// more `tick:1` carries A's; `tick:x` is a bad token.
+    #[test]
+    fn tick_token_carries_the_dwelt_hover() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        let (x, y) = face.layout().point(0, 5);
+        let errors = drive(&mut face, &format!("move:{x}:{y},tick:{}", nle_face::HOVER_DWELL - 1));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(reel_json(&face).starts_with(",\"reel\":\"B: "), "{}", reel_json(&face));
+        assert!(drive(&mut face, "tick:1").is_empty());
+        assert!(reel_json(&face).starts_with(",\"reel\":\"A: "), "{}", reel_json(&face));
+        assert_eq!(drive(&mut face, "tick:x"), vec!["bad token tick:x".to_string()]);
+        println!("striainforeelhoverdelay witness: move over A + tick:{} -> A's reel", nle_face::HOVER_DWELL);
     }
 }
 

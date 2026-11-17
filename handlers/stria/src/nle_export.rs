@@ -962,3 +962,58 @@ pub fn qblur_of(s: &str) -> Option<u32> {
 pub fn qpstep_of(s: &str) -> Option<u8> {
     s.trim().parse::<u8>().ok().filter(|&q| i32::from(q) <= h264enc_core::rc::QP_MAX)
 }
+
+// ---- H264ENCTWOPASSCLITABLE (LEDGER SR790): the two-pass plan's four CLI knobs as one value and one word (named tail block) ----
+/// The planned pass's four CLI knobs gathered (`nle export --qcomp F --cplxblur N --qblur F --qpstep N` and `--pass2 k=v,...`):
+/// each None = x264's default, as [`H264Opts`]'s four fields; [`Pass2Cli::into_opts`] puts them on the table's options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pass2Cli {
+    /// [`H264Opts::qcomp`] ([`qcomp_of`]'s (num, den)).
+    pub qcomp: Option<(i64, i64)>,
+    /// [`H264Opts::cplxblur`] in pictures.
+    pub cplxblur: Option<u32>,
+    /// [`H264Opts::qblur_q8`] ([`qblur_of`]'s Q8).
+    pub qblur_q8: Option<u32>,
+    /// [`H264Opts::qpstep`] ([`qpstep_of`]'s QP).
+    pub qpstep: Option<u8>,
+}
+
+impl Pass2Cli {
+    /// `base` with the knobs this value sets in place (a None keeps `base`'s field); every other field is `base`'s.
+    pub fn into_opts(self, base: H264Opts) -> H264Opts {
+        H264Opts { qcomp: self.qcomp.or(base.qcomp), cplxblur: self.cplxblur.or(base.cplxblur), qblur_q8: self.qblur_q8.or(base.qblur_q8), qpstep: self.qpstep.or(base.qpstep), ..base }
+    }
+
+    /// The last-wins merge of argv order: each knob this (later) value sets wins over `base`'s; a None keeps `base`'s.
+    pub fn over(self, base: Pass2Cli) -> Pass2Cli {
+        Pass2Cli { qcomp: self.qcomp.or(base.qcomp), cplxblur: self.cplxblur.or(base.cplxblur), qblur_q8: self.qblur_q8.or(base.qblur_q8), qpstep: self.qpstep.or(base.qpstep) }
+    }
+}
+
+/// The keys [`pass2_cli_of`] takes, x264's flag names (`qblur` is F, held as Q8).
+pub const PASS2_KEYS: [&str; 4] = ["qcomp", "cplxblur", "qblur", "qpstep"];
+
+/// `nle export --pass2 k=v,...`'s parse: comma-separated `k=v` items over [`PASS2_KEYS`], each value through the knob's own
+/// parse ([`qcomp_of`], `cplxblur` as an integer, [`qblur_of`], [`qpstep_of`]) and refused with that knob's message; an unknown
+/// key refused by name; a key written twice: the later wins.
+pub fn pass2_cli_of(s: &str) -> Result<Pass2Cli, String> {
+    let mut p = Pass2Cli::default();
+    for item in s.split(',') {
+        let (k, v) = item.split_once('=').ok_or_else(|| format!("{item}: not k=v"))?;
+        match k.trim() {
+            "qcomp" => p.qcomp = Some(qcomp_of(v).ok_or_else(|| format!("qcomp {v}: not a fraction within 0..=1"))?),
+            "cplxblur" => p.cplxblur = Some(v.trim().parse().map_err(|_| format!("cplxblur {v}: not an integer"))?),
+            "qblur" => p.qblur_q8 = Some(qblur_of(v).ok_or_else(|| format!("qblur {v}: not a number within 0..={QBLUR_MAX}"))?),
+            "qpstep" => p.qpstep = Some(qpstep_of(v).ok_or_else(|| format!("qpstep {v}: not an integer within 0..={}", h264enc_core::rc::QP_MAX))?),
+            k => return Err(format!("unknown pass2 key {k} ({})", PASS2_KEYS.join("|"))),
+        }
+    }
+    Ok(p)
+}
+
+/// The effective four of the planned pass (through [`pass2_of`], x264's defaults for a None) as `qcomp=0.6 cplxblur=20 qblur=0.5
+/// qpstep=4`: `nle: two-pass plan <words>` on stderr when a plan runs.
+pub fn pass2_words(cli: &Pass2Cli) -> String {
+    let p = pass2_of(cli.qcomp, cli.cplxblur, cli.qblur_q8, cli.qpstep);
+    format!("qcomp={} cplxblur={} qblur={} qpstep={}", p.qcomp.0 as f64 / p.qcomp.1 as f64, p.cplxblur, f64::from(p.qblur_q8) / 256.0, p.qpstep)
+}

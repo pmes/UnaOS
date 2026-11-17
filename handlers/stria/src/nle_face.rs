@@ -193,13 +193,14 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
+    hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -275,6 +276,7 @@ impl Face {
     /// One playback tick: the playhead steps `rate` frames (back when negative); playback stops at the end going
     /// forward and at 0 going back. True when it moved or stopped.
     pub fn tick(&mut self) -> bool {
+        if self.hover_dwell_tick() && !self.playing { return true; } // STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
         if !self.playing {
             return false;
         }
@@ -305,7 +307,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
     use tokio::sync::broadcast::error::RecvError;
     for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
-    let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64));
+    let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
     loop {
         tokio::select! {
             m = rx.recv() => match m {
@@ -320,7 +322,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() => { // NLEFACEEXPORT (SR694): the clock also paints a running export's band
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
                 if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
@@ -2351,7 +2353,7 @@ impl Face {
     /// The hovered clip's reel ([`Face::hovered_clip`], STRIAINFOREELHOVER SR762), else the selected clip's: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
-        let c = self.hovered_clip().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
+        let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
         let s = self.sources.summary(c.src)?;
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         Some(format!("{name}: {s}"))
@@ -2781,7 +2783,52 @@ impl Face {
         if self.drag.is_some() {
             return None;
         }
-        Some(self.labels.is_some() && self.hovered_clip() != was)
+        Some(self.hover_moved(was) && self.labels.is_some()) // STRIAINFOREELHOVERDELAY (SR789): a move repaints only when a dwelt hover ends (file tail)
+    }
+}
+
+// ---- STRIAINFOREELHOVERDELAY (LEDGER SR789): a dwell of HOVER_DWELL face ticks before the hover line replaces the selected one (named tail block) ----
+// SR762 swapped the message line on the very move that entered a clip, so a pointer crossing the timeline flickered the line
+// through every clip it passed; every editor dwells first (Chromium's hover intent ~300 ms, macOS tooltips 500 ms). The dwell
+// counts on THE face clock (`serve`'s one interval, `Face::tick`): no timer, no Instant, no thread. `hover_ticks` keys the count
+// to its clip, so a change with no move (an edit, a select, a playback scroll) is seen at the next tick. `serve` runs the clock
+// while a dwell counts (`hover_pending`) and skips the ticks missed while it was idle. Owed: STRIA-INFO-REEL-HOVER-DWELL-MS
+// (the dwell in wall ms: today HOVER_DWELL frames of the timeline's rate), STRIA-PLAY-IDLE-BURST (pin play after idle under Skip).
+
+/// STRIAINFOREELHOVERDELAY (SR789): the face ticks a hover must stand before its line shows: one tick is one timeline
+/// frame (`serve`'s clock), so 8 is 320 ms at 25 fps, 333 ms at 24, 267 ms at 30.
+pub const HOVER_DWELL: u16 = 8;
+
+impl Face {
+    /// STRIAINFOREELHOVERDELAY (SR789): one face tick of the dwell: the same hovered clip counts on, another starts at 1,
+    /// none clears it. True only on the tick the count reaches [`HOVER_DWELL`], and only with labels on (the message paints).
+    fn hover_dwell_tick(&mut self) -> bool {
+        let next = match (self.hover_ticks, self.hovered_clip()) {
+            (Some((c, n)), Some(h)) if c == h => Some((c, n.saturating_add(1))),
+            (_, Some(h)) => Some((h, 1)),
+            (_, None) => None,
+        };
+        self.hover_ticks = next;
+        self.labels.is_some() && next.is_some_and(|(_, n)| n == HOVER_DWELL)
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): the hovered clip once it has stood [`HOVER_DWELL`] ticks (the line `reel_line` names).
+    pub fn hover_dwelt(&self) -> Option<(usize, usize)> {
+        let h = self.hovered_clip()?;
+        self.hover_ticks.filter(|&(c, n)| c == h && n >= HOVER_DWELL).map(|(c, _)| c)
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): a dwell is counting (labels on, a hovered clip not yet dwelt): `serve` runs its clock.
+    pub fn hover_pending(&self) -> bool {
+        self.labels.is_some() && self.hovered_clip().is_some() && self.hover_dwelt().is_none()
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): the pointer moved off `was`: when the hovered clip changed the count resets, and the
+    /// answer is whether `was` had dwelt (its line was showing); false when the hovered clip is unchanged.
+    fn hover_moved(&mut self, was: Option<(usize, usize)>) -> bool {
+        if self.hovered_clip() == was {
+            return false;
+        }
+        let dwelt = was.is_some() && self.hover_ticks.is_some_and(|(c, n)| Some(c) == was && n >= HOVER_DWELL);
+        self.hover_ticks = None;
+        dwelt
     }
 }
 
