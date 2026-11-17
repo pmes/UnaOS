@@ -3673,7 +3673,7 @@ fn striatrackaddremove_face_buttons_add_and_remove() {
     assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the empty A2 survives the save");
     face.state.select(0, 1).unwrap();
     assert!(face.verb("track-"));
-    assert_eq!(face.last_error.take().as_deref(), Some("track-: removed V (3 clips)"));
+    assert_eq!((face.last_error.take(), face.note.take().as_deref()), (None, Some("track-: removed V (3 clips)")));
     assert_eq!((face.state.timeline.tracks.len(), face.state.selection), (2, None));
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl0.insert_track(Kind::Audio).unwrap(), "one undo restores the track and its clips");
@@ -3681,7 +3681,36 @@ fn striatrackaddremove_face_buttons_add_and_remove() {
     assert!(face.verb("track-"));
     assert_eq!(face.last_error.take(), Some(format!("track-: {}", EditError::NoTrack)));
     assert!(face.verb("track- A2"));
-    assert_eq!(face.last_error.take().as_deref(), Some("track-: removed A2 (0 clips)"));
+    assert_eq!((face.last_error.take(), face.note.take().as_deref()), (None, Some("track-: removed A2 (0 clips)")));
     assert_eq!(face.state.timeline, tl0);
     println!("striatrackaddremove: A+ -> 3 tracks, saved with * UNA TRACKS 1 2; track- -> removed V (3 clips); undo; A2 removed");
+}
+
+// ---- STRIATRACKSMORE (LEDGER SR955): the `track-` success line is the face's note, not an error (named tail block) ----
+
+/// `track- A2` through `Face::on` names the removal in `note` (no `last_error`: the witness counts that as an error);
+/// `message_text` reads it, an error still wins over it, and the next taken input clears it. Undo then puts the A2
+/// selection back on its own track (SR955's track map).
+#[test]
+fn striatracksmore_track_remove_note_cleared_by_next_input() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |w: &str| bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: w.into() };
+    assert!(face.on(&input("track+ audio")));
+    assert!(face.on(&input("track- A2")));
+    let line = "track-: removed A2 (0 clips)";
+    assert_eq!((face.last_error.clone(), face.note.as_deref(), face.message_text().as_deref()), (None, Some(line), Some(line)));
+    face.last_error = Some("x: y".into());
+    assert_eq!(face.message_text().as_deref(), Some("x: y"), "an error wins over the note");
+    face.last_error = None;
+    assert!(face.on(&input("zoom+")));
+    assert_eq!(face.note, None, "the next taken input clears it");
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select(1, 0).unwrap();
+    let a = face.state.selected();
+    assert!(face.on(&input("track- V")));
+    assert_eq!((face.state.selection, face.note.as_deref()), (Some((0, 0)), Some("track-: removed V (3 clips)")));
+    assert!(face.on(&input("undo")));
+    assert_eq!((face.state.timeline.clone(), face.state.selection, face.state.selected(), face.note.clone()), (tl0.clone(), Some((1, 0)), a, None));
+    println!("striatracksmore: track- A2 -> note {line:?}, cleared by zoom+; track- V then undo -> the A1 selection back on track 1");
 }

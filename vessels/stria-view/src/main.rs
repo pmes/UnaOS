@@ -921,7 +921,7 @@ mod striatrackaddremove_tests {
         assert!(drive(&mut face, "track+:audio").is_empty());
         assert_eq!(face.state.timeline.tracks.len(), 3);
         assert!(face.dirty());
-        assert_eq!(drive(&mut face, "track-:A2"), vec!["track-: removed A2 (0 clips)".to_string()], "the message road");
+        assert_eq!((drive(&mut face, "track-:A2"), face.note.as_deref()), (Vec::<String>::new(), Some("track-: removed A2 (0 clips)")), "the note road");
         assert_eq!((face.state.timeline.tracks.len(), face.state.undo_depth()), (2, 2));
         assert_eq!(face.state.timeline, tl);
         assert_eq!(drive(&mut face, "track-:V9"), vec![format!("track- V9: {}", timeline_core::EditError::NoTrack)]);
