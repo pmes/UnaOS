@@ -635,7 +635,7 @@ pub fn scrollers_at<H: Host>(tree: &LayoutTree<H>, x: f32, y: f32, vs: (f32, f32
             let ko = if tree.paint_map.get(&k).and_then(|q| q.position_kind) == Some(3) {
                 (vs.0 + kl.location.x, vs.1 + kl.location.y)
             } else {
-                (shifted.0 + kl.location.x + cs.0, shifted.1 + kl.location.y + cs.1)
+                { let (hx, hy) = sticky_hold(tree, k, vs, tree.viewport); (shifted.0 + kl.location.x + cs.0 + hx, shifted.1 + kl.location.y + cs.1 + hy) } // AETHEROUTLINESTICKYHELD (SR1174): a sticky child sits at its painted place (its own hold; an ancestor's is already in `o`)
             };
             walk(tree, k, ko, p, vs, out);
         }
@@ -867,4 +867,16 @@ pub fn sticky_shift<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), v
     let (Some((hx, hy)), Some((fx, fy))) = (box_origin_held(tree, id, vs, viewport), box_origin(tree, id, vs)) else { return (0.0, 0.0) };
     let (ox, oy) = sticky_hold(tree, id, vs, viewport);
     (hx + ox - fx, hy + oy - fy)
+}
+
+// ---- AETHEROUTLINESTICKYHELD (LEDGER SR1174): the painted border-box origin for the readers that draw or hit-test at the screen place (named tail block) ----
+
+/// AETHEROUTLINESTICKYHELD (SR1174): where the painter draws `id`'s own border box in document space: [`box_origin`]
+/// moved by [`sticky_shift`] (every ancestor's sticky hold and `id`'s own, SR1167's one rule). The readers that draw or
+/// hit-test at the screen place (focusring's outline and ring, the shell's scrollbar press) read this; the flow readers
+/// keep [`box_origin`].
+pub fn box_origin_painted<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> Option<(f32, f32)> {
+    let (x, y) = box_origin(tree, id, vs)?;
+    let (dx, dy) = sticky_shift(tree, id, vs, viewport);
+    Some((x + dx, y + dy))
 }

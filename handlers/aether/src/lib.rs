@@ -436,7 +436,7 @@ impl AetherEngine {
         let vs = (self.scroll_x as i32 as f32, self.scroll_y as i32 as f32);
         let (px, py) = ((x + self.scroll_x) as f32, (y + self.scroll_y) as f32);
         for id in layout_core::scroll::scrollers_at(tree, px, py, vs) {
-            let Some((ox, oy)) = layout_core::scroll::box_origin(tree, id, vs) else { continue };
+            let Some((ox, oy)) = layout_core::scroll::box_origin_painted(tree, id, vs, (self.width as f32, self.height as f32)) else { continue }; // AETHEROUTLINESTICKYHELD (SR1174): the bar is hit where it is painted (sticky holds)
             let Some((axis, on_thumb, along)) = layout_core::scroll::hit_scrollbar(tree, id, px - ox, py - oy) else { continue };
             let (cur_x, cur_y) = layout_core::scroll::offset(tree, id);
             if on_thumb {

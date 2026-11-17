@@ -12678,3 +12678,196 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
 }
+
+// ---- AETHEROUTLINESTICKYHELD (LEDGER SR1174): the outline, the focus ring, the scrollbar press and the wheel chain at the painted place of a box inside a stuck sticky box (named tail block) ----
+
+#[cfg(test)]
+mod sticky_held_readers {
+    /// AETHEROUTLINESTICKYHELD (SR1174): 400x300, body margin 0: a 100px spacer; the blue sticky `top: 0` header `#hd`
+    /// (flow 100..300) holding a 20px spacer, the green link `#lk` (x 20..120, flow y 120), a 10px spacer, the green `#lo`
+    /// with `outline: 2px solid red` (flow y 150), a 10px spacer and the yellow 100px `overflow: auto` list `#ls` (x
+    /// 200..300, flow y 180, 400px content); then a 100px spacer, the green link `#fl` in normal flow (flow y 400) and
+    /// 2000px. Scrolled `sc` by the wheel with no pointer (the page takes it): at 300 the header holds at 0, so `#lk` is
+    /// painted at viewport 20, `#lo` at 50, `#ls` at 80 and `#fl` at 100.
+    fn page(sc: f64) -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="height:100px"></div><div id="hd" style="position:sticky;top:0;height:200px;background-color:rgb(0, 0, 255)"><div style="height:20px"></div><a id="lk" href="x" style="display:block;margin-left:20px;width:100px;height:20px;background-color:rgb(0, 255, 0)"></a><div style="height:10px"></div><a id="lo" href="y" style="display:block;margin-left:20px;width:100px;height:20px;outline:2px solid rgb(255, 0, 0);background-color:rgb(0, 255, 0)"></a><div style="height:10px"></div><div id="ls" style="margin-left:200px;width:100px;height:100px;overflow:auto;background-color:rgb(255, 255, 0)"><div style="height:400px"></div></div></div><div style="height:100px"></div><a id="fl" href="z" style="display:block;margin-left:20px;width:100px;height:20px;background-color:rgb(0, 255, 0)"></a><div style="height:2000px"></div></body></html>"#;
+        engine(html, sc)
+    }
+
+    fn engine(html: &str, sc: f64) -> crate::AetherEngine {
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        if sc > 0.0 {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, sc));
+            e.render_frame();
+            e.tick();
+        }
+        e
+    }
+
+    fn px(e: &crate::AetherEngine, x: usize, y: usize) -> (u8, u8, u8) {
+        let i = (y * e.width as usize + x) * 4;
+        let s = e.surface();
+        (s[i + 2], s[i + 1], s[i])
+    }
+
+    fn dom(e: &crate::AetherEngine, id: &str) -> crate::dom::NodeRef {
+        e.document
+            .as_ref()
+            .unwrap()
+            .descendants()
+            .find(|n| n.as_element().is_some_and(|el| el.attributes.borrow().get("id") == Some(id)))
+            .unwrap_or_else(|| panic!("#{id}"))
+    }
+
+    fn node(e: &crate::AetherEngine, id: &str) -> taffy::NodeId {
+        let t = e.layout_tree.as_ref().expect("laid out");
+        t.node_map
+            .iter()
+            .find_map(|(k, n)| n.as_element().filter(|el| el.attributes.borrow().get("id") == Some(id)).map(|_| *k))
+            .unwrap_or_else(|| panic!("#{id} has a box"))
+    }
+
+    /// The ring armed on `#id` (as a keyboard focus would arm it, without the focus's scroll-into-view), the frame
+    /// painted whole.
+    fn ring_on(e: &mut crate::AetherEngine, id: &str) {
+        crate::render::focusring::set_target(Some(dom(e, id)));
+        e.damage_rects.push((0, 0, e.width, e.height));
+        e.needs_repaint = true;
+        e.render_frame();
+    }
+
+    fn ring_off() {
+        crate::render::focusring::set_target(None);
+    }
+
+    /// The default ring (2px (16, 16, 16), flush with the border box) on the left edge of a box whose viewport border box
+    /// starts at (`x`, `y`) and is `h` tall: the pixel at (x - 1, y + h / 2).
+    fn ring_left(e: &crate::AetherEngine, x: usize, y: usize, h: usize) -> (u8, u8, u8) {
+        px(e, x - 1, y + h / 2)
+    }
+
+    const RING: (u8, u8, u8) = (16, 16, 16);
+    const RED: (u8, u8, u8) = (255, 0, 0);
+    const GREEN: (u8, u8, u8) = (0, 255, 0);
+    const YELLOW: (u8, u8, u8) = (255, 255, 0);
+
+    /// The vertical thumb of `#ls` pressed at its centre at `#ls`'s viewport origin (`ox`, `oy`), dragged 30px down and
+    /// released: `#ls`'s scroll offset y afterwards.
+    fn drag_thumb(e: &mut crate::AetherEngine, ox: f64, oy: f64) -> f32 {
+        let id = node(e, "ls");
+        let bar = layout_core::scroll::scrollbars(e.layout_tree.as_ref().unwrap(), id).v.expect("#ls shows a vertical bar");
+        let (x, y) = (ox + (bar.thumb.0 + bar.thumb.2 / 2.0) as f64, oy + (bar.thumb.1 + bar.thumb.3 / 2.0) as f64);
+        e.handle_event(crate::api::events::Event::MouseDown(x, y));
+        e.handle_event(crate::api::events::Event::MouseMove(x, y + 30.0));
+        e.handle_event(crate::api::events::Event::MouseUp(x, y + 30.0));
+        e.render_frame();
+        layout_core::scroll::offset(e.layout_tree.as_ref().unwrap(), id).1
+    }
+
+    /// Scrolled 300: the stuck header paints `#lk` at viewport 20 and the default ring is drawn around it there (armed: the
+    /// ring was placed by focusring's own location sum at the flow place, viewport -180, off screen).
+    #[test]
+    fn sticky_held_readers_ua_ring_on_stuck_link() {
+        let mut e = page(300.0);
+        assert_eq!(e.scroll_y, 300.0, "the page scrolled 300px");
+        assert_eq!((0..300).find(|&y| px(&e, 50, y) == GREEN), Some(20), "#lk painted at the held header's 20px row");
+        ring_on(&mut e, "lk");
+        let got = ring_left(&e, 20, 20, 20);
+        ring_off();
+        assert_eq!(got, RING, "armed: the ring is drawn on the stuck link's painted left edge");
+    }
+
+    /// Scrolled 300: `#lo`'s author outline (2px solid red) rings its painted rect at viewport 50 (armed: paint_outlines
+    /// read the unheld `box_origin`, viewport -150).
+    #[test]
+    fn sticky_held_readers_author_outline_on_stuck_link() {
+        let e = page(300.0);
+        assert_eq!(px(&e, 50, 60), GREEN, "#lo painted at viewport 50..70");
+        assert_eq!(px(&e, 19, 60), RED, "armed: the outline's left band at the painted place");
+        assert_eq!(px(&e, 50, 49), RED, "armed: the outline's top band at the painted place");
+    }
+
+    /// Scrolled 300: a press on `#ls`'s thumb where it is painted (viewport 200, 80) starts a drag that scrolls the list
+    /// (armed: scrollers_at placed no sticky hold, so the press found no scroller and the list stayed at 0).
+    #[test]
+    fn sticky_held_readers_scrollbar_press_stuck_list() {
+        let mut e = page(300.0);
+        assert_eq!(px(&e, 205, 85), YELLOW, "#ls painted at viewport 80");
+        let off = drag_thumb(&mut e, 200.0, 80.0);
+        assert!(off > 0.0, "armed: the thumb drag scrolled the stuck list ({off})");
+        assert_eq!(e.scroll_y, 300.0, "the page did not move");
+    }
+
+    /// Scrolled 300: a wheel over the stuck list scrolls the list, not the page (armed: scrollers_at's chain at the
+    /// painted point held no scroller and the page took the wheel).
+    #[test]
+    fn sticky_held_readers_wheel_stuck_list() {
+        let mut e = page(300.0);
+        e.handle_event(crate::api::events::Event::MouseMove(250.0, 130.0));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 300.0, "armed: the page did not take the wheel");
+        assert_eq!(layout_core::scroll::offset(e.layout_tree.as_ref().unwrap(), node(&e, "ls")).1, 40.0, "the list took it");
+    }
+
+    /// PIN at scroll 0 (flow == painted): the ring on `#lk` (viewport 120), `#lo`'s outline (150) and the thumb drag on
+    /// `#ls` (180) as before SR1174.
+    #[test]
+    fn sticky_held_readers_pins_at_scroll_zero() {
+        let mut e = page(0.0);
+        assert_eq!(px(&e, 19, 160), RED, "#lo's outline at its flow place");
+        ring_on(&mut e, "lk");
+        let got = ring_left(&e, 20, 120, 20);
+        ring_off();
+        assert_eq!(got, RING, "the ring at #lk's flow place");
+        let mut e = page(0.0);
+        assert!(drag_thumb(&mut e, 200.0, 180.0) > 0.0, "the thumb drag at the flow place");
+    }
+
+    /// PIN: scrolled 300, the link in normal flow (`#fl`, flow 400) is ringed at viewport 100.
+    #[test]
+    fn sticky_held_readers_flow_link_pin() {
+        let mut e = page(300.0);
+        assert_eq!(px(&e, 50, 110), GREEN, "#fl painted at viewport 100");
+        ring_on(&mut e, "fl");
+        let got = ring_left(&e, 20, 100, 20);
+        ring_off();
+        assert_eq!(got, RING, "the ring at #fl's place");
+    }
+
+    /// CORRECTION (the UA ring now reads the painter's origin, not focusring's location sum): a link 50px into a 100px
+    /// `overflow: auto` panel at the page top, the panel wheeled 30: the link is painted at viewport 20 and ringed there
+    /// (the location sum ignored the panel's offset and drew the ring at 50).
+    #[test]
+    fn sticky_held_readers_ring_in_scrolled_panel() {
+        let html = r#"<!doctype html><html><body style="margin:0"><div id="p" style="height:100px;overflow:auto"><div style="height:50px"></div><a id="pl" href="x" style="display:block;margin-left:20px;width:100px;height:20px;background-color:rgb(0, 255, 0)"></a><div style="height:400px"></div></div><div style="height:2000px"></div></body></html>"#;
+        let mut e = engine(html, 0.0);
+        e.handle_event(crate::api::events::Event::MouseMove(50.0, 50.0));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 30.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel");
+        assert_eq!((0..100).find(|&y| px(&e, 50, y) == GREEN), Some(20), "#pl painted at viewport 20");
+        ring_on(&mut e, "pl");
+        let (now, old) = (ring_left(&e, 20, 20, 20), ring_left(&e, 20, 50, 20));
+        ring_off();
+        assert_eq!(now, RING, "the ring at the painted place");
+        assert_ne!(old, RING, "no ring at the location sum's place");
+    }
+
+    /// CORRECTION: a link inside a `position: fixed; top: 10px` bar, the page scrolled 300: the link is painted at viewport
+    /// 10 and ringed there (the location sum ignored the fixed pin and drew the ring 300px up, off screen).
+    #[test]
+    fn sticky_held_readers_ring_under_fixed_ancestor() {
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="position:fixed;top:10px;left:0;width:200px;height:40px"><a id="xl" href="x" style="display:block;margin-left:20px;width:100px;height:20px;background-color:rgb(0, 255, 0)"></a></div><div style="height:3000px"></div></body></html>"#;
+        let mut e = engine(html, 300.0);
+        assert_eq!(e.scroll_y, 300.0, "the page scrolled 300px");
+        assert_eq!((0..100).find(|&y| px(&e, 50, y) == GREEN), Some(10), "#xl painted at viewport 10");
+        ring_on(&mut e, "xl");
+        let got = ring_left(&e, 20, 10, 20);
+        ring_off();
+        assert_eq!(got, RING, "the ring at the fixed link's painted place");
+    }
+}

@@ -167,24 +167,6 @@ pub fn ring_suppressed(layout: &LayoutTree, n: &NodeRef) -> bool {
     }
 }
 
-/// `n`'s border box in document coordinates.
-fn box_of(layout: &LayoutTree, n: &NodeRef) -> Option<(f32, f32, f32, f32)> {
-    fn walk(id: taffy::prelude::NodeId, cx: f32, cy: f32, layout: &LayoutTree, want: &NodeRef) -> Option<(f32, f32, f32, f32)> {
-        let l = layout.taffy.layout(id).ok()?;
-        let (x, y) = (cx + l.location.x, cy + l.location.y);
-        if layout.node_map.get(&id) == Some(want) {
-            return Some((x, y, l.size.width, l.size.height));
-        }
-        for c in layout.taffy.children(id).ok()? {
-            if let Some(r) = walk(c, x, y, layout, want) {
-                return Some(r);
-            }
-        }
-        None
-    }
-    walk(layout.root_node, 0.0, 0.0, layout, n)
-}
-
 /// Fills the frame between `inner` and `outer` (viewport rects `(x, y, w, h)`), inside the damage. `keep` picks
 /// the pixels of a patterned band by their position along the edge (dashes, dots); `alpha` blends.
 #[allow(clippy::too_many_arguments)]
@@ -261,7 +243,7 @@ fn paint_outlines(layout: &LayoutTree, surface: &mut [u8], width: u32, height: u
         if unpainted(layout, id) {
             continue;
         }
-        let Some((x, y)) = layout_core::scroll::box_origin(layout, id, (sx as f32, sy as f32)) else { continue };
+        let Some((x, y)) = layout_core::scroll::box_origin_painted(layout, id, (sx as f32, sy as f32), (width as f32, height as f32)) else { continue }; // AETHEROUTLINESTICKYHELD (SR1174): the outline rings the painted box (sticky holds)
         let Ok(l) = layout.taffy.layout(id) else { continue };
         let bb = (x - sx as f32, y - sy as f32, l.size.width, l.size.height);
         let (rgb, mut alpha) = match o.color {
@@ -309,7 +291,7 @@ pub(super) fn paint(layout: &LayoutTree, surface: &mut [u8], width: u32, height:
     if super::focus_of(&n).is_some() || ring_suppressed(layout, &n) {
         return;
     }
-    let Some((x, y, w, h)) = box_of(layout, &n) else { return };
+    let Some((x, y, w, h)) = id_of(layout, &n).and_then(|id| Some((layout_core::scroll::box_origin_painted(layout, id, (sx as f32, sy as f32), (width as f32, height as f32))?, layout.taffy.layout(id).ok()?.size))).map(|((x, y), s)| (x, y, s.width, s.height)) else { return }; // AETHEROUTLINESTICKYHELD (SR1174): the ring at the painted border box (scroller offsets, the fixed pin, sticky holds)
     let t = theme();
     let bb = (x - sx as f32, y - sy as f32, w, h);
     let ring = |inset: f32, thick: f32| {
