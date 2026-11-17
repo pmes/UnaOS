@@ -373,3 +373,42 @@ fn striaundothree_redo_history() {
     assert_eq!(st.verb("mark out"), Some(Ok(())));
     assert!(st.redo_history(HISTORY_N).is_empty(), "a commit drops the redo words");
 }
+
+// ---- STRIAHISTORYRIPPLE (LEDGER SR9072): a set edit's undo entry names its clip count (named tail block) ----
+
+/// A set word over a set of more than one clip names its entry `<word> (<n> clips)` (`nudge+`, `lift`); a word that acts
+/// on the primary only (`split`) and a set of one (`delete`) keep the bare word; undo / redo carry the counted names.
+#[test]
+fn striahistoryripple_set_words_carry_count() {
+    use timeline_core::editor::{EditorState, HISTORY_N, SET_WORDS};
+    let (mut tl, a, _) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 40, 50, 30));
+    tl.validate().unwrap();
+
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    st.select_add(0, 2).unwrap();
+    assert_eq!(st.counted_word("nudge+"), "nudge+ (2 clips)");
+    assert_eq!(st.counted_word("split"), "split");
+    assert!(SET_WORDS.contains(&"drag move"));
+    assert_eq!(st.verb("nudge+"), Some(Ok(())));
+    assert_eq!(st.set.len(), 2, "the set follows its clips");
+    st.seek(15);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    assert_eq!(st.history_line(HISTORY_N), "history: 2 split | 1 nudge+ (2 clips)");
+    assert!(st.undo());
+    assert!(st.undo());
+    assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("nudge+ (2 clips)")), (2, Some("split"))]);
+    assert!(st.redo());
+    assert!(st.redo());
+    assert_eq!(st.history_line(HISTORY_N), "history: 2 split | 1 nudge+ (2 clips)");
+
+    let mut st = EditorState::new(tl);
+    st.select(0, 1).unwrap();
+    st.select_add(0, 2).unwrap();
+    assert_eq!(st.verb("lift"), Some(Ok(())));
+    st.select(0, 0).unwrap();
+    assert_eq!(st.counted_word("delete"), "delete");
+    assert_eq!(st.verb("delete"), Some(Ok(())));
+    assert_eq!(st.history_line(HISTORY_N), "history: 2 delete | 1 lift (2 clips)");
+}
