@@ -9810,3 +9810,82 @@ fn striasourceinfokey_wall_deadline_ends_it() {
     assert_eq!(face.info_text(), None);
     println!("striasourceinfokey: standing at +4 s, ended at +{} s after 2 of {} ticks", stria::nle_face::INFO_SECS, stria::nle_face::INFO_SECS * 25);
 }
+
+// ---- STRIASEQREPORT (LEDGER SR943): a sequence reel's open line and its own rate (named tail block) ----
+// `Sources::open_report` answers `open=seq` for a sequence reel (so tools/nle `schedule` prints its `reel=` line with the
+// summary), and `--src REEL=<dir>/frame_%04d.png@<R>` reads the sequence at R frames a second by exact integer arithmetic on the
+// timeline's tick (a file held for several ticks, or files skipped); no `@` stays one file per tick.
+
+#[test]
+fn striaseqreport_open_report_names_the_sequence() {
+    let pat = striaimportimagesequence_dir("seqreport-open", 16, 8, &[(7, [1, 2, 3]), (8, [4, 5, 6]), (9, [7, 8, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let r = src.open_report(s).expect("a sequence reel reports");
+    assert_eq!(r.to_string(), "open=seq");
+    assert_eq!((r.seq, r.colour), (true, None));
+    assert!(src.open_report(SourceId(7)).is_none(), "an unknown id says nothing");
+    println!("striaseqreport: reel=SEQ {r} summary=\"{}\"", src.summary(s).unwrap());
+}
+
+#[test]
+fn striaseqreport_rate_holds_each_file() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqreport-hold", 4, 4, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s) = striaimportimagesequence_tl(7);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &format!("{pat}@12")).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(7), "3 files at 12/s on a 25/s timeline: ceil(75/12)");
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=9 4x4 @12"));
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..7, &src, &mut sink).unwrap();
+    assert_eq!(sink.0.len(), 7);
+    for (t, file) in [0usize, 0, 0, 1, 1, 2, 2].into_iter().enumerate() {
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, cols[file]), "tick {t}: file {}", 7 + file);
+    }
+    let (long, s2) = striaimportimagesequence_tl(8);
+    let mut past = Sources::new(&long);
+    past.add_sequence(s2, &format!("{pat}@12")).unwrap();
+    assert!(render(&long, 7..8, &past, &mut StriaTitleFrames::default()).is_err(), "tick 7 is file 10: past the last");
+    println!("striaseqreport: frame_0007..0009.png@12 -> 7 ticks at 25/s, files 7,7,7,8,8,9,9");
+}
+
+#[test]
+fn striaseqreport_rate_skips_at_a_slower_timeline() {
+    let cols: Vec<[u8; 3]> = (0..6u8).map(|i| [i * 40, 10, 10]).collect();
+    let frames: Vec<(u64, [u8; 3])> = cols.iter().enumerate().map(|(i, c)| (i as u64, *c)).collect();
+    let pat = striaimportimagesequence_dir("seqreport-skip", 4, 4, &frames);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &format!("{pat}@50")).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(3), "6 files at 50/s on a 25/s timeline");
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..3, &src, &mut sink).unwrap();
+    for (t, file) in [0usize, 2, 4].into_iter().enumerate() {
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, cols[file]), "tick {t}: file {file}");
+    }
+}
+
+#[test]
+fn striaseqreport_rate_refused_by_name() {
+    let pat = striaimportimagesequence_dir("seqreport-refuse", 4, 4, &[(1, [9, 9, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    for r in ["0", "", "x", "-3", "12.5", "+3"] {
+        let p = format!("{pat}@{r}");
+        let e = src.add_sequence(s, &p).unwrap_err().to_string();
+        assert!(e.contains(&format!("image sequence {p}: rate \"{r}\"")), "{e}");
+    }
+    assert!(src.add_sequence(s, &pat).is_ok(), "the plain pattern still opens");
+}
+
+#[test]
+fn striaseqreport_default_is_one_file_per_tick() {
+    let pat = striaimportimagesequence_dir("seqreport-default", 16, 8, &[(7, [1, 2, 3]), (8, [4, 5, 6]), (9, [7, 8, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(3));
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=9 16x8"));
+}

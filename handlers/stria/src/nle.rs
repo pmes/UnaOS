@@ -219,12 +219,12 @@ impl Sources {
     }
     /// DEMUXWIRE (SR213): how source `id` opened — its video stream's (else its audio stream's) survey facts.
     pub fn open_report(&self, id: SourceId) -> Option<OpenReport> {
-        let m = self.get(id).ok()?;
+        if let Some(q) = self.seq(id) { return Some(q.report()); } let m = self.get(id).ok()?; // STRIASEQREPORT (SR943): a sequence reel reports `open=seq` (file tail)
         let i = m.video.or(m.audio)?;
         let s = m.demux.survey().streams.into_iter().nth(i)?;
         let applied = self.applied.iter().find(|a| a.0 == id).map(|a| a.1);
         let stand_in = self.stand_in.lock().map(|v| v.contains(&id)).unwrap_or(false);
-        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour, stand_in })
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour, stand_in, seq: false }) // STRIASEQREPORT (SR943): a demuxed reel
     }
 }
 
@@ -243,12 +243,12 @@ pub struct OpenReport {
     /// NLEPROBEHDRWIRE (SR305): the reel's colour (container, else the bitstream's through `fill_colour(colour_of)`).
     pub colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
     /// SWAPBACK (SR329): a render drew stand-in frames for this reel (its decoder refused a span mid-reel); NLE-STANDIN-OPEN (SR353): or no decoder fits it (set at open).
-    pub stand_in: bool,
+    pub stand_in: bool, pub seq: bool, // STRIASEQREPORT (SR943): a PNG sequence reel (SR888): Display writes `open=seq` alone
 }
 
 impl std::fmt::Display for OpenReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let open = if self.indexed { "indexed" } else { "full" };
+        if self.seq { return write!(f, "open=seq"); } let open = if self.indexed { "indexed" } else { "full" }; // STRIASEQREPORT (SR943): no dts / edits / applied tokens for a file sequence
         write!(f, "open={open} dts=")?;
         match self.decode_time {
             DecodeTime::Stored => write!(f, "stored")?,
@@ -1315,7 +1315,7 @@ struct Seq {
     first: u64,
     last: u64,
     w: u32,
-    h: u32, held: SeqHeld, // STRIASEQINFO (SR940): the last decoded frame (file tail)
+    h: u32, held: SeqHeld, rate: SeqRate, // STRIASEQREPORT (SR943): its own frames a second (file tail); STRIASEQINFO (SR940): the last decoded frame (file tail)
 }
 
 impl Seq {
@@ -1325,7 +1325,7 @@ impl Seq {
     }
     /// STRIAIMPORTIMAGESEQUENCE: the reel's length in ticks, one per file number `first..=last`.
     fn len(&self) -> i64 {
-        (self.last - self.first + 1) as i64
+        self.ticks(self.last - self.first + 1) // STRIASEQREPORT (SR943): at its own rate when set (file tail)
     }
 }
 
@@ -1356,7 +1356,7 @@ impl Sources {
     pub fn add_sequence(&mut self, id: SourceId, pattern: &str) -> Result<(), RenderError> {
         use std::io::Read;
         let refuse = |why: String| RenderError::Demux(format!("image sequence {pattern}: {why}"));
-        let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?;
+        let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?; let (suffix, rate) = seq_rate(suffix).map_err(refuse)?; // STRIASEQREPORT (SR943): a trailing `@<rate>` (file tail)
         if !suffix.to_ascii_lowercase().ends_with(".png") {
             return Err(refuse(String::from("only .png frames (the PNG decoder)")));
         }
@@ -1380,7 +1380,7 @@ impl Sources {
         if first == u64::MAX {
             return Err(refuse(String::from("no file matches")));
         }
-        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default() }; // STRIASEQINFO (SR940): nothing kept yet
+        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default(), rate: rate.map(|r| (r, self.tb.num.max(1), self.tb.den.max(1))) }; // STRIASEQINFO (SR940): nothing kept yet; STRIASEQREPORT (SR943): the rate against the timeline's tick
         let p = seq.path(first);
         let mut head = Vec::new();
         std::fs::File::open(&p).and_then(|f| f.take(4096).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?;
@@ -1418,7 +1418,7 @@ fn seq_size(sources: &Sources, src: SourceId, kind: Kind, r: &mut RenderReport) 
 fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64) -> Result<Option<Frame>, RenderError> {
     let Some(q) = sources.seq(src) else { return Ok(None) };
     *run = None;
-    let n = u64::try_from(src_t).ok().and_then(|k| q.first.checked_add(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?;
+    let n = u64::try_from(src_t).ok().and_then(|k| q.file_at(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?; // STRIASEQREPORT (SR943): tick to file at the reel's rate (file tail)
     if let Some(f) = q.held_frame(n, tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); // STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
     let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
@@ -1437,7 +1437,7 @@ type SeqHeld = std::sync::Mutex<Option<(u64, u32, u32, Arc<Vec<u8>>)>>;
 impl Seq {
     /// STRIASEQINFO: the reel's person's line for [`Sources::summary`]: `seq <first>..=<last> <w>x<h>`.
     fn summary(&self) -> String {
-        format!("seq {}..={} {}x{}", self.first, self.last, self.w, self.h)
+        format!("seq {}..={} {}x{}{}", self.first, self.last, self.w, self.h, self.rate.map(|r| format!(" @{}", r.0)).unwrap_or_default()) // STRIASEQREPORT (SR943): ` @<rate>` only when set
     }
     /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
     fn held_frame(&self, n: u64, pts_ns: i64) -> Option<Frame> {
@@ -1559,5 +1559,43 @@ impl Sources {
     /// media. The bin (`nle_face`) reads it to lay a reel that sits on no track yet on a track of a kind it can feed.
     pub fn holds(&self, id: SourceId, kind: Kind) -> bool {
         self.get(id).is_ok_and(|m| m.stream(kind).is_some())
+    }
+}
+
+// ---- STRIASEQREPORT (LEDGER SR943): a sequence reel's open line and its own rate (named tail block) ----
+/// STRIASEQREPORT (LEDGER SR943): a sequence reel's own rate `(frames a second R, tick num, tick den)` (the timeline's tick is
+/// `num / den` seconds, taken from `Sources.tb` at the add); `None` = one file per timeline tick (the default). Set once at the
+/// add, immutable: no lock.
+type SeqRate = Option<(u64, u64, u64)>;
+
+/// STRIASEQREPORT: split a trailing `@<rate>` off a sequence pattern's suffix (the part after its `%d` / `%0Nd`, so a `@` in a
+/// directory name is untouched): `(suffix, Some(rate))`, `(suffix, None)` with no `@`. A rate that is not a whole number of
+/// frames a second above 0 (`@0`, `@`, `@x`, `@-3`, `@12.5`) is refused by name.
+fn seq_rate(suffix: &str) -> Result<(&str, Option<u64>), String> {
+    let Some((head, r)) = suffix.rsplit_once('@') else { return Ok((suffix, None)) };
+    match r.parse::<u64>() {
+        Ok(n) if n > 0 && r.bytes().all(|b| b.is_ascii_digit()) => Ok((head, Some(n))),
+        _ => Err(format!("rate \"{r}\" is not a whole number of frames a second above 0")),
+    }
+}
+
+impl Seq {
+    /// STRIASEQREPORT: the reel's [`OpenReport`] for [`Sources::open_report`]: `seq` set, so it prints `open=seq` alone (no
+    /// demuxer: no index, no decode-time derivation, no edit list, no colour, no stand-in).
+    fn report(&self) -> OpenReport {
+        OpenReport { indexed: false, decode_time: DecodeTime::Presentation, edits: 0, applied: None, colour: None, stand_in: false, seq: true }
+    }
+    /// STRIASEQREPORT: the ticks `count` files last: `count` at one file per tick, else ceil(count * den / (R * num)), exact.
+    fn ticks(&self, count: u64) -> i64 {
+        let Some((r, num, den)) = self.rate else { return count as i64 };
+        let per = r as i128 * num as i128;
+        ((count as i128 * den as i128 + per - 1) / per) as i64
+    }
+    /// STRIASEQREPORT: the file number shown at source tick `k`: `first + k` at one file per tick, else
+    /// `first + floor(k * R * num / den)`, exact (`None` on overflow).
+    fn file_at(&self, k: u64) -> Option<u64> {
+        let Some((r, num, den)) = self.rate else { return self.first.checked_add(k) };
+        let off = k as u128 * r as u128 * num as u128 / den as u128;
+        self.first.checked_add(u64::try_from(off).ok()?)
     }
 }
