@@ -2263,7 +2263,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
         let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
         d
     };
-    *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
+    *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); SCRUB_SOUGHT.store(i64::MIN, Ordering::Release); // STRIAKSCRUB (SR9060): a press starts a fresh scrub (file tail); NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
     serial_println!("[nle] drag press {} at={} track={} clip={}", drag_word(d.kind), d.origin_tick, d.track, d.idx);
     true
 }
@@ -2664,4 +2664,62 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKSCRUB (LEDGER SR9060): a ruler scrub seeks per step, one in flight (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SCRUB-KERNEL. The host face shows the picture under the pointer on every scrub step; the Player
+// showed only the release tick's. [`edit_scrub_step`] names the step the pass may seek: the live Scrub drag's tick
+// (timeline_core's ONE `Drag::scrub_tick`, the host `hover`'s), when it differs from the last tick sought this drag and no
+// step is in flight (the restarted job has neither presented a frame nor ended): each restart re-opens the reels and decodes
+// the schedule up to the tick, so the latest tick wins and a fast drag restarts the job at most once per shown frame. The
+// press resets the record ([`edit_press`]), so the pressed tick shows first. The pass's seek door (player.rs `edit_pass`)
+// is the one road: its call is owed NLE-SCRUB-KERNEL-PASS (player.rs is not this arc's), so nothing calls these yet. Steps
+// run while playing too. Sound: what the seek door's restarted job plays (owed NLE-SCRUB-KERNEL-SOUND). Wire: `[nle] drag
+// scrub step at=<tick> ms=<ms>`.
+
+/// The tick the last scrub step sought this drag (`i64::MIN`: none yet).
+static SCRUB_SOUGHT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// A ruler scrub drag is live (the pass asks before it reads the Player's state; a held lock answers no for one pass).
+pub fn edit_scrubbing() -> bool {
+    DRAG.try_lock().is_some_and(|g| g.as_ref().is_some_and(|(_, d)| d.kind == timeline_core::view::DragKind::Scrub))
+}
+
+/// **The scrub step the pass may seek** on the EDL at `path`: `Some(ms)` of the live Scrub drag's tick when it is not the
+/// last one sought and no step is in flight (the tick recorded); `None` otherwise (no scrub, the same tick, in flight, a
+/// lock held: the next pass asks again).
+pub fn edit_scrub_step(path: &str) -> Option<u64> {
+    let t = {
+        let g = DRAG.try_lock()?;
+        g.as_ref()?.1.scrub_tick()?
+    };
+    if SCRUB_SOUGHT.load(Ordering::Acquire) == t || scrub_in_flight() {
+        return None;
+    }
+    let tb = {
+        let g = EDIT.try_lock()?;
+        g.as_ref().filter(|e| e.path == path)?.st.timeline.tb
+    };
+    SCRUB_SOUGHT.store(t, Ordering::Release);
+    let ms = (tb.to_ns(t).max(0) as u64) / 1_000_000;
+    serial_println!("[nle] drag scrub step at={} ms={}", t, ms);
+    Some(ms)
+}
+
+/// A scrub step was sought this drag and its restarted job has neither presented a frame nor ended (a held lock: in flight).
+fn scrub_in_flight() -> bool {
+    if SCRUB_SOUGHT.load(Ordering::Acquire) == i64::MIN {
+        return false;
+    }
+    let presented = match PLAY.try_lock() {
+        Some(p) => p.presented,
+        None => return true,
+    };
+    if presented > 0 {
+        return false;
+    }
+    match JOB.try_lock() {
+        Some(g) => g.as_ref().is_some_and(|j| !j.eos && j.err.is_none()),
+        None => true,
+    }
 }

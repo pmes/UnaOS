@@ -33,6 +33,7 @@
 //! * STRIAAUDIOSCRUB (LEDGER SR865): a ruler scrub step (with a device, not playing) is ONE `play_tick` of that tick: its still, the meters, one frame of sound.
 //! * STRIAAUDIOSCRUBMORE (LEDGER SR947): a clip / track click sounds its frame too; a scrub burst waits until the last snippet is mostly played; the meter strip shows the last sounded scrub step.
 //! * STRIAAUDIOSCRUBNEXT (LEDGER SR988): a scrub step the gate refused sounds on a later face clock tick.
+//! * STRIAKSCRUB (LEDGER SR9060): the scrub step's tick is `Drag::scrub_tick` (timeline_core), the kernel Player's per-step seek reads the same fn.
 
 use std::time::Duration;
 
@@ -462,8 +463,7 @@ impl Face {
             DragKind::Marquee => d.at != before.2,
             _ => (d.delta, d.to_track, d.guide) != (before.0, before.1, before.3),
         };
-        if d.kind == DragKind::Scrub {
-            let t = d.origin_tick + d.delta;
+        if let Some(t) = d.scrub_tick() { // STRIAKSCRUB (SR9060): the scrub step's tick is timeline_core's `Drag::scrub_tick`, the one the kernel Player reads
             let p = self.state.playhead; self.state.seek(t); self.scrub_burst(p); // STRIAAUDIOSCRUB (SR865): each tick-changing scrub step plays its frame (file tail)
         }
         changed
