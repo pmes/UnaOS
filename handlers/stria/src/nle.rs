@@ -1049,7 +1049,7 @@ fn title_size(tl: &Timeline, sources: &Sources, steps: &[timeline_core::schedule
         return;
     }
     let reel = tl.sources.iter().filter(|s| s.title.is_none()).find_map(|s| {
-        let m = sources.get(s.id).ok()?;
+        if let Some(q) = sources.seq(s.id) { return Some((q.w, q.h)); } let m = sources.get(s.id).ok()?; // STRIASEQMORE (SR978): a sequence reel sizes a title-only range by its first file (file tail)
         let t = &m.demux.tracks()[m.video?];
         (t.width > 0 && t.height > 0).then_some((t.width, t.height))
     });
@@ -1326,7 +1326,7 @@ pub fn peak_over(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: 
 
 // ---- STRIAIMPORTIMAGESEQUENCE (LEDGER SR888): a PNG sequence as a video reel (named tail block) ----
 /// STRIAIMPORTIMAGESEQUENCE (LEDGER SR888): a reel whose `--src` path is a printf pattern (`<dir>/frame_%04d.png`: one `%d`
-/// or `%0Nd`, a `.png` suffix) is a sequence of PNG files, one per timeline tick: source tick k is file number `first + k`
+/// or `%0Nd`, an image suffix) is a sequence of image files, one per timeline tick: source tick k is file number `first + k`
 /// (the timeline's rate). [`Sources::add_sequence`] reads the directory's names once and the first file's header
 /// (pixel_core's ONE header reader `facts_of`) for the reel size; the render reads and decodes ONE file per tick through
 /// pixel_core's `decode_png`, never the whole sequence. A number between the first and the last with no file is refused,
@@ -1355,7 +1355,7 @@ impl Seq {
 
 /// STRIAIMPORTIMAGESEQUENCE: `path` as an image-sequence pattern: `(prefix, width, suffix)` around its one `%d` / `%0Nd`
 /// (width 0 for `%d`), no other `%` after it; `None` when it is no such pattern (a plain media path). The suffix's
-/// format is [`Sources::add_sequence`]'s rule (PNG only), so a `.jpg` pattern is refused by name there, not read as a file.
+/// format is [`Sources::add_sequence`]'s rule (STRIASEQMORE `seq_format`), so a `.tif` pattern is refused by name there, not read as a file.
 pub fn seq_pattern(path: &str) -> Option<(&str, usize, &str)> {
     let i = path.find('%')?;
     let rest = &path[i + 1..];
@@ -1373,7 +1373,7 @@ pub fn seq_pattern(path: &str) -> Option<(&str, usize, &str)> {
 }
 
 impl Sources {
-    /// STRIAIMPORTIMAGESEQUENCE: open the PNG sequence `pattern` ([`seq_pattern`]) as source `id` (whatever `id` held is
+    /// STRIAIMPORTIMAGESEQUENCE: open the image sequence `pattern` ([`seq_pattern`]) as source `id` (whatever `id` held is
     /// forgotten). Refused by name (`RenderError::Demux`, `image sequence <pattern>: <why>`): no `%d` / `%0Nd`, a suffix other
     /// than `.png`, an unreadable directory, no file matching, a first file with no PNG header. Logs
     /// `[STRIA] :: nle seq reel=<id> frames=<first>..=<last> <w>x<h>`.
@@ -1381,8 +1381,8 @@ impl Sources {
         use std::io::Read;
         let refuse = |why: String| RenderError::Demux(format!("image sequence {pattern}: {why}"));
         let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?; let (suffix, rate) = seq_rate(suffix).map_err(refuse)?; // STRIASEQREPORT (SR943): a trailing `@<rate>` (file tail)
-        if !suffix.to_ascii_lowercase().ends_with(".png") {
-            return Err(refuse(String::from("only .png frames (the PNG decoder)")));
+        if seq_format(suffix).is_none() { // STRIASEQMORE (SR978): the suffix names one of pixel_core's formats (file tail)
+            return Err(refuse(String::from("only .png, .jpg, .jpeg, .gif, .bmp, .qoi or .webp frames (pixel_core's decoders)")));
         }
         let (dir, stem) = match prefix.rfind('/') {
             Some(k) => (&prefix[..=k], &prefix[k + 1..]),
@@ -1404,12 +1404,12 @@ impl Sources {
         if first == u64::MAX {
             return Err(refuse(String::from("no file matches")));
         }
-        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default(), rate: rate.map(|r| (r, self.tb.num.max(1), self.tb.den.max(1))) }; // STRIASEQINFO (SR940): nothing kept yet; STRIASEQREPORT (SR943): the rate against the timeline's tick
+        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default(), rate: seq_rate_tick(rate, self.tb).map_err(refuse)? }; // STRIASEQINFO (SR940): nothing kept yet; STRIASEQREPORT (SR943): the rate against the timeline's tick; STRIASEQMORE (SR978): a fractional rate folds into it (file tail)
         let p = seq.path(first);
         let mut head = Vec::new();
-        std::fs::File::open(&p).and_then(|f| f.take(4096).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?;
-        let png = matches!(gneiss_pal::dsp::image::sniff(&head), Some(gneiss_pal::dsp::image::Format::Png));
-        let f = gneiss_pal::dsp::image::facts_of(&head).filter(|f| png && f.width > 0 && f.height > 0).ok_or_else(|| refuse(format!("{p}: not a PNG header")))?;
+        std::fs::File::open(&p).and_then(|f| f.take(SEQ_HEAD).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?; // STRIASEQMORE (SR978): a head long enough for a JPEG's APP segments (file tail)
+        let png = seq_format(suffix).is_some_and(|q| gneiss_pal::dsp::image::sniff(&head) == Some(q.0)); // STRIASEQMORE (SR978): the head is the suffix's format (file tail)
+        let f = gneiss_pal::dsp::image::facts_of(&head).filter(|f| png && f.width > 0 && f.height > 0).ok_or_else(|| refuse(format!("{p}: not a {} header", seq_format(suffix).map_or("PNG", |q| q.1))))?; // STRIASEQMORE (SR978): named by the suffix's format
         log::info!("[STRIA] :: nle seq reel={} frames={}..={} {}x{}", id.0, first, last, f.width, f.height);
         self.media.retain(|(s, _)| *s != id);
         self.seqs.retain(|q| q.0 != id);
@@ -1448,7 +1448,7 @@ fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: Sourc
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
-    let img = gneiss_pal::dsp::image::decode_png(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?;
+    let img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; // STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
     Ok(Some(q.keep(n, img.width, img.height, img.rgba, tl.tb.to_ns(src_t)))) // STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
 }
 
@@ -1461,7 +1461,7 @@ type SeqHeld = std::sync::Mutex<Option<(u64, u32, u32, Arc<Vec<u8>>)>>;
 impl Seq {
     /// STRIASEQINFO: the reel's person's line for [`Sources::summary`]: `seq <first>..=<last> <w>x<h>`.
     fn summary(&self) -> String {
-        format!("seq {}..={} {}x{}{}", self.first, self.last, self.w, self.h, self.rate.map(|r| format!(" @{}", r.0)).unwrap_or_default()) // STRIASEQREPORT (SR943): ` @<rate>` only when set
+        format!("seq {}..={} {}x{}{}", self.first, self.last, self.w, self.h, self.rate.map(seq_rate_text).unwrap_or_default()) // STRIASEQREPORT (SR943): ` @<rate>` only when set; STRIASEQMORE (SR978): ` @n/d` for a fractional one
     }
     /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
     fn held_frame(&self, n: u64, pts_ns: i64) -> Option<Frame> {
@@ -1590,16 +1590,16 @@ impl Sources {
 /// STRIASEQREPORT (LEDGER SR943): a sequence reel's own rate `(frames a second R, tick num, tick den)` (the timeline's tick is
 /// `num / den` seconds, taken from `Sources.tb` at the add); `None` = one file per timeline tick (the default). Set once at the
 /// add, immutable: no lock.
-type SeqRate = Option<(u64, u64, u64)>;
+type SeqRate = Option<(u64, u64, u64, u64)>; // STRIASEQMORE (SR978): (n, tick num, tick den * d, d) for a rate n/d
 
 /// STRIASEQREPORT: split a trailing `@<rate>` off a sequence pattern's suffix (the part after its `%d` / `%0Nd`, so a `@` in a
-/// directory name is untouched): `(suffix, Some(rate))`, `(suffix, None)` with no `@`. A rate that is not a whole number of
-/// frames a second above 0 (`@0`, `@`, `@x`, `@-3`, `@12.5`) is refused by name.
-fn seq_rate(suffix: &str) -> Result<(&str, Option<u64>), String> {
+/// directory name is untouched): `(suffix, Some(rate))`, `(suffix, None)` with no `@`. A rate that is not N, N/D or N.F frames
+/// a second above 0 (`@0`, `@`, `@x`, `@-3`, `@1/0`; STRIASEQMORE SR978) is refused by name.
+fn seq_rate(suffix: &str) -> Result<(&str, Option<(u64, u64)>), String> { // STRIASEQMORE (SR978): the rate as (n, d)
     let Some((head, r)) = suffix.rsplit_once('@') else { return Ok((suffix, None)) };
-    match r.parse::<u64>() {
-        Ok(n) if n > 0 && r.bytes().all(|b| b.is_ascii_digit()) => Ok((head, Some(n))),
-        _ => Err(format!("rate \"{r}\" is not a whole number of frames a second above 0")),
+    match seq_rate_q(r) { // STRIASEQMORE (SR978): N, N/D or N.F (file tail)
+        Some(q) => Ok((head, Some(q))),
+        _ => Err(format!("rate \"{r}\" is not a frame rate above 0 (N, N/D or N.F)")),
     }
 }
 
@@ -1611,14 +1611,14 @@ impl Seq {
     }
     /// STRIASEQREPORT: the ticks `count` files last: `count` at one file per tick, else ceil(count * den / (R * num)), exact.
     fn ticks(&self, count: u64) -> i64 {
-        let Some((r, num, den)) = self.rate else { return count as i64 };
+        let Some((r, num, den, _)) = self.rate else { return count as i64 };
         let per = r as i128 * num as i128;
         ((count as i128 * den as i128 + per - 1) / per) as i64
     }
     /// STRIASEQREPORT: the file number shown at source tick `k`: `first + k` at one file per tick, else
     /// `first + floor(k * R * num / den)`, exact (`None` on overflow).
     fn file_at(&self, k: u64) -> Option<u64> {
-        let Some((r, num, den)) = self.rate else { return self.first.checked_add(k) };
+        let Some((r, num, den, _)) = self.rate else { return self.first.checked_add(k) };
         let off = k as u128 * r as u128 * num as u128 / den as u128;
         self.first.checked_add(u64::try_from(off).ok()?)
     }
@@ -1667,4 +1667,66 @@ pub fn up_peak(s: &mut resample::Sinc, ch: usize, pcm: &[f32], end: bool) -> f32
 /// preview shows the reel's size, not the proxy's. An original's run (its track IS the reel's) keeps `fit` unchanged.
 fn proxy_fit(fit: SizePolicy, run: Option<&Track>, reel: (u32, u32)) -> SizePolicy {
     if fit == SizePolicy::Adopt && run.is_some_and(|t| (t.width, t.height) != reel) { SizePolicy::Letterbox } else { fit }
+}
+
+// ---- STRIASEQMORE (LEDGER SR978): sequence formats, fractional rates, the title size (named tail block) ----
+/// STRIASEQMORE (LEDGER SR978): the bytes [`Sources::add_sequence`] reads of a sequence's first file for its header: long enough
+/// for a JPEG whose EXIF APP1 (up to 64 KiB) and ICC APP2 segments sit before the SOF that [`gneiss_pal::dsp::image::facts_of`]
+/// walks to. One bounded read.
+const SEQ_HEAD: u64 = 256 * 1024;
+
+/// STRIASEQMORE: the ONE table of sequence frame formats: the pattern's suffix (case-insensitive) names the pixel_core format
+/// its files must sniff as, and that format's name for the refusal (`<p>: not a <NAME> header`). `None`: not a sequence format
+/// (TIFF / raw, SVG and everything else are refused at the suffix).
+fn seq_format(suffix: &str) -> Option<(gneiss_pal::dsp::image::Format, &'static str)> {
+    use gneiss_pal::dsp::image::Format;
+    let s = suffix.to_ascii_lowercase();
+    [(".png", Format::Png, "PNG"), (".jpg", Format::Jpeg, "JPEG"), (".jpeg", Format::Jpeg, "JPEG"), (".gif", Format::Gif, "GIF"), (".bmp", Format::Bmp, "BMP"), (".qoi", Format::Qoi, "QOI"), (".webp", Format::WebP, "WebP")]
+        .into_iter()
+        .find(|e| s.ends_with(e.0))
+        .map(|e| (e.1, e.2))
+}
+
+/// STRIASEQMORE: a sequence rate's text as `(n, d)` frames a second, reduced: `N` (d 1), `N/D` (D above 0) or `N.F` (F one to
+/// nine digits: N*10^k+F over 10^k). Digits only (no sign, no space); `None` for anything else or a rate of 0.
+fn seq_rate_q(r: &str) -> Option<(u64, u64)> {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let (n, d) = if let Some((a, b)) = r.split_once('/') {
+        if !digits(a) || !digits(b) {
+            return None;
+        }
+        (a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)
+    } else if let Some((a, b)) = r.split_once('.') {
+        if !digits(a) || !digits(b) || b.len() > 9 {
+            return None;
+        }
+        let scale = 10u64.pow(b.len() as u32);
+        (a.parse::<u64>().ok()?.checked_mul(scale)?.checked_add(b.parse::<u64>().ok()?)?, scale)
+    } else {
+        if !digits(r) {
+            return None;
+        }
+        (r.parse::<u64>().ok()?, 1)
+    };
+    if n == 0 || d == 0 {
+        return None;
+    }
+    let (mut x, mut y) = (n, d);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    Some((n / x, d / x))
+}
+
+/// STRIASEQMORE: the rate `(n, d)` against the timeline's tick `tb` as [`SeqRate`] `(n, num, den * d, d)`: the tick formulas of
+/// `Seq::ticks` / `Seq::file_at` (R = n over a tick of num / (den * d)) stay SR943's. Refused by name when `den * d` overflows.
+fn seq_rate_tick(rate: Option<(u64, u64)>, tb: Timebase) -> Result<SeqRate, String> {
+    let Some((n, d)) = rate else { return Ok(None) };
+    let den = tb.den.max(1).checked_mul(d).ok_or_else(|| format!("rate {n}/{d} is too fine for the timeline's tick"))?;
+    Ok(Some((n, tb.num.max(1), den, d)))
+}
+
+/// STRIASEQMORE: the summary's rate text: ` @n` for a whole rate (SR943's text), ` @n/d` for a fractional one.
+fn seq_rate_text(r: (u64, u64, u64, u64)) -> String {
+    if r.3 == 1 { format!(" @{}", r.0) } else { format!(" @{}/{}", r.0, r.3) }
 }

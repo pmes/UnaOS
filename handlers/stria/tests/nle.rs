@@ -7427,8 +7427,8 @@ fn striaimportimagesequence_refusals_by_name() {
     let (tl, s) = striaimportimagesequence_tl(1);
     let mut src = Sources::new(&tl);
     let none = pat.replace("frame_%04d", "shot_%04d");
-    let jpg = pat.replace("%04d.png", "%04d.jpg");
-    for (p, why) in [(none.as_str(), "no file matches"), (jpg.as_str(), "only .png frames"), ("clip.mp4", "no %d or %0Nd")] {
+    let jpg = pat.replace("%04d.png", "%04d.tif"); // STRIASEQMORE (SR978): .jpg is a sequence format now; .tif is not
+    for (p, why) in [(none.as_str(), "no file matches"), (jpg.as_str(), "only .png"), ("clip.mp4", "no %d or %0Nd")] {
         let e = src.add_sequence(s, p).unwrap_err().to_string();
         assert!(e.contains(&format!("image sequence {p}: ")) && e.contains(why), "{e}");
     }
@@ -9871,7 +9871,7 @@ fn striaseqreport_rate_refused_by_name() {
     let pat = striaimportimagesequence_dir("seqreport-refuse", 4, 4, &[(1, [9, 9, 9])]);
     let (tl, s) = striaimportimagesequence_tl(1);
     let mut src = Sources::new(&tl);
-    for r in ["0", "", "x", "-3", "12.5", "+3"] {
+    for r in ["0", "", "x", "-3", "12.5.1", "+3"] { // STRIASEQMORE (SR978): 12.5 is a rate now
         let p = format!("{pat}@{r}");
         let e = src.add_sequence(s, &p).unwrap_err().to_string();
         assert!(e.contains(&format!("image sequence {p}: rate \"{r}\"")), "{e}");
@@ -11570,4 +11570,133 @@ fn striatrackgainkeysnext_face_mute_by_channel() {
     assert!(face.verb("undo") && face.verb("undo"));
     assert_eq!((&face.state.timeline, face.dirty()), (&tl0, false));
     println!("striatrackgainkeysnext face: solo A1 + mute V1 with no selection, two undos restore; mute A9 -> {}", timeline_core::EditError::NoTrack);
+}
+
+// ---- STRIASEQMORE (LEDGER SR978): sequence formats, fractional rates, the title size (named tail block) ----
+/// STRIASEQMORE: a `w` x `h` 24-bit bottom-up BMP (BITMAPINFOHEADER, BI_RGB) of one colour `c`.
+fn striaseqmore_bmp(w: u32, h: u32, c: [u8; 3]) -> Vec<u8> {
+    let stride = (w as usize * 3).div_ceil(4) * 4;
+    let size = 54 + stride * h as usize;
+    let mut b = Vec::with_capacity(size);
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(size as u32).to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.extend_from_slice(&54u32.to_le_bytes());
+    b.extend_from_slice(&40u32.to_le_bytes());
+    b.extend_from_slice(&(w as i32).to_le_bytes());
+    b.extend_from_slice(&(h as i32).to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&24u16.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&((stride * h as usize) as u32).to_le_bytes());
+    b.extend_from_slice(&2835u32.to_le_bytes());
+    b.extend_from_slice(&2835u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..h {
+        let mut row: Vec<u8> = (0..w).flat_map(|_| [c[2], c[1], c[0]]).collect();
+        row.resize(stride, 0);
+        b.extend_from_slice(&row);
+    }
+    b
+}
+
+#[test]
+fn striaseqmore_bmp_sequence_renders_each_file() {
+    let d = common::fresh_dir("striaseqmore", "bmp");
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    for (i, c) in cols.iter().enumerate() {
+        std::fs::write(d.join(format!("shot_{:04}.bmp", i + 1)), striaseqmore_bmp(4, 4, *c)).unwrap();
+    }
+    let pat = format!("{}/shot_%04d.bmp", d.display());
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 1..=3 4x4"));
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(3));
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..3, &src, &mut sink).unwrap();
+    assert_eq!(sink.0.len(), 3);
+    for (t, c) in cols.iter().enumerate() {
+        assert_eq!((sink.0[t].1, sink.0[t].2), (4, 4));
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, *c), "tick {t}: shot_{:04}.bmp", t + 1);
+    }
+    println!("striaseqmore: shot_0001..0003.bmp -> 3 ticks, each file's pixels");
+}
+
+#[test]
+fn striaseqmore_format_mismatch_refused_by_name() {
+    let pat = striaimportimagesequence_dir("seqmore-mismatch", 4, 4, &[(1, [9, 9, 9])]);
+    let dir = std::path::Path::new(&pat).parent().unwrap().to_path_buf();
+    std::fs::copy(dir.join("frame_0001.png"), dir.join("fake_0001.bmp")).unwrap();
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    let fake = format!("{}/fake_%04d.bmp", dir.display());
+    let e = src.add_sequence(s, &fake).unwrap_err().to_string();
+    assert!(e.contains("fake_0001.bmp: not a BMP header"), "{e}");
+    let tif = format!("{}/frame_%04d.tif", dir.display());
+    let e = src.add_sequence(s, &tif).unwrap_err().to_string();
+    assert!(e.contains(&format!("image sequence {tif}: only .png")), "{e}");
+    assert!(src.add_sequence(s, &pat).is_ok(), "the PNG pattern still opens");
+}
+
+#[test]
+fn striaseqmore_fractional_rate_maps_ticks() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqmore-frac", 4, 4, &[(1, cols[0]), (2, cols[1]), (3, cols[2])]);
+    for r in ["25/2", "12.5", "50/4"] {
+        let (tl, s) = striaimportimagesequence_tl(6);
+        let mut src = Sources::new(&tl);
+        src.add_sequence(s, &format!("{pat}@{r}")).unwrap();
+        assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(6), "@{r}: 3 files at 12.5/s on a 25/s timeline");
+        assert_eq!(src.summary(s).as_deref(), Some("seq 1..=3 4x4 @25/2"), "@{r} reduces to 25/2");
+        let mut sink = StriaTitleFrames::default();
+        render(&tl, 0..6, &src, &mut sink).unwrap();
+        for (t, file) in [0usize, 0, 1, 1, 2, 2].into_iter().enumerate() {
+            assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, cols[file]), "@{r} tick {t}: file {}", file + 1);
+        }
+    }
+    let many: Vec<(u64, [u8; 3])> = (1..=8u64).map(|n| (n, [n as u8 * 20, 0, 0])).collect();
+    let pat = striaimportimagesequence_dir("seqmore-ntsc", 4, 4, &many);
+    let (tl, s) = striaimportimagesequence_tl(7);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &format!("{pat}@30000/1001")).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(7), "ceil(8 * 25 * 1001 / 30000)");
+    assert_eq!(src.summary(s).as_deref(), Some("seq 1..=8 4x4 @30000/1001"));
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..7, &src, &mut sink).unwrap();
+    for (t, file) in [0usize, 1, 2, 3, 4, 5, 7].into_iter().enumerate() {
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, many[file].1), "tick {t}: file {}", file + 1);
+    }
+    println!("striaseqmore: @25/2 holds each file 2 ticks; @30000/1001 skips file 7 at tick 6");
+}
+
+#[test]
+fn striaseqmore_fractional_rate_refused_by_name() {
+    let pat = striaimportimagesequence_dir("seqmore-refuse", 4, 4, &[(1, [9, 9, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    for r in ["0/1", "1/0", "1/", "/2", ".5", "12.", "1.2.3", "x/2", "0.0", "1/2/3", "1.0000000001"] {
+        let p = format!("{pat}@{r}");
+        let e = src.add_sequence(s, &p).unwrap_err().to_string();
+        assert!(e.contains(&format!("image sequence {p}: rate \"{r}\"")), "{e}");
+    }
+}
+
+#[test]
+fn striaseqmore_title_only_range_takes_sequence_size() {
+    let pat = striaimportimagesequence_dir("seqmore-title", 16, 8, &[(1, [1, 2, 3]), (2, [4, 5, 6])]);
+    let mut tl = Timeline::new(25);
+    let q = tl.add_source("SEQ", 2);
+    let t = tl.add_source("T1", 2);
+    tl.sources[t.0 as usize].title = Some("Hello".to_string());
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(t, 0, 2, 0)];
+    let mut src = Sources::new(&tl);
+    src.add_sequence(q, &pat).unwrap();
+    let mut sink = StriaTitleFrames::default();
+    let r = render(&tl, 0..2, &src, &mut sink).unwrap();
+    assert_eq!((r.width, r.height), (16, 8), "the sequence reel's size, not TITLE_SIZE");
+    assert!(sink.0.iter().all(|f| (f.1, f.2) == (16, 8)));
+    println!("striaseqmore: a title-only range beside a 16x8 sequence reel renders at 16x8");
 }
