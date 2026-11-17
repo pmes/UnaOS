@@ -765,7 +765,7 @@ impl Sources {
             applied.get_or_insert(tl.tracks[track].clips.len());
         }
         sources.applied.push((src, applied.unwrap_or(0)));
-        Ok(Some((tl, sources)))
+        Ok(Some((tl.link_av(), sources))) // STRIALINKAUTO (SR911): each V1 clip and its equal A1 clip linked, one group per pair (timeline_core lib.rs tail)
     }
 }
 

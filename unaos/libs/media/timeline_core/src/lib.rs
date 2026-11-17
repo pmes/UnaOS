@@ -2816,3 +2816,26 @@ impl Timeline {
         self.tracks.get(track).and_then(|tr| tr.clips.iter().find(|c| c.covers(t))).map_or(Xform::NONE, |c| c.xform)
     }
 }
+
+// ---- STRIALINKAUTO (LEDGER SR911): the opened media file's V1 / A1 pairs linked (named tail block) ----
+// `stria::nle::Sources::from_media` lays one file's picture and sound on their own tracks; `link_av` gives each video
+// clip and the audio clip laid at the same tick for the same length ONE fresh group (SR863's `Clip::group`), one id per
+// pair, so selecting a segment takes its sound. Only `group` changes; an unpaired or already linked clip is left alone.
+impl Timeline {
+    /// STRIALINKAUTO: the first video and first audio track's equal clips (same `at`, same `len`) linked pair by pair.
+    pub fn link_av(&self) -> Timeline {
+        let mut tl = self.clone();
+        let (Some(v), Some(a)) = (tl.tracks.iter().position(|t| t.kind == Kind::Video), tl.tracks.iter().position(|t| t.kind == Kind::Audio)) else { return tl };
+        for i in 0..tl.tracks[v].clips.len() {
+            let c = tl.tracks[v].clips[i];
+            if c.group != 0 {
+                continue;
+            }
+            let Some(j) = tl.tracks[a].clips.iter().position(|o| o.group == 0 && o.at == c.at && o.len() == c.len()) else { continue };
+            let g = tl.next_group();
+            tl.tracks[v].clips[i].group = g;
+            tl.tracks[a].clips[j].group = g;
+        }
+        tl
+    }
+}

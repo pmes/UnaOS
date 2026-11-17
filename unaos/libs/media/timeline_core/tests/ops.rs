@@ -1863,3 +1863,53 @@ fn striaxfadecurve_refusal_text() {
     assert_eq!(st.xfade_refusal("xfade", EditError::NoSource), None);
     println!("striaxfadecurve: five audio wordings; kind / NoSource -> None");
 }
+
+// ---- STRIALINKAUTO (LEDGER SR911): the V1 / A1 pairs of an opened file linked, and `unlink-all` (named tail block) ----
+
+#[test]
+fn strialinkauto_link_av_pairs_equal_clips() {
+    let tl = striacliplink_base();
+    let ln = tl.link_av();
+    let groups = |t: &Timeline| t.tracks[0].clips.iter().chain(&t.tracks[1].clips).map(|c| c.group).collect::<Vec<_>>();
+    assert_eq!(groups(&ln), vec![1, 2, 1, 2], "one fresh id per pair");
+    assert_eq!(ln.mates(0, 0), vec![(0, 0), (1, 0)]);
+    assert_eq!(ln.mates(1, 1), vec![(0, 1), (1, 1)]);
+    assert_eq!(ln.set_group(&[(0, 0), (1, 0), (0, 1), (1, 1)], 0).unwrap(), tl, "only the group changed");
+    // An audio clip of another length stays unlinked; so does its video clip.
+    let mut odd = striacliplink_base();
+    odd.tracks[1].clips[1].src_out = 28;
+    assert_eq!(groups(&odd.link_av()), vec![1, 0, 1, 0]);
+    // An already linked clip is left alone; the free pair takes the next id.
+    let pre = striacliplink_linked().link_av();
+    assert_eq!(groups(&pre), vec![1, 2, 1, 2]);
+    assert_eq!(striacliplink_linked().set_group(&[(0, 1), (1, 1)], 2).unwrap(), pre);
+    // A video-only timeline is unchanged.
+    let (v, _, _) = base();
+    let mut v = v;
+    v.tracks.truncate(1);
+    assert_eq!(v.link_av(), v);
+}
+
+#[test]
+fn strialinkauto_unlink_all_word() {
+    let tl = striacliplink_base();
+    let ln = tl.link_av();
+    let mut st = EditorState::new(ln.clone());
+    assert_eq!(st.verb("unlink-all"), Some(Ok(())), "no selection needed");
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.clone(), 1), "every link parted, one commit");
+    assert_eq!(st.verb("unlink-all"), Some(Ok(())), "nothing linked");
+    assert_eq!(st.undo_depth(), 1, "nothing linked: no commit");
+    assert!(st.undo());
+    assert_eq!(st.timeline, ln, "one undo step restores both pairs");
+}
+
+#[test]
+fn strialinkauto_unlink_all_keeps_selection() {
+    let mut st = EditorState::new(striacliplink_base().link_av());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1), (1, 1)], "the pair selects together");
+    assert_eq!(st.verb("unlink-all"), Some(Ok(())));
+    assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), vec![(0, 1), (1, 1)]), "no clip moved: the selection stands");
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1)], "unlinked: the clip alone");
+}

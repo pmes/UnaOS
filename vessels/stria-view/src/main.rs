@@ -543,7 +543,7 @@ fn transport() -> TetraNode {
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
-        button("link", "Link"), button("unlink", "Unlink"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
+        button("link", "Link"), button("unlink", "Unlink"), button("unlink-all", "Unlink all"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
         button("info", "Info"), // STRIASOURCEINFO (SR875): the selected clip's reel line, standing five seconds on the message row
         button("track-up", "Track Up"), button("track-down", "Track Down"), // STRIATRACKREORDER (SR877): the selected clip's track swaps with its same-kind neighbour
         button("meters-reset", "Reset Meters"), button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
@@ -1314,7 +1314,26 @@ mod striacliplink_tests {
         let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
-        assert_eq!(&ids[ids.len() - 3..], ["link", "unlink", "help"]);
+        assert_eq!(&ids[ids.len() - 4..], ["link", "unlink", "unlink-all", "help"]); // STRIALINKAUTO (SR911): `unlink-all` before help
+    }
+}
+
+// ---- STRIALINKAUTO (LEDGER SR911): the `unlink-all` button through `--do` (named tail block) ----
+#[cfg(test)]
+mod strialinkauto_tests {
+    use super::*;
+
+    /// `--do unlink-all` parts every link of the face's timeline in one step; the button sits just before `help`.
+    #[test]
+    fn strialinkauto_do_unlink_all_button() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl.link_av()), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "unlink-all");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.state.timeline.clone(), f.state.undo_depth()), (tl, 1));
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        assert_eq!(row.len(), nle_face::VERBS.len());
     }
 }
 

@@ -858,7 +858,7 @@ impl EditorState {
     fn track_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         match v {
             "mute" => Some(self.toggle_mute()),
-            "solo" => Some(self.toggle_solo()),
+            "solo" => Some(self.toggle_solo()), "unlink-all" => Some(self.unlink_all()), // STRIALINKAUTO (SR911): every link in the timeline parted, one commit (file tail)
             _ => None,
         }
     }
@@ -2860,5 +2860,21 @@ mod striatrackgainstep_tests {
         assert_eq!(st.verb("track-gain+"), Some(Err(EditError::Gain)));
         assert_eq!((&st.timeline, st.undo_depth()), (&top, 1));
         assert_eq!(st.verb("track-gain-x"), None, "not this word");
+    }
+}
+
+// ---- STRIALINKAUTO (LEDGER SR911): the `unlink-all` word (named tail block) ----
+// Every linked clip of the timeline gets group 0 through SR863's `Timeline::set_group`, ONE commit through THE verb
+// dispatch (`link_verb`'s `unlink-all` arm); no linked clip commits nothing; no selection is needed and none moves.
+impl EditorState {
+    /// Unlink every clip in the timeline (one commit; none linked commits nothing).
+    pub fn unlink_all(&mut self) -> Result<(), EditError> {
+        let linked: Vec<(usize, usize)> = self.timeline.tracks.iter().enumerate().flat_map(|(t, tr)| tr.clips.iter().enumerate().filter(|(_, c)| c.group != 0).map(move |(i, _)| (t, i))).collect();
+        if linked.is_empty() {
+            return Ok(());
+        }
+        let tl = self.timeline.set_group(&linked, 0)?;
+        self.commit(tl);
+        Ok(())
     }
 }

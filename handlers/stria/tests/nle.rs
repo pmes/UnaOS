@@ -570,7 +570,7 @@ fn editmap_file(rate: i32) -> Vec<u8> {
 #[test]
 fn editmap_the_editor_plays_the_whole_edit_list() {
     let (tl, src) = Sources::from_media("AX", &editmap_file(0x1_0000), 25).unwrap().expect("an MP4 is media");
-    let want = vec![Clip::new(SourceId(0), 25, 35, 0), Clip::new(SourceId(0), 5, 15, 10)];
+    let want = vec![Clip { group: 1, ..Clip::new(SourceId(0), 25, 35, 0) }, Clip { group: 2, ..Clip::new(SourceId(0), 5, 15, 10) }]; // STRIALINKAUTO (SR911): each V1 / A1 pair linked, one group per pair
     assert_eq!((tl.tracks[0].kind, &tl.tracks[0].clips), (Kind::Video, &want));
     assert_eq!((tl.tracks[1].kind, &tl.tracks[1].clips), (Kind::Audio, &want));
     assert_eq!((tl.sources[0].reel.as_str(), tl.sources[0].duration), ("AX", 50));
@@ -601,7 +601,7 @@ fn editmap_a_rate_edit_is_refused_and_an_edl_is_not_media() {
     assert!(Sources::from_media("AX", edl_text.as_bytes(), 25).unwrap().is_none());
     // A file without an edit list is the whole source.
     let (tl, src) = Sources::from_media("AX", &synth_source(0, 50, 25), 25).unwrap().unwrap();
-    assert_eq!(tl.tracks[0].clips, vec![Clip::new(SourceId(0), 0, 50, 0)]);
+    assert_eq!(tl.tracks[0].clips, vec![Clip { group: 1, ..Clip::new(SourceId(0), 0, 50, 0) }]); // STRIALINKAUTO (SR911): linked to its A1 clip
     assert_eq!(src.open_report(SourceId(0)).unwrap().to_string(), "open=full dts=stored edits=0 applied=1");
 }
 
@@ -7939,4 +7939,38 @@ fn striatrackgainstep_face_steps_and_line() {
     assert_eq!(face.last_error.take(), Some(format!("track-gain+ 2: {}", EditError::Gain)));
     assert_eq!(stria::nle_face::db_words(-350), "-3.5 dB");
     println!("striatrackgainstep face: track-gain- -> A1 -1.0 dB, two track-gain+ -> +1.0 dB; no selection -> {}", EditError::NoTrack);
+}
+
+// ---- STRIALINKAUTO (LEDGER SR911): an opened media file's V1 / A1 pair is linked; the `unlink-all` word (named tail block) ----
+#[test]
+fn strialinkauto_from_media_links_v1_a1() {
+    let (tl, _) = Sources::from_media("AX", &synth_source(0, 50, 25), 25).unwrap().unwrap();
+    assert_eq!((tl.tracks[0].kind, tl.tracks[1].kind), (Kind::Video, Kind::Audio));
+    assert_eq!((tl.tracks[0].clips[0].group, tl.tracks[1].clips[0].group), (1, 1), "the picture and its sound share one group");
+    let mut st = EditorState::new(tl);
+    st.select(0, 0).unwrap();
+    assert_eq!(st.set, vec![(0, 0), (1, 0)], "selecting the picture takes its sound");
+    st.seek(20);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    let groups = |t: &Timeline| t.tracks.iter().map(|tr| tr.clips.iter().map(|c| c.group).collect::<Vec<_>>()).collect::<Vec<_>>();
+    assert_eq!(groups(&st.timeline), vec![vec![1, 2], vec![1, 2]], "both tracks cut: heads keep the id, tails share a fresh one");
+    let text = edl::write(&st.timeline, "AUTO").unwrap();
+    assert!(text.contains("* UNA GROUP 1\n") && text.contains("* UNA GROUP 2\n"), "{text}");
+    let back = edl::parse(&text, 25).unwrap();
+    let mut got: Vec<u32> = back.tracks.iter().flat_map(|tr| tr.clips.iter().map(|c| c.group)).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 1, 2, 2], "the links round-trip through the EDL");
+    println!("strialinkauto: opened V1 / A1 linked, split into groups {:?}", groups(&st.timeline));
+}
+
+#[test]
+fn strialinkauto_face_unlink_all_word() {
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.clone();
+    let mut face = nlefaceexport_face(tl.link_av(), src);
+    assert_eq!(&VERBS[VERBS.len() - 2..], ["unlink-all", "help"], "unlink-all just before help");
+    assert!(face.verb("unlink-all"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl0, 1), "every pair parted, one step");
+    println!("strialinkauto: VERBS[{}] unlink-all", VERBS.len() - 2);
 }
