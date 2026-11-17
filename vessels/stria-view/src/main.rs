@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("close-all", "Close All"), // STRIAGAPSMORE (SR969): closes every gap on every track (`close-gaps all`, one undo step)
         button("gap", "Gap"), // STRIAGAPSBLACK (SR909): opens one second of gap at the playhead on the selected clip's track (one undo step)
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
@@ -969,5 +970,32 @@ mod striagapsalltracks_tests {
         assert_eq!(face.state.timeline, tl0.close_gaps_all().unwrap());
         assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (20, 20));
         println!("striagapsalltracks witness: close-gaps:all -> {:?}", face.state.timeline.tracks[1].clips);
+    }
+}
+
+// ---- STRIAGAPSMORE (LEDGER SR969): the witness's Close All button and `close-gaps:sync` token (named tail block) ----
+#[cfg(test)]
+mod striagapsmore_tests {
+    use super::*;
+
+    /// The Close All button sits right before Gap (Gap, Close Gaps, help stay last); its word `close-all` is the argument
+    /// word `close-gaps all`; `close-gaps:sync` closes the spans empty on every track, the timeline_core op by hand.
+    #[test]
+    fn striagapsmore_witness_button_and_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        let i = ids.iter().position(|x| x == "close-all").expect("close-all button");
+        assert_eq!(ids[i + 1], "gap");
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "close-all").is_empty());
+        assert_eq!(face.state.timeline, tl0.close_gaps_all().unwrap());
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "close-gaps:sync").is_empty());
+        assert_eq!(face.state.timeline, tl0.close_gaps_sync().unwrap());
+        assert_eq!(tl0.sync_gaps(), vec![(20, 25)]);
+        println!("striagapsmore witness: close-gaps:sync -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }

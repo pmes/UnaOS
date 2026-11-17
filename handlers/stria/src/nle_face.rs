@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "gap", "close-gaps", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "close-all", "gap", "close-gaps", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -3105,7 +3105,7 @@ impl Face {
 impl Face {
     /// The `close-gaps` word with its note; `None` for any other word.
     fn gaps_note_verb(&mut self, v: &str) -> Option<bool> {
-        if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
+        if let Some(r) = self.gaps_more_note_verb(v) { return Some(r); } if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail); STRIAGAPSMORE (SR969): `close-all` and `close-gaps sync` (file tail)
             return None;
         }
         let track = self.state.selection.map(|(t, _)| t);
@@ -3157,6 +3157,36 @@ impl Face {
                 if gone > 0 {
                     let s = |n: usize| if n == 1 { "" } else { "s" };
                     self.last_error = Some(format!("close-gaps all: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
+                }
+            }
+            None => return Some(false),
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAGAPSMORE (LEDGER SR969): the Close All button word and the `close-gaps sync` message row (named tail block) ----
+// `close-all` (VERBS, the Close All button) is the one argument word `close-gaps all` (SR929's note and refusal unchanged);
+// `close-gaps sync` rides timeline_core's ONE verb dispatch (one commit, every track moving alike) and follows SR909's note
+// rule: a refusal is `close-gaps sync: <why>`, and `close-gaps sync: closed 2 gaps, removed 2 fades` only when a fade went.
+impl Face {
+    /// The `close-all` / `close-gaps sync` words with their notes; `None` for any other word.
+    fn gaps_more_note_verb(&mut self, v: &str) -> Option<bool> {
+        if v == "close-all" {
+            return self.gaps_all_note_verb("close-gaps all");
+        }
+        if !v.split_ascii_whitespace().eq(["close-gaps", "sync"]) {
+            return None;
+        }
+        let fades = |tl: &Timeline| tl.tracks.iter().map(|k| k.transitions.len()).sum::<usize>();
+        let (gaps, before) = (self.state.timeline.sync_gaps().len(), fades(&self.state.timeline));
+        match self.state.verb(v) {
+            Some(Err(e)) => self.last_error = Some(format!("close-gaps sync: {e}")),
+            Some(Ok(())) => {
+                let gone = before.saturating_sub(fades(&self.state.timeline));
+                if gone > 0 {
+                    let s = |n: usize| if n == 1 { "" } else { "s" };
+                    self.last_error = Some(format!("close-gaps sync: closed {gaps} gap{}, removed {gone} fade{}", s(gaps), s(gone)));
                 }
             }
             None => return Some(false),

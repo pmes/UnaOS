@@ -692,7 +692,7 @@ impl EditorState {
     }
     /// The `close-gaps` / `gap <n>` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn gap_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if v.split_ascii_whitespace().eq(["close-gaps", "all"]) { return Some(self.close_gaps_all()); } if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second; STRIAGAPSALLTRACKS (SR929): `close-gaps all` (file tail)
+        if v.split_ascii_whitespace().eq(["close-gaps", "sync"]) { return Some(self.close_gaps_sync()); } if v.split_ascii_whitespace().eq(["close-gaps", "all"]) { return Some(self.close_gaps_all()); } if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second; STRIAGAPSALLTRACKS (SR929): `close-gaps all` (file tail); STRIAGAPSMORE (SR969): `close-gaps sync` (file tail)
             None => self.close_gaps(),
             Some(n) => self.insert_gap(n),
         })
@@ -717,6 +717,20 @@ impl EditorState {
     /// Close every gap on every track (one commit; no gap commits nothing).
     pub fn close_gaps_all(&mut self) -> Result<(), EditError> {
         let tl = self.timeline.close_gaps_all().map_err(|(_, e)| e)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+}
+
+// ---- STRIAGAPSMORE (LEDGER SR969): `close-gaps sync` through the one commit (named tail block) ----
+// Only the spans empty on every track close, every track moving alike (`Timeline::close_gaps_sync`), as ONE commit (one
+// undo step); no selection is needed, and no such span commits nothing.
+impl EditorState {
+    /// Close every span empty on every track (one commit; none commits nothing).
+    pub fn close_gaps_sync(&mut self) -> Result<(), EditError> {
+        let tl = self.timeline.close_gaps_sync()?;
         if tl != self.timeline {
             self.commit(tl);
         }
