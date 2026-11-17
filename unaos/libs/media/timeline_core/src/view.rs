@@ -827,7 +827,7 @@ impl Drag {
                 (alloc::vec![c.at, c.end()], &slide_ex, true)
             }
         };
-        let targets = snap_targets(st, exclude, playhead);
+        let link_ex = link_exclude(st, self.kind, self.track, self.idx, exclude); let targets = snap_targets(st, &link_ex, playhead); // STRIALINKSLIDE (SR927): a trim or slide drag never snaps to its link mates' own edges (file tail)
         let mut best: Option<(f64, i64, i64)> = None;
         for &e in &edges {
             let ex = l.x_of(e) as f64 + dx;
@@ -1211,4 +1211,37 @@ fn paint_links(c: &mut Canvas, l: Layout, st: &EditorState) {
             c.frame(xa + 3, ya, xa + 8, ya + 4, LINK);
         }
     }
+}
+
+// ---- STRIALINKSLIDE (LEDGER SR927): a linked trim or slide drag excludes its mates' own edges from the snap (named tail block) ----
+// A trim or slide of a linked clip carries every mate (`Timeline::linked`), so the mates' edges move with the drag just as
+// the primary's do: `snap_delta` excludes them as it excludes the primary (and, for a slide, each mate's butted
+// neighbours, as the primary's are excluded); otherwise a small drag snaps back to its mate's still edge (delta 0). A
+// move of a linked set already excludes the whole set; group 0 has no mates, so the exclusion is unchanged there.
+/// `exclude` grown, for a trim or slide drag of clip `idx` of `track`, by that clip's other link mates (a slide: and each
+/// mate's butted neighbours on its own track); `exclude` unchanged for every other drag and for group 0.
+fn link_exclude(st: &EditorState, kind: DragKind, track: usize, idx: usize, exclude: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut v = exclude.to_vec();
+    if !matches!(kind, DragKind::TrimIn | DragKind::TrimOut | DragKind::Slide) {
+        return v;
+    }
+    let tl = &st.timeline;
+    for (k, j) in tl.mates(track, idx) {
+        if (k, j) == (track, idx) {
+            continue;
+        }
+        v.push((k, j));
+        let Some(tr) = tl.tracks.get(k) else { continue };
+        let Some(&m) = tr.clips.get(j) else { continue };
+        if kind != DragKind::Slide {
+            continue;
+        }
+        if let Some(p) = j.checked_sub(1).filter(|&i| tr.clips.get(i).is_some_and(|p| p.end() == m.at)) {
+            v.push((k, p));
+        }
+        if tr.clips.get(j + 1).is_some_and(|n| n.at == m.end()) {
+            v.push((k, j + 1));
+        }
+    }
+    v
 }

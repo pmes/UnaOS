@@ -506,3 +506,88 @@ fn strialinktrim_chain_mark_paints_only_when_linked() {
         assert_ne!(a[i..i + 4], view::LINK, "no mark unlinked");
     }
 }
+
+// ---- STRIALINKSLIDE (LEDGER SR927): a linked slide, all-or-nothing, and the linked drags' snap (named tail block) ----
+
+/// `slide 2` on one member slides every mate by the same timeline delta (each track's butted next clip follows); ONE
+/// undo step restores both tracks.
+#[test]
+fn strialinkslide_slide_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("slide 2"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.slide(0, 0, 2).unwrap().slide(1, 0, 2).unwrap());
+    for k in 0..2 {
+        let (c, n) = (st.timeline.tracks[k].clips[0], st.timeline.tracks[k].clips[1]);
+        assert_eq!((c.at, n.at, n.src_in), (2, 12, 22), "track {k} slid");
+    }
+    assert_eq!(st.undo_depth(), 1, "one undo step");
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl, "one undo restores both members");
+}
+
+/// A mate whose neighbour cannot follow refuses the whole slide (nothing committed); an unlinked clip slides exactly as
+/// the trunk did.
+#[test]
+fn strialinkslide_refusal_is_all_or_nothing() {
+    let mut tl = striacliplink_base();
+    tl.tracks[1].clips[0] = Clip { src_in: 90, src_out: 100, ..tl.tracks[1].clips[0] };
+    let base = tl.clone();
+    let tl = tl.set_group(&[(0, 1), (1, 1)], 1).unwrap();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("slide 1"), Some(Err(EditError::OutOfSource)), "A1's butted first clip would pass its source");
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0), "nothing committed");
+    let mut st = EditorState::new(base.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("slide 2"), Some(Ok(())));
+    assert_eq!(st.timeline, base.slide(0, 1, 2).unwrap(), "group 0: the trunk's single-clip slide");
+    assert_eq!(st.timeline.tracks[1].clips, base.tracks[1].clips, "A1 untouched");
+}
+
+/// A slide drag (the slip modifier on the out handle) previews and commits the linked slide through `slide_selected`.
+#[test]
+fn strialinkslide_drag_slide_carries_the_mates() {
+    let tl = striacliplink_linked();
+    let want = tl.slide(0, 0, 2).unwrap().slide(1, 0, 2).unwrap();
+    let mut st = EditorState::new(tl);
+    st.select(0, 0).unwrap();
+    let l = Layout::of(400, 240, &st);
+    let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+    let x = l.x_of(10) as f64 - 2.0;
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, true, true).unwrap();
+    assert_eq!(d.kind, DragKind::Slide);
+    d.update(&st, x + 2.0 * z, y);
+    assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the preview shows both members slid");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!((&st.timeline, st.undo_depth()), (&want, 1));
+}
+
+/// NLE-LINK-SNAP: a linked pair's slide and trim-in drags of 5 px (one tick, inside `SNAP_PX`) keep their delta: the
+/// mate's still edges are no snap target. The same drags on the unlinked base snap back to A1's edge (delta 0).
+#[test]
+fn strialinkslide_linked_drag_does_not_snap_to_its_mates() {
+    let drag = |tl: Timeline, slip: bool, edge: i64, off: f64| {
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.seek(20);
+        let l = Layout::of(400, 240, &st);
+        let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
+        let x = l.x_of(edge) as f64 + off;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, slip).unwrap();
+        d.update(&st, x + 5.0, y);
+        (d.kind, d.delta, d.guide, d, st)
+    };
+    let (k, delta, guide, d, mut st) = drag(striacliplink_linked(), true, 10, -1.0);
+    assert_eq!((k, delta, guide), (DragKind::Slide, 1, None), "the linked slide keeps its tick");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    let tl = striacliplink_linked();
+    assert_eq!(st.timeline, tl.slide(0, 0, 1).unwrap().slide(1, 0, 1).unwrap());
+    let (k, delta, guide, ..) = drag(striacliplink_base(), true, 10, -1.0);
+    assert_eq!((k, delta, guide), (DragKind::Slide, 0, Some(0)), "unlinked: A1's in edge is a target (the first moving edge wins the tie)");
+    let (k, delta, guide, ..) = drag(striacliplink_linked(), false, 0, 3.0);
+    assert_eq!((k, delta, guide), (DragKind::TrimIn, 1, None), "the linked trim keeps its tick");
+    let (k, delta, guide, ..) = drag(striacliplink_base(), false, 0, 3.0);
+    assert_eq!((k, delta, guide), (DragKind::TrimIn, 0, Some(0)), "unlinked: A1's in edge is a target");
+}
