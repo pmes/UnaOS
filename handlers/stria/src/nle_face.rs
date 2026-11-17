@@ -1417,14 +1417,7 @@ fn paint_meters(px: Vec<u8>, l: Layout, order: PixelOrder, levels: &[MeterLevel]
     let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
     let frac = |db: f64| view::db_frac(db, METER_VIEW_DB); // STRIACLIPGAINFACE (SR838): the ONE dB map, lifted to timeline_core view
     for lv in levels {
-        let (y0, y1) = match lv.track {
-            Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
-            Some(_) => continue,
-            None => (1, l.preview_h as i64 - 1),
-        };
-        if y1 - y0 < 2 {
-            continue;
-        }
+        let Some((_, y0, _, y1)) = meter_rect(l, lv.track) else { continue }; // STRIAMETERSNEXT (SR996): NLE-METER-RECT-ONE, the one layout (file tail)
         let span = (y1 - y0) as f64;
         c.rect(x0, y0, x1, y1, METER_BG);
         let fill = (frac(lv.rms_db) * span).round() as i64;
@@ -8579,5 +8572,43 @@ impl Face {
             Some(f) => format!("transition: {} ({n} ticks)", timeline_core::edl::timecode(n, f)),
             None => format!("transition: {n} ticks"),
         })
+    }
+}
+
+// ---- STRIAMETERSNEXT (LEDGER SR996): one meter layout for the strip, its clip caps and its clicks (named tail block) ----
+
+#[cfg(test)]
+mod striametersnext_tests {
+    use super::*;
+
+    /// M3: full bars (0 dB RMS and peak) fill exactly each meter's [`meter_rect`]: every pixel inside is the RMS fill or
+    /// the peak line, the row at `y1` and the column at `x1` stay the base; a meter with no rect paints nothing.
+    #[test]
+    fn striametersnext_strip_paints_exactly_meter_rect() {
+        let mut st = EditorState::new(synth_fixture().0);
+        st.seek(15);
+        let l = Layout::of(320, 160, &st);
+        let base = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let keys = [Some(1), None];
+        let levels: Vec<MeterLevel> = keys.iter().map(|&track| MeterLevel { track, peak_db: 0.0, rms_db: 0.0 }).collect();
+        let rgba = paint_meters(base.clone(), l, PixelOrder::Rgba, &levels);
+        let at = |px: &[u8], x: i64, y: i64| px[((y as usize) * 320 + x as usize) * 4..((y as usize) * 320 + x as usize) * 4 + 4].to_vec();
+        for k in keys {
+            let (x0, y0, x1, y1) = meter_rect(l, k).expect("a bar");
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = at(&rgba, x, y);
+                    assert!(p == METER_RMS.to_vec() || p == METER_PEAK.to_vec(), "{k:?} ({x}, {y})");
+                }
+                assert_eq!(at(&rgba, x1, y), at(&base, x1, y), "{k:?} column x1 untouched");
+            }
+            for x in x0..x1 {
+                assert_eq!(at(&rgba, x, y1), at(&base, x, y1), "{k:?} row y1 untouched");
+            }
+        }
+        let off = Some(l.rows + 5);
+        assert!(meter_rect(l, off).is_none());
+        let none = [MeterLevel { track: off, peak_db: 0.0, rms_db: 0.0 }];
+        assert_eq!(paint_meters(base.clone(), l, PixelOrder::Rgba, &none), base, "no rect paints nothing");
     }
 }
