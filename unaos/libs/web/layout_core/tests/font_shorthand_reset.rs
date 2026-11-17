@@ -791,8 +791,8 @@ fn text_decoration_style_thickness_merge() {
 // ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset / -position arms (named tail block) ----
 
 /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the offset longhand: a length in px (negative and 0 accepted; em at the parse
-/// context's font), a percentage of 1em; auto / initial / unset are `Some(None)`; a bare non-zero number, an invalid
-/// word and `inherit` (not inherited, no bit) write nothing.
+/// context's font), a percentage of 1em; auto / initial are `Some(None)`; a bare non-zero number, an invalid
+/// word, `inherit` and `unset` write nothing (SR1116: inherited, so the keywords take css_wide's `INHERIT_UNDERLINE_OFFSET` bit and the field stays None).
 #[test]
 fn text_underline_offset_longhand() {
     assert_eq!(styled(&[("text-underline-offset", "3px")]).paint.underline_offset, Some(Some(3.0)));
@@ -803,10 +803,10 @@ fn text_underline_offset_longhand() {
         let o = styled(&[("text-underline-offset", v)]).paint.underline_offset.flatten().expect("parses");
         assert!((o - em).abs() < 1e-3, "{v} = {o}, want {em}");
     }
-    for v in ["auto", "initial", "unset"] {
+    for v in ["auto", "initial"] { // SR1116: unset moved to the None loop (inherited)
         assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, Some(None), "{v}");
     }
-    for v in ["3", "bogus", "inherit"] {
+    for v in ["3", "bogus", "inherit", "unset"] {
         assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, None, "{v}");
     }
     let s = styled(&[("text-underline-offset", "5px"), ("text-underline-offset", "initial")]);

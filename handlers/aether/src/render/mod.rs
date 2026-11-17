@@ -4631,7 +4631,7 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// the decorating box's ink; None now means only "no decorating ancestor" (draw_decorations' run-ink fallback).
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
     let own = tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some(); if own {
-        inherited.deco_color = None; inherited.deco_alpha = 1.0; inherited.deco_style = 0; inherited.deco_thick = None; inherited.ul_offset = None;
+        inherited.deco_color = None; inherited.deco_alpha = 1.0; inherited.deco_style = 0; inherited.deco_thick = None; // SR1116: ul_offset is inherited (css-text-decor-4 §2.6): kept at a decorating box
     }
     if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(o) = spec.underline_offset { inherited.ul_offset = o; } if let Some(p) = spec.underline_position { inherited.ul_pos = p; } if let Some(c) = spec.decoration_color {
         inherited.deco_color = c; inherited.deco_alpha = spec.deco_alpha.unwrap_or(1.0);

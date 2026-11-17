@@ -7479,8 +7479,8 @@ mod tests {
     }
 
     /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): text-underline-position is inherited: the span under the `under` parent paints
-    /// below its descenders; text-underline-offset is not: the span under the 6px parent paints at the auto rows, through
-    /// its descenders.
+    /// below its descenders. AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): so is text-underline-offset (css-text-decor-4
+    /// §2.6; SR1045 pinned it as not inherited): the span under the 6px parent paints 6px lower, below its descenders.
     #[test]
     fn text_underline_position_inherits_offset_not() {
         let mut e = text_underline_engine();
@@ -7489,7 +7489,7 @@ mod tests {
         assert!(red[0] > *ink.last().unwrap(), "the inherited under: red {red:?} ink to {}", ink.last().unwrap());
         let (ink, red) = (text_underline_rows(&mut e, "pos", text_decoration_black), text_underline_rows(&mut e, "pos", css_wide_red));
         assert!(!ink.is_empty() && !red.is_empty(), "#pos paints text and an underline");
-        assert!(red[0] <= *ink.last().unwrap(), "the parent's offset does not reach the span: red {red:?} ink to {}", ink.last().unwrap());
+        assert!(red[0] > *ink.last().unwrap(), "SR1116: the parent's 6px reaches the span: red {red:?} ink to {}", ink.last().unwrap());
     }
 
     // ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the UA control colours and the canvas under color-scheme: dark (named tail block) ----
@@ -11892,6 +11892,58 @@ b</div>
         let mut e = text_decoration_columns_engine();
         for (id, want) in [("cr", "rgb(255, 0, 0)"), ("ca", "rgb(0, 0, 255)"), ("ci", "rgb(0, 128, 0)"), ("pd", "rgb(0, 0, 0)")] {
             assert_eq!(font_shorthand_cs(&mut e, id, "caretColor"), want, "{id} caretColor");
+        }
+    }
+
+    // ---- AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (LEDGER SR1116): text-underline-offset is inherited: the report and the paint (named tail block) ----
+
+    /// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): 20px serif rows of "gyp gyp" (black text, red decorations, 20px apart):
+    /// `#io` an underlined span under a `text-underline-offset: 3px` div and `#ia` its twin under a plain div; `#iu` a `<u>`
+    /// under a 3px div; under 3px divs, `#ii` a span with `text-underline-offset: inherit`, `#in` one with `initial`, `#iw`
+    /// one with its own 1px.
+    fn underline_offset_inherit_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            div, span, u { text-decoration-color: red }
+            .o { text-underline-offset: 3px }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div class="o"><span id="io" style="text-decoration-line: underline">gyp gyp</span></div>
+            <div><span id="ia" style="text-decoration-line: underline">gyp gyp</span></div>
+            <div class="o"><u id="iu">gyp gyp</u></div>
+            <div class="o"><span id="ii" style="text-underline-offset: inherit">gyp</span><span id="in" style="text-underline-offset: initial">gyp</span><span id="iw" style="text-underline-offset: 1px">gyp</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): getComputedStyle reads the inherited offset (Chromium: `3px` under a
+    /// 3px div; armed: before SR1116 the column read the span's own paint, `auto`); `inherit` 3px, `initial` auto, own 1px.
+    #[test]
+    fn underline_offset_inherit_computed_style() {
+        let mut e = underline_offset_inherit_engine();
+        for (id, want) in [("io", "3px"), ("ia", "auto"), ("iu", "3px"), ("ii", "3px"), ("in", "auto"), ("iw", "1px")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textUnderlineOffset"), want, "{id} textUnderlineOffset");
+        }
+    }
+
+    /// AETHERCSSOMTEXTUNDERLINEOFFSETINHERIT (SR1116): a span that decorates on its own under a 3px div paints its underline
+    /// 3 rows lower than its twin under a plain div (each from its own box top; armed: before SR1116 deco_ink reset the
+    /// offset at the decorating span and both painted at auto), and so does a `<u>` under a 3px div.
+    #[test]
+    fn underline_offset_inherit_paints_lower() {
+        let mut e = underline_offset_inherit_engine();
+        let auto = text_underline_rows(&mut e, "ia", css_wide_red);
+        let ta = imgalt_rect(&mut e, "ia").1.floor() as i64;
+        assert!(!auto.is_empty(), "the auto twin paints red: {auto:?}");
+        for id in ["io", "iu"] {
+            let off = text_underline_rows(&mut e, id, css_wide_red);
+            assert!(!off.is_empty(), "{id} paints red");
+            let t = imgalt_rect(&mut e, id).1.floor() as i64;
+            assert_eq!(off[0] as i64 - t, auto[0] as i64 - ta + 3, "{id} 3 rows lower: {off:?} vs {auto:?}");
+            assert_eq!(off.len(), auto.len(), "{id} the same band height");
         }
     }
 }
