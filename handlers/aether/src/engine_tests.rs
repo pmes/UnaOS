@@ -12486,4 +12486,71 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "lt", "textDecoration"), "line-through solid rgb(0, 0, 0)");
         assert_eq!(font_shorthand_cs(&mut e, "ul", "textDecoration"), "underline line-through solid rgb(0, 0, 0)");
     }
+
+    // ---- AETHERCSSOMREPORTSHORTHANDCOMPUTED (LEDGER SR1125): a declared report-covered shorthand reads its columns' computed values (named tail block) ----
+
+    /// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): declared margin / padding / border shorthands, a non-uniform border,
+    /// an undeclared div, a percentage width and a text-decoration.
+    fn report_shorthand_computed_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="m1" style="margin: 1em">a</div>
+            <div id="m2" style="margin: 1px 2px">b</div>
+            <div id="p" style="padding: 1em 0">c</div>
+            <div id="bw" style="border-style: solid; border-width: 0.25em">d</div>
+            <div id="bs" style="border-width: 2px; border-style: dashed">e</div>
+            <div id="bt" style="border-top: 1px dashed red">f</div>
+            <div id="b" style="border: 2px solid red">g</div>
+            <div id="bn" style="border: 2px solid red; border-left-width: 4px">h</div>
+            <div id="u">i</div>
+            <div id="w" style="width: 50%">j</div>
+            <div id="td" style="text-decoration: underline red">k</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): the sides shorthands read their columns in px (before SR1125: `#m1`
+    /// read `1em`, `#p` `1em 0`, `#bw` `0.25em`, the declared text).
+    #[test]
+    fn report_shorthand_computed_declared_sides() {
+        let mut e = report_shorthand_computed_engine();
+        for (id, prop, want) in [
+            ("m1", "margin", "16px"),
+            ("m2", "margin", "1px 2px"),
+            ("p", "padding", "16px 0px"),
+            ("bw", "borderWidth", "4px"), // layout_core reads no `thin` keyword in border-width (owed AETHER-CSS-BORDER-WIDTH-KEYWORD)
+            ("bs", "borderStyle", "dashed"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "#{id} {prop}");
+        }
+    }
+
+    /// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): border-<side> and border keep every part (Chromium's computed form);
+    /// a non-uniform border reads "" (before SR1125: `#bt` `1px dashed red`, `#b` `2px solid red`, `#u` border "").
+    #[test]
+    fn report_shorthand_computed_border() {
+        let mut e = report_shorthand_computed_engine();
+        for (id, prop, want) in [
+            ("bt", "borderTop", "1px dashed rgb(255, 0, 0)"),
+            ("b", "border", "2px solid rgb(255, 0, 0)"),
+            ("bn", "border", ""),
+            ("u", "borderTop", "0px none rgb(0, 0, 0)"),
+            ("u", "border", "0px none rgb(0, 0, 0)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "#{id} {prop}");
+        }
+    }
+
+    /// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): unchanged reads — an undeclared margin, the boxes road for a percentage
+    /// width, SR1113's textDecoration composer.
+    #[test]
+    fn report_shorthand_computed_kept() {
+        let mut e = report_shorthand_computed_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "u", "margin"), "0px");
+        assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
+    }
 }
