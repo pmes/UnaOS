@@ -108,7 +108,7 @@ pub fn text_boxes() -> Vec<TextBox> {
 // call's SUBTREE INK: the screen rect every pixel its paint (its own and its nested calls') can touch, or
 // unbounded when the shape is not bounded here (transforms, filters, clip-paths, backdrop filters,
 // text shadows, vertical writing, column fragments, multicol rules, scrollbars, form controls and media,
-// author ::marker text, text outside an inline formatting context). It records the text boxes too. The PAINT
+// author ::marker text). It records the text boxes too. The PAINT
 // walk then skips a `draw_node` call whose subtree ink meets no damage rect: such a box writes no pixel of the
 // damage, every pixel it would write is outside it, and every painter clips to the damage — the skip moves no
 // pixel. The ink is a flat map of (box -> rect) in paint order of recording, rebuilt every frame, so it is never
@@ -3393,10 +3393,6 @@ fn frame_walk(
                     }
                 }
                 }
-            } else if dom_node.as_text().is_some() && !inherited.text_hidden && walk_mode() == 1 {
-                // AETHERPAINTPERF (SR130): a text run outside an inline formatting context wraps (or does not) at
-                // paint time; its lines are not bounded here.
-                ink_add(INK_ALL);
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
                 // The same face the measurer wrapped this run with
                 // (fonts::face): family x weight x style. The preloaded sans
@@ -3451,7 +3447,7 @@ fn frame_walk(
                             current_y - sy as f32 + inherited.shift_y,
                             if inherited.nowrap { f32::MAX } else { wrap_w.max(1.0) },
                         ));
-                        draw_lines(
+                        if walk_mode() == 1 { ink_add(text_lines_ink(&text, tx, ty, max_w, &adv, inherited.line_height, &mode, inherited.shadows(layout))); } else { draw_lines(
                             &text,
                             tx,
                             ty,
@@ -3467,7 +3463,7 @@ fn frame_walk(
                             height,
                             damage_rects,
                             clip,
-                        );
+                        ); }
                     }
                 }
             }
@@ -4952,4 +4948,35 @@ fn text_shadow_extent(text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32
 /// extent (the index walk's term in place of the unbounded ink).
 fn text_shadows_ink(run: Ink, text: &str, adv: &Advancer, ox: f32, by: f32, shadows: &[effects::Shadow]) -> Ink {
     shadows.iter().fold(run, |r, sh| ink_union(r, text_shadow_extent(text, adv, ox, by, sh)))
+}
+
+// ---- AETHERPAINTINDEXNONIFCTEXT (LEDGER SR1153): a text run outside an IFC is bounded by the lines draw_lines breaks it into (named tail block) ----
+
+/// AETHERPAINTINDEXNONIFCTEXT (SR1153): the ink of a text run outside an inline formatting context — `draw_lines`'s
+/// sibling: the same face, ascent and line height and the SAME `break_lines(adv, text, mode, max_width)` call, with the
+/// inputs the paint twin builds for `draw_lines` (the index walk runs the twin, which only computes until the draw).
+/// Each line's rect takes the IFC road's slack (its line box, 3 em above the baseline, 2 em below, 2 em and the
+/// spacing either side: glyph overhang and decorations), unioned with SR1150's shadow extents for that line.
+#[allow(clippy::too_many_arguments)]
+fn text_lines_ink(
+    text: &str,
+    origin_x: f32,
+    origin_y: f32,
+    max_width: f32,
+    adv: &Advancer,
+    line_height_mult: f32,
+    mode: &crate::fonts::lines::TextMode,
+    shadows: &[effects::Shadow],
+) -> Ink {
+    let Some(font) = crate::fonts::face(&adv.sel) else { return INK_NONE };
+    let size = adv.size;
+    let ascent = crate::fonts::baseline_offset(font, size, line_height_mult);
+    let line_height = crate::fonts::line_height(font, size, line_height_mult);
+    let m = 2.0 * size + 4.0 + mode.letter_spacing.abs() + mode.word_spacing.abs();
+    crate::fonts::lines::break_lines(adv, text, mode, max_width).iter().enumerate().fold(INK_NONE, |r, (i, line)| {
+        let top = origin_y + i as f32 * line_height;
+        let by = top + ascent;
+        let run = (origin_x - m, top.min(by - 3.0 * size) - 4.0, origin_x + line.width + m, (top + line_height).max(by + 2.0 * size) + 4.0);
+        ink_union(r, text_shadows_ink(run, &line.text, adv, origin_x, by, shadows))
+    })
 }
