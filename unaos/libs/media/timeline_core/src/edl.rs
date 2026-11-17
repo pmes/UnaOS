@@ -139,7 +139,7 @@ fn parse_tc(s: &str, fps: u32, line: usize) -> Result<i64, EdlError> {
     Ok(((n[0] * 60 + n[1]) * 60 + n[2]) * fps as i64 + n[3])
 }
 
-fn channel(s: &str) -> Option<(Kind, usize)> {
+pub(crate) fn channel(s: &str) -> Option<(Kind, usize)> {
     let (k, rest) = match s.as_bytes().first()? {
         b'V' => (Kind::Video, &s[1..]),
         b'A' => (Kind::Audio, &s[1..]),
@@ -291,8 +291,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             tl.add_source(reel, d);
         }
     }
-    let nv = events.iter().filter(|e| e.1 == Kind::Video).map(|e| e.2).max().unwrap_or(0);
-    let na = events.iter().filter(|e| e.1 == Kind::Audio).map(|e| e.2).max().unwrap_or(0);
+    let nv = events.iter().filter(|e| e.1 == Kind::Video).map(|e| e.2).max().unwrap_or(0).max(track_counts(text)?.0); // STRIATRACKADDREMOVE (SR856): `* UNA TRACKS` is a floor (file tail)
+    let na = events.iter().filter(|e| e.1 == Kind::Audio).map(|e| e.2).max().unwrap_or(0).max(track_counts(text)?.1); // STRIATRACKADDREMOVE (SR856)
     for _ in 0..nv {
         tl.add_track(Kind::Video);
     }
@@ -397,7 +397,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
     }
-    s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
+    s.push_str(&mark_line(tl)); s.push('\n'); s.insert_str(s.len() - 1, &tracks_line(tl)); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail); STRIATRACKADDREMOVE (SR856): `* UNA TRACKS` when a kind has an empty trailing track (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -624,4 +624,38 @@ fn mark_line(tl: &Timeline) -> String {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
+}
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): the `* UNA TRACKS` line (named tail block) ----
+// `* UNA TRACKS <nv> <na>` is the timeline's video and audio track counts. The events alone carry a kind's tracks only up
+// to the highest channel an event names, so an EMPTY TRAILING track would be dropped by a save; the line is written (last
+// in the header, before the blank line) ONLY when a count exceeds what the events carry, so every EDL without such a track
+// writes as before. The reader takes the counts as a floor for the tracks it makes (V first, then A). Refused as a syntax
+// error: not two integers, a count above `TRACKS_MAX`, a second TRACKS line.
+
+/// STRIATRACKADDREMOVE: the `(video, audio)` floor of every `* UNA TRACKS` line in `text` (`(0, 0)` without one).
+fn track_counts(text: &str) -> Result<(usize, usize), EdlError> {
+    let mut got: Option<(usize, usize)> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let Some(r) = raw.trim().strip_prefix("* UNA TRACKS ") else { continue };
+        let w: Vec<&str> = r.split_whitespace().collect();
+        let n = |s: &str| s.parse::<usize>().ok().filter(|&n| n <= crate::TRACKS_MAX);
+        let (Some(v), Some(a), 2, None) = (w.first().and_then(|s| n(s)), w.get(1).and_then(|s| n(s)), w.len(), got) else {
+            return Err(EdlError::Syntax { line });
+        };
+        got = Some((v, a));
+    }
+    Ok(got.unwrap_or((0, 0)))
+}
+
+/// STRIATRACKADDREMOVE: the header's `* UNA TRACKS` line, only when a kind holds more tracks than its events carry.
+fn tracks_line(tl: &Timeline) -> String {
+    let count = |k: Kind| tl.tracks.iter().filter(|t| t.kind == k).count();
+    let carried = |k: Kind| (0..tl.tracks.len()).filter(|&i| tl.tracks[i].kind == k && !tl.tracks[i].clips.is_empty()).filter_map(|i| tl.track_number(i)).max().unwrap_or(0);
+    let (nv, na) = (count(Kind::Video), count(Kind::Audio));
+    if (nv, na) == (carried(Kind::Video), carried(Kind::Audio)) {
+        return String::new();
+    }
+    format!("* UNA TRACKS {nv} {na}\n")
 }

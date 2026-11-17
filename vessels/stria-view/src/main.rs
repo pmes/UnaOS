@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "track+" | "track-"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,31 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): the V+ / A+ / Track - buttons and the `track+:` / `track-:` tokens (named tail block) ----
+
+#[cfg(test)]
+mod striatrackaddremove_tests {
+    use super::*;
+
+    /// M3: `track+:audio` adds A2 (the JSON `"tracks"` reads 3), `track-:A2` removes it (2) and names it on the message
+    /// line (the witness's `errors`), two undo steps; the three buttons' words are VERBS words and sit before `help`, still the last button.
+    #[test]
+    fn striatrackaddremove_witness_tokens_and_buttons() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "track+:audio").is_empty());
+        assert_eq!(face.state.timeline.tracks.len(), 3);
+        assert!(face.dirty());
+        assert_eq!(drive(&mut face, "track-:A2"), vec!["track-: removed A2 (0 clips)".to_string()], "the message road");
+        assert_eq!((face.state.timeline.tracks.len(), face.state.undo_depth()), (2, 2));
+        assert_eq!(face.state.timeline, tl);
+        assert_eq!(drive(&mut face, "track-:V9"), vec![format!("track- V9: {}", timeline_core::EditError::NoTrack)]);
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().map(|b| if let TetraNode::Button { id, .. } = b { id.as_str() } else { "" }).collect();
+        assert_eq!(ids[ids.len() - 4..], ["track+ video", "track+ audio", "track-", "help"]);
+        assert!(["track+ video", "track+ audio", "track-"].iter().all(|w| nle_face::VERBS.contains(w)));
     }
 }

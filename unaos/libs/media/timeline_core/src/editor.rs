@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -658,5 +658,66 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): `track+` / `track-` through the one commit, the selection remapped (named tail block) ----
+// The words ride THE verb dispatch both faces call. `track+ video` / `track+ audio` add an empty track at its canonical
+// slot (`Timeline::insert_track`); `track- <ch>` removes the track its channel word names (`V`, `V2`..`V9`, `A`, `A1`..`A9`,
+// the EDL's one channel parser), bare `track-` the primary selection's track, with its clips (`Timeline::remove_track`).
+// Each is ONE `commit` (undo restores the whole timeline). The selection, the set and the selected transition carry a track
+// index: they are remapped to the new layout BEFORE the commit (a removed track's entries are dropped), so `settle` checks
+// the new layout. Refused by name: a tenth track of a kind `EditError::Tracks`; bare `track-` with nothing selected, or a
+// channel word naming no track, `EditError::NoTrack`. Any other `track+` shape is not this verb.
+impl EditorState {
+    /// Add an empty track of `kind` at its canonical slot (one commit); later selected indices move up one track.
+    pub fn add_track(&mut self, kind: crate::Kind) -> Result<(), EditError> {
+        let slot = self.timeline.track_slot(kind);
+        let tl = self.timeline.insert_track(kind)?;
+        self.retrack(|t| Some(if t >= slot { t + 1 } else { t }));
+        self.commit(tl);
+        Ok(())
+    }
+    /// Remove track `track` with its clips (one commit); its selected entries go, later ones move down one track.
+    pub fn remove_track(&mut self, track: usize) -> Result<(), EditError> {
+        let tl = self.timeline.remove_track(track)?;
+        self.retrack(|t| match t {
+            t if t == track => None,
+            t if t > track => Some(t - 1),
+            t => Some(t),
+        });
+        self.commit(tl);
+        Ok(())
+    }
+    /// The track `track-` words name: `Some(Ok(index))`, `Some(Err(NoTrack))` for none, `None` when `v` is no `track-` word.
+    /// A face reads it before the verb to name what went (the message line).
+    pub fn track_minus_target(&self, v: &str) -> Option<Result<usize, EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("track-") {
+            return None;
+        }
+        Some(match (w.next(), w.next()) {
+            (None, _) => self.selection.map(|p| p.0).filter(|&t| t < self.timeline.tracks.len()).ok_or(EditError::NoTrack),
+            (Some(ch), None) => edl::channel(ch).and_then(|(k, n)| self.timeline.track_of(k, n)).ok_or(EditError::NoTrack),
+            _ => Err(EditError::NoTrack),
+        })
+    }
+    /// Every held track index through `f` (`None`: dropped): the set, the primary, the selected transition.
+    fn retrack(&mut self, f: impl Fn(usize) -> Option<usize>) {
+        self.set = self.set.iter().filter_map(|&(t, i)| f(t).map(|t| (t, i))).collect();
+        self.set.sort_unstable();
+        self.selection = self.selection.and_then(|(t, i)| f(t).map(|t| (t, i)));
+        self.transition = self.transition.and_then(|(t, i)| f(t).map(|t| (t, i)));
+    }
+    /// The `track+` / `track-` words of [`EditorState::verb`]; `None` for any other word.
+    fn tracks_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        if let Some(target) = self.track_minus_target(v) {
+            return Some(target.and_then(|t| self.remove_track(t)));
+        }
+        match v {
+            "track+ video" => Some(self.add_track(crate::Kind::Video)),
+            "track+ audio" => Some(self.add_track(crate::Kind::Audio)),
+            _ => None,
+        }
     }
 }

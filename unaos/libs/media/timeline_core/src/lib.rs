@@ -376,6 +376,8 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    /// STRIATRACKADDREMOVE (SR856): a tenth track of one kind (CMX channels run V..V9 and A..A9).
+    Tracks,
 }
 
 impl core::fmt::Display for EditError {
@@ -396,6 +398,7 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
         })
     }
 }
@@ -1525,6 +1528,68 @@ impl Timeline {
         }
         let mut tl = self.clone();
         tl.marks = m;
+        Ok(tl)
+    }
+}
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): add / remove a track at its canonical slot, the xfade indices shifted (named tail block) ----
+// A new track goes to its CANONICAL slot (after the last track of its kind; with none, video first and audio last), so a
+// timeline built V1..Vn, A1..An stays so and an EDL save / reopen keeps every track index. The one carrier of a track index
+// inside the Timeline is `audio_xfades[].track`: both ops shift it (a removed track's own records go with it) and validate.
+// The editor's selection, set and selected transition are remapped by `EditorState::add_track` / `remove_track`.
+
+/// STRIATRACKADDREMOVE: the most tracks of one kind (CMX 3600 channels `V`..`V9`, `A`..`A9`).
+pub const TRACKS_MAX: usize = 9;
+
+impl Timeline {
+    /// The index of the `num`th (1-based) track of `kind`: the inverse of [`Timeline::track_number`].
+    pub fn track_of(&self, kind: Kind, num: usize) -> Option<usize> {
+        (0..self.tracks.len()).filter(|&i| self.tracks[i].kind == kind).nth(num.checked_sub(1)?)
+    }
+    /// A track's channel word as the EDL writes it: `V`, `V2`.., `A`, `A2`.. (`None`: no such track).
+    pub fn track_word(&self, track: usize) -> Option<String> {
+        let num = self.track_number(track)?;
+        let k = if self.tracks[track].kind == Kind::Video { "V" } else { "A" };
+        Some(if num == 1 { String::from(k) } else { alloc::format!("{k}{num}") })
+    }
+    /// Where a new track of `kind` goes: after the last track of its kind; with none, video at 0 and audio at the end.
+    pub fn track_slot(&self, kind: Kind) -> usize {
+        match self.tracks.iter().rposition(|t| t.kind == kind) {
+            Some(i) => i + 1,
+            None if kind == Kind::Video => 0,
+            None => self.tracks.len(),
+        }
+    }
+    /// The timeline with an empty track of `kind` at [`Timeline::track_slot`]; every explicit audio crossfade at or after
+    /// the slot moves up one track. Refused: a tenth track of `kind` (`EditError::Tracks`).
+    pub fn insert_track(&self, kind: Kind) -> Result<Timeline, EditError> {
+        if self.tracks.iter().filter(|t| t.kind == kind).count() >= TRACKS_MAX {
+            return Err(EditError::Tracks);
+        }
+        let slot = self.track_slot(kind);
+        let mut tl = self.clone();
+        let i = tl.add_track(kind);
+        let t = tl.tracks.remove(i);
+        tl.tracks.insert(slot, t);
+        for x in tl.audio_xfades.iter_mut().filter(|x| x.track >= slot) {
+            x.track += 1;
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+    /// The timeline without track `track`: its clips and transitions go with it, its explicit audio crossfades are dropped
+    /// and every later one moves down one track. Refused: no such track (`EditError::NoTrack`).
+    pub fn remove_track(&self, track: usize) -> Result<Timeline, EditError> {
+        if track >= self.tracks.len() {
+            return Err(EditError::NoTrack);
+        }
+        let mut tl = self.clone();
+        tl.tracks.remove(track);
+        tl.audio_xfades.retain(|x| x.track != track);
+        for x in tl.audio_xfades.iter_mut().filter(|x| x.track > track) {
+            x.track -= 1;
+        }
+        tl.validate()?;
         Ok(tl)
     }
 }
