@@ -3600,7 +3600,7 @@ fn img_alt_ids<H: Host>(tree: &LayoutTree<H>, text: &NodeMap<TextRun>) -> Vec<ta
 /// next line starts at 0), so the widest line is the first line + the advance or a later line, and the box (icon
 /// included) stays inside the width SR707's `img_alt_cap` gives. Every line beside the 16 px float is indented, not only
 /// the first ([`icon_indents`], AETHERIMGALTINLINEICONFLOAT SR779: a line under 16 px tall indents line 2 too). A run with no
-/// face keeps `measure_text_run`'s rule (SR412).
+/// face keeps `measure_text_run`'s rule (SR412); the box is at least [`INLINE_ICON_ADVANCE`] tall (AETHERIMGALTINLINEICONFLOATCLEAR SR795: the float's bottom, below the last line).
 fn img_alt_measure<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) -> (f32, f32) {
     if !fonts.has_face(run.sel()) {
         return measure_text_run(run, max_width, fonts);
@@ -3612,7 +3612,7 @@ fn img_alt_measure<F: Fonts + ?Sized>(run: &TextRun, max_width: f32, fonts: &F) 
     let n = icon_indents(fonts.line_height(run.sel(), run.font_size, run.line_height)); let lines = fonts.break_lines(&run.text, &mode, &run.advancer(), max_width, INLINE_ICON_ADVANCE, n, false);
     let widest = lines.iter().enumerate().map(|(i, l)| if i < n { l.width + INLINE_ICON_ADVANCE } else { l.width }).fold(0.0f32, f32::max);
     let lh = fonts.line_height(run.sel(), run.font_size, run.line_height);
-    (widest, lines.len().max(1) as f32 * lh)
+    (widest, (lines.len().max(1) as f32 * lh).max(INLINE_ICON_ADVANCE)) // AETHERIMGALTINLINEICONFLOATCLEAR (SR795): the 16 px float's bottom
 }
 
 #[cfg(test)]
@@ -3704,5 +3704,33 @@ mod img_alt_inline_icon_float_kat {
         assert_eq!(img_alt_measure(&run("seventeen one", 12.0), 0.0, &Mono).0, 72.0 + 16.0, "min-content: the first word + the icon");
         assert_eq!(img_alt_measure(&run("one seventeen", 12.0), 0.0, &Mono).0, 72.0 + 16.0, "min-content at 12 px: line 2 is beside the icon too");
         assert_eq!(img_alt_measure(&run("one seventeen", 16.0), 0.0, &Mono).0, 72.0, "min-content at 16 px: line 2 uses the whole column");
+    }
+}
+
+// ---- AETHERIMGALTINLINEICONFLOATCLEAR (LEDGER SR795): the inline alt's box clears its 16 px icon float (named tail block) ----
+
+#[cfg(test)]
+mod img_alt_inline_icon_float_clear_kat {
+    use super::img_alt_wrap_kat::Mono;
+    use super::{img_alt_measure, TextRun};
+    use crate::prelude::*;
+
+    /// A 16 px Mono run (8 px per char) on a `lh` px line (`line_height` -lh: px).
+    fn run(text: &str, lh: f32) -> TextRun {
+        TextRun { text: text.to_string(), font_size: 16.0, line_height: -lh, ..Default::default() }
+    }
+
+    /// AETHERIMGALTINLINEICONFLOATCLEAR (SR795): Chromium's 16x16 icon is a float its container contains, so a one-line
+    /// alt on a line under 16 px is a 16 px box (the float's bottom below the last line); 16 px and taller lines keep
+    /// lines x line height, and two 12 px lines (24 > 16) are unchanged.
+    #[test]
+    fn img_alt_inline_icon_float_clear_kat() {
+        for lh in [12.0, 14.0, 15.9, 16.0] {
+            assert_eq!(img_alt_measure(&run("Hello", lh), 120.0, &Mono), (40.0 + 16.0, 16.0), "one line at {lh} px: the box clears the icon");
+        }
+        assert_eq!(img_alt_measure(&run("Hello", 20.0), 120.0, &Mono), (56.0, 20.0), "a 20 px line is taller than the icon");
+        assert_eq!(img_alt_measure(&run("aaaa bbbb", 12.0), 80.0, &Mono), (48.0, 24.0), "two 12 px lines beside the icon: 24 > 16 unchanged");
+        let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        assert_eq!(img_alt_measure(&run(long, 12.0), f32::MAX, &Mono).1, 16.0, "unbounded at 12 px: one line, the icon's 16 px");
     }
 }

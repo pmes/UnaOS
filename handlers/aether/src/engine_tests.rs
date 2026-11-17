@@ -5508,4 +5508,53 @@ mod tests {
         let mut e = font_size_rel_engine();
         assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
     }
+
+    // ---- AETHERIMGALTINLINEICONFLOATCLEAR (LEDGER SR795): the inline alt's box clears its 16 px icon float (named tail block) ----
+
+    /// AETHERIMGALTINLINEICONFLOATCLEAR (SR795): a reference span "Hello", then `target`, then a second line "Hello" (`n`),
+    /// in a div `d` at `font`.
+    fn img_alt_float_clear_page(font: &str, target: &str) -> crate::AetherEngine {
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div id="d" style="font:{font}"><span id="r">Hello</span> {target}<br><span id="n">Hello</span></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERIMGALTINLINEICONFLOATCLEAR (SR795): Chromium's 16x16 icon floats inside the alt's container, which contains
+    /// it, so a one-line alt on a 12 or 14 px line is a 16 px box (20 px lines keep 20); the alt text stays on SR730's
+    /// first-line baseline (its bottom ink row is the reference span's), and the extra lies below it: the next line's
+    /// first ink row is 4 px lower than in the twin page whose target is a plain span.
+    #[test]
+    fn img_alt_inline_icon_float_clears_short_lines() {
+        let img = r#"<img id="t" src="missing.png" alt="Hello">"#;
+        for (font, want) in [("12px/12px sans-serif", 16.0), ("12px/14px sans-serif", 16.0), ("12px/20px sans-serif", 20.0)] {
+            let mut engine = img_alt_float_clear_page(font, img);
+            let (_, _, _, h) = imgalt_rect(&mut engine, "t");
+            assert!((h - want).abs() <= 0.5, "{font}: the alt box is {want} px tall ({h})");
+        }
+        let first_ink = |e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize| (y0..300).find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0);
+        let bottom_ink = |e: &crate::AetherEngine, x0: usize, x1: usize, y1: usize| (0..y1).rev().find(|&y| imgalt_ink(e, x0, x1, y, y + 1) > 0);
+        let mut engine = img_alt_float_clear_page("12px/12px sans-serif", img);
+        let (rl, _, rw, _) = imgalt_rect(&mut engine, "r");
+        let (tl, tt, tw, _) = imgalt_rect(&mut engine, "t");
+        let y1 = (tt + 12.0).round() as usize;
+        let rb = bottom_ink(&engine, rl.floor() as usize, (rl + rw).ceil() as usize, y1).expect("the reference span paints");
+        let tb = bottom_ink(&engine, (tl + 17.0).ceil() as usize, (tl + tw).ceil() as usize, y1).expect("the alt text paints");
+        assert!((rb as i64 - tb as i64).abs() <= 1, "SR730: the alt sits on the reference span's baseline (bottom ink rows {tb} vs {rb})");
+        let (_, dt, _, _) = imgalt_rect(&mut engine, "d");
+        let (nl, _, nw, _) = imgalt_rect(&mut engine, "n");
+        let (x0, x1, y0) = (nl.floor() as usize + 17, (nl + nw).ceil() as usize, (dt + 12.0).round() as usize);
+        let with_img = first_ink(&engine, x0, x1, y0).expect("line 2 paints under the img");
+        let mut twin = img_alt_float_clear_page("12px/12px sans-serif", r#"<span id="t">Hello</span>"#);
+        let (_, twin_dt, _, _) = imgalt_rect(&mut twin, "d");
+        let with_span = first_ink(&twin, x0, x1, (twin_dt + 12.0).round() as usize).expect("line 2 paints under the span");
+        let shift = with_img as i64 - with_span as i64;
+        assert!((shift - 4).abs() <= 1, "the line below starts 16 px down, 4 below a 12 px line (line 2 first ink row {with_img} vs {with_span})");
+    }
 }
