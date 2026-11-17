@@ -43,7 +43,7 @@
 //! (the renderers interpolate linearly between edges); those runs continue their sources (no seek, the same decoder). A
 //! transition TO black fades the outgoing's handle out in the track's gap ([`crate::Timeline::fade_to_silence`]): the
 //! clip's layer continues past its end under the falling weight, on its own slot.
-//! STRIAOPACITY (LEDGER SR868): a winning clip below [`crate::OPAQUE`] carries a Dissolve [`VideoMix`] of the highest video track under it (its clip at its own tick, or black) at `t = opacity / 100`, the outgoing-run slot holding the track below; an opaque winner's step is unchanged, and a stack of more than two layers is refused by name ([`ScheduleError::Opacity`]).
+//! STRIAOPACITY (LEDGER SR868): a winning clip below [`crate::OPAQUE`] carries a Dissolve [`VideoMix`] of the highest video track under it (its clip at its own tick, or black) at `t = opacity / 100`, the outgoing-run slot holding the track below; an opaque winner's step is unchanged, and a stack of more than four layers is refused by name ([`ScheduleError::Opacity`]); STRIASTACK (SR9066): the layers under the mixed one ride [`Step::stack`], bottom to top.
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -67,6 +67,8 @@ pub struct Step {
     pub seek: Option<i64>,
     /// NLE3: inside a transition (video only), the outgoing source mixed under this step's.
     pub vmix: Option<VideoMix>,
+    /// STRIASTACK (SR9066): the layers under `vmix`'s source, bottom to top from index 0 (each `t` the weight of the layer on it; index 0 may be black); [`NO_STACK`] for a two-layer step.
+    pub stack: [Option<VideoMix>; STACK_UNDER],
 }
 
 /// A fraction `num / den` (`den > 0`).
@@ -100,7 +102,7 @@ pub enum ScheduleError {
     OutOfSource(SourceId),
     /// The source has no stream of the kind its track needs.
     NoKeyframe(SourceId),
-    /// STRIAOPACITY (SR868): a non-opaque clip of this source over a transition or a second non-opaque layer (two layers only).
+    /// STRIAOPACITY (SR868): a non-opaque clip of this source over a transition, or topping a stack of more than four layers (STRIASTACK SR9066).
     Opacity(SourceId),
 }
 
@@ -111,7 +113,7 @@ impl core::fmt::Display for ScheduleError {
             ScheduleError::Invalid(e) => write!(f, "invalid timeline: {e}"),
             ScheduleError::OutOfSource(s) => write!(f, "clip past the end of source {}", s.0),
             ScheduleError::NoKeyframe(s) => write!(f, "source {} has no stream to seek", s.0),
-            ScheduleError::Opacity(s) => write!(f, "source {} is not opaque over a transition or a second non-opaque layer (two layers only)", s.0),
+            ScheduleError::Opacity(s) => write!(f, "source {} is not opaque over a transition, or tops a stack of more than four layers", s.0),
         }
     }
 }
@@ -128,7 +130,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
     let has = |k: Kind| tl.tracks.iter().any(|t| t.kind == k);
     let (video, audio) = (has(Kind::Video), has(Kind::Audio));
     let mut out = Vec::new();
-    let mut m_next: Option<(SourceId, i64)> = None; // NLE3: the transition's outgoing run
+    let mut m_next: Option<(SourceId, i64)> = None; let mut s_next: [Option<(SourceId, i64)>; STACK_UNDER] = [None; STACK_UNDER]; // STRIASTACK (SR9066): each stack index's continuation. NLE3: the transition's outgoing run
     // The previous video step's (source, the source tick it would continue at).
     let mut v_next: Option<(SourceId, i64)> = None;
     // NLE4: the audio steps are the mix runs' headers, one per run.
@@ -142,17 +144,17 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                 (None, Some((ti, ci))) => {
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_in + (t - c.at);
-                    let m0 = m_next; let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?; let vmix = opacity_mix(tl, idx, ti, ci, t, vmix, (v_next, m0), &mut m_next)?; // STRIAOPACITY (SR868): a non-opaque winner mixes the track below (file tail)
+                    let m0 = m_next; let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?; let vmix = opacity_mix(tl, idx, ti, ci, t, vmix, (v_next, m0), &mut m_next)?; let stack = stack_under(tl, idx, ti, ci, t, &mut s_next)?; // STRIASTACK (SR9066): the layers under the mixed one (file tail). STRIAOPACITY (SR868): a non-opaque winner mixes the track below (file tail)
                     let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, hand_back_prev(vmix.is_some(), m0, v_next, (c.src, src_t)))?; // STRIAOPACITYNEXT (SR993): the lower run positioned by the overlay continues without a seek (file tail)
                     v_next = Some((c.src, src_t + 1));
-                    Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
+                    Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix, stack }
                 }
                 (None, None) => {
                     (v_next, m_next) = (None, None);
-                    Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: None }
+                    Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: None, stack: NO_STACK }
                 }
             };
-            out.push(step);
+            if step.stack == NO_STACK { s_next = [None; STACK_UNDER]; } out.push(step);
         }
         if let Some(r) = run.next_if(|r| r.out_t == t) {
             out.push(r.header());
@@ -210,7 +212,7 @@ impl AudioRun {
             Some(l) => (Some(l.track), Some(l.src), l.src_t, l.seek),
             None => (None, None, 0, None),
         };
-        Step { kind: Kind::Audio, track, src, src_t, out_t: self.out_t, len: self.len, seek, vmix: None }
+        Step { kind: Kind::Audio, track, src, src_t, out_t: self.out_t, len: self.len, seek, vmix: None, stack: NO_STACK }
     }
 }
 
@@ -412,7 +414,7 @@ fn black_step(
     let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { *v_next } else { *m_next })?;
     (*v_next, *m_next) = (None, Some((o.src, src_t + 1)));
     let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: x.ease.apply(Frac { num: k + 1, den: x.dur + 1 }) }; // NLEWIPES (SR679): the ease
-    Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix) })
+    Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix), stack: NO_STACK })
 }
 
 // ── NLE6MIXAUDIO (rmbp-ledger B953): the ONE audio slot rule (Stria's render and the kernel Player's EDL feed) ──────
@@ -545,7 +547,7 @@ fn opacity_mix(
         return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
     };
     let lc = tl.tracks[li].clips[lci];
-    if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+    if tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
         return Err(ScheduleError::Opacity(c.src));
     }
     let src_t = lc.src_in + (t - lc.at);
@@ -577,4 +579,77 @@ fn hand_back_prev(mixing: bool, m0: Option<(SourceId, i64)>, v_next: Option<(Sou
         return m0;
     }
     v_next
+}
+
+// ---- STRIASTACK (LEDGER SR9066): the full visible stack under a non-opaque winner (named tail block) ----
+// NLE-OPACITY-STACK. `opacity_mix` mixes the layer right below the winner (`Step::vmix`, at the winner's opacity). When
+// that layer is itself below [`crate::OPAQUE`], the layers under it ride [`Step::stack`], BOTTOM TO TOP from index 0: each
+// a Dissolve [`VideoMix`] whose `t` is the opacity of the layer sitting on it (vmix's own meaning), index 0 black
+// (`src: None`) when the lowest non-opaque layer has nothing under it. Each index keeps its own run ([`seek_for`] against
+// that index's previous continuation); a step without index `j` drops run `j` ([`crate::vmix::take_stack`]). A two-layer
+// step carries [`NO_STACK`], so every two-layer schedule is byte-identical.
+
+/// STRIASTACK: how many layers a step carries under `vmix`'s source (four layers in all with the winner and `vmix`).
+pub const STACK_UNDER: usize = 2;
+
+/// STRIASTACK: the empty stack (every step of a timeline with at most two visible layers).
+pub const NO_STACK: [Option<VideoMix>; STACK_UNDER] = [None; STACK_UNDER];
+
+/// STRIASTACK: a layer clip's opacity at tick `t`: the ONE opacity read of [`stack_under`].
+fn layer_opacity(c: &crate::Clip, _t: i64) -> u8 {
+    c.opacity
+}
+
+/// STRIASTACK: the stack under the winner (clip `ci` of track `ti`) at tick `t`, bottom to top; `s_next` holds each
+/// index's continuation and is rewritten for the next tick. Refused by name ([`ScheduleError::Opacity`] of the winner's
+/// source): a transition TO black between a non-opaque layer and the one under it, a layer clip inside its own transition,
+/// and a stack deeper than [`STACK_UNDER`] under `vmix`.
+fn stack_under(
+    tl: &Timeline,
+    idx: &dyn SourceIndex,
+    ti: usize,
+    ci: usize,
+    t: i64,
+    s_next: &mut [Option<(SourceId, i64)>; STACK_UNDER],
+) -> Result<[Option<VideoMix>; STACK_UNDER], ScheduleError> {
+    let top = tl.tracks[ti].clips[ci];
+    let mut down = NO_STACK; // top to bottom
+    let mut n = 0;
+    let mut at = if layer_opacity(&top, t) == crate::OPAQUE { None } else { below(tl, ti, t) };
+    while let Some((li, lci)) = at {
+        let lc = tl.tracks[li].clips[lci];
+        let pct = layer_opacity(&lc, t);
+        if pct == crate::OPAQUE {
+            break;
+        }
+        let lower = below(tl, li, t);
+        if n == STACK_UNDER || black_over(tl, t, lower.map(|l| l.0)).is_some_and(|(i, _)| i < li) {
+            return Err(ScheduleError::Opacity(top.src));
+        }
+        let w = Frac { num: pct as i64, den: 100 };
+        down[n] = Some(match lower {
+            None => VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w },
+            Some((l2, c2)) => {
+                let c = tl.tracks[l2].clips[c2];
+                if tl.tracks[l2].transitions.iter().any(|x| x.at == c.at && t < c.at + x.dur) {
+                    return Err(ScheduleError::Opacity(top.src));
+                }
+                VideoMix { kind: TransitionKind::Dissolve, src: Some(c.src), src_t: c.src_in + (t - c.at), seek: None, t: w }
+            }
+        });
+        n += 1;
+        at = lower;
+    }
+    let mut stack = NO_STACK;
+    for k in 0..n {
+        let mut m = down[n - 1 - k].expect("filled above");
+        if let Some(src) = m.src {
+            m.seek = seek_for(tl, idx, Kind::Video, src, m.src_t, s_next[k])?;
+        }
+        stack[k] = Some(m);
+    }
+    for (k, next) in s_next.iter_mut().enumerate() {
+        *next = stack[k].and_then(|m| m.src.map(|src| (src, m.src_t + 1)));
+    }
+    Ok(stack)
 }

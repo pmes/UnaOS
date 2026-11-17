@@ -3802,3 +3802,39 @@ fn striaopacitynext_step_note_is_not_an_error() {
     assert_eq!(face.message_text(), face.reel_line());
     println!("striaopacitynext: opacity- -> note opacity: 90 %, cleared by select-all");
 }
+
+// ---- STRIASTACK (LEDGER SR9066): three video layers rendered through the one mix (named tail block) ----
+
+/// V1 A[0,30)@0 (counter 0) opaque, V2 B[0,30)@0 (counter 1000) at 40 %, V3 C[0,10)@10 (counter 2000) at 50 %: an
+/// overlay frame is A, B put on at 40/100, C put on at 50/100, each through timeline_core's ONE `vmix::mix_step`, byte
+/// for byte; outside the overlay it is SR868's two-layer frame (B at 40/100 over A).
+#[test]
+fn striastack_three_layers_render_through_the_one_mix() {
+    use timeline_core::TransitionKind::Dissolve;
+    use timeline_core::schedule::Frac;
+    let mut tl = Timeline::new(25);
+    let (a, b, c) = (tl.add_source("A", 50), tl.add_source("B", 50), tl.add_source("C", 50));
+    for _ in 0..3 {
+        tl.add_track(Kind::Video);
+    }
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 30, 0)];
+    tl.tracks[2].clips = vec![Clip::new(c, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    src.add(c, synth_source(2000, 50, 25)).unwrap();
+    let tl = tl.set_opacity(&[(1, 0)], 40).unwrap().set_opacity(&[(2, 0)], 50).unwrap();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..30, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 30);
+    for t in 0..30usize {
+        let mut model = TestPattern::render(64, 48, t as u32);
+        timeline_core::vmix::mix_step(Dissolve, Frac { num: 40, den: 100 }, &mut model, &TestPattern::render(64, 48, 1000 + t as u32), 64, 48);
+        if (10..20).contains(&t) {
+            timeline_core::vmix::mix_step(Dissolve, Frac { num: 50, den: 100 }, &mut model, &TestPattern::render(64, 48, 2000 + t as u32 - 10), 64, 48);
+        }
+        assert_eq!(sink.frames[t].1, model, "tick {t}");
+    }
+    println!("striastack: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
+}

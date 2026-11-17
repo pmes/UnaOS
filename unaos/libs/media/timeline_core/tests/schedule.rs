@@ -217,10 +217,10 @@ fn striaopacity_refusals_are_named() {
     use timeline_core::TransitionKind;
     let g = Gop { dur: 50 };
     let refused = Err(ScheduleError::Opacity(SourceId(1)));
-    // a non-opaque clip over a second non-opaque one
+    // a non-opaque clip over a second non-opaque one: STRIASTACK (SR9066) schedules it, black under the lower at 40/100
     let mut tl = striaopacity_stack(50);
     tl.tracks[0].clips[0].opacity = 40;
-    assert_eq!(schedule(&tl, 0..30, &g), refused);
+    assert_eq!(schedule(&tl, 0..30, &g).map(|s| s[10].stack[0].map(|m| (m.src, m.t.num))), Ok(Some((None, 40))));
     // a transition on the non-opaque clip's own cut: V2 B[0,10)@10 then B[10,20)@20 at 50%, a dissolve at 20
     let mut tl = striaopacity_stack(timeline_core::OPAQUE);
     tl.tracks[1].clips.push(Clip::new(SourceId(1), 20, 25, 20).with_opacity(50));
@@ -231,7 +231,7 @@ fn striaopacity_refusals_are_named() {
     tl.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 15, 0), Clip::new(SourceId(0), 20, 35, 15)];
     let tl = tl.add_transition(0, 15, TransitionKind::Dissolve, 3).unwrap();
     assert_eq!(schedule(&tl, 0..30, &g), refused);
-    assert_eq!(ScheduleError::Opacity(SourceId(1)).to_string(), "source 1 is not opaque over a transition or a second non-opaque layer (two layers only)");
+    assert_eq!(ScheduleError::Opacity(SourceId(1)).to_string(), "source 1 is not opaque over a transition, or tops a stack of more than four layers");
 }
 
 /// validate: above 100 percent, or a non-opaque audio clip, is `EditError::Opacity`.
@@ -273,7 +273,7 @@ fn striaopacitynext_lower_run_hands_back() {
 fn striaopacitynext_take_outgoing_hands_back() {
     use timeline_core::vmix::take_outgoing;
     let (a, b) = (SourceId(0), SourceId(1));
-    let step = |seek: Option<i64>| Step { kind: Kind::Video, track: Some(0), src: Some(a), src_t: 20, out_t: 20, len: 1, seek, vmix: None };
+    let step = |seek: Option<i64>| Step { kind: Kind::Video, track: Some(0), src: Some(a), src_t: 20, out_t: 20, len: 1, seek, vmix: None, stack: timeline_core::schedule::NO_STACK };
     let (mut live, mut mix) = (Some(b), Some(a));
     assert!(!take_outgoing(&step(None), &mut live, &mut mix, |r| *r));
     assert_eq!((live, mix), (Some(a), None));
@@ -284,4 +284,74 @@ fn striaopacitynext_take_outgoing_hands_back() {
     assert!(!take_outgoing(&step(None), &mut live, &mut mix, |r| *r));
     assert_eq!((live, mix), (Some(a), None));
     println!("striaopacitynext: the mix run hands back to the live slot");
+}
+
+// ---- STRIASTACK (LEDGER SR9066): the full visible stack, bottom to top (named tail block) ----
+
+/// V1 A[0,30)@0 opaque, V2 B[0,30)@0 at 40 %, V3 C[0,10)@10 at 50 %.
+fn striastack_three() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let (a, b, c) = (tl.add_source("A", 50), tl.add_source("B", 50), tl.add_source("C", 50));
+    for _ in 0..3 {
+        tl.add_track(Kind::Video);
+    }
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 30, 0).with_opacity(40)];
+    tl.tracks[2].clips = vec![Clip::new(c, 0, 10, 10).with_opacity(50)];
+    tl
+}
+
+/// Ticks 10..20: C's own step, vmix B at C's 50/100 continuing B's run, stack[0] A at its own tick at B's 40/100 (its
+/// own run: a seek at the first tick, none after), stack[1] empty; outside the overlay no stack; the SR868 two-layer
+/// stack carries NO_STACK on every step.
+#[test]
+fn striastack_three_layers_bottom_to_top() {
+    use timeline_core::schedule::{Frac, NO_STACK};
+    use timeline_core::TransitionKind;
+    let g = Gop { dur: 50 };
+    let steps = schedule(&striastack_three(), 0..30, &g).unwrap();
+    for (t, s) in steps.iter().enumerate().take(20).skip(10) {
+        let m = s.vmix.expect("the overlay mixes");
+        assert_eq!((s.src, s.track), (Some(SourceId(2)), Some(2)));
+        assert_eq!((m.src, m.src_t, m.seek, m.t), (Some(SourceId(1)), t as i64, None, Frac { num: 50, den: 100 }), "tick {t}");
+        let u = s.stack[0].expect("A under B");
+        assert_eq!((u.kind, u.src, u.src_t, u.t), (TransitionKind::Dissolve, Some(SourceId(0)), t as i64, Frac { num: 40, den: 100 }));
+        assert_eq!(u.seek, if t == 10 { Some(10 * NS) } else { None }, "tick {t}");
+        assert_eq!(s.stack[1], None);
+    }
+    assert!(steps[..10].iter().chain(&steps[20..]).all(|s| s.stack == NO_STACK));
+    let two = schedule(&striaopacity_stack(50), 0..30, &g).unwrap();
+    assert!(two.iter().all(|s| s.stack == NO_STACK), "two layers: byte-identical");
+    println!("striastack: three layers, the bottom run seeks once");
+}
+
+/// Five layers (four non-opaque over A) are refused by name, as the top clip's source.
+#[test]
+fn striastack_five_layers_refused() {
+    let mut tl = striastack_three();
+    let (d, e) = (tl.add_source("D", 50), tl.add_source("E", 50));
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Video);
+    tl.tracks[2].clips = vec![Clip::new(SourceId(2), 0, 30, 0).with_opacity(50)];
+    tl.tracks[3].clips = vec![Clip::new(d, 0, 30, 0).with_opacity(60)];
+    tl.tracks[4].clips = vec![Clip::new(e, 0, 10, 10).with_opacity(70)];
+    assert_eq!(schedule(&tl, 0..30, &Gop { dur: 50 }), Err(ScheduleError::Opacity(e)));
+    tl.tracks[4].clips.clear();
+    assert!(schedule(&tl, 0..30, &Gop { dur: 50 }).is_ok(), "four layers schedule");
+}
+
+/// `vmix::take_stack`: a run whose stack index names no source is dropped; a used index keeps its run.
+#[test]
+fn striastack_take_stack_drops_unused() {
+    use timeline_core::schedule::{Frac, NO_STACK, VideoMix};
+    let a = SourceId(0);
+    let m = VideoMix { kind: timeline_core::TransitionKind::Dissolve, src: Some(a), src_t: 3, seek: None, t: Frac { num: 40, den: 100 } };
+    let mut step = Step { kind: Kind::Video, track: Some(2), src: Some(SourceId(2)), src_t: 0, out_t: 3, len: 1, seek: None, vmix: None, stack: NO_STACK };
+    step.stack[0] = Some(m);
+    let mut runs = [Some(a), Some(SourceId(1))];
+    timeline_core::vmix::take_stack(&step, &mut runs);
+    assert_eq!(runs, [Some(a), None]);
+    step.stack[0] = Some(VideoMix { src: None, ..m });
+    timeline_core::vmix::take_stack(&step, &mut runs);
+    assert_eq!(runs, [None, None]);
 }

@@ -518,7 +518,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let (w, h) = (r.width, r.height);
     let black: Vec<u8> = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
     let tol = tl.tb.to_ns(1) / 2;
-    let mut vmix_run: Option<Vid> = None; // NLE3: a transition's outgoing run
+    let mut vmix_run: Option<Vid> = None; let mut stack_runs: [Option<Vid>; timeline_core::schedule::STACK_UNDER] = Default::default(); // STRIASTACK (SR9066): each stack layer's own run. NLE3: a transition's outgoing run
     let mut vid: Option<Vid> = None;
     // NLE4: one audio decoder per track; the k-th audio step is the k-th mix run.
     let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
@@ -527,18 +527,18 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
         if sink.stop() { r.stopped = Some(s.out_t); break; } // NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
         match (s.kind, s.src) {
             (Kind::Video, None) => {
-                vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
+                vmix_take(s, &mut vid, &mut vmix_run); timeline_core::vmix::take_stack(s, &mut stack_runs); // STRIASTACK (SR9066). NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
                 match s.vmix {
-                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &black, w, h, tol, &mut r)?),
+                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &mut stack_runs, &black, w, h, tol, &mut r)?),
                     None => sink.frame(s.out_t, w, h, &black),
                 }
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
-                vmix_take(s, &mut vid, &mut vmix_run);
+                vmix_take(s, &mut vid, &mut vmix_run); timeline_core::vmix::take_stack(s, &mut stack_runs); // STRIASTACK (SR9066): a stack index the step leaves empty drops its run
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
                 let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
-                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
+                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &mut stack_runs, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -711,6 +711,7 @@ fn vmix_frame(
     sources: &Sources,
     s: &timeline_core::schedule::Step,
     vmix_run: &mut Option<Vid>,
+    stack_runs: &mut [Option<Vid>; timeline_core::schedule::STACK_UNDER], // STRIASTACK (SR9066): the layers under the mixed one
     b: &[u8],
     w: u32,
     h: u32,
@@ -721,7 +722,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            stack_rgba(tl, sources, s, stack_runs, reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0, w, h, tol, r)? // STRIASTACK (SR9066): composited over the stack under it (file tail). NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -987,4 +988,52 @@ impl Sources {
         let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
+}
+
+// ---- STRIASTACK (LEDGER SR9066): the stack under the mixed layer, composited through the one mix (named tail block) ----
+// NLE-OPACITY-STACK. A step's `stack` (timeline_core `schedule::Step::stack`, bottom to top) lies under `vmix`'s source:
+// the bottom layer's frame (or opaque black), each next layer put on at the `t` of the entry below it, then
+// `vmix`'s own frame at the top stack entry's `t`; that composite is `vmix_frame`'s outgoing, which the step's own frame
+// then goes over at `vmix.t`. Every layer decodes on its own run (`stack_runs[j]`) through `vid_frame` / `reel_rgba`, and
+// every mix is timeline_core's ONE `vmix::mix_step`. An empty stack returns the frame untouched (byte-identical).
+
+/// STRIASTACK: `top` (the frame of `s.vmix`'s source, `w x h`) composited over `s.stack`.
+#[allow(clippy::too_many_arguments)]
+fn stack_rgba(
+    tl: &Timeline,
+    sources: &Sources,
+    s: &timeline_core::schedule::Step,
+    stack_runs: &mut [Option<Vid>; timeline_core::schedule::STACK_UNDER],
+    top: Vec<u8>,
+    w: u32,
+    h: u32,
+    tol: i64,
+    r: &mut RenderReport,
+) -> Result<Vec<u8>, RenderError> {
+    if s.stack == timeline_core::schedule::NO_STACK {
+        return Ok(top);
+    }
+    let mut out: Option<Vec<u8>> = None;
+    let mut under_t = None;
+    for (j, m) in s.stack.iter().enumerate() {
+        let Some(m) = *m else { break };
+        let f = match m.src {
+            Some(src) => {
+                let a = vid_frame(tl, sources, &mut stack_runs[j], src, m.src_t, m.seek, tol, r)?;
+                reel_rgba(sources, src, &a, &mut stack_runs[j], w, h, reel_fit(tl, src, false))?.0
+            }
+            None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
+        };
+        out = Some(match (out, under_t) {
+            (Some(mut o), Some(t)) => {
+                timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, t, &mut o, &f, w, h);
+                o
+            }
+            _ => f,
+        });
+        under_t = Some(m.t);
+    }
+    let (Some(mut o), Some(t)) = (out, under_t) else { return Ok(top) };
+    timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, t, &mut o, &top, w, h);
+    Ok(o)
 }

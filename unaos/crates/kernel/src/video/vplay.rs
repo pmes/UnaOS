@@ -980,6 +980,8 @@ pub struct EdlReport {
     pub stand_in_frames: u64,
     /// STRIAOPACITYNEXT (SR993): what the current step mixes for (`opacity` / `transition`), named by a refused second slot.
     pub mix_what: &'static str,
+    /// STRIASTACK (SR9066): video steps whose stack (layers under the mixed one) the two decoder slots cannot carry.
+    pub stack_refused: u64,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
 }
 
@@ -1082,7 +1084,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if rep.plan.len() < SHOWN_CAP {
             rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
         }
-        rep.mix_what = mix_what(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIAOPACITYNEXT (SR993): an opacity tick's refusal names opacity (file tail)
+        stack_refuse(rep, s); rep.mix_what = mix_what(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIASTACK (SR9066): a stack deeper than two layers refused by name. STRIAOPACITYNEXT (SR993): an opacity tick's refusal names opacity (file tail)
         let mut frame = match s.src {
             None => {
                 if s.vmix.is_none() {
@@ -2686,4 +2688,22 @@ fn mix_what(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step) -> 
 /// STRIAOPACITYNEXT: the refusal line's subject and tail for [`EdlReport::mix_what`].
 fn refuse_words(what: &str) -> (&'static str, &'static str) {
     if what == "opacity" { ("opacity", "; the top clip shows opaque") } else { ("transition", "") }
+}
+
+// ── STRIASTACK (LEDGER SR9066): a stack deeper than the two decoder slots, refused by name (named tail block) ─────────────
+// handlers.md NLE-OPACITY-STACK. timeline_core's step carries the layers under the mixed one in `Step::stack`; the Player has
+// two decoder slots (`run`, `mix`), so it shows the top two layers (the step's own picture over `vmix`'s source) and names
+// the rest: `[vplay] opacity: a stack of <n> layers refused (two decoder slots); the top two show` for the first four.
+// NLE-STACK-KERNEL (decoding the stack) stays owed.
+
+/// STRIASTACK: a step with any stack layer is counted and, for the first four, named on the wire.
+fn stack_refuse(rep: &mut EdlReport, s: &timeline_core::schedule::Step) {
+    let n = s.stack.iter().filter(|m| m.is_some()).count();
+    if n == 0 {
+        return;
+    }
+    rep.stack_refused += 1;
+    if rep.stack_refused <= 4 {
+        serial_println!("[vplay] opacity: a stack of {} layers refused (two decoder slots); the top two show", n + 2);
+    }
 }
