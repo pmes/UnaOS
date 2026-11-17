@@ -2145,7 +2145,7 @@ mod playaudio_tests {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
-use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, H264Opts, VIDEO_NAMES, export_as_with, video_named_with}; // STRIAEXPORTPRESETS (SR871): the table with a preset's H.264 options
+use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, H264Opts, PresetOpts, VIDEO_NAMES, export_as_with, video_named_with}; // STRIAEXPORTPRESETS (SR871): the table with a preset's H.264 options
 
 /// NLE5d (SR694): the export band's height (px), painted over the ruler's foot while an export runs.
 pub const EXPORT_BAND_H: u32 = 2;

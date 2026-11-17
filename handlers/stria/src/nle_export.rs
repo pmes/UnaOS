@@ -897,7 +897,7 @@ pub fn qcomp_of(s: &str) -> Option<(i64, i64)> {
 
 // ---- NLE5DEXPORTAUDIOOPTIONS (LEDGER SR722): the one audio table, the video table's twin (named tail block) ----
 /// AAC-LC's kb/s when the word names none (`nle export --audio aac` / `--aac`, NLE6EXPORTAAC rmbp-ledger B960's 128).
-pub const DEFAULT_AAC_KBPS: u32 = 128;
+pub const DEFAULT_AAC_KBPS: u32 = timeline_core::export_presets::AAC_KBPS; // STRIAEXPORTPRESETSTHREE (SR9021): the shared core's, the kernel export's `aac` too
 
 /// The audio words [`audio_named`] takes (`nle export --audio`'s, the editor face's `export` audio word); `aac` also as
 /// `aac:KBPS`.
@@ -1034,55 +1034,20 @@ pub fn export_total(tl: &Timeline, range: &std::ops::Range<i64>) -> u64 {
 }
 
 // ---- STRIAEXPORTPRESETS (LEDGER SR871): the export presets, named bundles of the two tables' words (named tail block) ----
-/// One export preset (`nle export --preset <name>`, the editor face's `export [<dir>] --preset <name>`): a [`VIDEO_NAMES`]
-/// word read by [`video_named_with`], an [`audio_named`] word, and the [`H264Opts`] fields it sets ([`ExportPreset::opts`]).
-/// A preset is no second table: both faces hand its words to the two tables they already read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExportPreset {
-    /// The word after `--preset`.
-    pub name: &'static str,
-    /// A [`VIDEO_NAMES`] word.
-    pub video: &'static str,
-    /// An [`audio_named`] word.
-    pub audio: &'static str,
-    /// [`H264Opts::qp`] (the rate controller's starting QP under a CRF).
-    pub qp: u8,
-    /// [`H264Opts::crf`].
-    pub crf: Option<u8>,
-    /// [`H264Opts::scenecut`].
-    pub scenecut: Option<u8>,
-    /// [`H264Opts::aq`].
-    pub aq: Option<u8>,
-    pub scale: u8, // STRIAEXPORTPRESETSNEXT (SR989): the frame's width / height divisor (1 = the timeline's size), applied by [`scaled`] (file tail)
-}
+/// THE preset table lives in timeline_core (STRIAEXPORTPRESETSTHREE, LEDGER SR9021: the kernel's `nle export --preset` reads
+/// the same rows); every name is re-exported here. A preset is no second table: both faces hand its words to the two tables
+/// they already read ([`VIDEO_NAMES`] through [`video_named_with`], [`audio_named`]), its knobs through [`PresetOpts::opts`].
+pub use timeline_core::export_presets::{ExportPreset, PRESETS, preset_named, preset_words};
 
-/// THE preset table: `web` (H.264 at CRF 23 with AQ and scene cuts, AAC-LC 128), `archive` (the lossless PNG sequence and
-/// PCM16 WAV), `proxy` (H.264 at CRF 32, AAC-LC 64).
-pub const PRESETS: [ExportPreset; 3] = [
-    ExportPreset { name: "web", video: "h264", audio: "aac", qp: 26, crf: Some(23), scenecut: Some(40), aq: Some(10), scale: 1 },
-    ExportPreset { name: "archive", video: "png", audio: "wav", qp: 26, crf: None, scenecut: None, aq: None, scale: 1 },
-    ExportPreset { name: "proxy", video: "h264", audio: "aac:64", qp: 26, crf: Some(32), scenecut: None, aq: None, scale: 2 },
-];
-
-/// The preset named `word`; None for any other word.
-pub fn preset_named(word: &str) -> Option<&'static ExportPreset> {
-    PRESETS.iter().find(|p| p.name == word)
-}
-
-/// The preset names as the usages and refusals spell them: `web|archive|proxy`.
-pub fn preset_words() -> String {
-    PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join("|")
-}
-
-impl ExportPreset {
+/// The H.264 options a preset sets (the [`H264Opts`] type is this crate's, the table timeline_core's).
+pub trait PresetOpts {
     /// The H.264 options the preset sets, every other field [`H264Opts::default`]'s.
-    pub fn opts(&self) -> H264Opts {
+    fn opts(&self) -> H264Opts;
+}
+
+impl PresetOpts for ExportPreset {
+    fn opts(&self) -> H264Opts {
         H264Opts { qp: self.qp, crf: self.crf, scenecut: self.scenecut, aq: self.aq, ..H264Opts::default() }
-    }
-    /// The preset's one listing line: `<name>: <video> + <audio>` then ` crf=N` / ` aq=N` / ` scenecut=N` for each set knob.
-    pub fn words(&self) -> String {
-        let knobs: String = [("crf", self.crf), ("aq", self.aq), ("scenecut", self.scenecut)].iter().filter_map(|(k, v)| v.map(|v| format!(" {k}={v}"))).collect();
-        format!("{}: {} + {}{knobs}{}", self.name, self.video, self.audio, if self.scale > 1 { format!(" scale=1/{}", self.scale) } else { String::new() }) // STRIAEXPORTPRESETSNEXT (SR989): a scaled preset names its divisor
     }
 }
 
@@ -1104,11 +1069,8 @@ pub fn scaled(inner: Box<dyn VideoEncoder>, div: u8) -> Box<dyn VideoEncoder> {
     Box::new(Scaled { inner, div: div as u32 })
 }
 
-/// The coded size of a `w x h` frame divided by `div`: each side divided, rounded down to even (4:2:0), at least 2.
-pub fn scaled_size(w: u32, h: u32, div: u32) -> (u32, u32) {
-    let d = div.max(1);
-    (((w / d) & !1).max(2), ((h / d) & !1).max(2))
-}
+/// The coded size of a `w x h` frame divided by `div` (timeline_core's, STRIAEXPORTPRESETSTHREE SR9021: the kernel's export reads it too).
+pub use timeline_core::export_presets::scaled_size;
 
 impl VideoEncoder for Scaled {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {

@@ -5127,7 +5127,7 @@ fn strianudge_keys_help_and_the_collisions() {
 
 #[test]
 fn striaexportpresets_table_is_the_two_tables_words() {
-    use stria::nle_export::{PRESETS, VIDEO_NAMES, audio_named, preset_named, preset_words};
+    use stria::nle_export::{PRESETS, PresetOpts, VIDEO_NAMES, audio_named, preset_named, preset_words}; // STRIAEXPORTPRESETSTHREE (SR9021): opts() is a trait now
     for p in &PRESETS {
         assert!(VIDEO_NAMES.contains(&p.video), "{}: {} is a video word", p.name, p.video);
         assert!(audio_named(p.audio).is_some(), "{}: {} is an audio word", p.name, p.audio);
@@ -5160,7 +5160,7 @@ fn striaexportpresets_archive_is_png_wav() {
 
 #[test]
 fn striaexportpresets_proxy_is_the_tables_encoder() {
-    use stria::nle_export::{Container, audio_named, export_as_with, preset_named, video_named_with};
+    use stria::nle_export::{Container, PresetOpts, audio_named, export_as_with, preset_named, video_named_with}; // STRIAEXPORTPRESETSTHREE (SR9021): opts() is a trait now
     let (pre, direct) = (nlefaceexport_dir("preset-proxy"), nlefaceexport_dir("preset-proxy-direct"));
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl, src);
@@ -11890,7 +11890,7 @@ fn striaexportpresetsnext_scale_one_is_the_encoder_itself() {
 
 #[test]
 fn striaexportpresetsnext_face_proxy_is_the_scaled_table_encoder() {
-    use stria::nle_export::{Container, PRESETS, audio_named, export_as_with, preset_named, scaled, video_named_with};
+    use stria::nle_export::{Container, PRESETS, PresetOpts, audio_named, export_as_with, preset_named, scaled, video_named_with}; // STRIAEXPORTPRESETSTHREE (SR9021): opts() is a trait now
     assert_eq!(PRESETS.iter().map(|p| (p.name, p.scale)).collect::<Vec<_>>(), [("web", 1), ("archive", 1), ("proxy", 2)]);
     let (picked, direct) = (nlefaceexport_dir("scale-picked"), nlefaceexport_dir("scale-direct"));
     let (tl, src) = synth_fixture();
@@ -13239,4 +13239,22 @@ fn striatracksthree_headers_toggle_target_track_minus() {
     assert!(face.on(&input("headers")));
     assert_eq!(face.layout().left, 0);
     println!("striatracksthree: headers on (left {HEADER_W}), A2's header -> bare track- removed A2; a ruler click drops the target");
+}
+
+// ---- STRIAEXPORTPRESETSTHREE (LEDGER SR9021): stria reads THE preset table from the shared core (named tail block) ----
+#[test]
+fn striaexportpresetsthree_stria_reads_the_core_table() {
+    use stria::nle_export::{AudioOut, DEFAULT_AAC_KBPS, PRESETS, audio_named, scaled_size};
+    assert_eq!(PRESETS, timeline_core::export_presets::PRESETS, "one table, re-exported");
+    assert_eq!(DEFAULT_AAC_KBPS, timeline_core::export_presets::AAC_KBPS);
+    for p in &PRESETS {
+        match audio_named(p.audio) {
+            Some(AudioOut::Aac(k)) => assert_eq!(p.aac_kbps(), Some(k), "{}: the kernel's rate is the host's", p.name),
+            _ => assert_eq!(p.aac_kbps(), None, "{}: no AAC word, no kernel rate", p.name),
+        }
+    }
+    for (w, h, d) in [(1280, 720, 2), (1920, 1080, 3), (5, 5, 2), (64, 48, 1)] {
+        assert_eq!(scaled_size(w, h, d), timeline_core::export_presets::scaled_size(w, h, d));
+    }
+    println!("striaexportpresetsthree: {}", PRESETS.iter().map(|p| format!("{}={:?}", p.name, p.aac_kbps())).collect::<Vec<_>>().join(" "));
 }
