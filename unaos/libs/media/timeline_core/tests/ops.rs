@@ -674,3 +674,40 @@ fn striagapclose_editor_one_undo_step() {
     assert_eq!(st.verb("gap 3"), Some(Err(EditError::NoClip)));
     assert_eq!(st.timeline, tl);
 }
+
+// ---- STRIANUDGE (LEDGER SR855): `nudge <d>` on THE dispatch, over move_set (named tail block) ----
+
+/// `nudge <d>` is `move_many` of the set by `d` ticks as ONE undo step; a refusal (negative, overlap, nothing selected)
+/// leaves the state; `nudge-` / `nudge+` are unchanged; any other shape is not an editor verb.
+#[test]
+fn strianudge_verb_moves_the_set_by_a_count() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("nudge 10"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.move_many(&[(0, 1)], 10).unwrap());
+    assert_eq!((st.undo_depth(), st.selection, st.set.clone()), (1, Some((0, 1)), vec![(0, 1)]));
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    st.select_many(&[(0, 0), (0, 1)], false);
+    assert_eq!(st.verb("nudge 5"), Some(Ok(())));
+    let five = tl.move_many(&[(0, 0), (0, 1)], 5).unwrap();
+    assert_eq!((&st.timeline, st.set.clone()), (&five, vec![(0, 0), (0, 1)]));
+    let depth = st.undo_depth();
+    assert_eq!(st.verb("nudge -50"), Some(Err(EditError::Negative)));
+    assert_eq!((&st.timeline, st.undo_depth()), (&five, depth));
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("nudge 3"), Some(Err(EditError::Overlap)));
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    for v in ["nudge 0", "nudge x", "nudge 1 2", "nudge", "nudge+7"] {
+        assert_eq!(st.verb(v), None, "{v}");
+    }
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("nudge+"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.move_many(&[(0, 1)], 1).unwrap());
+    st.deselect();
+    assert_eq!(st.verb("nudge 1"), Some(Err(EditError::NoClip)));
+    println!("strianudge: nudge 10 / nudge 5 over a set of two, one commit each; -50 Negative, +3 Overlap, deselected NoClip");
+}

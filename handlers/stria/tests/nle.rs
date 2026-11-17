@@ -5029,3 +5029,64 @@ fn striagapclose_face_words_ride_the_one_dispatch() {
     assert_eq!(face.state.timeline.tracks[0].clips[1].at, 15);
     println!("striagapclose: VERBS[{i}] = close-gaps; V1 after gap 5 at 10: {:?}", face.state.timeline.tracks[0].clips);
 }
+
+// ---- STRIANUDGE (LEDGER SR855): Shift+Left / Shift+Right nudge the selection SLIP_STEP frames; the message reads the new `at` (named tail block) ----
+
+/// Shift+Right moves the selected clip SLIP_STEP frames as ONE commit (timeline_core's `nudge 10` = `move_many`), the
+/// message line reads its new `at`; Shift+Left moves it back; an overlap is refused by name with the state kept; with
+/// nothing selected the face says so.
+#[test]
+fn strianudge_shift_arrows_step_ten_through_one_commit() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let tl0 = f.state.timeline.clone();
+    f.state.select(0, 2).unwrap();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Shift+Right".into())));
+    assert_eq!(f.state.timeline, tl0.move_many(&[(0, 2)], SLIP_STEP).unwrap());
+    assert_eq!((f.state.undo_depth(), f.state.selection), (1, Some((0, 2))));
+    assert_eq!(f.message_text().as_deref(), Some("nudge: at 35 (00:00:01:10)"));
+    assert!(f.on(&bandy::SMessage::BrowserKey("Shift+Left".into())));
+    assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 2));
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: at 25 (00:00:01:00)"));
+    f.state.select(0, 1).unwrap();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Shift+Right".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: clips overlap"));
+    assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 2));
+    f.state.deselect();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Shift+Left".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: no such clip"));
+    assert_eq!(f.state.timeline, tl0);
+    println!("strianudge: Shift+Right 25 -> 35, Shift+Left back, overlap and no-clip refused, undo depth 2");
+}
+
+/// The two KEYS rows (no VERBS word, no button) have their help phrases; Right still moves one frame and its message
+/// reads the new `at`; a set of two says its count; `,` is still SR737's slip; other counts are not face words.
+#[test]
+fn strianudge_keys_help_and_the_collisions() {
+    let rows = help_rows();
+    for (k, w, p) in [("Shift+Left", "nudge-10", "move the selection 10 frames earlier"), ("Shift+Right", "nudge+10", "move the selection 10 frames later")] {
+        assert!(KEYS.contains(&(k, w)), "{k}");
+        assert!(!VERBS.contains(&w), "{w}: a key's word, no button");
+        assert_eq!(help_phrase(w), p);
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, p);
+    }
+    assert!(KEYS.contains(&(",", "slip-")) && KEYS.contains(&(".", "slip+")), "SR737's keys kept");
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let tl0 = f.state.timeline.clone();
+    f.state.select(0, 2).unwrap();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Right".into())));
+    assert_eq!(f.state.timeline, tl0.move_many(&[(0, 2)], 1).unwrap());
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: at 26 (00:00:01:01)"));
+    assert!(f.verb("undo"));
+    f.state.select(0, 1).unwrap();
+    f.state.select_add(0, 2).unwrap();
+    assert!(f.on(&bandy::SMessage::BrowserText("\u{f703}".into())));
+    assert_eq!(f.state.timeline, tl0.move_many(&[(0, 1), (0, 2)], 1).unwrap());
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: 2 clips, at 26 (00:00:01:01)"));
+    let tl1 = f.state.timeline.clone();
+    for v in ["nudge+7", "nudge10", "nudge-10x"] {
+        assert!(!f.verb(v), "{v} is not a face word");
+    }
+    assert_eq!(f.state.timeline, tl1);
+    println!("strianudge: help rows={} keys={}; Right one frame, a set of two says its count", rows.len(), KEYS.len());
+}
