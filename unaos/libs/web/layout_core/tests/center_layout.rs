@@ -712,3 +712,140 @@ fn table_align_css_wins_div_caption_rtl() {
     assert_eq!(box_of(&tree, &doc.by_id("t")).0, 100.0, "rtl: align=center still centres the table box");
 }
 
+
+// ---- AETHERCENTERAUTOWIDTH (LEDGER SR1159): an auto-width block under the centring road fills its line (named tail block) ----
+
+const AW: f32 = 800.0;
+
+/// AETHERCENTERAUTOWIDTH (SR1159): the first text line's (x, width) inside box `id`.
+fn line_of(tree: &Tree, doc: &N, id: &str) -> (f32, f32) {
+    tree.inline[&id_of(tree, &doc.by_id(id))]
+        .frags
+        .iter()
+        .find_map(|f| match f {
+            layout_core::inline::Frag::Text { x, width, .. } => Some((*x, *width)),
+            _ => None,
+        })
+        .expect("the block's text line")
+}
+
+/// AETHERCENTERAUTOWIDTH (SR1159): CSS 2.1 §10.3.3: an author `width: auto` block under `<center>` / -webkit-center /
+/// text-align center / right is as wide as its line (before SR1159 the column's align_items CENTER / END shrank it to its
+/// text); its INLINE content is what the centring moves. The builder's placeholder div already filled (pin).
+#[test]
+fn center_autowidth_fills() {
+    let div = || el("div", &[("id", "f"), ("style", "width: auto")], vec![text("fill me")]);
+    let cases: [(&str, N, bool); 4] = [
+        ("<center>", page(vec![el("center", &[], vec![div()])]), true),
+        ("-webkit-center", page(vec![el("div", &[("style", "text-align: -webkit-center")], vec![div()])]), true),
+        ("text-align: center", page(vec![el("div", &[("style", "text-align: center")], vec![div()])]), true),
+        ("text-align: right", page(vec![el("div", &[("style", "text-align: right")], vec![div()])]), false),
+    ];
+    for (how, doc, mid) in &cases {
+        let tree = lay(doc, AW, 400.0);
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("f"));
+        assert_eq!((x, w), (0.0, AW), "{how}: the width: auto block fills its line");
+        if *mid {
+            let (lx, lw) = line_of(&tree, doc, "f");
+            assert!(lw > 0.0 && (lx + lw / 2.0 - AW / 2.0).abs() <= 1.0, "{how}: its text line is centred (x {lx} w {lw})");
+        }
+    }
+    let doc = page(vec![el("center", &[], vec![el("div", &[("id", "p")], vec![text("fill me")])])]);
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("p"));
+    assert_eq!((x, w), (0.0, AW), "<center>: the placeholder div fills (pin)");
+}
+
+/// AETHERCENTERAUTOWIDTH (SR1159): the kinds `centres_as_block` names keep the centring road (pins): a 200px div, a
+/// shrink-to-fit table, a CSS-sized block img; a block img sized by its attributes only is at (0, 800) before and after
+/// SR1159 (blockwidth's placeholder road; owed AETHER-CENTER-IMG-ATTR-BLOCK); a `max-width: 300px` div is 300 wide where blockwidth's STRETCH road puts it (owed
+/// AETHER-CENTER-MAXWIDTH: Chromium centres it); a floated `width: auto` div keeps the float arm's align-self, no mark.
+#[test]
+fn center_autowidth_narrow_kinds_stay_centred() {
+    use layout_core::taffy::style::AlignSelf;
+    let doc = page(vec![el(
+        "center",
+        &[],
+        vec![
+            el("div", &[("id", "d"), ("style", "width: 200px")], vec![text("ab")]),
+            el("table", &[("id", "t")], vec![el("tr", &[], vec![el("td", &[], vec![text("cell")])])]),
+            el("img", &[("id", "i"), ("style", "display: block; width: 100px; height: 10px")], vec![]),
+            el("img", &[("id", "ia"), ("width", "100"), ("height", "10"), ("style", "display: block")], vec![]),
+            el("div", &[("id", "m"), ("style", "max-width: 300px")], vec![text("cap")]),
+            el("div", &[("id", "fl"), ("style", "float: left; width: auto")], vec![text("float")]),
+        ],
+    )]);
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("d"));
+    assert_eq!((x, w), (300.0, 200.0), "the 200px div is centred");
+    for id in ["t", "i"] {
+        let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+        assert!(w > 0.0 && w < AW - 100.0 && (x + w / 2.0 - AW / 2.0).abs() < 0.5, "#{id} stays centred (x {x} w {w})");
+    }
+    assert_eq!(box_of(&tree, &doc.by_id("ia")).0, 0.0, "a block img sized by its width / height attributes only: today at x 0 (AETHER-CENTER-IMG-ATTR-BLOCK owed)");
+    assert_eq!(box_of(&tree, &doc.by_id("ia")).2, AW, "and 800 wide today, before and after SR1159");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (MAXW_X, 300.0), "max-width: 300px: 300 wide at today's x (AETHER-CENTER-MAXWIDTH owed)");
+    let fl = id_of(&tree, &doc.by_id("fl"));
+    assert_ne!(tree.taffy.style(fl).unwrap().align_self, Some(AlignSelf::STRETCH), "a float keeps its own align-self");
+    assert_eq!(layout_core::rule_align_mark(&tree, fl), None, "the rule writes no mark on a float");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("fl"));
+    assert!(x == 0.0 && w > 0.0 && w < AW - 100.0, "the float sits at the start, shrunk to its text (x {x} w {w})");
+}
+
+/// AETHERCENTERAUTOWIDTH (SR1159): today's x of a `max-width: 300px` div under `<center>` at 800 (measured).
+const MAXW_X: f32 = 0.0;
+
+/// AETHERCENTERAUTOWIDTH (SR1159): center > div > div, both `width: auto`: the inner column inherits -webkit-center and
+/// both fill.
+#[test]
+fn center_autowidth_nested() {
+    let doc = page(vec![el(
+        "center",
+        &[],
+        vec![el("div", &[("id", "o"), ("style", "width: auto")], vec![el("div", &[("id", "i"), ("style", "width: auto")], vec![text("inner")])])],
+    )]);
+    let tree = lay(&doc, AW, 400.0);
+    for id in ["o", "i"] {
+        let (x, _, w, _) = box_of(&tree, &doc.by_id(id));
+        assert_eq!((x, w), (0.0, AW), "#{id} fills");
+    }
+}
+
+/// AETHERCENTERAUTOWIDTH (SR1159): the STRETCH write rides SR686's undo road both ways: the width: auto div fills
+/// (mark STRETCH); a restyle to `width: 200px` centres it (mark CENTER); back to `width: auto` it fills again (mark
+/// STRETCH); the parent losing its centring (`text-align: left`) leaves no mark and no rule align-self on it.
+#[test]
+fn center_autowidth_restyle() {
+    use layout_core::taffy::style::AlignSelf;
+    let doc = page(vec![el("center", &[("id", "c")], vec![el("div", &[("id", "r"), ("style", "width: auto")], vec![text("restyle")])])]);
+    let mut tree = lay(&doc, AW, 400.0);
+    let r = id_of(&tree, &doc.by_id("r"));
+    let c = id_of(&tree, &doc.by_id("c"));
+    let cx = layout_core::css::ParseCx::new(AW, 400.0);
+    let restyle = |tree: &mut Tree, id, prop: &str, value: &str| {
+        let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+        layout_core::css::apply_declaration(prop, value, &mut s, &cx);
+        layout_core::apply_specs(tree, &[(id, std::rc::Rc::new(s))]);
+        layout_core::remeasure(tree, &F);
+    };
+    assert_eq!(box_of(&tree, &doc.by_id("r")).0, 0.0);
+    assert_eq!(box_of(&tree, &doc.by_id("r")).2, AW, "width: auto fills");
+    assert_eq!(layout_core::rule_align_mark(&tree, r), Some(AlignSelf::STRETCH), "the rule marks its STRETCH");
+
+    restyle(&mut tree, r, "width", "200px");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("r"));
+    assert_eq!((x, w), (300.0, 200.0), "width: 200px: centred");
+    assert_eq!(layout_core::rule_align_mark(&tree, r), Some(AlignSelf::CENTER), "the STRETCH mark is undone, CENTER marked");
+
+    restyle(&mut tree, r, "width", "auto");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("r"));
+    assert_eq!((x, w), (0.0, AW), "back to width: auto: fills again");
+    assert_eq!(layout_core::rule_align_mark(&tree, r), Some(AlignSelf::STRETCH), "the CENTER mark is undone, STRETCH marked");
+
+    restyle(&mut tree, c, "text-align", "left");
+    assert_eq!(layout_core::rule_align_mark(&tree, r), None, "the parent lost its centring: no mark on the child");
+    assert_eq!(tree.taffy.style(r).unwrap().align_self, None, "and no rule align-self");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("r"));
+    assert_eq!((x, w), (0.0, AW), "text-align: left: still fills");
+}
