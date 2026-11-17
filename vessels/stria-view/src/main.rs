@@ -62,7 +62,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, kind:CODE, ease:NAME, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -1098,7 +1098,7 @@ mod witnessdocs_tests {
 
     /// The depth-1 keys of the JSON object `j` starts with, in order, up to its close (strings skipped whole, so a `:` inside a
     /// value is no key).
-    fn top_keys(j: &str) -> Vec<String> {
+    pub(super) fn top_keys(j: &str) -> Vec<String> {
         let (b, mut keys, mut depth, mut i) = (j.as_bytes(), Vec::new(), 0usize, 0usize);
         while i < b.len() {
             match b[i] {
@@ -1153,6 +1153,81 @@ mod witnessdocs_tests {
         assert_eq!(keys[WITNESS_KEYS.len()..], ["export"], "{line}: export last");
         let obj = line.split_once(",\"export\":").map(|(_, o)| o).unwrap_or_else(|| panic!("{line}"));
         assert_eq!(top_keys(obj), &EXPORT_JSON_KEYS[..3], "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEWITNESSSCRIPTWORDSONETABLE (LEDGER SR1123): the --do words and the conditional keys, listed once (named tail block) ----
+/// The `--do` words besides the transport verbs (`nle_face::VERBS`): a word, or a prefix ending `:` that takes arguments, and
+/// its meaning. A PIN, not the parser: [`token`] / [`drive_on`] / [`tick_token`] keep their arms; the test below holds the three
+/// to this table, USAGE and docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md §4 (regenerated from it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SCRIPT_WORDS: [(&str, &str); 16] = [
+    ("at:", "at:<tick>:<track>, a click on that track at that tick"), ("ruler:", "ruler:<tick>, a click on the ruler"),
+    ("press:", "press:<x>:<y>, a button press at surface pixels"), ("move:", "move:<x>:<y>, the pointer moves there"),
+    ("release", "the button up and the click, at the last pointer"), ("key:", "key:<name>, the key as GTK sends it (key:space; key:Ctrl+a / key:Meta+a select all)"),
+    ("wheel:", "wheel:<n>, n notches at the last pointer (n > 0 zooms in)"), ("marquee:", "marquee:<x0>:<y0>:<x1>:<y1>, a press, a move and the release"),
+    ("shift:", "shift:<token>, the token with MOD_SHIFT on its presses (add to the set)"), ("alt:", "alt:<token>, the token with MOD_ALT on its presses (no snapping)"),
+    ("transition:", "transition:<track>:<idx>, a click on that transition (selects it)"), ("kind:", "kind:<code>, the selected transition's kind (D, W007 ...)"),
+    ("ease:", "ease:<name>, the selected transition's ease (linear, in, out, inout)"), ("meters", "feeds the meters the tick at the playhead (the line gains meters)"),
+    ("tick:", "tick:<n>, the face clock n times (playback steps, the hover dwell)"), ("aux:", "aux:<token>, the token on the other Surface (--two-surfaces: aux; --split: preview)"),
+];
+/// The witness line's conditional keys in the order they follow [`WITNESS_KEYS`], each with the condition that adds it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const WITNESS_OPTIONAL_KEYS: [(&str, &str); 9] = [("meters", "the script has a meters token"), ("help", "the keys help shows"), ("presses", "--two-surfaces or --split"),
+    ("surfaces", "--split"), ("fnvs", "--split"), ("export", "an export job is on the face"), ("range", "both range marks set"), ("reel", "a clip selected or a dwelt hover"), ("audio", "--mute (the value none)")];
+
+#[cfg(test)]
+mod scriptwords_tests {
+    use super::*;
+
+    fn fresh() -> Face {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// NLEFACEWITNESSSCRIPTWORDSONETABLE (SR1123): every `SCRIPT_WORDS` word drives (a fresh face, its example) with no `bad token`
+    /// and is in USAGE; every `VERBS` word is a token; `bogus` is the parser's `_ =>` refusal (the page's §4 is this table).
+    #[test]
+    fn nlefacewitnessscriptwordsonetable_words_parse() {
+        for (w, _) in SCRIPT_WORDS {
+            let ex = match w { "at:" => "at:12:0", "ruler:" => "ruler:5", "press:" => "press:81:100", "move:" => "move:105:100", "release" => "release", "key:" => "key:j", "wheel:" => "wheel:1", "marquee:" => "marquee:316:85:1:155", "shift:" => "shift:press:228:100", "alt:" => "alt:release", "transition:" => "transition:0:0", "kind:" => "kind:W007", "ease:" => "ease:in", "meters" => "meters", "tick:" => "tick:1", "aux:" => "aux:release", _ => panic!("no example for {w}") };
+            let errors = drive(&mut fresh(), ex);
+            assert!(!errors.iter().any(|e| e.starts_with("bad token")), "{ex}: {errors:?}");
+            assert!(USAGE.contains(w), "{w} not in USAGE");
+        }
+        let face = fresh();
+        for v in nle_face::VERBS { assert!(token(&face, v).is_some(), "{v}"); }
+        assert!(token(&face, "bogus").is_none());
+        assert_eq!(drive(&mut fresh(), "bogus"), vec!["bad token bogus".to_string()]);
+        let mut words: Vec<&str> = SCRIPT_WORDS.iter().map(|(w, _)| *w).collect();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), SCRIPT_WORDS.len(), "a word listed twice");
+    }
+
+    /// NLEFACEWITNESSSCRIPTWORDSONETABLE (SR1123): nine distinct conditional keys, none a `WITNESS_KEYS` key; ONE run arms them
+    /// all (--split, --mute, a held export Esc cancels, marks, a selection, meters, help last) and the line is the two lists in order.
+    #[test]
+    fn nlefacewitnessscriptwordsonetable_optional_keys() {
+        let keys: Vec<&str> = WITNESS_OPTIONAL_KEYS.iter().map(|(k, _)| *k).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 9, "a key listed twice");
+        assert!(keys.iter().all(|k| !WITNESS_KEYS.contains(k)), "{keys:?}");
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: Some("ruler:5,in,ruler:15,out,at:12:0,meters,key:Escape,help".into()), out: None, labels: false, two: false, split: true, mute: true };
+        let dir = std::env::current_exe().expect("the test binary").parent().expect("its directory").join("nlefacewitnessscriptwordsonetable-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, c.labels).with_doc(None));
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        assert_eq!(witness(&c, face), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        let want: Vec<&str> = WITNESS_KEYS.iter().copied().chain(keys).collect();
+        assert_eq!(super::witnessdocs_tests::top_keys(&line), want, "{line}");
+        println!("nlefacewitnessscriptwordsonetable witness: {line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
