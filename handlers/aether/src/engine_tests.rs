@@ -5688,4 +5688,218 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "bi", "fontSize"), "20px", "cssom reads the parent's size");
         assert_ne!(font_shorthand_cs(&mut e, "bp", "fontSize"), "20px", "the plain button keeps the earlier rule (armed)");
     }
+
+    // ---- AETHERCSSWIDECOLOR (LEDGER SR823): an explicit color: inherit beats an earlier rule and the a tag's link blue (named tail block) ----
+
+    /// AETHERCSSWIDECOLOR (SR823): one row per probe at 20px serif, the rules in a sheet. Under a red parent: a plain
+    /// link (the UA link blue), `a.c { color: blue }` and its `a.c.x { color: inherit }` twin, `a.u { color: unset }`,
+    /// `a.l { color: inherit } a.l.k { color: rgb(0, 160, 0) }` and a same-block `color: inherit; color: rgb(0, 160, 0)`
+    /// link. Under a black-background yellow-text row (the dark theme): the reset sheet's `a.r { color: inherit }` and a
+    /// plain link. Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn css_wide_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            a.c { color: blue }
+            a.c.x { color: inherit }
+            a.r { color: inherit }
+            a.u { color: unset }
+            a.l { color: inherit }
+            a.l.k { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><a id="aref" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ac" class="c" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ax" class="c x" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="au" class="u" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ak" class="l k" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ai" href="#" style="color:inherit;color:rgb(0, 160, 0)">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="ar" class="r" href="#">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="aref2" href="#">Hello</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the count of pixels in element `id`'s rect whose (r, g, b) passes `hue`.
+    fn css_wide_color_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 1).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn css_wide_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 < 90 && c.2 < 90
+    }
+
+    fn css_wide_blue(c: (u8, u8, u8)) -> bool {
+        c.2 > 150 && c.0 < 90 && c.1 < 90
+    }
+
+    fn css_wide_green(c: (u8, u8, u8)) -> bool {
+        c.1 > 110 && c.0 < 90 && c.2 < 90
+    }
+
+    fn css_wide_yellow(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 > 150 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `a.c.x { color: inherit }` after `a.c { color: blue }` under a red parent paints red
+    /// (no blue ink); the `a.c` twin and the plain link paint blue (armed); cssom reads the parent's rgb(255, 0, 0).
+    #[test]
+    fn css_wide_color_cross_rule_red() {
+        let mut e = css_wide_color_engine();
+        for id in ["aref", "ac"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 3, "#{id} paints blue (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red (armed)");
+        }
+        assert!(css_wide_color_ink(&mut e, "ax", css_wide_red) > 3, "a.c.x takes the red parent past the earlier rule");
+        assert_eq!(css_wide_color_ink(&mut e, "ax", css_wide_blue), 0, "a.c.x paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "aref", "color"), "rgb(0, 0, 238)", "the plain link reads the UA link blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the reset sheet's `a { color: inherit }` under a dark (black, yellow-text) row paints
+    /// the row's yellow, not the UA link blue; the plain link beside it stays blue (armed).
+    #[test]
+    fn css_wide_color_reset_link_dark() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "aref2", css_wide_blue) > 3, "the plain link on the dark row is blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "ar", css_wide_yellow) > 3, "the reset link paints the row's yellow");
+        assert_eq!(css_wide_color_ink(&mut e, "ar", css_wide_blue), 0, "the reset link paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ar", "color"), "rgb(255, 255, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `color: unset` is inherit for an inherited property (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_color_unset_is_inherit() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "au", css_wide_red) > 3, "a.u takes the red parent");
+        assert_eq!(css_wide_color_ink(&mut e, "au", css_wide_blue), 0, "a.u paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "color"), "rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): a later `color: rgb(0, 160, 0)` beats an earlier inherit, across rules (`a.l.k`) and
+    /// in one block (the inline style): green, neither red nor blue.
+    #[test]
+    fn css_wide_color_later_value_wins() {
+        let mut e = css_wide_color_engine();
+        for id in ["ak", "ai"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_green) > 3, "#{id} paints the later green");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
+    }
+
+    // ---- AETHERCSSWIDENONINHERITEDINITIAL (LEDGER SR832): initial / unset on a non-inherited property beat an earlier rule (named tail block) ----
+
+    /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): one probe pair per row at 400 px wide, the rules in a sheet, each `.r`
+    /// twin resetting what its class's rule set: margin-left (initial), padding (unset), a red background (initial), a
+    /// 100px width (unset) and a 4px red border (initial); plus a `display: initial` div after a span beside a plain
+    /// div after a span. Rows 12px apart.
+    fn css_wide_initial_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div, section { margin: 0 0 12px }
+            .m { margin-left: 20px }
+            .m.r { margin-left: initial }
+            .p { padding: 10px }
+            .p.r { padding: unset }
+            div.di { display: initial }
+            .bg { background-color: rgb(255, 0, 0); height: 20px }
+            .bg.r { background-color: initial }
+            .w { width: 100px }
+            .w.r { width: unset }
+            .b { border: 4px solid rgb(255, 0, 0); height: 20px }
+            .b.r { border: initial }
+            </style></head><body style="margin:0;font:20px serif">
+            <div id="m" class="m">Hello</div>
+            <div id="mr" class="m r">Hello</div>
+            <div id="p" class="p"><span id="pin">Hello</span></div>
+            <div id="pr" class="p r"><span id="prin">Hello</span></div>
+            <section><span id="dbsib">Hello</span><div id="db">World</div></section>
+            <section><span id="disib">Hello</span><div id="di" class="di">World</div></section>
+            <div id="bg" class="bg"></div>
+            <div id="bgr" class="bg r"></div>
+            <div id="w" class="w">Hi</div>
+            <div id="wr" class="w r">Hi</div>
+            <div id="b" class="b"></div>
+            <div id="br" class="b r"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): `.m.r { margin-left: initial }` after `.m { margin-left: 20px }` puts
+    /// the box at x 0 (the `.m` twin at 20, armed); `.p.r { padding: unset }` puts the span at the box's edge (the `.p`
+    /// twin's span 10px in, armed).
+    #[test]
+    fn css_wide_initial_margin_padding() {
+        let mut e = css_wide_initial_engine();
+        let (ml, ..) = imgalt_rect(&mut e, "m");
+        let (mrl, ..) = imgalt_rect(&mut e, "mr");
+        assert!((ml - 20.0).abs() <= 0.5, "the .m box at 20 (armed): {ml}");
+        assert!(mrl.abs() <= 0.5, "margin-left: initial is 0: {mrl}");
+        let (pl, ..) = imgalt_rect(&mut e, "p");
+        let (pinl, ..) = imgalt_rect(&mut e, "pin");
+        let (prl, ..) = imgalt_rect(&mut e, "pr");
+        let (prinl, ..) = imgalt_rect(&mut e, "prin");
+        assert!((pinl - pl - 10.0).abs() <= 0.5, "the .p span 10px in (armed): {pinl} vs {pl}");
+        assert!((prinl - prl).abs() <= 0.5, "padding: unset is 0: {prinl} vs {prl}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): `div { display: initial }` is inline (css-display-3: the initial value),
+    /// not the tag's block: it sits on its sibling span's line, right of it, and paints; a plain div after a span starts
+    /// a new line below it (armed).
+    #[test]
+    fn css_wide_initial_display_inline() {
+        let mut e = css_wide_initial_engine();
+        let (_, st, ..) = imgalt_rect(&mut e, "dbsib");
+        let (_, bt, ..) = imgalt_rect(&mut e, "db");
+        assert!(bt > st + 5.0, "a plain div after a span is on a new line (armed): {bt} vs {st}");
+        let (il, it, iw, _) = imgalt_rect(&mut e, "disib");
+        let (dl, dt, dw, dh) = imgalt_rect(&mut e, "di");
+        assert!((dt - it).abs() <= 2.0, "display: initial sits on the span's line: {dt} vs {it}");
+        assert!(dl >= il + iw - 1.0, "right of the span: {dl} vs {il} + {iw}");
+        let x0 = dl.floor().max(0.0) as usize;
+        let (x1, y0, y1) = ((dl + dw).ceil() as usize, dt.floor().max(0.0) as usize, (dt + dh).ceil() as usize);
+        assert!(imgalt_ink(&e, x0, x1.min(e.width as usize), y0, y1.min(e.height as usize)) > 20, "the inline div paints");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): `background-color: initial` after a red rule is transparent (no red
+    /// ink; the `.bg` twin is red, armed); `border: initial` after a 4px red border paints no border (the `.b` twin's
+    /// border is red, armed).
+    #[test]
+    fn css_wide_initial_background_border() {
+        let mut e = css_wide_initial_engine();
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_red) > 100, "the .bg box is red (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "bgr", css_wide_red), 0, "background-color: initial is transparent");
+        assert!(css_wide_color_ink(&mut e, "b", css_wide_red) > 20, "the .b border is red (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "br", css_wide_red), 0, "border: initial paints no border");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): `width: unset` after `width: 100px` is auto: the block fills its 400px
+    /// container (the `.w` twin is 100, armed).
+    #[test]
+    fn css_wide_initial_width_auto() {
+        let mut e = css_wide_initial_engine();
+        let (_, _, w, _) = imgalt_rect(&mut e, "w");
+        let (_, _, wr, _) = imgalt_rect(&mut e, "wr");
+        assert!((w - 100.0).abs() <= 0.5, "the .w box is 100 (armed): {w}");
+        assert!((wr - 400.0).abs() <= 0.5, "width: unset fills the container: {wr}");
+    }
 }
