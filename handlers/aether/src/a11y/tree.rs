@@ -21,7 +21,7 @@ use html_core::NodeId;
 /// `display` and `visibility` (`css::computed_report`, the values layout and paint consumed). Without a
 /// layout tree the DOM alone decides (the `hidden` attribute and the never-rendered metadata elements).
 pub struct Rendering {
-    report: Option<HashMap<NodeId, [String; 20]>>,
+    report: Option<HashMap<NodeId, [String; crate::css::REPORT_COLS]>>,
     /// Every element that generated a layout box, and whether that box is `display: none` (its subtree
     /// keeps boxes in the taffy tree but is not rendered). An element with no box is either inside a
     /// subtree layout skipped (`hidden`, the metadata elements) or `display: contents`.
@@ -53,7 +53,7 @@ impl Rendering {
         Rendering { report: None, boxed: None }
     }
 
-    fn computed(&self, n: &NodeRef) -> Option<&[String; 20]> {
+    fn computed(&self, n: &NodeRef) -> Option<&[String; crate::css::REPORT_COLS]> {
         self.report.as_ref()?.get(&n.id())
     }
 

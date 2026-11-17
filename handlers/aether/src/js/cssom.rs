@@ -990,7 +990,7 @@ fn current_sheets() -> Vec<String> {
 struct Flushed {
     version: u64,
     tree: crate::layout::LayoutTree,
-    report: HashMap<NodeId, [String; 20]>,
+    report: HashMap<NodeId, [String; crate::css::REPORT_COLS]>,
     boxes: HashMap<NodeId, Vec<(f32, f32, f32, f32)>>,
     /// AETHERFIT2 (SR191): every element in a `position: fixed` box's subtree, with the axes `LayoutTree::fixed_at`
     /// pins to the viewport — its rects do not move with the scroll on those axes (applied at read time,
