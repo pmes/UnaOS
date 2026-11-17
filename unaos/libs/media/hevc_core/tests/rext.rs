@@ -998,3 +998,65 @@ fn y_conceal_subpel_422_chroma_follows_the_vertical_full_resolution() {
 fn z_conceal_subpel_444_chroma_fills_every_full_block() {
     conceal_subpel_case(3);
 }
+
+// ---- HEVCREXTIPREDANGLE (LEDGER SR1089): the 4:2:2 chroma mode of Table 8-3 at X = 11 and 14 (named tail block) ----
+
+/// SR1089: a 16x8 4:2:2 picture — a pcm CU whose Cb column is `a` = 64 in rows 0-3 and `b` = 192 in rows 4-7, then an
+/// 8x8 intra CU at luma (8, 0) with luma mode 2 + `rem` past MPMs {0, 1, 26} (rem 9 -> 11, rem 12 -> 14), chroma DM, no
+/// residual — and the lower Cb 4x4 of its stacked 4:2:2 pair, chroma (4..8, 4..8).
+fn ipred_422_lower_cb(rem: u32) -> Vec<u16> {
+    let cfg = SpsCfg { width: 16, pcm: Some((8, 8, 3, 3, true)), ..cfg8(2, 8, None) };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext::default());
+    let cb: Vec<u16> = (0..32).map(|i| if i / 4 < 4 { 64 } else { 192 }).collect();
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    e.part_mode_2nx2n();
+    e.pcm_samples_fmt(3, 8, 8, &[128; 64], &cb, &[128; 32], (2, 1));
+    e.part_mode_2nx2n();
+    e.terminate(0); // pcm_flag 0
+    e.prev_intra(false);
+    e.bypass_bits(rem, 5);
+    e.chroma_dm();
+    for _ in 0..4 {
+        e.cbf_chroma(0, false); // cbf_cb (top, second), cbf_cr (top, second)
+    }
+    e.cbf_luma(0, false);
+    s.extend(nal(19, &e.finish().out));
+    let p = samples(&decode(&s)[0], 1);
+    assert_eq!(p.len(), 8 * 8);
+    (4..8).flat_map(|y| (4..8).map(move |x| (x, y))).map(|(x, y)| p[y * 8 + x]).collect()
+}
+
+/// 8.4.4.2.6 for a horizontal mode of intraPredAngle `ang` on that block: ref[k] = a for k <= 0 (the corner, the top
+/// and the top projected by invAngle are all a), b for k >= 1 (the left column and the substituted below-left).
+fn hand_422_lower(ang: i32) -> Vec<u16> {
+    let r = |k: i32| if k <= 0 { 64 } else { 192 };
+    let mut out = Vec::new();
+    for y in 0..4 {
+        for x in 0..4 {
+            let (idx, f) = (((x + 1) * ang) >> 5, ((x + 1) * ang) & 31);
+            out.push((((32 - f) * r(y + idx + 1) + f * r(y + idx + 2) + 16) >> 5) as u16);
+        }
+    }
+    out
+}
+
+#[test]
+fn ipred_angle_422_lower_chroma_block_follows_table_8_3() {
+    use hevc_core::intra::chroma_mode_422;
+    // Table 8-3 (ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2): X = 11 -> 12 (angle -5), X = 14 -> 17 (angle -26).
+    assert_eq!(chroma_mode_422(11), 12);
+    assert_eq!(chroma_mode_422(14), 17);
+    // HEVC-CHROMA422-TABLE-KAT: all 35 entries of Table 8-3 (g above spot-checks 11 of them).
+    let table_8_3 = [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+    for (x, &m) in table_8_3.iter().enumerate() {
+        assert_eq!(chroma_mode_422(x as u32), m, "Table 8-3 mode {x}");
+    }
+    let m11 = ipred_422_lower_cb(9);
+    assert_eq!(m11, hand_422_lower(INTRA_PRED_ANGLE[12]), "luma 11 -> chroma 12");
+    assert_eq!(&m11[..4], &[172, 152, 132, 112]);
+    assert!(m11[4..].iter().all(|&v| v == 192));
+    assert_ne!(m11, hand_422_lower(INTRA_PRED_ANGLE[11]), "not the unremapped angle -2 (row 0 184 176 168 160)");
+    let m14 = ipred_422_lower_cb(12);
+    assert_eq!(m14, hand_422_lower(INTRA_PRED_ANGLE[17]), "luma 14 -> chroma 17");
+    assert_ne!(m14, hand_422_lower(INTRA_PRED_ANGLE[16]), "not angle -21");
+}

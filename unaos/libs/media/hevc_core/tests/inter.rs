@@ -2456,3 +2456,53 @@ fn conceal_forward_depth_waits_for_the_first_real_referencer() {
     assert_frame(by_poc(&f, 6), &shifted(&p5, 4, -2), "refined from P5, the first picture that references POC 3");
     assert_ne!(img_of(by_poc(&f, 6)).y, hand_mc(&p2, [3, 1]).y, "not the pre-SR1073 S projection");
 }
+
+// ---- HEVCWPTOSHIBALUMA (LEDGER SR1082): merge B0 prunes against the B1 neighbour, not the pruned candidate (named tail block) ----
+
+/// 8.5.3.2.3: availableFlagB0 is 0 when availableB1 and the units covering B1 and B0 carry the same motion — the B1
+/// NEIGHBOUR, whether or not B1 itself was pruned against A1. MaxNumMergeCand 2. CTB 0 an AMVP unit, mvd (8, 0) (mvp 0:
+/// mv 2 luma samples right = M); CTBs 1 and 2 skip, merge_idx 0 (M by A1 / B1); CTB 3 split into four 8x8 skip CUs
+/// (cu_skip_flag ctxInc 2: left and above skipped), merge_idx 0, 0, 1, 0. At z2 (16, 24): A1 = CTB 2 (M), B1 = z0 (M,
+/// pruned: equal to A1), B0 = z1 (M, pruned against B1), A0 below the picture, B2 = CTB 2 (M, pruned: equal to A1), no
+/// temporal candidate: the list is {M, zero}, merge_idx 1 = mv 0 refIdx 0; z3 merges A1 = z2 (mv 0). Before SR1082 B0
+/// survived (compared with the pruned B1, None), the list was {M, M}, and the whole picture moved by M (WP_A_Toshiba_3
+/// and WP_A_MAIN10_Toshiba_3: CTB 17's merge_idx 1, mv (2, 0) for (0, 0)).
+#[test]
+fn merge_b0_prunes_against_the_b1_neighbour_not_the_pruned_candidate() {
+    let i0 = gradient();
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&i0, true));
+    let cfg = SliceCfg { five_minus_max_num_merge_cand: 3, ..p_slice(1, vec![(-1, true)]) };
+    s.extend(picture(&cfg, |mut e| {
+        e.split_cu(0, false);
+        e.cu_skip(0, false);
+        e.pred_inter();
+        e.part_mode_2nx2n();
+        e.merge_flag(false);
+        e.mvd([8, 0]);
+        e.mvp_flag(0);
+        e.rqt_root_cbf(false);
+        for _ in 0..2 {
+            e.terminate(0);
+            e.split_cu(0, false);
+            e.cu_skip(0, true);
+            e.merge_idx(0, 2);
+        }
+        e.terminate(0);
+        e.split_cu(0, true);
+        for idx in [0, 0, 1, 0] {
+            e.cu_skip(2, true);
+            e.merge_idx(idx, 2);
+        }
+        e.finish().out
+    }));
+    let f = decode_all(&s);
+    let m = shifted(&i0, 2, 0);
+    let want = Img::new(
+        |x, y| if x >= 16 && y >= 24 { i0.y[y * W + x] } else { m.y[y * W + x] },
+        |x, y| if x >= 8 && y >= 12 { i0.cb[y * (W / 2) + x] } else { m.cb[y * (W / 2) + x] },
+        |x, y| if x >= 8 && y >= 12 { i0.cr[y * (W / 2) + x] } else { m.cr[y * (W / 2) + x] },
+    );
+    assert_ne!(img_of(by_poc(&f, 1)).y, m.y, "not the whole-picture shift of the duplicate B0 (pre-SR1082)");
+    assert_frame(by_poc(&f, 1), &want, "z2 merge_idx 1 = the zero candidate; z3 merges it");
+}
