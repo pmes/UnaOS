@@ -468,6 +468,7 @@ fn verb_hint(args: &[String]) {
         eprintln!("nle: {w}: unknown verb; did you mean {v}?");
         usage()
     }
+    if args.get(1).map(String::as_str) == Some("--help") { usage() } // NLECLIHELPUNKNOWNEXAMPLES (SR1049): a far unknown word + `--help` is the usage (stderr, exit 2), never `load("--help")`
 }
 
 // ---- NLECLIPASS2VALUE (LEDGER SR821): the shell completion scripts from FLAGS / VERBS (named tail block) ----
@@ -927,4 +928,19 @@ fn verb_usage(w: &mut dyn Write, verb: &str) {
         let word = flag_word(&line, f);
         let _ = writeln!(w, "  {f}{}", if word.is_empty() { String::new() } else { format!(" {word}") });
     }
+    if let Some((_, e)) = USAGE_EXAMPLES.iter().find(|(v, _)| *v == verb) { let _ = writeln!(w, "example: {e}"); } // NLECLIHELPUNKNOWNEXAMPLES (SR1049): the verb's example last (file tail)
 }
+
+// ---- NLECLIHELPUNKNOWNEXAMPLES (LEDGER SR1049): one example command line per verb, printed by `nle <verb> --help` (named tail block) ----
+/// NLECLIHELPUNKNOWNEXAMPLES (SR1049): THE example per [`USAGE_LINES`] verb, same keys and order; [`verb_usage`] prints it
+/// last as `example: <line>` (the full usage carries none). The paths are relative: tests/cli.rs `cli_help_examples_run`
+/// runs every line in a fixture dir holding `cut.edl` (reels A and B), `a.mp4` and `b.mp4`, so an example cannot drift
+/// from the parser.
+const USAGE_EXAMPLES: [(&str, &str); 6] = [
+    ("schedule", "nle schedule cut.edl --src A=a.mp4 --src B=b.mp4"),
+    ("render", "nle render cut.edl --src A=a.mp4 --src B=b.mp4 --out frame"),
+    ("export", "nle export cut.edl --src A=a.mp4 --src B=b.mp4 --out out --video h264 --bitrate 2500"),
+    ("--make-src", "nle --make-src a.mp4 0 50 25"),
+    ("size", "nle size cut.edl A letterbox"),
+    ("completions", "nle completions bash --install"),
+];
