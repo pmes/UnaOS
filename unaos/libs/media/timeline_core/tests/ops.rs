@@ -3244,3 +3244,57 @@ mod striakcrop {
         }
     }
 }
+
+// ---- STRIAKTRACKADD (LEDGER SR9007): the removal note's one text, and the kernel Player's two key words (named tail block) ----
+mod striaktrackadd {
+    use timeline_core::editor::EditorState;
+    use timeline_core::{Clip, EditError, Kind, Timeline};
+
+    /// V1 A[0,20)@0 B[0,20)@20; A1 the same; A2 A[0,10)@0; V2 (added last, empty) is made by the tests.
+    fn three() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 100), tl.add_source("B", 100));
+        let (v1, a1, a2) = (tl.add_track(Kind::Video), tl.add_track(Kind::Audio), tl.add_track(Kind::Audio));
+        tl.tracks[v1].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+        tl.tracks[a1].clips = tl.tracks[v1].clips.clone();
+        tl.tracks[a2].clips = vec![Clip::new(a, 0, 10, 0)];
+        tl
+    }
+
+    /// The host face's exact text (SR856's pins): the channel word, the count, `clip` / `clips`; `None` past the end.
+    #[test]
+    fn striaktrackadd_track_removed_note() {
+        let tl = three();
+        assert_eq!(tl.track_removed_note(0).as_deref(), Some("track-: removed V (2 clips)"));
+        assert_eq!(tl.track_removed_note(1).as_deref(), Some("track-: removed A (2 clips)"));
+        assert_eq!(tl.track_removed_note(2).as_deref(), Some("track-: removed A2 (1 clip)"));
+        assert_eq!(tl.track_removed_note(3), None);
+        let tl = tl.insert_track(Kind::Video).unwrap();
+        assert_eq!(tl.track_removed_note(1).as_deref(), Some("track-: removed V2 (0 clips)"));
+    }
+
+    /// The Player's words as its keys send them (`T` -> `track+ video`, `R` -> bare `track-` after the shown clip is
+    /// selected): one undo step each; the note read BEFORE the verb names what went; nothing shown -> `NoTrack`, no step.
+    #[test]
+    fn striaktrackadd_player_words_through_verb() {
+        let tl = three();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("track+ video"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.timeline.tracks.len(), st.timeline.tracks[1].kind), (1, 4, Kind::Video), "V2 after V1");
+        assert!(st.timeline.tracks[1].clips.is_empty());
+        st.select(0, 1).unwrap();
+        let gone = st.track_minus_target("track-").and_then(|r| r.ok()).and_then(|t| st.timeline.track_removed_note(t));
+        assert_eq!(gone.as_deref(), Some("track-: removed V (2 clips)"));
+        assert_eq!(st.verb("track-"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.timeline.tracks.len(), st.selection), (2, 3, None));
+        assert!(st.undo());
+        assert_eq!((st.timeline.tracks.len(), st.timeline.tracks[0].clips.len()), (4, 2));
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl);
+        st.deselect();
+        let depth = st.undo_depth();
+        assert_eq!(st.track_minus_target("track-"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.verb("track-"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.undo_depth(), depth, "a refusal commits nothing");
+    }
+}

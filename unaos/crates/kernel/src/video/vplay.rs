@@ -1847,7 +1847,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 2021201920] = [
+const EDIT_KEYS: [(u8, &str); 202120192020] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1874,6 +1874,7 @@ const EDIT_KEYS: [(u8, &str); 2021201920] = [
     (b'g', "gap"), (b'G', "close-gaps sync"), // STRIAKGAPS (LEDGER SR9005): g opens one second of gap at the playhead on the shown clip's track, G closes the spans empty on every track, every track moving alike (timeline_core gap_verb; one undo step each)
     (b'H', "history"),
     (b'y', "link-av"), (b'Y', "unlink"), // STRIAKLINK (LEDGER SR9006): `y` links every coincident V1 / A1 pair (SR928's `link-av` verb word; None until it folds), `Y` unlinks the shown clip's group
+    (b'T', "track+ video"), (b'R', "track-"), // STRIAKTRACKADD (SR9007): `T` adds an empty video track, `R` removes the shown clip's track (timeline_core's words; file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1927,9 +1928,9 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
                 None => st.deselect(),
             }
         }
-        let before = st.timeline.clone();
+        let before = st.timeline.clone(); let gone = edit_track_gone(st, verb); // STRIAKTRACKADD (SR9007): the removal's note, read before the verb (file tail)
         match edit_verb_or_jump(st, verb) {
-            Some(Ok(())) if st.timeline != before => edit_size_note(st, verb, at), // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
+            Some(Ok(())) if st.timeline != before => { edit_size_note(st, verb, at); edit_track_note(st, verb, at, gone) } // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail); STRIAKTRACKADD (SR9007): the track count and the removal's note (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
                 return None;
@@ -2909,4 +2910,30 @@ fn crop_own(reels: &Reels, tl: &timeline_core::Timeline, s: &timeline_core::sche
 fn out_crop(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step, m: &timeline_core::schedule::VideoMix) -> (timeline_core::Crop, timeline_core::SizePolicy) {
     let crop = s.track.map_or(timeline_core::Crop::NONE, |ti| tl.crop_at(ti, s.out_t, true));
     (crop, m.src.map_or(timeline_core::SizePolicy::Letterbox, |o| tl.reel_fit(o, false)))
+}
+
+// ---- STRIAKTRACKADD (LEDGER SR9007): the Player adds / removes a track by key, its band following (named tail block) ----
+// `T` / `R` in [`EDIT_KEYS`] name timeline_core's `track+ video` / bare `track-` (`EditorState::verb`'s ONE dispatch: the
+// canonical slot, the nine-track cap, the one commit, SR955's undo remap). Bare `track-` removes the primary selection's
+// track, which [`edit_key`] has just set to the shown clip ([`shown_clip`]); no clip at the playhead -> `no such track`,
+// refused on the existing line. The band needs nothing here: [`view_band`] re-reads the track count on every present and the
+// seek door re-presents after the save. Removing the track that holds the only video leaves an EDL `edl_run` refuses by name
+// (`no-video`); `u` restores it (owed NLE-TRACKADD-KERNEL-LASTV: refuse that key before the save). Wire: `[nle] edit
+// <track+ video|track-> at=<tick> tracks=<n>[ track-: removed <ch> (<n> clips)]`, after the edit's own line.
+
+/// The note a `track-` word will leave (timeline_core's ONE text), read BEFORE the verb; `None` for any other word.
+fn edit_track_gone(st: &timeline_core::editor::EditorState, verb: &str) -> Option<String> {
+    let t = st.track_minus_target(verb)?.ok()?;
+    st.timeline.track_removed_note(t)
+}
+
+/// After a changed timeline: a track word names the track count and what it removed; silent for any other word.
+fn edit_track_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64, gone: Option<String>) {
+    if !verb.starts_with("track") {
+        return;
+    }
+    match gone {
+        Some(g) => serial_println!("[nle] edit {} at={} tracks={} {}", verb, at, st.timeline.tracks.len(), g),
+        None => serial_println!("[nle] edit {} at={} tracks={}", verb, at, st.timeline.tracks.len()),
+    }
 }
