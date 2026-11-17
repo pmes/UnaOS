@@ -306,7 +306,7 @@ pub fn stack(sel: &FontSel) -> std::rc::Rc<Vec<&'static Face>> {
                 // an author family contributes every face of its unicode-range subsets
                 let web = webfont::select_all(&n, want);
                 if web.is_empty() {
-                    push(&mut faces, named_face(&n, want));
+                    push(&mut faces, named_family_face(&n, want));
                 }
                 for f in web {
                     push(&mut faces, Some(f));
@@ -744,6 +744,75 @@ mod font_family_quoted_generic_tests {
             assert!(parse_family_list(w).is_none(), "{w} unquoted is refused");
             assert!(parse_family_list(&w.to_ascii_uppercase()).is_none());
             assert_eq!(parse_family_list(&format!("'{w}'")), Some(vec![Family::Named(w.into())]));
+        }
+    }
+}
+
+// ---- AETHERFONTSGENERICRESOLVENAMEDSERIF (LEDGER SR1120): a family NAMED like a generic resolves by installed name only (named tail block) ----
+
+/// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): the face a `Family::Named` gives in [`stack`]. A name that is a css-fonts-4
+/// §4.2 generic keyword (`'serif'`, `'monospace'`: quoted, so a NAME, §2.1) resolves by installed family name only (an
+/// `@font-face` family, then text_host's exact family match, [`db::FontDb::select`]), never through `resolve_family`'s
+/// fontconfig alias road, which maps the generic WORDS to faces; every other name keeps [`named_face`] (installed, then
+/// Skia's metric-compatible aliases: Arial → Liberation Sans, and the freely substituted `sans`).
+fn named_family_face(name: &str, want: Style) -> Option<&'static Face> {
+    if generic_of(name).is_none() {
+        return named_face(name, want);
+    }
+    if let Some(f) = webfont::select(name, want) {
+        return Some(f);
+    }
+    db_face(db::db().select(name, want)?, want)
+}
+
+#[cfg(test)]
+mod named_serif_tests {
+    use super::*;
+
+    fn first(list: Vec<Family>) -> Option<String> {
+        face(&FontSel::new(intern_family_list(list), 400, false)).map(|f| f.family.clone())
+    }
+
+    /// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): `'serif', monospace` is a family NAMED serif (none installed) then the
+    /// monospace generic: the stack starts at the monospace face (armed: it started at fontconfig's serif alias).
+    #[test]
+    fn named_serif_falls_through_to_next_family() {
+        if db::db().faces.is_empty() {
+            return;
+        }
+        let (mono, serif) = (first(vec![Family::Generic(Generic::Monospace)]), first(vec![Family::Generic(Generic::Serif)]));
+        if mono == serif || db::db().select("serif", db::Style::default()).is_some() {
+            return; // the host cannot tell the two apart, or installs a family literally named serif
+        }
+        assert_eq!(first(vec![Family::Named("serif".into()), Family::Generic(Generic::Monospace)]), mono, "armed: the named serif is skipped");
+        assert_eq!(first(vec![Family::Named("Serif".into()), Family::Generic(Generic::Monospace)]), mono, "any case");
+        assert_eq!(first(vec![Family::Named("monospace".into()), Family::Generic(Generic::Serif)]), serif, "a named monospace the same");
+    }
+
+    /// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): a list with no installed name ends at the standard font.
+    #[test]
+    fn named_serif_alone_is_the_standard_font() {
+        if db::db().faces.is_empty() || db::db().select("serif", db::Style::default()).is_some() {
+            return;
+        }
+        assert_eq!(first(vec![Family::Named("serif".into())]), face(&FontSel::new(STANDARD, 400, false)).map(|f| f.family.clone()));
+    }
+
+    /// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): names that are not generic keywords keep resolve_family's road (metric
+    /// aliases, the freely substituted `sans`), and the generics keep theirs.
+    #[test]
+    fn named_serif_keeps_aliases_and_generics() {
+        let d = db::db();
+        if d.faces.is_empty() {
+            return;
+        }
+        for n in ["Arial", "sans", "Times New Roman"] {
+            if let Some(fam) = d.resolve_family(n) {
+                assert_eq!(first(vec![Family::Named(n.into())]), Some(fam), "{n} kept");
+            }
+        }
+        if let Some(fam) = d.resolve_family(Generic::Serif.family_name()) {
+            assert_eq!(first(vec![Family::Generic(Generic::Serif)]), Some(fam), "the serif generic kept");
         }
     }
 }

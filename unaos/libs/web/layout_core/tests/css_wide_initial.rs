@@ -228,7 +228,7 @@ fn css_wide_rest_flex() {
 }
 
 /// AETHERCSSWIDENONINHERITEDREST (SR848): align-items / justify-content reset to normal, gap / row-gap to 0;
-/// column-gap's keyword stays dropped (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL owed, pinned).
+/// column-gap's keyword stays dropped (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL owed, pinned; flipped by SR1077: initial is 0).
 #[test]
 fn css_wide_rest_align_gap() {
     let n = styled(&[("align-items", "normal"), ("justify-content", "normal")]);
@@ -240,9 +240,8 @@ fn css_wide_rest_align_gap() {
     assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "gap: initial is 0");
     let s = cascade(&[&[("row-gap", "10px")], &[("row-gap", "initial")]]);
     assert_eq!(s.row_gap, zero.row_gap, "row-gap: initial is 0");
-    let ten = cascade(&[&[("column-gap", "10px")]]);
     let s = cascade(&[&[("column-gap", "10px")], &[("column-gap", "initial")]]);
-    assert_eq!(s.column_gap, ten.column_gap, "column-gap: initial unchanged by this arc (owed, pinned)");
+    assert_eq!(s.column_gap, zero.column_gap, "column-gap: initial is the flex gap's 0 (SR1077 flipped the SR848 pin)");
 }
 
 /// AETHERCSSWIDENONINHERITEDREST (SR848): the background layer longhands reset to repeat / `0% 0%` / auto; the
@@ -2345,4 +2344,52 @@ fn outline_style_word_round_trip() {
     assert_eq!(outline_style_code("hidden").map(outline_style_word), Some("none"));
     assert_eq!(outline_style_word(layout_core::paint::OUTLINE_AUTO), "auto");
     assert_eq!(outline_style_word(6), "none", "out of range");
+}
+
+// ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): `column-gap: normal` after 10px is the flex gap's 0 (css-align-3 §8.1),
+/// in one block (the engine's one-style road) and across rules (merge copies Somes).
+#[test]
+fn gap_normal_column_gap_zero() {
+    let zero = styled(&[("gap", "0px")]);
+    let ten = styled(&[("column-gap", "10px")]);
+    assert_ne!(ten.column_gap, zero.column_gap, "10px (armed)");
+    let s = styled(&[("column-gap", "10px"), ("column-gap", "normal")]);
+    assert_eq!(s.column_gap, zero.column_gap, "in one block: a later normal is 0");
+    let s = cascade(&[&[("column-gap", "10px")], &[("column-gap", "normal")]]);
+    assert_eq!(s.column_gap, zero.column_gap, "across rules: a later normal is 0");
+    let s = cascade(&[&[("column-gap", "normal")], &[("column-gap", "10px")]]);
+    assert_eq!(s.column_gap, ten.column_gap, "a later 10px still wins over an earlier normal");
+}
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): `gap: normal` zeroes both gaps, `gap: 10px normal` only the column
+/// gap, and `row-gap: normal` after 5px is 0.
+#[test]
+fn gap_normal_shorthand_and_row_gap_zero() {
+    let zero = styled(&[("gap", "0px")]);
+    let both = styled(&[("gap", "10px 20px")]);
+    assert_ne!((both.row_gap, both.column_gap), (zero.row_gap, zero.column_gap), "10px 20px (armed)");
+    let s = styled(&[("gap", "10px 20px"), ("gap", "normal")]);
+    assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "in one block: gap: normal is 0 0");
+    let s = cascade(&[&[("gap", "10px 20px")], &[("gap", "normal")]]);
+    assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "across rules: gap: normal is 0 0");
+    let s = styled(&[("gap", "10px normal")]);
+    assert_eq!((s.row_gap, s.column_gap), (styled(&[("row-gap", "10px")]).row_gap, zero.column_gap), "gap: 10px normal");
+    let five = styled(&[("row-gap", "5px")]);
+    assert_ne!(five.row_gap, zero.row_gap, "5px (armed)");
+    let s = styled(&[("row-gap", "5px"), ("row-gap", "normal")]);
+    assert_eq!(s.row_gap, zero.row_gap, "in one block: row-gap: normal is 0");
+    let s = cascade(&[&[("row-gap", "5px")], &[("row-gap", "normal")]]);
+    assert_eq!(s.row_gap, zero.row_gap, "across rules: row-gap: normal is 0");
+}
+
+/// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): the multicol gutter's `normal` stays SR1016's explicit normal (1em):
+/// the flex zero does not reach `PaintStyle::col_gap`.
+#[test]
+fn gap_normal_multicol_unchanged() {
+    let s = cascade(&[&[("column-count", "2"), ("column-gap", "40px")], &[("column-gap", "normal")]]);
+    assert_eq!(s.paint.col_gap, Some(None), "multicol normal stays the explicit normal (1em)");
+    let s = styled(&[("column-count", "2"), ("column-gap", "40px"), ("column-gap", "normal")]);
+    assert_eq!(s.paint.col_gap, Some(None), "in one block too");
 }
