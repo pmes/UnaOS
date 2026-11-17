@@ -2604,7 +2604,7 @@ fn striainforeelhover_message_names_the_clip_under_the_pointer() {
     assert!(matches!(l.hit(&tl, at(22), row_y), Hit::Track(0, _)));
     assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
     let selected = face.paint();
-    assert!(striainforeelhover_move(&mut face, at(5), row_y), "the hovered clip changed: repaint");
+    assert!(!striainforeelhover_move(&mut face, at(5), row_y), "entering A asks no repaint"); assert!(striainforeelhoverdelay_dwell(&mut face), "the crossing tick repaints"); // STRIAINFOREELHOVERDELAY (SR789): A's line after HOVER_DWELL ticks
     assert_eq!(face.hovered_clip(), Some((0, 0)));
     assert_eq!(face.message_text().as_deref(), Some(a.as_str()));
     assert_eq!(face.reel_line().as_deref(), Some(a.as_str()), "the witness's reel follows the hover");
@@ -2616,10 +2616,10 @@ fn striainforeelhover_message_names_the_clip_under_the_pointer() {
     assert!(striainforeelhover_move(&mut face, at(5), l.ruler_y as f64 + 1.0));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the ruler");
     assert_eq!(face.paint(), selected, "back to the selected clip's paint");
-    striainforeelhover_move(&mut face, at(5), row_y);
+    striainforeelhover_move(&mut face, at(5), row_y); striainforeelhoverdelay_dwell(&mut face); // STRIAINFOREELHOVERDELAY (SR789): dwell on A so leaving it repaints
     assert!(striainforeelhover_move(&mut face, at(15), row_y));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the selected clip itself");
-    striainforeelhover_move(&mut face, at(5), row_y);
+    striainforeelhover_move(&mut face, at(5), row_y); striainforeelhoverdelay_dwell(&mut face); // STRIAINFOREELHOVERDELAY (SR789): dwell on A so leaving it repaints
     assert!(striainforeelhover_move(&mut face, at(22), row_y));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "an empty track spot");
     println!("striainforeelhover: hover={a} selected={b}");
@@ -2653,4 +2653,97 @@ fn striainforeelhover_labels_off_is_unchanged() {
 fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String {
     let (_, src) = stria::nle_face::synth_fixture();
     src.summary(face.state.timeline.tracks[0].clips[i].src).unwrap()
+}
+
+// ---- STRIAINFOREELHOVERDELAY (LEDGER SR789): a dwell of HOVER_DWELL face ticks before the hover line replaces the selected one (named tail block) ----
+
+/// `HOVER_DWELL` face ticks; true when every tick but the last asked no repaint and the last (the crossing) did.
+fn striainforeelhoverdelay_dwell(face: &mut stria::nle_face::Face) -> bool {
+    let ticks: Vec<bool> = (0..stria::nle_face::HOVER_DWELL).map(|_| face.tick()).collect();
+    ticks.last() == Some(&true) && ticks[..ticks.len() - 1].iter().all(|t| !t)
+}
+
+/// Rule: the hover line shows only after the pointer has stood `HOVER_DWELL` face ticks on the same clip: until then the
+/// selected clip's line stands and no tick repaints; the crossing tick repaints once; a move off a dwelt clip gives the
+/// selected line back at once and repaints; an error still wins over a dwelt hover.
+#[test]
+fn striainforeelhoverdelay_the_hover_line_waits_for_the_dwell() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(true);
+    let (a, b) = (format!("A: {}", striainforeelhover_summary(&face, 0)), format!("B: {}", striainforeelhover_summary(&face, 1)));
+    let (row_y, at) = (l.tracks_y as f64 + 10.0, |t: i64| l.x_of(t) as f64 + 0.5);
+    assert!(!striainforeelhover_move(&mut face, at(5), row_y), "entering A asks no repaint");
+    assert_eq!(face.hovered_clip(), Some((0, 0)));
+    assert!(face.hover_pending(), "the clock runs while the dwell counts");
+    for n in 1..HOVER_DWELL {
+        assert!(!face.tick(), "tick {n}: no repaint");
+        assert_eq!(face.message_text().as_deref(), Some(b.as_str()), "tick {n}: still the selected line");
+    }
+    assert!(face.tick(), "the crossing tick repaints");
+    assert_eq!((face.hover_dwelt(), face.message_text()), (Some((0, 0)), Some(a.clone())));
+    assert!(!face.hover_pending(), "dwelt: the clock may stop");
+    assert!(!face.tick(), "a further tick asks nothing");
+    assert_eq!(face.reel_line().as_deref(), Some(a.as_str()));
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over a dwelt hover");
+    face.last_error = None;
+    assert!(striainforeelhover_move(&mut face, at(5), l.ruler_y as f64 + 1.0), "a dwelt hover ends: repaint");
+    assert_eq!(face.message_text().as_deref(), Some(b.as_str()), "the ruler: the selected line at once");
+    println!("striainforeelhoverdelay: dwell={HOVER_DWELL} ticks (320 ms at 25 fps) hover={a} selected={b}");
+}
+
+/// Rule: a change of the hovered clip resets the count: A -> B (the selected clip: no hover) -> A within the dwell never
+/// shows A, and the count restarts at the second entry.
+#[test]
+fn striainforeelhoverdelay_a_change_resets_the_count() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(true);
+    let b = format!("B: {}", striainforeelhover_summary(&face, 1));
+    let (row_y, at) = (l.tracks_y as f64 + 10.0, |t: i64| l.x_of(t) as f64 + 0.5);
+    for x in [at(5), at(15), at(5)] {
+        assert!(!striainforeelhover_move(&mut face, x, row_y), "no dwelt hover ends: no repaint");
+        for _ in 1..HOVER_DWELL {
+            assert!(!face.tick());
+            assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
+        }
+    }
+    assert!(face.tick(), "HOVER_DWELL ticks after the second entry");
+    assert_eq!(face.hover_dwelt(), Some((0, 0)));
+}
+
+/// Rule: a labels-off face asks no repaint on any tick and paints byte-identically, while the witness's reel line still
+/// follows the dwell.
+#[test]
+fn striainforeelhoverdelay_labels_off_is_unchanged() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(false);
+    let before = face.paint();
+    let b = format!("B: {}", striainforeelhover_summary(&face, 1));
+    assert!(!striainforeelhover_move(&mut face, l.x_of(5) as f64 + 0.5, l.tracks_y as f64 + 10.0));
+    assert!(!face.hover_pending(), "labels off: the clock stays off");
+    for _ in 1..HOVER_DWELL {
+        assert!(!face.tick());
+    }
+    assert_eq!(face.reel_line().as_deref(), Some(b.as_str()));
+    assert!(!face.tick(), "labels off: the crossing asks no repaint");
+    assert_eq!(face.hover_dwelt(), Some((0, 0)));
+    assert_eq!(face.reel_line().map(|s| s.starts_with("A: ")), Some(true), "the witness follows the dwell");
+    assert_eq!(face.paint(), before);
+}
+
+/// Rule: a change under a resting pointer with no move is seen at the next tick: selecting the dwelt clip A leaves no
+/// hover (the line is A's as the selection), and selecting B again restarts the count rather than reusing a stale one.
+#[test]
+fn striainforeelhoverdelay_a_select_under_the_pointer_leaves_no_stale_count() {
+    let (mut face, l) = striainforeelhover_face(true);
+    let (a, b) = (format!("A: {}", striainforeelhover_summary(&face, 0)), format!("B: {}", striainforeelhover_summary(&face, 1)));
+    striainforeelhover_move(&mut face, l.x_of(5) as f64 + 0.5, l.tracks_y as f64 + 10.0);
+    assert!(striainforeelhoverdelay_dwell(&mut face));
+    face.state.select(0, 0).unwrap();
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(a)), "A selected: no hover, A's line");
+    face.tick();
+    face.state.select(0, 1).unwrap();
+    assert_eq!(face.hover_dwelt(), None, "the count was cleared at the tick that saw no hover");
+    assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
+    assert!(striainforeelhoverdelay_dwell(&mut face), "the dwell counts again from 1");
 }
