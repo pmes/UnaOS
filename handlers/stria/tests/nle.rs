@@ -3353,3 +3353,134 @@ fn nle5dexportmessageetasmooth_scripted_slow_start() {
     assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
     println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
 }
+
+// ---- STRIATRACKMUTESOLO (LEDGER SR837): per-track mute / solo through the render, the export and the face (named tail block) ----
+
+/// Reels A (base 0) and B (base 1000), 50 ticks each; one 20-tick clip per listed track (`(kind, reel, muted, solo)`).
+fn striatrackmutesolo_tl(tracks: &[(Kind, u32, bool, bool)]) -> Timeline {
+    let mut tl = Timeline::new(25);
+    tl.add_source("A", 50);
+    tl.add_source("B", 50);
+    for &(k, reel, m, s) in tracks {
+        let t = tl.add_track(k);
+        tl.tracks[t].clips = vec![Clip::new(SourceId(reel), 0, 20, 0)];
+        tl = tl.set_track_flags(t, m, s).unwrap();
+    }
+    tl
+}
+
+fn striatrackmutesolo_render(tl: &Timeline) -> Collect {
+    let mut sink = Collect::default();
+    render(tl, 0..20, &sources(tl), &mut sink).unwrap();
+    sink
+}
+
+/// M3: A1 (reel A) muted under A2 (reel B) renders reel B's track alone, byte for byte; A1 soloed renders reel A's alone;
+/// both muted decodes nothing (the schedule's runs carry no layers; the render takes its audio format from a scheduled
+/// source, so it writes no PCM: today's all-gap behaviour).
+#[test]
+fn striatrackmutesolo_muted_audio_track_renders_the_other_alone() {
+    use Kind::Audio as Au;
+    let one_b = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Au, 1, false, false)])).pcm;
+    let one_a = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Au, 0, false, false)])).pcm;
+    assert_eq!(one_b.len(), 20 * PER);
+    let muted = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Au, 0, true, false), (Au, 1, false, false)])).pcm;
+    assert_eq!(muted, one_b, "A1 muted: A2 alone");
+    let solo = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Au, 0, false, true), (Au, 1, false, false)])).pcm;
+    assert_eq!(solo, one_a, "A1 solo: A1 alone");
+    let both = striatrackmutesolo_tl(&[(Au, 0, true, false), (Au, 1, true, false)]);
+    let mut sink = Pcm::default();
+    let r = render(&both, 0..20, &sources(&both), &mut sink).unwrap();
+    assert_eq!((r.seeks, r.pcm_frames, sink.pcm.len()), (0, 0, 0), "no muted layer is decoded");
+    println!("striatrackmutesolo audio: muted == one-track ({} samples), solo == one-track, all muted pcm {}", muted.len(), sink.pcm.len());
+}
+
+/// M3: V2 (reel B) muted over V1 (reel A) shows V1's frames exactly; a muted V1 under V2's gap is black there; every video
+/// track muted schedules black steps but the render refuses `NoSize` (no scheduled source sizes the frame, the all-gap rule);
+/// the muted audio track's
+/// meter feed (`track_pcm`) is all zero while the live one carries its source.
+#[test]
+fn striatrackmutesolo_muted_video_track_shows_the_lower() {
+    use Kind::{Audio as Au, Video as Vi};
+    let low = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Vi, 0, false, false)]));
+    let top = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Vi, 0, false, false), (Vi, 1, false, false)]));
+    let muted = striatrackmutesolo_render(&striatrackmutesolo_tl(&[(Vi, 0, false, false), (Vi, 1, true, false)]));
+    assert_eq!(muted.frames.len(), 20);
+    assert_eq!(muted.frames, low.frames, "V2 muted: the lower track shows");
+    assert_ne!(top.frames, low.frames, "unmuted V2 covers V1");
+    assert_eq!(TestPattern::read_counter(&muted.frames[5].1, 64, 48), Some(5));
+    let mut gap = striatrackmutesolo_tl(&[(Vi, 0, true, false), (Vi, 1, false, false)]);
+    gap.tracks[1].clips = vec![Clip::new(SourceId(1), 0, 10, 0)];
+    let shown = striatrackmutesolo_render(&gap);
+    assert_eq!(TestPattern::read_counter(&shown.frames[5].1, 64, 48), Some(1005), "V2's clip");
+    assert!(shown.frames[10..].iter().all(|(_, f)| f.chunks(4).all(|p| p == [0, 0, 0, 255])), "V1 muted under V2's gap: black");
+    let all = striatrackmutesolo_tl(&[(Vi, 0, true, false)]);
+    let err = render(&all, 0..20, &sources(&all), &mut Collect::default()).err();
+    assert!(matches!(err, Some(stria::nle::RenderError::NoSize)), "every video track muted: the all-gap rule ({err:?})");
+
+    #[derive(Default)]
+    struct Taps(std::collections::BTreeMap<usize, Vec<f32>>);
+    impl RenderSink for Taps {
+        fn frame(&mut self, _: i64, _: u32, _: u32, _: &[u8]) {}
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+        fn taps_tracks(&self) -> bool {
+            true
+        }
+        fn track_pcm(&mut self, _: i64, track: usize, _: u32, _: u16, s: &[f32]) {
+            self.0.entry(track).or_default().extend_from_slice(s);
+        }
+    }
+    let tl = striatrackmutesolo_tl(&[(Au, 0, true, false), (Au, 1, false, false)]);
+    let mut taps = Taps::default();
+    render(&tl, 0..20, &sources(&tl), &mut taps).unwrap();
+    assert!(taps.0[&0].iter().all(|&x| x == 0.0), "the muted track meters silence");
+    assert!(taps.0[&1].iter().any(|&x| x != 0.0));
+    println!("striatrackmutesolo video: V2 muted == V1 alone (20 frames), V1 muted black, muted meter silent");
+}
+
+/// M3: the export honours the same set: V2 + A2 muted exports the same RGBA stream (fnv) and the same audio.wav bytes as
+/// the V1 + A1 timeline.
+#[test]
+fn striatrackmutesolo_export_of_the_muted_fixture_is_the_single_track_export() {
+    use Kind::{Audio as Au, Video as Vi};
+    use stria::nle_export::{AudioOut, RawSequence, export};
+    let one = striatrackmutesolo_tl(&[(Vi, 0, false, false), (Au, 0, false, false)]);
+    let muted = striatrackmutesolo_tl(&[(Vi, 0, false, false), (Vi, 1, true, false), (Au, 0, false, false), (Au, 1, true, false)]);
+    let run = |tl: &Timeline, name: &str| {
+        let dir = fresh_dir("striatrackmutesolo", name);
+        let r = export(tl, 0..20, &sources(tl), &dir, Box::new(RawSequence), AudioOut::Wav).unwrap();
+        let wav = std::fs::read(dir.join("audio.wav")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (r, wav)
+    };
+    let (r1, w1) = run(&one, "one");
+    let (r2, w2) = run(&muted, "muted");
+    assert_eq!((r2.frames, r2.pcm_frames, r2.fnv), (r1.frames, r1.pcm_frames, r1.fnv));
+    assert_eq!(w2, w1, "audio.wav byte-equal");
+    println!("striatrackmutesolo export: frames {} pcm {} fnv {:016x} wav {} bytes, muted == single", r2.frames, r2.pcm_frames, r2.fnv, w2.len());
+}
+
+/// M3: the face's `mute` toggles the selected clip's track through ONE commit (undo restores it, the document is dirty,
+/// the EDL carries `* UNA MUTE A` and reads back equal); `solo` likewise; with nothing selected the word is refused by name.
+#[test]
+fn striatrackmutesolo_face_mute_then_undo() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(VERBS.contains(&"mute") && VERBS.contains(&"solo"));
+    assert!(face.verb("mute"));
+    assert_eq!(face.last_error.take(), Some(format!("mute: {}", timeline_core::EditError::NoTrack)));
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("mute"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.state.timeline.tracks[1].muted && !face.state.timeline.tracks[0].muted);
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.selection), (1, true, Some((1, 0))));
+    let text = edl::write(&face.state.timeline, "MUTE").unwrap();
+    assert!(text.contains("\n* UNA MUTE A\n\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline);
+    assert!(face.verb("solo"));
+    assert!(face.state.timeline.tracks[1].solo);
+    assert!(face.verb("undo") && face.verb("undo"));
+    assert_eq!((&face.state.timeline, face.dirty()), (&tl0, false));
+    println!("striatrackmutesolo face: no selection -> mute: {}; mute + solo then two undos restore", timeline_core::EditError::NoTrack);
+}

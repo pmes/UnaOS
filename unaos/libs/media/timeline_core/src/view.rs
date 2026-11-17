@@ -337,6 +337,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
         }
     }
+    paint_track_flags(&mut c, l, tl); // STRIATRACKMUTESOLO (SR837): the inactive rows dimmed, the M / S badges (file tail)
     // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
     for &(row, i) in &st.set {
         if let Some(clip) = tl.tracks.get(row).and_then(|tr| tr.clips.get(i)) {
@@ -1187,5 +1188,116 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIATRACKMUTESOLO (LEDGER SR837): the mute / solo badges and the inactive rows' dimmed clips (named tail block) ----
+// After the clip arm: every row NOT in `Timeline::active_tracks` (muted, or not soloed while another track is) has each
+// clip body averaged half-way with its row colour in place (the canvas has no alpha: this is the half alpha, over whatever
+// the clip arm painted), then each flagged row shows its badge at the left edge: an amber `M` box, a green `S` box beside
+// it. No flag on any track: nothing is touched (every golden unchanged).
+
+/// The mute badge's colour (amber).
+pub const MUTE: [u8; 4] = [0xff, 0xb0, 0x20, 255];
+/// The solo badge's colour (green).
+pub const SOLO: [u8; 4] = [0x40, 0xd0, 0x60, 255];
+/// A badge's side (px).
+pub const BADGE: i64 = 11;
+/// The badge letters, 7x7 (bit 6 the leftmost column): M, S.
+const BADGE_GLYPHS: [[u8; 7]; 2] = [[0x41, 0x63, 0x55, 0x49, 0x41, 0x41, 0x41], [0x3e, 0x40, 0x40, 0x3e, 0x01, 0x01, 0x7e]];
+
+fn paint_track_flags(c: &mut Canvas, l: Layout, tl: &Timeline) {
+    if !tl.tracks.iter().any(|t| t.muted || t.solo) {
+        return;
+    }
+    let live: Vec<usize> = tl.active_tracks().collect();
+    for (row, tr) in tl.tracks.iter().enumerate().take(l.rows) {
+        let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
+        if !live.contains(&row) {
+            let bg = c.put(ROW[row % 2]);
+            for clip in &tr.clips {
+                dim(c, l.x_of(clip.at) + 1, y0 + 2, l.x_of(clip.end()) - 1, y1 - 2, bg);
+            }
+        }
+        let mut x = 2;
+        for (on, ink, g) in [(tr.muted, MUTE, 0), (tr.solo, SOLO, 1)] {
+            if !on {
+                continue;
+            }
+            c.rect(x, y0 + 2, x + BADGE, y0 + 2 + BADGE, ink);
+            for (dy, bits) in BADGE_GLYPHS[g].iter().enumerate() {
+                for dx in 0..7i64 {
+                    if bits & (0x40 >> dx) != 0 {
+                        let (px, py) = (x + 2 + dx, y0 + 4 + dy as i64);
+                        c.rect(px, py, px + 1, py + 1, FIELD);
+                    }
+                }
+            }
+            x += BADGE + 2;
+        }
+    }
+}
+
+/// Average every pixel of `x0..x1` x `y0..y1` (clipped) half-way with `bg` (already in the canvas's byte order).
+fn dim(c: &mut Canvas, x0: i64, y0: i64, x1: i64, y1: i64, bg: [u8; 4]) {
+    let (x0, x1) = (x0.clamp(0, c.w as i64) as usize, x1.clamp(0, c.w as i64) as usize);
+    let (y0, y1) = (y0.clamp(0, c.h as i64) as usize, y1.clamp(0, c.h as i64) as usize);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (y * c.w as usize + x) * 4;
+            for k in 0..3 {
+                c.px[i + k] = ((c.px[i + k] as u16 + bg[k] as u16) / 2) as u8;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod striatrackmutesolo_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// Two audio tracks, the same reel's clip on each (twins), 320x120.
+    fn twins() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for _ in 0..2 {
+            let t = tl.add_track(Kind::Audio);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// M3: A1 muted: its row carries amber badge pixels, A2's none; the muted clip's body colour differs from its unmuted
+    /// twin's (and is the half-way blend); with both flags off the canvas is byte-equal to the unflagged paint.
+    #[test]
+    fn striatrackmutesolo_badge_and_dim_paint() {
+        let st0 = twins();
+        let l = Layout::of(320, 120, &st0);
+        let px0 = paint_in(&st0, l, Order::Rgba, None, None);
+        let mut st = st0.clone();
+        st.timeline = st.timeline.set_track_flags(0, true, false).unwrap();
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let at = |p: &[u8], x: i64, y: i64| -> [u8; 4] {
+            let i = (y as usize * 320 + x as usize) * 4;
+            [p[i], p[i + 1], p[i + 2], p[i + 3]]
+        };
+        let amber = |row: usize| (0..BADGE + 4).flat_map(|x| (0..ROW_H as i64).map(move |y| (x, y))).filter(|&(x, y)| at(&px, x, l.row_y(row) + y) == MUTE).count();
+        assert!(amber(0) > 0, "the M badge on the muted row");
+        assert_eq!(amber(1), 0, "no badge on the live row");
+        let (x, y0, y1) = (100, l.row_y(0) + 20, l.row_y(1) + 20);
+        let live = clip_colour(0, Kind::Audio);
+        assert_eq!(at(&px, x, y1), live, "the unmuted twin");
+        assert_ne!(at(&px, x, y0), live, "the muted body differs");
+        let bg = ROW[0];
+        assert_eq!(at(&px, x, y0), [((live[0] as u16 + bg[0] as u16) / 2) as u8, ((live[1] as u16 + bg[1] as u16) / 2) as u8, ((live[2] as u16 + bg[2] as u16) / 2) as u8, 255]);
+        let mut solo = st0.clone();
+        solo.timeline = solo.timeline.set_track_flags(1, false, true).unwrap();
+        let ps = paint_in(&solo, l, Order::Rgba, None, None);
+        assert_ne!(at(&ps, x, y0), live, "A1 not soloed while A2 is: dimmed");
+        assert_eq!(at(&ps, x, y1), live, "the soloed row stays");
+        let mut off = st.clone();
+        off.timeline = off.timeline.set_track_flags(0, false, false).unwrap();
+        assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "no flag: the unflagged paint, byte for byte");
     }
 }

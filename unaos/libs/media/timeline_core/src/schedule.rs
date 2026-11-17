@@ -114,7 +114,7 @@ impl core::fmt::Display for ScheduleError {
 
 /// The winner at tick `t` for `kind`: (track index, clip index).
 fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
-    tl.tracks.iter().enumerate().rev().filter(|(_, tr)| tr.kind == kind).find_map(|(i, _)| tl.clip_at(i, t).map(|c| (i, c)))
+    tl.active_tracks().rev().filter(|&i| tl.tracks[i].kind == kind).find_map(|i| tl.clip_at(i, t).map(|c| (i, c))) // STRIATRACKMUTESOLO (SR837): a muted / unsoloed track never wins
 }
 
 /// The schedule for output ticks `range` (see the module docs).
@@ -213,8 +213,8 @@ impl AudioRun {
 /// NLE4: the audio mix runs for output ticks `range` (see the module docs).
 pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Result<Vec<AudioRun>, ScheduleError> {
     check(tl, &range, idx)?;
-    let tracks: Vec<usize> = (0..tl.tracks.len()).filter(|&i| tl.tracks[i].kind == Kind::Audio).collect();
-    if tracks.is_empty() {
+    let tracks: Vec<usize> = tl.active_tracks().filter(|&i| tl.tracks[i].kind == Kind::Audio).collect(); // STRIATRACKMUTESOLO (SR837): only the active audio tracks mix
+    if !tl.tracks.iter().any(|t| t.kind == Kind::Audio) { // STRIATRACKMUTESOLO (SR837): every audio track muted is silent runs, not none
         return Ok(Vec::new());
     }
     // NLE3b: the crossfade on clip `ci` of track `ti` covering tick `t`, if any.
@@ -385,7 +385,7 @@ fn black_over(tl: &Timeline, t: i64, above: Option<usize>) -> Option<(usize, cra
         .iter()
         .enumerate()
         .rev()
-        .filter(|(i, tr)| tr.kind == Kind::Video && above.is_none_or(|a| *i > a))
+        .filter(|(i, tr)| tr.kind == Kind::Video && above.is_none_or(|a| *i > a) && tl.active_tracks().any(|a| a == *i)) // STRIATRACKMUTESOLO (SR837): a muted track's to-black does not show
         .find_map(|(i, tr)| tr.transitions.iter().find(|x| x.to_black && x.at <= t && t < x.at + x.dur).map(|x| (i, *x)))
 }
 
