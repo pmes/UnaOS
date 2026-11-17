@@ -308,7 +308,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail)
+        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -3544,5 +3544,87 @@ mod striabinmore_tests {
         assert_eq!(st.place_tracks_at_playhead(&[0, 7], SourceId(2), 0, 50, Mode::Insert), Err(EditError::NoTrack), "a missing second track");
         assert_eq!(st.place_tracks_at_playhead(&[0, 1], SourceId(2), 0, 51, Mode::Insert), Err(EditError::OutOfSource));
         assert_eq!((st.timeline.clone(), st.undo_depth(), st.playhead), (tl0, 0, 5));
+    }
+}
+
+// ---- STRIATRACKGAINKEYSNEXT (LEDGER SR983): `mute <ch>` / `solo <ch>` on the NAMED track through the one commit (named tail block) ----
+// SR837's words with a channel word (`mute A2`, `solo V1`; [`Timeline::track_named`], uppercase only): they toggle that
+// track's flag with no selection needed (the selection stays), ONE `commit` each through `Timeline::set_track_flags` like
+// SR837's toggles. A word naming no track, or an extra word, is refused `EditError::NoTrack` with the state kept. Bare
+// `mute` / `solo` stay SR837's (`track_verb`, the selected clip's track).
+impl EditorState {
+    /// Toggle track `track`'s solo flag (`solo`) or mute flag (ONE commit; the selection untouched).
+    pub fn toggle_track_flag(&mut self, track: usize, solo: bool) -> Result<(), EditError> {
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let (m, s) = if solo { (t.muted, !t.solo) } else { (!t.muted, t.solo) };
+        let tl = self.timeline.set_track_flags(track, m, s)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `mute <ch>` / `solo <ch>` words of [`EditorState::verb`]; `None` for any other word.
+    fn track_ch_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let solo = match w.next()? {
+            "mute" => false,
+            "solo" => true,
+            _ => return None,
+        };
+        let ch = w.next()?;
+        Some(match (self.timeline.track_named(ch), w.next()) {
+            (Some(t), None) => self.toggle_track_flag(t, solo),
+            _ => Err(EditError::NoTrack),
+        })
+    }
+}
+
+#[cfg(test)]
+mod striatrackgainkeysnext_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1: A 0..20, A1: A 0..20, A2: A 0..20; nothing selected.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for k in [Kind::Video, Kind::Audio, Kind::Audio] {
+            let t = tl.add_track(k);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// M3: `mute A2` / `solo V1` toggle the named track with no selection, ONE undo step each; the selection stays; undo
+    /// restores; `mute V` names V1.
+    #[test]
+    fn striatrackgainkeysnext_mute_by_channel() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("mute A2"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[2].muted, st.timeline.tracks[1].muted, st.undo_depth()), (true, false, 1));
+        assert_eq!(st.verb("solo V1"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[0].solo, st.timeline.tracks[0].muted, st.undo_depth()), (true, false, 2));
+        assert_eq!(st.selection, None);
+        assert_eq!(st.verb("mute A2"), Some(Ok(())));
+        assert!(!st.timeline.tracks[2].muted, "a toggle");
+        st.undo();
+        st.undo();
+        st.undo();
+        assert_eq!(st.timeline, tl0);
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("mute V"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[0].muted, st.timeline.tracks[1].muted, st.selection), (true, false, Some((1, 0))));
+    }
+
+    /// M3: each refusal is `NoTrack`, the state and the undo depth untouched; other words are not this one.
+    #[test]
+    fn striatrackgainkeysnext_channel_refusals() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        for bad in ["mute A3", "solo V2", "mute a2", "mute X", "mute A2 A1", "solo V1 x"] {
+            assert_eq!(st.verb(bad), Some(Err(EditError::NoTrack)), "{bad}");
+        }
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
+        assert_eq!(st.verb("mute"), Some(Err(EditError::NoTrack)), "bare: SR837's word, nothing selected");
+        assert_eq!(st.verb("muteA2"), None, "not this word");
     }
 }

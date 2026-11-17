@@ -11548,3 +11548,26 @@ fn striahelpmore_typed_query_drawn() {
     assert_eq!(f.paint(), bare);
     println!("striahelpmore: typed sl, Backspace -> find: s_, Backspace -> bare");
 }
+
+// ---- STRIATRACKGAINKEYSNEXT (LEDGER SR983): `mute <ch>` / `solo <ch>` on the face with no selection (named tail block) ----
+/// M3: the face takes `solo A1` / `mute V1` with nothing selected (timeline_core's verb, no line), one undo step each, the
+/// EDL carries the flags; a channel naming no track is refused by name on the message line, the state kept.
+#[test]
+fn striatrackgainkeysnext_face_mute_by_channel() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("solo A1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("mute V1"));
+    assert_eq!((face.state.timeline.tracks[1].solo, face.state.timeline.tracks[0].muted), (true, true));
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.selection), (2, true, None));
+    let text = edl::write(&face.state.timeline, "CH").unwrap();
+    assert!(text.contains("\n* UNA MUTE V\n* UNA SOLO A\n\n"), "{text}");
+    let at = face.state.timeline.clone();
+    assert!(face.verb("mute A9"));
+    assert_eq!(face.last_error.take(), Some(format!("mute A9: {}", timeline_core::EditError::NoTrack)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&at, 2));
+    assert!(face.verb("undo") && face.verb("undo"));
+    assert_eq!((&face.state.timeline, face.dirty()), (&tl0, false));
+    println!("striatrackgainkeysnext face: solo A1 + mute V1 with no selection, two undos restore; mute A9 -> {}", timeline_core::EditError::NoTrack);
+}

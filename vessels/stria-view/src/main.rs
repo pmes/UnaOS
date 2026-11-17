@@ -201,6 +201,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
+        [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
@@ -2905,5 +2906,24 @@ mod striabinmore_tests {
         let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(drive(&mut plain, "binwheel:1,binsize:9:9"), vec!["bad token binwheel:1".to_string(), "bad token binsize:9:9".to_string()]);
         println!("striabinmore witness: --split --bin --do binsize:320:18,binwheel:1,ruler:15,bin:0 -> B at 15 on V1, bintop 1");
+    }
+}
+
+// ---- STRIATRACKGAINKEYSNEXT (LEDGER SR983): the `mute:<ch>` / `solo:<ch>` tokens (named tail block) ----
+#[cfg(test)]
+mod striatrackgainkeysnext_tests {
+    use super::*;
+
+    /// M3: `mute:A1` with nothing selected mutes A1 (no line, one undo step); `solo:V1` solos V1; `mute:A9` is refused by
+    /// name on the message road with the state kept.
+    #[test]
+    fn striatrackgainkeysnext_witness_mute_channel() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "mute:A1,solo:V1").is_empty());
+        assert_eq!((face.state.timeline.tracks[1].muted, face.state.timeline.tracks[0].solo, face.state.undo_depth(), face.state.selection), (true, true, 2, None));
+        assert_eq!(drive(&mut face, "mute:A9"), vec![format!("mute A9: {}", timeline_core::EditError::NoTrack)]);
+        assert_eq!(face.state.undo_depth(), 2);
+        println!("striatrackgainkeysnext witness: mute:A1 + solo:V1 with no selection; mute:A9 -> {}", timeline_core::EditError::NoTrack);
     }
 }

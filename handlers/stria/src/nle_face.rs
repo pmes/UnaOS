@@ -5906,8 +5906,7 @@ impl Face {
 
 /// A track as a person names it: its kind's letter and its 1-based number within the kind (`V1`, `A2`).
 fn track_word(tl: &Timeline, ti: usize) -> String {
-    let k = if tl.tracks.get(ti).is_some_and(|t| t.kind == Kind::Video) { "V" } else { "A" };
-    format!("{k}{}", tl.track_number(ti).unwrap_or(1))
+    tl.track_name(ti).unwrap_or_else(|| String::from("A1")) // STRIATRACKGAINKEYSNEXT (SR983): timeline_core's ONE name rule
 }
 
 // ---- STRIAGAPSBLACK (LEDGER SR909): the close-gaps message row names the black fades it removed (named tail block) ----

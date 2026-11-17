@@ -3575,3 +3575,44 @@ impl Xform {
         (xf != self).then_some(xf)
     }
 }
+
+// ---- STRIATRACKGAINKEYSNEXT (LEDGER SR983): the track's channel word both ways, ONE name rule (named tail block) ----
+// A track as a person names it is its kind's letter and its 1-based number within the kind (`V1`, `A2`):
+// [`Timeline::track_name`] is THE spelling (the face's message lines read it). [`Timeline::track_named`] is its inverse
+// over the EDL's channel parser (`V` / `V1`..`V9`, `A` / `A1`..`A9`, uppercase only): the nth track of that kind.
+impl Timeline {
+    /// Track `ti`'s name (`V1`, `A2`); `None` for no such track.
+    pub fn track_name(&self, ti: usize) -> Option<String> {
+        let k = if self.tracks.get(ti)?.kind == Kind::Video { "V" } else { "A" };
+        Some(alloc::format!("{k}{}", self.track_number(ti)?))
+    }
+    /// The index of the track a channel word names; `None` for a word that is not a channel or names no track.
+    pub fn track_named(&self, word: &str) -> Option<usize> {
+        let (kind, num) = edl::channel(word)?;
+        (0..self.tracks.len()).filter(|&t| self.tracks[t].kind == kind).nth(num - 1)
+    }
+}
+
+#[cfg(test)]
+mod striatrackgainkeysnext_tests {
+    use super::*;
+
+    /// M3: interleaved tracks name and parse back; `V` is `V1`; a bad word or a missing track is `None`.
+    #[test]
+    fn striatrackgainkeysnext_track_name_round_trip() {
+        let mut tl = Timeline::new(25);
+        for k in [Kind::Video, Kind::Audio, Kind::Video, Kind::Audio] {
+            tl.add_track(k);
+        }
+        let names: Vec<String> = (0..4).map(|t| tl.track_name(t).unwrap()).collect();
+        assert_eq!(names, ["V1", "A1", "V2", "A2"]);
+        for t in 0..4 {
+            assert_eq!(tl.track_named(&names[t]), Some(t));
+        }
+        assert_eq!((tl.track_named("V"), tl.track_named("A")), (Some(0), Some(1)));
+        for bad in ["V3", "A9", "a2", "X1", "", "V10", "A 2"] {
+            assert_eq!(tl.track_named(bad), None, "{bad}");
+        }
+        assert_eq!(tl.track_name(4), None);
+    }
+}
