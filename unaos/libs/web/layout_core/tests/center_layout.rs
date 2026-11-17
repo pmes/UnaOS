@@ -422,3 +422,49 @@ fn left_and_webkit_left_split() {
     assert_eq!(line_x("width: 300px; text-align: left", &[]), 0.0, "left: the line is at the left");
     assert_eq!(line_x("width: 300px", &[("align", "left")]), 0.0, "align=left: the line is at the left");
 }
+
+// ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
+
+/// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): CSS 2.2 §10.3.3 in rtl: a definite-width block with neither
+/// margin auto is over-constrained and margin-left is the one ignored, so it sits margin-right from the right edge
+/// (SR711's `place_narrow_blocks` END: taffy's End places it at free + margin-left). One auto margin takes the slack and
+/// two centre, either direction (taffy's auto margins); the ltr twin keeps margin-left; a `direction` restyle round
+/// trip re-derives the placement through SR686's `rule_align` undo.
+#[test]
+fn rtl_margins_over_constrained() {
+    let col = |col_style: &str, kid_style: &str| {
+        page(vec![el("div", &[("id", "col"), ("style", col_style)], vec![el("div", &[("id", "n"), ("style", kid_style)], vec![text("ab")])])])
+    };
+    let offset_in = |tree: &Tree, doc: &N| {
+        let (cx, _, cw, _) = box_of(tree, &doc.by_id("col"));
+        let (x, _, _, _) = box_of(tree, &doc.by_id("n"));
+        assert_eq!(cw, 300.0, "the column is 300 wide");
+        x - cx
+    };
+    let m = "width: 100px; margin-left: 10px; margin-right: 20px";
+    let cases: [(&str, N, f32); 6] = [
+        ("rtl 10 / 20", col("width: 300px; direction: rtl", m), 180.0),
+        ("ltr 10 / 20", col("width: 300px", m), 10.0),
+        ("rtl auto / 20", col("width: 300px; direction: rtl", "width: 100px; margin-left: auto; margin-right: 20px"), 180.0),
+        ("rtl 0 auto", col("width: 300px; direction: rtl", "width: 100px; margin: 0 auto"), 100.0),
+        ("rtl 400 wide, 10 / 20", col("width: 300px; direction: rtl", "width: 400px; margin-left: 10px; margin-right: 20px"), -120.0),
+        ("rtl text-align: center, 10 / 20", col("width: 300px; direction: rtl; text-align: center", m), 180.0),
+    ];
+    for (how, doc, want) in &cases {
+        let tree = lay(doc, VW, 400.0);
+        assert_eq!(offset_in(&tree, doc), *want, "{how}: the block's offset in the 300px column");
+    }
+
+    let doc = col("width: 300px", m);
+    let mut tree = lay(&doc, VW, 400.0);
+    assert_eq!(offset_in(&tree, &doc), 10.0, "ltr: margin-left binds");
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    for (dir, want) in [("rtl", 180.0), ("ltr", 10.0)] {
+        let mut spec = layout_core::css::SpecifiedStyle::<TH>::default();
+        layout_core::css::apply_declaration("direction", dir, &mut spec, &cx);
+        let specs = [(id_of(&tree, &doc.by_id("col")), std::rc::Rc::new(spec))];
+        layout_core::apply_specs(&mut tree, &specs);
+        layout_core::remeasure(&mut tree, &F);
+        assert_eq!(offset_in(&tree, &doc), want, "direction: {dir} restyle: the block's offset");
+    }
+}
