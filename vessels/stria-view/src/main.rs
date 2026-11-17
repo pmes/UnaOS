@@ -186,7 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease" | "help"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
+        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
     Some(vec![one])
@@ -327,9 +327,9 @@ mod tests {
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let (tl, src) = nle_face::synth_fixture();
         let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
-        assert_eq!(row.len(), nle_face::VERBS.len());
+        assert_eq!(row.len(), nle_face::VERBS.len() + 1); // STRIAHELPMORE (SR977): plus the help query field
         for b in row {
-            let TetraNode::Button { action, .. } = b else { panic!("not a button") };
+            let TetraNode::Button { action, .. } = b else { assert!(matches!(b, TetraNode::TextField { id, .. } if id == nle_face::HELP_FIELD), "not a button"); continue }; // STRIAHELPMORE (SR977): the one non-button is the help field
             let SMessage::Input { target, text } = action else { panic!("not an Input") };
             assert_eq!(target, SURFACE);
             assert!(face.verb(text), "{text}");
@@ -517,7 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
+        TetraNode::TextField { id: nle_face::HELP_FIELD.into(), placeholder: "find a key".into(), action: quartzite::tetra::TextAction::ConsoleInput, secret: false }, button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAHELPMORE (SR977): the help query field before it
     ])
 }
 
@@ -962,5 +962,38 @@ mod striahelpsearchlive_tests {
         assert_eq!(f.help_query(), Some("s"));
         assert!(f.help_shown());
         println!("striahelpsearchlive witness: help,key:s,key:l -> ,\"help_query\":\"sl\",\"help_rows\":{n}");
+    }
+}
+
+// ---- STRIAHELPMORE (LEDGER SR977): the witness's help query field on the bar (named tail block) ----
+#[cfg(test)]
+mod striahelpmore_tests {
+    use super::*;
+
+    /// STRIAHELPMORE M3: the transport row's field `HELP_FIELD` sits just before the `?` button and fires ConsoleInput;
+    /// `--do find:slip` (its Enter) prints the `help:slip` line; `find:zzz` is refused by name; a blank `find:` toggles.
+    #[test]
+    fn striahelpmore_witness_help_field() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::TextField { id, action, secret, .. }) = row.get(row.len() - 2) else { panic!("no field before ?") };
+        assert_eq!((id.as_str(), *secret), (nle_face::HELP_FIELD, false));
+        assert!(matches!(action, quartzite::tetra::TextAction::ConsoleInput));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut word = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&word, "find:slip").as_deref(), Some([SMessage::ConsoleInput(q)]) if q == "slip"));
+        assert!(drive(&mut word, "help:slip").is_empty());
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "find:slip");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((help_json(&f), help_search_json(&f)), (help_json(&word), help_search_json(&word)));
+        assert_eq!(f.help_query(), Some("slip"));
+        let errors = drive(&mut f, "find:zzz");
+        assert_eq!(errors, vec!["help: no key matches \"zzz\"".to_string()]);
+        assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+        let errors = drive(&mut f, "find:");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.help_shown(), f.help_query()), (false, None));
+        println!("striahelpmore witness: find:slip -> {}", help_search_json(&word));
     }
 }
