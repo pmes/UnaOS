@@ -506,22 +506,7 @@ fn root_inherited() -> Inherited {
 /// The Advancer a form control's value is painted with: the inherited font state along the box
 /// tree's path from the root to `id` (the engine hit-tests a click into a field's text on it).
 pub fn control_advancer(layout: &LayoutTree, id: NodeId) -> Option<Advancer> {
-    let mut path = vec![id];
-    let mut n = layout.taffy.parent(id);
-    while let Some(p) = n {
-        path.push(p);
-        n = layout.taffy.parent(p);
-    }
-    let mut inh = root_inherited();
-    for p in path.into_iter().rev() {
-        if let Some(dn) = layout.node_map.get(&p) {
-            if let Some(el) = dn.as_element() {
-                let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
-                inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
-            }
-        }
-    }
-    Some(inh.advancer())
+    Some(inherited_at(layout, id).advancer()) // AETHEROUTLINECURRENTCOLORUA (SR1131): the walk is `inherited_at` (file tail)
 }
 
 /// The focused text control's editing state, as the engine hands it to paint (AETHERINPUT, SR68): the
@@ -1068,10 +1053,10 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
-        (0, 0, 238) // UA default link blue
-    } else if control_tag(tag) { layout_core::ua_colours(inherited.scheme).ink } else if tag == "html" { layout_core::ua_colours(inherited.scheme).canvastext } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
-        inherited.color
+    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |c| {
+        ua_color(tag, c, inherited.scheme)
+        // AETHEROUTLINECURRENTCOLORUA (SR1131): the a / control (SR1001 ButtonText) / html UA table is `ua_color` (file tail),
+        // read by computed_report too
     })); deco_ink(inherited, tag, spec); // AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): after the colour write, so currentcolor is this element's ink
 }
 
@@ -4822,4 +4807,40 @@ fn caret_ink(inherited: &Inherited, ink: (u8, u8, u8)) -> Option<((u8, u8, u8), 
         Some((_, _, _, 0)) => None,
         Some((r, g, b, a)) => Some(((r, g, b), a)),
     }
+}
+
+// ---- AETHEROUTLINECURRENTCOLORUA (LEDGER SR1131): one UA colour table and the render's inherited state at a box (named tail block) ----
+
+/// AETHEROUTLINECURRENTCOLORUA (SR1131): the UA tag colour an element without a declared or inherited `color` takes (html.css):
+/// a link's (0, 0, 238), a control's ButtonText / FieldText (AETHERCSSCONTROLUACOLOR SR1001), html's CanvasText, both from
+/// the resolved scheme's UA row (SR1031); anything else keeps `inherited`. Read by `inherit_element` and computed_report.
+pub(crate) fn ua_color(tag: &str, inherited: (u8, u8, u8), scheme: Option<u8>) -> (u8, u8, u8) {
+    match tag {
+        "a" => (0, 0, 238), // UA default link blue
+        _ if control_tag(tag) => layout_core::ua_colours(scheme).ink,
+        "html" => layout_core::ua_colours(scheme).canvastext,
+        _ => inherited,
+    }
+}
+
+/// AETHEROUTLINECURRENTCOLORUA (SR1131): the inherited state the painter carries at `id`: `root_inherited` and
+/// `inherit_element` along the box tree's path from the root (lifted from `control_advancer`). Its `color` is an outline's
+/// and a canvas background's currentcolor (focusring `current_color`).
+fn inherited_at(layout: &LayoutTree, id: NodeId) -> Inherited {
+    let mut path = vec![id];
+    let mut n = layout.taffy.parent(id);
+    while let Some(p) = n {
+        path.push(p);
+        n = layout.taffy.parent(p);
+    }
+    let mut inh = root_inherited();
+    for p in path.into_iter().rev() {
+        if let Some(dn) = layout.node_map.get(&p) {
+            if let Some(el) = dn.as_element() {
+                let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
+                inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
+            }
+        }
+    }
+    inh
 }

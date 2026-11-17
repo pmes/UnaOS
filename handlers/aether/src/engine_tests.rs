@@ -10025,4 +10025,62 @@ b</div>
         let (_, _, w, h) = imgalt_rect(&mut e, "tz");
         assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
     }
+
+    // ---- AETHEROUTLINECURRENTCOLORUA (LEDGER SR1131): a currentcolor outline paints the render's own ink, UA colours included (named tail block) ----
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): 40x20 inline-block boxes with no text, each outline pulled inside its box by
+    /// `outline-offset: -6px` (SR1119's shape): `#la` a link with `outline: 2px solid`, `#dv` a div with `outline: 1px solid`,
+    /// `#lr` a red link with `outline: 1px solid`, `#ls` a span inside a link with `outline: 1px solid`, `#bt` a button with
+    /// `outline: 1px solid`.
+    fn outline_currentcolor_ua_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            .b { display: inline-block; width: 40px; height: 20px; outline-offset: -6px; vertical-align: top }
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0">
+            <div><a id="la" class="b" href="#x" style="outline:2px solid"></a></div>
+            <div id="dv" style="width:40px;height:20px;outline:1px solid;outline-offset:-6px"></div>
+            <div><a id="lr" class="b" href="#x" style="color:red;outline:1px solid"></a></div>
+            <div><a href="#x"><span id="ls" class="b" style="outline:1px solid"></span></a></div>
+            <div><button id="bt" class="b" style="outline:1px solid"></button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): a link's currentcolor outline paints the UA link blue (Chromium's -webkit-link
+    /// rgb(0, 0, 238)); before SR1131 focusring `current_color` read only declared colours and painted it black. The
+    /// outline-color column (SR1124) already read `rgb(0, 0, 238)`: the paint and the column now agree.
+    #[test]
+    fn outline_currentcolor_ua_link_blue() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "la", css_wide_blue) > 20, "armed: #la's outline is the link blue (black before)");
+        assert_eq!(css_wide_color_ink(&mut e, "la", text_decoration_black), 0, "#la paints no black");
+        assert_eq!(font_shorthand_cs(&mut e, "la", "outlineColor"), "rgb(0, 0, 238)", "#la: the column, unchanged");
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): a span inside a link inherits the UA link blue into its currentcolor outline
+    /// (the walk is the render's own inheritance, not the nearest declared colour).
+    #[test]
+    fn outline_currentcolor_ua_link_descendant() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "ls", css_wide_blue) > 20, "armed: #ls inherits the link blue");
+        assert_eq!(css_wide_color_ink(&mut e, "ls", text_decoration_black), 0, "#ls paints no black");
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): the controls, unchanged: a plain div's outline is black (CanvasText), a declared
+    /// `color: red` on a link wins over the UA blue, and a button's is its ButtonText black.
+    #[test]
+    fn outline_currentcolor_ua_controls() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "dv", text_decoration_black) > 20, "#dv: black");
+        assert_eq!(css_wide_color_ink(&mut e, "dv", css_wide_blue), 0, "#dv: no blue");
+        assert!(css_wide_color_ink(&mut e, "lr", css_wide_red) > 20, "#lr: the declared red");
+        assert_eq!(css_wide_color_ink(&mut e, "lr", css_wide_blue), 0, "#lr: no blue");
+        assert!(css_wide_color_ink(&mut e, "bt", text_decoration_black) > 0, "#bt: the ButtonText black");
+        assert_eq!(css_wide_color_ink(&mut e, "bt", css_wide_blue), 0, "#bt: no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(0, 0, 0)", "#bt: the color column through the one table");
+    }
 }
