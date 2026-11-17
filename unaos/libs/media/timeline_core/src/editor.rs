@@ -755,3 +755,17 @@ impl EditorState {
         alloc::format!("history: {}", items.join(" | "))
     }
 }
+
+// ---- STRIAUNDOTHREE (LEDGER SR9027): the redo entries' words (named tail block) ----
+// SR876's [`UndoNames`] keeps the redo entries' words in lockstep with the redo stack but only the undo side had a reader;
+// [`EditorState::redo_history`] is the ONE reader of the redo side (the host face's history note lists them).
+
+impl EditorState {
+    /// The top `n` redo entries, next first: `(the redo count that reaches it, 1 = the next redo; its word, None when
+    /// unnamed)`.
+    pub fn redo_history(&self, n: usize) -> Vec<(usize, Option<&str>)> {
+        let depth = self.redo.len();
+        let names = &self.hist.redo;
+        (0..n.min(depth)).map(|k| (k + 1, names.len().checked_sub(k + 1).and_then(|j| names[j].as_deref()))).collect()
+    }
+}

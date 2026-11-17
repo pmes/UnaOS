@@ -3108,7 +3108,7 @@ impl Face {
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
         if let Some(r) = self.undo_jump_verb(v) { return r; } if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
-            self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N)); self.note = self.last_error.clone();
+            self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N)); self.note = self.last_error.clone().map(|l| self.with_redo(l, timeline_core::editor::HISTORY_N)); // STRIAUNDOTHREE (SR9027): the redo entries ride the note (file tail)
             return true;
         }
         let armed = self.state.arm_word(v);
@@ -3128,7 +3128,7 @@ impl Face {
         let arg = v.strip_prefix("history ")?.trim();
         let max = timeline_core::editor::UNDO_MAX;
         self.last_error = Some(match arg.parse::<usize>() {
-            Ok(n) if (1..=max).contains(&n) => { let s = self.state.history_line(n); self.note = Some(s.clone()); s }
+            Ok(n) if (1..=max).contains(&n) => { let s = self.state.history_line(n); self.note = Some(self.with_redo(s.clone(), n)); s } // STRIAUNDOTHREE (SR9027): the redo entries ride the note (file tail)
             _ => format!("history: {arg:?} is not a count 1..={max}"),
         });
         Some(true)
@@ -3225,7 +3225,7 @@ impl Face {
         if self.message_text().as_deref() != Some(text.as_str()) {
             return None;
         }
-        let b = style.shape(&text).hit(&text, (x - 4.0) as f32);
+        let b = style.shape(&text).hit(&text, (x - 4.0) as f32); if let Some(r) = self.redo_pick_at(&text, b) { return Some(r); } // STRIAUNDOTHREE (SR9027): a press on a redo entry (file tail)
         let depth = self.state.undo_depth();
         let Some(p) = history_entry_at(&text, b).filter(|p| (1..=depth).contains(p)) else { return Some(false) };
         self.note = None;
@@ -3243,6 +3243,56 @@ fn history_entry_at(line: &str, b: usize) -> Option<usize> {
         let end = start + item.len();
         if (start..=end).contains(&b) {
             return item.split(' ').next()?.parse().ok();
+        }
+        start = end + 3;
+    }
+    None
+}
+
+// ---- STRIAUNDOTHREE (LEDGER SR9027): redo entries on the noted history line, picked by pointer (named tail block) ----
+// The history words' note (SR973) carries the redo entries after the undo line: `history: 1 split || redo: r1 delete | r2
+// slip+` (the top n redo entries, next first, from timeline_core's ONE name store through `EditorState::redo_history`);
+// with an empty redo stack the note is the history line unchanged. `last_error` keeps SR876's line (serve's log, stria-
+// view's errors). A press on an entry `r<q> <word>` runs SR934's one jump road, `redo <q>`: forward to after that entry,
+// named on the message line; a press elsewhere in the redo part is taken and moves nothing. Owed: NLE-UNDO-PICK-SPLIT.
+
+/// STRIAUNDOTHREE (SR9027): the separator between the undo line and the redo entries on the note.
+const REDO_SEP: &str = " || redo: ";
+
+impl Face {
+    /// STRIAUNDOTHREE (SR9027): `line` (a history line) with the top `n` redo entries after [`REDO_SEP`]; `line` unchanged
+    /// when there is nothing to redo.
+    fn with_redo(&self, line: String, n: usize) -> String {
+        let r = self.state.redo_history(n);
+        if r.is_empty() {
+            return line;
+        }
+        let items: Vec<String> = r.iter().map(|&(q, w)| format!("r{q} {}", w.unwrap_or("(unnamed)"))).collect();
+        format!("{line}{REDO_SEP}{}", items.join(" | "))
+    }
+    /// STRIAUNDOTHREE (SR9027): byte `b` of the noted line `text` in its redo part: the entry under it redone to
+    /// (`Some(true)`), or `Some(false)` off any entry; `None` when the line has no redo part or `b` is before it.
+    fn redo_pick_at(&mut self, text: &str, b: usize) -> Option<bool> {
+        let at = text.find(REDO_SEP)?;
+        if b <= at {
+            return None;
+        }
+        let depth = self.state.redo_depth();
+        let Some(q) = redo_entry_at(text, at, b).filter(|q| (1..=depth).contains(q)) else { return Some(false) };
+        self.note = None;
+        self.verb(&format!("redo {q}"));
+        Some(true)
+    }
+}
+
+/// STRIAUNDOTHREE (SR9027): the redo count of the entry `r<q> <word>` whose bytes (its end included) hold byte `b` of
+/// `line`, whose redo part starts at byte `at` ([`REDO_SEP`]); `None` on the separator or between entries.
+fn redo_entry_at(line: &str, at: usize, b: usize) -> Option<usize> {
+    let mut start = at + REDO_SEP.len();
+    for item in line[start..].split(" | ") {
+        let end = start + item.len();
+        if (start..=end).contains(&b) {
+            return item.split(' ').next()?.strip_prefix('r')?.parse().ok();
         }
         start = end + 3;
     }

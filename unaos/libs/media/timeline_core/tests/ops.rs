@@ -347,3 +347,29 @@ fn striaundohistorydrag_drag_kind_words() {
     assert_eq!(DragKind::Marquee.word(), None);
     assert_eq!(DragKind::Scrub.word(), None);
 }
+
+// ---- STRIAUNDOTHREE (LEDGER SR9027): the redo entries' words (named tail block) ----
+
+/// `redo_history` lists the redo entries next first with the count that reaches each; an unnamed step is None; a redo
+/// moves the entry back to the undo side; a commit drops them with the redo stack.
+#[test]
+fn striaundothree_redo_history() {
+    use timeline_core::editor::{EditorState, HISTORY_N};
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl);
+    assert!(st.redo_history(HISTORY_N).is_empty());
+    st.select(0, 1).unwrap();
+    st.seek(15);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    assert_eq!(st.verb("]"), Some(Ok(())));
+    assert_eq!(st.verb("mark in"), Some(Ok(())));
+    assert!(st.undo() && st.undo());
+    assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("]")), (2, Some("mark in"))]);
+    assert_eq!(st.redo_history(1), vec![(1, Some("]"))]);
+    assert!(st.redo());
+    assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("mark in"))]);
+    assert_eq!(st.history(1), vec![(2, Some("]"))]);
+    assert!(st.undo());
+    assert_eq!(st.verb("mark out"), Some(Ok(())));
+    assert!(st.redo_history(HISTORY_N).is_empty(), "a commit drops the redo words");
+}

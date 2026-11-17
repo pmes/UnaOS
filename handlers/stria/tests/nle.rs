@@ -3940,3 +3940,57 @@ fn striaundomore_pick_misses_and_clears() {
     assert_eq!(off.state.undo_depth(), 3, "no row: nothing is picked");
     assert!(off.message_text().is_none_or(|m| !m.starts_with("history:")), "the press clears the note");
 }
+
+// ---- STRIAUNDOTHREE (LEDGER SR9027): redo entries on the noted history line, picked by pointer (named tail block) ----
+
+/// SR973's face after `undo 2` (the post-split timeline shown), then `history` through `Face::on` with `last_error`
+/// taken as `serve` takes it: (the face, the post-slip+ timeline, the note on the row).
+fn striaundothree_face() -> (stria::nle_face::Face, Timeline, String) {
+    let (mut face, split) = striaundomore_face(true);
+    let top = face.state.timeline.clone();
+    assert!(face.verb("undo 2"));
+    face.last_error = None;
+    assert_eq!(face.state.timeline, split);
+    assert!(face.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "history".into() }));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 split"), "last_error keeps SR876's line");
+    let note = face.message_text().expect("the note on the row");
+    (face, top, note)
+}
+
+/// Rule: with redo entries the note lists them after the undo line, next first; a press on `r2 slip+` runs SR934's
+/// `redo 2`, forward to after "slip+", and the note is gone.
+#[test]
+fn striaundothree_pick_redo() {
+    let (mut face, top, note) = striaundothree_face();
+    assert_eq!(note, "history: 1 split || redo: r1 delete | r2 slip+");
+    let (x, y) = striaundomore_at(&face, &note, note.find("r2 slip+").unwrap());
+    assert!(striaundomore_press(&mut face, x, y));
+    let landed = face.last_error.take();
+    assert_eq!(landed.as_deref(), Some("redo 2: forward to after \"slip+\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (3, 0));
+    assert_eq!(face.state.timeline, top);
+    assert!(face.message_text().is_none_or(|m| !m.starts_with("history:")), "the pick clears the note");
+    println!("striaundothree: pick at x {x:.1} -> {landed:?}");
+}
+
+/// Rule: an undo entry on a line that carries redo entries still picks SR973's undo; a press on the redo separator is
+/// taken and moves nothing; with nothing to redo the note is SR876's line unchanged.
+#[test]
+fn striaundothree_redo_part_miss_and_undo_pick() {
+    let (mut face, _top, note) = striaundothree_face();
+    let shown = face.state.timeline.clone();
+    let (x, y) = striaundomore_at(&face, &note, note.find("|| redo").unwrap() + 4);
+    assert!(!striaundomore_press(&mut face, x, y), "on the separator: taken, nothing to repaint");
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth(), face.state.timeline == shown), (1, 2, true));
+    assert_eq!(face.message_text().as_deref(), Some(note.as_str()), "the note stands");
+    let (x, y) = striaundomore_at(&face, &note, note.find("1 split").unwrap());
+    assert!(striaundomore_press(&mut face, x, y));
+    assert_eq!(face.last_error.take().as_deref(), Some("undo 1: back to before \"split\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (0, 3));
+
+    let (mut fresh, _split) = striaundomore_face(true);
+    assert!(fresh.verb("history"));
+    let line = fresh.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 3 slip+ | 2 delete | 1 split"));
+    assert_eq!(fresh.message_text(), line, "no redo entries: the note is the history line");
+}
