@@ -1038,13 +1038,49 @@ pub const TRUE_PEAK_OS: u32 = 4;
 /// exactly SR878's sample peak. The converter's history pre-rolls silence at the range start, so an edge can only
 /// over-read (a normalize lands lower, never above its target).
 pub fn peak_over(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: u32) -> Result<Option<f32>, RenderError> {
+    peak_at(sources, id, ns, os, 0) // STRIANORMALIZETHREE (SR9035): the body moved to `peak_at` (file tail); out rate 0 is the source's own
+}
+
+/// STRIANORMALIZEMORE (SR963): the largest |sample| `s` yields for `pcm` (whole interleaved frames of `ch` channels, the
+/// converter's own count), every output that did not fit one buffer drained by calling again; `end` flushes the stream
+/// instead (`pcm` unused; the window's lookahead is silence). NaN ignored.
+pub fn up_peak(s: &mut resample::Sinc, ch: usize, pcm: &[f32], end: bool) -> f32 {
+    let ch = ch.max(1);
+    let (from, to) = s.rates();
+    let room = (pcm.len() / ch) * (to as usize).div_ceil(from.max(1) as usize) + 64;
+    let mut buf = vec![0.0f32; room * ch];
+    let mut peak = 0.0f32;
+    let mut input = pcm;
+    loop {
+        let made = if end { s.flush(&mut buf) } else { s.process(input, &mut buf).1 };
+        input = &[];
+        peak = buf[..made * ch].iter().fold(peak, |m, &x| {
+            let v = if x < 0.0 { -x } else { x };
+            if v > m { v } else { m }
+        });
+        if made < room {
+            break;
+        }
+    }
+    peak
+}
+
+// ---- STRIANORMALIZETHREE (LEDGER SR9035): the peak at the rate the mix plays, through the one peak body (named tail block) ----
+
+/// STRIANORMALIZETHREE (SR9035): SR963's [`peak_over`] body (moved here, not copied) with the converter's rate
+/// `to * os`, `to` = `out_rate` (0: the source's own rate). The one `resample::Sinc` (the mix's own, as `Aud::take_at`
+/// builds it) runs only when that rate differs from the source's, so `out_rate` 0 is SR963's `peak_over` exactly and
+/// `out_rate` 0 with `os` 1 is SR878's sample peak exactly. The sample peak is always folded too and the larger kept, so
+/// a normalize never lands above its target (a downsample can only lower the peak: conservative).
+pub fn peak_at(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: u32, out_rate: u32) -> Result<Option<f32>, RenderError> {
     let m = sources.get(id)?;
     let Some(i) = m.audio else { return Ok(None) };
     let ch = m.demux.tracks()[i].channels.max(1);
     let key = sources.keyframe_ns(id, Kind::Audio, ns.start.max(0)).ok_or(RenderError::NoStream(id, Kind::Audio))?;
     let mut a = Aud::open(m, id, key, ch)?;
     let rate = a.rate.max(1);
-    let mut up = (os > 1).then(|| resample::Sinc::new(rate, rate.saturating_mul(os), ch as usize));
+    let to = (if out_rate == 0 { rate } else { out_rate }).saturating_mul(os.max(1));
+    let mut up = (to != rate).then(|| resample::Sinc::new(rate, to, ch as usize));
     let (s0, s1) = (samples(ns.start.max(0), rate), samples(ns.end.max(0), rate));
     let mut peak = 0.0f32;
     let mut at = s0;
@@ -1070,26 +1106,8 @@ pub fn peak_over(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: 
     Ok(Some(peak))
 }
 
-/// STRIANORMALIZEMORE (SR963): the largest |sample| `s` yields for `pcm` (whole interleaved frames of `ch` channels, the
-/// converter's own count), every output that did not fit one buffer drained by calling again; `end` flushes the stream
-/// instead (`pcm` unused; the window's lookahead is silence). NaN ignored.
-pub fn up_peak(s: &mut resample::Sinc, ch: usize, pcm: &[f32], end: bool) -> f32 {
-    let ch = ch.max(1);
-    let (from, to) = s.rates();
-    let room = (pcm.len() / ch) * (to as usize).div_ceil(from.max(1) as usize) + 64;
-    let mut buf = vec![0.0f32; room * ch];
-    let mut peak = 0.0f32;
-    let mut input = pcm;
-    loop {
-        let made = if end { s.flush(&mut buf) } else { s.process(input, &mut buf).1 };
-        input = &[];
-        peak = buf[..made * ch].iter().fold(peak, |m, &x| {
-            let v = if x < 0.0 { -x } else { x };
-            if v > m { v } else { m }
-        });
-        if made < room {
-            break;
-        }
-    }
-    peak
+/// STRIANORMALIZETHREE (SR9035): source `id`'s peak over `ns` at the rate the mix plays it ([`Sources::set_audio_rate`]'s
+/// project rate, 0 = the source's own), `os` times oversampled: an overshoot the mix's resample builds is seen.
+pub fn peak_mix(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>, os: u32) -> Result<Option<f32>, RenderError> {
+    peak_at(sources, id, ns, os, sources.audio_rate)
 }
