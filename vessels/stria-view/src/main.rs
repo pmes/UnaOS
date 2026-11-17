@@ -37,6 +37,7 @@
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 //! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
 //! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>}` after the other fields (the default line unchanged).
+//! STRIARECENTFILES (SR884): a window's `<edl>` goes first in Principia's `stria.recent` (the last five, `nle_face::remember_doc`); `--do recent` ends the JSON line with `"recent":[...]` read from it (the witness never writes it).
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -204,7 +205,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -253,7 +254,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &recent_json(c); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -294,7 +295,7 @@ fn main() {
         std::process::exit(witness(&c, face));
     }
 
-    let title = c.edl.as_deref().and_then(|p| std::path::Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("synthetic").to_string();
+    remember_recent(&c); let title = c.edl.as_deref().and_then(|p| std::path::Path::new(p).file_name()).and_then(|s| s.to_str()).unwrap_or("synthetic").to_string();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let synapse = Synapse::new();
     let mut engine: Option<Box<dyn std::any::Any>> = None; // NLEPLAYAUDIO (SR676): the audio engine, held for the process life
@@ -902,5 +903,78 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIARECENTFILES (LEDGER SR884): the recent documents through Principia's store (named tail block) ----
+
+/// STRIARECENTFILES (SR884): a window's `<edl>` goes first in Principia's `stria.recent` (canonicalized, else as given),
+/// folded by `nle_face::remember_doc` and written through quartzite's host prefs get / set (`chrome_rows::stored_str` /
+/// `store_str`: the SAVERECENT SR391 road, one store). `--synth` records nothing.
+fn remember_recent(c: &Cli) {
+    use quartzite::widgets::chrome_rows::{store_str, stored_str};
+    let Some(edl) = c.edl.as_deref() else { return };
+    let path = std::fs::canonicalize(edl).unwrap_or_else(|_| std::path::PathBuf::from(edl));
+    if let Some(row) = nle_face::remember_doc(&path, stored_str(nle_face::RECENT_NS, nle_face::RECENT_KEY).as_deref()) {
+        store_str(nle_face::RECENT_NS, nle_face::RECENT_KEY, row);
+    }
+}
+
+/// STRIARECENTFILES (SR884): the `recent` token asks the witness line for the recent list; it sends the face nothing.
+fn recent_token(tok: &str) -> Option<Vec<SMessage>> {
+    (tok == "recent").then(Vec::new)
+}
+
+/// STRIARECENTFILES (SR884): the witness's `"recent"` field, only when the script names `recent` (the default line is
+/// unchanged and reads no store).
+fn recent_json(c: &Cli) -> String {
+    if !recent_asked(c.script.as_deref()) {
+        return String::new();
+    }
+    recent_json_of(quartzite::widgets::chrome_rows::stored_str(nle_face::RECENT_NS, nle_face::RECENT_KEY).as_deref())
+}
+
+/// STRIARECENTFILES (SR884): the script names the `recent` token.
+fn recent_asked(script: Option<&str>) -> bool {
+    script.unwrap_or("").split(',').any(|t| t == "recent")
+}
+
+/// STRIARECENTFILES (SR884): `,"recent":["<path>",...]` of a stored row, newest first (a `"` read as `'`, as `errors`).
+fn recent_json_of(stored: Option<&str>) -> String {
+    let all: Vec<String> = nle_face::recent_docs(stored).iter().map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "'"))).collect();
+    format!(",\"recent\":[{}]", all.join(","))
+}
+
+#[cfg(test)]
+mod striarecentfiles_tests {
+    use super::*;
+
+    /// STRIARECENTFILES M3: `recent` is a witness token that sends the face nothing and raises no error.
+    #[test]
+    fn striarecentfiles_token_is_quiet() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "recent");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((face.state.playhead, face.state.undo_depth(), face.dirty()), (0, 0, false));
+        assert_eq!(recent_token("recent").map(|m| m.len()), Some(0));
+        assert!(recent_token("recently").is_none());
+    }
+
+    /// STRIARECENTFILES M3: the field's shapes: an unset row is an empty list, newest first, a quote read as `'`.
+    #[test]
+    fn striarecentfiles_json_shapes() {
+        assert_eq!(recent_json_of(None), ",\"recent\":[]");
+        assert_eq!(recent_json_of(Some("/p/b.edl\n/p/a.edl")), ",\"recent\":[\"/p/b.edl\",\"/p/a.edl\"]");
+        assert_eq!(recent_json_of(Some("/p/say \"hi\".edl")), ",\"recent\":[\"/p/say 'hi'.edl\"]");
+    }
+
+    /// STRIARECENTFILES M3: a script without `recent` adds no field (and reads no store).
+    #[test]
+    fn striarecentfiles_default_line_unchanged() {
+        assert!(!recent_asked(None));
+        assert!(!recent_asked(Some("play,play,meters")));
+        assert!(!recent_asked(Some("recently")));
+        assert!(recent_asked(Some("play,recent")));
     }
 }

@@ -3648,3 +3648,41 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIARECENTFILES (LEDGER SR884): the recent documents row's fold (named tail block) ----
+
+/// STRIARECENTFILES M3: an opened document goes first, a repeat moves to the front, the row keeps at most five.
+#[test]
+fn striarecentfiles_front_dedupe_cap() {
+    use std::path::Path;
+    use stria::nle_face::{RECENT_MAX, recent_docs, remember_doc};
+    assert_eq!(RECENT_MAX, 5);
+    let mut row = remember_doc(Path::new("/p/a.edl"), None).expect("a plain path is recorded");
+    assert_eq!(row, "/p/a.edl");
+    for p in ["/p/b.edl", "/p/c.edl"] {
+        row = remember_doc(Path::new(p), Some(&row)).unwrap();
+    }
+    assert_eq!(recent_docs(Some(&row)), ["/p/c.edl", "/p/b.edl", "/p/a.edl"], "newest first");
+    row = remember_doc(Path::new("/p/a.edl"), Some(&row)).unwrap();
+    assert_eq!(recent_docs(Some(&row)), ["/p/a.edl", "/p/c.edl", "/p/b.edl"], "a repeat moved to the front, not doubled");
+    for p in ["/p/d.edl", "/p/e.edl", "/p/f.edl", "/p/g.edl"] {
+        row = remember_doc(Path::new(p), Some(&row)).unwrap();
+    }
+    assert_eq!(recent_docs(Some(&row)), ["/p/g.edl", "/p/f.edl", "/p/e.edl", "/p/d.edl", "/p/a.edl"], "capped at five");
+    assert_eq!(row.lines().count(), 5);
+}
+
+/// STRIARECENTFILES M3: an unset or blank row reads empty, blank lines are dropped, an over-long stored row reads five,
+/// and a path holding a line break is refused (`None`: the row is one path per line).
+#[test]
+fn striarecentfiles_reads_and_refusals() {
+    use std::path::Path;
+    use stria::nle_face::{recent_docs, remember_doc};
+    assert!(recent_docs(None).is_empty());
+    assert!(recent_docs(Some("")).is_empty());
+    assert_eq!(recent_docs(Some("\n/p/a.edl\n\n/p/b.edl\n")), ["/p/a.edl", "/p/b.edl"]);
+    assert_eq!(recent_docs(Some("1\n2\n3\n4\n5\n6\n7")).len(), 5);
+    assert_eq!(remember_doc(Path::new("/p/bad\nname.edl"), Some("/p/a.edl")), None);
+    assert_eq!(remember_doc(Path::new(""), Some("/p/a.edl")), None);
+    assert_eq!(remember_doc(Path::new("/p/x.edl"), Some("1\n2\n3\n4\n5\n6\n7")).unwrap(), "/p/x.edl\n1\n2\n3\n4");
+}

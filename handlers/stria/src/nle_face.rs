@@ -3097,3 +3097,34 @@ impl Face {
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
     }
 }
+
+// ---- STRIARECENTFILES (LEDGER SR884): the recent documents, Principia's stria.recent (named tail block) ----
+// The list is a preference: its store is Principia's (one key, the SAVERECENT SR391 `aether.recent` shape), never a file
+// of Stria's own. The face folds the row; the vessel reads and writes it through quartzite `chrome_rows::stored_str` /
+// `store_str`. Opening one of them from the face is owed (NLE-RECENT-OPEN: the face's document is fixed at `Face::new`).
+
+/// STRIARECENTFILES (SR884): Principia's namespace of the recent documents row.
+pub const RECENT_NS: &str = "stria";
+/// STRIARECENTFILES (SR884): Principia's key for the recent documents, newest first, one path per line.
+pub const RECENT_KEY: &str = "recent";
+/// STRIARECENTFILES (SR884): how many recent documents are kept.
+pub const RECENT_MAX: usize = 5;
+
+/// STRIARECENTFILES (SR884): the stored recent documents, newest first (blank lines dropped, at most [`RECENT_MAX`];
+/// empty when unset).
+pub fn recent_docs(stored: Option<&str>) -> Vec<String> {
+    stored.map(|s| s.lines().filter(|l| !l.is_empty()).take(RECENT_MAX).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// STRIARECENTFILES (SR884): the row with `path` opened: `path` first, an equal older entry dropped, at most
+/// [`RECENT_MAX`], one per line. `None` for a path holding a line break (the row is one path per line). Pure.
+pub fn remember_doc(path: &std::path::Path, stored: Option<&str>) -> Option<String> {
+    let p = path.to_string_lossy().into_owned();
+    if p.is_empty() || p.contains('\n') || p.contains('\r') {
+        return None;
+    }
+    let mut recent = vec![p.clone()];
+    recent.extend(recent_docs(stored).into_iter().filter(|r| *r != p));
+    recent.truncate(RECENT_MAX);
+    Some(recent.join("\n"))
+}
