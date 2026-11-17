@@ -1837,38 +1837,13 @@ fn seq_stamp(path: &str) -> SeqStamp {
 }
 
 /// STRIASEQTHREE: at most this many kept frames per sequence reel (a short scrub back and forth reads no file).
-const SEQ_KEPT: usize = 8;
+#[cfg_attr(not(test), allow(dead_code))] const SEQ_KEPT: usize = timeline_core::seq::KEPT; // STRIAKSEQSOUND (SR9103): timeline_core's number
 /// STRIASEQTHREE: at most this many bytes of kept RGBA per sequence reel (the newest frame is kept whatever its size).
-const SEQ_KEPT_BYTES: usize = 128 * 1024 * 1024;
+#[cfg_attr(not(test), allow(dead_code))] const SEQ_KEPT_BYTES: usize = timeline_core::seq::KEPT_BYTES; // STRIAKSEQSOUND (SR9103): timeline_core's number, a `Kept`'s default cap
 
 /// STRIASEQTHREE: a sequence reel's kept frames `(file number, w, h, RGBA, stamp)`, least recently used first; owned by its
 /// [`Seq`] behind SR940's one Mutex (`SeqHeld`), locked for one `get` or one `put`, never across a stat, read or decode.
-#[derive(Default)]
-struct SeqKept(Vec<(u64, u32, u32, Arc<Vec<u8>>, SeqStamp)>);
-
-impl SeqKept {
-    /// STRIASEQTHREE: file number `n`'s kept frame when its stamp is `st` (taken just before); a hit moves to the back, a
-    /// kept frame whose file changed or is gone is dropped and not served.
-    fn get(&mut self, n: u64, st: SeqStamp) -> Option<(u32, u32, Arc<Vec<u8>>)> {
-        let i = self.0.iter().position(|e| e.0 == n)?;
-        let e = self.0.remove(i);
-        if st.is_none() || e.4 != st {
-            return None;
-        }
-        let out = (e.1, e.2, e.3.clone());
-        self.0.push(e);
-        Some(out)
-    }
-    /// STRIASEQTHREE: keep file number `n`'s frame (replacing an older copy of it) at the back, then drop from the front while
-    /// more than [`SEQ_KEPT`] frames or [`SEQ_KEPT_BYTES`] bytes are kept, the newest always staying.
-    fn put(&mut self, n: u64, w: u32, h: u32, rgba: Arc<Vec<u8>>, stamp: SeqStamp) {
-        self.0.retain(|e| e.0 != n);
-        self.0.push((n, w, h, rgba, stamp));
-        while self.0.len() > 1 && (self.0.len() > SEQ_KEPT || self.0.iter().map(|e| e.3.len()).sum::<usize>() > SEQ_KEPT_BYTES) {
-            self.0.remove(0);
-        }
-    }
-}
+type SeqKept = timeline_core::seq::Kept<Vec<u8>, (u64, std::time::SystemTime)>; // STRIAKSEQSOUND (SR9103): the kept set and its count / byte / stamp rule are timeline_core's, the Player's too
 
 impl Seq {
     /// STRIASEQTHREE: the reel with its size upright: a `.jpg` / `.jpeg` reel decodes its first file `p` whole (pixel_core's

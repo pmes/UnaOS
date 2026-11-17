@@ -1097,7 +1097,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 }
                 Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
-            Some(id) => {
+            Some(id) if seq_skip(&reels, id, pts_ms, seek_ms, &mut run) => Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }, Some(id) => { // STRIAKSEQSOUND (LEDGER SR9103): a sequence step before the seek is not read or decoded, it is never shown (file tail)
                 let live = run.as_ref().map(|x| x.src); let (w, h, px, ord) = match title_card(&reels, id, fw as usize, fh as usize, &mut run) { Some(c) => c, None => match edl_held(&held, live, s, id) { Some(f) => f, None => edl_keep(&mut held, &holds, s, id, edl_rated(&reels, tl, &mut run, s, id, rep)?) }; // STRIAKFREEZE (SR9008): a hold's repeat shows the held picture, no decode (file tail) // STRIAKSPEED (SR9012): held or decoded forward to the step's source tick through THE edl_frame (file tail) } // STRIAKTITLE (LEDGER SR9009): a title's frame is its card (file tail)
                 coded(rep, s.out_t, ord, &px); let px = edl_grade(tl.grade_at(s.track, s.out_t, false), px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) } // STRIAGRADENEXT (SR992): the clip's grade after the coded witness (file tail)
             }
@@ -2035,7 +2035,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HELP_SHOWN.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); shuttle_close(); meter_clear(); band_note_clear(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. STRIAKSHUTTLE (SR9061): the Player closed, 1x (file tail). STRIAKMETER (SR9058): holds and latches go with the editor state (file tail). STRIAKINSERTALL (SR9090): the note goes with the editor state; NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HELP_SHOWN.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); shuttle_close(); meter_clear(); band_note_clear(); SEQ_KEPT.lock().clear(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. STRIAKSHUTTLE (SR9061): the Player closed, 1x (file tail). STRIAKMETER (SR9058): holds and latches go with the editor state (file tail). STRIAKINSERTALL (SR9090): the note goes with the editor state; STRIAKSEQSOUND (LEDGER SR9103): the Player's kept sequence frames go with it (file tail); NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -4186,7 +4186,7 @@ fn seq_frame(reels: &Reels, id: timeline_core::SourceId, src_t: i64, slot: &mut 
         return Some(Err(("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, src_t)))));
     };
     let p = q.path(n);
-    if crate::shell::vfs_mount_table().stat(&p).is_err() {
+    let (here, stamp) = seq_stamp(&p); if let Some(f) = seq_kept_get(&q.dir, n, stamp) { return Some(Ok(f)); } if !here { // STRIAKSEQSOUND (LEDGER SR9103): a kept frame of an unchanged file is served without a read or a decode (file tail)
         return Some(Err(("seq-frame-missing", Some(alloc::format!("reel {} frame {} missing ({})", id.0, n, p)))));
     }
     let bytes = match read_all(&p) {
@@ -4197,7 +4197,89 @@ fn seq_frame(reels: &Reels, id: timeline_core::SourceId, src_t: i64, slot: &mut 
         Ok(i) => i,
         Err(e) => return Some(Err(("decode-refused", Some(alloc::format!("reel {} frame {} ({}): {:?}", id.0, n, p, e))))),
     };
-    Some(Ok((img.width as usize, img.height as usize, Px::from(pack(&img.rgba)), None)))
+    Some(Ok(seq_kept_put(&q.dir, n, stamp, img.width, img.height, pack(&img.rgba)))) // STRIAKSEQSOUND (LEDGER SR9103): kept in the Player's set as it is handed on (file tail)
+}
+
+// ---- STRIAKSEQSOUND (LEDGER SR9103): the Player's kept sequence frames (named tail block) ----
+// A seek or an edit restarts the EDL job (its `Reels` rebuilt), so the kept frames live in one static, keyed by the reel
+// directory, each reel's set a timeline_core `seq::Kept` (Stria's kept set, ONE rule: at most `seq::KEPT` frames, least
+// recently used dropped first, the newest always kept, a frame served only while its file's stamp `(size, mtime)` is the
+// one it was kept with, a file with no mtime never kept). The Player's byte cap is its own, [`SEQ_KEPT_BYTES`], while
+// [`slot_room`] grants a frame of that size, else 0 (only the newest stays). `SEQ_KEPT` is locked for one get or one put,
+// never across a stat, a read, a decode or the copy out (the Arc is cloned under it); cleared at [`edit_close`].
+// Wire: `[nle] seq kept down to one frame (heap free_kb=<n> need_kb=<n>)` once each time the heap check starts refusing.
+// NLE-SEQ-KERNEL-SEEKSKIP: [`seq_skip`] — a sequence step before the seek point is shown black and unseen, never read.
+
+/// The Player's byte cap per sequence reel's kept set (Stria's `seq::KEPT_BYTES` is a desktop's).
+const SEQ_KEPT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The kept sequence frames, one set per reel directory (0RGB pictures, stamp `(size, mtime)`).
+static SEQ_KEPT: crate::sync::Mutex<Vec<(String, timeline_core::seq::Kept<Vec<u32>, (u64, u64)>)>> = crate::sync::Mutex::new(Vec::new());
+
+/// Set while the heap check refuses (the down-to-one line is printed once per refusal run).
+static SEQ_KEPT_LOW: AtomicBool = AtomicBool::new(false);
+
+/// The file at `p`: `(present, stamp)` from ONE stat; the stamp is `None` when the file is gone or its medium keeps no mtime.
+fn seq_stamp(p: &str) -> (bool, Option<(u64, u64)>) {
+    match crate::shell::vfs_mount_table().stat(p) {
+        Ok(st) => (true, st.mtime.map(|m| (st.size, m))),
+        Err(_) => (false, None),
+    }
+}
+
+/// File number `n` of the reel in `dir` from the kept set, as `edl_frame` returns a picture, when its stamp is still `stamp`.
+fn seq_kept_get(dir: &str, n: u64, stamp: Option<(u64, u64)>) -> Option<(usize, usize, Px, Option<u32>)> {
+    let (w, h, px) = {
+        let mut g = SEQ_KEPT.lock();
+        let k = g.iter_mut().find(|e| e.0 == dir)?;
+        k.1.get(n, stamp)?
+    };
+    Some((w as usize, h as usize, Px::from((*px).clone()), None))
+}
+
+/// Keep file number `n`'s decoded 0RGB picture in the reel `dir`'s set (cap [`SEQ_KEPT_BYTES`] while [`slot_room`] grants,
+/// else 0) and hand it on as `edl_frame` returns it.
+fn seq_kept_put(dir: &str, n: u64, stamp: Option<(u64, u64)>, w: u32, h: u32, px: Vec<u32>) -> (usize, usize, Px, Option<u32>) {
+    if stamp.is_none() {
+        return (w as usize, h as usize, Px::from(px), None);
+    }
+    let cap = match slot_room(w as usize, h as usize) {
+        Ok(()) => {
+            SEQ_KEPT_LOW.store(false, Ordering::Relaxed);
+            SEQ_KEPT_BYTES
+        }
+        Err(why) => {
+            if !SEQ_KEPT_LOW.swap(true, Ordering::Relaxed) {
+                serial_println!("[nle] seq kept down to one frame ({})", why);
+            }
+            0
+        }
+    };
+    let kept = alloc::sync::Arc::new(px.clone());
+    {
+        let mut g = SEQ_KEPT.lock();
+        let i = match g.iter().position(|e| e.0 == dir) {
+            Some(i) => i,
+            None => {
+                g.push((String::from(dir), timeline_core::seq::Kept::default()));
+                g.len() - 1
+            }
+        };
+        g[i].1 .1 = cap;
+        g[i].1.put(n, w, h, kept, stamp);
+    }
+    (w as usize, h as usize, Px::from(px), None)
+}
+
+/// NLE-SEQ-KERNEL-SEEKSKIP: `true` when source `id` is a sequence reel and its step at `pts_ms` falls before the seek
+/// (`seek_ms`): the step is never shown, and a sequence has no run state to advance, so it is not read or decoded. The live
+/// run is dropped as `seq_frame` drops it (the next movie step opens by its seek).
+fn seq_skip(reels: &Reels, id: timeline_core::SourceId, pts_ms: u64, seek_ms: u64, run: &mut Option<EdlRun>) -> bool {
+    if pts_ms >= seek_ms || reels.seq(id).is_none() {
+        return false;
+    }
+    *run = None;
+    true
 }
 
 // ── STRIASTACK (LEDGER SR9066): a stack deeper than the two decoder slots, refused by name (named tail block) ─────────────
