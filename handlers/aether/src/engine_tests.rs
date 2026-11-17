@@ -9381,4 +9381,37 @@ b</div>
         assert_eq!((w2, h2), (44.0, 24.0), "#th: hover does not shift the box");
         assert!(css_wide_color_ink(&mut e, "th", css_wide_red) > 0, "#th: the hover colour paints the reserved frame");
     }
+
+    // ---- AETHERCSSOUTLINETRANSPARENT (LEDGER SR1119): an alpha-0 outline-color paints nothing and reads its cascaded text (named tail block) ----
+
+    /// AETHERCSSOUTLINETRANSPARENT (SR1119): three 40x20 boxes 12px apart, each outline pulled inside its box by
+    /// `outline-offset: -6px` (so the box's own rect holds the band): `#or` `2px solid red` (the reference), `#oa` the same
+    /// then `outline-color: rgba(255, 0, 0, 0)`, `#ob` `outline: 2px solid rgba(255, 0, 0, 0)`.
+    fn outline_transparent_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { width: 40px; height: 20px; margin: 0 0 12px; outline-offset: -6px }
+            </style></head><body style="margin:0">
+            <div id="or" style="outline:2px solid red"></div>
+            <div id="oa" style="outline:2px solid red;outline-color:rgba(255, 0, 0, 0)"></div>
+            <div id="ob" style="outline:2px solid rgba(255, 0, 0, 0)"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOUTLINETRANSPARENT (SR1119): an alpha-0 outline colour paints no ink (focusring's `paint_outlines` skips
+    /// alpha 0): `#oa` (red before SR1119: the alpha-0 longhand was dropped and the red stayed) and `#ob` paint no red
+    /// while `#or` does; getComputedStyle(#oa).outlineColor reads the cascaded `rgba(255, 0, 0, 0)` (no outline column:
+    /// AETHER-CSSOM-OUTLINE-COLUMNS owed).
+    #[test]
+    fn outline_transparent_paints_nothing() {
+        let mut e = outline_transparent_engine();
+        assert!(css_wide_color_ink(&mut e, "or", css_wide_red) > 20, "#or: the reference paints its red outline");
+        assert_eq!(css_wide_color_ink(&mut e, "oa", css_wide_red), 0, "armed: #oa's alpha-0 outline-color paints no red");
+        assert_eq!(css_wide_color_ink(&mut e, "ob", css_wide_red), 0, "#ob: the alpha-0 shorthand paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "oa", "outlineColor"), "rgba(255, 0, 0, 0)", "#oa: cssom");
+    }
 }
