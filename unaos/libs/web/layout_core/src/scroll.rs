@@ -419,9 +419,9 @@ pub fn snap_offset<H: Host>(tree: &LayoutTree<H>, id: NodeId, cur: (f32, f32), w
 // ---- AETHERSTYLE3C (SR122): scroll-state container queries (css-conditional-5 §2.3) ---------------------------
 
 /// Which inset edges a `position: sticky` box is stuck to, as the painter places it (css-position-3 §3.4:
-/// against the viewport — Aether's one sticky scrollport — scrolled to `vs` and `viewport` big, never leaving
-/// its containing block, the parent's content box): `css_core::container` edge bits, 0 when it sits at its
-/// normal-flow place or is not sticky.
+/// against its nearest scrollport, [`sticky_scrollport`] — an inner scroll container's padding box, else the
+/// viewport scrolled to `vs` and `viewport` big — never leaving its containing block, the parent's content box):
+/// `css_core::container` edge bits, 0 when it sits at its normal-flow place or is not sticky.
 pub fn sticky_stuck<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> u8 {
     use css_core::container::{BOTTOM, LEFT, RIGHT, TOP};
     let Some(p) = tree.paint_map.get(&id) else { return 0 };
@@ -431,34 +431,26 @@ pub fn sticky_stuck<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), v
     let Some(ins) = p.inset_px else { return 0 };
     let (Some((nx, ny)), Ok(l)) = (box_origin(tree, id, vs), tree.taffy.layout(id)) else { return 0 };
     let (w, h) = (l.size.width, l.size.height);
-    let (cb_l, cb_t, cb_r, cb_b) = match tree.taffy.parent(id).and_then(|q| Some((box_origin(tree, q, vs)?, tree.taffy.layout(q).ok()?))) {
-        Some(((px, py), pl)) => (
-            px + pl.border.left + pl.padding.left,
-            py + pl.border.top + pl.padding.top,
-            px + pl.size.width - pl.border.right - pl.padding.right,
-            py + pl.size.height - pl.border.bottom - pl.padding.bottom,
-        ),
-        None => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
-    };
+    let (pl, pt, pr, pb, cb_l, cb_t, cb_r, cb_b) = sticky_scrollport(tree, id, vs, viewport);
     let mut out = 0u8;
     if let Some(t) = ins[0] {
-        let target = vs.1 + t;
+        let target = pt + t;
         if ny < target && target.min(cb_b - h).max(ny) > ny {
             out |= TOP;
         }
     } else if let Some(b) = ins[2] {
-        let target = vs.1 + viewport.1 - b - h;
+        let target = pb - b - h;
         if ny > target && target.max(cb_t).min(ny) < ny {
             out |= BOTTOM;
         }
     }
     if let Some(lf) = ins[3] {
-        let target = vs.0 + lf;
+        let target = pl + lf;
         if nx < target && target.min(cb_r - w).max(nx) > nx {
             out |= LEFT;
         }
     } else if let Some(r) = ins[1] {
-        let target = vs.0 + viewport.0 - r - w;
+        let target = pr - r - w;
         if nx > target && target.max(cb_l).min(nx) < nx {
             out |= RIGHT;
         }
@@ -742,4 +734,67 @@ pub(crate) fn prepare<H: Host>(tree: &mut LayoutTree<H>) {
             }
         }
     }
+}
+
+// ---- AETHERSCROLLSTATESTUCKNESTED (LEDGER SR1155): one sticky scrollport rule (named tail block) ----
+
+/// AETHERSCROLLSTATESTUCKNESTED (SR1155): the scroll container a `position: sticky` box holds against
+/// (css-position-3 §3.4: its NEAREST scroll container), None for the viewport. The ancestors are walked from the
+/// parent: a `position: fixed` ancestor ends the walk at the viewport; the root element and a body whose overflow
+/// propagates to the viewport (css-overflow-3 §3.3: the root is not a scroll container) are skipped, since
+/// layout_core keeps their overflow on the box. The walk is the taffy parent chain (an absolutely positioned box
+/// between the scroller and the sticky box is not re-parented). SR1152's walk, moved from the painter.
+pub fn sticky_scroller<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> Option<NodeId> {
+    use crate::DomNode;
+    let tag_is = |n: NodeId, t: &str| tree.node_map.get(&n).and_then(|d| d.tag()).is_some_and(|g| g.eq_ignore_ascii_case(t));
+    let mut cur = tree.taffy.parent(id);
+    while let Some(a) = cur {
+        if tree.paint_map.get(&a).and_then(|q| q.position_kind) == Some(3) {
+            return None;
+        }
+        let up = tree.taffy.parent(a);
+        let propagates = tag_is(a, "html") || (tag_is(a, "body") && !up.is_some_and(|h| tag_is(h, "html") && is_scroll_container(tree, h)));
+        if !propagates && is_scroll_container(tree, a) {
+            return Some(a);
+        }
+        cur = up;
+    }
+    None
+}
+
+/// AETHERSCROLLSTATESTUCKNESTED (SR1155): Aether's ONE sticky scrollport rule, in document space (the
+/// [`box_origin`] space, the viewport scrolled to `vs` and `viewport` big): `(port_l, port_t, port_r, port_b, cb_l,
+/// cb_t, cb_r, cb_b)`. The port is the [`sticky_scroller`]'s padding box (`box_origin` + [`client_rect`]), else the
+/// viewport. The containing block is the parent's content box where the box's flow place is measured, i.e. moved by
+/// the parent's [`content_shift`] (no parent: unbounded); when the parent IS the scroller it reaches to the
+/// scroller's scrollable overflow minus its end padding (Chromium / WebKit), so a direct-child header stays stuck
+/// through the whole scroll. [`sticky_stuck`] reads it as is; the painter translates it into its walk space.
+pub fn sticky_scrollport<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+    let parent = tree.taffy.parent(id).and_then(|q| Some((q, box_origin(tree, q, vs)?, tree.taffy.layout(q).ok()?)));
+    let (cb_l, cb_t, mut cb_r, mut cb_b) = match parent {
+        Some((q, (px, py), ql)) => {
+            let (shx, shy) = content_shift(tree, q);
+            let (ax, ay) = (px + shx, py + shy);
+            (
+                ax + ql.border.left + ql.padding.left,
+                ay + ql.border.top + ql.padding.top,
+                ax + ql.size.width - ql.border.right - ql.padding.right,
+                ay + ql.size.height - ql.border.bottom - ql.padding.bottom,
+            )
+        }
+        None => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
+    };
+    let port = sticky_scroller(tree, id).and_then(|s| Some((s, box_origin(tree, s, vs)?)));
+    let Some((s, (sx, sy))) = port else { return (vs.0, vs.1, vs.0 + viewport.0, vs.1 + viewport.1, cb_l, cb_t, cb_r, cb_b) };
+    let (cx, cy, cw, ch) = client_rect(tree, s);
+    let (pl, pt) = (sx + cx, sy + cy);
+    if let (Some((q, _, _)), Ok(sl)) = (parent, tree.taffy.layout(s)) {
+        if q == s {
+            let (shx, shy) = content_shift(tree, s);
+            let (sw, sh) = scroll_size(tree, s);
+            cb_r = cb_r.max(sx + shx + sl.border.left + sw - sl.padding.right);
+            cb_b = cb_b.max(sy + shy + sl.border.top + sh - sl.padding.bottom);
+        }
+    }
+    (pl, pt, pl + cw, pt + ch, cb_l, cb_t, cb_r, cb_b)
 }
