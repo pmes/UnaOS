@@ -5172,7 +5172,7 @@ fn striaexportpresets_proxy_is_the_tables_encoder() {
     let p = preset_named("proxy").unwrap();
     let (tl, src) = synth_fixture();
     std::fs::create_dir_all(&direct).unwrap();
-    let enc = video_named_with(p.video, tl.tb, p.opts()).unwrap();
+    let enc = stria::nle_export::scaled(video_named_with(p.video, tl.tb, p.opts()).unwrap(), p.scale); // STRIAEXPORTPRESETSNEXT (SR989): the table's scale too
     export_as_with(&tl, 0..tl.end(), &src, &direct, enc, audio_named(p.audio).unwrap(), Container::Mp4, &mut |_, _| Ok(())).unwrap();
     assert_eq!(std::fs::read(pre.join("movie.mp4")).unwrap(), std::fs::read(direct.join("movie.mp4")).unwrap(), "the face's preset is the table's encoder, byte-exact");
     println!("striaexportpresets: proxy {line}");
@@ -9920,7 +9920,7 @@ fn striaexportpresetsmore_word_steps_the_table_as_a_note() {
     assert!(VERBS.contains(&"preset"));
     assert_eq!(VERBS.last(), Some(&"help"));
     assert_eq!(face.export_preset(), None);
-    for want in ["web: h264 + aac crf=23 aq=10 scenecut=40", "archive: png + wav", "proxy: h264 + aac:64 crf=32"] {
+    for want in ["web: h264 + aac crf=23 aq=10 scenecut=40", "archive: png + wav", "proxy: h264 + aac:64 crf=32 scale=1/2"] { // STRIAEXPORTPRESETSNEXT (SR989): proxy names its scale
         assert!(face.verb("preset"));
         assert_eq!(face.last_error, None, "a pick is a note, not an error");
         assert_eq!(face.message_text(), Some(format!("preset {want}")));
@@ -11840,4 +11840,86 @@ fn striainsertmarkskeysnext_face_target_steers_and_notes() {
     assert!(face.verb("target V9"));
     assert_eq!(face.last_error.take(), Some("target V9: no such track".to_string()));
     println!("striainsertmarkskeysnext: target V2 -> insert on V2; target A1 -> insert refused by kind");
+}
+
+// ---- STRIAEXPORTPRESETSNEXT (LEDGER SR989): a preset's scale through THE one scaler, the pick on the message row (named tail block) ----
+
+/// A PNG's IHDR width and height.
+fn striaexportpresetsnext_png_size(path: &std::path::Path) -> (u32, u32) {
+    let b = std::fs::read(path).unwrap();
+    (u32::from_be_bytes([b[16], b[17], b[18], b[19]]), u32::from_be_bytes([b[20], b[21], b[22], b[23]]))
+}
+
+#[test]
+fn striaexportpresetsnext_scaled_frames_are_halved() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as, scaled, scaled_size};
+    let (full, half) = (nlefaceexport_dir("scale-full"), nlefaceexport_dir("scale-half"));
+    std::fs::create_dir_all(&full).unwrap();
+    std::fs::create_dir_all(&half).unwrap();
+    let (tl, src) = synth_fixture();
+    let a = export_as(&tl, 0..tl.end(), &src, &full, Box::new(PngSequence), AudioOut::Wav, Container::Mp4).unwrap();
+    let b = export_as(&tl, 0..tl.end(), &src, &half, scaled(Box::new(PngSequence), 2), AudioOut::Wav, Container::Mp4).unwrap();
+    assert_eq!((a.frames, b.frames), (35, 35));
+    let (w, h) = striaexportpresetsnext_png_size(&full.join("000000.png"));
+    assert_eq!(striaexportpresetsnext_png_size(&half.join("000000.png")), scaled_size(w, h, 2));
+    assert_eq!(striaexportpresetsnext_png_size(&half.join("000034.png")), scaled_size(w, h, 2));
+    assert_eq!(scaled_size(w, h, 2), (((w / 2) & !1).max(2), ((h / 2) & !1).max(2)));
+    assert_eq!(std::fs::read(full.join("audio.wav")).unwrap(), std::fs::read(half.join("audio.wav")).unwrap(), "the sound is not scaled");
+    println!("striaexportpresetsnext: {w}x{h} -> {:?}", scaled_size(w, h, 2));
+}
+
+#[test]
+fn striaexportpresetsnext_scale_one_is_the_encoder_itself() {
+    use stria::nle_export::{AudioOut, Container, H264Opts, export_as, scaled, video_named_with};
+    let (a, b) = (nlefaceexport_dir("scale-one-a"), nlefaceexport_dir("scale-one-b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let (tl, src) = synth_fixture();
+    export_as(&tl, 0..tl.end(), &src, &a, video_named_with("h264", tl.tb, H264Opts::default()).unwrap(), AudioOut::Wav, Container::Mp4).unwrap();
+    export_as(&tl, 0..tl.end(), &src, &b, scaled(video_named_with("h264", tl.tb, H264Opts::default()).unwrap(), 1), AudioOut::Wav, Container::Mp4).unwrap();
+    assert_eq!(std::fs::read(a.join("video.mp4")).unwrap(), std::fs::read(b.join("video.mp4")).unwrap(), "a divisor of one is no scale, byte-exact");
+}
+
+#[test]
+fn striaexportpresetsnext_face_proxy_is_the_scaled_table_encoder() {
+    use stria::nle_export::{Container, PRESETS, audio_named, export_as_with, preset_named, scaled, video_named_with};
+    assert_eq!(PRESETS.iter().map(|p| (p.name, p.scale)).collect::<Vec<_>>(), [("web", 1), ("archive", 1), ("proxy", 2)]);
+    let (picked, direct) = (nlefaceexport_dir("scale-picked"), nlefaceexport_dir("scale-direct"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("preset proxy"));
+    assert_eq!(face.message_text(), Some("preset proxy: h264 + aac:64 crf=32 scale=1/2".to_string()));
+    assert!(face.verb(&format!("export {}", picked.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" h264 + aac:64 in "), "{line}");
+    let p = preset_named("proxy").unwrap();
+    let (tl, src) = synth_fixture();
+    std::fs::create_dir_all(&direct).unwrap();
+    let enc = scaled(video_named_with(p.video, tl.tb, p.opts()).unwrap(), 2);
+    export_as_with(&tl, 0..tl.end(), &src, &direct, enc, audio_named(p.audio).unwrap(), Container::Mp4, &mut |_, _| Ok(())).unwrap();
+    assert_eq!(std::fs::read(picked.join("movie.mp4")).unwrap(), std::fs::read(direct.join("movie.mp4")).unwrap(), "the face's proxy is the table's encoder at half size, byte-exact");
+    println!("striaexportpresetsnext: proxy {line}");
+}
+
+#[test]
+fn striaexportpresetsnext_pick_is_the_message_rows_last_fallback() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let before = face.message_text();
+    assert!(face.verb("preset proxy"));
+    face.on(&bandy::SMessage::BrowserMouseMove(1.0, 1.0, 0));
+    match before {
+        None => assert_eq!(face.message_text(), Some("export preset proxy".to_string()), "nothing else said: the pick"),
+        Some(b) => assert_eq!(face.message_text(), Some(b), "a reel line wins over the pick"),
+    }
+    face.last_error = Some("export: busy (1/2)".into());
+    assert_eq!(face.message_text().as_deref(), Some("export: busy (1/2)"), "an error wins over the pick");
+    face.last_error = None;
+    assert!(face.verb("preset none"));
+    face.on(&bandy::SMessage::BrowserMouseMove(1.0, 1.0, 0));
+    assert_eq!(face.message_text().filter(|m| m.starts_with("export preset ")), None, "no pick, nothing named");
+    assert_eq!(face.state.timeline, tl, "a view-only word leaves the document");
+    assert!(!face.dirty());
 }

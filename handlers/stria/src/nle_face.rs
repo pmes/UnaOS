@@ -2193,7 +2193,7 @@ impl Face {
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
     /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `audio` (the verb's word, default `AudioOut::Wav`, NLE5DEXPORTAUDIOOPTIONS SR722) into `Container::Mp4` (`nle export`'s defaults).
     /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
-    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut, opts: H264Opts) -> Result<(), String> { // STRIAEXPORTPRESETS (SR871): `opts` moved into the thread, as `fmt` is
+    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut, (opts, scale): (H264Opts, u8)) -> Result<(), String> { // STRIAEXPORTPRESETS (SR871): `opts` moved into the thread, as `fmt` is; STRIAEXPORTPRESETSNEXT (SR989): the preset's `scale` beside it
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
         }
@@ -2207,7 +2207,7 @@ impl Face {
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
-                let video = video_named_with(&fmt, tl.tb, opts).expect("a VIDEO_NAMES word"); // STRIAEXPORTPRESETS (SR871): the face's defaults unless a preset set them
+                let video = crate::nle_export::scaled(video_named_with(&fmt, tl.tb, opts).expect("a VIDEO_NAMES word"), scale); // STRIAEXPORTPRESETS (SR871): the face's defaults unless a preset set them; STRIAEXPORTPRESETSNEXT (SR989): a scaled preset's frames through THE one scaler
                 let mut progress = |n: u64, of: u64| -> Result<(), ExportError> {
                     d.store(n, Relaxed);
                     t.store(of, Relaxed);
@@ -2230,7 +2230,7 @@ impl Face {
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
     /// [`Face::cancel_export`]). The verb's own job is this with no hold.
     pub fn export_paused_at(&mut self, dir: &std::path::Path, fmt: &str, k: u64) -> Result<(), String> {
-        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav, H264Opts::default())
+        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav, (H264Opts::default(), 1)) // STRIAEXPORTPRESETSNEXT (SR989): unscaled
     }
     /// True while an export's result has not been reported.
     pub fn exporting(&self) -> bool {
@@ -2416,7 +2416,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
+        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3745,8 +3745,8 @@ impl Face {
 /// with at most a directory left, the preset's video and audio words ([`crate::nle_export::PRESETS`]) are appended, so the
 /// verb's own match and [`export_audio_word`] read them; the preset's H.264 options come back. Refused by name: a missing
 /// name, an unknown one, and a format / audio word beside a preset.
-fn export_preset_words(mut args: Vec<&str>) -> (Vec<&str>, Result<H264Opts, String>) {
-    let Some(i) = args.iter().position(|w| *w == "--preset") else { return (args, Ok(H264Opts::default())) };
+fn export_preset_words(mut args: Vec<&str>) -> (Vec<&str>, Result<(H264Opts, u8), String>) { // STRIAEXPORTPRESETSNEXT (SR989): the preset's scale divisor beside its options (file tail)
+    let Some(i) = args.iter().position(|w| *w == "--preset") else { return (args, Ok((H264Opts::default(), 1))) }; // STRIAEXPORTPRESETSNEXT (SR989): no preset, no scale
     args.remove(i);
     if i >= args.len() {
         return (args, Err(format!("--preset needs one of {}", crate::nle_export::preset_words())));
@@ -3760,7 +3760,7 @@ fn export_preset_words(mut args: Vec<&str>) -> (Vec<&str>, Result<H264Opts, Stri
     }
     args.push(p.video);
     args.push(p.audio);
-    (args, Ok(p.opts()))
+    (args, Ok((p.opts(), p.scale))) // STRIAEXPORTPRESETSNEXT (SR989): the table's divisor
 }
 
 // ---- STRIAAUDIOSCRUB (LEDGER SR865): a ruler scrub step plays one frame through the play road (named tail block) ----
@@ -8633,5 +8633,15 @@ impl Face {
             }
         }
         Some(true)
+    }
+}
+
+// ---- STRIAEXPORTPRESETSNEXT (LEDGER SR989): the picked export preset named on the message row (named tail block) ----
+impl Face {
+    /// The message row's last fallback while a preset is picked ([`Face::export_preset`]): `export preset <name>`, shown
+    /// whenever nothing else is said (an error, a note, a running job and a reel line all win). None without a pick, so
+    /// the default face paints nothing new.
+    fn picked_line(&self) -> Option<String> {
+        self.export_preset.map(|p| format!("export preset {}", p.name))
     }
 }

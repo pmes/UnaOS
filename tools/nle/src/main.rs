@@ -112,7 +112,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
-    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let mut min_keyint = None::<u32>; let mut p2 = Pass2Cli::default(); let mut preset_crf = false; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`; STRIAEXPORTPRESETSMORE (SR948): `preset_crf` = the crf came from a `--preset`
+    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let mut min_keyint = None::<u32>; let mut p2 = Pass2Cli::default(); let mut preset_crf = false; let mut scale = 1u8; // STRIAEXPORTPRESETSNEXT (SR989): `--scale N`, the frame's divisor (a preset sets it); H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`; STRIAEXPORTPRESETSMORE (SR948): `preset_crf` = the crf came from a `--preset`
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -140,7 +140,8 @@ fn main() {
             "--qblur" => p2.qblur_q8 = Some({ let s = value(&mut it, "--qblur"); qblur_of(&s).unwrap_or_else(|| bad("--qblur", &s, "not a number within 0..=16")) }), // H264ENCTWOPASSQBLURCLI (SR766): x264's QP blur of the planned pass (Q8)
             "--qpstep" => p2.qpstep = Some({ let s = value(&mut it, "--qpstep"); qpstep_of(&s).unwrap_or_else(|| bad("--qpstep", &s, "not an integer within 0..=51")) }), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
             "--pass2" => p2 = pass2_cli_of(&value(&mut it, "--pass2")).unwrap_or_else(|e| die(format!("--pass2 {e}"))).over(p2), // H264ENCTWOPASSCLITABLE (SR790): any of the four plan knobs in one word, the last flag written winning; NLECLIPASS2VALUE (SR821): a missing value through `value`
-            "--preset" => { let s = value(&mut it, "--preset"); let p = preset_named(&s).unwrap_or_else(|| bad("--preset", &s, &format!("one of {}", preset_words()))); (video, audio, qp, crf, bitrate, scenecut, aq) = (p.video.into(), p.audio.into(), p.qp, p.crf, None, p.scenecut, p.aq); preset_crf = p.crf.is_some(); } // STRIAEXPORTPRESETS (SR871): THE preset table assigns the knobs below it; the last flag written wins; STRIAEXPORTPRESETSMORE (SR948): it records whether the crf is the preset's
+            "--preset" => { let s = value(&mut it, "--preset"); let p = preset_named(&s).unwrap_or_else(|| bad("--preset", &s, &format!("one of {}", preset_words()))); (video, audio, qp, crf, bitrate, scenecut, aq) = (p.video.into(), p.audio.into(), p.qp, p.crf, None, p.scenecut, p.aq); preset_crf = p.crf.is_some(); scale = p.scale; } // STRIAEXPORTPRESETS (SR871): THE preset table assigns the knobs below it; the last flag written wins; STRIAEXPORTPRESETSMORE (SR948): it records whether the crf is the preset's
+            "--scale" => scale = num(&mut it, "--scale"), // STRIAEXPORTPRESETSNEXT (SR989): the export frame's width / height divisor through stria's `scaled` (1 = the timeline's size)
             "--src" => {
                 let v = value(&mut it, "--src");
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
@@ -190,7 +191,7 @@ fn main() {
             }
             let two_pass = two_pass_of(two_pass, pass, stats, bitrate.is_some(), &video); // H264ENCTWOPASS (SR698) / H264ENCTWOPASSFILE (SR719): the mode and its refusals (file tail)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| die(format!("export: {}", what("export --out")))), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, p2, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| die(format!("export: {}", what("export --out")))), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, p2, container, scale) // STRIAEXPORTPRESETSNEXT (SR989): the divisor
         }
         _ => usage(),
     }
@@ -198,9 +199,9 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, min_keyint: Option<u32>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, p2: Pass2Cli, container: Container) {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, scenecut: Option<u8>, min_keyint: Option<u32>, aq: Option<u8>, two_pass: TwoPass, hrd: bool, p2: Pass2Cli, container: Container, scale: u8) { // STRIAEXPORTPRESETSNEXT (SR989): `scale` wraps the encoder
     let two_pass_stats = match bitrate { Some(k) if two_pass.plans() && video == "h264" => Some(pass2_stats(&two_pass, tl, range.clone(), sources, dir, qp, gop, k, scenecut, aq, container)), _ => None }; if two_pass_stats.is_some() { eprintln!("nle: two-pass plan {}", pass2_words(&p2)); } // NLE5DCLITABLE (SR718): the planned pass of --two-pass / --pass 2 (H264ENCTWOPASSFILE SR719: `pass2_stats`, file tail), then the ONE table
-    let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_min_keyint(min_keyint).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, p2.into_opts(H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint, hrd, two_pass_stats, ..H264Opts::default() })).unwrap_or_else(|| bad("--video", video, &format!("one of {}", VIDEO_NAMES.join("|")))) }; // H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
+    let mut kept = None; let enc: Box<dyn VideoEncoder> = match (video, bitrate, &two_pass) { ("h264", Some(k), TwoPass::Pass1(_)) => { let e = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_min_keyint(min_keyint).with_aq(aq).with_hrd(hrd).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32); kept = Some(e.stats()); Box::new(e) } _ => video_named_with(video, tl.tb, p2.into_opts(H264Opts { qp, gop: Some(gop), bitrate, crf, scenecut, aq, min_keyint, hrd, two_pass_stats, ..H264Opts::default() })).unwrap_or_else(|| bad("--video", video, &format!("one of {}", VIDEO_NAMES.join("|")))) }; let enc = stria::nle_export::scaled(enc, scale); // STRIAEXPORTPRESETSNEXT (SR989): 1 hands the encoder back itself. H264ENCTWOPASSFILE (SR719): `--pass 1` keeps the records' handle, which the table cannot hand out (owed H264ENC-TWOPASS-FILE-TABLE)
     let aud = stria::nle_export::audio_named(audio).unwrap_or_else(|| bad("--audio", audio, &format!("one of {}|aac:KBPS", stria::nle_export::AUDIO_NAMES.join("|")))); // NLE5DEXPORTAUDIOOPTIONS (SR722): THE audio table
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
     let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else if matches!(video, "i420" | "y4m") { planar_export(tl, range, sources, dir, video, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
@@ -394,7 +395,7 @@ fn help_asked(args: &[String]) -> bool {
 fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     let _ = writeln!(w, "       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png] [--preset {}]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"), preset_words()); // STRIAEXPORTPRESETS (SR871): the preset words
+    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png] [--preset {}] [--scale N]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"), preset_words()); // STRIAEXPORTPRESETS (SR871): the preset words
     let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     let _ = writeln!(w, "       nle completions bash|zsh|fish");
@@ -405,9 +406,9 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
 // ---- NLECLIDIDYOUMEAN (LEDGER SR816): the nearest arm / verb of an unknown word (named tail block) ----
 /// NLECLIDIDYOUMEAN (SR816): THE list of the option loop's arm words, in arm order (a tie names the first). SR799's
 /// `cli_usage_lists_every_flag` pins it equal to the arms its source scan finds, so a new arm without its word here reds.
-const FLAGS: [&str; 25] = [
+const FLAGS: [&str; 26] = [
     "--fps", "--out", "--video", "--audio", "--aac", "--png", "--qp", "--gop", "--bitrate", "--mkv", "--crf", "--scenecut",
-    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--preset", "--src",
+    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--preset", "--scale", "--src",
 ];
 
 /// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order (NLECLIPASS2VALUE SR821: `completions`).
