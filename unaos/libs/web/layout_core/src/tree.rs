@@ -1723,7 +1723,7 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         let entry = tree.paint_map.entry(node_id).or_default();
         css::merge_paint(entry, &spec.paint);
     }
-    size_flex_items_by_content(tree, specs);
+    inherit_box_pass(tree, specs, &mut abs_nodes); size_flex_items_by_content(tree, specs);
     // AETHERCAPTIONSIDECSS (SR462): a caption whose cascaded, inherited caption-side is bottom goes after the rows.
     caption_side_order(tree);
     // Static-position fallback: `position:absolute` with no inset specified
@@ -3733,4 +3733,82 @@ mod img_alt_inline_icon_float_clear_kat {
         let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
         assert_eq!(img_alt_measure(&run(long, 12.0), f32::MAX, &Mono).1, 16.0, "unbounded at 12 px: one line, the icon's 16 px");
     }
+}
+
+// ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property takes the parent's resolved value (named tail block) ----
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): css-cascade-4 §7.3.2: each box whose cascaded style explicitly inherits a
+/// non-inherited family (`SpecifiedStyle::inherits_box`) takes its parent's RESOLVED value: the parent's taffy style
+/// and paint after `apply_specs`' fold, its UA tag defaults included. Shallowest boxes first, so a chained inherit
+/// reads a parent already resolved; the parent is the nearest ancestor box that is an element (anonymous wrappers
+/// are skipped). The values go through [`inherit_box`]'s patch, folded as any spec (`fold_into`, `merge_paint`); an
+/// inherited `position` joins `apply_specs`' static-position fallback. `computed_report` reads the result.
+fn inherit_box_pass<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, Rc<SpecifiedStyle<H>>)], abs_nodes: &mut BTreeSet<u64>) {
+    let mut todo: Vec<(usize, taffy::NodeId, &SpecifiedStyle<H>)> = Vec::new();
+    for (id, spec) in specs {
+        if spec.inherits_box() == 0 {
+            continue;
+        }
+        let mut depth = 0;
+        let mut cur = *id;
+        while let Some(p) = tree.taffy.parent(cur) {
+            depth += 1;
+            cur = p;
+        }
+        todo.push((depth, *id, &**spec));
+    }
+    todo.sort_by_key(|t| t.0);
+    for (_, id, spec) in todo {
+        let mut parent = tree.taffy.parent(id);
+        while let Some(p) = parent {
+            if tree.node_map.get(&p).is_some_and(|n| n.is_element()) {
+                break;
+            }
+            parent = tree.taffy.parent(p);
+        }
+        let Some(parent) = parent else { continue };
+        let (Ok(parent_style), Ok(child_style)) = (tree.taffy.style(parent).cloned(), tree.taffy.style(id).cloned()) else { continue };
+        let parent_paint = tree.paint_map.get(&parent).cloned().unwrap_or_default();
+        let patch = inherit_box(spec, &parent_style, &parent_paint, is_inline_level(tree, parent));
+        let mut child_style = child_style;
+        patch.fold_into(&mut child_style);
+        let _ = tree.taffy.set_style(id, child_style);
+        css::merge_paint(tree.paint_map.entry(id).or_default(), &patch.paint);
+        match patch.position {
+            Some(Position::Absolute) => {
+                abs_nodes.insert(u64::from(id));
+            }
+            Some(Position::Relative) => {
+                abs_nodes.remove(&u64::from(id));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): the patch that gives `child` its parent's resolved value for each family
+/// it explicitly inherits, ONE line per family. Display keeps the child's own flex-direction / -wrap / align-items for
+/// `fold_into`; a parent with no border is `border: none`, one with no background colour is transparent.
+fn inherit_box<H: Host>(child: &SpecifiedStyle<H>, ps: &Style, pp: &PaintStyle<H>, inline_parent: bool) -> SpecifiedStyle<H> {
+    let bits = child.inherits_box();
+    let mut p = SpecifiedStyle::<H>::default();
+    let (margin, padding) = ([ps.margin.top, ps.margin.right, ps.margin.bottom, ps.margin.left], [ps.padding.top, ps.padding.right, ps.padding.bottom, ps.padding.left]);
+    for i in 0..4 {
+        if bits & (1 << i) != 0 { p.margin[i] = Some(margin[i]); }
+        if bits & (16 << i) != 0 { p.padding[i] = Some(padding[i]); }
+    }
+    if bits & css::INHERIT_BOX_DISPLAY != 0 {
+        (p.display, p.flex_container, p.flex_direction, p.flex_wrap, p.align_items) = (Some(ps.display), pp.flex_container, child.flex_direction, child.flex_wrap, child.align_items);
+        (p.paint.flex_container, p.paint.display_kind, p.paint.list_item) = (pp.flex_container, Some(pp.display_kind.unwrap_or(if inline_parent { 0 } else { 1 })), Some(pp.list_item == Some(true)));
+    }
+    if bits & css::INHERIT_BOX_WIDTH != 0 { (p.width, p.paint.has_width) = (Some(ps.size.width), pp.has_width); }
+    if bits & css::INHERIT_BOX_HEIGHT != 0 { p.height = Some(ps.size.height); }
+    if bits & css::INHERIT_BOX_POSITION != 0 { (p.position, p.paint.position_kind) = (Some(ps.position), Some(pp.position_kind.unwrap_or(0))); }
+    if bits & css::INHERIT_BOX_BORDER != 0 {
+        (p.paint.border, p.paint.border_width, p.paint.border_style, p.paint.border_alpha) = (Some(pp.border.unwrap_or([None; 4])), pp.border_width, pp.border_style, pp.border_alpha);
+    }
+    if bits & css::INHERIT_BOX_BACKGROUND_COLOR != 0 {
+        (p.paint.background, p.paint.bg_alpha) = (pp.background, pp.bg_alpha.or(pp.background.is_none().then_some(0.0)));
+    }
+    p
 }
