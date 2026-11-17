@@ -1319,3 +1319,26 @@ fn xform_line(c: &Clip) -> String {
     }
     format!("* UNA XFORM {} {} {}\n", c.xform.x, c.xform.y, c.xform.s)
 }
+
+// ---- STRIATCMORE (LEDGER SR964): drop-frame timecode text (named tail block) ----
+// SMPTE drop-frame labels for the NTSC rates (30000/1001 at nominal 30, 60000/1001 at nominal 60): `drop` = nominal / 15
+// frame NUMBERS (2 or 4) are skipped at the start of every minute except each tenth, so the label keeps wall-clock time.
+// The tick is renumbered and formatted through `timecode` (ONE formatter), the frame separator `;`. The EDL still refuses
+// drop-frame (`parse_tc`): this is the readout's text. Owed: NLE-TC-DROPFRAME-MODEL, NLE-TC-KERNEL.
+
+/// STRIATCMORE (SR964): `HH:MM:SS;FF` drop-frame for tick `t` at `nominal` 30 or 60; any other nominal is [`timecode`].
+pub fn timecode_drop(t: i64, nominal: u32) -> String {
+    if nominal != 30 && nominal != 60 {
+        return timecode(t, nominal);
+    }
+    let (t, nom) = (t.max(0), nominal as i64);
+    let drop = nom / 15;
+    let (per10, per1) = (nom * 600 - 9 * drop, nom * 60 - drop);
+    let (d, m) = (t / per10, t % per10);
+    let n = t + 9 * drop * d + if m >= drop { drop * ((m - drop) / per1) } else { 0 };
+    let mut s = timecode(n, nominal);
+    if let Some(i) = s.rfind(':') {
+        s.replace_range(i..i + 1, ";");
+    }
+    s
+}
