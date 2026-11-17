@@ -23,6 +23,8 @@ pub struct PaintStyle<H: Host> {
     pub line_height: Option<f32>,
     /// background-image url (as written; resolved via images::get at paint).
     pub bg_image: Option<String>,
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): this block declared `background-image: none` (`merge_paint` clears the earlier image and gradient).
+    pub bg_image_none: bool,
     /// visibility:hidden / opacity:0 — box keeps its space, paints nothing.
     pub hidden: Option<bool>,
     /// overflow != visible — descendants clip to this box's rect.
@@ -262,6 +264,7 @@ impl<H: Host> Default for PaintStyle<H> {
             border: None,
             line_height: None,
             bg_image: None,
+            bg_image_none: false,
             hidden: None,
             clip: None,
             underline: None,

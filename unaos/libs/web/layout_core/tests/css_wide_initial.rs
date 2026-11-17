@@ -77,12 +77,12 @@ fn css_wide_initial_background_color_transparent() {
     assert_eq!(s.paint.bg_alpha, Some(0.0), "background: unset clears the colour layer");
 }
 
-/// The rewrite of `background: initial` is the colour only: the image layer an earlier rule set stays, as it does
-/// today (AETHER-CSS-WIDE-NONINHERITED-REST owed).
+/// `background: initial` resets the colour AND the image layer an earlier rule set (SR1015: the rewrite is `none`;
+/// before it the image stayed).
 #[test]
 fn css_wide_initial_background_keeps_image_layer() {
     let s = cascade(&[&[("background", "url(a.png) no-repeat")], &[("background", "initial")]]);
-    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "the image layer stays (pinned, owed)");
+    assert_eq!(s.paint.bg_image.as_deref(), None /* SR1015 */, "background: initial resets the image layer");
     assert_eq!(s.paint.bg_alpha, Some(0.0));
 }
 
@@ -255,4 +255,65 @@ fn css_wide_rest_background_layers() {
     assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "background-position: initial is 0% 0%");
     let s = cascade(&[&[("background-size", "cover")], &[("background-size", "initial")]]);
     assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "background-size: initial is auto");
+}
+
+// ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background-image: none` (and `initial` / `unset`, rewritten to none)
+/// after a url clears the image and marks the gradient layer cleared (Some(None)).
+#[test]
+fn css_wide_bgnone_image_none_beats_earlier_rule() {
+    let before = cascade(&[&[("background-image", "url(a.png)")]]);
+    assert_eq!(before.paint.bg_image.as_deref(), Some("a.png"), "the earlier url (armed)");
+    for kw in ["none", "initial", "unset", "NONE"] {
+        let s = cascade(&[&[("background-image", "url(a.png)")], &[("background-image", kw)]]);
+        assert_eq!(s.paint.bg_image, None, "background-image: {kw} clears the earlier url");
+        assert!(matches!(s.paint.bg_gradient, Some(None)), "background-image: {kw} clears the gradient layer");
+    }
+}
+
+/// The shorthand's empty spellings reset every layer: no image, transparent, repeat / `0% 0%` / auto.
+#[test]
+fn css_wide_bgnone_shorthand_resets_layers() {
+    let first: &[(&str, &str)] = &[("background", "url(a.png) red no-repeat 10px 20px / cover")];
+    let before = cascade(&[first]);
+    assert_eq!(before.paint.bg_image.as_deref(), Some("a.png"), "the earlier image (armed)");
+    assert_eq!(before.paint.bg_repeat, Some(1), "the earlier no-repeat (armed)");
+    for kw in ["none", "initial", "unset", "transparent", "none transparent"] {
+        let s = cascade(&[first, &[("background", kw)]]);
+        assert_eq!(s.paint.bg_image, None, "background: {kw}: no image");
+        assert_eq!(s.paint.bg_alpha, Some(0.0), "background: {kw}: transparent");
+        assert_eq!(s.paint.bg_repeat, Some(0), "background: {kw}: repeat");
+        assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "background: {kw}: 0% 0%");
+        assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "background: {kw}: auto");
+    }
+}
+
+/// A later url after `none` wins (a later rule, and later in the same block); url then none in one block clears.
+#[test]
+fn css_wide_bgnone_later_url_wins() {
+    let a: &[(&str, &str)] = &[("background-image", "url(a.png)")];
+    let s = cascade(&[a, &[("background-image", "none")], &[("background-image", "url(b.png)")]]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("b.png"), "a later rule's url after none");
+    let s = cascade(&[a, &[("background-image", "none"), ("background-image", "url(b.png)")]]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("b.png"), "none; url(b) in one block");
+    let s = cascade(&[a, &[("background-image", "url(b.png)"), ("background-image", "none")]]);
+    assert_eq!(s.paint.bg_image, None, "url(b); none in one block");
+    let mid = cascade(&[a, &[("background-image", "none")]]);
+    let mut again = SpecifiedStyle::<TH>::default();
+    merge_specified(&mut again, &styled(a));
+    merge_specified(&mut again, &mid);
+    assert_eq!(again.paint.bg_image, None, "a merged none overlaid again still clears");
+}
+
+/// `background-image: none` clears the image only: the colour stays; `background: red` after an image keeps the image
+/// (pinned: AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+#[test]
+fn css_wide_bgnone_image_only_and_pins() {
+    let s = cascade(&[&[("background", "red url(a.png)")], &[("background-image", "none")]]);
+    assert_eq!(s.paint.bg_image, None, "the image goes");
+    assert_eq!(s.paint.background, Some((255, 0, 0)), "the colour stays");
+    assert_eq!(s.paint.bg_alpha, Some(1.0), "still opaque");
+    let s = cascade(&[&[("background-image", "url(a.png)")], &[("background", "red")]]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "background: red keeps the image (pinned, owed)");
 }

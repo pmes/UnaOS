@@ -1279,7 +1279,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
-            None => {
+            None => { bg_image_clear::<H>(&mut style.paint, value);
                 if !is_neutral_keyword(value) {
                     H::record_css(&format!("background-image-value:{}", clip(value)));
                 }
@@ -1288,7 +1288,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background" => {
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
-            if let Some(u) = extract_css_url(value) {
+            bg_shorthand_none::<H>(&mut style.paint, value); if let Some(u) = extract_css_url(value) {
                 style.paint.bg_image = Some(u);
             }
             // Components outside url(...) — the url may itself hold slashes
@@ -2603,7 +2603,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
             list.push((p.clone(), v.clone()));
         }
     }
-    clone!(pct_math, bg_gradient, shadows);
+    merge_bg_image_none(dst, src); clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
@@ -3673,6 +3673,7 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
 /// rewritten (author-origin revert rolls back to the UA origin, which Aether keeps on the tag road:
 /// AETHER-CSS-WIDE-REVERT-UA owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
 /// AETHERCSSWIDENONINHERITEDREST (SR848): opacity / transform / flex-grow / flex-shrink through the same anim call; position static, float / clear none, overflow visible, z-index and the insets auto, flex-direction row, flex-wrap nowrap, flex-flow `row nowrap`, flex-basis auto, flex `0 1 auto`, align-items / justify-content normal, gap / row-gap 0px, background-repeat / -position / -size repeat / `0% 0%` / auto; not column-gap (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL), align-content (AETHER-CSS-ALIGN-CONTENT-FIELD) or the background shorthand's image layers (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE).
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background` and `background-image` rewrite to `none`, which the arms now write as an explicit no-image (`bg_image_clear`, `bg_shorthand_none`), so `background: initial` resets the image, the colour and the repeat / position / size layers.
 fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
     if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset")) {
         return value;
@@ -3683,7 +3684,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         | "padding-right" | "padding-bottom" | "padding-left" | "background-color" => {
             crate::anim::initial_value(prop).unwrap_or(value)
         }
-        "background" => "transparent",
+        "background" | "background-image" => "none",
         "display" => "inline",
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
@@ -3706,5 +3707,49 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "background-position" => "0% 0%",
         "background-size" => "auto",
         _ => value,
+    }
+}
+
+// ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): css-backgrounds-3 §3.3: `background-image: none` is a value (no image
+/// layer), but `PaintStyle::bg_image`'s None means "unspecified", so `merge_paint` (Somes only) kept an earlier rule's
+/// url. The arm's `none` (and `initial` / `unset`, rewritten to `none` by `noninherited_initial`) clears both image
+/// roads of this block (`bg_image` None, `bg_gradient` Some(None): background-image is ONE property) and sets
+/// `bg_image_none`, which `merge_bg_image_none` turns into the same clear on the cascade's accumulated style.
+fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    if value.trim().eq_ignore_ascii_case("none") {
+        paint.bg_image = None;
+        paint.bg_gradient = Some(None);
+        paint.bg_image_none = true;
+    }
+}
+
+/// The `background` shorthand's empty spellings (`none`, `transparent`, `none transparent`, and `initial` / `unset`
+/// through `noninherited_initial`'s `none`): css-backgrounds-3 §3.10 resets every omitted longhand to its initial
+/// value, so the image goes (`bg_image_clear`), the colour is transparent, and repeat / position / size take SR848's
+/// initials (repeat / `0% 0%` / auto, stored as their arms store them; not through `apply_declaration`, which would
+/// enter background-color / -position in `animatable`). Any other shorthand keeps its omitted layers
+/// (AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+fn bg_shorthand_none<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let parts = split_top_level(value);
+    if parts.is_empty() || !parts.iter().all(|p| p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("transparent")) {
+        return;
+    }
+    bg_image_clear(paint, "none");
+    paint.bg_alpha = Some(0.0);
+    paint.bg_repeat = parse_repeat("repeat");
+    paint.bg_position = Some("0% 0%".to_string());
+    paint.bg_size = Some("auto".to_string());
+}
+
+/// `merge_paint`'s half for the bit, BEFORE the image / gradient clones: a later block that declared none clears the
+/// accumulated image and gradient and carries the bit (a chained merge clears again); that block's own later url or
+/// gradient (`none; url(b)`) is then copied by the clones, so the later value wins either way.
+fn merge_bg_image_none<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    if src.bg_image_none {
+        dst.bg_image = None;
+        dst.bg_gradient = Some(None);
+        dst.bg_image_none = true;
     }
 }
