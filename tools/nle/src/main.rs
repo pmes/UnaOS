@@ -10,7 +10,7 @@
 //! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
-//! nle completions bash|zsh|fish [--install [<dir>]] [--force]
+//! nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]
 //! ```
 //!
 //! `size` (NLESIZEPOLICYUI, LEDGER SR402) sets a reel's size policy through the editor's ONE verb dispatch
@@ -395,7 +395,7 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
     let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
-    let _ = writeln!(w, "       nle completions bash|zsh|fish [--install [<dir>]] [--force]");
+    let _ = writeln!(w, "       nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"); // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall
     let _ = w.flush();
     std::process::exit(code)
 }
@@ -617,24 +617,35 @@ fn fish_arg(word: &str) -> String {
 // ---- NLECLICOMPLETIONSINSTALL (LEDGER SR1011): nle completions <shell> --install [<dir>] [--force] (named tail block) ----
 /// NLECLICOMPLETIONSINSTALL (SR1011): the `completions` verb's own arm words (not the export loop's: `FLAGS` feeds
 /// `unknown_flag` and every script's word list, so these stay out of it); SR816's pin in tests/cli.rs subtracts them by name.
-const COMPLETIONS_FLAGS: [&str; 2] = ["--install", "--force"];
+const COMPLETIONS_FLAGS: [&str; 3] = ["--install", "--force", "--uninstall"]; // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall
 
 /// NLECLICOMPLETIONSINSTALL (SR1011): what follows `nle completions <shell>` — nothing prints `script` on stdout (SR821's road,
 /// byte-identical); `--install [<dir>]` writes it through [`install_completions`] and prints `installed <path>` (or
 /// `installed <path> (unchanged)`), zsh a second line naming the fpath step; `--force` overwrites a differing file. An
 /// unknown word is refused by name ([`nearest`] over [`COMPLETIONS_FLAGS`]), every refusal through [`die`], exit 1.
 fn completions_out(shell: &str, script: &str, rest: &[String]) {
-    let (mut install, mut force) = (None::<Option<std::path::PathBuf>>, false);
+    let (mut install, mut force, mut uninstall) = (None::<Option<std::path::PathBuf>>, false, None::<Option<std::path::PathBuf>>); // NLECLICOMPLETIONSUNINSTALL (SR1025): uninstall
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--install" => install = Some(match it.clone().next() { Some(d) if !d.starts_with("--") => { it.next(); Some(std::path::PathBuf::from(d)) } _ => None }),
+            "--uninstall" => uninstall = Some(match it.clone().next() { Some(d) if !d.starts_with("--") => { it.next(); Some(std::path::PathBuf::from(d)) } _ => None }), // NLECLICOMPLETIONSUNINSTALL (SR1025)
             "--force" => force = true,
             _ => die(match nearest(a, &COMPLETIONS_FLAGS) {
                 Some(f) => format!("completions {shell} {a}: unknown flag; did you mean {f}?"),
-                None => format!("completions {shell} {a}: unknown flag (--install [<dir>] or --force)"),
+                None => format!("completions {shell} {a}: unknown flag (--install [<dir>], --uninstall [<dir>] or --force)"), // NLECLICOMPLETIONSUNINSTALL (SR1025)
             }),
         }
+    }
+    // NLECLICOMPLETIONSUNINSTALL (SR1025): `--uninstall [<dir>]` removes what `--install [<dir>]` writes (before the
+    // `--force needs --install` refusal: `--uninstall --force` removes a file that is not ours).
+    if let Some(dir) = uninstall {
+        if install.is_some() {
+            die(format!("completions {shell}: --install and --uninstall together (one at a time)"));
+        }
+        let (path, absent) = uninstall_completions(shell, dir, force, script).unwrap_or_else(|e| die(e));
+        println!("removed {}{}", path.display(), if absent { " (absent)" } else { "" });
+        return;
     }
     let Some(dir) = install else {
         if force {
@@ -663,17 +674,11 @@ struct Installed {
 /// (`exists <path> (differs; --force to overwrite)`: a hand-edited script is not clobbered); else the dir is created and
 /// the file written.
 fn install_completions(shell: &str, script: &str, dir: Option<std::path::PathBuf>, force: bool) -> Result<Installed, String> {
-    let dir = match dir {
-        Some(d) => d,
-        None => completion_dir(shell)?,
-    };
-    let path = dir.join(completion_file(shell));
-    match std::fs::read(&path) {
-        Ok(b) if b == script.as_bytes() => return Ok(Installed { path, dir, unchanged: true }),
-        Ok(_) if !force => return Err(format!("exists {} (differs; --force to overwrite)", path.display())),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+    let (dir, path, found) = completions_target(shell, dir, script)?; // NLECLICOMPLETIONSUNINSTALL (SR1025): the path + compare lifted
+    match found {
+        Some(true) => return Ok(Installed { path, dir, unchanged: true }),
+        Some(false) if !force => return Err(format!("exists {} (differs; --force to overwrite)", path.display())),
+        _ => {}
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::write(&path, script).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -719,7 +724,7 @@ const PATH_FLAGS: [&str; 3] = ["--out", "--stats", "--src"];
 
 /// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the kind of each [`COMPLETIONS_FLAGS`] word, in its order (FLAG_ARG's shape):
 /// `--install [<dir>]` a directory, `--force` nothing.
-const COMPLETIONS_ARG: [Arg; 2] = [Arg::Dir, Arg::Bare];
+const COMPLETIONS_ARG: [Arg; 3] = [Arg::Dir, Arg::Bare, Arg::Dir]; // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall [<dir>]
 
 /// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the completions verb's words that take a directory ([`COMPLETIONS_ARG`] `Dir`).
 fn dir_words() -> Vec<&'static str> {
@@ -761,4 +766,39 @@ fn fish_dirs() -> String {
         .iter()
         .map(|w| format!("complete -c nle -n \"__fish_seen_subcommand_from completions\" -l {} -x -a \"(__fish_complete_directories)\"\n", w.trim_start_matches('-')))
         .collect()
+}
+
+// ---- NLECLICOMPLETIONSUNINSTALL (LEDGER SR1025): nle completions <shell> --uninstall [<dir>] [--force] (named tail block) ----
+/// NLECLICOMPLETIONSUNINSTALL (SR1025): THE target of `--install` and `--uninstall` — the dir (`dir`, else [`completion_dir`]),
+/// the file ([`completion_file`] in it) and what is there now, by ONE read: `None` nothing, `Some(true)` exactly `script`'s
+/// bytes (ours), `Some(false)` other bytes (a hand-written script); a read error other than NotFound is `<path>: <error>`.
+/// Lifted verbatim from SR1011's `install_completions` head, so the two roads cannot name different files.
+fn completions_target(shell: &str, dir: Option<std::path::PathBuf>, script: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<bool>), String> {
+    let dir = match dir {
+        Some(d) => d,
+        None => completion_dir(shell)?,
+    };
+    let path = dir.join(completion_file(shell));
+    let found = match std::fs::read(&path) {
+        Ok(b) => Some(b == script.as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    Ok((dir, path, found))
+}
+
+/// NLECLICOMPLETIONSUNINSTALL (SR1025): remove the file `--install [<dir>]` would write ([`completions_target`]): nothing
+/// there is `(path, true)` (absent: idempotent); bytes that are not `script`'s are refused without `force`
+/// (`<path>: not nle's completion script (use --force)`: a hand-written `_nle` is never deleted silently); else the file
+/// is removed, `(path, false)`. The dir is left in place (it is the shell's, not nle's).
+fn uninstall_completions(shell: &str, dir: Option<std::path::PathBuf>, force: bool, script: &str) -> Result<(std::path::PathBuf, bool), String> {
+    let (_, path, found) = completions_target(shell, dir, script)?;
+    match found {
+        None => Ok((path, true)),
+        Some(false) if !force => Err(format!("{}: not nle's completion script (use --force)", path.display())),
+        Some(_) => {
+            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((path, false))
+        }
+    }
 }
