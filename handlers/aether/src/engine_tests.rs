@@ -5537,4 +5537,194 @@ mod tests {
         assert_eq!(cs(&mut e, "fsh", "fontVariantCaps"), "normal", "the invalid shorthand sets no caps");
         assert_eq!(cs(&mut e, "fsh", "fontSize"), "16px", "the invalid shorthand sets no size");
     }
+
+    // ---- AETHERFONTSHORTHANDINHERIT (LEDGER SR810): font: inherit / unset / initial reach the longhands (named tail block) ----
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): one line per probe under a `font: italic 20px serif` parent: a plain child
+    /// (the reference), `font: inherit` and `font: unset` after same-block longhands, `font: initial`, and three buttons
+    /// (`font: inherit`, a `font-size: 20px` twin, and a plain one at the control default).
+    fn font_wide_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font:italic 20px serif"><span id="ref">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="inh" style="font-style:normal;font-size:12px;font:inherit">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="uns" style="font-size:12px;font:unset">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="ini" style="font:initial">Hello</span></div>
+            <div style="font:italic 20px serif"><button id="btn" style="font:inherit">Go</button></div>
+            <div style="font:italic 20px serif"><button id="pbtn" style="font-size:20px">Go</button></div>
+            <div style="font:italic 20px serif"><button id="ubtn">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): getComputedStyle: the `font: inherit` / `font: unset` children read the
+    /// parent's italic 20px past their own earlier longhands; the `font: initial` child reads upright 16px.
+    #[test]
+    fn font_inherit_cssom() {
+        let mut e = font_wide_engine();
+        for id in ["inh", "uns"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "italic", "#{id} inherits the parent's style");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontSize"), "20px", "#{id} inherits the parent's size");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "ini", "fontStyle"), "normal", "font: initial is upright");
+        assert_eq!(font_shorthand_cs(&mut e, "ini", "fontSize"), "16px", "font: initial is medium");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "20px", "SR819: the font: inherit button reads its used 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ubtn", "fontSize"), "13.333px", "SR819: the plain button reads the control default");
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): the inherit reaches layout and paint: the `font: inherit` and `font: unset`
+    /// runs paint the reference run's ink column for column; the `font: initial` run does not (armed).
+    #[test]
+    fn font_inherit_ink() {
+        let mut e = font_wide_engine();
+        let reference = small_caps_ink_columns(&mut e, "ref");
+        assert!(reference.iter().sum::<usize>() > 20, "the reference run paints");
+        for id in ["inh", "uns"] {
+            assert_eq!(small_caps_ink_columns(&mut e, id), reference, "#{id}: the parent's italic 20px ink");
+        }
+        assert_ne!(small_caps_ink_columns(&mut e, "ini"), reference, "font: initial is not the parent's font (armed)");
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): `button { font: inherit }` (every reset sheet's line) takes the parent's
+    /// 20px: its box is the `font-size: 20px` twin's, not the 13.333px control default's (armed by the plain button).
+    /// The family stays the control family (AETHER-CSS-WIDE-LONGHANDS owed); cssom reads the used size (SR819), so the
+    /// box and fontSize are both pinned.
+    #[test]
+    fn font_inherit_button_takes_parent_size() {
+        let mut e = font_wide_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "btn");
+        let (_, _, pw, ph) = imgalt_rect(&mut e, "pbtn");
+        let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
+        assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
+        assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), font_shorthand_cs(&mut e, "pbtn", "fontSize"), "SR819: btn reads the twin's size");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "20px", "SR819: the parent's 20px");
+    }
+
+    // ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): one probe per relative road: em and % of the parent's size, smaller / larger
+    /// (layout_core's /1.2 and x1.2), `font: inherit` and em on a control, a plain control, and nested em.
+    fn font_size_rel_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:10px"><span id="em" style="font-size:2em">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="font-size:150%">Hello</span></div>
+            <div style="font-size:10px"><span id="sm" style="font-size:smaller">Hello</span></div>
+            <div style="font-size:10px"><span id="lg" style="font-size:larger">Hello</span></div>
+            <div style="font-size:20px"><button id="fib" style="font:inherit">Go</button></div>
+            <div style="font-size:20px"><button id="plain">Go</button></div>
+            <div style="font-size:10px"><button id="emb" style="font-size:2em">Go</button></div>
+            <div style="font-size:10px"><div style="font-size:2em"><span id="nest" style="font-size:1.5em">Hello</span></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `font-size: 2em` under 10px reads 20px and `150%` under 16px reads 24px (the
+    /// specified road read the parent's size: 10px / 16px).
+    #[test]
+    fn font_size_rel_cssom_em_percent() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "em", "fontSize"), "20px", "2em of 10px");
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
+    /// 4-decimal grammar.
+    #[test]
+    fn font_size_rel_cssom_smaller_larger() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
+        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
+    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
+    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
+    #[test]
+    fn font_size_rel_cssom_font_inherit_button() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
+        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
+    #[test]
+    fn font_size_rel_cssom_nested_em() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
+    }
+
+    // ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): one probe per line-height road: a number (under a px and an em font size), a
+    /// length, `normal`, a % and em (at 16px and 20px, the latter through `reresolve_font_relative`), and inheritance
+    /// (a number re-multiplies, a length is kept).
+    fn line_height_used_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:20px"><span id="num" style="line-height:1.5">Hello</span></div>
+            <div style="font-size:10px"><span id="numem" style="font-size:2em;line-height:1.5">Hello</span></div>
+            <div><span id="len" style="line-height:24px">Hello</span></div>
+            <div><span id="nrm" style="line-height:normal">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="line-height:150%">Hello</span></div>
+            <div style="font-size:16px"><span id="em16" style="line-height:1.5em">Hello</span></div>
+            <div><span id="em20" style="font-size:20px;line-height:1.5em">Hello</span></div>
+            <div style="font-size:10px;line-height:2"><span id="inum" style="font-size:20px">Hello</span></div>
+            <div style="font-size:10px;line-height:20px"><span id="ilen" style="font-size:30px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a number reads number x the USED font size: `1.5` under 20px reads 30px
+    /// (Chromium), and `font-size: 2em; line-height: 1.5` under 10px reads 30px (1.5 x the used 20px).
+    #[test]
+    fn line_height_used_cssom_number() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), "30px", "1.5 x 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "numem", "lineHeight"), "30px", "1.5 x the used 2em of 10px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a px line-height reads its px (it read `normal`: the stored length is negative).
+    #[test]
+    fn line_height_used_cssom_length() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), "24px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): `normal` stays the keyword (Chromium).
+    #[test]
+    fn line_height_used_cssom_normal() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a % and an em resolve against the element's own used font size: `150%` and
+    /// `1.5em` at 16px read 24px, `1.5em` with `font-size: 20px` reads 30px.
+    #[test]
+    fn line_height_used_cssom_percent_em() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "lineHeight"), "24px", "150% of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em16", "lineHeight"), "24px", "1.5em of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em20", "lineHeight"), "30px", "1.5em of the element's own 20px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): CSS 2.2 §10.8.1 inheritance: a number inherits as the number (a 20px child of
+    /// `line-height: 2` reads 40px), a length as the length (a 30px child of `line-height: 20px` reads 20px).
+    #[test]
+    fn line_height_used_cssom_inherit() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inum", "lineHeight"), "40px", "2 x the child's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ilen", "lineHeight"), "20px", "the parent's 20px kept");
+    }
 }

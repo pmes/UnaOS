@@ -67,8 +67,8 @@ fn invalid_font_changes_nothing() {
 
 #[test]
 fn css_wide_keywords_and_system_fonts_unchanged() {
-    // Owed (AETHER-FONT-SHORTHAND-INHERIT / -SYSTEM): pinned as today, dropped.
-    for v in ["inherit", "initial", "unset", "menu", "status-bar"] {
+    // Owed (AETHER-CSS-WIDE-REVERT / AETHER-FONT-SHORTHAND-SYSTEM): pinned as today, dropped; inherit / initial / unset are SR810's.
+    for v in ["revert", "menu", "status-bar"] {
         let s = styled(&[("font-style", "italic"), ("font", v)]);
         assert_eq!(s.paint.italic, Some(true), "font: {v}");
         assert_eq!(s.paint.font_size, None, "font: {v}");
@@ -99,4 +99,79 @@ fn font_relative_replay_keeps_line_height_normal() {
     let spec: SpecifiedStyle<TH> = reapply_declarations(&list, &cx);
     merge_paint(&mut s.paint, &spec.paint);
     assert_eq!(s.paint.line_height, Some(0.0), "the font-relative replay does not bring line-height 3 back");
+}
+
+// ---- AETHERFONTSHORTHANDINHERIT (LEDGER SR810): the CSS-wide keywords on font reach its longhands (named tail block) ----
+
+/// AETHERFONTSHORTHANDINHERIT (SR810): every longhand `font` resets, set earlier in the same block.
+const FONT_ALL: [(&str, &str); 7] = [
+    ("font-style", "italic"),
+    ("font-size", "20px"),
+    ("font-weight", "bold"),
+    ("font-stretch", "condensed"),
+    ("font-variant", "small-caps"),
+    ("line-height", "3"),
+    ("font-family", "serif"),
+];
+
+fn font_wide(kw: &str) -> SpecifiedStyle<TH> {
+    let mut decls = FONT_ALL.to_vec();
+    decls.push(("font", kw));
+    styled(&decls)
+}
+
+/// AETHERFONTSHORTHANDINHERIT (SR810): the fields `font` resets, for a field-by-field comparison.
+#[allow(clippy::type_complexity)]
+fn font_fields(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<FontWeight>, Option<u16>, Option<layout_core::paint::Caps>, Option<f32>, Option<f32>, Option<(u8, f32)>, Option<u16>) {
+    let p = &s.paint;
+    (p.italic, p.weight, p.stretch, p.small_caps, p.line_height, p.font_size, p.font_size_rel, p.family)
+}
+
+#[test]
+fn font_inherit_clears_the_block() {
+    let s = font_wide("inherit");
+    assert_eq!(s.paint.italic, None, "font-style inherits");
+    assert_eq!(s.paint.weight, None, "font-weight inherits");
+    assert_eq!(s.paint.stretch, None, "font-stretch inherits");
+    assert_eq!(s.paint.small_caps, None, "font-variant-caps inherits");
+    assert_eq!(s.paint.line_height, None, "line-height inherits");
+    assert_eq!(s.paint.family, None, "font-family inherits");
+    assert_eq!(s.paint.font_size, None, "no absolute size survives");
+    assert_eq!(s.paint.font_size_rel, Some((0, 1.0)), "the size is 1 x the parent's (a control's default does not apply)");
+}
+
+#[test]
+fn font_unset_is_inherit() {
+    assert_eq!(font_fields(&font_wide("unset")), font_fields(&font_wide("inherit")), "every font longhand is inherited");
+}
+
+#[test]
+fn font_initial_takes_the_initials() {
+    let s = font_wide("initial");
+    assert_eq!(s.paint.italic, Some(false));
+    assert_eq!(s.paint.weight, Some(FontWeight::Abs(400)));
+    assert_eq!(s.paint.stretch, Some(100));
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal), "font-variant-caps initial");
+    assert_eq!(s.paint.line_height, Some(0.0), "line-height normal");
+    assert_eq!(s.paint.font_size, Some(16.0), "medium");
+    assert_eq!(s.paint.font_size_rel, Some((2, 0.0)), "absolute");
+    assert_eq!(s.paint.family, Some(layout_core::STANDARD), "the standard family");
+}
+
+#[test]
+fn longhand_after_font_inherit_wins() {
+    let s = styled(&[("font-style", "italic"), ("font", "inherit"), ("font-weight", "bold")]);
+    assert_eq!(s.paint.weight, Some(FontWeight::Abs(700)), "declaration order: the later longhand wins");
+    assert_eq!(s.paint.italic, None);
+}
+
+#[test]
+fn font_inherit_replay_keeps_line_height_inherited() {
+    let mut s = styled(&[("line-height", "1.5em"), ("padding", "1em"), ("font", "inherit")]);
+    let list = s.paint.font_rel.clone().expect("length declarations kept");
+    assert!(list.iter().any(|(p, v)| p == "line-height" && v == "inherit"), "the line-height entry was replaced: {list:?}");
+    let cx = ParseCx::default();
+    let spec: SpecifiedStyle<TH> = reapply_declarations(&list, &cx);
+    merge_paint(&mut s.paint, &spec.paint);
+    assert_eq!(s.paint.line_height, None, "the font-relative replay does not bring line-height 1.5em back");
 }
