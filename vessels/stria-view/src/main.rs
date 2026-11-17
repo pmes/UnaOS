@@ -204,6 +204,8 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
         ["dur", t @ ..] if (2..=3).contains(&t.len()) => SMessage::Input { target: SURFACE.into(), text: format!("dur {}", t.join(":")) }, // STRIATRANSITIONNEXT (SR991): `dur:00:07`, `dur:00:00:07`
+        ["track-gain", ch, db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {ch} {db}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain:A2:-6` the named track
+        [w @ ("track-gain-" | "track-gain+"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain-:A2` / `track-gain+:V1`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
@@ -3126,5 +3128,26 @@ mod striamarkerjumpkeysnext_tests {
         assert!(face.verb("marker range"));
         assert_eq!(markers_json(&face), r#","markers":[{"t":12,"name":"M1","colour":"red","len":8}]"#);
         println!("striamarkerjumpkeysnext witness: {}", markers_json(&face));
+    }
+}
+
+// ---- STRIATRACKGAINTHREE (LEDGER SR9024): the `track-gain:<ch>[:<dB>]` / `track-gain-:<ch>` / `track-gain+:<ch>` tokens (named tail block) ----
+#[cfg(test)]
+mod striatrackgainthree_tests {
+    use super::*;
+
+    /// M3: with nothing selected `track-gain:A1:-6` sets A1 and its line names A1; `track-gain+:A1` steps it; `track-gain:A1`
+    /// is unity; `track-gain:A9:-6` is refused by name with the state kept.
+    #[test]
+    fn striatrackgainthree_witness_track_gain_channel() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut face, "track-gain:A1:-6"), vec!["track-gain: A1 -6.0 dB".to_string()]);
+        assert_eq!(drive(&mut face, "track-gain+:A1"), vec!["track-gain: A1 -5.0 dB".to_string()]);
+        assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth(), face.state.selection), (-500, 2, None));
+        assert_eq!(drive(&mut face, "track-gain:A1"), vec!["track-gain: A1 0.0 dB".to_string()]);
+        assert_eq!(drive(&mut face, "track-gain:A9:-6"), vec![format!("track-gain A9 -6: {}", timeline_core::EditError::NoTrack)]);
+        assert_eq!(face.state.undo_depth(), 3);
+        println!("striatrackgainthree witness: track-gain:A1:-6 -> A1 -6.0 dB, +1 step, unity; A9 -> {}", timeline_core::EditError::NoTrack);
     }
 }
