@@ -1010,3 +1010,96 @@ fn cli_completions_verb_flags_text() {
     let (code, out, err) = nle(&["completions", "tcsh"]);
     assert_eq!((code, out.as_str(), err), (1, "", format!("nle: completions tcsh: one of {}\n", const_words("SHELLS").join("|"))));
 }
+
+// ---- NLECLIUSAGEVERBSPIN (LEDGER SR1032): the usage's table words and VERBS pinned to main's dispatch (named tail block) ----
+/// NLECLIUSAGEVERBSPIN (SR1032): the words of `line`'s `[<flag> a|b|c]` group, split on `|`; empty when the group is absent.
+fn usage_group<'a>(line: &'a str, flag: &str) -> Vec<&'a str> {
+    let open = format!("[{flag} ");
+    line.split_once(open.as_str()).and_then(|(_, r)| r.split_once(']')).map(|(g, _)| g.split('|').collect()).unwrap_or_default()
+}
+
+/// NLECLIUSAGEVERBSPIN (SR1032, NLE5D-CLI-USAGE-TEST): `nle help`'s `--video` / `--audio` groups are exactly stria's tables (the
+/// owners' consts, imported: main.rs holds no copy for SR821's `const_words` to read), so a table change reaches the usage.
+#[test]
+fn cli_usage_names_the_tables() {
+    let (code, out, err) = nle(&["help"]);
+    assert_eq!((code, err.as_str()), (0, ""), "nle help");
+    let audio: Vec<&str> = AUDIO_NAMES.iter().copied().chain(["aac:KBPS"]).collect();
+    for (flag, want) in [("--video", VIDEO_NAMES.to_vec()), ("--audio", audio)] {
+        let open = format!("[{flag} ");
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains(&open)).collect();
+        assert_eq!(lines.len(), 1, "{flag}: one usage line carries the group: {out}");
+        assert_eq!(lines[0].matches(&open).count(), 1, "{flag}: the group once: {}", lines[0]);
+        let group = usage_group(lines[0], flag);
+        assert_eq!(group, want, "{flag}: the usage's words are the table's, in order, no extra and none missing");
+        let mut d = group.clone();
+        d.sort();
+        d.dedup();
+        assert_eq!(d.len(), group.len(), "{flag}: no word twice: {group:?}");
+    }
+    assert_eq!(out, usage_text(), "the help road and the stderr usage are one text");
+}
+
+/// NLECLIUSAGEVERBSPIN (SR1032, NLE-CLI-VERBS-PIN): the first words `main` dispatches on, read from main.rs in its three shapes —
+/// every `args.first().map(String::as_str) == Some("<w>")`, the first slot of each slice pattern in `help_asked`'s `matches!`,
+/// and every arm word of `match verb.as_str() {` (8-space indent, up to its `_ => usage(),`). Sorted, deduped.
+fn dispatch_verbs() -> Vec<&'static str> {
+    let src: &'static str = include_str!("../src/main.rs");
+    let unq = |t: &'static str| t.trim().trim_matches('"');
+    let mut verbs: Vec<&'static str> = Vec::new();
+    let first = "args.first().map(String::as_str) == Some(\"";
+    for (i, _) in src.match_indices(first) {
+        let rest = &src[i + first.len()..];
+        if let Some(e) = rest.find('"') {
+            verbs.push(&rest[..e]);
+        }
+    }
+    let help = src.split_once("fn help_asked(").and_then(|(_, r)| r.split_once("matches!(")).and_then(|(_, r)| r.split_once(")\n")).map(|(b, _)| b).expect("help_asked's matches!");
+    for pat in help.split('[').skip(1) {
+        let slot = pat.split(',').next().unwrap_or("");
+        verbs.extend(slot.split('|').map(unq));
+    }
+    let arms = src.split_once("match verb.as_str() {").and_then(|(_, r)| r.split_once("_ => usage(),")).map(|(b, _)| b).expect("main's `match verb.as_str()`");
+    for line in arms.lines() {
+        if line.starts_with("        \"") {
+            if let Some((words, _)) = line.split_once("=>") {
+                verbs.extend(words.split('|').map(unq));
+            }
+        }
+    }
+    verbs.sort();
+    verbs.dedup();
+    verbs
+}
+
+/// NLECLIUSAGEVERBSPIN (SR1032, NLE-CLI-VERBS-PIN): main.rs `VERBS` == the dispatch's first words, both ways (a new verb without
+/// its VERBS word reds, so SR821's completion scripts, built from VERBS, cannot miss one); each verb in the bash script; each
+/// bare `nle <verb>` pinned as measured at 976d8ffbf.
+#[test]
+fn cli_verbs_pinned_to_dispatch() {
+    let scanned = dispatch_verbs();
+    for w in ["schedule", "render", "export", "size", "--make-src", "completions", "help", "--help"] {
+        assert!(scanned.contains(&w), "{w}: the scan finds the measured verb: {scanned:?}");
+    }
+    let verbs = const_words("VERBS");
+    assert!(!verbs.is_empty(), "VERBS read from main.rs");
+    let mut sorted = verbs.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), verbs.len(), "no word twice in VERBS: {verbs:?}");
+    assert_eq!(sorted, scanned, "main.rs VERBS is main's dispatch words");
+    let (code, bash, err) = nle(&["completions", "bash"]);
+    assert_eq!((code, err.as_str()), (0, ""), "completions bash");
+    let usage = usage_text();
+    for v in &verbs {
+        assert!(has_word(&bash, v), "{v}: in the bash completion script");
+        let (code, out, err) = nle(&[*v]);
+        let want: (i32, &str, &str) = match *v {
+            "schedule" | "render" | "export" | "size" | "--make-src" => (2, "", usage.as_str()),
+            "completions" => (1, "", "nle: completions: a value is required\n"),
+            "help" | "--help" => (0, usage.as_str(), ""),
+            _ => panic!("{v}: a VERBS word with no bare-call row here: measure `nle {v}` and add it"),
+        };
+        assert_eq!((code, out.as_str(), err.as_str()), want, "nle {v}");
+    }
+}
