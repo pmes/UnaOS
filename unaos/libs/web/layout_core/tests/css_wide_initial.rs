@@ -2304,3 +2304,124 @@ fn border_thin_thick_width_sides() {
     }
     assert_eq!(cascade(&[&[("border-width", "1px 0")], &[("border-style", "solid")]]).paint.border, want, "across rules");
 }
+
+// ---- AETHERCSSLINEWIDTHONETABLE (LEDGER SR1084): column-rule's width through the ONE <line-width> road; medium has one home (named tail block) ----
+
+use layout_core::paint::{outline_width_keyword, LINE_WIDTH_MEDIUM, OUTLINE_MEDIUM};
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): `column-rule`'s width word reads SR1075's `line_width` (the
+/// `outline_width_keyword` table, else a length): thin 1 / medium 3 / thick 5 / 2px 2, the same values the inline match
+/// gave; the style and the colour still land beside it.
+#[test]
+fn line_width_one_table_column_rule() {
+    let solid = styled(&[("column-rule-style", "solid")]).paint.col_rule_style;
+    assert!(solid.is_some(), "the reference solid code");
+    for (k, w) in [("thin", 1.0), ("medium", 3.0), ("thick", 5.0), ("2px", 2.0)] {
+        let s = styled(&[("column-rule", &format!("{k} solid red"))]);
+        assert_eq!(s.paint.col_rule_width, Some(w), "{k}");
+        assert_eq!(s.paint.col_rule_style, solid, "{k}: the style lands");
+        assert_eq!(s.paint.col_rule_color, Some(stored_rgb("red")), "{k}: the colour lands");
+    }
+    assert_eq!(styled(&[("column-rule-width", "thick")]).paint.col_rule_width, Some(5.0), "the longhand");
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): FLIPPED by SR1084: `THICK` is 5px as the keyword table reads it (CSS keywords
+/// are ASCII case-insensitive); the inline match was case-sensitive and dropped it (no width).
+#[test]
+fn line_width_one_table_case() {
+    assert_eq!(styled(&[("column-rule", "THICK solid red")]).paint.col_rule_width, Some(5.0));
+    assert_eq!(styled(&[("column-rule-width", "Thin")]).paint.col_rule_width, Some(1.0));
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): a bogus width word is refused as before: no width, the style still lands.
+#[test]
+fn line_width_one_table_bogus() {
+    let s = styled(&[("column-rule", "bogus solid")]);
+    assert_eq!(s.paint.col_rule_width, None);
+    assert_eq!(s.paint.col_rule_style, styled(&[("column-rule-style", "solid")]).paint.col_rule_style);
+    assert_eq!(styled(&[("column-rule-width", "bogus")]).paint.col_rule_width, None);
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): `medium` has ONE home: the alias, the keyword table, border_medium (reached
+/// through `border-style: solid` alone, whose sides are created at medium) and the SR832 `border-width: initial` row
+/// all read LINE_WIDTH_MEDIUM.
+#[test]
+fn line_width_one_table_medium_one_home() {
+    assert_eq!(OUTLINE_MEDIUM, LINE_WIDTH_MEDIUM);
+    assert_eq!(outline_width_keyword("medium"), Some(LINE_WIDTH_MEDIUM));
+    let created = styled(&[("border-style", "solid")]).paint.border;
+    assert_eq!(created, Some([Some((LINE_WIDTH_MEDIUM, STORED_GREY)); 4]), "border_medium");
+    let initial = styled(&[("border-width", "initial"), ("border-style", "solid")]).paint.border;
+    assert_eq!(initial, Some([Some((LINE_WIDTH_MEDIUM, STORED_GREY)); 4]), "the SR832 initial row");
+}
+
+// ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): a 2px solid blue frame, then `border-color: <v>` in the same block.
+fn border_color_sides_of(v: &str) -> [Option<(f32, (u8, u8, u8))>; 4] {
+    styled(&[("border", "2px solid blue"), ("border-color", v)]).paint.border.expect("sides")
+}
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): one colour keeps the old all-sides road; the per-side road with the colour four
+/// times writes the same `border` / `border_style` / `border_alpha` / `sys_border` on a sided block, and the same
+/// `border` / `border_pending` on a styleless one.
+#[test]
+fn border_color_sides_one_value_identity() {
+    let red = stored_rgb("red");
+    let sided = |v: &str| {
+        let s = styled(&[("border", "2px solid blue"), ("border-color", v)]);
+        (s.paint.border, s.paint.border_style, s.paint.border_alpha, s.paint.sys_border)
+    };
+    assert_eq!(sided("red"), sided("red red red red"), "sided block");
+    assert_eq!(sided("red").0, Some([Some((2.0, red)); 4]), "the old road: four red sides");
+    let alone = |v: &str| {
+        let s = styled(&[("border-color", v)]);
+        (s.paint.border, s.paint.border_pending)
+    };
+    assert_eq!(alone("red"), alone("red red red red"), "styleless block");
+    assert_eq!(alone("red"), (None, Some([Some((red, false)); 4])), "the colour pends, no frame");
+}
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): 2-4 colours in the top / right / bottom / left expansion (before SR1085 the
+/// declaration was dropped whole and the frame stayed blue).
+#[test]
+fn border_color_sides_expansion() {
+    let (r, b, g, y) = (stored_rgb("red"), stored_rgb("blue"), stored_rgb("green"), stored_rgb("yellow"));
+    let s = |c: (u8, u8, u8)| Some((2.0, c));
+    assert_eq!(border_color_sides_of("red blue"), [s(r), s(b), s(r), s(b)], "two values");
+    assert_eq!(border_color_sides_of("red blue green"), [s(r), s(b), s(g), s(b)], "three values");
+    assert_eq!(border_color_sides_of("red blue green yellow"), [s(r), s(b), s(g), s(y)], "four values");
+    let (dd, cc) = ((221, 221, 221), (204, 204, 204));
+    assert_eq!(border_color_sides_of("#ddd #ddd #ccc"), [s(dd), s(dd), s(cc), s(dd)], "a lighter bottom edge");
+    assert_eq!(border_color_sides_of("red transparent"), [s(r), None, s(r), None], "armed: transparent drops its sides");
+    let t = styled(&[("border", "2px solid blue"), ("border-color", "transparent red")]);
+    assert_eq!(t.paint.border_alpha, Some(1.0), "the first non-transparent token's alpha");
+    assert_eq!(border_color_sides_of("red blue green yellow purple"), [s(b); 4], "five values: dropped whole");
+    assert_eq!(border_color_sides_of("red foo"), [s(b); 4], "a bad token: dropped whole");
+}
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): a styleless block pends each side's colour, and the cascade lays them on an
+/// earlier rule's sides (width kept); a later one-value `border-color` resets all four.
+#[test]
+fn border_color_sides_across_rules() {
+    let (r, b) = (stored_rgb("red"), stored_rgb("blue"));
+    let s = styled(&[("border-color", "red blue")]);
+    assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some((r, false)), Some((b, false)), Some((r, false)), Some((b, false))])));
+    let (dd, cc) = ((221, 221, 221), (204, 204, 204));
+    let c = cascade(&[&[("border", "1px solid blue")], &[("border-color", "#ddd #ddd #ccc")]]);
+    assert_eq!(c.paint.border, Some([Some((1.0, dd)), Some((1.0, dd)), Some((1.0, cc)), Some((1.0, dd))]), "the Bootstrap card edge");
+    let c = cascade(&[&[("border", "1px solid green")], &[("border-color", "red blue")], &[("border-color", "blue")]]);
+    assert_eq!(c.paint.border, Some([Some((1.0, b)); 4]), "a later border-color: blue resets all four");
+}
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): SR1046's slot per side: a plain colour leaves its side out, the second of two
+/// different keywords keeps its light carrier (one slot, one keyword), and an earlier keyword in the block is cleared.
+#[test]
+fn border_color_sides_system_colors() {
+    let k = system_color_index("canvastext").expect("canvastext");
+    let sys = |d: &[(&str, &str)]| styled(d).paint.sys_border;
+    assert_eq!(sys(&[("border", "2px solid blue"), ("border-color", "CanvasText red")]), Some((k, 0b0101)), "top and bottom");
+    assert_eq!(sys(&[("border", "2px solid blue"), ("border-color", "CanvasText Canvas")]), Some((k, 0b0101)), "the first keyword");
+    assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red CanvasText")]), Some((k, 0b1010)), "the earlier keyword goes");
+    assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red blue")]), None, "plain colours clear the slot");
+}
