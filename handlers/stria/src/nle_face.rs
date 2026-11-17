@@ -2325,7 +2325,7 @@ fn paint_marks(px: Vec<u8>, l: Layout, order: PixelOrder, marks: (Option<i64>, O
 /// (`unknown audio <w> (wav|aac|mp4|none)`). Otherwise the words are SR694's / SR717's and the audio is `AudioOut::Wav`
 /// (the audio words and `VIDEO_NAMES` are disjoint, so every grammar the verb took before parses the same).
 fn export_audio_word(mut args: Vec<&str>) -> (Vec<&str>, Result<AudioOut, String>) {
-    let named = args.last().and_then(|w| crate::nle_export::audio_named(w));
+    let named = args.last().and_then(|w| crate::nle_export::audio_named(w)); if let Some(e) = striaexportaacbitrate_refusal(&mut args) { return (args, Err(e)); }
     match (args.len(), named) {
         (2 | 3, Some(a)) => {
             args.pop();
@@ -3096,4 +3096,19 @@ impl Face {
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
     }
+}
+
+// ---- STRIAEXPORTAACBITRATE (LEDGER SR887): a bad aac rate refused by name (named tail block) ----
+/// The `export` verb's bad AAC rate, refused by name before any job: of two or three words, a last word `aac:<k>` that the
+/// audio table ([`crate::nle_export::audio_named`]) refuses (`aac:0`, `aac:x`, `aac:`) is popped and named
+/// (`aac rate "<k>": aac:KBPS takes a whole number of kb/s above 0; the words are <usage>`). Without it the two-word form
+/// `export <dir> aac:0` fell to the format slot (`unknown format aac:0`). Every other word: `None` (the grammar unchanged).
+fn striaexportaacbitrate_refusal(args: &mut Vec<&str>) -> Option<String> {
+    let k = match args.last() {
+        Some(w) if (2..=3).contains(&args.len()) && crate::nle_export::audio_named(w).is_none() => w.strip_prefix("aac:")?,
+        _ => return None,
+    };
+    let e = format!("aac rate \"{k}\": aac:KBPS takes a whole number of kb/s above 0; the words are {}", export_usage());
+    args.pop();
+    Some(e)
 }
