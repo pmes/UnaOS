@@ -419,3 +419,17 @@ fn striaopacity_alpha_line_round_trips_and_refusals_are_named() {
     assert_eq!(edl::parse(&format!("{head}{a}* UNA ALPHA 50\n"), 25), Err(EdlError::Edit(EditError::Opacity)), "audio");
     assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA 0\n"), 25).unwrap().tracks[0].clips[0].opacity, 0);
 }
+
+// ---- STRIAHANDLEFIT (LEDGER SR9117): the lifted reel fit (named tail block) ----
+#[test]
+fn striahandlefit_reel_fit_is_the_policy_and_adopt_mixes_letterbox() {
+    use timeline_core::{SizePolicy, SourceId};
+    assert_eq!(cut().reel_fit(SourceId(9), true), SizePolicy::Letterbox, "absent source");
+    assert_eq!(cut().reel_fit(SourceId(1), false), SizePolicy::Letterbox, "the default");
+    for p in SizePolicy::ALL {
+        let tl = cut().set_size_policy(SourceId(1), p).unwrap();
+        assert_eq!(tl.reel_fit(SourceId(1), true), p, "alone: the reel's own policy");
+        let mixed = if p == SizePolicy::Adopt { SizePolicy::Letterbox } else { p };
+        assert_eq!(tl.reel_fit(SourceId(1), false), mixed, "in a mix: Adopt places as Letterbox");
+    }
+}

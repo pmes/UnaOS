@@ -979,6 +979,7 @@ pub struct EdlReport {
     pub swaps: u64,
     pub stand_in_frames: u64,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
+    pub mix_fitted: u64, // STRIAHANDLEFIT (SR9117): mixed frames whose outgoing / lower layer was fitted to the incoming's size (file tail)
     pub layer: Option<u8>, pub layer_mixed: u64, pub layer_refused: u64, // STRIAKOPACITY (SR9013): this step's layer opacity (`schedule::step_opacity`), opacity ticks mixed and refused (file tail)
 }
 
@@ -1009,7 +1010,7 @@ fn edl_task(arg: usize) {
         "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={} swaps={} standin={}",
         rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max, rep.swaps, rep.stand_in_frames
     );
-    let frames = rep.frames; layer_exit(&rep); // STRIAKOPACITY (SR9013): the opacity ticks' counts, only when nonzero (file tail)
+    let frames = rep.frames; layer_exit(&rep); fit_exit(&rep); // STRIAKOPACITY (SR9013): the opacity ticks' counts, only when nonzero (file tail); STRIAHANDLEFIT (SR9117): the fitted mix frames, only when nonzero (file tail)
     *NLE.lock() = Some(rep);
     let why = match r {
         Ok(()) => {
@@ -1096,7 +1097,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         };
         match (s.vmix, refused) {
             (Some(_), Some(why)) => edl_refuse(rep, &why),
-            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, rep)?,
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, rep, m.src.map_or(timeline_core::SizePolicy::Letterbox, |o| tl.reel_fit(o, false)))?, // STRIAHANDLEFIT (SR9117): the outgoing reel's fit, by the rule lifted from the host
             (None, _) => {}
         }
         if pts_ms < seek_ms {
@@ -1200,6 +1201,7 @@ fn edl_mix(
     frame: &mut Frame,
     mix: &mut Option<EdlRun>,
     rep: &mut EdlReport,
+    fit: timeline_core::SizePolicy, // STRIAHANDLEFIT (SR9117): the outgoing reel's policy the mix fits it by (file tail)
 ) -> Result<(), (&'static str, Option<String>)> {
     let t0 = crate::hidstall::now_us();
     let (w, h) = (frame.w, frame.h);
@@ -1207,13 +1209,14 @@ fn edl_mix(
         None => [0u8, 0, 0, 255].repeat(w * h), // NLE3c: from black, the outgoing is opaque black
         Some(o) => {
             if m.seek.is_some() || mix.as_ref().map(|x| x.src) != Some(o) {
-                if let Err(why) = slot_room(w, h) {
+                if let Err(why) = slot_room_out(reels, o, w, h) { // STRIAHANDLEFIT (SR9117): a larger outgoing sized by itself (file tail)
                     edl_refuse(rep, &why);
                     return Ok(());
                 }
             }
             match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
                 Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(px.rgb()),
+                Ok((ow, oh, px, _)) if ow * oh > 0 && px.rgb().len() == ow * oh => mix_fit(rep, o, &px, ow, oh, w, h, fit), // STRIAHANDLEFIT (SR9117): another size fitted, not refused (file tail)
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
                     edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
@@ -2699,4 +2702,42 @@ fn edit_opacity_note(st: &timeline_core::editor::EditorState, verb: &str, at: i6
     }
     let Some(c) = st.selected() else { return };
     serial_println!("[nle] edit {} -> {}% at={}", verb, c.opacity, at);
+}
+
+// ---- STRIAHANDLEFIT (LEDGER SR9117): the mix's outgoing / lower layer fitted, not refused (named tail block) ----
+// handlers.md §5 NLE5b's NLE-OPACITY-KERNEL-FIT. [`edl_mix`]'s ONE arm serves a transition's outgoing and SR868's opacity
+// layer (the track below): a frame of another positive size than the incoming's is fitted to the incoming's size by the
+// outgoing reel's policy (`Timeline::reel_fit(.., false)`, the rule lifted from stria nle.rs; never Adopt in a mix)
+// through the Player's ONE size door [`fit_rgba`] (Letterbox: [`blit_fit`]; Fill / Stretch: `Canvas::blit_policy`),
+// instead of refusing the second slot. The second slot's heap ask ([`slot_room_out`]) is the larger of the mix size and
+// the outgoing reel's own size (NLE-FIT-KERNEL-HEAP). Wire: `[vplay] mix fit reel=<id> <ow>x<oh>-><w>x<h> fit=<name>` for
+// the first four fitted frames of a job; `[nle] mix fitted=<n>` after `[nle] job exit` only when nonzero, so a same-size
+// EDL's serial is byte-identical.
+
+/// STRIAHANDLEFIT: the outgoing `px` (`ow x oh`, 0RGB) as straight RGBA fitted into `w x h` by `fit`; counted, and named
+/// for the first four. [`fit_rgba`] cannot refuse here (every side > 0, the length checked by the caller's guard); if it
+/// ever did, the outgoing mixes as opaque black.
+#[allow(clippy::too_many_arguments)]
+fn mix_fit(rep: &mut EdlReport, o: timeline_core::SourceId, px: &Px, ow: usize, oh: usize, w: usize, h: usize, fit: timeline_core::SizePolicy) -> Vec<u8> {
+    rep.mix_fitted += 1;
+    if rep.mix_fitted <= 4 {
+        serial_println!("[vplay] mix fit reel={} {}x{}->{}x{} fit={}", o.0, ow, oh, w, h, fit.name());
+    }
+    fit_rgba(unpack(px.rgb()), ow, oh, w, h, fit).unwrap_or_else(|| [0u8, 0, 0, 255].repeat(w * h))
+}
+
+/// STRIAHANDLEFIT: the job's fitted mix frames; nothing when every mix was one size.
+fn fit_exit(rep: &EdlReport) {
+    if rep.mix_fitted == 0 {
+        return;
+    }
+    serial_println!("[nle] mix fitted={}", rep.mix_fitted);
+}
+
+/// STRIAHANDLEFIT (NLE-FIT-KERNEL-HEAP): [`slot_room`] for the outgoing reel `o`'s second slot, asked with the reel's own
+/// track size when it is larger than the mix's `w x h` (a larger outgoing is sized by itself), else with `w x h`.
+fn slot_room_out(reels: &Reels, o: timeline_core::SourceId, w: usize, h: usize) -> Result<(), String> {
+    let own = reels.get(o).and_then(|r| r.v.as_ref()).map(|v| (v.1.width as usize, v.1.height as usize)).unwrap_or((w, h));
+    let (sw, sh) = if own.0 * own.1 > w * h { own } else { (w, h) };
+    slot_room(sw, sh)
 }
