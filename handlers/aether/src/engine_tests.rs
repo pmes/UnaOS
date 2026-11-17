@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7833,7 +7833,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8669,11 +8669,11 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "49"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "53"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
@@ -9513,6 +9513,88 @@ b</div>
         assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
     }
 
+    // ---- AETHERCSSOMINSETCOLUMNS (LEDGER SR1127): top / right / bottom / left report columns from the cascade's SpecifiedStyle (named tail block) ----
+
+    fn inset_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="i1" style="position:relative;top:10px;left:-5px">a</div>
+            <div id="i2" style="position:relative;top:1em">b</div>
+            <div id="i3" style="position:relative;inset:1px 2px">c</div>
+            <div id="i4">d</div>
+            <div id="i5" style="top:10%">e</div>
+            <div id="i6" style="position:sticky;top:7px">f</div>
+            <table><tr><td id="i7">g</td><td id="i8">h</td></tr></table>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    fn inset_columns_of(e: &mut crate::AetherEngine, id: &str) -> [String; 4] {
+        ["top", "right", "bottom", "left"].map(|p| font_synth_eval(&mut *e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{p}')")))
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): a relative box's declared sides read their computed px (a negative length kept),
+    /// the undeclared ones `auto`.
+    #[test]
+    fn inset_columns_relative() {
+        let mut e = inset_columns_engine();
+        assert_eq!(inset_columns_of(&mut e, "i1"), ["10px", "auto", "auto", "-5px"], "#i1: top 10px, left -5px");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): `top: 1em` reads the px the cascade resolved at its 16px basis (Chromium `16px` at the
+    /// default font); a non-16px font is owed AETHER-CSSOM-INSET-FONT-RELATIVE.
+    #[test]
+    fn inset_columns_em() {
+        let mut e = inset_columns_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "i2", "top"), "16px", "armed: #i2 read the cascaded text `1em` before");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): the `inset` shorthand's two values reach the four columns.
+    #[test]
+    fn inset_columns_shorthand() {
+        let mut e = inset_columns_engine();
+        assert_eq!(inset_columns_of(&mut e, "i3"), ["1px", "2px", "1px", "2px"], "#i3: inset 1px 2px");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): a plain div reads the four initial `auto`s.
+    #[test]
+    fn inset_columns_unset() {
+        let mut e = inset_columns_engine();
+        assert_eq!(inset_columns_of(&mut e, "i4"), ["auto", "auto", "auto", "auto"], "#i4: unset");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): a percentage reads `<p>%` (Chromium's computed value for a non-positioned box; a
+    /// positioned box's used px is owed AETHER-CSSOM-INSET-USED-VALUE).
+    #[test]
+    fn inset_columns_percent() {
+        let mut e = inset_columns_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "i5", "top"), "10%", "#i5: top 10%");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): the handle is the cascade's SpecifiedStyle, not the taffy inset: a sticky box's sides
+    /// (never folded into taffy) read their px, and a table cell (whose taffy inset carries its column x) reads `auto`.
+    #[test]
+    fn inset_columns_sticky_and_cell() {
+        let mut e = inset_columns_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "i6", "top"), "7px", "#i6: sticky top 7px");
+        assert_eq!(font_shorthand_cs(&mut e, "i8", "left"), "auto", "#i8: the second cell's placement is not its left");
+        assert_eq!(font_shorthand_cs(&mut e, "i7", "top"), "auto", "#i7: the cell's placement top is not its top");
+    }
+
+    /// AETHERCSSOMINSETCOLUMNS (SR1127): the four columns sit at 49..53, after SR1124's.
+    #[test]
+    fn inset_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 53);
+        assert_eq!(&crate::css::REPORT_PROPS[49..], &["top", "right", "bottom", "left"]);
+        let mut e = inset_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('i4')).length)"), "53");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('i4')).item(52)"), "left");
+    }
+
     // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
 
     /// AETHERCSSBORDERTHINTHICK (SR1075): 40x20 boxes in green ink, rows 12px apart: `#tn` `border: thin solid`, `#tk`
@@ -9807,10 +9889,10 @@ b</div>
     #[test]
     fn outline_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49);
-        assert_eq!(&crate::css::REPORT_PROPS[45..], &["outline-width", "outline-style", "outline-color", "outline-offset"]);
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1127: four inset columns, 53
+        assert_eq!(&crate::css::REPORT_PROPS[45..49], &["outline-width", "outline-style", "outline-color", "outline-offset"]); // SR1127: four inset columns, 53
         let mut e = outline_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('o3')).length)"), "49");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('o3')).length)"), "53"); // SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('o3')).item(48)"), "outline-offset");
     }
 
@@ -11530,14 +11612,14 @@ b</div>
     #[test]
     fn box_side_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
         assert_eq!(
             &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
             &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
         );
         let mut e = box_side_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "49"); // SR1103; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "53"); // SR1103; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
     }
 
@@ -11787,11 +11869,11 @@ b</div>
     #[test]
     fn border_side_style_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]); // SR1104: the three colour columns follow at 37..40
         let mut e = border_side_style_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "49"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "53"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
     }
 
@@ -11845,12 +11927,12 @@ b</div>
     #[test]
     fn border_side_color_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(crate::css::REPORT_PROPS[16], "border-left-color");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]);
         assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]); // SR1108: five text-decoration / caret columns, 45
         let mut e = border_side_color_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "49"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "53"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('nc')).item(39)"), "border-bottom-color");
     }
 
@@ -11910,14 +11992,14 @@ b</div>
     #[test]
     fn text_decoration_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 49); // SR1124: four outline columns, 49
+        assert_eq!(crate::css::REPORT_COLS, 53); // SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]);
         assert_eq!(
             &crate::css::REPORT_PROPS[40..45], // SR1124: four outline columns follow at 45..49
             &["text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color"]
         );
         let mut e = text_decoration_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "49"); // SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "53"); // SR1124: four outline columns, 49; SR1127: four inset columns, 53
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('pd')).item(44)"), "caret-color");
     }
 
@@ -12083,7 +12165,221 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "ta", "borderTopColor"), "rgba(255, 0, 0, 0.5)", "#ta: 128/255");
         assert_eq!(font_shorthand_cs(&mut e, "nb", "backgroundColor"), "rgba(0, 0, 0, 0)", "#nb backgroundColor");
         assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "49"); // SR1124: four outline columns, 49
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "53"); // SR1124: four outline columns, 49; SR1127: four inset columns, 53
+    }
+
+    // ---- AETHERCSSOMINSETFONTRELATIVE (LEDGER SR1133): a font-relative inset reads its px at the element's font, not the cascade's 16px basis (named tail block) ----
+
+    fn inset_font_relative_engine(root_style: &str) -> crate::AetherEngine {
+        let html = format!(r#"<!doctype html><html style="{root_style}"><body style="margin:0">
+            <div id="f1" style="position:relative;font-size:20px;top:1em">a</div>
+            <div id="f2" style="position:relative;font-size:20px;top:1rem">b</div>
+            <div id="f3" style="position:relative;font-size:20px;top:10px">c</div>
+            <div id="f4" style="position:relative;font-size:20px;inset:1em">d</div>
+            <div id="f5" style="position:relative;font-size:20px;inset:1em;top:5px">e</div>
+            <div id="f6" style="position:relative;font-size:20px;top:calc(1em + 2px)">f</div>
+            <div id="f7" style="position:relative;font-size:200%;top:1em">g</div>
+            <div id="f8" style="position:relative;font-size:20px;top:1em;inset:5px">h</div>
+            <div id="r1" style="position:relative;top:2rem">i</div>
+        </body></html>"#);
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): `font-size: 20px; top: 1em` reads `20px` (Chromium), not the cascade's 16px.
+    #[test]
+    fn inset_font_relative_em() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f1", "top"), "20px", "armed: #f1 read 16px before SR1133");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): rem resolves against the root's font, not the element's.
+    #[test]
+    fn inset_font_relative_rem_root() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f2", "top"), "16px", "#f2: 1rem under a 20px element, root 16px");
+        let mut e = inset_font_relative_engine("font-size:10px");
+        assert_eq!(font_shorthand_cs(&mut e, "r1", "top"), "20px", "armed: #r1 2rem at a 10px root read 32px before");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): a px inset keeps SR1127's spec road.
+    #[test]
+    fn inset_font_relative_px_spec_road() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f3", "top"), "10px", "#f3: top 10px");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): the `inset` shorthand is recorded as one entry and replayed per side; the
+    /// later declaration wins in either order.
+    #[test]
+    fn inset_font_relative_shorthand() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(inset_columns_of(&mut e, "f4"), ["20px", "20px", "20px", "20px"], "armed: #f4 inset 1em read 16px before");
+        assert_eq!(inset_columns_of(&mut e, "f5"), ["5px", "20px", "20px", "20px"], "#f5: inset 1em then top 5px");
+        assert_eq!(inset_columns_of(&mut e, "f8"), ["5px", "5px", "5px", "5px"], "#f8: top 1em then inset 5px");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): em inside calc() re-resolves at the element's font.
+    #[test]
+    fn inset_font_relative_calc() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f6", "top"), "22px", "armed: #f6 calc(1em + 2px) read 18px before");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): a percentage font-size feeds em through the used font (200% of 16 = 32).
+    #[test]
+    fn inset_font_relative_percent_font() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f7", "top"), "32px", "armed: #f7 read 16px before");
+    }
+
+    // ---- AETHEROUTLINECURRENTCOLORUA (LEDGER SR1131): a currentcolor outline paints the render's own ink, UA colours included (named tail block) ----
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): 40x20 inline-block boxes with no text, each outline pulled inside its box by
+    /// `outline-offset: -6px` (SR1119's shape): `#la` a link with `outline: 2px solid`, `#dv` a div with `outline: 1px solid`,
+    /// `#lr` a red link with `outline: 1px solid`, `#ls` a span inside a link with `outline: 1px solid`, `#bt` a button with
+    /// `outline: 1px solid`.
+    fn outline_currentcolor_ua_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            .b { display: inline-block; width: 40px; height: 20px; outline-offset: -6px; vertical-align: top }
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0">
+            <div><a id="la" class="b" href="#x" style="outline:2px solid"></a></div>
+            <div id="dv" style="width:40px;height:20px;outline:1px solid;outline-offset:-6px"></div>
+            <div><a id="lr" class="b" href="#x" style="color:red;outline:1px solid"></a></div>
+            <div><a href="#x"><span id="ls" class="b" style="outline:1px solid"></span></a></div>
+            <div><button id="bt" class="b" style="outline:1px solid"></button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): a link's currentcolor outline paints the UA link blue (Chromium's -webkit-link
+    /// rgb(0, 0, 238)); before SR1131 focusring `current_color` read only declared colours and painted it black. The
+    /// outline-color column (SR1124) already read `rgb(0, 0, 238)`: the paint and the column now agree.
+    #[test]
+    fn outline_currentcolor_ua_link_blue() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "la", css_wide_blue) > 20, "armed: #la's outline is the link blue (black before)");
+        assert_eq!(css_wide_color_ink(&mut e, "la", text_decoration_black), 0, "#la paints no black");
+        assert_eq!(font_shorthand_cs(&mut e, "la", "outlineColor"), "rgb(0, 0, 238)", "#la: the column, unchanged");
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): a span inside a link inherits the UA link blue into its currentcolor outline
+    /// (the walk is the render's own inheritance, not the nearest declared colour).
+    #[test]
+    fn outline_currentcolor_ua_link_descendant() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "ls", css_wide_blue) > 20, "armed: #ls inherits the link blue");
+        assert_eq!(css_wide_color_ink(&mut e, "ls", text_decoration_black), 0, "#ls paints no black");
+    }
+
+    /// AETHEROUTLINECURRENTCOLORUA (SR1131): the controls, unchanged: a plain div's outline is black (CanvasText), a declared
+    /// `color: red` on a link wins over the UA blue, and a button's is its ButtonText black.
+    #[test]
+    fn outline_currentcolor_ua_controls() {
+        let mut e = outline_currentcolor_ua_engine();
+        assert!(css_wide_color_ink(&mut e, "dv", text_decoration_black) > 20, "#dv: black");
+        assert_eq!(css_wide_color_ink(&mut e, "dv", css_wide_blue), 0, "#dv: no blue");
+        assert!(css_wide_color_ink(&mut e, "lr", css_wide_red) > 20, "#lr: the declared red");
+        assert_eq!(css_wide_color_ink(&mut e, "lr", css_wide_blue), 0, "#lr: no blue");
+        assert!(css_wide_color_ink(&mut e, "bt", text_decoration_black) > 0, "#bt: the ButtonText black");
+        assert_eq!(css_wide_color_ink(&mut e, "bt", css_wide_blue), 0, "#bt: no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(0, 0, 0)", "#bt: the color column through the one table");
+    }
+
+    // ---- AETHERUACOLORONETABLESCHEME (LEDGER SR1138): getComputedStyle reads the UA colour row of the element's color-scheme (named tail block) ----
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): `head` (raw, e.g. a meta) and `root` (a `:root` rule body) on a page with an
+    /// id'd html (#hr), a text div (#d), an unstyled button (#bt), a link (#la), and a `color-scheme: light` subtree
+    /// holding a text div (#lt) and a button (#lb), on a 400x600 viewport.
+    fn ua_color_scheme_engine(head: &str, root: &str) -> crate::AetherEngine {
+        let html = format!(r##"<!doctype html><html id="hr"><head>{head}<style>
+            :root {{ {root} }}
+            div {{ margin: 0 0 12px }}
+            </style></head><body style="margin:0;font:20px serif">
+            <div id="d">Text</div>
+            <div><button id="bt">Hello</button></div>
+            <div><a id="la" href="#x">Link</a></div>
+            <div style="color-scheme:light"><div id="lt">Text</div><div><button id="lb">Hello</button></div></div>
+        </body></html>"##);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): under `:root { color-scheme: dark }` the html color column reads the dark
+    /// CanvasText (UA_DARK.canvastext, Chromium `rgb(255, 255, 255)`) and a div inherits it; before SR1138 computed_report
+    /// called `ua_color` at scheme None and read the light `rgb(0, 0, 0)`.
+    #[test]
+    fn ua_color_scheme_dark_root_column() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "hr", "color"), "rgb(255, 255, 255)", "armed: html reads the dark CanvasText (rgb(0, 0, 0) before)");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "armed: a div inherits the white");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): a dark-scheme button's color column is the dark ButtonText (UA_DARK.ink).
+    #[test]
+    fn ua_color_scheme_dark_button_column() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(255, 255, 255)", "armed: the dark ButtonText (rgb(0, 0, 0) before)");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the ONE table's link arm is (0, 0, 238) under dark too, and the render paints
+    /// the same blue (AETHER-UA-LINK-DARK owed: Chromium's dark link differs): column and paint agree.
+    #[test]
+    fn ua_color_scheme_dark_link_one_table() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 238)", "#la: the one table's link blue");
+        assert!(css_wide_color_ink(&mut e, "la", css_wide_blue) > 3, "#la paints the same blue");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the column and the painted ink agree: the dark div's glyphs paint white and
+    /// its color column reads white.
+    #[test]
+    fn ua_color_scheme_column_agrees_with_paint() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert!(css_wide_color_ink(&mut e, "d", color_scheme_white_ink) > 3, "#d paints white CanvasText");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "#d: the column is the painted white");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): `<meta name="color-scheme" content="dark">` (SR1047's UA-origin root rule)
+    /// reads as the `:root` rule does: no special seed, the scheme arrives through the cascade.
+    #[test]
+    fn ua_color_scheme_meta_dark() {
+        let mut e = ua_color_scheme_engine(r#"<meta name="color-scheme" content="dark">"#, "");
+        assert_eq!(font_shorthand_cs(&mut e, "hr", "color"), "rgb(255, 255, 255)", "armed: html under the meta");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "armed: the div under the meta");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(255, 255, 255)", "armed: the button under the meta");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): a `color-scheme: light` subtree inside the dark root reads the light row (the
+    /// render's inherit rule, `scheme_of`): its button is ButtonText black; its div inherits the root's resolved white
+    /// (color inherits as a value, not re-resolved per scheme: AETHER-UA-CANVASTEXT-INHERIT-KEYWORD owed).
+    #[test]
+    fn ua_color_scheme_light_subtree() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "lb", "color"), "rgb(0, 0, 0)", "#lb: the light ButtonText");
+        assert_eq!(font_shorthand_cs(&mut e, "lt", "color"), "rgb(255, 255, 255)", "#lt: the inherited white");
+        assert!(css_wide_color_ink(&mut e, "lt", color_scheme_white_ink) > 3, "#lt paints the inherited white (column and paint agree)");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the light page, unchanged: html / div / button black, the link blue.
+    #[test]
+    fn ua_color_scheme_light_page_unchanged() {
+        let mut e = ua_color_scheme_engine("", "");
+        for id in ["hr", "d", "bt", "lt", "lb"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 0, 0)", "#{id}: light");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 238)", "#la: light");
     }
 
     // ---- AETHERSTICKYOUTERHOLD (LEDGER SR1167): every reader asks a box inside a stuck sticky box at its painted place (named tail block) ----

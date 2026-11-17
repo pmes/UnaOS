@@ -3231,8 +3231,8 @@ mod shorthand_computed_before_cascade_tests {
     #[test]
     fn shorthand_computed_before_cascade_covered_rows() {
         let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
-        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding", "outline"]); // SR1124: outline too; SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
-        for sh in ["border", "gap", "inset", "overflow", "font-synthesis", "not-a-shorthand"] {
+        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding", "inset", "outline"]); // SR1127: inset; // SR1124: outline too; SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
+        for sh in ["border", "gap", "overflow", "font-synthesis", "not-a-shorthand"] {
             assert!(!report_covered(sh), "{sh}: not covered");
         }
     }
