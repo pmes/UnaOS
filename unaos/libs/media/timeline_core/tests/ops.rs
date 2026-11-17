@@ -237,3 +237,20 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIASEQFACE (LEDGER SR9088): a sequence reel's rate and length as one commit (named tail block) ----
+#[test]
+fn striaseqface_set_seq_rate_one_commit() {
+    let (tl, a, _) = base();
+    let mut st = timeline_core::editor::EditorState::new(tl.clone());
+    st.set_seq_rate(a, (12, 1), 120).unwrap();
+    assert_eq!((st.timeline.sources[0].seq_rate, st.timeline.sources[0].duration), (Some((12, 1)), 120));
+    assert_eq!(st.undo_depth(), 1, "one step for both");
+    st.set_seq_rate(a, (12, 1), 120).unwrap();
+    assert_eq!(st.undo_depth(), 1, "the same rate and length: no step");
+    assert_eq!(st.set_seq_rate(a, (50, 1), 5), Err(EditError::OutOfSource), "A's clip [0,10) past a 5-tick reel");
+    assert_eq!(st.set_seq_rate(SourceId(9), (12, 1), 10), Err(EditError::NoSource));
+    assert_eq!(st.undo_depth(), 1, "refusals commit nothing");
+    st.undo();
+    assert_eq!(st.timeline, tl, "undo restores the rate and the length");
+}

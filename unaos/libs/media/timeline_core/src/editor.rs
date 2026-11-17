@@ -681,3 +681,23 @@ impl EditorState {
         Ok(())
     }
 }
+
+// ---- STRIASEQFACE (LEDGER SR9088): a sequence reel's rate and length as ONE commit (named tail block) ----
+impl EditorState {
+    /// Source `src`'s image-sequence rate `rate` (reduced frames a second, `edl`'s `* UNA SEQRATE`) and its length `dur` in
+    /// ticks at that rate (the host knows the file count, so it computes `dur`), set in ONE commit: undo restores both. The same
+    /// rate and length again commits nothing. Refused by name: no such source `EditError::NoSource`; a clip past the new
+    /// length `EditError::OutOfSource` (`Timeline::validate`), the timeline unchanged.
+    pub fn set_seq_rate(&mut self, src: crate::SourceId, rate: (u64, u64), dur: i64) -> Result<(), EditError> {
+        let mut tl = self.timeline.clone();
+        let s = tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?;
+        if s.seq_rate == Some(rate) && s.duration == dur {
+            return Ok(());
+        }
+        s.seq_rate = Some(rate);
+        s.duration = dur;
+        tl.validate()?;
+        self.commit(tl);
+        Ok(())
+    }
+}
