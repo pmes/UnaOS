@@ -843,7 +843,7 @@ fn genv_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Resu
     let Some(r) = l.strip_prefix("* UNA GENV ") else { return Ok(()) };
     let bad = EdlError::Syntax { line };
     let c = clip.ok_or(bad.clone())?;
-    let w: Vec<&str> = r.split_whitespace().collect();
+    let (curve, r) = genv_curve_word(r); let w: Vec<&str> = r.split_whitespace().collect(); // STRIAGAINENVCURVE (SR9083): a leading EQUAL (file tail)
     if w.is_empty() || w.len() % 2 != 0 || !c.gain_env.is_empty() {
         return Err(bad);
     }
@@ -858,7 +858,7 @@ fn genv_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Resu
         last = Some(t);
         env = env.with(t, v).map_err(|_| bad.clone())?;
     }
-    c.gain_env = env;
+    c.gain_env = env.curved(curve); // STRIAGAINENVCURVE (SR9083)
     Ok(())
 }
 
@@ -867,7 +867,7 @@ fn genv_line(c: &Clip, fps: u32) -> String {
     if c.gain_env.is_empty() {
         return String::new();
     }
-    let mut s = String::from("* UNA GENV");
+    let mut s = String::from(genv_head(&c.gain_env)); // STRIAGAINENVCURVE (SR9083): `* UNA GENV EQUAL` for an equal-power envelope (file tail)
     for (t, v) in c.gain_env.points() {
         s.push_str(&format!(" {} {v}", timecode(*t, fps)));
     }
@@ -922,5 +922,56 @@ mod striagainenvelope_tests {
         let hl = text.lines().position(|l| l.is_empty()).unwrap() + 1;
         assert_eq!(parse(&head, 25), Err(EdlError::Syntax { line: hl }), "no event above");
         assert_eq!(with("* UNA GENV 00:00:00:05 -300").map(|t| t.tracks[0].clips[0].gain_env.points().to_vec()), Ok(alloc::vec![(5, -300)]));
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the GENV line's curve word (named tail block) ----
+// `* UNA GENV EQUAL <tc> <cdb> ...` is an equal-power envelope ([`crate::Curve::EqualPower`], the `* UNA XFADE EQUAL`
+// precedent); absent = linear, so a linear envelope writes as before. `EQUAL` with no pair is refused as GENV refuses any
+// line without a pair.
+
+/// STRIAGAINENVCURVE: the GENV payload's curve and the rest after a leading `EQUAL ` word.
+fn genv_curve_word(r: &str) -> (crate::Curve, &str) {
+    match r.strip_prefix("EQUAL ") {
+        Some(rest) => (crate::Curve::EqualPower, rest),
+        None => (crate::Curve::Linear, r),
+    }
+}
+
+/// STRIAGAINENVCURVE: the GENV line's head for envelope `e`.
+fn genv_head(e: &crate::GainEnv) -> &'static str {
+    if e.curve() == crate::Curve::EqualPower { "* UNA GENV EQUAL" } else { "* UNA GENV" }
+}
+
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    /// M3: an equal-power envelope round trips as `* UNA GENV EQUAL ...` byte for byte; a linear one writes no word;
+    /// `EQUAL` with no pair is refused by line.
+    #[test]
+    fn striagainenvcurve_edl() {
+        let e = crate::GainEnv::EMPTY.with(5, -600).unwrap().with(30, 150).unwrap();
+        let lin = write(&tl().set_gain_env(0, 0, e).unwrap(), "T").unwrap();
+        assert!(lin.ends_with("\n* UNA GENV 00:00:00:05 -600 00:00:01:05 150\n"), "{lin}");
+        let g = tl().set_gain_env(0, 0, e.curved(crate::Curve::EqualPower)).unwrap();
+        let text = write(&g, "T").unwrap();
+        assert_eq!(text, lin.replace("* UNA GENV ", "* UNA GENV EQUAL "));
+        let back = parse(&text, 25).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(back.tracks[0].clips[0].gain_env.curve(), crate::Curve::EqualPower);
+        assert_eq!(write(&back, "T").unwrap(), text);
+        let plain = write(&tl(), "T").unwrap();
+        let at = plain.lines().count() + 1;
+        assert_eq!(parse(&format!("{plain}* UNA GENV EQUAL\n"), 25), Err(EdlError::Syntax { line: at }));
+        assert_eq!(parse(&format!("{plain}* UNA GENV EQUAL \n"), 25), Err(EdlError::Syntax { line: at }));
     }
 }

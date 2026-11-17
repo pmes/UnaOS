@@ -525,7 +525,7 @@ fn transport() -> TetraNode {
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
         button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
-        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
+        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), button("env-curve", "Env Curve"), // STRIAGAINENVCURVE (SR9083): the selected clip's envelope curve linear / equal-power; STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -1054,5 +1054,28 @@ mod striagainenvelope_tests {
         assert_eq!(drive(&mut face, "env:x"), vec![format!("env x: {}", timeline_core::EditError::Gain)]);
         assert_eq!(face.state.undo_depth(), 3);
         println!("striagainenvelope witness: at:12:1,env:-6 -> ({s}, -600); env+ -> -500; env-del -> empty; env:x -> {}", timeline_core::EditError::Gain);
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the Env Curve button (named tail block) ----
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+
+    /// M3: the Env Curve button is on the row (help still last); `at:12:1,env:-6,env-curve` makes the selected clip's
+    /// envelope equal-power with no error line; `env-curve` again puts it back.
+    #[test]
+    fn striagainenvcurve_witness_button() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == "env-curve")));
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:1,env:-6,env-curve").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.curve(), timeline_core::Curve::EqualPower);
+        assert_eq!(face.note.as_deref(), Some("env curve: equal-power, 1 points"));
+        assert!(drive(&mut face, "env-curve").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.curve(), timeline_core::Curve::Linear);
+        println!("striagainenvcurve witness: at:12:1,env:-6,env-curve -> equal-power; env-curve -> linear");
     }
 }

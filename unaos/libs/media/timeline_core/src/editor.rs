@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.env_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAGAINENVELOPE (SR9047): the `env` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.env_curve_verb(v) { return Some(r); } if let Some(r) = self.env_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAGAINENVELOPE (SR9047): the `env` words (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1305,5 +1305,95 @@ mod striagainenvelope_tests {
         assert_eq!(st.verb("env"), Some(Err(EditError::NoClip)));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
         assert_eq!(st.verb("envelope"), None);
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the selected clip's envelope curve through the one commit (named tail block) ----
+// `env-curve` toggles the selected clip's gain envelope between linear and equal-power; `env-curve linear` / `env-curve
+// equal` set it. ONE commit through `set_selected_gain_env`; the same curve commits nothing. Refused: no selected clip
+// `NoClip`; an envelope with no point (it is always linear), an unknown or extra word `Gain`. The playhead plays no part.
+impl EditorState {
+    /// The `env-curve` word of [`EditorState::verb`]; `None` for any other word.
+    fn env_curve_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|w| *w == "env-curve")?;
+        let (arg, extra) = (w.next(), w.next());
+        Some(self.env_curve_word(arg, extra.is_some()))
+    }
+    fn env_curve_word(&mut self, arg: Option<&str>, extra: bool) -> Result<(), EditError> {
+        let e = self.selected().ok_or(EditError::NoClip)?.gain_env;
+        if extra || e.is_empty() {
+            return Err(EditError::Gain);
+        }
+        let c = match arg {
+            None if e.curve() == crate::Curve::Linear => crate::Curve::EqualPower,
+            None => crate::Curve::Linear,
+            Some("linear") => crate::Curve::Linear,
+            Some("equal") => crate::Curve::EqualPower,
+            Some(_) => return Err(EditError::Gain),
+        };
+        self.set_selected_gain_env(e.curved(c))
+    }
+}
+
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+    use crate::{Curve, Kind};
+
+    /// A1: A 10..30 at tick 5, selected, one point at the playhead (source tick 15) and one at source tick 25.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 10, 30, 5)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.seek(10);
+        assert_eq!(st.verb("env -6"), Some(Ok(())));
+        st.seek(20);
+        assert_eq!(st.verb("env 0"), Some(Ok(())));
+        st
+    }
+
+    fn curve(st: &EditorState) -> Curve {
+        st.timeline.tracks[0].clips[0].gain_env.curve()
+    }
+
+    /// M3: bare toggles, the words set, one undo step each, the same curve commits nothing; undo restores.
+    #[test]
+    fn striagainenvcurve_words() {
+        let mut st = state();
+        let (tl0, d0) = (st.timeline.clone(), st.undo_depth());
+        assert_eq!(st.verb("env-curve"), Some(Ok(())));
+        assert_eq!((curve(&st), st.undo_depth()), (Curve::EqualPower, d0 + 1));
+        assert_eq!(st.verb("env-curve equal"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), d0 + 1, "the same curve commits nothing");
+        assert_eq!(st.verb("env-curve"), Some(Ok(())));
+        assert_eq!(curve(&st), Curve::Linear);
+        assert_eq!(st.verb("env-curve equal"), Some(Ok(())));
+        assert_eq!(st.verb("env-curve linear"), Some(Ok(())));
+        assert_eq!((curve(&st), st.undo_depth()), (Curve::Linear, d0 + 4));
+        for _ in 0..4 {
+            st.undo();
+        }
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// M3: refusals by name leave the state; other words are not this one.
+    #[test]
+    fn striagainenvcurve_refusals() {
+        let mut st = state();
+        let (tl0, d0) = (st.timeline.clone(), st.undo_depth());
+        for w in ["env-curve x", "env-curve equal 1"] {
+            assert_eq!(st.verb(w), Some(Err(EditError::Gain)), "{w}");
+        }
+        assert_eq!(st.verb("env-clear"), Some(Ok(())));
+        assert_eq!(st.verb("env-curve"), Some(Err(EditError::Gain)), "no point: always linear");
+        st.undo();
+        st.deselect();
+        assert_eq!(st.verb("env-curve"), Some(Err(EditError::NoClip)));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, d0));
+        assert_eq!(st.verb("env-curves"), None);
     }
 }

@@ -1747,11 +1747,12 @@ pub const GAIN_ENV_MAX: usize = 8;
 pub struct GainEnv {
     n: u8,
     pts: [(i64, i32); GAIN_ENV_MAX],
+    curve: Curve, // STRIAGAINENVCURVE (SR9083): the segments' shape (Linear when empty; `curve()` / `curved()`)
 }
 
 impl GainEnv {
     /// No point: the flat gain.
-    pub const EMPTY: GainEnv = GainEnv { n: 0, pts: [(0, 0); GAIN_ENV_MAX] };
+    pub const EMPTY: GainEnv = GainEnv { n: 0, pts: [(0, 0); GAIN_ENV_MAX], curve: Curve::Linear };
     /// The points, in tick order.
     pub fn points(&self) -> &[(i64, i32)] {
         &self.pts[..self.n as usize]
@@ -1796,7 +1797,7 @@ impl GainEnv {
             e.pts[j] = e.pts[j + 1];
         }
         e.pts[n - 1] = (0, 0);
-        e.n -= 1;
+        e.n -= 1; if e.n == 0 { e.curve = Curve::Linear; } // STRIAGAINENVCURVE (SR9083): no point is always linear
         Ok(e)
     }
     /// The offset (centi-dB) at source tick `src_t`: linear between points (truncating toward zero), held at both ends,
@@ -1812,7 +1813,7 @@ impl GainEnv {
         }
         let i = p.iter().rposition(|q| q.0 <= src_t).unwrap_or(0);
         let ((s0, v0), (s1, v1)) = (p[i], p[i + 1]);
-        (v0 as i64 + (v1 - v0) as i64 * (src_t - s0) / (s1 - s0)) as i32
+        self.seg_at(v0, v1, src_t - s0, s1 - s0) // STRIAGAINENVCURVE (SR9083): the segment through the envelope's curve (file tail)
     }
     /// The largest offset (0 when empty).
     pub fn peak(&self) -> i32 {
@@ -1885,5 +1886,61 @@ mod striagainenvelope_tests {
         assert_eq!(tl.set_gain_env(a, 3, e), Err(EditError::NoClip));
         let sp = tl.split(a, 10).unwrap();
         assert!(sp.tracks[a].clips.iter().all(|c| c.gain_env == e));
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the gain envelope's segment curve (named tail block) ----
+// A clip's envelope carries ONE [`Curve`] for all its segments. `Linear` (the default, written as nothing) is linear in
+// centi-dB between two points, today's exact integer formula. `EqualPower` takes the segment's phase through THE crossfade
+// ramp curve ([`crate::schedule::xfade_weight`], the quarter-wave table), in either direction: `v0 + (v1 - v0) * w(p)`.
+// An envelope with no point is always `Linear` (`without` of the last point resets it; `curved` leaves an empty one as
+// it is), so `is_empty` still means the default. `curve()` / `curved()` are the only way to the field.
+
+impl GainEnv {
+    /// STRIAGAINENVCURVE (SR9083): the segments' curve.
+    pub fn curve(&self) -> Curve {
+        self.curve
+    }
+    /// STRIAGAINENVCURVE (SR9083): the same envelope with curve `c` (an empty envelope comes back unchanged: linear).
+    pub fn curved(self, c: Curve) -> GainEnv {
+        if self.is_empty() {
+            return self;
+        }
+        GainEnv { curve: c, ..self }
+    }
+    /// The value `k` ticks into a segment of `len` ticks (`len > 0`) from `v0` to `v1`, through the curve.
+    fn seg_at(&self, v0: i32, v1: i32, k: i64, len: i64) -> i32 {
+        match self.curve {
+            Curve::Linear => (v0 as i64 + (v1 - v0) as i64 * k / len) as i32,
+            Curve::EqualPower => {
+                let one = crate::schedule::ENV_ONE as i64;
+                let w = crate::schedule::xfade_weight(Curve::EqualPower, (k.clamp(0, len) * one / len) as u32) as i64;
+                (v0 as i64 + (v1 - v0) as i64 * w / one) as i32
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+
+    /// M3: linear is unchanged; equal-power is the quarter sine of the phase (mid of -600..0 = -600 + 600 * 46341 / 65536
+    /// = -176), the ends are the points; an empty envelope stays linear; removing the last point resets the curve.
+    #[test]
+    fn striagainenvcurve_value() {
+        let e = GainEnv::EMPTY.with(10, -600).unwrap().with(20, 0).unwrap();
+        assert_eq!((e.curve(), e.at(15)), (Curve::Linear, -300));
+        let q = e.curved(Curve::EqualPower);
+        assert_eq!((q.curve(), q.at(10), q.at(15), q.at(20), q.at(5), q.at(25)), (Curve::EqualPower, -600, -176, 0, -600, 0));
+        let d = GainEnv::EMPTY.with(10, 0).unwrap().with(20, -600).unwrap().curved(Curve::EqualPower);
+        assert_eq!(d.at(15), -424, "falling: the same phase weight");
+        assert!(q.at(12) > e.at(12), "faster start than linear");
+        assert_eq!(GainEnv::EMPTY.curved(Curve::EqualPower), GainEnv::EMPTY);
+        assert_eq!(GainEnv::default(), GainEnv::EMPTY);
+        let one = q.without(10).unwrap();
+        assert_eq!(one.curve(), Curve::EqualPower, "one point left keeps the curve");
+        assert_eq!(one.without(20).unwrap(), GainEnv::EMPTY);
+        assert_ne!(q, e);
     }
 }
