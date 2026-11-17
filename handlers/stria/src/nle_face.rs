@@ -30,6 +30,9 @@
 //!   `mods`, bandy's `MOD_SHIFT` / `MOD_ALT`), so both faces have them and no keydown latch exists.
 //! * NLEHOSTSAVE (LEDGER SR677): `save` (button, `Ctrl+s` / `Meta+s`) writes the timeline through `edl::write` to the path the document was opened from.
 //! * NLEPLAYAUDIO (LEDGER SR676): a forward played tick is ONE `render` through `PlaySink` (the still, the meters, the mix to a `media::AudioOut` installed by [`Face::with_audio`]).
+//! * STRIAAUDIOSCRUB (LEDGER SR865): a ruler scrub step (with a device, not playing) is ONE `play_tick` of that tick: its still, the meters, one frame of sound.
+//! * STRIAAUDIOSCRUBMORE (LEDGER SR947): a clip / track click sounds its frame too; a scrub burst waits until the last snippet is mostly played; the meter strip shows the last sounded scrub step.
+//! * STRIAAUDIOSCRUBNEXT (LEDGER SR988): a scrub step the gate refused sounds on a later face clock tick.
 
 use std::time::Duration;
 
@@ -271,12 +274,12 @@ impl Face {
             }
             Hit::None => return false,
         }
-        true
+        self.click_burst(); true // STRIAAUDIOSCRUBMORE (SR947): a clip / track / ruler click sounds its frame (file tail)
     }
     /// One playback tick: the playhead steps `rate` frames (back when negative); playback stops at the end going
     /// forward and at 0 going back. True when it moved or stopped.
     pub fn tick(&mut self) -> bool {
-        if self.hover_dwell_tick() && !self.playing { return true; } // STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
+        if (self.hover_dwell_tick() | self.scrub_retry_tick()) && !self.playing { return true; } // STRIAAUDIOSCRUBNEXT (SR988): a refused scrub step retried on the same clock (file tail); STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
         if !self.playing {
             return false;
         }
@@ -322,7 +325,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.scrub_pending() => { // STRIAAUDIOSCRUBNEXT (SR988): and a refused scrub step owed its sound; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
                 if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
@@ -434,7 +437,7 @@ impl Face {
         let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0);
         self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
-            self.state.seek(d.origin_tick);
+            self.state.seek(d.origin_tick); self.scrub_burst(ph); // STRIAAUDIOSCRUB (SR865): a ruler scrub step plays its frame through the play road (file tail)
         }
         dropped || self.state.selection != sel || self.state.set != set || self.state.playhead != ph
     }
@@ -467,7 +470,7 @@ impl Face {
         };
         if d.kind == DragKind::Scrub {
             let t = d.origin_tick + d.delta;
-            self.state.seek(t);
+            let p = self.state.playhead; self.state.seek(t); self.scrub_burst(p); // STRIAAUDIOSCRUB (SR865): each tick-changing scrub step plays its frame (file tail)
         }
         changed
     }
@@ -1346,7 +1349,7 @@ impl Face {
     }
     /// What the strip paints: the meters while playing, nothing when stopped (never a frozen reading).
     fn meter_levels(&self) -> Vec<MeterLevel> {
-        if self.playing { self.meters.levels() } else { Vec::new() }
+        if self.playing || self.scrub_metered() { self.meters.levels() } else { Vec::new() } // STRIAAUDIOSCRUBMORE (SR947): and the last sounded step while a Scrub drag lives (file tail)
     }
 }
 
@@ -1597,7 +1600,7 @@ impl Face {
         if role == Role::Bin { return self.paint_bin(); } let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail); STRIAPROJECTBIN (SR885): the bin's own painter (file tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
-        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.shown_tick(), shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIASOURCEPLAY (SR9080): keyed on the source playhead while loaded
+        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.shown_tick(), shown.is_none() || scrubbing(&self.drag)) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIASOURCEPLAY (SR9080): keyed on the source playhead while loaded; STRIAAUDIOSCRUB (SR865): and a scrub step's, under its live Scrub drag
             self.still = match preview_shown(st, &self.sources) { // STRIASOURCEVIEWER (SR9045): a loaded source shows through the same frame road (file tail)
                 Ok(s) => s,
                 Err(e) => {
@@ -1773,6 +1776,8 @@ struct PlayAudio {
     run_base: u64,
     run_pushed: u64,
     rate: u32,
+    scrub: Option<(u64, u64)>, // STRIAAUDIOSCRUBMORE (SR947): the last scrub burst (device consumed before it, frames it pushed)
+    scrub_retry: Option<i64>, // STRIAAUDIOSCRUBNEXT (SR988): the tick a refused scrub step owes
 }
 
 impl PlayAudio {
@@ -1849,7 +1854,7 @@ impl Face {
         if want == self.play.live {
             return;
         }
-        self.play.live = want;
+        self.play.live = want; self.play.scrub = None; self.play.scrub_retry = None; // STRIAAUDIOSCRUBNEXT (SR988): and the owed retry; STRIAAUDIOSCRUBMORE (SR947): a transport change ends the scrub gate (file tail)
         let rate = self.play.rate;
         let Some(o) = self.play.out.as_mut() else { return };
         if want {
@@ -1922,14 +1927,14 @@ mod playaudio_tests {
 
     /// What the recording device saw, in order.
     #[derive(Debug, Clone, PartialEq)]
-    enum Ev {
+    pub(super) enum Ev {
         Push(Vec<f32>),
         Paused(bool),
         Flush,
     }
 
     /// The tests' `AudioOut`: records every call; takes every sample; `consumed` is what it took.
-    struct RecordingOut(Arc<Mutex<Vec<Ev>>>);
+    pub(super) struct RecordingOut(pub(super) Arc<Mutex<Vec<Ev>>>);
 
     impl AudioOut for RecordingOut {
         fn push(&mut self, stereo: &[f32]) -> usize {
@@ -1947,18 +1952,18 @@ mod playaudio_tests {
         }
     }
 
-    fn face() -> (Face, Arc<Mutex<Vec<Ev>>>) {
+    pub(super) fn face() -> (Face, Arc<Mutex<Vec<Ev>>>) {
         let (tl, src) = synth_fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
         let f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(RecordingOut(log.clone())), SYNTH_RATE);
         (f, log)
     }
 
-    fn pushes(log: &Arc<Mutex<Vec<Ev>>>) -> Vec<Vec<f32>> {
+    pub(super) fn pushes(log: &Arc<Mutex<Vec<Ev>>>) -> Vec<Vec<f32>> {
         log.lock().unwrap().iter().filter_map(|e| if let Ev::Push(s) = e { Some(s.clone()) } else { None }).collect()
     }
 
-    fn still_at(t: i64) -> Option<Still> {
+    pub(super) fn still_at(t: i64) -> Option<Still> {
         let (tl, src) = synth_fixture();
         preview(&tl, &src, t).unwrap()
     }
@@ -3794,5 +3799,363 @@ mod striasourceplay_tests {
         assert_eq!(f.state.source, None);
         assert!(f.last_error.is_none(), "{:?}", f.last_error);
         assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+    }
+}
+
+// ---- STRIAAUDIOSCRUB (LEDGER SR865): a ruler scrub step plays one frame through the play road (named tail block) ----
+
+/// STRIAAUDIOSCRUB (SR865): a live Scrub drag is shown at the face's own state (its finish edits nothing), so the paint may
+/// take the scrub step's played still instead of rendering `preview` a second time.
+fn scrubbing(drag: &Option<Drag>) -> bool {
+    drag.as_ref().is_some_and(|d| d.kind == DragKind::Scrub)
+}
+
+impl Face {
+    /// STRIAAUDIOSCRUB (SR865): one scrub step rides the play road for ONE tick: when not playing, with a device, the playhead
+    /// moved off `prev`, lies before the end and is not the tick the road last showed, the device is released and
+    /// [`Face::play_tick`] renders `playhead..playhead + 1` through `PlaySink` (the still the step's paint takes, the meters,
+    /// one frame of sound), with `next` cleared so the meters restart and the ring is flushed (at most one frame queued: the
+    /// sound never lags the pointer). `rate` and `play.live` are overridden for that one call and restored. The device stays
+    /// released afterwards (an empty ring idles silent) until the next transport change's `sync_audio`.
+    fn scrub_burst(&mut self, prev: i64) {
+        let ph = self.state.playhead;
+        if self.playing || ph == prev || self.play.out.is_none() || self.play.shown == Some(ph) || ph >= self.state.timeline.end() || !self.scrub_gate(ph) { // STRIAAUDIOSCRUBNEXT (SR988): the gate records a refused tick; STRIAAUDIOSCRUBMORE (SR947): and the last snippet mostly played (file tail)
+            return;
+        }
+        if let Some(o) = self.play.out.as_mut() {
+            o.set_paused(false);
+        }
+        let (rate, live) = (self.rate, self.play.live);
+        (self.rate, self.play.live, self.play.shown, self.play.next) = (1, true, None, None);
+        self.scrub_tick(ph); // STRIAAUDIOSCRUBMORE (SR947): the one play_tick, the gate recorded (file tail)
+        (self.rate, self.play.live) = (rate, live);
+    }
+}
+
+#[cfg(test)]
+mod audioscrub_tests {
+    use super::playaudio_tests::{Ev, face, pushes, still_at};
+    use super::*;
+    use crate::nle::synth_sample;
+
+    fn btn(down: bool, x: f64, y: f64) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 }
+    }
+
+    /// STRIAAUDIOSCRUB M3: a ruler press and each tick-changing move is ONE render through the play road: one push of rate /
+    /// fps stereo frames of the tick's own mix, the meters as `MixMeters::feed` of that tick, the still the step's paint takes
+    /// (no `preview` render); a move inside the tick and the release render nothing; the transport stays stopped.
+    #[test]
+    fn striaaudioscrub_step_is_one_render() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        assert!(f.on(&btn(true, 44.0, 70.0)));
+        assert_eq!((f.dragging().map(|d| d.kind), f.state.playhead), (Some(DragKind::Scrub), 5));
+        assert_eq!(f.played().renders, 1);
+        let ev = log.lock().unwrap().clone();
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert_eq!((&ev[0], &ev[1]), (&Ev::Paused(false), &Ev::Flush));
+        let p = pushes(&log);
+        assert_eq!(p[0].len(), 2 * 1920);
+        for (i, fr) in p[0].chunks_exact(2).enumerate() {
+            assert_eq!(fr[0], fr[1]);
+            assert_eq!(fr[0], synth_sample(0, 18 * 1920 + i as u64) as f32 / 32768.0, "frame {i}");
+        }
+        let (tl, src) = synth_fixture();
+        let mut m = MixMeters::default();
+        m.feed(&tl, 5..6, &src).unwrap();
+        assert_eq!(f.meters().levels(), m.levels());
+        let _ = f.frames();
+        assert!(f.play.pending.is_none(), "the paint took the scrub step's still");
+        assert_eq!(f.still().cloned(), still_at(5));
+        assert!(f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0)));
+        assert_eq!((f.state.playhead, f.played().renders), (15, 2));
+        let _ = f.frames();
+        assert!(f.play.pending.is_none(), "a moved Scrub drag's paint takes the still too");
+        assert_eq!(f.still().cloned(), still_at(15));
+        f.on(&SMessage::BrowserMouseMove(126.0, 70.0, 0));
+        assert_eq!((f.state.playhead, f.played().renders, pushes(&log).len()), (15, 2, 2), "the same tick plays nothing");
+        f.on(&btn(false, 126.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders, f.played().pushed), (15, 2, 3840));
+        assert!(!f.playing && !f.played().live);
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    }
+
+    /// STRIAAUDIOSCRUB M3: no burst without a device (the paint is `preview`'s, as before), while playing (the play road
+    /// already sounds), at the timeline's end, or on the tick already shown.
+    #[test]
+    fn striaaudioscrub_refusals() {
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        mute.on(&btn(true, 44.0, 70.0));
+        assert_eq!((mute.state.playhead, mute.played().renders), (5, 0));
+        let _ = mute.frames();
+        assert_eq!(mute.still().cloned(), still_at(5));
+
+        let (mut f, _) = face();
+        f.verb("play");
+        f.tick();
+        f.on(&btn(true, 44.0, 70.0));
+        f.on(&btn(false, 44.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders), (5, 1), "a scrub while playing adds no render");
+
+        let (mut f, _) = face();
+        let end = f.state.timeline.end();
+        f.state.seek(3);
+        f.scrub_burst(0);
+        assert_eq!(f.played().renders, 1);
+        f.scrub_burst(0);
+        assert_eq!(f.played().renders, 1, "the tick already shown");
+        f.scrub_burst(3);
+        assert_eq!(f.played().renders, 1, "the playhead did not move");
+        f.state.seek(end);
+        f.scrub_burst(3);
+        assert_eq!((f.state.playhead, f.played().renders), (end, 1), "nothing past the end");
+    }
+
+    /// STRIAAUDIOSCRUB M3: play after a scrub to 7 steps past the tick it sounded (the resumed-run rule) and continues the
+    /// ring: no flush between the burst and the first played tick.
+    #[test]
+    fn striaaudioscrub_play_after_scrub() {
+        let (mut f, log) = face();
+        f.on(&btn(true, 60.0, 70.0));
+        f.on(&btn(false, 60.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders), (7, 1));
+        log.lock().unwrap().clear();
+        f.verb("play");
+        assert!(f.tick());
+        assert_eq!((f.state.playhead, f.played().renders), (8, 2));
+        let ev = log.lock().unwrap().clone();
+        assert!(!ev.contains(&Ev::Flush), "{ev:?}");
+        assert_eq!(pushes(&log).len(), 1);
+    }
+}
+
+// ---- STRIAAUDIOSCRUBMORE (LEDGER SR947): clicks sound, bursts wait for the device, the strip shows a scrub (named tail block) ----
+
+impl Face {
+    /// STRIAAUDIOSCRUBMORE (SR947): a click on a clip, a track or the ruler is a fresh scrub step (no previous tick): SR865's
+    /// `play.shown` test alone keeps a ruler click after its own press silent (one render, as before).
+    fn click_burst(&mut self) {
+        self.scrub_burst(i64::MIN)
+    }
+    /// STRIAAUDIOSCRUBMORE (SR947): SR865's one `play_tick` of a scrub step, with the gate recorded: what the device had
+    /// consumed before the burst and how many frames the burst pushed.
+    fn scrub_tick(&mut self, ph: i64) {
+        let (c0, p0) = (self.play.out.as_ref().map_or(0, |o| o.consumed()), self.play.pushed);
+        self.play_tick(ph);
+        self.play.scrub = Some((c0, self.play.pushed - p0));
+    }
+    /// STRIAAUDIOSCRUBMORE (SR947): the next scrub burst may flush the ring once the last burst's snippet is at least three
+    /// quarters played by the device's own `consumed` counter (the quarter slack covers a resampler holding back a source
+    /// frame, so a drained ring never stalls the gate). No record or no device: due.
+    fn scrub_due(&self) -> bool {
+        match (self.play.scrub, self.play.out.as_ref()) {
+            (Some((c0, n)), Some(o)) => o.consumed() + n / 4 >= c0 + n,
+            _ => true,
+        }
+    }
+    /// STRIAAUDIOSCRUBMORE (SR947): the meter strip shows the last sounded scrub step while the Scrub drag lives; a release,
+    /// a click or a face without a device paints none (never a frozen reading).
+    fn scrub_metered(&self) -> bool {
+        scrubbing(&self.drag) && self.play.scrub.is_some()
+    }
+}
+
+#[cfg(test)]
+mod audioscrubmore_tests {
+    use super::playaudio_tests::{Ev, face, pushes, still_at};
+    use super::*;
+
+    fn btn(down: bool, x: f64, y: f64) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 }
+    }
+
+    /// STRIAAUDIOSCRUBMORE M3: a click on a clip seeks, selects and sounds its frame (one render, one push); the same click
+    /// again plays nothing (the tick already shown); a click on an empty track spot sounds too; no device, no render.
+    #[test]
+    fn striaaudioscrubmore_click_sounds() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        let (x, y) = f.layout().point(1, 12);
+        assert!(f.on(&SMessage::BrowserClick(x, y, 0)));
+        assert_eq!((f.state.playhead, f.state.selection), (12, Some((1, 1))));
+        assert_eq!((f.played().renders, pushes(&log).len()), (1, 1));
+        assert!(f.on(&SMessage::BrowserClick(x, y, 0)));
+        assert_eq!((f.played().renders, pushes(&log).len()), (1, 1), "the tick already shown");
+        let (x, y) = f.layout().point(0, 22);
+        assert!(f.on(&SMessage::BrowserClick(x, y, 0)));
+        assert_eq!((f.state.playhead, f.state.selection, f.played().renders), (22, None, 2));
+        assert!(!f.playing && !f.played().live);
+
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let (x, y) = mute.layout().point(1, 12);
+        mute.on(&SMessage::BrowserClick(x, y, 0));
+        assert_eq!((mute.state.playhead, mute.played().renders), (12, 0));
+    }
+
+    /// STRIAAUDIOSCRUBMORE M3: a ruler press and its unmoved release sound the tick once: the release's click is refused by
+    /// the tick the press already showed.
+    #[test]
+    fn striaaudioscrubmore_ruler_click_once() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 60.0, 70.0));
+        f.on(&btn(false, 60.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders, pushes(&log).len()), (7, 1, 1));
+    }
+
+    /// STRIAAUDIOSCRUBMORE M3: a scrub step waits until the device has played three quarters of the last burst: a refused
+    /// step still seeks and its paint renders `preview`; once `consumed` reaches the threshold the next step sounds; a
+    /// transport change drops the gate.
+    #[test]
+    fn striaaudioscrubmore_gate_waits() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        assert!(f.on(&btn(true, 44.0, 70.0)));
+        assert_eq!((f.state.playhead, f.played().renders), (5, 1));
+        assert_eq!(f.play.scrub, Some((0, 1920)));
+        log.lock().unwrap().clear();
+        assert!(!f.scrub_due());
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert_eq!((f.state.playhead, f.played().renders), (15, 1), "the last snippet is not played yet");
+        let _ = f.frames();
+        assert_eq!(f.still().cloned(), still_at(15));
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1439]));
+        assert!(!f.scrub_due(), "1439 of 1920 played");
+        log.lock().unwrap().clear();
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1440]));
+        assert!(f.scrub_due(), "1440 of 1920 played");
+        f.on(&SMessage::BrowserMouseMove(140.0, 70.0, 0));
+        assert_eq!((f.state.playhead, f.played().renders), (17, 2));
+        f.on(&btn(false, 140.0, 70.0));
+        f.verb("play");
+        f.verb("play");
+        assert!(f.play.scrub.is_none(), "a transport change ends the gate");
+    }
+
+    /// STRIAAUDIOSCRUBMORE M3: the meter strip paints the scrub's reading while the Scrub drag lives and nothing after the
+    /// release; a face without a device paints none.
+    #[test]
+    fn striaaudioscrubmore_meters_strip() {
+        let (mut f, _) = face();
+        assert!(f.meter_levels().is_empty());
+        f.on(&btn(true, 44.0, 70.0));
+        let lv = f.meter_levels();
+        assert!(!lv.is_empty());
+        assert_eq!(lv, f.meters().levels());
+        f.on(&btn(false, 44.0, 70.0));
+        assert!(f.meter_levels().is_empty(), "released: no strip");
+
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        mute.on(&btn(true, 44.0, 70.0));
+        assert!(mute.meter_levels().is_empty());
+    }
+}
+
+// ---- STRIAAUDIOSCRUBNEXT (LEDGER SR988): a refused scrub step is retried on the face clock (named tail block) ----
+
+impl Face {
+    /// STRIAAUDIOSCRUBNEXT (SR988): SR947's gate with the refusal recorded: not due records `ph` as the tick a later face
+    /// clock tick owes its sound; due drops the record. Reached only when every other clause of `scrub_burst`'s guard passed.
+    fn scrub_gate(&mut self, ph: i64) -> bool {
+        let due = self.scrub_due();
+        self.play.scrub_retry = if due { None } else { Some(ph) };
+        due
+    }
+    /// STRIAAUDIOSCRUBNEXT (SR988): a refused scrub step is owed its sound: `serve` runs its clock.
+    pub fn scrub_pending(&self) -> bool {
+        self.play.scrub_retry.is_some()
+    }
+    /// STRIAAUDIOSCRUBNEXT (SR988): one face clock tick of the retry: playing or a playhead moved off the recorded tick
+    /// drops it; not yet due keeps it; due runs SR865's `scrub_burst` itself (the whole guard re-checked) and drops it.
+    /// True only when a render happened (the repaint takes its still).
+    fn scrub_retry_tick(&mut self) -> bool {
+        let Some(t) = self.play.scrub_retry else { return false };
+        if self.playing || t != self.state.playhead {
+            self.play.scrub_retry = None;
+            return false;
+        }
+        if !self.scrub_due() {
+            return false;
+        }
+        let n = self.play.renders;
+        self.scrub_burst(i64::MIN);
+        self.play.scrub_retry = None;
+        self.play.renders != n
+    }
+}
+
+#[cfg(test)]
+mod audioscrubnext_tests {
+    use super::playaudio_tests::{Ev, face, still_at};
+    use super::*;
+
+    fn btn(down: bool, x: f64, y: f64) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 }
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a step the gate refused is owed; a clock tick before the device drained keeps it; the tick
+    /// after sounds it (one render) and the paint takes its still.
+    #[test]
+    fn striaaudioscrubnext_retry_sounds() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        assert_eq!((f.state.playhead, f.played().renders), (5, 1));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert_eq!((f.state.playhead, f.played().renders), (15, 1));
+        assert!(f.scrub_pending());
+        assert!(!f.tick(), "not drained yet");
+        assert_eq!(f.played().renders, 1);
+        assert!(f.scrub_pending());
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1440]));
+        assert!(f.tick());
+        assert_eq!((f.state.playhead, f.played().renders), (15, 2));
+        assert!(!f.scrub_pending());
+        let _ = f.frames();
+        assert!(f.play.pending.is_none(), "the paint took the retried still");
+        assert_eq!(f.still().cloned(), still_at(15));
+        assert!(!f.playing);
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a playhead moved off the refused tick drops the retry; play drops it too.
+    #[test]
+    fn striaaudioscrubnext_retry_dropped() {
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(f.scrub_pending());
+        f.state.seek(3);
+        log.lock().unwrap().push(Ev::Push(vec![0.0; 2 * 1440]));
+        assert!(!f.tick());
+        assert!(!f.scrub_pending());
+        assert_eq!(f.played().renders, 1);
+
+        let (mut f, log) = face();
+        log.lock().unwrap().clear();
+        f.on(&btn(true, 44.0, 70.0));
+        log.lock().unwrap().clear();
+        f.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(f.scrub_pending());
+        f.on(&btn(false, 124.0, 70.0));
+        f.verb("play");
+        assert!(!f.scrub_pending(), "a transport change drops the retry");
+    }
+
+    /// STRIAAUDIOSCRUBNEXT M3: a face without a device never owes a retry.
+    #[test]
+    fn striaaudioscrubnext_no_device() {
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        mute.on(&btn(true, 44.0, 70.0));
+        mute.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
+        assert!(!mute.scrub_pending());
+        assert!(!mute.tick());
     }
 }
