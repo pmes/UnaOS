@@ -155,7 +155,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "proxy", "help"]; // STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "proxy", "proxy-off", "proxy-all", "help"]; // STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -3275,7 +3275,7 @@ fn proxy_gate(c: &AtomicBool, hold: Option<u64>, k: u64) -> Result<(), ExportErr
 impl Face {
     /// `proxy off` / `proxy all` / `proxy <other>` (the usage); the bare word is SR882's [`Face::proxy_verb`] (None here).
     fn proxy_words(&mut self, v: &str) -> Option<bool> {
-        let mut words = v.split_whitespace();
+        let mut words = proxy_alias(v).split_whitespace(); // STRIAPROXYBUTTONS (SR930): the button words read as their arguments (file tail)
         if words.next() != Some("proxy") {
             return None;
         }
@@ -3283,8 +3283,8 @@ impl Face {
         match args.as_slice() {
             [] => return None,
             ["off"] => self.proxy_off(),
-            ["all"] => self.proxy_all(),
-            _ => self.last_error = Some("proxy: usage: proxy [off|all]".into()),
+            ["all"] => self.proxy_all(), ["purge"] => self.proxy_purge(), // STRIAPROXYBUTTONS (SR930): purge detaches then removes the files (file tail)
+            _ => self.last_error = Some("proxy: usage: proxy [off|all|purge]".into()),
         }
         Some(true)
     }
@@ -3374,5 +3374,59 @@ impl Face {
             line.push_str(&r);
         }
         self.last_error = Some(line);
+    }
+}
+
+// ---- STRIAPROXYBUTTONS (LEDGER SR930): the proxy's buttons, purge and reels (named tail block) ----
+// The stria-view buttons `Proxy Off` / `Proxy All` send the VERBS words `proxy-off` / `proxy-all`, read by SR915's ONE
+// dispatch (`proxy_words`) as `proxy off` / `proxy all`. `proxy purge` (an argument, no button: it deletes files) detaches
+// through SR915's `proxy_off` (its selection and busy refusals stand), then removes the selected source's proxy file, stamp
+// and any leftover work dir (SR882's `proxy_paths`). `proxy_reels` names the reels with an attached proxy (the witness's
+// `"proxy"` field). View-only: no undo step, the document clean. Owed: NLE-PROXY-PURGE-ALL.
+
+/// STRIAPROXYBUTTONS (LEDGER SR930): a button word as the `proxy` argument it stands for; any other text unchanged.
+fn proxy_alias(v: &str) -> &str {
+    match v.trim() {
+        "proxy-off" => "proxy off",
+        "proxy-all" => "proxy all",
+        _ => v,
+    }
+}
+
+impl Face {
+    /// `proxy purge` on the selected clip's source: [`Face::proxy_off`]'s line, then `; removed <proxy>, <stamp>` /
+    /// `; no proxy files` / `; no source path`; refused (proxy_off's busy line) while that source's own job runs.
+    fn proxy_purge(&mut self) {
+        self.proxy_off();
+        let Some(c) = self.state.selected() else { return };
+        let src = c.src;
+        if self.proxy.as_ref().is_some_and(|j| j.src == src) {
+            return;
+        }
+        self.proxy_queue.retain(|(s, _)| *s != src);
+        let reel = self.state.timeline.source(src).map(|s| s.reel.clone());
+        let file = reel.and_then(|r| self.reel_paths.iter().find(|(p, _)| *p == r).map(|(_, f)| f.clone()));
+        let tail = match file {
+            None => "no source path".to_string(),
+            Some(f) => {
+                let (proxy, stamp, work) = proxy_paths(&f);
+                let mut removed = Vec::new();
+                for p in [&proxy, &stamp] {
+                    if p.is_file() && std::fs::remove_file(p).is_ok() {
+                        removed.push(p.display().to_string());
+                    }
+                }
+                if work.is_dir() && std::fs::remove_dir_all(&work).is_ok() {
+                    removed.push(work.display().to_string());
+                }
+                if removed.is_empty() { "no proxy files".to_string() } else { format!("removed {}", removed.join(", ")) }
+            }
+        };
+        let line = self.last_error.take().unwrap_or_else(|| "proxy:".to_string());
+        self.last_error = Some(format!("{line}; {tail}"));
+    }
+    /// The reels whose source has an attached proxy, in source order (the witness's `"proxy"` field).
+    pub fn proxy_reels(&self) -> Vec<String> {
+        self.state.timeline.sources.iter().filter(|s| self.sources.has_proxy(s.id)).map(|s| s.reel.clone()).collect()
     }
 }

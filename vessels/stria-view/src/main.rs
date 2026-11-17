@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "proxy"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &proxy_json(&face); // STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -518,6 +518,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("proxy", "Proxy"), // STRIAPROXYMEDIA (SR882): a half-size H.264 of the selected clip's source, beside it; the preview reads it, an export never
+        button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -903,5 +904,53 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAPROXYBUTTONS (LEDGER SR930): the Proxy Off / Proxy All buttons and the witness's attached reels (named tail block) ----
+/// The witness's `"proxy"` field, only while some reel has an attached proxy (`Face::proxy_reels`); the default line is
+/// unchanged.
+fn proxy_json(face: &Face) -> String {
+    let reels = face.proxy_reels();
+    if reels.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = reels.iter().map(|r| format!("\"{}\"", r.replace('"', "'"))).collect();
+    format!(",\"proxy\":[{}]", list.join(","))
+}
+
+#[cfg(test)]
+mod striaproxybuttons_tests {
+    use super::*;
+
+    /// STRIAPROXYBUTTONS M3: the two buttons sit right before `?`, each firing its own VERBS word; with nothing selected
+    /// the face refuses by name.
+    #[test]
+    fn striaproxybuttons_buttons_precede_help() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let n = row.len();
+        for (b, (want, lab)) in row[n - 3..n - 1].iter().zip([("proxy-off", "Proxy Off"), ("proxy-all", "Proxy All")]) {
+            let TetraNode::Button { id, label, action } = b else { panic!("not a button") };
+            assert_eq!((id.as_str(), label.as_str()), (want, lab));
+            let SMessage::Input { target, text } = action else { panic!("not an Input") };
+            assert_eq!((target.as_str(), text.as_str()), (SURFACE, want));
+        }
+        assert_eq!(&nle_face::VERBS[nle_face::VERBS.len() - 3..], &["proxy-off", "proxy-all", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut f, "proxy-off"), vec!["proxy: no clip selected".to_string()]);
+        assert_eq!(drive(&mut f, "proxy-all"), vec!["proxy: all: no reel has a source path".to_string()]);
+        println!("striaproxybuttons witness: Proxy Off / Proxy All before ?");
+    }
+
+    /// STRIAPROXYBUTTONS M3: no proxy attached -> no `"proxy"` field; `proxy:purge` is a token the face takes.
+    #[test]
+    fn striaproxybuttons_proxy_field_absent_without_proxy() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(proxy_json(&f), "");
+        assert_eq!(drive(&mut f, "proxy:purge"), vec!["proxy: no clip selected".to_string()]);
+        assert_eq!(proxy_json(&f), "");
+        println!("striaproxybuttons witness: no proxy -> no field; proxy:purge -> no clip selected");
     }
 }
