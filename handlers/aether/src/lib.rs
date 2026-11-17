@@ -77,7 +77,7 @@ pub struct AetherEngine {
     sel_gen: u64,
     /// Bumped whenever the layout tree is replaced; `painted_epoch` is the one the last full frame drew
     /// (the frame whose text fragments a pointer is hit-tested against).
-    layout_epoch: u64, holders: (u64, Vec<taffy::prelude::NodeId>), // AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): (epoch, the fixed / sticky boxes), `holder_damage`
+    layout_epoch: u64, holders: (u64, Vec<taffy::prelude::NodeId>), scroll_seen: (u64, Vec<(taffy::prelude::NodeId, css_core::container::ScrollState)>), // AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): (epoch, the fixed / sticky boxes), `holder_damage`
     painted_epoch: u64,
     /// AETHERPAINTPERF (SR130): the layout epoch the paint index (`render::subtree_ink`) was last built for.
     index_epoch: u64,
@@ -163,7 +163,7 @@ impl AetherEngine {
             last_press: None,
             shift_held: false,
             sel_gen: selection::generation(),
-            layout_epoch: 1, holders: (0, Vec::new()),
+            layout_epoch: 1, holders: (0, Vec::new()), scroll_seen: (0, Vec::new()),
             painted_epoch: 0,
             index_epoch: 0,
             last_snap: None,
@@ -271,7 +271,7 @@ impl AetherEngine {
     /// Rebuilds layout from the (possibly script-mutated) DOM and re-applies
     /// the page's stylesheets. The M3 mutation→relayout half-loop.
     pub fn relayout(&mut self) {
-        let Some(document) = self.document.clone() else { return };
+        crate::css::set_page_scroll(self.scroll_x, self.scroll_y); let Some(document) = self.document.clone() else { return };
         // A script may have inserted media elements: register them (poster requests queue).
         let base = self.history.get(self.history_idx).cloned().unwrap_or_default();
         media::scan(&document, &base);
@@ -292,7 +292,7 @@ impl AetherEngine {
         css::apply_stylesheets_scoped(&mut layout_tree, &self.stylesheets, &hover);
         layout::end_kept();
         self.layout_tree = Some(layout_tree);
-        self.layout_epoch += 1;
+        self.layout_epoch += 1; self.scroll_state_restyle(false);
         self.needs_repaint = true;
         // AETHERPAINTPERF2 (SR132): the next frame damages what differs from the last frame (the viewport when that
         // frame is not known, or the scopes are off).
@@ -660,7 +660,7 @@ impl AetherEngine {
             }
             css::anim::Frame::Idle => {}
         }
-        if images::take_lazy_loaded() > 0 {
+        self.scroll_state_restyle(true); if images::take_lazy_loaded() > 0 {
             self.relayout(); // AETHERMEDIA (SR107): a lazy image arrived — its box takes its size
             self.lazy_images_pass();
         }
@@ -2708,5 +2708,34 @@ impl AetherEngine {
             out = vec![(0, 0, self.width, self.height)];
         }
         self.damage_rects.extend(out);
+    }
+}
+
+// ---- AETHERSCROLLSTATERESTYLEONPANELSCROLL (LEDGER SR1166): a scroll that moves a scroll-state bit restyles (named tail block) ----
+impl AetherEngine {
+    /// css-conditional-5 §2.3: `@container scroll-state()` queries follow the scroll. `scroll_seen` is (layout epoch, each
+    /// `container-type: scroll-state` element box's state as that layout left it), read by `layout_core::scroll::scroll_state`,
+    /// the cascade's own reader (`css::container_sizes`). `check` false (the end of `relayout`): record this layout's states.
+    /// `check` true (once a frame in `tick`, after the frame's scrolls: a panel wheel, the scrollbar, script `scrollTop` /
+    /// `scrollTo` / `scrollIntoView`, smooth steps, the page): re-read the recorded boxes and relayout only when a stuck /
+    /// snapped / scrollable bit moved — at most once a frame, since the relayout re-records the round-2 layout (a style that
+    /// unsticks its own container settles there instead of looping). An empty record (no scroll-state container) calls no
+    /// `scroll_state`; a layout this engine has not recorded (a new document) is recorded, not restyled.
+    fn scroll_state_restyle(&mut self, check: bool) {
+        let Some(tree) = self.layout_tree.as_ref() else { return };
+        let (vs, vp) = ((self.scroll_x as f32, self.scroll_y as f32), tree.viewport);
+        if check && self.scroll_seen.0 == self.layout_epoch {
+            if self.scroll_seen.1.iter().all(|(id, st)| layout_core::scroll::scroll_state(tree, *id, vs, vp) == *st) {
+                return;
+            }
+            return self.relayout();
+        }
+        let now = tree
+            .paint_map
+            .iter()
+            .filter(|(id, p)| p.container_scroll == Some(true) && tree.node_map.get(*id).is_some_and(|n| n.is_element()))
+            .map(|(id, _)| (*id, layout_core::scroll::scroll_state(tree, *id, vs, vp)))
+            .collect::<Vec<_>>();
+        self.scroll_seen = (self.layout_epoch, now);
     }
 }

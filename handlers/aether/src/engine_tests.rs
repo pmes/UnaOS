@@ -12085,4 +12085,180 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
         assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "49"); // SR1124: four outline columns, 49
     }
+
+    // ---- AETHERSCROLLSTATERESTYLEONPANELSCROLL (LEDGER SR1166): a scroll that moves a scroll-state bit restyles on the next frame (named tail block) ----
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): SR1152's 400x300 page with a 200px `overflow: auto` panel `#p` at y 50:
+    /// `sheet` in a body `<style>`, `inner` in the panel, then ONE frame (`tick`: the engine records the load's layout).
+    fn scroll_state_panel_scroll_engine(sheet: &str, panel: &str, inner: &str) -> crate::AetherEngine {
+        let mut e = sticky_nested_scroller_engine(&format!(r#"<style>{sheet}</style><div style="height:50px"></div>"#), panel, inner);
+        e.tick();
+        e.render_frame();
+        e
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the sticky scroll-state header `#h` at panel y 30 (stuck from panel
+    /// offset 31 on) whose `#s` turns red under `scroll-state(stuck: top)`; `#h` has no height of its own.
+    fn scroll_state_panel_scroll_stuck() -> crate::AetherEngine {
+        scroll_state_panel_scroll_engine(
+            "@container scroll-state(stuck: top) { .h > span { color: rgb(255, 0, 0); background-color: rgb(255, 0, 0) } }",
+            "overflow:auto;height:200px",
+            r#"<div style="height:30px"></div><div class="h" id="h" style="position:sticky;top:0;container-type:scroll-state"><span id="s" style="display:block;height:20px"></span></div><div style="height:1000px"></div>"#,
+        )
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the layout id of the element `id`.
+    fn scroll_state_panel_scroll_tid(e: &crate::AetherEngine, id: &str) -> taffy::prelude::NodeId {
+        let t = e.layout_tree.as_ref().expect("laid out");
+        t.node_map.iter().find(|(_, n)| layout_core::DomNode::attr(*n, "id").as_deref() == Some(id)).map(|(k, _)| *k).expect("the element has a box")
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): `id`'s specified colour on the engine's OWN tree (what the next frame
+    /// paints; no script flush re-cascades it).
+    fn scroll_state_panel_scroll_color(e: &crate::AetherEngine, id: &str) -> Option<(u8, u8, u8)> {
+        let tid = scroll_state_panel_scroll_tid(e, id);
+        e.layout_tree.as_ref().and_then(|t| t.paint_map.get(&tid)).and_then(|p| p.color)
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): a wheel of `dy` with the pointer at viewport (`x`, `y`), no frame.
+    fn scroll_state_panel_scroll_wheel(e: &mut crate::AetherEngine, x: f64, y: f64, dy: f64) {
+        e.handle_event(crate::api::events::Event::MouseMove(x, y));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the panel wheeled 100, then ONE frame and no other event: `#s` is red
+    /// (armed: before SR1166 the query was asked again only at an unrelated relayout).
+    #[test]
+    fn scroll_state_panel_scroll_wheel_sticks_red() {
+        let mut e = scroll_state_panel_scroll_stuck();
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), None, "unscrolled: not stuck");
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 100.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel");
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), Some((255, 0, 0)), "stuck: top restyled on the next frame (armed)");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): wheeled 100 then back to 0: `#s` is not red again (armed: the stuck
+    /// style stayed until an unrelated relayout).
+    #[test]
+    fn scroll_state_panel_scroll_wheel_back_unsticks() {
+        let mut e = scroll_state_panel_scroll_stuck();
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 100.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), Some((255, 0, 0)));
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, -100.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), None, "back at 0: not stuck (armed)");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): `p.scrollTop = 100` from script (queued, applied by the frame's
+    /// `scroll_frame`): the same frame restyles `#s` red (armed).
+    #[test]
+    fn scroll_state_panel_scroll_js_scrolltop_red() {
+        let mut e = scroll_state_panel_scroll_stuck();
+        assert_eq!(font_synth_eval(&mut e, "String(document.getElementById('p').scrollTop = 100)"), "100");
+        e.tick();
+        e.render_frame();
+        let tree = e.layout_tree.as_ref().expect("laid out");
+        assert_eq!(layout_core::scroll::offset(tree, scroll_state_panel_scroll_tid(&e, "p")), (0.0, 100.0), "the script scrolled the panel");
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), Some((255, 0, 0)), "stuck: top restyled (armed)");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the flip costs exactly ONE relayout, and a further wheel that moves no
+    /// scroll-state bit (still stuck) costs none (`layout_epoch` counts the layout passes).
+    #[test]
+    fn scroll_state_panel_scroll_no_bit_no_relayout() {
+        let mut e = scroll_state_panel_scroll_stuck();
+        let e0 = e.layout_epoch;
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 100.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(e.layout_epoch, e0 + 1, "the flip relayouts once");
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 50.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(e.layout_epoch, e0 + 1, "still stuck: no relayout");
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), Some((255, 0, 0)));
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the flip's relayout keeps every offset (the page scrolled 10, the panel
+    /// 100) and its frame paints the restyled content: `#s` red at the panel's top (viewport y 40) and the frame byte-equal
+    /// to a fresh full repaint (no blit over the restyle).
+    #[test]
+    fn scroll_state_panel_scroll_keeps_offsets_full_repaint() {
+        let mut e = scroll_state_panel_scroll_stuck();
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 280.0, 10.0);
+        assert_eq!(e.scroll_y, 10.0, "the page took the wheel below the panel");
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 100.0);
+        e.render_frame();
+        e.tick();
+        e.render_frame();
+        let p = scroll_state_panel_scroll_tid(&e, "p");
+        assert_eq!(e.scroll_y, 10.0, "the page offset survives the flip's relayout");
+        assert_eq!(layout_core::scroll::offset(e.layout_tree.as_ref().expect("laid out"), p), (0.0, 100.0), "the panel offset survives it");
+        assert_eq!(imgalt_px(&e, 10, 45), STICKY_NESTED_RED, "#s painted red, stuck at the panel's top");
+        let frame = e.surface().to_vec();
+        e.damage_rects.push((0, 0, e.width, e.height));
+        e.needs_repaint = true;
+        e.render_frame();
+        assert!(frame == e.surface(), "the flip's frame equals a fresh full repaint");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): the PANEL is the scroll-state container: `.q` is blue under
+    /// `scroll-state(scrollable: bottom)` until the panel is wheeled to its end (armed: it stayed blue).
+    #[test]
+    fn scroll_state_panel_scroll_scrollable_bottom_flips() {
+        let mut e = scroll_state_panel_scroll_engine(
+            "@container scroll-state(scrollable: bottom) { .q { color: rgb(0, 0, 255) } }",
+            "overflow:auto;height:200px;container-type:scroll-state",
+            r#"<div class="q" id="q" style="height:10px"></div><div style="height:1000px"></div>"#,
+        );
+        assert_eq!(scroll_state_panel_scroll_color(&e, "q"), Some((0, 0, 255)), "the panel can scroll down");
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 2000.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(scroll_state_panel_scroll_color(&e, "q"), None, "at its end: not scrollable: bottom (armed)");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): a sticky scroll-state header in the PAGE (no panel): a page wheel of
+    /// 400 restyles `#s` red on the next frame (armed: the page road restyled no scroll-state query either).
+    #[test]
+    fn scroll_state_panel_scroll_page_wheel_flips() {
+        let html = r#"<!doctype html><html><body style="margin:0"><style>@container scroll-state(stuck: top) { .h > span { color: rgb(255, 0, 0) } }</style><div style="height:100px"></div><div class="h" id="h" style="position:sticky;top:0;container-type:scroll-state"><span id="s" style="display:block;height:20px"></span></div><div style="height:2000px"></div></body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.tick();
+        e.render_frame();
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), None, "unscrolled: not stuck");
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 10.0, 400.0);
+        e.tick();
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled");
+        assert_eq!(scroll_state_panel_scroll_color(&e, "s"), Some((255, 0, 0)), "stuck: top restyled (armed)");
+    }
+
+    /// AETHERSCROLLSTATERESTYLEONPANELSCROLL (SR1166): a self-defeating style — stuck hides `#s`, whose 1000px is what lets
+    /// the panel scroll, so the relayout clamps the panel to 0 and `#h` unsticks: ONE relayout on the frame that flips, none
+    /// after (the record is the settled round-2 layout), never a recursion.
+    #[test]
+    fn scroll_state_panel_scroll_self_defeating_one_relayout() {
+        let mut e = scroll_state_panel_scroll_engine(
+            "@container scroll-state(stuck: top) { .h > span { display: none } }",
+            "overflow:auto;height:200px",
+            r#"<div style="height:30px"></div><div class="h" id="h" style="position:sticky;top:0;container-type:scroll-state"><span id="s" style="display:block;height:1000px"></span></div><div style="height:150px"></div>"#,
+        );
+        scroll_state_panel_scroll_wheel(&mut e, 10.0, 100.0, 100.0);
+        let mut steps = Vec::new();
+        for _ in 0..3 {
+            let before = e.layout_epoch;
+            e.tick();
+            e.render_frame();
+            steps.push(e.layout_epoch - before);
+        }
+        assert_eq!(steps, vec![1, 0, 0], "one relayout on the flip, then settled");
+    }
 }
