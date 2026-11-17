@@ -474,7 +474,7 @@ pub const OUTLINE_DASHED: u8 = 3;
 pub const OUTLINE_DOTTED: u8 = 4;
 pub const OUTLINE_DOUBLE: u8 = 5;
 /// `medium`, the initial `outline-width` (§4.2), in px.
-pub const OUTLINE_MEDIUM: f32 = 3.0;
+pub const OUTLINE_MEDIUM: f32 = LINE_WIDTH_MEDIUM;
 
 /// An `outline-style` keyword (css-ui-4 §4.3: `auto | <outline-line-style>`; `hidden` is not valid for outlines
 /// and reads as none).
@@ -1221,3 +1221,11 @@ pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u
     }
     sides
 }
+
+// ---- AETHERCSSLINEWIDTHONETABLE (LEDGER SR1084): the ONE <line-width> medium (named tail block) ----
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): `medium` of the ONE `<line-width>` grammar css-backgrounds-3 §4.3, css-ui-4 §4.1
+/// and css-multicol-1 §5.2 share (Chromium 3px), in px: read by [`outline_width_keyword`] (through the
+/// [`OUTLINE_MEDIUM`] alias) and by css.rs `border_medium`. Before SR1084 the 3.0 lived as `OUTLINE_MEDIUM` and as
+/// border_medium's parse of the SR832 `"3px"` row.
+pub const LINE_WIDTH_MEDIUM: f32 = 3.0;

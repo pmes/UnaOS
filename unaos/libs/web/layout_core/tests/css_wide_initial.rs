@@ -2488,3 +2488,53 @@ fn border_thin_thick_width_sides() {
     }
     assert_eq!(cascade(&[&[("border-width", "1px 0")], &[("border-style", "solid")]]).paint.border, want, "across rules");
 }
+
+// ---- AETHERCSSLINEWIDTHONETABLE (LEDGER SR1084): column-rule's width through the ONE <line-width> road; medium has one home (named tail block) ----
+
+use layout_core::paint::{outline_width_keyword, LINE_WIDTH_MEDIUM, OUTLINE_MEDIUM};
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): `column-rule`'s width word reads SR1075's `line_width` (the
+/// `outline_width_keyword` table, else a length): thin 1 / medium 3 / thick 5 / 2px 2, the same values the inline match
+/// gave; the style and the colour still land beside it.
+#[test]
+fn line_width_one_table_column_rule() {
+    let solid = styled(&[("column-rule-style", "solid")]).paint.col_rule_style;
+    assert!(solid.is_some(), "the reference solid code");
+    for (k, w) in [("thin", 1.0), ("medium", 3.0), ("thick", 5.0), ("2px", 2.0)] {
+        let s = styled(&[("column-rule", &format!("{k} solid red"))]);
+        assert_eq!(s.paint.col_rule_width, Some(w), "{k}");
+        assert_eq!(s.paint.col_rule_style, solid, "{k}: the style lands");
+        assert_eq!(s.paint.col_rule_color, Some(stored_rgb("red")), "{k}: the colour lands");
+    }
+    assert_eq!(styled(&[("column-rule-width", "thick")]).paint.col_rule_width, Some(5.0), "the longhand");
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): FLIPPED by SR1084: `THICK` is 5px as the keyword table reads it (CSS keywords
+/// are ASCII case-insensitive); the inline match was case-sensitive and dropped it (no width).
+#[test]
+fn line_width_one_table_case() {
+    assert_eq!(styled(&[("column-rule", "THICK solid red")]).paint.col_rule_width, Some(5.0));
+    assert_eq!(styled(&[("column-rule-width", "Thin")]).paint.col_rule_width, Some(1.0));
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): a bogus width word is refused as before: no width, the style still lands.
+#[test]
+fn line_width_one_table_bogus() {
+    let s = styled(&[("column-rule", "bogus solid")]);
+    assert_eq!(s.paint.col_rule_width, None);
+    assert_eq!(s.paint.col_rule_style, styled(&[("column-rule-style", "solid")]).paint.col_rule_style);
+    assert_eq!(styled(&[("column-rule-width", "bogus")]).paint.col_rule_width, None);
+}
+
+/// AETHERCSSLINEWIDTHONETABLE (SR1084): `medium` has ONE home: the alias, the keyword table, border_medium (reached
+/// through `border-style: solid` alone, whose sides are created at medium) and the SR832 `border-width: initial` row
+/// all read LINE_WIDTH_MEDIUM.
+#[test]
+fn line_width_one_table_medium_one_home() {
+    assert_eq!(OUTLINE_MEDIUM, LINE_WIDTH_MEDIUM);
+    assert_eq!(outline_width_keyword("medium"), Some(LINE_WIDTH_MEDIUM));
+    let created = styled(&[("border-style", "solid")]).paint.border;
+    assert_eq!(created, Some([Some((LINE_WIDTH_MEDIUM, STORED_GREY)); 4]), "border_medium");
+    let initial = styled(&[("border-width", "initial"), ("border-style", "solid")]).paint.border;
+    assert_eq!(initial, Some([Some((LINE_WIDTH_MEDIUM, STORED_GREY)); 4]), "the SR832 initial row");
+}
