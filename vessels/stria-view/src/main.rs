@@ -78,7 +78,7 @@ fn cli() -> Cli {
             "--labels" => c.labels = true,
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
-            "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
+            "--mute" => c.mute = true, "--paint-ms" => {} // NLEPLAYAUDIO (SR676): the window plays no sound
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -240,7 +240,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     };
     let mut presses = Vec::new();
     let mut errors = drive_on(&mut face, c.script.as_deref().unwrap_or(""), surfaces, &mut presses);
-    let blits = face.frames();
+    let t0 = std::time::Instant::now(); let blits = face.frames(); let paint = paint_ms_json(paint_ms_on(), t0.elapsed()); // STRIAPERFPAINTBUDGET (SR890): the wall time of the one repaint `serve` pays (file tail)
     let fnvs = blits_json(c, &blits);
     let Some(SMessage::SurfaceBlit { width, height, pixels, .. }) = blits.into_iter().last() else { return 1 };
     if let Some(e) = face.last_error.take() {
@@ -258,7 +258,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face) + &color_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint; // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -1471,5 +1471,95 @@ mod striameterclipverb_tests {
         assert_eq!((id.as_str(), label.as_str()), ("meters-reset", "Reset Meters"));
         let SMessage::Input { target, text } = action else { panic!("not an Input") };
         assert_eq!((target.as_str(), text.as_str()), (SURFACE, "meters-reset"));
+    }
+}
+
+// ---- STRIAPERFPAINTBUDGET (LEDGER SR890): the witness's paint time and the 60-clip budget (named tail block) ----
+// `--paint-ms` adds `,"paint_ms":<ms>` at the line's end: the wall time of the witness's ONE `Face::frames` (one
+// `paint_role` unsplit, the preview's and the tracks' with `--split`), which is exactly what `serve` pays per repaint. Off by
+// default: a wall time differs run to run and the default line stays byte-identical. The flag is read from the arguments
+// (no `Cli` field: the tests' two `Cli` literals stay as they are). Owed (handlers.md NLE5b row): NLE-PERF-PREVIEW-CACHE,
+// NLE-PERF-PREVIEW-SCALE, NLE-PERF-CANVAS-FILL, NLE-PERF-LABEL-SHAPE, NLE-PERF-ROLE-CULL, NLE-PERF-MESSAGE, NLE-PERF-HELP,
+// NLE-PERF-DRAG-SHOWN, NLE-PERF-DAMAGE; NLE-PERF-PIN-REALMEDIA, NLE-PERF-PIN-NUMBER.
+
+/// `--paint-ms` was given (`cli` accepts it and keeps no field for it).
+fn paint_ms_on() -> bool {
+    std::env::args().skip(1).any(|a| a == "--paint-ms")
+}
+
+/// The witness's `"paint_ms"` field: `d` in milliseconds to three decimals when `on`, else nothing (the default line).
+fn paint_ms_json(on: bool, d: std::time::Duration) -> String {
+    if on { format!(",\"paint_ms\":{:.3}", d.as_secs_f64() * 1000.0) } else { String::new() }
+}
+
+#[cfg(test)]
+mod striaperfpaintbudget_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use timeline_core::{Clip, Kind};
+
+    /// The ceiling the test asserts (ms, median): generous, a debug build on a shared loaded bench. The 8 ms pin of the
+    /// backlog entry is a release-build number the seat sets once it has run this (NLE-PERF-PIN-NUMBER).
+    const PAINT_CEILING_MS: f64 = 250.0;
+
+    /// 60 clips on one page at the default zoom: V1 + A1, 30 clips each of 8 ticks back to back (240 ticks = 1920 px at
+    /// 8 px per tick), reels A / B alternating, `src_in` (i % 5) * 8 inside 50-frame synth sources (NLE1's, `synth_fixture`'s shape).
+    fn sixty_clips() -> (Timeline, Sources) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = (0..30i64).map(|i| Clip::new(if i % 2 == 0 { a } else { b }, (i % 5) * 8, (i % 5) * 8 + 8, i * 8)).collect();
+        }
+        let mut src = Sources::new(&tl);
+        for (id, base) in [(a, 0u32), (b, 1000)] {
+            src.add(id, stria::nle::synth_source(base, 50, 25)).expect("synthetic source opens");
+        }
+        (tl, src)
+    }
+
+    /// One warm `frames()`, then 20 timed: (min, median, max) in ms; every blit is the whole 1920x1200 canvas.
+    fn time_frames(face: &mut Face) -> (f64, f64, f64) {
+        assert_eq!(face.frames().len(), 1);
+        let mut ms: Vec<f64> = (0..20)
+            .map(|_| {
+                let t0 = Instant::now();
+                let blits = face.frames();
+                let d = t0.elapsed().as_secs_f64() * 1000.0;
+                assert!(matches!(blits.as_slice(), [SMessage::SurfaceBlit { width: 1920, height: 1200, .. }]));
+                d
+            })
+            .collect();
+        ms.sort_by(|x, y| x.total_cmp(y));
+        (ms[0], ms[ms.len() / 2], ms[ms.len() - 1])
+    }
+
+    /// STRIAPERFPAINTBUDGET M3: the field is absent unless asked for, and reads milliseconds to three decimals.
+    #[test]
+    fn striaperfpaintbudget_field_off_by_default() {
+        assert_eq!(paint_ms_json(false, Duration::from_micros(1234)), "");
+        assert_eq!(paint_ms_json(true, Duration::from_micros(1234)), r#","paint_ms":1.234"#);
+    }
+
+    /// STRIAPERFPAINTBUDGET M3: a 60-clip timeline at 1920x1200 with a clip selected (handles, the reel message line) and the
+    /// playhead mid-page (a preview decodes): the paint PRINTED with labels, without, and with the keys help; only the
+    /// generous ceiling is asserted (the 64x48 synth reels under-measure the preview: NLE-PERF-PIN-REALMEDIA).
+    #[test]
+    fn striaperfpaintbudget_sixty_clips_paint() {
+        let mut runs = Vec::new();
+        for (name, labels, script) in [("labels", true, "at:120:0"), ("nolabels", false, "at:120:0"), ("help", true, "at:120:0,help")] {
+            let (tl, src) = sixty_clips();
+            let mut face = Face::new(EditorState::new(tl), src, (1920, 1200), PixelOrder::Rgba, labels);
+            let errors = drive(&mut face, script);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(face.state.timeline.tracks.iter().map(|t| t.clips.len()).sum::<usize>(), 60);
+            assert!(face.state.selected().is_some(), "at:120:0 selects a clip");
+            let (min, med, max) = time_frames(&mut face);
+            assert!(med < PAINT_CEILING_MS, "{name}: median paint {med:.3} ms over the {} ms ceiling", PAINT_CEILING_MS);
+            runs.push(format!("{name} {min:.3}/{med:.3}/{max:.3}"));
+        }
+        println!("striaperfpaintbudget witness: 60 clips 1920x1200 paint_ms min/median/max {}", runs.join(" "));
     }
 }
