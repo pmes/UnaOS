@@ -3551,3 +3551,84 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIALOUDNESSREADOUT (LEDGER SR866): the export range's integrated loudness on the message line (named tail block) ----
+
+/// The PCM `render` sends, collected whole (the test's own sink: the road the measure takes must be this one).
+#[derive(Default)]
+struct StriaLoudnessPcm {
+    pcm: Vec<f32>,
+    fmt: Option<(u32, u16)>,
+}
+
+impl stria::nle::RenderSink for StriaLoudnessPcm {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {}
+    fn pcm(&mut self, _out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        self.fmt = Some((rate, channels));
+        self.pcm.extend_from_slice(interleaved);
+    }
+}
+
+/// Rule: `nle::loudness` is BS.1770's pure fn over exactly the PCM `render` mixes for the range; the face's `loudness`
+/// word puts that number on the message line off its thread, with no undo step and the document clean.
+#[test]
+fn strialoudnessreadout_face_line_is_the_render_measure() {
+    let (tl, src) = synth_fixture();
+    let mut sink = StriaLoudnessPcm::default();
+    stria::nle::render(&tl, 0..tl.end(), &src, &mut sink).unwrap();
+    let (rate, ch) = sink.fmt.expect("the fixture has audio");
+    let want = gneiss_pal::dsp::audio::meter::integrated_lufs(&sink.pcm, ch as usize, rate);
+    let got = stria::nle::loudness(&tl, 0..tl.end(), &src).unwrap();
+    assert_eq!(got, Some(want));
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let undo = face.state.undo_depth();
+    assert!(VERBS.contains(&"loudness"));
+    assert!(face.verb("loudness"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.loudness_pending());
+    assert!(face.wait_loudness());
+    let line = stria::nle_face::loudness_line(&Ok(Some(want)), &None);
+    assert_eq!(face.last_error.take(), Some(line.clone()));
+    assert!(!face.loudness_pending());
+    assert_eq!((face.state.undo_depth(), face.dirty(), &face.state.timeline), (undo, false, &tl));
+    println!("strialoudnessreadout: whole timeline -> {line}");
+}
+
+/// Rule: with both marks set the measure takes `in..out` only and names its ticks; marks past the end are refused by
+/// `range_check`'s name (no thread); a second word while one runs is `busy`.
+#[test]
+fn strialoudnessreadout_marked_range_and_refusals() {
+    let (tl, src) = synth_fixture();
+    let (tl2, src2) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.set_marks((Some(5), Some(30))).unwrap();
+    let want = stria::nle::loudness(&tl2, 5..30, &src2);
+    assert!(face.verb("loudness"));
+    assert!(face.verb("loudness"));
+    assert_eq!(face.last_error.take().as_deref(), Some("loudness: busy"));
+    assert!(face.wait_loudness());
+    let line = face.last_error.take().expect("the line");
+    assert_eq!(line, stria::nle_face::loudness_line(&want, &Some(5..30)));
+    assert!(line.ends_with(" ticks 5..30"), "{line}");
+    let end = face.state.timeline.end();
+    face.state.set_marks((Some(end + 5), Some(end + 9))).unwrap();
+    assert!(face.verb("loudness"));
+    assert!(!face.loudness_pending(), "a refused range starts no thread");
+    assert_eq!(face.last_error.take(), Some(format!("loudness: the marks {}..{} are past the timeline's end {end}", end + 5, end + 9)));
+    println!("strialoudnessreadout: {line}");
+}
+
+/// Rule: a range that sends no PCM (a video-only timeline) reads `no audio`; silence reads the gate's floor by name.
+#[test]
+fn strialoudnessreadout_no_audio_and_the_floor() {
+    let (mut tl, src) = synth_fixture();
+    tl.tracks.retain(|t| t.kind == timeline_core::Kind::Video);
+    assert_eq!(stria::nle::loudness(&tl, 0..tl.end(), &src).unwrap(), None);
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("loudness"));
+    assert!(face.wait_loudness());
+    assert_eq!(face.last_error.take().as_deref(), Some("loudness: no audio in the range"));
+    let floor = stria::nle_face::loudness_line(&Ok(Some(gneiss_pal::dsp::audio::meter::LUFS_FLOOR)), &None);
+    assert_eq!(floor, "loudness: -70.0 LUFS integrated (nothing above the -70 LUFS gate)");
+    println!("strialoudnessreadout: video-only -> no audio; {floor}");
+}

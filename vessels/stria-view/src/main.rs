@@ -516,7 +516,7 @@ fn transport() -> TetraNode {
         button("export", "Export"), // NLEFACEEXPORT (SR694): exports beside the document (`<stem>-export/`, H.264), off the face's thread
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
-        button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), button("loudness", "LUFS"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +856,32 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIALOUDNESSREADOUT (LEDGER SR866): the LUFS transport button — the `loudness` word on the bar (named tail block) ----
+#[cfg(test)]
+mod strialoudnessreadout_tests {
+    use super::*;
+
+    /// STRIALOUDNESSREADOUT M3: the `loudness` button (`LUFS`) sits immediately before `help`; driving its word (the
+    /// `--do` road the click takes) starts the measure with no error, and its end puts the face's own line on the message line.
+    #[test]
+    fn strialoudnessreadout_button_before_help_measures() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("loudness", "LUFS"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "loudness"));
+        let (tl, src) = nle_face::synth_fixture();
+        let (tl2, src2) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(f.loudness_pending());
+        assert!(f.wait_loudness());
+        let want = nle_face::loudness_line(&stria::nle::loudness(&tl2, 0..tl2.end(), &src2), &None);
+        assert_eq!(f.last_error.take(), Some(want.clone()));
+        println!("strialoudnessreadout witness: button {id} {label:?} -> {want}");
     }
 }
