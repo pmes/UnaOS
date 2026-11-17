@@ -7632,3 +7632,80 @@ fn striapositionscale_face_pip_is_one_undo_step() {
     assert_eq!(face.last_error.take(), Some(format!("pip: {}", EditError::Kind)));
     assert_eq!(face.state.undo_depth(), 1);
 }
+
+// ---- STRIATCSET (LEDGER SR908): `tc <unit>` sets SR872's readout directly; `t` keys `tc` (named tail block) ----
+
+/// `tc timecode|frames|seconds|off` sets the unit exactly, from off and from a set unit; bare `tc` still cycles from the set
+/// unit; a view word: no undo step, not dirty, the timeline and playhead untouched, no message.
+#[test]
+fn striatcset_tc_sets_each_unit_as_a_view_word() {
+    use stria::nle_face::TcUnit;
+    let mut face = striatimecodedisplay_face(false);
+    face.state.seek(12);
+    let (tl, undo) = (face.state.timeline.clone(), face.state.undo_depth());
+    let mut seen = Vec::new();
+    for v in ["tc frames", "tc seconds", "tc timecode", "tc off", "tc seconds", "tc frames"] {
+        assert!(face.verb(v), "{v}");
+        seen.push(face.tc_unit());
+    }
+    assert_eq!(seen, vec![Some(TcUnit::Frames), Some(TcUnit::Seconds), Some(TcUnit::Timecode), None, Some(TcUnit::Seconds), Some(TcUnit::Frames)]);
+    assert_eq!(face.tc_readout().as_deref(), Some("12"));
+    assert!(face.verb("tc"));
+    assert_eq!(face.tc_unit(), Some(TcUnit::Seconds), "bare tc cycles on from the set unit");
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.playhead), (undo, false, 12));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striatcset: tc <unit> {seen:?} undo={undo} dirty=false");
+}
+
+/// An unknown unit or an extra argument keeps the unit and names `tc` in the message; `tcx` is not a face word.
+#[test]
+fn striatcset_tc_refuses_an_unknown_unit() {
+    use stria::nle_face::TcUnit;
+    let mut face = striatimecodedisplay_face(false);
+    assert!(face.verb("tc seconds"));
+    for v in ["tc fps", "tc frames x"] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.tc_unit(), Some(TcUnit::Seconds), "{v}");
+        let e = face.last_error.take().expect("a refusal");
+        assert!(e.starts_with("tc: unknown unit"), "{e}");
+    }
+    assert!(!face.verb("tcx"));
+    assert_eq!((face.tc_unit(), face.state.undo_depth(), face.dirty()), (Some(TcUnit::Seconds), 0, false));
+    println!("striatcset: tc fps / tc frames x refused, tcx not a word");
+}
+
+/// `t` (text) cycles the readout through `tc`; KEYS has the row, the help names `t` with a phrase; while the help shows, `t`
+/// only dismisses it (the unit unchanged).
+#[test]
+fn striatcset_t_key_cycles_and_help_names_it() {
+    use stria::nle_face::TcUnit;
+    assert!(KEYS.contains(&("t", "tc")));
+    let rows = help_rows();
+    let row = rows.iter().find(|r| r.0.split(" / ").any(|k| k == "t")).expect("a help row for t");
+    assert_eq!(row.1, help_phrase("tc"));
+    assert!(row.1 != "tc" && HELP.iter().any(|(a, _)| *a == "tc"));
+    let mut face = striatimecodedisplay_face(false);
+    assert!(nle5drangekeys_press(&mut face, "t"));
+    assert_eq!(face.tc_unit(), Some(TcUnit::Timecode));
+    assert!(nle5drangekeys_press(&mut face, "t"));
+    assert_eq!(face.tc_unit(), Some(TcUnit::Frames));
+    assert!(face.verb("help") && face.help_shown());
+    assert!(nle5drangekeys_press(&mut face, "t"));
+    assert_eq!((face.help_shown(), face.tc_unit()), (false, Some(TcUnit::Frames)), "dismissed, not applied");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striatcset: t -> timecode -> frames; help row {row:?}");
+}
+
+/// Labels on: `tc seconds` paints the readout, `tc off` paints byte-identical to the untouched face.
+#[test]
+fn striatcset_set_off_paint_is_byte_identical() {
+    let mut face = striatimecodedisplay_face(true);
+    let off = face.paint();
+    assert!(face.verb("tc seconds"));
+    let on = face.paint();
+    assert_ne!(on, off, "the readout shows");
+    assert!(face.verb("tc off"));
+    assert_eq!(face.paint(), off, "off: byte-identical");
+    println!("striatcset: tc seconds inks, tc off fnv {:016x}", stria::nle_face::fnv1a(&off));
+}
