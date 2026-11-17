@@ -13,7 +13,7 @@
 //! reconstruction byte for byte (SEI and filler skipped); (d) `hrd: true` without a bucket (constant QP: tests/rc.rs's pin, CRF)
 //! changes no byte. H264COREHRD (SR708): the SPS is read by h264_core's `ps::parse_sps` (`Sps::timing_info` / `nal_hrd`) and the
 //! SEIs by its decoder (`Decoder::take_hrd_notes`); no bit walker of its own. H264ENCHRDVBRKAT (SR1034): the VBR twins (e-h, the file tail) through
-//! the same replay, its cbr_flag 0 arm (arrival at the max rate stops while the CPB is full).
+//! the same replay, its cbr_flag 0 road (H264ENCHRDVBRONEROAD SR1105: Annex C's on-demand arrival, `vbr_road`, for the NAL and the VCL HRD alike).
 
 use h264_core::decoder::HrdKind;
 use h264_core::nal::{unescape, NAL_FILLER, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SPS};
@@ -140,15 +140,13 @@ fn bits(au: &Access) -> i128 {
 fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
     let (nut, ts, _) = sps.timing_info.expect("timing_info");
     let h = sps.nal_hrd.or(sps.vcl_hrd).expect("nal_hrd_parameters"); // the NAL HRD (Type II, every NAL unit), else the VCL HRD (Type I: VCL + filler, SR1060)
-    // cbr_flag 1: continuous arrival from t = 0 at BitRate; cbr_flag 0 (the VCL HRD, SR1060): on demand, `vbr_road` (C.1.2).
-    let cbr = h.cbr || sps.nal_hrd.is_none(); // H264ENCHRDVBRKAT (SR1034): the NAL HRD's cbr_flag 0 is the VBR replay (arrival at BitRate, the max, stops while the CPB is full: no overflow under VBR); the CBR arm unchanged, and the VCL-only replay (SR1060) keeps it before `vbr_road`
+    // cbr_flag 1: continuous arrival from t = 0 at BitRate; cbr_flag 0 (either HRD, SR1105): on demand, `vbr_road` (C.1.2).
     let (nut, ts, br, cpb) = (nut as i128, ts as i128, h.bit_rate as i128, h.cpb_size as i128);
     let notes = seis(aus);
     let unit = 90_000 * ts;
     let tick = nut * 90_000;
     let (mut anchor, mut cum, mut fillers) = (None::<i128>, 0i128, 0usize); let mut road: Vec<(i128, i128, i128)> = Vec::new();
     let (mut margin, mut peak) = (i128::MAX, 0i128);
-    let (mut fill, mut last) = (0i128, 0i128); // SR1034: the VBR CPB fullness x unit after the last removal, and its time
     for (n, au) in aus.iter().enumerate() {
         let s = &notes[n];
         let (cpb_delay, _) = s.pt[0];
@@ -161,21 +159,17 @@ fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
             anchor = Some(t);
         }
         assert_eq!(t, aus_first(&notes, ts) + 2 * n as i128 * tick, "access unit {n}: removal times are one frame apart");
-        let before = if cbr { br * t - cum * unit } else { (fill + br * (t - last)).min(cpb * unit) }; // CPB fullness x unit just before the removal (bits arrived - bits removed)
+        let before = br * t - cum * unit; // CPB fullness x unit just before the removal (bits arrived - bits removed)
         let b = if sps.nal_hrd.is_some() { bits(au) } else { vcl_bits(au) }; cum += b; road.push((t, b, s.bp.first().map_or(road.last().map_or(0, |r| r.2), |&d| d as i128 * ts)));
-        let arrived = if cbr { br * t - cum * unit } else { before - b * unit }; // >= 0: all of the access unit has arrived
-        (fill, last) = (arrived, t); // SR1034
-        if let (false, Some(&d)) = (cbr, s.bp.first()) {
-            assert!(d as i128 * br * ts <= before, "access unit {n}: VBR initial_cpb_removal_delay {d} claims more than the CPB holds"); // SR1034: the delay is the fullness at the max rate (H264ENC-HRD-VBR-INITIAL-DELAY's rule)
-        }
+        let arrived = br * t - cum * unit; // >= 0: all of the access unit has arrived
         margin = margin.min(arrived / unit);
         peak = peak.max(before / unit);
         assert!(arrived >= 0, "access unit {n}: CPB underflow ({} bits short)", -arrived / unit);
         assert!(!h.cbr || before <= cpb * unit, "access unit {n}: CPB overflow ({} bits over {cpb})", (before - cpb * unit) / unit);
         fillers += au.nals.iter().filter(|x| x[0] & 0x1f == NAL_FILLER).count();
     }
-    // SR1060 fold: the NAL HRD's cbr_flag 0 keeps SR1034's inline VBR replay (its KATs pin that road); the VCL HRD alone takes `vbr_road` (C.1.2).
-    if h.cbr || sps.nal_hrd.is_some() { (fillers, margin, peak) } else { vbr_road(&road, br, cpb, unit, fillers) }
+    // H264ENCHRDVBRONEROAD (SR1105): ONE cbr_flag 0 road, `vbr_road` (C.1.2), for the NAL and the VCL HRD (SR1034's stop-when-full inline replay retired).
+    if h.cbr { (fillers, margin, peak) } else { vbr_road(&road, br, cpb, unit, fillers) }
 }
 
 fn aus_first(notes: &[Sei], ts: i128) -> i128 {
@@ -287,8 +281,8 @@ fn d_no_bucket_no_bytes_moved() {
 // ---- H264ENCHRDVBRKAT (LEDGER SR1034): VBR twins of the HRD KATs (named tail block) ----
 // `Config::hrd` under a VBR rate signals rc.rs's max bucket (`Rc::hrd_params`: BitRate = CpbSize = the max, cbr_flag 0) and each
 // buffering period's initial_cpb_removal_delay as the max bucket's fullness at the max rate (`Encoder::hrd_au`, x264's rule). The
-// twins replay it through `replay`'s cbr_flag 0 arm: bits arrive at the max rate and stop while the CPB is full, a picture never
-// leaves it short, and no delay claims more than the CPB holds.
+// twins replay it through `replay`'s cbr_flag 0 road (SR1105: `vbr_road`, Annex C's on-demand arrival, was SR1034's stop-when-full
+// bucket): a picture never leaves the CPB short, it never overflows, and no delay exceeds 90000 x CpbSize / BitRate (D.2.1).
 
 /// Encode `n` frames of tests/rc.rs's scene (the KATs above): `run_src` over [`scene`].
 fn run(cfg: Config, n: usize, decode: bool) -> Vec<Access> {
@@ -340,6 +334,7 @@ fn e_vbr_sps_signals_the_max_bucket() {
 
 #[test]
 fn f_vbr_cpb_replay_never_underflows() {
+    let mut peaks = Vec::new(); // H264ENCHRDVBRONEROAD (SR1105): the C.1.2 peak per bframes, pinned after the loop
     for bframes in [0u8, 2] {
         let aus = run(Config { bframes, ..vbr(600, 6) }, N, false);
         assert_eq!(aus.len(), N);
@@ -352,9 +347,10 @@ fn f_vbr_cpb_replay_never_underflows() {
         );
         println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
         assert_eq!(fillers, 0, "VBR pads nothing");
-        assert_eq!(peak, 600_000, "the CPB fills to CpbSize and stops (cbr_flag 0)");
+        assert!(peak <= 600_000, "C.3: the CPB within CpbSize (cbr_flag 0, on-demand arrival)"); peaks.push(peak); // SR1105: was `peak == 600_000` (SR1034's stop-when-full bucket)
         assert!(margin >= 0);
     }
+    assert_eq!(peaks, [92_304, 86_288], "SR1105: the C.1.2 on-demand peak for bframes 0 / 2 (was 600_000 on SR1034's stop-when-full bucket)"); // measured (SR1105 EXCEPTION run): the whole 12-picture stream (its total bits) is in the CPB before the first removal, the first initial delay (1 s) longer than the stream (0.4 s)
 }
 
 #[test]
@@ -410,12 +406,16 @@ fn vcl_bits(au: &Access) -> i128 {
 /// buffering period's initial_cpb_removal_delay) and arrives at BitRate. `road` holds (removal time, bits, initial delay) per
 /// access unit in `replay`'s time unit; times are scaled by BitRate (bits x unit). Asserts no underflow (each access unit has
 /// arrived by its removal) and no overflow (the fullness before each removal within CpbSize); returns (fillers, the smallest
-/// arrival margin in bits, the largest fullness before a removal).
+/// arrival margin in bits, the largest fullness before a removal). SR1105: t_ai(n) = Max(t_af(n - 1), t_ai,earliest(n)), t_af(n) =
+/// t_ai(n) + b(n) / BitRate; t_ai,earliest(n) = t_r,n(n) - (initial_cpb_removal_delay + initial_cpb_removal_delay_offset) / 90000 with
+/// the associated buffering period's values (no offset at a subsequent period's first access unit): the offset is 0 (`seis`), so
+/// both forms are the carried delay below; t_ai(0) = 0 (t0 is the first delay). D.2.1: each delay at most 90000 x CpbSize / BitRate.
 fn vbr_road(road: &[(i128, i128, i128)], br: i128, cpb: i128, unit: i128, fillers: usize) -> (usize, i128, i128) {
     let mut start = Vec::with_capacity(road.len());
     let mut end = i128::MIN;
     let (mut margin, mut peak) = (i128::MAX, 0i128);
     for (n, &(t, b, d)) in road.iter().enumerate() {
+        assert!(d * br <= cpb * unit, "access unit {n}: initial_cpb_removal_delay exceeds 90000 x CpbSize / BitRate (D.2.1)"); // H264ENCHRDVBRONEROAD (SR1105): SR1034's claims check, the spec's form
         let a = end.max((t - d) * br);
         end = a + b * unit;
         start.push(a);
@@ -629,4 +629,29 @@ fn j_vbr_row_qp_steps_are_bounded() {
     assert!(term.iter().any(|&d| d > 0), "the room term never fired at the knife edge");
     // Measured (SR1050): idle rows [16, 19 x 5] (row_qp's +3), knife rows [16, 22, 24, 25, 25, 25]; at the old rc.rs the term was all 0.
     assert_eq!(term, [0, 3, 5, 6, 6, 6], "the room term per macroblock row");
+}
+
+// ---- H264ENCHRDVBRONEROAD (LEDGER SR1105): one cbr_flag 0 road for the NAL and the VCL HRD (named tail block) ----
+// Annex C's on-demand arrival (C.1.2) is ONE model for cbr_flag 0 whichever HRD carries it: `replay` takes `vbr_road` for both. The
+// VBR stream signalled through the NAL HRD (Type II: every NAL unit) and the VCL HRD (Type I: VCL + filler) differs in its bit sets
+// (the SEI in every access unit, the IDRs' SPS / PPS), so the relation is pinned: t_af(n) is monotone non-decreasing in every b(j),
+// so the Type I set (fewer bits) never arrives later and its margin is at least the Type II one. Peak is not monotone in the bits
+// (earlier starts pull later access units in): both are printed and held within CpbSize by `vbr_road`.
+
+#[test]
+fn o_vbr_one_road_nal_and_vcl_agree() {
+    let aus = run(Config { hrd_vcl: true, ..vbr(600, 6) }, N, false);
+    assert_eq!(aus.len(), N);
+    let v = sps_of(&aus[0].nals[0]);
+    let nal = v.nal_hrd.expect("nal_hrd_parameters");
+    assert!(!nal.cbr, "VBR: cbr_flag 0");
+    assert_eq!(v.vcl_hrd, Some(nal), "the VCL table is the NAL table (both cbr_flag 0)");
+    let extra: Vec<i128> = aus.iter().map(|a| bits(a) - vcl_bits(a)).collect();
+    assert!(extra.iter().all(|&e| e > 0), "every access unit carries bits outside the Type I set (SEI, SPS / PPS): {extra:?}");
+    let (f2, m2, p2) = replay(&aus, &v);
+    let (f1, m1, p1) = replay(&aus, &Sps { nal_hrd: None, ..v.clone() });
+    println!("hrd vbr one road: type II (nal) margin {m2} peak {p2}; type I (vcl) margin {m1} peak {p1} / {} bits; non-VCL bits per access unit {extra:?}", nal.cpb_size);
+    assert_eq!((f1, f2), (0, 0), "VBR pads nothing");
+    assert!(m1 >= m2, "the Type I set is a subset on the same road: its margin {m1} below the Type II one {m2}");
+    assert!(m2 >= 0 && p1 <= nal.cpb_size as i128 && p2 <= nal.cpb_size as i128);
 }
