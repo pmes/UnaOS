@@ -725,7 +725,7 @@ impl EditorState {
         Some(self.gain_word(word, arg, extra.is_some()))
     }
     fn gain_word(&mut self, word: &str, arg: Option<&str>, extra: bool) -> Result<(), EditError> {
-        let c = self.selected().ok_or(EditError::NoClip)?;
+        self.selected().ok_or(EditError::NoClip)?; // STRIAFADESET (SR906): the NoClip check stays; every word now reads the set's own clips (file tail)
         let refused = if word.starts_with("gain") { EditError::Gain } else { EditError::Fade };
         if extra {
             return Err(refused);
@@ -740,14 +740,14 @@ impl EditorState {
                 Some(cdb) => self.gain_set(|_| cdb), // STRIAMULTISELECT (SR853): the whole selection (file tail)
                 None => Err(refused),
             },
-            ("fade-in", None) => self.set_selected_fades(ph - c.at, c.fade_out),
-            ("fade-out", None) => self.set_selected_fades(c.fade_in, c.end() - ph),
+            ("fade-in", None) => self.fades_set(|k| (k.at..=k.end()).contains(&ph).then(|| (ph - k.at, k.fade_out))), // STRIAFADESET (SR906): every clip of the set the playhead is on; one off it is skipped, none on refused (file tail)
+            ("fade-out", None) => self.fades_set(|k| (k.at..=k.end()).contains(&ph).then(|| (k.fade_in, k.end() - ph))), // STRIAFADESET (SR906): the set, as fade-in (file tail)
             ("fade-in", Some(n)) => match ticks_of(n, fps) {
-                Some(n) => self.set_selected_fades(n, c.fade_out),
+                Some(n) => self.fades_set(|k| Some((n, k.fade_out))), // STRIAFADESET (SR906): the whole selection, all-or-nothing (file tail)
                 None => Err(refused),
             },
             ("fade-out", Some(n)) => match ticks_of(n, fps) {
-                Some(n) => self.set_selected_fades(c.fade_in, n),
+                Some(n) => self.fades_set(|k| Some((k.fade_in, n))), // STRIAFADESET (SR906): the whole selection, all-or-nothing (file tail)
                 None => Err(refused),
             },
             _ => Err(refused),
@@ -2397,5 +2397,111 @@ impl EditorState {
             _ => return Some(Err(EditError::Xform)),
         };
         Some(self.set_xform(xf))
+    }
+}
+
+// ---- STRIAFADESET (LEDGER SR906): fades over the whole selection (named tail block) ----
+// SR838's `fade-in` / `fade-out` words act on every clip of NLE2c's `set`, in the shape of SR853's `gain_set`:
+// [`EditorState::fades_set`] folds the existing per-clip `Timeline::set_fades` (its own `validate`) over the set and lands
+// ONE `commit`; any clip refused (`EditError::Fade`) refuses the whole edit. The bare forms are playhead-relative PER CLIP:
+// a clip the playhead is on (`at <= playhead <= end`) fades to it, a clip the playhead is not on is SKIPPED, and a word
+// with the playhead on NO clip of the set is refused `EditError::Fade` (so a one-clip set behaves as SR838's did).
+impl EditorState {
+    /// Every selected clip's fades set to `fades(the clip)` (`None` skips that clip). ONE commit; refused whole; no clip
+    /// taken refuses `EditError::Fade`; no change commits nothing.
+    pub fn fades_set(&mut self, fades: impl Fn(Clip) -> Option<(i64, i64)>) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let mut tl = self.timeline.clone();
+        let (mut any, mut changed) = (false, false);
+        for &(t, i) in &self.set {
+            let c = tl.tracks.get(t).and_then(|tr| tr.clips.get(i)).copied().ok_or(EditError::NoClip)?;
+            let Some((fi, fo)) = fades(c) else { continue };
+            any = true;
+            if (fi, fo) != (c.fade_in, c.fade_out) {
+                tl = tl.set_fades(t, i, fi, fo)?;
+                changed = true;
+            }
+        }
+        if !any {
+            return Err(EditError::Fade);
+        }
+        if changed {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod striafadeset_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10; A1: A 0..20 at 0. The set: V1's B (primary, 10 ticks at 10) and A1's clip (20 at 0).
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(1, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        st
+    }
+    fn fades(st: &EditorState) -> [(i64, i64); 3] {
+        let f = |t: usize, i: usize| (st.timeline.tracks[t].clips[i].fade_in, st.timeline.tracks[t].clips[i].fade_out);
+        [f(0, 0), f(0, 1), f(1, 0)]
+    }
+
+    #[test]
+    fn striafadeset_numeric_fades_every_clip_of_the_set_one_commit() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("fade-in 4"), Some(Ok(())));
+        assert_eq!(fades(&st), [(0, 0), (4, 0), (4, 0)], "both selected clips; the unselected clip stays");
+        assert_eq!(st.undo_depth(), 1, "ONE commit for the whole set");
+        assert_eq!(st.verb("fade-out 3"), Some(Ok(())));
+        assert_eq!(fades(&st), [(0, 0), (4, 3), (4, 3)], "each keeps its own fade-in");
+        assert_eq!(st.undo_depth(), 2);
+        assert_eq!(st.verb("fade-out 3"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 2, "the same fades commit nothing");
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), alloc::vec![(0, 1), (1, 0)]));
+        assert_eq!(edl::parse(&edl::write(&st.timeline, "T").unwrap(), 25).unwrap(), st.timeline, "the EDL carries every fade");
+        assert!(st.undo() && st.undo());
+        assert_eq!(st.timeline, tl0, "one undo per word");
+    }
+
+    #[test]
+    fn striafadeset_numeric_fade_refused_whole() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("fade-in 15"), Some(Err(EditError::Fade)), "longer than B (10 ticks), not than A1's clip (20)");
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0), "nothing of the set changed");
+    }
+
+    #[test]
+    fn striafadeset_bare_fade_skips_clips_off_the_playhead() {
+        let mut st = state();
+        st.seek(15); // on B [10,20] and on A1's clip [0,20]
+        assert_eq!(st.verb("fade-in"), Some(Ok(())));
+        assert_eq!(fades(&st), [(0, 0), (5, 0), (15, 0)], "each clip fades to the playhead from its own start");
+        assert_eq!(st.undo_depth(), 1);
+        st.seek(5); // on A1's clip only: B is skipped
+        assert_eq!(st.verb("fade-out"), Some(Err(EditError::Fade)), "A1's clip would be 15 + 15 > 20: refused whole");
+        assert_eq!((fades(&st), st.undo_depth()), ([(0, 0), (5, 0), (15, 0)], 1));
+        assert_eq!(st.verb("fade-in 0"), Some(Ok(())));
+        assert_eq!(st.verb("fade-out"), Some(Ok(())));
+        assert_eq!(fades(&st), [(0, 0), (0, 0), (0, 15)], "B, off the playhead, skipped");
+        assert_eq!(st.undo_depth(), 3);
+        st.select(0, 0).unwrap(); // the set is V1's A [0,10] alone
+        st.seek(15); // on no clip of the set
+        assert_eq!(st.verb("fade-in"), Some(Err(EditError::Fade)), "a one-clip set off the playhead: refused, as SR838's");
+        assert_eq!(st.undo_depth(), 3, "refused: no commit");
+        st.deselect();
+        assert_eq!(st.verb("fade-in"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.fades_set(|k| Some((k.fade_in, k.fade_out))), Err(EditError::NoClip));
     }
 }
