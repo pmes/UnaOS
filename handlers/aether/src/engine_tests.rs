@@ -1610,7 +1610,7 @@ mod tests {
     }
 
     /// A later, more specific `opacity: 1` un-hides what `opacity: 0` hid,
-    /// and `border-color: transparent` drops the UA control stroke.
+    /// and `border-color: transparent` drops the UA control stroke (SR1112: the sides kept at alpha 0, painting nothing).
     #[test]
     fn test_opacity_and_transparent_border_override() {
         let html = r#"<html><body class="on"><button class="b" id="q">go</button></body></html>"#;
@@ -1630,7 +1630,8 @@ mod tests {
             })
             .expect("button has a paint entry");
         assert_eq!(p.hidden, Some(false), "opacity:1 must win over an earlier opacity:0");
-        assert_eq!(p.border, Some([None; 4]), "transparent border-color = no stroke");
+        assert_eq!(p.border, Some([Some((1.0, (0, 0, 0))); 4]), "SR1112 (flipped in place; was Some([None; 4])): the sides are kept, black RGB");
+        assert_eq!(p.border_alpha, Some([Some(0.0); 4]), "SR1112: transparent border-color = alpha 0 on every side, no stroke (the UA frame stays off: spec.border is Some)");
     }
 
     /// float:left/right sizes to content and hugs its edge (approximation).
@@ -8955,6 +8956,40 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "cn", "lineHeight"), "normal");
     }
 
+    // ---- AETHERCSSBORDERCOLORONEROAD (LEDGER SR1098): border-color takes ONE road; a colour creates no side (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): two 40x20 boxes, rows 12px apart, under a green body ink: `#oa` `border: 2px
+    /// solid; border-top-style: none; border-color: red`; `#ob` `border-top-style: solid; border-color: red`.
+    fn border_color_one_road_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="oa" style="width:40px;height:20px;border:2px solid;border-top-style:none;border-color:red"></div>
+            <div id="ob" style="width:40px;height:20px;border-top-style:solid;border-color:red"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §4.3 a colour creates no side: `#oa` paints no top edge
+    /// (before SR1098 the one-value road re-created a 2px red top), its left edge red (armed); `#ob` paints its top red
+    /// (armed) and no other edge (before SR1098 a fabricated 3px red frame on the three styleless sides).
+    #[test]
+    fn border_color_one_road_paints() {
+        let mut e = border_color_one_road_engine();
+        let a = border_side_color_edges(&mut e, "oa");
+        assert!(!css_wide_red(a[0]), "#oa: no top edge: {:?}", a[0]);
+        assert!(css_wide_red(a[3]), "armed: #oa's left edge is red: {:?}", a[3]);
+        let b = border_side_color_edges(&mut e, "ob");
+        assert!(css_wide_red(b[0]), "armed: #ob's top is red: {:?}", b[0]);
+        for (i, c) in b.iter().enumerate().skip(1) {
+            assert!(!css_wide_red(*c), "#ob: side {i} paints no red: {c:?}");
+        }
+    }
+
     // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
 
     /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a
@@ -9552,5 +9587,134 @@ b</div>
             }
         }
         assert_eq!(font_shorthand_cs(&mut e, "bs", "borderLeftColor"), "rgb(0, 0, 255)");
+    }
+
+    // ---- AETHERCSSSTICKYEMINSETRELATIVE (LEDGER SR1130): a sticky box's font-relative inset stays the sticky constraint on the re-resolution (named tail block) ----
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): 400x300, 20px-tall boxes in flow from y 0: `#c` a control, `#a` sticky
+    /// `top: 1em`, `#b` sticky `top: 16px`, a 20px-font wrapper holding `#r` relative `top: 1em`, `#d` a red 20px-font
+    /// sticky `top: 1em`, then a 2000px spacer.
+    fn sticky_em_inset_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .h { height: 20px }
+            </style></head><body style="margin:0">
+            <div id="c" class="h"></div>
+            <div id="a" class="h" style="position:sticky;top:1em"></div>
+            <div id="b" class="h" style="position:sticky;top:16px"></div>
+            <div style="font-size:20px"><div id="r" class="h" style="position:relative;top:1em"></div></div>
+            <div id="d" class="h" style="font-size:20px;position:sticky;top:1em;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): unscrolled, each sticky box sits at its normal-flow y (css-position-3
+    /// §3.4): `#a` at 20 like the px-inset `#b` at 40 and the control `#c` at 0; `#d` at 80. Before SR1130 the
+    /// font-relative re-resolution folded `top: 1em` into taffy as a relative offset (`#a` 36, `#d` 100).
+    #[test]
+    fn sticky_em_inset_normal_flow() {
+        let mut e = sticky_em_inset_engine();
+        let top = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).1;
+        assert_eq!(top(&mut e, "c"), 0.0, "#c: the control");
+        assert_eq!(top(&mut e, "a"), 20.0, "#a: sticky top: 1em sits at its normal-flow y (armed: 36 before SR1130)");
+        assert_eq!(top(&mut e, "b"), 40.0, "#b: sticky top: 16px sits at its normal-flow y");
+        assert_eq!(top(&mut e, "d"), 80.0, "#d: sticky top: 1em at 20px sits at its normal-flow y (armed: 100 before SR1130)");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): a relative box's font-relative inset still offsets it, at its own
+    /// font: `#r` normal y 60 + 1em at 20px = 80 (the re-resolution's fold for a kind that is not sticky, unchanged).
+    #[test]
+    fn sticky_em_inset_relative_unchanged() {
+        let mut e = sticky_em_inset_engine();
+        assert_eq!(imgalt_rect(&mut e, "r").1, 80.0, "#r: relative top: 1em at 20px offsets 20");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): scrolled 400px, the red `#d` (document y 80) holds at its inset, 1em of
+    /// its own 20px font: rows 20..39 red, rows 19 and 40 not (`inset_px` is re-resolved inside the re-application). The
+    /// scroll is a full viewport or more so the frame repaints whole: a shorter scroll blits the surface and repaints
+    /// only the exposed strip, leaving a stuck box unpainted (owed AETHER-CSS-STICKY-SCROLL-BLIT-DAMAGE).
+    #[test]
+    fn sticky_em_inset_sticks_at_own_font() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d: row 20 is its first row (stuck at 1em = 20px)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "#d: row 39 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
+        assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
+    }
+
+    // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): one 40x20 box per row under a green parent: `#ta` `border: 2px solid
+    /// transparent`, `#tb` its borderless twin, `#td` `border: 2px solid red; border-color: transparent`, and `#th` the
+    /// reserve-space idiom: a transparent frame that `:hover` colours red.
+    fn border_transparent_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div div { width: 40px; height: 20px; margin: 0 0 12px }
+            .f { border: 2px solid; border-color: transparent }
+            .f:hover { border-color: red }
+            </style></head><body style="margin:0">
+            <div style="background:rgb(0, 160, 0);padding:8px">
+            <div id="ta" style="border:2px solid transparent"></div>
+            <div id="tb"></div>
+            <div id="td" style="border:2px solid red;border-color:transparent"></div>
+            <div id="th" class="f"></div>
+            </div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn border_transparent_not_green(c: (u8, u8, u8)) -> bool {
+        !css_wide_green(c)
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border: 2px solid transparent` reserves its 2px (a 44x24 border box)
+    /// and paints nothing over the green parent (before SR1112 a grey 2px frame: the shorthand read no colour); the
+    /// borderless twin is 40x20.
+    #[test]
+    fn border_transparent_shorthand_reserves_and_paints_nothing() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "ta");
+        assert_eq!((w, h), (44.0, 24.0), "#ta: the transparent 2px sides size the box");
+        assert_eq!(css_wide_color_ink(&mut e, "ta", border_transparent_not_green), 0, "#ta: no ink over the green parent");
+        let (_, _, w, h) = imgalt_rect(&mut e, "tb");
+        assert_eq!((w, h), (40.0, 20.0), "#tb: the borderless twin");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-color: transparent` over `border: 2px solid red` keeps the
+    /// sides (44x24; before SR1112 the sides were dropped and the box was 40x20) and paints no red.
+    #[test]
+    fn border_transparent_color_keeps_box() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "td");
+        assert_eq!((w, h), (44.0, 24.0), "#td: border-color: transparent keeps the 2px sides");
+        assert_eq!(css_wide_color_ink(&mut e, "td", css_wide_red), 0, "#td: paints no red");
+        assert_eq!(css_wide_color_ink(&mut e, "td", border_transparent_not_green), 0, "#td: paints nothing");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the reserve-space idiom: `#th`'s transparent frame is 44x24 before and
+    /// under the pointer, so `:hover { border-color: red }` paints red without a layout shift (before SR1112 the frame
+    /// was dropped: 40x20 and no red on hover).
+    #[test]
+    fn border_transparent_hover_no_shift() {
+        let mut e = border_transparent_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "th");
+        assert_eq!((w, h), (44.0, 24.0), "#th: the transparent frame reserves its space");
+        assert_eq!(css_wide_color_ink(&mut e, "th", css_wide_red), 0, "#th: no red before hover");
+        e.handle_event(crate::api::events::Event::MouseMove(l + w / 2.0, t + h / 2.0));
+        e.render_frame();
+        let (_, _, w2, h2) = imgalt_rect(&mut e, "th");
+        assert_eq!((w2, h2), (44.0, 24.0), "#th: hover does not shift the box");
+        assert!(css_wide_color_ink(&mut e, "th", css_wide_red) > 0, "#th: the hover colour paints the reserved frame");
     }
 }

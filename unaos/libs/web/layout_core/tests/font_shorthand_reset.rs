@@ -476,7 +476,7 @@ fn currentcolorrest_border_marker() {
     assert_eq!(cc(&[("border", "2px solid blue"), ("border-left", "2px solid currentcolor")]), 8, "the left bit only");
     assert_eq!(cc(&[("border", "2px solid currentcolor"), ("border-top", "2px solid blue")]), CC_SIDES & !1, "the top bit cleared");
     let s = styled(&[("border-color", "currentcolor")]);
-    assert_eq!(s.paint.currentcolor, CC_SIDES, "border-color: currentcolor");
+    assert_eq!(s.paint.currentcolor, 0, "SR1098 (re-pinned in place): an absent side carries no live bit; the pending entry carries the answer and creation sets the bit (was CC_SIDES)");
     assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some(((128, 128, 128), true)); 4])), "SR1058: no frame built (style none); the grey carrier pends with its currentcolor answer");
     assert_eq!(cc(&[("border-width", "3px")]), 0, "SR1069 (flipped in place): border-width alone creates no side, no bit (was CC_SIDES)");
     assert_eq!(cc(&[("border-width", "3px"), ("border-style", "solid")]), CC_SIDES, "SR1069: the style-created sides take currentcolor");
@@ -573,6 +573,7 @@ fn border_side_color_currentcolor_bits() {
 
 /// AETHERCSSBORDERSIDECOLOR (SR1014): a longhand on a borderless style creates no side (style none: no ink, as
 /// Chromium); `transparent` drops that side only; an invalid value or `inherit` leaves the side as it was.
+/// SR1112 (flipped in place): `transparent` keeps the side (black RGB) at alpha 0 on that side only.
 #[test]
 fn border_side_color_alone_transparent_invalid() {
     assert_eq!(styled(&[("border-top-color", "red")]).paint.border, None, "no border created");
@@ -581,16 +582,19 @@ fn border_side_color_alone_transparent_invalid() {
     assert_eq!(s.paint.border.expect("border")[3], None, "an absent side stays absent");
     let blue = side_color_rgb("blue");
     let s = styled(&[("border", "2px solid blue"), ("border-bottom-color", "transparent")]);
-    assert_eq!(s.paint.border, Some([Some((2.0, blue)), Some((2.0, blue)), None, Some((2.0, blue))]));
+    assert_eq!(s.paint.border, Some([Some((2.0, blue)), Some((2.0, blue)), Some((2.0, (0, 0, 0))), Some((2.0, blue))]), "SR1112: the bottom kept (was None)");
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0), Some(1.0), Some(0.0), Some(1.0)]), "SR1112: alpha 0 on the bottom only");
     let s = styled(&[("border", "2px solid blue"), ("border-right-color", "rgba(0, 0, 0, 0)")]);
-    assert_eq!(s.paint.border.expect("border")[1], None, "a zero-alpha rgba is transparent");
+    assert_eq!(s.paint.border.expect("border")[1], Some((2.0, (0, 0, 0))), "SR1112: a zero-alpha rgba is transparent: kept at alpha 0 (was None)");
+    assert_eq!(s.paint.border_alpha.expect("alpha")[1], Some(0.0));
     for bad in ["bogus", "inherit", "12px"] {
         let s = styled(&[("border", "2px solid blue"), ("border-left-color", bad)]);
         assert_eq!(s.paint.border, Some([Some((2.0, blue)); 4]), "{bad}: unchanged");
         assert_eq!(s.paint.currentcolor, 0, "{bad}: bits unchanged");
     }
     let s = styled(&[("border", "2px solid blue"), ("border-color", "transparent")]);
-    assert_eq!(s.paint.border, Some([None; 4]), "border-color: transparent unchanged by the lift");
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]), "SR1112: border-color: transparent keeps the sides (was Some([None; 4]))");
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "SR1112: alpha 0 on every side");
 }
 
 // ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color and the shorthand's colour word (named tail block) ----
