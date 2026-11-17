@@ -286,7 +286,7 @@ pub const COMB_IDX: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 
 
 /// HEVCREXT (SR334) 8.4.3 Table 8-3: the 4:2:2 IntraPredModeC from the mode X of Table 8-2 (ChromaArrayType 2).
 pub const CHROMA_422_MODE: [u8; 35] =
-    [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+    [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
 
 // HEVCREXTTOOLS (LEDGER SR345): the range extension's own syntax elements, in a SECOND table above `CTX_END` so the base
 // layout (and its contiguity KAT) stands; `cabac::initial_contexts` initialises both. sig_coeff_flag's transform_skip
