@@ -1741,7 +1741,7 @@ impl Face {
     pub fn save(&mut self) -> Result<usize, String> {
         let Some(path) = self.doc_path.clone() else { return Err("no document path".into()) };
         let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled");
-        let text = timeline_core::edl::write(&self.state.timeline, title).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = timeline_core::edl::write(&self.sources.seq_rated(&self.state.timeline), title).map_err(|e| format!("{}: {e}", path.display()))?; // STRIASEQRATEEDL (SR9053): each sequence reel's open rate rides the document (nle.rs `Sources::seq_rated`)
         std::fs::write(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
         self.clean = self.state.timeline.clone();
         Ok(text.len())

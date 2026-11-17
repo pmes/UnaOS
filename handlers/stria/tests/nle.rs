@@ -4302,3 +4302,122 @@ fn striaseqthree_jpeg_exif6_is_upright() {
     assert_eq!((sink.0[0].1, sink.0[0].2), (32, 48));
     println!("striaseqthree: photo-o6.jpg (48x32, EXIF 6) -> reel 32x48, frame 32x48");
 }
+
+// ---- STRIASEQRATEEDL (LEDGER SR9053): the sequence rate in the document, animated files inside a sequence (named tail block) ----
+// A sequence reel's rate rides the EDL as `* UNA SEQRATE <reel> <n>[/<d>]`: `Sources::new` reads it, `add_sequence` takes it
+// when the pattern carries no `@R` (the pattern's own `@R` wins), and the face's save writes each sequence reel's open rate.
+// An animated GIF / APNG / WebP inside a sequence shows its canvases in order across the ticks its file covers, the last held.
+
+/// A 1x1 two-frame GIF89a: frame 0 palette index 0 (white), frame 1 index 1 (black); no transparency, no disposal.
+fn striaseqrateedl_gif() -> Vec<u8> {
+    vec![
+        b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0, // screen 1x1, 2-colour table
+        0xFF, 0xFF, 0xFF, 0, 0, 0, // palette: white, black
+        0x21, 0xF9, 4, 0, 10, 0, 0, 0, // GCE delay 10 cs
+        0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 1, 0, // frame 0: clear, 0, end
+        0x21, 0xF9, 4, 0, 10, 0, 0, 0, // GCE delay 10 cs
+        0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4C, 1, 0, // frame 1: clear, 1, end
+        0x3B,
+    ]
+}
+
+/// Files `a_0001.gif` and `a_0002.gif`, each [`striaseqrateedl_gif`]; returns the `a_%04d.gif` pattern.
+fn striaseqrateedl_gif_dir(name: &str) -> String {
+    let d = common::fresh_dir("striaseqrateedl", name);
+    for n in [1, 2] {
+        std::fs::write(d.join(format!("a_{n:04}.gif")), striaseqrateedl_gif()).unwrap();
+    }
+    format!("{}/a_%04d.gif", d.display())
+}
+
+/// The sequence timeline of [`striaimportimagesequence_tl`] through the EDL with `* UNA SEQRATE SEQ <rate>`.
+fn striaseqrateedl_doc(len: i64, rate: (u64, u64)) -> (Timeline, SourceId, String) {
+    let (mut tl, s) = striaimportimagesequence_tl(len);
+    tl.sources[0].seq_rate = Some(rate);
+    let text = edl::write(&tl, "SEQ").unwrap();
+    (edl::parse(&text, 25).unwrap(), s, text)
+}
+
+#[test]
+fn striaseqrateedl_edl_rate_opens_the_reel() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqrateedl-open", 4, 4, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s, text) = striaseqrateedl_doc(7, (12, 1));
+    assert!(text.contains("* UNA SOURCE SEQ 00:00:00:07\n* UNA SEQRATE SEQ 12\n"), "{text}");
+    assert_eq!(tl.sources[0].seq_rate, Some((12, 1)));
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=9 4x4 @12"), "the document's rate, no `@` in the pattern");
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(7));
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..7, &src, &mut sink).unwrap();
+    for (t, file) in [0usize, 0, 0, 1, 1, 2, 2].into_iter().enumerate() {
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, cols[file]), "tick {t}: file {}", 7 + file);
+    }
+    println!("striaseqrateedl: `* UNA SEQRATE SEQ 12` + frame_%04d.png -> seq 7..=9 4x4 @12, files 7,7,7,8,8,9,9");
+}
+
+#[test]
+fn striaseqrateedl_src_rate_wins() {
+    let pat = striaimportimagesequence_dir("seqrateedl-wins", 4, 4, &[(7, [10, 10, 10]), (8, [20, 20, 20])]);
+    let (tl, s, _) = striaseqrateedl_doc(4, (12, 1));
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &format!("{pat}@25/2")).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=8 4x4 @25/2"), "the operator's `@R` at open wins over the document's");
+    assert_eq!(src.seq_rated(&tl).sources[0].seq_rate, Some((25, 2)), "and the next save writes it");
+    println!("striaseqrateedl: SEQRATE 12 + pattern @25/2 -> @25/2, saved as 25/2");
+}
+
+#[test]
+fn striaseqrateedl_save_writes_the_rate() {
+    let pat = striaimportimagesequence_dir("seqrateedl-save", 4, 4, &[(7, [10, 10, 10]), (8, [20, 20, 20]), (9, [30, 30, 30])]);
+    let (tl, s) = striaimportimagesequence_tl(7);
+    let path = common::fresh_dir("striaseqrateedl", "save").join("seq.edl");
+    std::fs::write(&path, edl::write(&tl, "seq").unwrap()).unwrap();
+    let opened = edl::parse(&std::fs::read_to_string(&path).unwrap(), 25).unwrap();
+    assert_eq!(opened.sources[0].seq_rate, None, "no SEQRATE line yet");
+    let mut src = Sources::new(&opened);
+    src.add_sequence(s, &format!("{pat}@12")).unwrap();
+    let mut face = Face::new(EditorState::new(opened), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    assert!(!face.dirty(), "clean at open");
+    face.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("* UNA SEQRATE SEQ 12\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().sources[0].seq_rate, Some((12, 1)), "the reopened document carries the rate");
+    assert!(!face.dirty(), "the save leaves the model alone");
+    assert!(face.state.timeline.sources[0].seq_rate.is_none(), "the face's model is not rewritten");
+    println!("striaseqrateedl: opened with @12, save -> `* UNA SEQRATE SEQ 12`, face clean");
+}
+
+#[test]
+fn striaseqrateedl_animated_frames_across_ticks() {
+    let pat = striaseqrateedl_gif_dir("anim");
+    let (tl, s) = striaimportimagesequence_tl(6);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &format!("{pat}@25/3")).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(6), "two files at 25/3 on a 25/s timeline: 3 ticks each");
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..6, &src, &mut sink).unwrap();
+    let (w, b) = ([255u8, 255, 255, 255].to_vec(), [0u8, 0, 0, 255].to_vec());
+    for (t, want) in [&w, &b, &b, &w, &b, &b].into_iter().enumerate() {
+        assert!(&sink.0[t].3 == want, "tick {t}: {:?}", sink.0[t].3);
+    }
+    let mut again = StriaTitleFrames::default();
+    render(&tl, 1..2, &src, &mut again).unwrap();
+    assert!(again.0[0].3 == b, "a repaint of tick 1 (a kept entry) is still canvas 1");
+    println!("striaseqrateedl: two-frame GIFs @25/3 -> ticks W B B W B B (frame order, the last held)");
+}
+
+#[test]
+fn striaseqrateedl_animated_default_shows_first_frame() {
+    let pat = striaseqrateedl_gif_dir("anim-default");
+    let (tl, s) = striaimportimagesequence_tl(2);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut sink = StriaTitleFrames::default();
+    render(&tl, 0..2, &src, &mut sink).unwrap();
+    for t in 0..2 {
+        assert!(sink.0[t].3 == [255u8, 255, 255, 255].to_vec(), "tick {t}: one tick per file shows its canvas 0");
+    }
+    println!("striaseqrateedl: no rate -> each tick its file's first canvas");
+}

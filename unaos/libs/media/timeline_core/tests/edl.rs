@@ -392,3 +392,37 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.verb("mark sideways"), None, "not a mark word");
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }
+
+// ---- STRIASEQRATEEDL (LEDGER SR9053): the `* UNA SEQRATE` line (named tail block) ----
+
+/// CUT with `l` right after reel A's SOURCE line (line 5).
+fn striaseqrateedl_at(l: &str) -> String {
+    CUT.replace("* UNA SOURCE A 00:00:02:00\n", &format!("* UNA SOURCE A 00:00:02:00\n{l}\n"))
+}
+
+#[test]
+fn striaseqrateedl_seqrate_round_trips() {
+    for (word, rate) in [("12", (12u64, 1u64)), ("25/2", (25, 2))] {
+        let text = striaseqrateedl_at(&format!("* UNA SEQRATE A {word}"));
+        let tl = edl::parse(&text, 25).unwrap();
+        let mut want = cut();
+        want.sources[0].seq_rate = Some(rate);
+        assert_eq!(tl, want, "{word}");
+        assert_eq!(edl::write(&tl, "CUT ONE").unwrap(), text, "{word}: written right after its SOURCE line, byte exact");
+    }
+    let reduced = edl::parse(&striaseqrateedl_at("* UNA SEQRATE A 50/4"), 25).unwrap();
+    assert_eq!(reduced.sources[0].seq_rate, Some((25, 2)), "read reduced");
+    assert_eq!(edl::write(&cut(), "CUT ONE").unwrap(), CUT, "no rate: no SEQRATE line");
+    println!("striaseqrateedl: `* UNA SEQRATE A 12` / `25/2` round-trip byte exact; 50/4 reads as 25/2");
+}
+
+#[test]
+fn striaseqrateedl_seqrate_refused_by_name() {
+    for bad in ["* UNA SEQRATE A", "* UNA SEQRATE A 12 13", "* UNA SEQRATE A 0", "* UNA SEQRATE A 1/0", "* UNA SEQRATE A x", "* UNA SEQRATE A -3", "* UNA SEQRATE A 12.5", "* UNA SEQRATE B 12"] {
+        assert_eq!(edl::parse(&striaseqrateedl_at(bad), 25), Err(EdlError::Syntax { line: 5 }), "{bad}");
+    }
+    let twice = striaseqrateedl_at("* UNA SEQRATE A 12\n* UNA SEQRATE A 12");
+    assert_eq!(edl::parse(&twice, 25), Err(EdlError::Syntax { line: 6 }), "a second SEQRATE for one reel");
+    let titled = striaseqrateedl_at("* UNA TITLE A \"Hi\"\n* UNA SEQRATE A 12");
+    assert_eq!(edl::parse(&titled, 25), Err(EdlError::Syntax { line: 6 }), "a title has no file");
+}

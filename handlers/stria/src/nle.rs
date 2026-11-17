@@ -194,12 +194,12 @@ pub struct Sources {
     applied: Vec<(SourceId, usize)>,
     /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
-    stand_in: std::sync::Mutex<Vec<SourceId>>, titles: TitleCache, seqs: Vec<(SourceId, Seq)>, // STRIATITLECLIP (SR828): the title stills, keyed (text, w, h) (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): the PNG sequence reels (file tail)
+    stand_in: std::sync::Mutex<Vec<SourceId>>, titles: TitleCache, seqs: Vec<(SourceId, Seq)>, seq_doc: Vec<(SourceId, (u64, u64))>, // STRIASEQRATEEDL (SR9053): the document's sequence rates, read at `new` (file tail); STRIATITLECLIP (SR828): the title stills, keyed (text, w, h) (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): the PNG sequence reels (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), titles: Default::default(), seqs: Vec::new() } // STRIAIMPORTIMAGESEQUENCE (SR888): no sequence reel yet
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), titles: Default::default(), seqs: Vec::new(), seq_doc: seq_doc_rates(tl) } // STRIASEQRATEEDL (SR9053): the EDL's `* UNA SEQRATE` rates (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): no sequence reel yet
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -1124,7 +1124,7 @@ impl Sources {
     pub fn add_sequence(&mut self, id: SourceId, pattern: &str) -> Result<(), RenderError> {
         use std::io::Read;
         let refuse = |why: String| RenderError::Demux(format!("image sequence {pattern}: {why}"));
-        let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?; let (suffix, rate) = seq_rate(suffix).map_err(refuse)?; // STRIASEQREPORT (SR943): a trailing `@<rate>` (file tail)
+        let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?; let (suffix, rate) = seq_rate(suffix).map_err(refuse)?; let rate = rate.or_else(|| self.seq_doc_rate(id)); // STRIASEQRATEEDL (SR9053): the pattern's `@R` wins, else the document's rate (file tail); STRIASEQREPORT (SR943): a trailing `@<rate>` (file tail)
         if seq_format(suffix).is_none() { // STRIASEQMORE (SR978): the suffix names one of pixel_core's formats (file tail)
             return Err(refuse(String::from("only .png, .jpg, .jpeg, .gif, .bmp, .qoi or .webp frames (pixel_core's decoders)")));
         }
@@ -1187,13 +1187,13 @@ fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: Sourc
     let Some(q) = sources.seq(src) else { return Ok(None) };
     *run = None;
     let n = u64::try_from(src_t).ok().and_then(|k| q.file_at(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?; // STRIASEQREPORT (SR943): tick to file at the reel's rate (file tail)
-    if let Some(f) = q.held_frame(n, tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); let stamp = seq_stamp(&path); // STRIASEQTHREE (SR9022): the file's stamp before its read (file tail); STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
+    if let Some(f) = q.held_frame(n, q.frame_in(src_t, n), tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); let stamp = seq_stamp(&path); // STRIASEQRATEEDL (SR9053): the frame of an animated file at this tick (file tail); STRIASEQTHREE (SR9022): the file's stamp before its read (file tail); STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
     let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
     let mut img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; img.apply_orientation(); // STRIASEQTHREE (SR9022): turned upright by its EXIF orientation (file tail); STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
-    Ok(Some(q.keep(n, img.width, img.height, img.rgba, tl.tb.to_ns(src_t), stamp))) // STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
+    Ok(Some(q.keep(n, img.width, img.height, seq_canvases(img.frames.take(), img.rgba), q.frame_in(src_t, n), tl.tb.to_ns(src_t), stamp))) // STRIASEQRATEEDL (SR9053): every canvas of an animated file kept, this tick's handed on (file tail); STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
 }
 
 // ---- STRIASEQINFO (LEDGER SR940): a sequence reel's line and its kept frame (named tail block) ----
@@ -1208,17 +1208,17 @@ impl Seq {
         format!("seq {}..={} {}x{}{}", self.first, self.last, self.w, self.h, self.rate.map(seq_rate_text).unwrap_or_default()) // STRIASEQREPORT (SR943): ` @<rate>` only when set; STRIASEQMORE (SR978): ` @n/d` for a fractional one
     }
     /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
-    fn held_frame(&self, n: u64, pts_ns: i64) -> Option<Frame> {
+    fn held_frame(&self, n: u64, i: usize, pts_ns: i64) -> Option<Frame> { // STRIASEQRATEEDL (SR9053): `i` the canvas of an animated file (file tail)
         let st = seq_stamp(&self.path(n)); let (w, h, rgba) = self.held.lock().ok().and_then(|mut g| g.get(n, st))?; // STRIASEQTHREE (SR9022): the stat before the lock; a kept frame of a changed or removed file is not served (file tail)
-        Some(Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba((*rgba).clone()) })
+        Some(Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba(seq_pick(&rgba, w, h, i)) }) // STRIASEQRATEEDL (SR9053): canvas `i`, the last held (file tail)
     }
     /// STRIASEQINFO: keep file number `n`'s decoded RGBA as the reel's one frame (the old one dropped) and hand it on as a `Frame`.
-    fn keep(&self, n: u64, w: u32, h: u32, rgba: Vec<u8>, pts_ns: i64, stamp: SeqStamp) -> Frame { // STRIASEQTHREE (SR9022): the stamp taken before the read (file tail)
+    fn keep(&self, n: u64, w: u32, h: u32, rgba: Vec<u8>, i: usize, pts_ns: i64, stamp: SeqStamp) -> Frame { // STRIASEQRATEEDL (SR9053): `rgba` every canvas back to back, `i` the one handed on (file tail); STRIASEQTHREE (SR9022): the stamp taken before the read (file tail)
         let kept = Arc::new(rgba.clone());
         if let Ok(mut g) = self.held.lock() {
             g.put(n, w, h, kept, stamp); // STRIASEQTHREE (SR9022): one of several kept frames (file tail)
         }
-        Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba(rgba) }
+        Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba(seq_pick_vec(rgba, w, h, i)) } // STRIASEQRATEEDL (SR9053): canvas `i` (a still: its own bytes, no copy) (file tail)
     }
 }
 
@@ -1423,4 +1423,66 @@ mod striaseqthree_kept {
         k.put(6, 2, 2, Arc::new(vec![7; 16]), None);
         assert!(k.get(6, None).is_none(), "a frame kept without a stamp is never served");
     }
+}
+
+// ---- STRIASEQRATEEDL (LEDGER SR9053): the sequence rate in the document, animated files inside a sequence (named tail block) ----
+/// STRIASEQRATEEDL (LEDGER SR9053): the document's sequence rates `(source, (n, d))`, from each source's `seq_rate`
+/// (`* UNA SEQRATE`), recorded once by [`Sources::new`]; immutable after: no lock.
+fn seq_doc_rates(tl: &Timeline) -> Vec<(SourceId, (u64, u64))> {
+    tl.sources.iter().filter_map(|s| s.seq_rate.map(|r| (s.id, r))).collect()
+}
+
+impl Sources {
+    /// STRIASEQRATEEDL: the rate the document gave source `id` (`None`: none), the one [`Sources::add_sequence`] takes when its
+    /// pattern carries no `@R`.
+    fn seq_doc_rate(&self, id: SourceId) -> Option<(u64, u64)> {
+        self.seq_doc.iter().find(|q| q.0 == id).map(|q| q.1)
+    }
+    /// STRIASEQRATEEDL: `tl` with every SEQUENCE reel's `seq_rate` set to the rate it was opened at (`None` when it has none),
+    /// other reels untouched: what a save writes, so a reopened EDL plays each sequence at its rate. A copy: the model the
+    /// face's undo and dirty reading compare is left alone (a clean face opened with `@R` and no SEQRATE line still writes it).
+    pub fn seq_rated(&self, tl: &Timeline) -> Timeline {
+        let mut out = tl.clone();
+        for s in out.sources.iter_mut() {
+            if let Some(q) = self.seq(s.id) {
+                s.seq_rate = q.rate.map(|r| (r.0, r.3));
+            }
+        }
+        out
+    }
+}
+
+impl Seq {
+    /// STRIASEQRATEEDL: the canvas of file `n` shown at source tick `k`: `k` minus the file's first tick (`ticks(n - first)`,
+    /// the inverse of `file_at`), so frame order across the ticks the file covers (not the file's own delays: the seat's
+    /// ruling). 0 at every tick with no rate (one tick per file).
+    fn frame_in(&self, k: i64, n: u64) -> usize {
+        usize::try_from(k.saturating_sub(self.ticks(n.saturating_sub(self.first)))).unwrap_or(0)
+    }
+}
+
+/// STRIASEQRATEEDL: a decoded file's canvases back to back: every composited frame of an animation (more than one), else
+/// `first` (the still's own bytes, no copy).
+fn seq_canvases(frames: Option<Vec<gneiss_pal::dsp::image::Frame>>, first: Vec<u8>) -> Vec<u8> {
+    match frames {
+        Some(v) if v.len() > 1 => v.into_iter().flat_map(|f| f.rgba).collect(),
+        _ => first,
+    }
+}
+
+/// STRIASEQRATEEDL: canvas `i` of `all` (`w` x `h` RGBA canvases back to back), the last one held past the end.
+fn seq_pick(all: &[u8], w: u32, h: u32, i: usize) -> Vec<u8> {
+    let size = w as usize * h as usize * 4;
+    let count = if size == 0 { 1 } else { (all.len() / size).max(1) };
+    if count == 1 {
+        return all.to_vec();
+    }
+    let j = i.min(count - 1);
+    all[j * size..(j + 1) * size].to_vec()
+}
+
+/// STRIASEQRATEEDL: [`seq_pick`] over an owned buffer: a single canvas is handed on as it is.
+fn seq_pick_vec(all: Vec<u8>, w: u32, h: u32, i: usize) -> Vec<u8> {
+    let size = w as usize * h as usize * 4;
+    if size == 0 || all.len() <= size { all } else { seq_pick(&all, w, h, i) }
 }
