@@ -1074,18 +1074,18 @@ impl Sources {
 // `eff = round(out_rate * 0x1_0000 / rate_q16)` Hz, so they cover `rate` times the 1x source span (pitch follows speed, as a
 // tape does; going faster is anti-aliased by the sinc's cutoff; `eff` equal to the source's rate is the plain sample copy).
 // The run's start is the layer's exact `src_t` at `eff`, so the < 1 Hz rounding of `eff` never accumulates past a run. A
-// crossfade's UNDER layer and a fade-to-silence tail play their 1x handle (the transition handle rule). The video needs no
+// crossfade's UNDER layer and a fade-to-silence tail play the outgoing's rate (STRIACLIPSPEEDTHREE SR9031: src_at past its end). The video needs no
 // arm: the schedule names `src_at(t)` and `Vid::show` decodes and drops forward (rate > 1) or holds the last frame (rate < 1).
 // A pitch-preserving stretch is owed (NLE-SPEED-PITCH-PRESERVE).
 
-/// STRIACLIPSPEED: the speed layer `li` of `run` plays at: 1x for an under layer or one no clip of its source covers at the
+/// STRIACLIPSPEED: the speed layer `li` of `run` plays at: the outgoing's (`schedule::handle_rate`, SR9031) for an under layer or one no clip of its source covers at the
 /// run's first tick (a handle past the clip's end), else that clip's `rate_q16`.
 fn layer_rate(tl: &Timeline, run: &AudioRun, li: usize) -> u32 {
     let Some(l) = run.layers.get(li) else { return 0x1_0000 };
     if run.under(li) {
-        return 0x1_0000;
+        return timeline_core::schedule::handle_rate(tl, l.track, l.src, run.out_t); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's rate, not 1x
     }
-    tl.clip_at(l.track, run.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or(0x1_0000, |c| c.rate_q16)
+    tl.clip_at(l.track, run.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or_else(|| timeline_core::schedule::handle_rate(tl, l.track, l.src, run.out_t), |c| c.rate_q16) // STRIACLIPSPEEDTHREE (SR9031): a handle past the clip's end plays at its rate
 }
 
 /// STRIACLIPSPEED: layer `li`'s `n` output samples at `rate`: exactly `take_at(start, n, rate)` at 1x, else `take_at` at the

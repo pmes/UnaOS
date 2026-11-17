@@ -3955,3 +3955,31 @@ fn striaclipspeedmore_face_rspeed_ripples_where_speed_overlaps() {
     assert_eq!(face.state.timeline, tl, "undo restores");
     println!("striaclipspeedmore: rspeed 0.5 -> {ats:?}; speed 0.5 -> {}", EditError::Overlap);
 }
+
+// ---- STRIACLIPSPEEDTHREE (LEDGER SR9031): the ripple speed button — bare `rspeed` (named tail block) ----
+
+/// Bare `rspeed` (the Ripple Speed button, the VERBS word before `help`) steps the selected clip 1x -> 2x -> 4x -> 1x through
+/// `ripple_speed`: each press is THE ripple (`Timeline::ripple_set_rate`) and ONE undo step; nothing selected is `NoClip`
+/// by name; bare `speed` still cycles in place through the same `next_speed`.
+#[test]
+fn striaclipspeedthree_face_rspeed_button_cycles_with_a_ripple() {
+    assert_eq!(VERBS.iter().position(|v| *v == "rspeed"), Some(VERBS.len() - 2), "rspeed sits right before help");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("rspeed"));
+    assert_eq!(face.last_error.take(), Some(format!("rspeed: {}", EditError::NoClip)), "nothing selected");
+    assert_eq!(face.state.undo_depth(), 0);
+    face.state.select(0, 0).unwrap();
+    let mut want = tl.clone();
+    for (n, q) in [0x2_0000u32, 0x4_0000, 0x1_0000].into_iter().enumerate() {
+        want = want.ripple_set_rate(0, 0, q).unwrap();
+        assert!(face.verb("rspeed"));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert_eq!(face.state.timeline, want, "press {}: the ripple at {q:#x}", n + 1);
+        assert_eq!(face.state.undo_depth(), n + 1, "one undo step per press");
+    }
+    assert_eq!(stria::nle_face::next_speed(&face.state), Ok(0x2_0000), "the one cycle the Speed button reads too");
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline.tracks[0].clips[0].rate_q16, 0x4_0000, "undo restores the press before");
+    println!("striaclipspeedthree: rspeed presses ripple 2x, 4x, 1x (3 undo steps); none selected -> {}", EditError::NoClip);
+}

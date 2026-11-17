@@ -495,7 +495,7 @@ impl Timeline {
             for ci in 1..t.clips.len() {
                 if let Some(x) = self.crossfade_of(&t.clips, ci) {
                     let (o, i) = (t.clips[ci - 1], t.clips[ci]);
-                    let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                    let handle = o.handle_room(self.source(o.src).ok_or(EditError::NoSource)?.duration); // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (1x: duration - src_out) (file tail)
                     if x.dur > i.len() || x.dur > handle {
                         return Err(EditError::Handle);
                     }
@@ -513,7 +513,7 @@ impl Timeline {
             if x.to_black {
                 // NLE3cBLACK: to black: an outgoing clip, NO incoming one, its handle, and nothing starting inside the black.
                 let (Some(o), None, false) = (out, inc, x.from_black) else { return Err(EditError::Transition) };
-                let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                let handle = o.handle_room(self.source(o.src).ok_or(EditError::NoSource)?.duration); // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (1x: duration - src_out) (file tail)
                 if x.dur > handle || t.clips.iter().any(|c| c.at > x.at && c.at < x.at + x.dur) {
                     return Err(EditError::Handle);
                 }
@@ -528,7 +528,7 @@ impl Timeline {
                 continue;
             }
             let (Some(o), Some(i)) = (out, inc) else { return Err(EditError::Transition) };
-            let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+            let handle = o.handle_room(self.source(o.src).ok_or(EditError::NoSource)?.duration); // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (1x: duration - src_out) (file tail)
             if x.dur > i.len() || x.dur > handle {
                 return Err(EditError::Handle);
             }
@@ -1265,7 +1265,7 @@ impl Timeline {
             let (Some(o), Some(i)) = (t.clips.iter().find(|c| c.end() == x.at), t.clips.iter().find(|c| c.at == x.at)) else {
                 return Err(EditError::Transition);
             };
-            let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+            let handle = o.handle_room(self.source(o.src).ok_or(EditError::NoSource)?.duration); // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (1x: duration - src_out) (file tail)
             if x.dur > i.len() || x.dur > handle {
                 return Err(EditError::Handle);
             }
@@ -1276,7 +1276,7 @@ impl Timeline {
                     return Err(EditError::Handle);
                 }
                 if let Some(x) = self.fade_to_silence(ti, ci) {
-                    let handle = self.source(c.src).ok_or(EditError::NoSource)?.duration - c.src_out;
+                    let handle = c.handle_room(self.source(c.src).ok_or(EditError::NoSource)?.duration); // STRIACLIPSPEEDTHREE (SR9031): the room at the clip's rate (1x: duration - src_out) (file tail)
                     if x.dur > handle {
                         return Err(EditError::Handle);
                     }
@@ -1340,7 +1340,7 @@ impl Timeline {
         let room = |tl: &Timeline, at: i64| -> Option<i64> {
             let t = tl.tracks.get(track)?;
             let inc = t.clips.iter().find(|i| i.at == at).map(|i| i.len());
-            let out = t.clips.iter().find(|o| o.end() == at).and_then(|o| tl.source(o.src).map(|s| s.duration - o.src_out));
+            let out = t.clips.iter().find(|o| o.end() == at).and_then(|o| tl.source(o.src).map(|s| o.handle_room(s.duration))); // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (file tail)
             match (inc, out) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1539,7 +1539,7 @@ impl Timeline {
 // rounding is CEILING, so every covered tick's source tick is below `src_out` and the last source frame is always shown.
 // Timeline tick `t` shows source tick `src_at(t) = src_in + floor((t - at) * rate / 0x1_0000)`. At 1x both are the old
 // identity, so a 1x timeline is unchanged everywhere. A rate-0 clip (refused `Rate` by `validate`) measures as 1x. A
-// transition's outgoing handle plays at 1x past `src_out` (NLE-SPEED-HANDLE owed). The ops that cut a rated clip (`split`,
+// transition's outgoing handle is `src_at` past `end()` (STRIACLIPSPEEDTHREE SR9031). The ops that cut a rated clip (`split`,
 // `place` Insert / Overwrite) cut it only ON ITS FRAME GRID (both halves keep every tick and frame: `cut_clean`), else
 // `Rate` by name. `slide` refuses a rated butted neighbour (`Rate`: it cannot follow tick for tick). `set_rate` is
 // `trim_out`'s shape: `at` and the source window stay, the out edge moves, nothing ripples. `validate` stays the one gate.
@@ -1840,5 +1840,112 @@ mod striaclipspeedmore_tests {
         assert_eq!(st.undo_depth(), 1, "a refusal pushes nothing");
         assert_eq!(st.verb("rspeed x"), None);
         std::println!("striaclipspeedmore: 2x drag -2 ticks ends at 3; rspeed 0.5 one undo step; rspeed 0 -> {}", EditError::Rate);
+    }
+}
+
+// ---- STRIACLIPSPEEDTHREE (LEDGER SR9031): a rated outgoing's handle room, measured at its rate (named tail block) ----
+// A transition's (or audio crossfade's, or fade-to-silence's) outgoing handle is THE `Clip::src_at` continued past the
+// clip's `end()` (the schedule reads `o.src_at(t)`), so the timeline ticks of handle a source of `duration` holds are the
+// largest `k` with `src_at(end + k - 1) < duration`: `rated_len(duration - src_in) - len()` (1x: `duration - src_out`).
+// `validate` (the transitions, the audio crossfades, the fades to silence), `fit_trimmed`'s room and the schedule's
+// `handles_fit` read this one fn.
+impl Clip {
+    /// STRIACLIPSPEEDTHREE: the timeline ticks of handle past `end()` that a source of `duration` ticks holds at this
+    /// clip's rate (1x: `duration - src_out`; negative when the clip already runs past it).
+    pub fn handle_room(&self, duration: i64) -> i64 {
+        rated_len(duration - self.src_in, self.rate_q16) - self.len()
+    }
+}
+
+#[cfg(test)]
+mod striaclipspeedthree_tests {
+    extern crate std;
+    use super::*;
+    use crate::editor::{Edge, EditorState};
+
+    /// V1 on source A (`d` ticks): `clips` laid as given.
+    fn tl(d: i64, clips: Vec<Clip>) -> Timeline {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", d);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = clips;
+        tl
+    }
+
+    fn a(src_in: i64, src_out: i64, at: i64) -> Clip {
+        Clip::new(SourceId(0), src_in, src_out, at)
+    }
+
+    /// Every source is `50` ticks with a keyframe at 0.
+    struct Idx;
+    impl SourceIndex for Idx {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            Some(50)
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, _: i64) -> Option<i64> {
+            Some(0)
+        }
+    }
+
+    #[test]
+    fn striaclipspeedthree_handle_room_kats() {
+        let c = a(0, 10, 0);
+        assert_eq!(c.handle_room(50), 40, "1x: duration - src_out");
+        assert_eq!(c.at_rate(0x2_0000).handle_room(50), 20, "2x: 25 - 5");
+        assert_eq!(c.at_rate(0x8000).handle_room(50), 80, "0.5x: 100 - 20");
+        let f = c.at_rate(0x1_8000);
+        assert_eq!(f.handle_room(50), 27, "1.5x: 34 - 7");
+        assert!(f.src_at(f.end() + 26) < 50 && f.src_at(f.end() + 27) >= 50, "the room's last tick reads inside the source");
+        std::println!("striaclipspeedthree: handle room over 50: 1x 40, 2x 20, 0.5x 80, 1.5x 27");
+    }
+
+    #[test]
+    fn striaclipspeedthree_validate_measures_the_handle_at_the_outgoing_rate() {
+        // Source 14: the outgoing 0..10 leaves a 1x handle of 4 source ticks; at 2x that is 2 timeline ticks.
+        let one = tl(14, alloc::vec![a(0, 10, 0), a(0, 10, 10)]);
+        assert!(one.add_transition(0, 10, TransitionKind::Dissolve, 3).is_ok(), "1x: room 4");
+        let two = tl(14, alloc::vec![a(0, 10, 0).at_rate(0x2_0000), a(0, 10, 5)]);
+        assert_eq!(two.add_transition(0, 5, TransitionKind::Dissolve, 3), Err(EditError::Handle), "2x: room 2");
+        assert!(two.add_transition(0, 5, TransitionKind::Dissolve, 2).is_ok());
+        std::println!("striaclipspeedthree: a 3-tick dissolve on a 2x outgoing with 4 source ticks of handle -> {}", EditError::Handle);
+    }
+
+    #[test]
+    fn striaclipspeedthree_the_mix_reads_the_outgoing_at_its_rate() {
+        let base = tl(50, alloc::vec![a(0, 10, 0).at_rate(0x2_0000), a(20, 30, 5)]).add_transition(0, 5, TransitionKind::Dissolve, 3).unwrap();
+        let steps = crate::schedule::schedule(&base, 5..8, &Idx).unwrap();
+        let mix: Vec<(i64, bool)> = steps.iter().filter_map(|s| s.vmix).map(|m| (m.src_t, m.seek.is_some())).collect();
+        assert_eq!(mix, alloc::vec![(10, true), (12, false), (14, false)], "src_out, +2, +4: one run");
+        let one = tl(50, alloc::vec![a(0, 10, 0), a(20, 30, 10)]).add_transition(0, 10, TransitionKind::Dissolve, 3).unwrap();
+        let m1: Vec<i64> = crate::schedule::schedule(&one, 10..13, &Idx).unwrap().iter().filter_map(|s| s.vmix).map(|m| m.src_t).collect();
+        assert_eq!(m1, alloc::vec![10, 11, 12], "1x: src_out + k as before");
+        assert_eq!(crate::schedule::handle_rate(&base, 0, SourceId(0), 6), 0x2_0000);
+        assert_eq!(crate::schedule::handle_rate(&base, 0, SourceId(0), 4), 0x1_0000, "no clip of A ends by tick 4");
+        std::println!("striaclipspeedthree: a 2x outgoing's dissolve mixes source 10, 12, 14 (1x: 10, 11, 12)");
+    }
+
+    #[test]
+    fn striaclipspeedthree_trim_keys_step_one_timeline_tick_on_a_fast_clip() {
+        let mut st = EditorState::new(tl(50, alloc::vec![a(0, 10, 0).at_rate(0x2_0000), a(20, 30, 10)]));
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("}"), Some(Ok(())));
+        assert_eq!(st.selected().map(|c| (c.src_out, c.end())), Some((12, 6)), "2x: out one tick later");
+        assert_eq!(st.verb("{"), Some(Ok(())));
+        assert_eq!(st.verb("{"), Some(Ok(())));
+        assert_eq!(st.selected().map(|c| (c.src_out, c.end())), Some((8, 4)), "2x: out one tick earlier each press");
+        for rate in [0x1_0000, 0x8000] {
+            let base = tl(50, alloc::vec![a(4, 10, 5).at_rate(rate), a(20, 30, 30)]);
+            let (mut k, mut s) = (EditorState::new(base.clone()), EditorState::new(base));
+            k.select(0, 0).unwrap();
+            s.select(0, 0).unwrap();
+            for (key, edge, d) in [("[", Edge::In, -1), ("}", Edge::Out, 1)] {
+                assert_eq!(k.verb(key), Some(Ok(())), "{key}");
+                assert_eq!(s.trim(edge, d), Ok(()));
+            }
+            assert_eq!(k.timeline, s.timeline, "rate {rate:#x}: the keys step one source tick");
+        }
+        let mut none = EditorState::new(tl(50, alloc::vec![a(0, 10, 0)]));
+        assert_eq!(none.verb("]"), Some(Err(EditError::NoClip)));
+        std::println!("striaclipspeedthree: on a 2x clip }} ends at 6, {{ {{ at 4; 1x and 0.5x keys == trim by one source tick");
     }
 }

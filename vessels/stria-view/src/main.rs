@@ -519,6 +519,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("speed", "Speed"), // STRIACLIPSPEED (SR829): the selected clip 1x -> 2x -> 4x -> 1x (THE `speed` verb)
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
+        button("rspeed", "Ripple Speed"), // STRIACLIPSPEEDTHREE (SR9031): the selected clip 1x -> 2x -> 4x -> 1x with the rest of its track following (THE `rspeed` verb)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }

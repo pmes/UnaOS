@@ -81,7 +81,7 @@ pub struct VideoMix {
     pub kind: TransitionKind,
     /// The OUTGOING clip's source (`None`: black, a transition from `BL`).
     pub src: Option<SourceId>,
-    /// Its source tick (in its handle: `src_out + k`).
+    /// Its source tick (in its handle: the outgoing's `src_at(t)` past its end, 1x `src_out + k`; STRIACLIPSPEEDTHREE SR9031).
     pub src_t: i64,
     /// Seek here before decoding it (`None`: its run continues).
     pub seek: Option<i64>,
@@ -332,9 +332,9 @@ fn vmix_for(
     }
     // validate: the outgoing clip ends at the cut, so it is the clip before (clips are ordered and never overlap).
     let o = tr.clips[ci - 1];
-    let src_t = o.src_out + k;
+    let src_t = o.src_at(t); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_out + k)
     let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { v_next } else { *m_next })?;
-    *m_next = Some((o.src, src_t + 1));
+    *m_next = Some((o.src, o.src_at(t + 1))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + 1)
     Ok(Some(VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: w }))
 }
 
@@ -343,7 +343,7 @@ fn handles_fit(tl: &Timeline, idx: &dyn SourceIndex) -> Result<(), ScheduleError
     for tr in &tl.tracks {
         for x in tr.transitions.iter().filter(|x| !x.from_black) {
             if let Some(o) = tr.clips.iter().find(|c| c.end() == x.at) {
-                if idx.duration(o.src).is_some_and(|d| o.src_out + x.dur > d) {
+                if idx.duration(o.src).is_some_and(|d| x.dur > o.handle_room(d)) { // STRIACLIPSPEEDTHREE (SR9031): the room at the outgoing's rate (1x: src_out + dur > d)
                     return Err(ScheduleError::OutOfSource(o.src));
                 }
             }
@@ -370,9 +370,9 @@ fn under_layer(
     end: i64,
     xnext: &mut Option<(SourceId, i64)>,
 ) -> Result<Layer, ScheduleError> {
-    let src_t = o.src_out + (t - x.at);
+    let src_t = o.src_at(t); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_out + (t - at))
     let seek = seek_for(tl, idx, Kind::Audio, o.src, src_t, *xnext)?;
-    *xnext = Some((o.src, src_t + (end - t)));
+    *xnext = Some((o.src, o.src_at(end))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + (end - t))
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
     Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: o.gain_cdb, env: [fall(t), fall(end)] })
@@ -404,9 +404,9 @@ fn black_step(
     // validate: the outgoing clip ends at the cut.
     let o = *tl.tracks[ti].clips.iter().find(|c| c.end() == x.at).ok_or(ScheduleError::Invalid(EditError::Transition))?;
     let k = t - x.at;
-    let src_t = o.src_out + k;
+    let src_t = o.src_at(t); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_out + k)
     let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { *v_next } else { *m_next })?;
-    (*v_next, *m_next) = (None, Some((o.src, src_t + 1)));
+    (*v_next, *m_next) = (None, Some((o.src, o.src_at(t + 1)))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + 1)
     let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: x.ease.apply(Frac { num: k + 1, den: x.dur + 1 }) }; // NLEWIPES (SR679): the ease
     Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix) })
 }
@@ -501,4 +501,15 @@ fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]
         }
         None => env,
     }
+}
+
+// ---- STRIACLIPSPEEDTHREE (LEDGER SR9031): the speed a handle plays at (named tail block) ----
+// A transition's outgoing handle, a crossfade's UNDER layer and a fade-to-silence tail are the outgoing clip's source read
+// through THE `Clip::src_at` past its `end()`, so they play at that clip's rate: the clip of the layer's source on its track
+// that ends at or before the run's first tick (the last such one) names it.
+
+/// STRIACLIPSPEEDTHREE: the rate (Q16.16) a handle of source `src` on track `track` plays at in a run starting at tick `t`:
+/// that of the last clip of `src` there ending at or before `t`; 1x when none does.
+pub fn handle_rate(tl: &Timeline, track: usize, src: SourceId, t: i64) -> u32 {
+    tl.tracks.get(track).and_then(|tr| tr.clips.iter().rev().find(|c| c.src == src && c.end() <= t)).map_or(0x1_0000, |c| c.rate_q16)
 }
