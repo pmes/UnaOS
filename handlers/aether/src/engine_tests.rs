@@ -6133,4 +6133,113 @@ mod tests {
         }
         assert!(inked > 0, "the probes paint");
     }
+
+    // ---- AETHERCSSWIDEINHERITEDREST (LEDGER SR831): an explicit inherit beats the white-space / direction / list-style tag roads (named tail block) ----
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): one probe per row at 20px serif in a 400px viewport, the rules in a sheet: three
+    /// pre with one 100-character line (plain, `white-space: inherit`, `inherit` then `pre`), three `Hello` blocks (`dir=rtl`,
+    /// `dir=rtl` with `direction: inherit`, plain ltr), and lists nested one level inside a `ul` item: an ol with
+    /// `list-style-type: inherit`, one with `unset`, a disc-styled twin and a plain ol; a ul with `inherit`, a disc-styled
+    /// twin and a plain ul. Rows 12px apart, so one probe's ink window (its rect +- 2px) does not take a neighbour's.
+    fn css_wide_rest_engine() -> crate::AetherEngine {
+        let line = "the quick brown fox jumps over the lazy dog and keeps on running far past the edge of the box again";
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+            div, pre, ul, ol {{ margin: 0 0 12px }}
+            pre.w {{ white-space: inherit }}
+            pre.v {{ white-space: inherit; white-space: pre }}
+            div.d {{ direction: inherit }}
+            ol.i {{ list-style-type: inherit }}
+            ol.u {{ list-style-type: unset }}
+            ul ul.i {{ list-style-type: inherit }}
+            </style></head><body style="margin:0;font:20px serif">
+            <pre id="pp">{line}</pre>
+            <pre id="pw" class="w">{line}</pre>
+            <pre id="pv" class="v">{line}</pre>
+            <div id="rref" dir="rtl">Hello</div>
+            <div id="rd" dir="rtl" class="d">Hello</div>
+            <div id="lref">Hello</div>
+            <ul><li><ol class="i"><li id="oli">Hello</li></ol></li></ul>
+            <ul><li><ol class="u"><li id="olu">Hello</li></ol></li></ul>
+            <ul><li><ol style="list-style-type:disc"><li id="old">Hello</li></ol></li></ul>
+            <ul><li><ol><li id="olp">Hello</li></ol></li></ul>
+            <ul><li><ul class="i"><li id="uli">Hello</li></ul></li></ul>
+            <ul><li><ul style="list-style-type:disc"><li id="uld">Hello</li></ul></li></ul>
+            <ul><li><ul><li id="ulp">Hello</li></ul></li></ul>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the dark-pixel count of each column in [x0, x1) across element `id`'s rows (its
+    /// rect, 2 px of margin above and below).
+    fn css_wide_rest_columns(e: &mut crate::AetherEngine, id: &str, x0: usize, x1: usize) -> Vec<usize> {
+        let (_, t, _, h) = imgalt_rect(e, id);
+        let (y0, y1) = ((t - 2.0).max(0.0) as usize, (t + h + 2.0).ceil() as usize);
+        (x0..x1).map(|x| imgalt_ink(e, x, x + 1, y0, y1)).collect()
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the marker columns of list item `id`: the 36 px left of its box.
+    fn css_wide_rest_marker(e: &mut crate::AetherEngine, id: &str) -> Vec<usize> {
+        let l = imgalt_rect(e, id).0.max(0.0) as usize;
+        css_wide_rest_columns(e, id, l.saturating_sub(36), l)
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `pre.w { white-space: inherit }` under a `normal` body wraps its long line (more
+    /// than 1.5 x the plain pre's one-line height; the plain pre does not wrap, armed); a later `white-space: pre` in the
+    /// same block beats the inherit (one line, the plain pre's height).
+    #[test]
+    fn css_wide_rest_pre_wraps() {
+        let mut e = css_wide_rest_engine();
+        let h = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).3;
+        let (pp, pw, pv) = (h(&mut e, "pp"), h(&mut e, "pw"), h(&mut e, "pv"));
+        assert!(pp > 5.0 && pp < 40.0, "the plain pre is one line ({pp})");
+        assert!(pw > 1.5 * pp, "pre.w wraps like its normal parent ({pw} vs one line {pp})");
+        assert!((pv - pp).abs() <= 0.5, "the later pre beats the inherit ({pv} vs {pp})");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `div.d { direction: inherit }` on a `dir=rtl` block under an ltr body lays out
+    /// ltr: its ink is the plain ltr block's, starting in the left half; the plain `dir=rtl` block's starts in the right
+    /// half (armed).
+    #[test]
+    fn css_wide_rest_direction_ltr() {
+        let mut e = css_wide_rest_engine();
+        let first = |c: &[usize]| c.iter().position(|&n| n > 0).unwrap_or(usize::MAX);
+        let lref = css_wide_rest_columns(&mut e, "lref", 0, 400);
+        let rref = css_wide_rest_columns(&mut e, "rref", 0, 400);
+        let rd = css_wide_rest_columns(&mut e, "rd", 0, 400);
+        assert!(lref.iter().sum::<usize>() > 20, "the reference run paints");
+        assert!(first(&rref) > 200 && first(&rref) != usize::MAX, "the plain dir=rtl block starts right (armed)");
+        assert!(first(&rd) < 200, "the inheriting block starts left");
+        assert_eq!(rd, lref, "the inheriting block lays out as the ltr reference");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ol.i { list-style-type: inherit }` and `ol.u { list-style-type: unset }` inside
+    /// a `ul` item take the ul's disc past the ol's decimal tag road: their item's marker ink is the disc-styled ol twin's,
+    /// and the plain ol's "1." differs (armed).
+    #[test]
+    fn css_wide_rest_list_ol_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "old");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "olp"), disc, "the plain ol's decimal is not the disc (armed)");
+        for id in ["oli", "olu"] {
+            assert_eq!(css_wide_rest_marker(&mut e, id), disc, "#{id}: the parent's disc");
+        }
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ul ul.i { list-style-type: inherit }` takes the outer ul's disc past the depth
+    /// match's circle: the disc-styled twin's marker ink, not the plain nested ul's (armed).
+    #[test]
+    fn css_wide_rest_list_nested_ul_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "uld");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "ulp"), disc, "the plain nested ul's circle is not the disc (armed)");
+        assert_eq!(css_wide_rest_marker(&mut e, "uli"), disc, "the inheriting ul takes the outer disc");
+    }
 }
