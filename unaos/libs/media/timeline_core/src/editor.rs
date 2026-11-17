@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAOPACITY (SR868): `opacity <pct>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -688,6 +688,36 @@ impl EditorState {
         Some(match n.as_slice() {
             [Some(l), Some(t), Some(r), Some(b)] => self.set_crop(crate::Crop { l: *l, t: *t, r: *r, b: *b }),
             _ => Err(EditError::Crop),
+        })
+    }
+}
+
+// ---- STRIAOPACITY (LEDGER SR868): the selection's opacity from the editor through the one commit (named tail block) ----
+// `opacity <pct>` (percent 0..=100) rides THE verb dispatch both faces call: every selected clip set through
+// `Timeline::set_opacity` as ONE commit (one undo step; `edl::write` keeps it as `* UNA ALPHA`). Refused by name: no
+// selection `EditError::NoClip`; a bare `opacity`, a word that is not 0..=100, or an audio clip `EditError::Opacity`.
+impl EditorState {
+    /// Every selected clip at opacity `pct` (percent), one commit; nothing commits when each already has it.
+    pub fn set_opacity(&mut self, pct: u8) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let picks = self.set.clone();
+        let tl = self.timeline.set_opacity(&picks, pct)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+    /// The `opacity` word of [`EditorState::verb`]; `None` when `v` is not an `opacity` verb.
+    fn opacity_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("opacity") {
+            return None;
+        }
+        Some(match (w.next().and_then(|p| p.parse::<u8>().ok()).filter(|&p| p <= crate::OPAQUE), w.next()) {
+            (Some(p), None) => self.set_opacity(p),
+            _ => Err(EditError::Opacity),
         })
     }
 }

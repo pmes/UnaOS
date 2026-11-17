@@ -3699,3 +3699,55 @@ fn striacrop_face_refusal_on_the_message_row() {
     assert_eq!(face.last_error.take(), Some(format!("crop 100 0 100 0: {}", EditError::Kind)));
     assert_eq!(face.state.undo_depth(), 0);
 }
+
+// ---- STRIAOPACITY (LEDGER SR868): a non-opaque clip over the track below, rendered through the one mix (named tail block) ----
+
+/// V1 A[0,30)@0 (utp1 counter 0), V2 B[0,10)@10 (counter 1000) at 50%: an overlay frame is timeline_core's ONE
+/// `vmix::mix_step` (Dissolve at 50/100: the top at alpha 128 over the lower) of the two sources' own frames, byte for
+/// byte; outside the overlay V1 shows alone; opaque, the overlay is V2's own frame.
+#[test]
+fn striaopacity_half_clip_renders_over_the_track_below() {
+    use timeline_core::schedule::Frac;
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    let tl = tl.set_opacity(&[(1, 0)], 50).unwrap();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..30, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 30);
+    for t in [10usize, 15, 19] {
+        let mut model = TestPattern::render(64, 48, t as u32);
+        timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, Frac { num: 50, den: 100 }, &mut model, &TestPattern::render(64, 48, 1000 + t as u32 - 10), 64, 48);
+        assert_eq!(sink.frames[t].1, model, "tick {t}");
+    }
+    let at = |t: usize| TestPattern::read_counter(&sink.frames[t].1, 64, 48);
+    assert_eq!((at(9), at(20), at(29)), (Some(9), Some(20), Some(29)));
+    let opaque = tl.set_opacity(&[(1, 0)], timeline_core::OPAQUE).unwrap();
+    let mut sink2 = Collect::default();
+    render(&opaque, 10..11, &src, &mut sink2).unwrap();
+    assert_eq!(sink2.frames[0].1, TestPattern::render(64, 48, 1000), "opaque: V2's own frame");
+    println!("striaopacity: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
+}
+
+/// The face's typed `opacity 50` reaches timeline_core's ONE verb dispatch: one undo step; a bad word is named.
+#[test]
+fn striaopacity_face_word_is_one_undo_step() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("opacity 50"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.timeline, tl0.set_opacity(&[(0, 1)], 50).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("opacity 150"));
+    assert_eq!(face.last_error.take().as_deref(), Some("opacity 150: opacity is a percent 0..=100, and video only"));
+    assert_eq!(face.state.undo_depth(), 1);
+}

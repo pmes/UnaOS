@@ -392,3 +392,30 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.verb("mark sideways"), None, "not a mark word");
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }
+
+// ---- STRIAOPACITY (LEDGER SR868): the `* UNA ALPHA` line (named tail block) ----
+
+/// A non-opaque clip writes ONE `* UNA ALPHA <pct>` line under its event and reads back equal; the opaque cut writes the
+/// known text unchanged (`CUT`); each refusal is named.
+#[test]
+fn striaopacity_alpha_line_round_trips_and_refusals_are_named() {
+    let tl = cut();
+    assert!(!edl::write(&tl, "CUT ONE").unwrap().contains("ALPHA"), "an opaque timeline writes no ALPHA line");
+    let tl = tl.set_opacity(&[(1, 0)], 50).unwrap();
+    let text = edl::write(&tl, "CUT ONE").unwrap();
+    assert_eq!(text.matches("* UNA ALPHA ").count(), 1);
+    let ev = text.lines().position(|l| l.contains(" V2 ")).unwrap();
+    assert_eq!(text.lines().nth(ev + 1), Some("* UNA ALPHA 50"), "under its own event");
+    let back = edl::parse(&text, 30).unwrap();
+    assert_eq!(back, tl);
+    assert_eq!(back.tracks[1].clips[0].opacity, 50);
+    assert_eq!(edl::write(&back, "CUT ONE").unwrap(), text);
+    let head = "TITLE: X\nFCM: NON-DROP FRAME\n";
+    let v = "001  A        V     C        00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n";
+    let a = "001  A        A     C        00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n";
+    assert_eq!(edl::parse(&format!("{head}* UNA ALPHA 50\n"), 25), Err(EdlError::Syntax { line: 3 }), "no event above");
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA 101\n"), 25), Err(EdlError::Syntax { line: 4 }));
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA half\n"), 25), Err(EdlError::Syntax { line: 4 }));
+    assert_eq!(edl::parse(&format!("{head}{a}* UNA ALPHA 50\n"), 25), Err(EdlError::Edit(EditError::Opacity)), "audio");
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA 0\n"), 25).unwrap().tracks[0].clips[0].opacity, 0);
+}

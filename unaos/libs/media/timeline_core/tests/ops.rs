@@ -364,3 +364,32 @@ mod striacrop {
         }
     }
 }
+
+// ---- STRIAOPACITY (LEDGER SR868): the `opacity <pct>` word through the one commit (named tail block) ----
+
+/// `opacity 50` sets every selected clip as ONE undo step; the same value again commits nothing; each refusal is named.
+#[test]
+fn striaopacity_opacity_word_is_one_undo_step() {
+    use timeline_core::editor::EditorState;
+    let (mut tl, a, _) = base();
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("opacity 50"), Some(Err(EditError::NoClip)), "nothing selected");
+    st.select(0, 0).unwrap();
+    st.select_add(0, 1).unwrap();
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("opacity 50"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1);
+    assert_eq!(st.timeline, tl.set_opacity(&[(0, 0), (0, 1)], 50).unwrap());
+    assert!(st.timeline.tracks[0].clips.iter().all(|c| c.opacity == 50));
+    assert_eq!(st.verb("opacity 50"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1, "the same value commits nothing");
+    for bad in ["opacity", "opacity 101", "opacity half", "opacity 50 60"] {
+        assert_eq!(st.verb(bad), Some(Err(EditError::Opacity)), "{bad}");
+    }
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("opacity 50"), Some(Err(EditError::Opacity)), "an audio clip");
+    assert_eq!(st.timeline, tl);
+}
