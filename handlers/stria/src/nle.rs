@@ -1405,7 +1405,7 @@ impl Sources {
         if let Ok(mut v) = self.stand_in.lock() {
             v.retain(|s| *s != id);
         }
-        self.seqs.push((id, Seq { w: f.width, h: f.height, ..seq }));
+        self.seqs.push((id, Seq { w: f.width, h: f.height, ..seq }.upright(&p))); // STRIASEQTHREE (SR9022): a JPEG reel's size taken upright (file tail)
         Ok(())
     }
     /// STRIAIMPORTIMAGESEQUENCE: source `id`'s sequence, when it is one.
@@ -1432,20 +1432,20 @@ fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: Sourc
     let Some(q) = sources.seq(src) else { return Ok(None) };
     *run = None;
     let n = u64::try_from(src_t).ok().and_then(|k| q.file_at(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?; // STRIASEQREPORT (SR943): tick to file at the reel's rate (file tail)
-    if let Some(f) = q.held_frame(n, tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); // STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
+    if let Some(f) = q.held_frame(n, tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); let stamp = seq_stamp(&path); // STRIASEQTHREE (SR9022): the file's stamp before its read (file tail); STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
     let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
-    let img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; // STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
-    Ok(Some(q.keep(n, img.width, img.height, img.rgba, tl.tb.to_ns(src_t)))) // STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
+    let mut img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; img.apply_orientation(); // STRIASEQTHREE (SR9022): turned upright by its EXIF orientation (file tail); STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
+    Ok(Some(q.keep(n, img.width, img.height, img.rgba, tl.tb.to_ns(src_t), stamp))) // STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
 }
 
 // ---- STRIASEQINFO (LEDGER SR940): a sequence reel's line and its kept frame (named tail block) ----
 /// STRIASEQINFO (LEDGER SR940): a sequence reel's ONE kept frame `(file number, w, h, RGBA)`, owned by its [`Seq`] (so keyed by
 /// reel, then by number; a re-add drops it with the `Seq`). Locked for one take or one put, never across a read, a decode or
 /// the RGBA copy.
-type SeqHeld = std::sync::Mutex<Option<(u64, u32, u32, Arc<Vec<u8>>)>>;
+type SeqHeld = std::sync::Mutex<SeqKept>; // STRIASEQTHREE (SR9022): a bounded set of kept frames, each with its file stamp (file tail)
 
 impl Seq {
     /// STRIASEQINFO: the reel's person's line for [`Sources::summary`]: `seq <first>..=<last> <w>x<h>`.
@@ -1454,14 +1454,14 @@ impl Seq {
     }
     /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
     fn held_frame(&self, n: u64, pts_ns: i64) -> Option<Frame> {
-        let (w, h, rgba) = self.held.lock().ok().and_then(|g| g.as_ref().filter(|e| e.0 == n).map(|e| (e.1, e.2, e.3.clone())))?;
+        let st = seq_stamp(&self.path(n)); let (w, h, rgba) = self.held.lock().ok().and_then(|mut g| g.get(n, st))?; // STRIASEQTHREE (SR9022): the stat before the lock; a kept frame of a changed or removed file is not served (file tail)
         Some(Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba((*rgba).clone()) })
     }
     /// STRIASEQINFO: keep file number `n`'s decoded RGBA as the reel's one frame (the old one dropped) and hand it on as a `Frame`.
-    fn keep(&self, n: u64, w: u32, h: u32, rgba: Vec<u8>, pts_ns: i64) -> Frame {
+    fn keep(&self, n: u64, w: u32, h: u32, rgba: Vec<u8>, pts_ns: i64, stamp: SeqStamp) -> Frame { // STRIASEQTHREE (SR9022): the stamp taken before the read (file tail)
         let kept = Arc::new(rgba.clone());
         if let Ok(mut g) = self.held.lock() {
-            *g = Some((n, w, h, kept));
+            g.put(n, w, h, kept, stamp); // STRIASEQTHREE (SR9022): one of several kept frames (file tail)
         }
         Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba(rgba) }
     }
@@ -1739,4 +1739,107 @@ pub fn loudness_reading(tl: &Timeline, range: std::ops::Range<i64>, sources: &So
     let mut sink = LoudnessSink { l: None, watch };
     render(tl, range, sources, &mut sink)?;
     Ok(sink.l.map(|l| LoudnessReading { lufs: l.integrated(), range_lu: l.range_lu(), true_peak_db: l.true_peak_db() }))
+}
+
+// ---- STRIASEQTHREE (LEDGER SR9022): sequence cache span and staleness, upright frames (named tail block) ----
+/// STRIASEQTHREE (LEDGER SR9022): a sequence file's stamp `(length, modified)` from one `std::fs::metadata` (no read); `None`
+/// when the file is gone or its filesystem keeps no modified time (such a frame is never served from the cache).
+type SeqStamp = Option<(u64, std::time::SystemTime)>;
+
+/// STRIASEQTHREE: the stamp of the file at `path`, taken before its read and again before a kept frame is served.
+fn seq_stamp(path: &str) -> SeqStamp {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// STRIASEQTHREE: at most this many kept frames per sequence reel (a short scrub back and forth reads no file).
+const SEQ_KEPT: usize = 8;
+/// STRIASEQTHREE: at most this many bytes of kept RGBA per sequence reel (the newest frame is kept whatever its size).
+const SEQ_KEPT_BYTES: usize = 128 * 1024 * 1024;
+
+/// STRIASEQTHREE: a sequence reel's kept frames `(file number, w, h, RGBA, stamp)`, least recently used first; owned by its
+/// [`Seq`] behind SR940's one Mutex (`SeqHeld`), locked for one `get` or one `put`, never across a stat, read or decode.
+#[derive(Default)]
+struct SeqKept(Vec<(u64, u32, u32, Arc<Vec<u8>>, SeqStamp)>);
+
+impl SeqKept {
+    /// STRIASEQTHREE: file number `n`'s kept frame when its stamp is `st` (taken just before); a hit moves to the back, a
+    /// kept frame whose file changed or is gone is dropped and not served.
+    fn get(&mut self, n: u64, st: SeqStamp) -> Option<(u32, u32, Arc<Vec<u8>>)> {
+        let i = self.0.iter().position(|e| e.0 == n)?;
+        let e = self.0.remove(i);
+        if st.is_none() || e.4 != st {
+            return None;
+        }
+        let out = (e.1, e.2, e.3.clone());
+        self.0.push(e);
+        Some(out)
+    }
+    /// STRIASEQTHREE: keep file number `n`'s frame (replacing an older copy of it) at the back, then drop from the front while
+    /// more than [`SEQ_KEPT`] frames or [`SEQ_KEPT_BYTES`] bytes are kept, the newest always staying.
+    fn put(&mut self, n: u64, w: u32, h: u32, rgba: Arc<Vec<u8>>, stamp: SeqStamp) {
+        self.0.retain(|e| e.0 != n);
+        self.0.push((n, w, h, rgba, stamp));
+        while self.0.len() > 1 && (self.0.len() > SEQ_KEPT || self.0.iter().map(|e| e.3.len()).sum::<usize>() > SEQ_KEPT_BYTES) {
+            self.0.remove(0);
+        }
+    }
+}
+
+impl Seq {
+    /// STRIASEQTHREE: the reel with its size upright: a `.jpg` / `.jpeg` reel decodes its first file `p` whole (pixel_core's
+    /// `decode` reads the EXIF orientation; its header reader does not) and an orientation 5..=8 swaps `w` and `h`. Any other
+    /// format, or a first file that does not decode (its tick refuses it by name), keeps the header size.
+    fn upright(self, p: &str) -> Seq {
+        if seq_format(&self.suffix).map(|q| q.0) != Some(gneiss_pal::dsp::image::Format::Jpeg) {
+            return self;
+        }
+        let o = std::fs::read(p).ok().and_then(|b| gneiss_pal::dsp::image::decode(&b).ok()).map_or(1, |i| i.orientation);
+        if (5..=8).contains(&o) { Seq { w: self.h, h: self.w, ..self } } else { self }
+    }
+}
+
+#[cfg(test)]
+mod striaseqthree_kept {
+    use super::{Arc, SEQ_KEPT, SEQ_KEPT_BYTES, SeqKept, SeqStamp};
+
+    fn st(len: u64) -> SeqStamp {
+        Some((len, std::time::SystemTime::UNIX_EPOCH))
+    }
+
+    #[test]
+    fn striaseqthree_kept_evicts_least_recent_by_count() {
+        let mut k = SeqKept::default();
+        for n in 0..SEQ_KEPT as u64 {
+            k.put(n, 1, 1, Arc::new(vec![n as u8; 4]), st(n));
+        }
+        assert!(k.get(0, st(0)).is_some(), "file 0 is touched, so file 1 is now the least recent");
+        k.put(99, 1, 1, Arc::new(vec![9; 4]), st(99));
+        assert_eq!(k.0.len(), SEQ_KEPT);
+        assert!(k.get(1, st(1)).is_none(), "the least recent went first");
+        assert!(k.get(0, st(0)).is_some() && k.get(99, st(99)).is_some());
+    }
+
+    #[test]
+    fn striaseqthree_kept_evicts_by_bytes_keeps_newest() {
+        let mut k = SeqKept::default();
+        let half = SEQ_KEPT_BYTES / 2 + 1;
+        k.put(1, 1, 1, Arc::new(vec![0; half]), st(1));
+        k.put(2, 1, 1, Arc::new(vec![0; half]), st(2));
+        assert_eq!(k.0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![2], "two halves overflow the budget: the older goes");
+        k.put(3, 1, 1, Arc::new(vec![0; SEQ_KEPT_BYTES + 1]), st(3));
+        assert_eq!(k.0.iter().map(|e| e.0).collect::<Vec<_>>(), vec![3], "the newest stays whatever its size");
+    }
+
+    #[test]
+    fn striaseqthree_kept_stale_stamp_misses_and_drops() {
+        let mut k = SeqKept::default();
+        k.put(5, 2, 2, Arc::new(vec![7; 16]), st(10));
+        assert!(k.get(5, st(11)).is_none(), "a rewritten file (other stamp) is not served");
+        assert!(k.get(5, st(10)).is_none(), "and its stale frame was dropped");
+        k.put(5, 2, 2, Arc::new(vec![7; 16]), st(10));
+        assert!(k.get(5, None).is_none(), "a removed file (no stamp) is not served");
+        k.put(6, 2, 2, Arc::new(vec![7; 16]), None);
+        assert!(k.get(6, None).is_none(), "a frame kept without a stamp is never served");
+    }
 }
