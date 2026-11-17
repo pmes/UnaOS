@@ -10016,7 +10016,7 @@ b</div>
         layout_core::FontSel { family, weight: 400, italic: false, stretch: 100 }
     }
 
-    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ex` under a 20px font lays out at 10 x the face's x-height, the value
+    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ex` under a 20px font lays out at 10 x the face's x-height (whole-px rounded), the value
     /// `font_units` gives (the first inline copy's, unchanged: armed-neutral).
     #[test]
     fn font_units_ex_width_face() {
@@ -10025,7 +10025,7 @@ b</div>
         let w = rect_by_id(&t, "e").unwrap().2;
         println!("[font_units] face: fs 20 ex {} ch {} -> #e {}", u.2, u.3, w);
         assert_eq!((u.0, u.1), (20.0, 16.0), "the tuple carries fs and root_fs through");
-        assert!((w - 10.0 * u.2).abs() < 0.01, "#e: 10ex = 10 x {} (got {w})", u.2);
+        assert_eq!(w, (10.0 * u.2).round(), "#e: 10ex = 10 x {}, at layout's whole-px rounding", u.2);
     }
 
     /// AETHERFONTUNITSONEFN (SR1142): `width: 10ch` under a 20px font lays out at 10 x the advance of "0".
@@ -10034,7 +10034,7 @@ b</div>
         let t = font_units_tree();
         let u = layout_core::font_units(&crate::layout::HostFonts, font_units_mono_sel(), 20.0, 16.0);
         let w = rect_by_id(&t, "c").unwrap().2;
-        assert!((w - 10.0 * u.3).abs() < 0.01, "#c: 10ch = 10 x {} (got {w})", u.3);
+        assert_eq!(w, (10.0 * u.3).round(), "#c: 10ch = 10 x {}, at layout's whole-px rounding", u.3);
     }
 
     /// AETHERFONTUNITSONEFN (SR1142): the same declarations re-resolved by the container-unit road (a `1cqw` sibling
