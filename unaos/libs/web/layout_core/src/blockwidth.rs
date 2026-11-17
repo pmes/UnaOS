@@ -41,7 +41,7 @@ fn walk<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, saved: &mut Saved) {
             }
             let auto_l = kst.margin.left == LengthPercentageAuto::auto();
             let auto_r = kst.margin.right == LengthPercentageAuto::auto();
-            if (auto_l || auto_r) && !kst.max_size.width.is_auto() {
+            if (auto_l || auto_r) && (!kst.max_size.width.is_auto() || shrink_table(tree, k)) {
                 continue; // centred under a max-width: keep the clamped 100%
             }
             let mut n = kst.clone();
@@ -173,4 +173,14 @@ pub(crate) fn auto_overflow<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Saved
         }
     }
     changed
+}
+
+// ---- AETHERTABLEALIGN (LEDGER SR1071): a shrink-to-fit table keeps its auto margins (named tail block) ----
+
+/// AETHERTABLEALIGN (SR1071): a table has a used width of its own (`table::apply` fixes it in the second pass, after
+/// this pass ran), so its auto horizontal margins are kept like the max-width case: taffy's auto margins then centre
+/// it (`<table align=center>`, an author `margin: 0 auto`), either direction, ahead of the table's align-self.
+fn shrink_table<H: Host>(tree: &LayoutTree<H>, k: NodeId) -> bool {
+    use crate::DomNode;
+    tree.node_map.get(&k).and_then(|n| n.tag()).is_some_and(|t| t == "table")
 }

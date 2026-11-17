@@ -569,7 +569,7 @@ pub fn build_taffy_tree<H: Host>(
             _ => None,
         };
         // AETHERCAPTIONSIDE (SR460): a caption's align= is caption-side (`caption_side_attr`), never text-align.
-        if let Some(a) = dom_node.attr("align").filter(|_| tag != "caption") {
+        if let Some(a) = dom_node.attr("align").filter(|a| tag != "caption" && !table_align_hint::<H>(a, &tag, &mut style, &mut paint, cx)) {
             match a.trim().to_ascii_lowercase().as_str() {
                 "center" | "middle" => paint.text_align = Some(5),
                 "right" => paint.text_align = Some(6),
@@ -4021,4 +4021,26 @@ fn system_color_pass<H: Host>(tree: &mut LayoutTree<H>) {
             resolve_system_colors(p, scheme);
         }
     }
+}
+
+// ---- AETHERTABLEALIGN (LEDGER SR1071): a table's align= is auto margins / float, never text-align (named tail block) ----
+
+/// AETHERTABLEALIGN (SR1071): HTML rendering §15.3.11 and Blink's HTMLTableElement presentation attribute: a `<table>`'s
+/// align=center is `margin-left: auto; margin-right: auto` (the BOX centres), align=left / right is `float: left` /
+/// `float: right`, any other value (`middle` included) is nothing, and none of them sets text-align (the cells keep
+/// their own alignment). Each hint is ONE declaration string through [`apply_inline_style`] (the same parser,
+/// `fold_into` and `merge_paint` style="" uses), written before style="" and the author cascade, so CSS beats it.
+/// Returns false for every other tag (the text-align road runs as before), true for a table (no text-align).
+fn table_align_hint<H: Host>(align: &str, tag: &str, style: &mut Style, paint: &mut PaintStyle<H>, cx: &ParseCx) -> bool {
+    if tag != "table" {
+        return false;
+    }
+    let decl = match align.trim().to_ascii_lowercase().as_str() {
+        "center" => "margin-left: auto; margin-right: auto",
+        "left" => "float: left",
+        "right" => "float: right",
+        _ => return true,
+    };
+    apply_inline_style::<H>(decl, style, paint, cx);
+    true
 }
