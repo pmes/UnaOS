@@ -502,3 +502,17 @@ fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]
         None => env,
     }
 }
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): the clip a mix layer plays (named tail block) ----
+impl AudioRun {
+    /// STRIASPEEDREVERSE: the clip layer `li` plays: `None` for an under layer (a crossfade's outgoing handle) or one no clip
+    /// of its source covers at the run's first tick (a handle past the clip's end), else that covering clip. The host's
+    /// reversed take reads its `reverse` / `rate_q16` here.
+    pub fn layer_clip(&self, tl: &Timeline, li: usize) -> Option<crate::Clip> {
+        let l = self.layers.get(li)?;
+        if self.under(li) {
+            return None;
+        }
+        tl.clip_at(l.track, self.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src)
+    }
+}
