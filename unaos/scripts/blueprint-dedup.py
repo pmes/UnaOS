@@ -13,6 +13,7 @@ row; a group with no provable drop is REFUSED and left as it is. A literal `BUIL
 THE PROOF (asserts, per row, before == after): the distinct capitalised KEY tokens; every SRnnn id; the ids written
 `BUILT|MEASURED-NOT-NEEDED by|as SRnnn`; the keys written `KEY BUILT|MEASURED-NOT-NEEDED by|as`; the keys `owed` and
 not built; the paren balance (net, unmatched `)`, unclosed `(`); the sheet's line count; every other line byte-identical.
+IMPORT (BLUEPRINTDEDUPONFOLD, SR1020): `copy_groups(row)` is the one entry blueprint-check.py calls (by path) for its copy-group check.
 usage: blueprint-dedup.py <sheet> "<row prefix>" [--dry-run]   rewrite (or only print) that row
        blueprint-dedup.py <sheet> --dry-run --all              print the drops every `- ` row would take
 exit 0 (no refusal), 1 (a group refused), 2 (usage / the row prefix matches no line or more than one).
@@ -75,12 +76,12 @@ def groups(r):
 
 
 def step(r, base, refused):
-    """One provable drop: (new row, log line) or None."""
+    """One provable drop: (new row, log line, (anchor, "dropped"|"refused")) or None."""
     m = STUTTER.search(r)
     if m:
         new = r[:m.start()] + m.group(1) + r[m.end():]
         if proof(new) == base:
-            return new, "stutter at %d: dropped %d chars %r" % (m.start(), m.end() - m.start() - len(m.group(1)), m.group(1))
+            return new, "stutter at %d: dropped %d chars %r" % (m.start(), m.end() - m.start() - len(m.group(1)), m.group(1)), (m.group(1), "dropped")
     pr, gs = groups(r)
     for ps, (encl, an, _) in gs:
         if (an, r[ps[0]:ps[0] + 200]) in refused:
@@ -89,7 +90,7 @@ def step(r, base, refused):
             a, b = ps[i], ps[i + 1]
             new = r[:a] + r[b:]
             if proof(new) == base:
-                return new, "%s: copy %d of %d at %d dropped (earlier copy, %d chars)" % (an, i + 1, len(ps), a, b - a)
+                return new, "%s: copy %d of %d at %d dropped (earlier copy, %d chars)" % (an, i + 1, len(ps), a, b - a), (an, "dropped")
             g = b + len(an)
             if r[g:g + 2] == " (" and g + 1 in pr:
                 e = pr[g + 1] + 1
@@ -100,22 +101,23 @@ def step(r, base, refused):
                 s -= 1
             new = r[:s] + r[e:]
             if proof(new) == base:
-                return new, "%s: copy %d of %d at %d dropped (later copy, %d chars)" % (an, i + 2, len(ps), b, e - s)
+                return new, "%s: copy %d of %d at %d dropped (later copy, %d chars)" % (an, i + 2, len(ps), b, e - s), (an, "dropped")
         refused.add((an, r[ps[0]:ps[0] + 200]))
-        return r, "%s: REFUSED, %d copies at %s (no drop keeps the proof)" % (an, len(ps), ps)
+        return r, "%s: REFUSED, %d copies at %s (no drop keeps the proof)" % (an, len(ps), ps), (an, "refused")
     return None
 
 
 def dedup(r):
-    base, refused, log = proof(r), set(), []
+    base, refused, log, acts = proof(r), set(), [], []
     while True:
         s = step(r, base, refused)
         if s is None:
             break
-        r, line = s
+        r, line, act = s
         log.append(line)
+        acts.append(act)
     assert proof(r) == base
-    return r, log, len(refused)
+    return r, log, len(refused), acts
 
 
 def main(argv):
@@ -130,7 +132,7 @@ def main(argv):
         print("blueprint-dedup: row prefix %r matches %d lines" % (args[1], len(targets))); return 2
     out, refusals, dropped = list(lines), 0, 0
     for i in targets:
-        new, log, nref = dedup(lines[i])
+        new, log, nref, _ = dedup(lines[i])
         refusals += nref
         if log:
             print("L%d %d -> %d chars" % (i + 1, len(lines[i]), len(new)))
@@ -144,6 +146,14 @@ def main(argv):
     if not dry and dropped:
         open(path, "w", encoding="utf-8").write("\n".join(out))
     return 1 if refusals else 0
+
+
+
+# ---- BLUEPRINTDEDUPONFOLD (LEDGER SR1020): the detector's importable entry (named tail block) ----
+def copy_groups(r):
+    """The copy groups dedup() would act on in row r: a sorted list of distinct (anchor, verdict), verdict "dropped" (a
+    provable drop, the stutter included) or "refused" (kept: no drop keeps the proof). [] = the row is clean."""
+    return sorted(set(dedup(r)[3]))
 
 
 if __name__ == "__main__":

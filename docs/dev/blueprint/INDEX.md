@@ -31,6 +31,32 @@ A sheet states what the tree holds. It is not a roadmap. History and reasons liv
 BLUEPRINT: sheets=<a>,<b>  keeps=BP-<A>-1,BP-<A>-4,…  changes=BP-<B>-3 (R<n> | seat: <one line>)  new=BP-<B>-<n>
 ```
 
+## §5 row grammar (what the gate parses; BLUEPRINTDEDUPONFOLD, LEDGER SR1020)
+
+A §5 ("Ruled, unbuilt / open") row is ONE `- ` line. The patterns below are quoted verbatim from
+`unaos/scripts/blueprint-dedup.py`; GATE-BLUEPRINT check 6 (`unaos/scripts/blueprint-check.py` `grammar_quoted`) reds this
+sheet when a quote and the script differ, so this section cannot drift from the code. Anything not quoted here is prose.
+
+1. A row is edited IN PLACE: an arc adds its clause to the row that names its subject. A sheet at its cap never gains a row.
+   The cap is MAX_LINES 120 counted as the checker splits the file, so `wc -l` stays at 119 or under.
+2. The prefix is free-form. Measured at SR1020's cut over 229 §5 rows: `- KEY (...):` 142, `- KEY (SRnnn owed):` 31,
+   `- KEY (LEDGER SRnnn):` 24, `- KEY:` 10, other 22. The gate keys a row on its text up to the first `:` only to name it.
+3. A KEY is `\b[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*[a-z]?\b` (KEY). A ledger id is `\bSR\d+\b` (SRID).
+4. A built clause's ANCHOR is `\b(?:BUILT|MEASURED-NOT-NEEDED) (?:by|as) (?:LEDGER )?SR\d+\b` (ANCH), normally followed by its
+   body in one paren group: `KEY BUILT by SRnnn (...)`, `KEY MEASURED-NOT-NEEDED by SRnnn (...)`. The built id is read by
+   `\b(?:BUILT|MEASURED-NOT-NEEDED) (?:by|as) (?:LEDGER )?(?:[A-Z0-9]+ )?(SR\d+)\b` (BUILTID), the built key by
+   `\b([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+[a-z]?) (?:BUILT|MEASURED-NOT-NEEDED) (?:by|as)\b` (BUILTKEY).
+5. An owed item is `\bowed (?:from it:? )?([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+[a-z]?)\b` (OWEDKEY): `owed KEY (...)`. A key both owed
+   and built in one row counts as built.
+6. Parens balance: every `(` closes in the row, and no `)` is unmatched (`balance()`).
+7. ONE copy per clause. A COPY GROUP is two or more ANCH matches with the same text, the same enclosing paren and the same
+   next 40 characters; a stutter is `(\b(?:BUILT|MEASURED-NOT-NEEDED) (?:by|as) (?:LEDGER )?SR\d+) \1\b` (STUTTER). Check 6
+   reds a row holding one (`copy_groups()`, the dedup's own detector); `blueprint-dedup.py <sheet> "<row prefix>"` removes it
+   when its proof holds. A group it REFUSES is kept and must be named on `KNOWN_REFUSED` in the checker (today the NLE5b
+   SR775 pair in handlers.md and the VUG-DOC SR663 pair in vug.md).
+8. NOT parsed by either script (prose, kept readable): `carried`, `retired`, `measured and BOUNDED by` (no sheet uses the
+   last today). A rule they should carry is owed to a parse here first.
+
 ## The sheets
 
 | sheet | covers | files it owns (kernel paths under `unaos/crates/kernel/src/` unless stated) |
