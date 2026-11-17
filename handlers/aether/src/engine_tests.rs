@@ -8956,6 +8956,40 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "cn", "lineHeight"), "normal");
     }
 
+    // ---- AETHERCSSBORDERCOLORONEROAD (LEDGER SR1098): border-color takes ONE road; a colour creates no side (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): two 40x20 boxes, rows 12px apart, under a green body ink: `#oa` `border: 2px
+    /// solid; border-top-style: none; border-color: red`; `#ob` `border-top-style: solid; border-color: red`.
+    fn border_color_one_road_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="oa" style="width:40px;height:20px;border:2px solid;border-top-style:none;border-color:red"></div>
+            <div id="ob" style="width:40px;height:20px;border-top-style:solid;border-color:red"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §4.3 a colour creates no side: `#oa` paints no top edge
+    /// (before SR1098 the one-value road re-created a 2px red top), its left edge red (armed); `#ob` paints its top red
+    /// (armed) and no other edge (before SR1098 a fabricated 3px red frame on the three styleless sides).
+    #[test]
+    fn border_color_one_road_paints() {
+        let mut e = border_color_one_road_engine();
+        let a = border_side_color_edges(&mut e, "oa");
+        assert!(!css_wide_red(a[0]), "#oa: no top edge: {:?}", a[0]);
+        assert!(css_wide_red(a[3]), "armed: #oa's left edge is red: {:?}", a[3]);
+        let b = border_side_color_edges(&mut e, "ob");
+        assert!(css_wide_red(b[0]), "armed: #ob's top is red: {:?}", b[0]);
+        for (i, c) in b.iter().enumerate().skip(1) {
+            assert!(!css_wide_red(*c), "#ob: side {i} paints no red: {c:?}");
+        }
+    }
+
     // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
 
     /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a
@@ -9479,6 +9513,142 @@ b</div>
         assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
     }
 
+    // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): 40x20 boxes in green ink, rows 12px apart: `#tn` `border: thin solid`, `#tk`
+    /// `border: thick solid`, `#tz` `border-width: 1px 0; border-style: solid`.
+    fn border_thin_thick_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="tn" style="width:40px;height:20px;border:thin solid"></div>
+            <div id="tk" style="width:40px;height:20px;border:thick solid"></div>
+            <div id="tz" style="width:40px;height:20px;border-width:1px 0;border-style:solid"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): `#tn` is a 42x22 border box whose row 0 (mid-x) is the ink and row 1 not; `#tk`
+    /// is 50x30 with rows 0-4 inked and row 5 not (before SR1075 both were medium 3px, 46x26); `#tz` is 40x22 (top / bottom
+    /// 1px, left / right 0; before SR1075 the two-value declaration was dropped). getComputedStyle reads 1px / 5px.
+    #[test]
+    fn border_thin_thick_paints() {
+        let mut e = border_thin_thick_engine();
+        for (id, bw, size) in [("tn", 1usize, (42.0, 22.0)), ("tk", 5, (50.0, 30.0))] {
+            let (l, t, w, h) = imgalt_rect(&mut e, id);
+            assert_eq!((w, h), size, "#{id}: the border box");
+            let x = (l + w / 2.0) as usize;
+            for dy in 0..bw {
+                let c = imgalt_px(&mut e, x, t as usize + dy);
+                assert!(css_wide_green(c), "#{id}: row {dy} is the ink: {c:?}");
+            }
+            let c = imgalt_px(&mut e, x, t as usize + bw);
+            assert!(!css_wide_green(c), "#{id}: row {bw} is inside the frame: {c:?}");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderTopWidth"), format!("{bw}px"), "#{id}: getComputedStyle");
+        }
+        let (_, _, w, h) = imgalt_rect(&mut e, "tz");
+        assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
+    }
+
+    // ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORSIDES (SR1085): under a green body ink, `#bs` a 40x20 box with `border: 2px solid;
+    /// border-color: red blue` (top / bottom red, left / right blue; before SR1085 the value was dropped and the frame
+    /// took the ink).
+    fn border_color_sides_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="bs" style="width:40px;height:20px;border:2px solid;border-color:red blue"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORSIDES (SR1085): `border-color: red blue` paints the top and bottom edges red and the left and
+    /// right edges blue; getComputedStyle reads borderLeftColor rgb(0, 0, 255) (border-top-color is no report column:
+    /// AETHER-CSSOM-BORDER-SIDE-COLOR-COLUMNS owed).
+    #[test]
+    fn border_color_sides_paints_two_colours() {
+        let mut e = border_color_sides_engine();
+        let edges = border_side_color_edges(&mut e, "bs");
+        for (i, c) in edges.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!(css_wide_red(*c), "#bs: side {i} is red: {c:?}");
+            } else {
+                assert!(css_wide_blue(*c), "#bs: side {i} is blue: {c:?}");
+            }
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "bs", "borderLeftColor"), "rgb(0, 0, 255)");
+    }
+
+    // ---- AETHERCSSSTICKYEMINSETRELATIVE (LEDGER SR1130): a sticky box's font-relative inset stays the sticky constraint on the re-resolution (named tail block) ----
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): 400x300, 20px-tall boxes in flow from y 0: `#c` a control, `#a` sticky
+    /// `top: 1em`, `#b` sticky `top: 16px`, a 20px-font wrapper holding `#r` relative `top: 1em`, `#d` a red 20px-font
+    /// sticky `top: 1em`, then a 2000px spacer.
+    fn sticky_em_inset_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .h { height: 20px }
+            </style></head><body style="margin:0">
+            <div id="c" class="h"></div>
+            <div id="a" class="h" style="position:sticky;top:1em"></div>
+            <div id="b" class="h" style="position:sticky;top:16px"></div>
+            <div style="font-size:20px"><div id="r" class="h" style="position:relative;top:1em"></div></div>
+            <div id="d" class="h" style="font-size:20px;position:sticky;top:1em;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): unscrolled, each sticky box sits at its normal-flow y (css-position-3
+    /// §3.4): `#a` at 20 like the px-inset `#b` at 40 and the control `#c` at 0; `#d` at 80. Before SR1130 the
+    /// font-relative re-resolution folded `top: 1em` into taffy as a relative offset (`#a` 36, `#d` 100).
+    #[test]
+    fn sticky_em_inset_normal_flow() {
+        let mut e = sticky_em_inset_engine();
+        let top = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).1;
+        assert_eq!(top(&mut e, "c"), 0.0, "#c: the control");
+        assert_eq!(top(&mut e, "a"), 20.0, "#a: sticky top: 1em sits at its normal-flow y (armed: 36 before SR1130)");
+        assert_eq!(top(&mut e, "b"), 40.0, "#b: sticky top: 16px sits at its normal-flow y");
+        assert_eq!(top(&mut e, "d"), 80.0, "#d: sticky top: 1em at 20px sits at its normal-flow y (armed: 100 before SR1130)");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): a relative box's font-relative inset still offsets it, at its own
+    /// font: `#r` normal y 60 + 1em at 20px = 80 (the re-resolution's fold for a kind that is not sticky, unchanged).
+    #[test]
+    fn sticky_em_inset_relative_unchanged() {
+        let mut e = sticky_em_inset_engine();
+        assert_eq!(imgalt_rect(&mut e, "r").1, 80.0, "#r: relative top: 1em at 20px offsets 20");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): scrolled 400px, the red `#d` (document y 80) holds at its inset, 1em of
+    /// its own 20px font: rows 20..39 red, rows 19 and 40 not (`inset_px` is re-resolved inside the re-application). The
+    /// scroll is a full viewport or more so the frame repaints whole: a shorter scroll blits the surface and repaints
+    /// only the exposed strip, leaving a stuck box unpainted (owed AETHER-CSS-STICKY-SCROLL-BLIT-DAMAGE).
+    #[test]
+    fn sticky_em_inset_sticks_at_own_font() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d: row 20 is its first row (stuck at 1em = 20px)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "#d: row 39 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
+        assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
+    }
+
     // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
 
     /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): one 40x20 box per row under a green parent: `#ta` `border: 2px solid
@@ -9581,6 +9751,82 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "oa", "outlineColor"), "rgba(255, 0, 0, 0)", "#oa: cssom");
     }
 
+    // ---- AETHERCSSSTICKYSCROLLBLITDAMAGE (LEDGER SR1135): a short scroll repaints the whole viewport when a box holds its place (named tail block) ----
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): scrolled 200px (shorter than the 300px viewport), the stuck red `#d` holds
+    /// at 1em = 20px: rows 20..39 red, rows 19 and 40 not. Before SR1135 the blit carried `#d`'s old rows 80..99 off-screen
+    /// and repainted only the exposed strip 100..300, so row 20 stayed white.
+    #[test]
+    fn sticky_scroll_blit_short_scroll_paints_stuck_box() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 200.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 200.0, "the page scrolled 200px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d: row 20 is its first row (armed: white before SR1135)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "#d: row 39 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
+        assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): after a full repaint at 400px, a +50 scroll keeps `#d` at rows 20..39
+    /// (before SR1135 the blit moved its rows off the top and left old document rows there), and a -50 scroll keeps it
+    /// there with no ghost at rows 70..89 (before SR1135 the blit shifted the stuck rows down by 50).
+    #[test]
+    fn sticky_scroll_blit_follow_on_scrolls() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 450.0, "the page scrolled to 450px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "+50: row 20 is still #d's first row (armed)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "+50: row 39 is still #d's last row");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled back to 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "-50: row 20 is #d's first row");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "-50: row 39 is #d's last row");
+        assert_ne!(imgalt_px(&e, 10, 70), (255, 0, 0), "-50: no ghost at row 70 (armed: the blit shifted row 20 here)");
+        assert_ne!(imgalt_px(&e, 10, 89), (255, 0, 0), "-50: no ghost at row 89 (armed: the blit shifted row 39 here)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a page with no fixed or sticky box keeps the blit: a 50px scroll damages
+    /// only the exposed 50px strip (unchanged); the sticky fixture's 50px scroll damages the whole viewport.
+    #[test]
+    fn sticky_scroll_blit_plain_page_damage_is_strip() {
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="height:2000px"></div></body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "plain page: the exposed strip only");
+        let mut s = sticky_em_inset_engine();
+        s.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(s.damage_rects, vec![(0, 0, 400, 300)], "sticky page: the whole viewport");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a `position: fixed` box (top 10px, 20px tall) stays at rows 10..29 under
+    /// a 50px scroll; before SR1135 the blit moved its rows to -40..-21 and the strip repaint never revisited 10..29.
+    #[test]
+    fn sticky_scroll_blit_fixed_box_stays_put() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="position:fixed;top:10px;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 50.0, "the page scrolled 50px");
+        assert_eq!(imgalt_px(&e, 10, 10), (255, 0, 0), "row 10 is the fixed box's first row (armed)");
+        assert_eq!(imgalt_px(&e, 10, 29), (255, 0, 0), "row 29 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 9), (255, 0, 0), "row 9 is above it");
+        assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
+    }
+
     // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
 
     /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
@@ -9674,47 +9920,6 @@ b</div>
         let (l, t, w, _) = imgalt_rect(&mut e, "bd");
         let c = imgalt_px(&e, (l + w / 2.0) as usize, t as usize + 1);
         assert!([c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v)), "SR1134: the currentcolor frame is half-alpha grey: {c:?}");
-    }
-
-    // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
-
-    /// AETHERCSSBORDERTHINTHICK (SR1075): 40x20 boxes in green ink, rows 12px apart: `#tn` `border: thin solid`, `#tk`
-    /// `border: thick solid`, `#tz` `border-width: 1px 0; border-style: solid`.
-    fn border_thin_thick_engine() -> crate::AetherEngine {
-        let html = r##"<!doctype html><html><head><style>
-            div { margin: 0 0 12px }
-            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
-            <div id="tn" style="width:40px;height:20px;border:thin solid"></div>
-            <div id="tk" style="width:40px;height:20px;border:thick solid"></div>
-            <div id="tz" style="width:40px;height:20px;border-width:1px 0;border-style:solid"></div>
-        </body></html>"##;
-        let mut engine = crate::AetherEngine::new();
-        engine.handle_event(crate::api::events::Event::Resize(400, 600));
-        engine.load_html("https://example.com/", html, true);
-        engine.render_frame();
-        engine
-    }
-
-    /// AETHERCSSBORDERTHINTHICK (SR1075): `#tn` is a 42x22 border box whose row 0 (mid-x) is the ink and row 1 not; `#tk`
-    /// is 50x30 with rows 0-4 inked and row 5 not (before SR1075 both were medium 3px, 46x26); `#tz` is 40x22 (top / bottom
-    /// 1px, left / right 0; before SR1075 the two-value declaration was dropped). getComputedStyle reads 1px / 5px.
-    #[test]
-    fn border_thin_thick_paints() {
-        let mut e = border_thin_thick_engine();
-        for (id, bw, size) in [("tn", 1usize, (42.0, 22.0)), ("tk", 5, (50.0, 30.0))] {
-            let (l, t, w, h) = imgalt_rect(&mut e, id);
-            assert_eq!((w, h), size, "#{id}: the border box");
-            let x = (l + w / 2.0) as usize;
-            for dy in 0..bw {
-                let c = imgalt_px(&mut e, x, t as usize + dy);
-                assert!(css_wide_green(c), "#{id}: row {dy} is the ink: {c:?}");
-            }
-            let c = imgalt_px(&mut e, x, t as usize + bw);
-            assert!(!css_wide_green(c), "#{id}: row {bw} is inside the frame: {c:?}");
-            assert_eq!(font_shorthand_cs(&mut e, id, "borderTopWidth"), format!("{bw}px"), "#{id}: getComputedStyle");
-        }
-        let (_, _, w, h) = imgalt_rect(&mut e, "tz");
-        assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
     }
 
     // ---- AETHERCSSCURRENTCOLORALPHA (LEDGER SR1134): currentcolor carries the text colour's alpha to the border and background (named tail block) ----

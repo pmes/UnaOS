@@ -1837,17 +1837,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
-            if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
-                side_alpha_set(&mut style.paint, crate::paint::CC_SIDES, color_alpha::<H>(value));
-                let Some(mut sides) = border_color_pend(&mut style.paint, c) else { return };
-                for side in sides.iter_mut() {
-                    let Some((w, _)) = *side else { continue };
-                    *side = Some((w, c));
-                }
-                style.paint.border = Some(sides);
-            }
-        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => border_color_sides::<H>(value, &mut style.paint),
         "border-width" => {
             if let Some(r) = parse_sides(value, |v| line_width(v, cx)) { for (i, w) in [r.top, r.right, r.bottom, r.left].into_iter().enumerate() { border_width_store(&mut style.paint, 1 << i, Some(w)); } } else { font_rel_undo(&mut style.paint, prop, &fr); } // SR1075
         }
@@ -4868,21 +4858,6 @@ fn border_pending_create<H: Host>(paint: &mut PaintStyle<H>, mask: u8) {
     paint.border = Some(border_create_sides(paint, mask, true));
 }
 
-/// AETHERCSSBORDERCOLORSTORED (SR1058): the `border-color` arm's colour `c` (from `border_color_of`, which set or
-/// cleared all four currentcolor bits) is pended for all four sides; the answer is the sides the arm recolours: this
-/// block's entries, created first for the absent sides when the block declared a style (`border-style: solid;
-/// border-color: red`), else as they are (an absent side stays absent: css-backgrounds-3 §3.2 style none paints
-/// nothing). None (no border in this block, no style) = the arm writes nothing: the colour waits in the store, and
-/// `merge_border_pending` lays it on an earlier rule's sides.
-fn border_color_pend<H: Host>(paint: &mut PaintStyle<H>, c: (u8, u8, u8)) -> Option<[Option<(f32, (u8, u8, u8))>; 4]> {
-    let cc = paint.currentcolor & 1 != 0;
-    paint.border_pending = Some([Some((c, cc)); 4]);
-    if paint.border_style.is_some() {
-        return Some(border_create_sides(paint, crate::paint::CC_SIDES, false));
-    }
-    paint.border
-}
-
 /// AETHERCSSBORDERCOLORSTORED (SR1058): `side_color_of`'s side with no entry: the colour is pended for that side (its
 /// currentcolor answer in the entry, the four live bits put back as they were), not dropped. `transparent` pends its RGB
 /// with that side's alpha 0 (SR1112: AETHER-CSS-BORDER-PENDING-TRANSPARENT); an invalid value is recorded as before.
@@ -5070,6 +5045,49 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
     style.align_self_auto = v.is_none();
 }
 
+// ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): <line-width> keywords and 1-4 border-width values (named tail block) ----
+
+/// AETHERCSSBORDERTHINTHICK (SR1075): css-backgrounds-3 §4.3 `<line-width> = <length> | thin | medium | thick`
+/// (Chromium 1px / 3px / 5px) through the existing keyword table [`crate::paint::outline_width_keyword`], else a length
+/// through [`parse_px`]. Read by `border-width` (each of its 1-4 values, expanded by `parse_sides`), the
+/// `border-<side>-width` longhands; the `border` / `border-<side>` shorthands take the same keyword road ahead of their
+/// numeric filter. Before SR1075 `thin` / `thick` were dropped and `border-width` took one value.
+fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
+    crate::paint::outline_width_keyword(value).or_else(|| parse_px(value, cx))
+}
+
+// ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): css-backgrounds-3 §3.2 `border-color: <color>{1,4}` in the top / right / bottom /
+/// left order. SR1098: THE one road for 1-4 colours (the arm is one call); 2-4 colours (before SR1085 dropped whole:
+/// `parse_color_str` reads no multi-token value) expand through [`parse_sides`] (token indices into `split_top_level`)
+/// and each side goes through the `border-<side>-color` arm's two writers, `sys_border_slot` (cleared first, so an
+/// earlier keyword does not block the join; SR1046's one slot keeps the first keyword) and `side_color_of` (a side with
+/// no entry pends). `border_alpha` is per side since SR1112 (`side_alpha_set`): a transparent token keeps its side at
+/// alpha 0. Five values or a bad token drop the declaration.
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §3.2 sets all four colour longhands, so every side's pending
+/// entry is written (`side_color_pend`, also on a present side: one value and the value four times end with ONE store);
+/// a colour creates no side (§4.3: the old one-value road re-created a side made None while `border_style` was Some);
+/// four transparent tokens drop the frame whole (`Some([None; 4])`, so an earlier rule's or the UA control's frame goes).
+fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
+    let (toks, n) = (split_top_level(value), core::cell::Cell::new(0usize));
+    let ok = |v: &str| parse_color_str::<H>(v).is_some() || v.eq_ignore_ascii_case("currentcolor") || border_transparent::<H>(v);
+    let Some(r) = parse_sides(value, |v| {
+        let i = n.get();
+        n.set(i + 1);
+        ok(v).then_some(i)
+    }) else {
+        return;
+    };
+    let sides = [toks[r.top], toks[r.right], toks[r.bottom], toks[r.left]];
+    paint.sys_border = None;
+    for (i, tok) in sides.into_iter().enumerate() {
+        sys_border_slot(paint, 1 << i, tok);
+        side_color_of::<H>(i, tok, paint); side_color_pend::<H>(i, tok, paint);
+    }
+    // SR1112 (fold compose): each side's alpha is written by `side_color_of` / `side_color_pend` (`side_alpha_set`); a transparent token keeps its side at alpha 0 (the frame is not dropped: its width sizes the box).
+}
+
 // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
 
 /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): a border colour's RGB: what [`parse_color_str`] reads, else a transparent
@@ -5124,17 +5142,6 @@ pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>;
         }
     }
     a
-}
-
-// ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): <line-width> keywords and 1-4 border-width values (named tail block) ----
-
-/// AETHERCSSBORDERTHINTHICK (SR1075): css-backgrounds-3 §4.3 `<line-width> = <length> | thin | medium | thick`
-/// (Chromium 1px / 3px / 5px) through the existing keyword table [`crate::paint::outline_width_keyword`], else a length
-/// through [`parse_px`]. Read by `border-width` (each of its 1-4 values, expanded by `parse_sides`), the
-/// `border-<side>-width` longhands; the `border` / `border-<side>` shorthands take the same keyword road ahead of their
-/// numeric filter. Before SR1075 `thin` / `thick` were dropped and `border-width` took one value.
-fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
-    crate::paint::outline_width_keyword(value).or_else(|| parse_px(value, cx))
 }
 
 // ---- AETHERCSSCURRENTCOLORALPHA (LEDGER SR1134): currentcolor carries the text colour's alpha to the border and background (named tail block) ----

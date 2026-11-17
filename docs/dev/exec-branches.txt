@@ -1883,3 +1883,10 @@ exec-rmbp-aethercssstickyeminsetrelative|c6a10062b|cut132h
 exec-rmbp-aetheroutlinecurrentcolorua|c6a10062b|cut132h
 exec-rmbp-nlefacewitnessverbsintable|c6a10062b|cut132h
 exec-rmbp-aethercssominsetfontrelative|c6a10062b|cut132h
+exec-rmbp-aethercsscurrentcoloralpha|f50f71205|cut133h
+exec-rmbp-aethercssstickyscrollblitdamage|b98719f28|cut134h
+exec-rmbp-aethercsscontainerunitsreapplykind|b98719f28|cut134h
+exec-rmbp-aethercssborderstyledeadarm|b98719f28|cut134h
+exec-rmbp-aetheruacoloronetablescheme|b98719f28|cut134h
+exec-rmbp-aethercssstickyscrolldamagerects|c0be8b5ef|cut135h
+exec-rmbp-aethercsscontainsizeminheight|c0be8b5ef|cut135h

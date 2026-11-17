@@ -476,7 +476,7 @@ fn currentcolorrest_border_marker() {
     assert_eq!(cc(&[("border", "2px solid blue"), ("border-left", "2px solid currentcolor")]), 8, "the left bit only");
     assert_eq!(cc(&[("border", "2px solid currentcolor"), ("border-top", "2px solid blue")]), CC_SIDES & !1, "the top bit cleared");
     let s = styled(&[("border-color", "currentcolor")]);
-    assert_eq!(s.paint.currentcolor, CC_SIDES, "border-color: currentcolor");
+    assert_eq!(s.paint.currentcolor, 0, "SR1098 (re-pinned in place): an absent side carries no live bit; the pending entry carries the answer and creation sets the bit (was CC_SIDES)");
     assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some(((128, 128, 128), true)); 4])), "SR1058: no frame built (style none); the grey carrier pends with its currentcolor answer");
     assert_eq!(cc(&[("border-width", "3px")]), 0, "SR1069 (flipped in place): border-width alone creates no side, no bit (was CC_SIDES)");
     assert_eq!(cc(&[("border-width", "3px"), ("border-style", "solid")]), CC_SIDES, "SR1069: the style-created sides take currentcolor");

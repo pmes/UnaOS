@@ -1673,7 +1673,7 @@ fn reresolve_font_relative<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>,
             (fs * 0.5, fs * 0.5)
         };
         let cx = ParseCx { viewport, font: (fs, root_fs, ex, ch), container: (None, None) };
-        let spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx);
+        let mut spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx); spec.paint.position_kind = tree.paint_map.get(&id).and_then(|p| p.position_kind); // SR1130: the kind (sticky's inset guard in fold_into) rides the re-applied spec
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
             spec.fold_into(&mut st);
