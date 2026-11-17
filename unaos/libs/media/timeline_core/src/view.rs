@@ -330,7 +330,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             if x1 <= 0 || x0 >= w as i64 {
                 continue;
             }
-            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
+            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind)); paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -1187,5 +1187,30 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the crop badge on a cropped clip's body (named tail block) ----
+/// STRIACROPFACE (SR900): the crop badge's glyph colour.
+pub const CROP_BADGE: [u8; 4] = [0xff, 0xa0, 0x20, 255];
+/// The crop glyph, 7x7 (bit 6 the leftmost column): two interlocking corners.
+const CROP_GLYPH: [u8; 7] = [0x20, 0x7c, 0x24, 0x24, 0x24, 0x3f, 0x04];
+
+/// A clip body `x0..x1` on the row at `y0` carrying `crop`: a 9x9 [`FIELD`] box at the body's top right (`x1 - 11 ..
+/// x1 - 2`, `y0 + 3 .. y0 + 12`) holding [`CROP_GLYPH`] in [`CROP_BADGE`]. No crop, or a body under 16 px: nothing painted
+/// (every golden stays byte-identical).
+fn paint_crop_badge(c: &mut Canvas, crop: crate::Crop, x0: i64, x1: i64, y0: i64) {
+    if crop == crate::Crop::NONE || x1 - x0 < 16 {
+        return;
+    }
+    let (bx, by) = (x1 - 11, y0 + 3);
+    c.rect(bx, by, bx + 9, by + 9, FIELD);
+    for (dy, bits) in CROP_GLYPH.iter().enumerate() {
+        for dx in 0..7i64 {
+            if bits & (0x40 >> dx) != 0 {
+                let (px, py) = (bx + 1 + dx, by + 1 + dy as i64);
+                c.rect(px, py, px + 1, py + 1, CROP_BADGE);
+            }
+        }
     }
 }

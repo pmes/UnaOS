@@ -187,6 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
+        [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -518,6 +519,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("crop", "Uncrop"), // STRIACROPFACE (SR900): clears the selection's crop (THE `crop` word)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -924,5 +926,31 @@ mod striacrop_tests {
         assert_eq!(drive(&mut face, "crop:1:2"), vec!["bad token crop:1:2".to_string()]);
         assert_eq!(drive(&mut face, "crop:900:0:200:0"), vec![format!("crop 900 0 200 0: {}", timeline_core::EditError::Crop)]);
         assert_eq!(face.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the witness's crop words and the Uncrop button (named tail block) ----
+#[cfg(test)]
+mod striacropface_tests {
+    use super::*;
+
+    /// STRIACROPFACE (SR900): `crop-l+` / `crop-r+` step the selected clip's crop (one undo step each); `crop` clears it (a
+    /// third); the transport's button before `?` is `Uncrop`, firing the `crop` word.
+    #[test]
+    fn striacropface_witness_crop_words() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,crop-l+,crop-r+");
+        assert!(errors.is_empty(), "{errors:?}");
+        let s = timeline_core::editor::CROP_STEP;
+        assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: s, t: 0, r: s, b: 0 }));
+        assert_eq!(face.state.undo_depth(), 2);
+        assert!(drive(&mut face, "crop").is_empty());
+        assert_eq!((face.state.selected().map(|c| c.crop), face.state.undo_depth()), (Some(timeline_core::Crop::NONE), 3));
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("crop", "Uncrop"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "crop"));
     }
 }

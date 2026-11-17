@@ -314,7 +314,7 @@ mod striacrop {
         assert_eq!((st.undo_depth(), st.selected().map(|c| c.crop)), (1, Some(C)));
         assert_eq!(st.verb("crop 250 0 250 0"), Some(Ok(())));
         assert_eq!(st.undo_depth(), 1, "the same crop commits nothing");
-        for bad in ["crop", "crop 1 2 3", "crop 1 2 3 4 5", "crop a 0 0 0", "crop -1 0 0 0", "crop 600 0 400 0"] {
+        for bad in ["crop 1 2 3", "crop 1 2 3 4 5", "crop a 0 0 0", "crop -1 0 0 0", "crop 600 0 400 0"] {
             assert_eq!(st.verb(bad), Some(Err(EditError::Crop)), "{bad}");
         }
         assert_eq!(st.undo_depth(), 1);
@@ -362,5 +362,88 @@ mod striacrop {
         ] {
             assert_eq!(edl::parse(&text, 25).map(|_| ()), Err(EdlError::Syntax { line }), "{text}");
         }
+    }
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the crop words over the selection set and the crop badge (named tail block) ----
+mod striacropface {
+    use super::base;
+    use timeline_core::editor::{CROP_STEP, EditorState};
+    use timeline_core::view::{self, Order};
+    use timeline_core::{Crop, EditError};
+
+    /// STRIACROPFACE (SR900): on a one-clip set the words step / clear the selected clip, one undo step each; bare `crop`
+    /// now clears (SR867 refused it); a step keeping no picture is refused by name and leaves the state.
+    #[test]
+    fn striacropface_words_on_one_clip() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, 1).unwrap();
+        for w in ["crop-l+", "crop-t+", "crop-r+", "crop-b+"] {
+            assert_eq!(st.verb(w), Some(Ok(())), "{w}");
+        }
+        let s = CROP_STEP;
+        assert_eq!((st.selected().map(|c| c.crop), st.undo_depth()), (Some(Crop { l: s, t: s, r: s, b: s }), 4));
+        assert_eq!(st.verb("crop-t-"), Some(Ok(())));
+        assert_eq!(st.selected().map(|c| c.crop), Some(Crop { l: s, t: 0, r: s, b: s }));
+        assert_eq!(st.verb("crop"), Some(Ok(())));
+        assert_eq!((st.selected().map(|c| c.crop), st.undo_depth()), (Some(Crop::NONE), 6));
+        assert_eq!(st.timeline, tl, "cleared: the timeline as before");
+        assert_eq!(st.verb("crop 500 0 490 0"), Some(Ok(())));
+        assert_eq!(st.verb("crop-l+"), Some(Err(EditError::Crop)));
+        assert_eq!((st.selected().map(|c| c.crop), st.undo_depth()), (Some(Crop { l: 500, t: 0, r: 490, b: 0 }), 7));
+    }
+
+    /// STRIACROPFACE (SR900): `crop l t r b` and the words act on every video clip of a multiselection as ONE commit.
+    #[test]
+    fn striacropface_set_wide_one_commit() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        let c = Crop { l: 100, t: 0, r: 100, b: 0 };
+        assert_eq!(st.verb("crop 100 0 100 0"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[0].clips[0].crop, st.timeline.tracks[0].clips[1].crop, st.undo_depth()), (c, c, 1));
+        assert_eq!(st.verb("crop-l-"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips[1].crop.l, 100 - CROP_STEP);
+        assert_eq!(st.undo_depth(), 2);
+        assert!(st.undo() && st.undo());
+        assert_eq!(st.timeline, tl);
+    }
+
+    /// STRIACROPFACE (SR900): a cropped clip's body carries the badge (CROP_BADGE glyph in a FIELD box at its top right)
+    /// and the canvas differs from the uncropped one only inside that box; a body under 16 px gets none.
+    #[test]
+    fn striacropface_badge_only_when_cropped() {
+        let (tl, _, _) = base();
+        let mut plain = EditorState::new(tl.clone());
+        plain.zoom = 8;
+        let mut cut = plain.clone();
+        cut.timeline = tl.set_crop(0, 1, Crop { l: 100, t: 0, r: 0, b: 0 }).unwrap();
+        let (w, h) = (320u32, 200u32);
+        let a = view::paint(&plain, w, h, Order::Rgba, None, None);
+        let b = view::paint(&cut, w, h, Order::Rgba, None, None);
+        let l = view::Layout::of(w, h, &cut);
+        let (x1, y0) = (l.x_of(20), l.row_y(0));
+        let (bx, by) = (x1 - 11, y0 + 3);
+        let px = |buf: &[u8], x: i64, y: i64| -> [u8; 4] {
+            let o = (y as usize * w as usize + x as usize) * 4;
+            buf[o..o + 4].try_into().unwrap()
+        };
+        assert_eq!(px(&b, bx + 2, by + 1), view::CROP_BADGE, "the glyph's first row");
+        assert_eq!(px(&b, bx, by), view::FIELD, "the box");
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let inside = x >= bx && x < bx + 9 && y >= by && y < by + 9;
+                if !inside {
+                    assert_eq!(px(&a, x, y), px(&b, x, y), "({x}, {y}) outside the badge");
+                }
+            }
+        }
+        let mut narrow = cut.clone();
+        narrow.zoom = 1;
+        let mut narrow_plain = plain.clone();
+        narrow_plain.zoom = 1;
+        assert_eq!(view::paint(&narrow, w, h, Order::Rgba, None, None), view::paint(&narrow_plain, w, h, Order::Rgba, None, None), "10 px: no badge");
     }
 }
