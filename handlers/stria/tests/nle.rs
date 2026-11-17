@@ -3551,3 +3551,106 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIATIMECODEDISPLAY (LEDGER SR872): the playhead readout on the message row's left half — `tc`, a view word (named tail block) ----
+
+/// The message row of a 320x144 labelled face split at the middle: (left half, right half) pixels of `px`, and the rows
+/// outside the message row.
+fn striatimecodedisplay_halves(px: &[u8], m: stria::nle_face::Layout) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut left, mut right, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    for y in 0..m.h {
+        let row = &px[(y * m.w * 4) as usize..((y + 1) * m.w * 4) as usize];
+        if y >= m.message_y && y < m.message_y + m.message_h {
+            left.extend_from_slice(&row[..(m.w / 2 * 4) as usize]);
+            right.extend_from_slice(&row[(m.w / 2 * 4) as usize..]);
+        } else {
+            rest.extend_from_slice(row);
+        }
+    }
+    (left, right, rest)
+}
+
+fn striatimecodedisplay_face(labels: bool) -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, labels)
+}
+
+/// `tc` is a transport word right before `help`; four presses cycle off -> timecode -> frames -> seconds -> off; it pushes no
+/// undo step, leaves the document clean, the timeline, selection and playhead untouched and no message.
+#[test]
+fn striatimecodedisplay_tc_cycles_as_a_view_word() {
+    use stria::nle_face::TcUnit;
+    assert_eq!(&VERBS[VERBS.len() - 2..], &["tc", "help"]);
+    let mut face = striatimecodedisplay_face(false);
+    face.state.seek(12);
+    let (tl, undo, sel) = (face.state.timeline.clone(), face.state.undo_depth(), face.state.selection);
+    assert_eq!((face.tc_unit(), face.tc_readout()), (None, None), "off by default");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        assert!(face.verb("tc"));
+        seen.push((face.tc_unit(), face.tc_readout()));
+    }
+    assert_eq!(seen, vec![
+        (Some(TcUnit::Timecode), Some("00:00:00:12".to_string())),
+        (Some(TcUnit::Frames), Some("12".to_string())),
+        (Some(TcUnit::Seconds), Some("0.48 s".to_string())),
+        (None, None),
+    ]);
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.selection, face.state.playhead), (undo, false, sel, 12));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striatimecodedisplay: tc cycle {seen:?} undo={undo} dirty=false");
+}
+
+/// Labels on: off paints are today's; on with no message the readout inks the row's left half only (the right half and every
+/// other row as off); with the reel line it moves to the right half; back off is byte-identical; labels off: nothing paints.
+#[test]
+fn striatimecodedisplay_readout_left_half_and_off_is_byte_identical() {
+    use timeline_core::view::BG;
+    let bg = |v: &[u8]| v.chunks(4).all(|p| p == BG);
+    let mut face = striatimecodedisplay_face(true);
+    let m = face.layout().with_message(true);
+    assert!(m.message_h > 0);
+    let off = face.paint();
+    let (l0, r0, rest0) = striatimecodedisplay_halves(&off, m);
+    assert!(bg(&l0) && bg(&r0), "off, no message: the row is BG");
+    assert!(face.verb("tc"));
+    let on = face.paint();
+    let (l1, r1, rest1) = striatimecodedisplay_halves(&on, m);
+    assert!(!bg(&l1), "the readout inks the left half");
+    assert!(bg(&r1), "the right half stays BG");
+    assert_eq!(rest1, rest0, "nothing outside the message row moves");
+    face.state.select(0, 0).unwrap();
+    let sel_on = face.paint();
+    let (l2, r2, _) = striatimecodedisplay_halves(&sel_on, m);
+    assert_eq!(l2, l1, "the readout's half is the readout's alone");
+    assert!(!bg(&r2), "the reel line moves to the right half");
+    for _ in 0..3 {
+        assert!(face.verb("tc"));
+    }
+    assert!(face.tc_unit().is_none());
+    let sel_off = face.paint();
+    let (l3, _, _) = striatimecodedisplay_halves(&sel_off, m);
+    assert_ne!(l3, l1, "off, the reel line is back at x 4");
+    face.state.deselect();
+    assert_eq!(face.paint(), off, "off again: byte-identical");
+    let mut plain = striatimecodedisplay_face(false);
+    let a = plain.paint();
+    assert!(plain.verb("tc"));
+    assert_eq!(plain.paint(), a, "labels off: no row, no readout");
+    println!("striatimecodedisplay: row {}+{} split x {}", m.message_y, m.message_h, m.w / 2);
+}
+
+/// The readout follows the playhead: a seek changes the text and the left half's ink.
+#[test]
+fn striatimecodedisplay_readout_follows_the_playhead() {
+    let mut face = striatimecodedisplay_face(true);
+    let m = face.layout().with_message(true);
+    assert!(face.verb("tc"));
+    let (a, ta) = (face.paint(), face.tc_readout());
+    face.state.seek(30);
+    let (b, tb) = (face.paint(), face.tc_readout());
+    assert_eq!((ta.as_deref(), tb.as_deref()), (Some("00:00:00:00"), Some("00:00:01:05")));
+    assert_ne!(striatimecodedisplay_halves(&a, m).0, striatimecodedisplay_halves(&b, m).0);
+    println!("striatimecodedisplay: playhead 0 -> 30: {ta:?} -> {tb:?}");
+}
