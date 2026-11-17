@@ -136,6 +136,7 @@ pub enum Role {
     Preview,
     /// The ruler and the tracks only.
     Tracks,
+    Bin, // STRIAPROJECTBIN (SR885): the source bin (`paint_bin` / `bin_hit`, its own row geometry: no band of the track view)
 }
 
 impl Layout {
@@ -156,6 +157,7 @@ impl Layout {
                 l.ruler_y = 0;
                 l.tracks_y = RULER_H;
             }
+            Role::Bin => { l.preview_h = 0; l.ruler_y = h + RULER_H; l.tracks_y = h + 2 * RULER_H; } // STRIAPROJECTBIN (SR885): no band of the track view on a bin Surface
         }
         l
     }
@@ -2329,5 +2331,205 @@ fn paint_crop_badge(c: &mut Canvas, crop: crate::Crop, x0: i64, x1: i64, y0: i64
                 c.rect(px, py, px + 1, py + 1, CROP_BADGE);
             }
         }
+    }
+}
+
+// ---- STRIAPROJECTBIN (LEDGER SR885): the source bin — rows, geometry, paint, hit, the insert word (named tail block) ----
+// The editor's source bin, painted by THIS painter so the kernel face can show it later (NLE-BIN-KERNEL owed): one row per
+// `Timeline::sources` entry (reel, duration as `edl::timecode`, the kind read from the tracks its clips sit on), each row
+// [`BIN_ROW_H`] px from the top of its own Surface ([`Role::Bin`]). A click is NOT an edit of its own: [`bin_word`] names
+// SR852's `insert <reel> 0 <duration>`, which the face sends through its one verb road (`EditorState::verb` ->
+// `insert_reel` -> `Timeline::place` -> the ONE `commit`). Rows past the canvas are not shown (NLE-BIN-SCROLL owed).
+
+/// One bin row's height (px).
+pub const BIN_ROW_H: u32 = 18;
+/// The row's left pad and the reel swatch's width (px).
+pub const BIN_PAD: i64 = 4;
+pub const BIN_SWATCH: i64 = 12;
+
+/// What a source feeds, read from the tracks its clips sit on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinKind {
+    Video,
+    Audio,
+    /// On a video and an audio track.
+    Both,
+    /// On no track.
+    Unused,
+}
+
+impl BinKind {
+    /// The bin's word: `V`, `A`, `AV`, `-`.
+    pub fn name(self) -> &'static str {
+        match self {
+            BinKind::Video => "V",
+            BinKind::Audio => "A",
+            BinKind::Both => "AV",
+            BinKind::Unused => "-",
+        }
+    }
+}
+
+/// One bin row: a source of the timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinRow {
+    pub src: crate::SourceId,
+    pub reel: alloc::string::String,
+    pub duration: i64,
+    pub kind: BinKind,
+}
+
+impl BinRow {
+    /// The row's swatch: the reel's clip colour (darker for an audio-only source), [`TICK`] grey when unused.
+    pub fn swatch(&self) -> [u8; 4] {
+        match self.kind {
+            BinKind::Video | BinKind::Both => clip_colour(self.src.0, Kind::Video),
+            BinKind::Audio => clip_colour(self.src.0, Kind::Audio),
+            BinKind::Unused => TICK,
+        }
+    }
+}
+
+/// THE bin's rows, in `Timeline::sources` order (read by [`paint_bin`], [`bin_hit`]'s index, the witness's JSON).
+pub fn bin_rows(tl: &Timeline) -> Vec<BinRow> {
+    tl.sources
+        .iter()
+        .map(|s| {
+            let on = |k: Kind| tl.tracks.iter().any(|t| t.kind == k && t.clips.iter().any(|c| c.src == s.id));
+            let kind = match (on(Kind::Video), on(Kind::Audio)) {
+                (true, true) => BinKind::Both,
+                (true, false) => BinKind::Video,
+                (false, true) => BinKind::Audio,
+                (false, false) => BinKind::Unused,
+            };
+            BinRow { src: s.id, reel: s.reel.clone(), duration: s.duration, kind }
+        })
+        .collect()
+}
+
+/// The y of bin row `i`'s top.
+pub fn bin_row_y(i: usize) -> i64 {
+    i as i64 * BIN_ROW_H as i64
+}
+
+/// A point inside bin row `i` (what a click on that row sends).
+pub fn bin_point(i: usize) -> (f64, f64) {
+    (BIN_PAD as f64 + 1.0, bin_row_y(i) as f64 + BIN_ROW_H as f64 / 2.0)
+}
+
+/// The source row under `(x, y)` on a `w` x `h` bin canvas: `Some(index into tl.sources)`, `None` off the canvas or
+/// under the last row.
+pub fn bin_hit(tl: &Timeline, w: u32, h: u32, x: f64, y: f64) -> Option<usize> {
+    if x < 0.0 || y < 0.0 || x >= w as f64 || y >= h as f64 {
+        return None;
+    }
+    let i = (y / BIN_ROW_H as f64) as usize;
+    (i < tl.sources.len()).then_some(i)
+}
+
+/// The word a click on bin row `i` sends: SR852's `insert <reel> 0 <duration>` (the reel's whole range at the playhead).
+pub fn bin_word(tl: &Timeline, i: usize) -> Option<alloc::string::String> {
+    tl.sources.get(i).map(|s| alloc::format!("insert {} 0 {}", s.reel, s.duration))
+}
+
+/// Paint the bin on a `w` x `h` canvas in `order`: [`BG`], one [`ROW`]-striped row per source with its swatch and, through
+/// `labels`, `"<reel>  <HH:MM:SS:FF>  <kind>"`.
+pub fn paint_bin(tl: &Timeline, w: u32, h: u32, order: Order, mut labels: Option<&mut dyn Text>) -> Vec<u8> {
+    let mut c = Canvas::new(w, h, order);
+    c.rect(0, 0, w as i64, h as i64, BG);
+    let fps = tl.fps().unwrap_or(25).max(1);
+    let lx = BIN_PAD * 2 + BIN_SWATCH;
+    for (i, r) in bin_rows(tl).iter().enumerate() {
+        let y0 = bin_row_y(i);
+        if y0 >= h as i64 {
+            break;
+        }
+        let y1 = y0 + BIN_ROW_H as i64;
+        c.rect(0, y0, w as i64, y1, ROW[i % 2]);
+        c.rect(BIN_PAD, y0 + 3, BIN_PAD + BIN_SWATCH, y1 - 3, r.swatch());
+        if let Some(text) = labels.as_mut() {
+            let s = alloc::format!("{}  {}  {}", r.reel, edl::timecode(r.duration, fps), r.kind.name());
+            text.text(&mut c, &s, lx as f32, y0 as f32 + 13.0, (lx as i32, w as i32));
+        }
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod striaprojectbin_tests {
+    use super::*;
+    use crate::{Clip, SourceId, Timeline};
+
+    /// A (on V1 and A1), B (V1 only), C (no track), D (A1 only) at 25 fps.
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_source("C", 25);
+        let d = tl.add_source("D", 30);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(d, 0, 10, 10)];
+        tl
+    }
+
+    fn px(c: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [c[i], c[i + 1], c[i + 2], c[i + 3]]
+    }
+
+    #[test]
+    fn striaprojectbin_rows_kind_duration_and_word() {
+        let tl = tl();
+        let rows = bin_rows(&tl);
+        let got: Vec<(&str, i64, &str)> = rows.iter().map(|r| (r.reel.as_str(), r.duration, r.kind.name())).collect();
+        assert_eq!(got, alloc::vec![("A", 50, "AV"), ("B", 50, "V"), ("C", 25, "-"), ("D", 30, "A")]);
+        assert_eq!(rows[3].src, SourceId(3));
+        assert_eq!(edl::timecode(rows[0].duration, 25), "00:00:02:00");
+        assert_eq!(bin_word(&tl, 1).as_deref(), Some("insert B 0 50"));
+        assert_eq!(bin_word(&tl, 4), None);
+        assert!(bin_rows(&Timeline::new(25)).is_empty());
+    }
+
+    #[test]
+    fn striaprojectbin_hit_maps_rows_and_refuses_off_canvas() {
+        let tl = tl();
+        assert_eq!(bin_hit(&tl, 120, 100, 5.0, 0.0), Some(0));
+        assert_eq!(bin_hit(&tl, 120, 100, 5.0, 18.0), Some(1));
+        assert_eq!(bin_hit(&tl, 120, 100, 119.0, 71.9), Some(3));
+        assert_eq!(bin_hit(&tl, 120, 100, 5.0, 72.0), None, "under the last row");
+        assert_eq!(bin_hit(&tl, 120, 100, -1.0, 5.0), None);
+        assert_eq!(bin_hit(&tl, 120, 100, 120.0, 5.0), None);
+        assert_eq!(bin_hit(&tl, 120, 30, 5.0, 40.0), None, "past the canvas");
+        for i in 0..4 {
+            let (x, y) = bin_point(i);
+            assert_eq!(bin_hit(&tl, 120, 100, x, y), Some(i));
+        }
+        let st = EditorState::new(tl.clone());
+        let l = Layout::of_role(Role::Bin, 120, 100, &st);
+        assert_eq!(l.preview_h, 0);
+        assert_eq!(l.hit(&tl, 5.0, 20.0), Hit::None, "the track view finds nothing on a bin Surface");
+    }
+
+    #[test]
+    fn striaprojectbin_paint_rows_and_swatches() {
+        let tl = tl();
+        let (w, h) = (120u32, 100u32);
+        let c = paint_bin(&tl, w, h, Order::Rgba, None);
+        assert_eq!(c.len(), (w * h * 4) as usize);
+        let mid = |i: usize| bin_row_y(i) + BIN_ROW_H as i64 / 2;
+        assert_eq!(px(&c, w, BIN_PAD + 1, mid(0)), clip_colour(0, Kind::Video));
+        assert_eq!(px(&c, w, BIN_PAD + 1, mid(1)), clip_colour(1, Kind::Video));
+        assert_eq!(px(&c, w, BIN_PAD + 1, mid(2)), TICK, "an unused source's swatch is grey");
+        assert_eq!(px(&c, w, BIN_PAD + 1, mid(3)), clip_colour(3, Kind::Audio));
+        assert_eq!(px(&c, w, 100, mid(0)), ROW[0]);
+        assert_eq!(px(&c, w, 100, mid(1)), ROW[1]);
+        assert_eq!(px(&c, w, 100, 90), BG, "under the rows");
+        let b = paint_bin(&tl, w, h, Order::Bgra, None);
+        let s = clip_colour(0, Kind::Video);
+        assert_eq!(px(&b, w, BIN_PAD + 1, mid(0)), [s[2], s[1], s[0], s[3]]);
+        let short = paint_bin(&tl, w, 20, Order::Rgba, None);
+        assert_eq!(short.len(), (w * 20 * 4) as usize, "rows past the canvas are clipped");
     }
 }

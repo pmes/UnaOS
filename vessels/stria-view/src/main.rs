@@ -59,12 +59,13 @@ struct Cli {
     split: bool,
     mute: bool,
     keys: Option<String>, // STRIAKEYBOARDMAP (SR886): `--keys MAP`, the key overlay text handed to `Face::with_keys`
+    bin: bool, // STRIAPROJECTBIN (SR885): `--bin` puts the source bin Surface under the split tree's tracks (file tail)
 }
 
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media|dir/frame_%04d.png> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media|dir/frame_%04d.png> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split [--bin]] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, bin:ROW)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -72,7 +73,7 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false, keys: None };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false, keys: None, bin: false };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -81,6 +82,7 @@ fn cli() -> Cli {
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
             "--mute" => c.mute = true, "--paint-ms" => {} // NLEPLAYAUDIO (SR676): the window plays no sound
+            "--bin" => c.bin = true, // STRIAPROJECTBIN (SR885): the source bin Surface (with --split)
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -104,7 +106,7 @@ fn cli() -> Cli {
             _ => die(USAGE.into()),
         }
     }
-    if (c.edl.is_none() && !c.synth) || (c.two && c.split) {
+    if (c.edl.is_none() && !c.synth) || (c.two && c.split) || (c.bin && !c.split) { // STRIAPROJECTBIN (SR885): the bin rides the split tree
         die(USAGE.into());
     }
     c
@@ -214,7 +216,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| bin_token(face, tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -247,7 +249,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let mut errors = drive_on(&mut face, c.script.as_deref().unwrap_or(""), surfaces, &mut presses);
     let t0 = std::time::Instant::now(); let blits = face.frames(); let paint = paint_ms_json(paint_ms_on(), t0.elapsed()); // STRIAPERFPAINTBUDGET (SR890): the wall time of the one repaint `serve` pays (file tail)
     let fnvs = blits_json(c, &blits);
-    let Some(SMessage::SurfaceBlit { width, height, pixels, .. }) = blits.into_iter().last() else { return 1 };
+    let Some(SMessage::SurfaceBlit { width, height, pixels, .. }) = blits.into_iter().filter(|m| !matches!(m, SMessage::SurfaceBlit { url, .. } if url == nle_face::BIN_SURFACE)).last() else { return 1 }; // STRIAPROJECTBIN (SR885): w / h / fnv stay the tracks blit's with --bin
     if let Some(e) = face.last_error.take() {
         errors.push(e);
     }
@@ -263,7 +265,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint; // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint; // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -432,7 +434,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
         assert_eq!(presses, vec![(0, false), (1, true)]);
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false, keys: None };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false, keys: None, bin: false };
         assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
         assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
     }
@@ -566,14 +568,14 @@ fn split_tree() -> TetraNode {
 
 /// The tree this run declares: `--split`'s, else the editor tree (with `--two-surfaces` its aux Surface).
 fn tree(c: &Cli) -> TetraNode {
-    if c.split { split_tree() } else if c.two { editor_tree_for(true) } else { editor_tree() }
+    if c.split { bin_tree(c, split_tree()) } else if c.two { editor_tree_for(true) } else { editor_tree() }
 }
 
 /// The face routed by the tree's `SurfaceMap`: split over the preview and tracks Surfaces, else on the editor's.
 fn route(c: &Cli, face: Face) -> Face {
     let map = SurfaceMap::of(&tree(c));
     if c.split {
-        face.on_surfaces(map.number(PREVIEW_SURFACE).unwrap_or(0), map.number(TRACKS_SURFACE).unwrap_or(1))
+        bin_route(c, &map, face.on_surfaces(map.number(PREVIEW_SURFACE).unwrap_or(0), map.number(TRACKS_SURFACE).unwrap_or(1))) // STRIAPROJECTBIN (SR885): and the bin's Surface with --bin (file tail)
     } else {
         face.on_surface(map.number(SURFACE).unwrap_or(0))
     }
@@ -607,7 +609,7 @@ mod split_tests {
         let TetraNode::VStack(top) = split_tree() else { panic!("not a VStack") };
         let TetraNode::VStack(one) = editor_tree() else { panic!("not a VStack") };
         assert_eq!(format!("{:?}", top[1]), format!("{:?}", one[1]), "the one transport row");
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: false };
         let (tl, src) = nle_face::synth_fixture();
         let tl0 = tl.clone();
         let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
@@ -1860,5 +1862,96 @@ mod striapositionscale_tests {
         assert_eq!(drive(&mut face, "pip:950:0"), vec![format!("pip 950 0: {}", timeline_core::EditError::Xform)]);
         assert!(drive(&mut face, "pip:off").is_empty());
         assert_eq!((face.state.undo_depth(), face.state.selected().map(|c| c.xform)), (4, Some(timeline_core::Xform::NONE)));
+    }
+}
+
+// ---- STRIAPROJECTBIN (LEDGER SR885): the bin Surface in the split tree, the `bin:<row>` token, the witness's bin rows (named tail block) ----
+
+/// `--bin`: the split tree with the source bin Surface ([`nle_face::BIN_SURFACE`]) last, so it is number 2 and the
+/// preview / tracks numbers stay 0 / 1. Without `--bin` the tree is returned unchanged.
+fn bin_tree(c: &Cli, t: TetraNode) -> TetraNode {
+    match t {
+        TetraNode::VStack(mut v) if c.bin => {
+            v.push(TetraNode::Surface { id: nle_face::BIN_SURFACE.into() });
+            TetraNode::VStack(v)
+        }
+        t => t,
+    }
+}
+
+/// `--bin`: the split face with its bin on the tree's bin Surface (`Face::with_bin`).
+fn bin_route(c: &Cli, map: &SurfaceMap, face: Face) -> Face {
+    if c.bin { face.with_bin(map.number(nle_face::BIN_SURFACE).unwrap_or(2)) } else { face }
+}
+
+/// `bin:<row>`: a click on that bin row, stamped with the bin's Surface number and sent through `Face::on` here (so
+/// `drive_on`'s stamping does not move it to the tracks Surface). `None` with no bin (a bad token).
+fn bin_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
+    let row = tok.strip_prefix("bin:")?.parse::<usize>().ok()?;
+    let b = face.bin()?;
+    let (x, y) = timeline_core::view::bin_point(row);
+    face.on(&SMessage::BrowserClick(x, y, b.n));
+    Some(Vec::new())
+}
+
+/// The witness's `"bin"` field with `--bin` only: each source's reel, duration as timecode and kind (the default line is
+/// unchanged).
+fn bin_json(c: &Cli, face: &Face) -> String {
+    if !c.bin {
+        return String::new();
+    }
+    let tl = &face.state.timeline;
+    let fps = tl.fps().unwrap_or(25);
+    let rows: Vec<String> = timeline_core::view::bin_rows(tl)
+        .iter()
+        .map(|r| format!("{{\"reel\":\"{}\",\"dur\":\"{}\",\"kind\":\"{}\"}}", r.reel.replace('"', "'"), edl::timecode(r.duration, fps), r.kind.name()))
+        .collect();
+    format!(",\"bin\":[{}]", rows.join(","))
+}
+
+#[cfg(test)]
+mod striaprojectbin_tests {
+    use super::*;
+    use timeline_core::{Clip, Mode, SourceId};
+
+    fn bin_cli() -> Cli {
+        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true }
+    }
+
+    /// `--split --bin` numbers the bin Surface 2 (preview 0, tracks 1); `--split` alone is today's tree; the routed face
+    /// carries the bin and its three blits.
+    #[test]
+    fn striaprojectbin_tree_numbers_the_bin_two() {
+        let c = bin_cli();
+        let m = SurfaceMap::of(&tree(&c));
+        assert_eq!((m.number(PREVIEW_SURFACE), m.number(TRACKS_SURFACE), m.number(nle_face::BIN_SURFACE)), (Some(0), Some(1), Some(2)));
+        assert_eq!(format!("{:?}", tree(&Cli { bin: false, ..bin_cli() })), format!("{:?}", split_tree()));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        assert_eq!(face.bin().map(|b| b.n), Some(2));
+        let frames = face.frames();
+        assert_eq!(frames.len(), 3);
+        assert!(blits_json(&c, &frames).starts_with(r#","surfaces":3,"fnvs":[""#));
+    }
+
+    /// `ruler:15,bin:1` lays reel B's whole range at 15 on V1 (SR852's `insert B 0 50`, one undo step); the witness's bin
+    /// field lists both reels; without a bin `bin:1` is a bad token.
+    #[test]
+    fn striaprojectbin_token_inserts_and_json_lists_the_sources() {
+        let c = bin_cli();
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        assert_eq!(bin_json(&c, &face), r#","bin":[{"reel":"A","dur":"00:00:02:00","kind":"AV"},{"reel":"B","dur":"00:00:02:00","kind":"AV"}]"#);
+        assert_eq!(bin_json(&Cli { bin: false, ..bin_cli() }, &face), "");
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "ruler:15,bin:1", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap());
+        assert_eq!((face.state.undo_depth(), face.state.playhead), (1, 65));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut plain, "bin:1"), vec!["bad token bin:1".to_string()]);
+        println!("striaprojectbin witness: --split --bin --do ruler:15,bin:1 -> B 0..50 at 15 on V1, undo 1, playhead 65");
     }
 }
