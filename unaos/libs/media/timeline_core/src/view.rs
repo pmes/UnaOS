@@ -225,12 +225,7 @@ impl Canvas {
         let (x0, x1) = (x0.clamp(0, self.w as i64) as usize, x1.clamp(0, self.w as i64) as usize);
         let (y0, y1) = (y0.clamp(0, self.h as i64) as usize, y1.clamp(0, self.h as i64) as usize);
         let c = self.put(c);
-        for y in y0..y1 {
-            let row = y * self.w as usize * 4;
-            for x in x0..x1 {
-                self.px[row + x * 4..row + x * 4 + 4].copy_from_slice(&c);
-            }
-        }
+        self.fill_rows(x0, x1, y0, y1, c); // STRIAPERFCANVASFILL (SR919): one row filled, then copied down (file tail)
     }
     /// A 1 px outline of `x0..x1` x `y0..y1`.
     pub fn frame(&mut self, x0: i64, y0: i64, x1: i64, y1: i64, c: [u8; 4]) {
@@ -297,8 +292,7 @@ pub fn paint(st: &EditorState, w: u32, h: u32, order: Order, labels: Option<&mut
 pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
     let (w, h) = (l.w, l.h);
     let tl = &st.timeline;
-    let mut c = Canvas::new(w, h, order);
-    c.rect(0, 0, w as i64, h as i64, BG);
+    let mut c = Canvas::filled(w, h, order, BG); // STRIAPERFCANVASFILL (SR919): BG in one pass
     // The preview band.
     c.rect(0, 0, w as i64, l.preview_h as i64, FIELD);
     if let Some(s) = preview {
@@ -308,7 +302,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     let fps = tl.fps().unwrap_or(25).max(1) as i64;
     let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
     c.rect(0, ry, w as i64, ty, RULER);
-    let t_end = l.tick_at(w as f64) + 1;
+    let t_end = if l.band_on(ry, ty) { l.tick_at(w as f64) + 1 } else { l.t0 - 1 }; // STRIAPERFCANVASFILL (SR919): an off-canvas ruler runs no tick
     for t in l.t0..=t_end {
         let x = l.x_of(t);
         if t % fps == 0 {
@@ -323,7 +317,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     // The tracks and their clips.
     for (row, track) in tl.tracks.iter().enumerate() {
         let y0 = l.row_y(row);
-        let y1 = y0 + ROW_H as i64;
+        let y1 = y0 + ROW_H as i64; if !l.band_on(y0, y1) { continue; } // STRIAPERFCANVASFILL (SR919): an off-canvas row paints and shapes nothing
         c.rect(0, y0, w as i64, y1, ROW[row % 2]);
         for clip in &track.clips {
             let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
@@ -1187,5 +1181,165 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAPERFCANVASFILL (LEDGER SR919): one-pass canvas fill and the off-canvas band cull (named tail block) ----
+// NLE-PERF-CANVAS-FILL: `paint_in` starts its canvas from BG in one pass ([`Canvas::filled`]) instead of a zero fill then
+// a BG rect, and [`Canvas::rect`] fills its first row then copies it down ([`Canvas::fill_rows`]): the same bytes for every
+// input. NLE-PERF-ROLE-CULL: a ruler or a track row whose band is wholly off the canvas ([`Layout::band_on`] false) runs no
+// tick and shapes no label (the split Preview Surface puts both a band below the canvas). Byte identity of the cull rests
+// on the label glyphs' rise: no glyph rises more than 9 px (ruler, baseline `ry + 9`) or 15 px (rows, baseline `y0 + 15`)
+// above its baseline (the host's 11 px sans; the kernel's 7x16 cell rises 9, vplay.rs `LABEL_RISE`), so a label of a band
+// starting at or below `h` painted nothing before. The kernel's `[nle] view labels=` then counts only the labels on its
+// band. no_std + alloc only.
+
+impl Canvas {
+    /// A `w` x `h` canvas in `order` every pixel of which is `c` (one pass: no zero fill first).
+    pub fn filled(w: u32, h: u32, order: Order, c: [u8; 4]) -> Canvas {
+        let pen = Canvas { w: 0, h: 0, order, px: Vec::new() };
+        let p = pen.put(c);
+        Canvas { w, h, order, px: p.repeat(w as usize * h as usize) }
+    }
+
+    /// Fill columns `x0..x1` of rows `y0..y1` (already clamped to the canvas) with the in-order pixel `c`: the first row's
+    /// span by one pixel and doubling copies, then that span copied to each later row.
+    fn fill_rows(&mut self, x0: usize, x1: usize, y0: usize, y1: usize, c: [u8; 4]) {
+        let span = x1.saturating_sub(x0) * 4;
+        if span == 0 || y0 >= y1 {
+            return;
+        }
+        let stride = self.w as usize * 4;
+        let first = y0 * stride + x0 * 4;
+        self.px[first..first + 4].copy_from_slice(&c);
+        let mut done = 4;
+        while done < span {
+            let n = done.min(span - done);
+            self.px.copy_within(first..first + n, first + done);
+            done += n;
+        }
+        for y in y0 + 1..y1 {
+            self.px.copy_within(first..first + span, y * stride + x0 * 4);
+        }
+    }
+}
+
+impl Layout {
+    /// Whether the band `y0..y1` reaches any row of the canvas.
+    pub fn band_on(&self, y0: i64, y1: i64) -> bool {
+        y1 > 0 && y0 < self.h as i64
+    }
+}
+
+#[cfg(test)]
+mod striaperfcanvasfill_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// The rect loop as it was before SR919: one 4-byte write per pixel.
+    fn rect_per_pixel(c: &mut Canvas, x0: i64, y0: i64, x1: i64, y1: i64, col: [u8; 4]) {
+        let (x0, x1) = (x0.clamp(0, c.w as i64) as usize, x1.clamp(0, c.w as i64) as usize);
+        let (y0, y1) = (y0.clamp(0, c.h as i64) as usize, y1.clamp(0, c.h as i64) as usize);
+        let col = c.put(col);
+        for y in y0..y1 {
+            let row = y * c.w as usize * 4;
+            for x in x0..x1 {
+                c.px[row + x * 4..row + x * 4 + 4].copy_from_slice(&col);
+            }
+        }
+    }
+
+    #[test]
+    fn striaperfcanvasfill_rect_matches_the_per_pixel_loop() {
+        let rects: [(i64, i64, i64, i64); 10] = [
+            (3, 4, 20, 9),
+            (-5, -7, 6, 5),
+            (30, 18, 60, 40),
+            (12, 10, 4, 15),
+            (8, 12, 8, 20),
+            (5, 5, 6, 6),
+            (0, 0, 37, 23),
+            (-100, 2, 100, 3),
+            (36, 0, 37, 23),
+            (10, 22, 30, 50),
+        ];
+        for order in [Order::Rgba, Order::Bgra] {
+            let mut a = Canvas::new(37, 23, order);
+            let mut b = Canvas::new(37, 23, order);
+            for (i, &(x0, y0, x1, y1)) in rects.iter().enumerate() {
+                let col = [i as u8 * 20, 255 - i as u8 * 7, i as u8 * 3 + 1, 200 + i as u8];
+                a.rect(x0, y0, x1, y1, col);
+                rect_per_pixel(&mut b, x0, y0, x1, y1, col);
+                assert_eq!(a.px, b.px, "rect {i} {:?} in {order:?}", (x0, y0, x1, y1));
+            }
+            a.frame(2, 3, 30, 20, SELECT);
+            rect_per_pixel(&mut b, 2, 3, 30, 4, SELECT);
+            rect_per_pixel(&mut b, 2, 19, 30, 20, SELECT);
+            rect_per_pixel(&mut b, 2, 3, 3, 20, SELECT);
+            rect_per_pixel(&mut b, 29, 3, 30, 20, SELECT);
+            assert_eq!(a.px, b.px, "frame in {order:?}");
+        }
+    }
+
+    #[test]
+    fn striaperfcanvasfill_filled_is_new_then_rect() {
+        for order in [Order::Rgba, Order::Bgra] {
+            for (w, h) in [(37u32, 23u32), (1, 1), (0, 5), (5, 0)] {
+                let mut want = Canvas::new(w, h, order);
+                want.rect(0, 0, w as i64, h as i64, BG);
+                let got = Canvas::filled(w, h, order, BG);
+                assert_eq!((got.w, got.h, got.order), (w, h, order));
+                assert_eq!(got.px, want.px, "{w}x{h} {order:?}");
+            }
+        }
+    }
+
+    struct Rec(Vec<alloc::string::String>);
+
+    impl Text for Rec {
+        fn text(&mut self, _: &mut Canvas, s: &str, _: f32, _: f32, _: (i32, i32)) {
+            self.0.push(alloc::string::String::from(s));
+        }
+    }
+
+    /// `tracks` video tracks, each one clip of source A (0..20) and one of B (20..40).
+    fn state(tracks: usize) -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        let b = tl.add_source("B", 100);
+        for row in 0..tracks {
+            tl.add_track(Kind::Video);
+            tl.tracks[row].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 20, 40, 20)];
+        }
+        EditorState::new(tl)
+    }
+
+    fn labels(st: &EditorState, l: Layout) -> (Vec<alloc::string::String>, Vec<u8>) {
+        let mut rec = Rec(Vec::new());
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        (rec.0, px)
+    }
+
+    #[test]
+    fn striaperfcanvasfill_preview_role_shapes_no_label() {
+        let st = state(2);
+        let (got, px) = labels(&st, Layout::of_role(Role::Preview, 320, 90, &st));
+        assert!(got.is_empty(), "the Preview Surface's ruler and rows are below the canvas: {got:?}");
+        assert_eq!(px.len(), 320 * 90 * 4);
+        let (whole, _) = labels(&st, Layout::of_role(Role::Whole, 320, 200, &st));
+        assert!(whole.iter().any(|s| s == "00:00:00:00"), "{whole:?}");
+        assert_eq!(whole.iter().filter(|s| *s == "A" || *s == "B").count(), 4, "{whole:?}");
+    }
+
+    #[test]
+    fn striaperfcanvasfill_short_tracks_canvas_is_the_tall_ones_top() {
+        let st = state(3);
+        let (short, sp) = labels(&st, Layout::of_role(Role::Tracks, 320, 56, &st));
+        let (tall, tp) = labels(&st, Layout::of_role(Role::Tracks, 320, 200, &st));
+        assert_eq!(sp[..], tp[..320 * 56 * 4], "the short canvas is the tall one's first 56 rows");
+        assert_eq!(short.iter().filter(|s| *s == "A" || *s == "B").count(), 2, "row 0 only: {short:?}");
+        assert_eq!(tall.iter().filter(|s| *s == "A" || *s == "B").count(), 6, "{tall:?}");
+        let ruler = |v: &[alloc::string::String]| v.iter().filter(|s| s.contains(':')).count();
+        assert_eq!(ruler(&short), ruler(&tall));
     }
 }
