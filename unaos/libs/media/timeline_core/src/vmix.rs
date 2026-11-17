@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn take_outgoing_rule() {
         let (a, b) = (SourceId(0), SourceId(1));
-        let step = |vmix: Option<VideoMix>| Step { kind: Kind::Video, track: Some(0), src: Some(b), src_t: 0, out_t: 10, len: 1, seek: Some(0), vmix };
+        let step = |vmix: Option<VideoMix>| Step { kind: Kind::Video, track: Some(0), src: Some(b), src_t: 0, out_t: 10, len: 1, seek: Some(0), vmix, stack: crate::schedule::NO_STACK };
         let mixing = |seek: Option<i64>| Some(VideoMix { kind: TransitionKind::Dissolve, src: Some(a), src_t: 23, seek, t: Frac { num: 1, den: 5 } });
         // the live run on the outgoing source moves into the mix slot
         let (mut live, mut mix) = (Some(a), None);
@@ -278,5 +278,19 @@ fn sweep(dir: WipeDir, x: usize, y: usize, w: usize, h: usize, num: i64, den: i6
 fn hand_back<R>(s: &Step, live: &mut Option<R>, mix: &mut Option<R>, src_of: &impl Fn(&R) -> SourceId) {
     if s.seek.is_none() && s.src.is_some() && mix.as_ref().map(src_of) == s.src && live.as_ref().map(src_of) != s.src {
         *live = mix.take();
+    }
+}
+
+// ---- STRIASTACK (LEDGER SR9066): each stack layer's own run (named tail block) ----
+// NLE-OPACITY-STACK: a step's `stack` index `j` decodes on run `j` (the schedule's seek for it compares against that index's
+// previous continuation), so a step that names no source at index `j` drops run `j`. Stria's render calls it beside
+// [`take_outgoing`]; the kernel Player decodes no stack (vplay.rs refuses it by name).
+
+/// STRIASTACK: run `j` of `runs` dropped when `s.stack[j]` names no source.
+pub fn take_stack<R>(s: &Step, runs: &mut [Option<R>]) {
+    for (run, m) in runs.iter_mut().zip(s.stack.iter()) {
+        if m.and_then(|m| m.src).is_none() {
+            *run = None;
+        }
     }
 }
