@@ -1615,3 +1615,175 @@ fn conceal_bidir_444_damaged_b_decodes_without_panic() {
         }
     }
 }
+
+// ---- HEVCCONCEALMAIN10PIN (LEDGER SR1027): the concealment roads at 10 bits (named tail block) ----
+
+/// SR1027: a Main10 gradient whose samples all sit above 255 (an 8-bit clamp would flatten every one) with a corner
+/// saturated at 1023 (luma and Cb): luma min(1023, 300 + 19x + 11y), Cb min(1023, 600 + 30x + 10y), Cr 900 - 7x - 13y.
+fn gradient10() -> Img {
+    Img::new(|x, y| (300 + x * 19 + y * 11).min(1023) as u16, |x, y| (600 + x * 30 + y * 10).min(1023) as u16, |x, y| (900 - x * 7 - y * 13) as u16)
+}
+
+/// SR1027: [`headers`] at Main10 through the kit's own knob (`SpsCfg.bit_depth` 10, pcm (10, 10, 3, 4)), no TMVP,
+/// deblocking off.
+fn headers10(pi: &PpsInter) -> Vec<u8> {
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { bit_depth: 10, pcm: Some((10, 10, 3, 4, true)), ..sps_cfg() }, &inter_sps(false))));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
+    s
+}
+
+/// SR1027: [`idr`] at 10 bits: the four CTBs as 16x16 pcm coding units through the kit's `pcm_cu_bits` (10, 10).
+fn idr10(img: &Img) -> Vec<u8> {
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    for k in 0..4 {
+        let (y, cb, cr) = img.ctb(k % 2, k / 2);
+        e.pcm_cu_bits(0, 4, 10, 10, &y, &cb, &cr);
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    nal(19, &e.finish().out)
+}
+
+/// SR1027: a Main10 frame's 10-bit samples (`planes16`) as an [`Img`].
+fn img16_of(f: &Frame) -> Img {
+    let p = f.planes16.as_ref().expect("planes16 at 10 bits");
+    Img { y: p[0].clone(), cb: p[1].clone(), cr: p[2].clone() }
+}
+
+/// SR1027: [`assert_frame`] at 10 bits: bit_depth 10, `planes16` equal to `want`, and the 8-bit `planes` its >> 2.
+fn assert_frame16(f: &Frame, want: &Img, what: &str) {
+    assert_eq!(f.bit_depth, 10, "{what}: a Main10 frame");
+    let got = img16_of(f);
+    for (c, (g, w)) in got.planes().into_iter().zip(want.planes()).enumerate() {
+        let n = if c == 0 { W } else { W / 2 };
+        for i in 0..n * n {
+            assert_eq!(g[i], w[i], "{what}: plane {c} sample ({}, {})", i % n, i / n);
+            assert_eq!(f.planes[c][i], (w[i] >> 2) as u8, "{what}: plane {c} narrowed ({}, {})", i % n, i / n);
+        }
+    }
+}
+
+/// SR1027: [`conceal_projection_scales_by_poc_distance`] at 10 bits: POC 3 is concealed from P2 along (32, 16) rescaled
+/// to (16, 8) = (4, 2) samples through `conceal_fetch` at bd 10, so P4 is P2 advanced by (4, 2) on the 10-bit planes:
+/// every sample stays above 255 and the saturated corner reads 1023 (the clamp (1 << 10) - 1), not 255.
+#[test]
+fn conceal_main10_projection_keeps_high_samples() {
+    let i0 = gradient10();
+    let mut s = headers10(&PpsInter::default());
+    s.extend(idr10(&i0));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(4, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_frame16(by_poc(&f, 0), &i0, "IDR0 at 10 bits");
+    assert_frame16(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
+    assert_frame16(by_poc(&f, 4), &shifted(&shifted(&i0, 8, 4), 4, 2), "P from the picture projected from POC 2 at 10 bits");
+    let p4 = img16_of(by_poc(&f, 4));
+    assert_eq!(p4.y.iter().copied().max(), Some(1023), "the saturated corner survives at (1 << 10) - 1");
+    assert!(p4.y.iter().chain(p4.cb.iter()).chain(p4.cr.iter()).all(|&v| v > 255), "no sample flattened to 8 bits");
+}
+
+/// SR1027: [`conceal_tie_takes_the_lower_poc`] at 10 bits: POC 1 ties POC 0 / POC 2 and is the still copy of the intra
+/// IDR0, so P4 is the 10-bit gradient.
+#[test]
+fn conceal_main10_tie_takes_the_lower_poc() {
+    let i0 = gradient10();
+    let mut s = headers10(&PpsInter::default());
+    s.extend(idr10(&i0));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(4, vec![(-3, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![1]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 1, src_poc: 0, projected: false, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    assert_frame16(by_poc(&f, 2), &shifted(&i0, 8, 4), "P2 moved");
+    assert_frame16(by_poc(&f, 4), &i0, "P from the picture concealed from POC 0 at 10 bits");
+}
+
+/// SR1027: [`conceal_bidir_averages_both_projections`] at 10 bits: the 10-bit head, then [`bidir_conceal_stream_fmt`]'s
+/// P4 / B2 / P6 bytes reused as they are (no bit-depth syntax in those slices). POC 3 is concealed from B2 along both
+/// lists ((4, 2) and (8, 0) samples) and `bi_default` at bd 10 (shift2 5 over s << 4) is (a + b + 1) >> 1 exactly, so P6
+/// is that average of B2's two fetches on the 10-bit planes.
+#[test]
+fn conceal_main10_bidir_averages_at_10_bits() {
+    let (full, _) = bidir_conceal_stream_fmt(1);
+    let head8 = head_fmt(1, &inter_sps(false), &PpsInter::default()).len();
+    let mut s = headers10(&PpsInter::default());
+    s.extend(idr10(&gradient10()));
+    s.extend_from_slice(&full[head8..]);
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "output in decoding order");
+    let b2 = img16_of(by_poc(&f, 2));
+    let (p, q) = (shifted(&b2, 4, 2), shifted(&b2, 8, 0));
+    let avg = |a: &[u16], b: &[u16]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u16).collect::<Vec<u16>>();
+    let want = Img { y: avg(&p.y, &q.y), cb: avg(&p.cb, &q.cb), cr: avg(&p.cr, &q.cr) };
+    assert_ne!(want.y, p.y, "the fixture's two projections must differ");
+    assert_ne!(want.y, q.y, "the fixture's two projections must differ");
+    assert!(want.y.iter().all(|&v| v > 255), "the average stays above 8 bits");
+    assert_frame16(by_poc(&f, 6), &want, "P from the picture concealed along both lists of B2 at 10 bits");
+}
+
+/// SR1027: [`conceal_weighted_applies_the_source_weights`] at 10 bits with luma weight 64 under denom 6 (unit) and
+/// luma_offset 10: 8.5.3.3.4.3 scales the offset by WpOffsetBdShiftY = BitDepthY - 8 (inter.rs `explicit_weight_of`
+/// `o << off_shift`), so P2 is the moved gradient + 40 and the concealed POC 3 (P4, its copy) is P2 advanced by (4, 2) +
+/// 40, clipped at (1 << 10) - 1: equal to P5 (the decoder's own weighted MC of P2 at (16, 8)); the fixture's fetches
+/// cross 1023 (the clamp is armed), and it is neither the unscaled + 10 nor the unit-weight projection.
+#[test]
+fn conceal_main10_weighted_offset_scales_by_bd() {
+    let i0 = gradient10();
+    let lift = Some((6, vec![Some((0, 10))]));
+    let mut s = headers10(&PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(idr10(&i0));
+    s.extend(picture(&SliceCfg { weights: lift.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+    s.extend(picture(&SliceCfg { weights: lift, ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [16, 8])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
+    let off = |r: &Img, o: u32| Img { y: r.y.iter().map(|&v| (v as u32 + o).min(1023) as u16).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
+    assert_frame16(by_poc(&f, 2), &off(&shifted(&i0, 8, 4), 40), "P2: the gradient moved by (8, 4), offset 10 << 2");
+    let p2 = img16_of(by_poc(&f, 2));
+    let fetch = shifted(&p2, 4, 2);
+    assert!(fetch.y.iter().any(|&v| v < 1023 && v + 40 > 1023), "the fixture reaches the clamp at (1 << 10) - 1");
+    assert_frame16(by_poc(&f, 4), &img16_of(by_poc(&f, 5)), "P from the concealed picture equals the decoder's own weighted MC of P2 at (16, 8)");
+    assert_frame16(by_poc(&f, 4), &off(&fetch, 40), "P from the concealed picture adds 10 << (10 - 8) and clips at 1023");
+    let p4 = img16_of(by_poc(&f, 4));
+    assert_ne!(p4.y, off(&fetch, 10).y, "not the unscaled offset");
+    assert_ne!(p4.y, fetch.y, "not the unit-weight projection");
+}
+
+/// SR1027: [`empty_dpb_keeps_the_generated_picture_grey`] at 10 bits: with the IDR lost POC 0 is generated at
+/// 1 << (10 - 1) = 512 on every plane (dpb.rs `generate_missing`), nothing is concealed, and P1 (its copy) reads 512
+/// (8-bit view 128).
+#[test]
+fn conceal_main10_grey_fill_is_512() {
+    let mut s = headers10(&PpsInter::default());
+    s.extend(picture(&p_slice(1, vec![(-1, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the missing reference");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![0]);
+    assert!(d.take_concealed().is_empty(), "an empty DPB conceals nothing");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![1]);
+    assert_frame16(&f[0], &Img::new(|_, _| 512, |_, _| 512, |_, _| 512), "P from the 10-bit grey generated reference");
+}

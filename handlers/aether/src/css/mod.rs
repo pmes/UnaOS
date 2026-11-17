@@ -1280,10 +1280,10 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 24; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 25; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
-    "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
+    "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1432,7 +1432,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
                 st.as_ref().map(|s| lp(s.padding.top)).unwrap_or_else(|| px(0.0)),
                 st.as_ref().map(|s| lpa_s(s.margin.top)).unwrap_or_else(|| px(0.0)),
-                flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(),
+                flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(), unicode_bidi_word(crate::render::unicode_bidi_of(tag, &paint, &any.node_at(id))).to_string(),
                 white_space_longhands(me.white_space).0.to_string(),
                 white_space_longhands(me.white_space).1.to_string(),
                 rgb(paint.decoration_color.flatten().unwrap_or(me.color)),
@@ -1784,3 +1784,18 @@ fn list_style_word(c: u8) -> &'static str {
 // ---- AETHERCSSOMCOLUMNSREST (LEDGER SR1036): white-space's two css-text-4 longhands from the one code (named tail block) ----
 
 use layout_core::css::white_space_longhands; // SR1036's code -> (white-space-collapse, text-wrap-mode) table, lifted to layout_core by SR1044 (one table for the arms, the resolve and these columns)
+
+// ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): the report's unicode-bidi keyword, the 22nd column (named tail block) ----
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): a `PaintStyle::unicode_bidi` code as its keyword (the inverse of layout_core's
+/// `unicode_bidi_code`: 0 normal, 1 embed, 2 isolate, 3 bidi-override, 4 isolate-override, 5 plaintext).
+fn unicode_bidi_word(c: u8) -> &'static str {
+    match c {
+        1 => "embed",
+        2 => "isolate",
+        3 => "bidi-override",
+        4 => "isolate-override",
+        5 => "plaintext",
+        _ => "normal",
+    }
+}
