@@ -386,6 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+"), // STRIAGRADEMORE (SR957): the digits step the selected clip's grade (SR899's VERBS words, text keys)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2354,9 +2355,9 @@ impl Face {
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
         let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
-        let s = self.sources.summary(c.src)?;
+        let s = self.sources.summary(c.src); // STRIAGRADEMORE (SR957): a reel with no summary still reads its grade (file tail)
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
-        Some(format!("{name}: {s}{}", grade_note(c.grade))) // STRIAGRADEFACE (SR899): the clip's grade while not identity (file tail)
+        reel_words(name, s, grade_note(c.grade)) // STRIAGRADEMORE (SR957): the summary-less arm (file tail); STRIAGRADEFACE (SR899): the clip's grade while not identity
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
@@ -2602,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("bright-", "brightness down one step"), ("bright+", "brightness up one step"), ("contrast-", "contrast down one step"), ("contrast+", "contrast up one step"), ("sat-", "saturation down one step"), ("sat+", "saturation up one step"), // STRIAGRADEMORE (SR957): the grade keys' phrases
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3106,4 +3108,20 @@ pub fn grade_note(g: timeline_core::Grade) -> String {
         return String::new();
     }
     format!("  bright {} contrast {} sat {}", g.brightness, g.contrast, g.saturation)
+}
+
+// ---- STRIAGRADEMORE (LEDGER SR957): the grade's keys and a summary-less reel's note (named tail block) ----
+// NLE-GRADE-KEYS: KEYS binds `1`..`6` (text keys) to SR899's six grade step words; `Face::key` routes a VERBS action through
+// `Face::verb`, so the keys and the buttons are ONE road, and HELP carries their phrases. NLE-GRADE-NOTE-NOSUMMARY:
+// [`Face::reel_line`] reads its line through [`reel_words`], so a graded clip on a reel with nothing to say still shows its grade.
+
+/// STRIAGRADEMORE (SR957): the reel line from its reel `name`, the reel's `summary` and the grade `note` ([`grade_note`]):
+/// a summary gives `<name>: <summary><note>` (SR899's line); no summary and a grade gives `<name>: bright <b> contrast <c>
+/// sat <s>`; no summary and no grade gives `None`.
+pub fn reel_words(name: String, summary: Option<String>, note: String) -> Option<String> {
+    match summary {
+        Some(s) => Some(format!("{name}: {s}{note}")),
+        None if !note.is_empty() => Some(format!("{name}: {}", note.trim_start())),
+        None => None,
+    }
 }

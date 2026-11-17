@@ -3784,3 +3784,104 @@ fn striagradeface_message_row_reads_the_grade() {
     println!("striagradeface: message row {plain:?} + \"  bright 50 contrast -50 sat 50\"");
 }
 
+
+// ---- STRIAGRADEMORE (LEDGER SR957): the grade's digit keys, a summary-less reel's note, a size switch's bars (named tail block) ----
+
+/// `2` / `4` / `6` (text keys) step B's grade up through SR899's words (one undo step each), `1` / `3` / `5` step it back;
+/// a one-char BrowserKey is not taken; with nothing selected a digit lands on the message row by EditError::NoClip's name;
+/// the keys help carries each digit on its word's row with its HELP phrase.
+#[test]
+fn striagrademore_digit_keys_step_the_grade() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.on(&bandy::SMessage::BrowserText("2".into())));
+    assert_eq!(face.last_error.take(), Some(format!("bright+: {}", EditError::NoClip)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    face.state.select(0, 1).unwrap();
+    assert!(!face.on(&bandy::SMessage::BrowserKey("2".into())), "a one-char BrowserKey alone is not taken");
+    for k in ["2", "4", "6"] {
+        assert!(face.on(&bandy::SMessage::BrowserText(k.into())), "{k}");
+        assert!(face.last_error.is_none(), "{k}: {:?}", face.last_error);
+    }
+    assert_eq!(face.state.timeline.tracks[0].clips[1].grade, timeline_core::Grade { brightness: 50, contrast: 50, saturation: 50 });
+    assert_eq!(face.state.undo_depth(), 3);
+    for k in ["1", "3", "5"] {
+        assert!(face.on(&bandy::SMessage::BrowserText(k.into())), "{k}");
+    }
+    assert_eq!(face.state.timeline.tracks[0].clips[1].grade, timeline_core::Grade::IDENTITY);
+    assert_eq!(face.state.undo_depth(), 6);
+    let rows = help_rows();
+    for (k, w) in [("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+")] {
+        assert!(KEYS.contains(&(k, w)), "{k} -> {w}");
+        let row = rows.iter().find(|(_, p)| *p == help_phrase(w)).expect("the grade row");
+        assert!(row.0.split(" / ").any(|x| x == k), "{k} not in {:?}", row.0);
+        assert!(help_phrase(w).ends_with("one step"), "{w}");
+    }
+    println!("striagrademore: keys 1..6 step the grade, depth 6");
+}
+
+/// A reel with nothing to say (B absent from the Sources) shows no line at identity; graded, it reads its grade alone; undo
+/// gives None back. `reel_words`' three arms.
+#[test]
+fn striagrademore_note_without_a_summary() {
+    use stria::nle_face::reel_words;
+    let (tl, _) = synth_fixture();
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), synth_source(0, 50, 25)).expect("synthetic source opens");
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    assert_eq!(face.reel_line(), None);
+    assert!(face.verb("bright+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.reel_line().as_deref(), Some("B: bright 50 contrast 0 sat 0"));
+    assert!(face.verb("undo"));
+    assert_eq!(face.reel_line(), None);
+    assert_eq!(reel_words("A".into(), Some("s".into()), String::new()).as_deref(), Some("A: s"));
+    assert_eq!(reel_words("A".into(), Some("s".into()), "  bright 1 contrast 0 sat 0".into()).as_deref(), Some("A: s  bright 1 contrast 0 sat 0"));
+    assert_eq!(reel_words("A".into(), None, "  bright 1 contrast 0 sat 0".into()).as_deref(), Some("A: bright 1 contrast 0 sat 0"));
+    assert_eq!(reel_words("A".into(), None, String::new()), None);
+}
+
+/// SR384's two-size reel with every clip graded: the unswitched frames are `Grade::apply` of the decoder's conversion, the
+/// switched ones are that graded picture letterboxed over FIELD, so the bars stay FIELD (SKIP offline).
+#[test]
+fn striagrademore_size_switch_bars_stay_black() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{chroma_of, decoder_for};
+    use timeline_core::view::{Canvas, FIELD, Order, Still};
+    let Some(file) = nlesizeswitch_reel() else { return };
+    let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
+    let g = timeline_core::Grade { brightness: 300, ..timeline_core::Grade::IDENTITY };
+    let mut graded = tl.clone();
+    for i in 0..graded.tracks[0].clips.len() {
+        graded = graded.set_grade(0, i, g).unwrap();
+    }
+    let mut sink = NleSizeSwitchSink::default();
+    render(&graded, 0..4, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 4);
+    let colour = src.open_report(SourceId(0)).and_then(|o| o.colour);
+    let mut d = Demuxer::open(file.clone()).unwrap();
+    let track = d.tracks()[0].clone();
+    let mut dec = decoder_for(&track).unwrap();
+    let mut decoded = Vec::new();
+    while let Some(p) = d.next_packet() {
+        decoded.extend(dec.decode(&p).unwrap());
+    }
+    decoded.extend(dec.flush());
+    for (i, f) in decoded.iter().enumerate() {
+        let mut native = f.to_rgba_colour(colour.as_ref(), chroma_of(&track));
+        g.apply(&mut native);
+        let want = if i < 2 {
+            native
+        } else {
+            let mut c = Canvas::new(768, 512, Order::Rgba);
+            c.rect(0, 0, 768, 512, FIELD);
+            c.blit_fit(&Still { width: 1280, height: 720, rgba: native }, 0, 0, 768, 512);
+            c.px
+        };
+        assert!(sink.frames[i].2 == want, "frame {i}: graded before the fit");
+    }
+    let px = |i: usize, x: usize, y: usize| sink.frames[i].2[(y * 768 + x) * 4..(y * 768 + x) * 4 + 4].to_vec();
+    assert_eq!((px(2, 384, 0), px(2, 384, 511)), (FIELD.to_vec(), FIELD.to_vec()), "the bars are not graded");
+    println!("striagrademore: graded size switch, bars FIELD");
+}
