@@ -892,3 +892,98 @@ mod striamultiselect_tests {
         assert_eq!(st.verb("gain+"), Some(Err(EditError::NoClip)));
     }
 }
+
+// ---- STRIAMULTISELECTMORE (LEDGER SR950): set toggle and the set's track move (named tail block) ----
+// `select_remove` is `select_add`'s inverse (view.rs `Drag::release_still` calls it for a shift-press released still on a
+// set member): view-only, no commit; a removed primary hands off to the set's first member (none left: nothing
+// selected). `move_set_track` is `move_set` with a track offset: ONE commit of `Timeline::move_many_track`, the set and
+// its primary re-found on the tracks they landed on.
+impl EditorState {
+    /// Take `(track, idx)` out of the set; `false` (nothing changes) when it is not in it.
+    pub fn select_remove(&mut self, track: usize, idx: usize) -> bool {
+        let Some(k) = self.set.iter().position(|&p| p == (track, idx)) else { return false };
+        self.set.remove(k);
+        if self.selection == Some((track, idx)) {
+            self.selection = self.set.first().copied();
+        }
+        true
+    }
+    /// Move every selected clip by `delta` ticks and `dtrack` tracks (ONE commit; refused whole). `dtrack == 0` is
+    /// [`EditorState::move_set`].
+    pub fn move_set_track(&mut self, dtrack: isize, delta: i64) -> Result<(), EditError> {
+        if dtrack == 0 {
+            return self.move_set(delta);
+        }
+        let primary = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.move_many_track(&self.set, dtrack, delta)?;
+        let to = |st: &EditorState, (t, i): (usize, usize)| (t.wrapping_add_signed(dtrack), st.timeline.tracks[t].clips[i].at + delta);
+        let landed: Vec<(usize, i64)> = self.set.iter().map(|&p| to(self, p)).collect();
+        let p = to(self, primary);
+        self.commit(tl);
+        let picks: Vec<(usize, usize)> = landed.iter().filter_map(|&(t, a)| self.timeline.clip_at(t, a).map(|i| (t, i))).collect();
+        self.select_many(&picks, false);
+        if let Some(i) = self.timeline.clip_at(p.0, p.1) {
+            self.selection = Some((p.0, i));
+        }
+        self.settle();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod striamultiselectmore_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10; A1: A 0..20 at 0; V2 (track 2) empty. The set: both V1 clips, primary V1's B.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        st
+    }
+
+    #[test]
+    fn striamultiselectmore_toggle_removes_member_and_primary_moves() {
+        let mut st = state();
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), alloc::vec![(0, 0), (0, 1)]));
+        assert!(!st.select_remove(1, 0), "a non-member");
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), alloc::vec![(0, 0), (0, 1)]));
+        assert!(st.select_remove(0, 1), "the primary");
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 0)), alloc::vec![(0, 0)]));
+        assert!(st.select_remove(0, 0), "the last member");
+        assert_eq!((st.selection, st.set.len()), (None, 0));
+        assert_eq!(st.undo_depth(), 0, "view-only: no commit");
+    }
+
+    #[test]
+    fn striamultiselectmore_set_moves_down_a_track_one_commit() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.move_set_track(1, 5), Err(EditError::Kind), "A1 is audio");
+        assert_eq!(st.move_set_track(3, 5), Err(EditError::NoTrack));
+        assert_eq!(st.move_set_track(-1, 5), Err(EditError::NoTrack));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0), "refused whole");
+        assert_eq!(st.move_set_track(2, 5), Ok(()));
+        assert_eq!(st.timeline, tl0.move_many_track(&[(0, 0), (0, 1)], 2, 5).unwrap());
+        assert!(st.timeline.tracks[0].clips.is_empty());
+        let ats: Vec<i64> = st.timeline.tracks[2].clips.iter().map(|c| c.at).collect();
+        assert_eq!(ats, alloc::vec![5, 15]);
+        assert_eq!((st.selection, st.set.clone()), (Some((2, 1)), alloc::vec![(2, 0), (2, 1)]), "the set and primary follow");
+        assert_eq!(st.undo_depth(), 1, "ONE commit");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0);
+        let mut same = state();
+        let mut plain = state();
+        assert_eq!(same.move_set_track(0, 5), plain.move_set(5));
+        assert_eq!(same, plain, "dtrack 0 is move_set");
+    }
+}
