@@ -12,7 +12,8 @@
 //! one pic_timing SEI and every IDR (only an IDR) one buffering_period, and h264_core decodes each to the encoder's
 //! reconstruction byte for byte (SEI and filler skipped); (d) `hrd: true` without a bucket (constant QP: tests/rc.rs's pin, CRF)
 //! changes no byte. H264COREHRD (SR708): the SPS is read by h264_core's `ps::parse_sps` (`Sps::timing_info` / `nal_hrd`) and the
-//! SEIs by its decoder (`Decoder::take_hrd_notes`); no bit walker of its own.
+//! SEIs by its decoder (`Decoder::take_hrd_notes`); no bit walker of its own. H264ENCHRDVBRKAT (SR1034): the VBR twins (e-h, the file tail) through
+//! the same replay, its cbr_flag 0 arm (arrival at the max rate stops while the CPB is full).
 
 use h264_core::decoder::HrdKind;
 use h264_core::nal::{unescape, NAL_FILLER, NAL_IDR, NAL_PPS, NAL_SEI, NAL_SPS};
@@ -55,12 +56,12 @@ fn cbr400(gop: u32) -> Config {
 
 /// Encode `n` frames of the scene (push / flush, so B pictures come out in decoding order); with `decode`, h264_core decodes
 /// every access unit (bframes 0) and it must equal the reconstruction.
-fn run(cfg: Config, n: usize, decode: bool) -> Vec<Access> {
+fn run_src(cfg: Config, n: usize, decode: bool, src: fn(usize) -> [Vec<u8>; 3]) -> Vec<Access> {
     let mut enc = Encoder::new(cfg).unwrap();
     let mut dec = Decoder::new();
     let mut out = Vec::new();
     for t in 0..n {
-        let p = scene(t);
+        let p = src(t);
         let aus = enc.push(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap();
         for (au, rec) in aus.iter().zip(enc.reconstructions()) {
             if decode {
@@ -140,12 +141,14 @@ fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
     let (nut, ts, _) = sps.timing_info.expect("timing_info");
     let h = sps.nal_hrd.or(sps.vcl_hrd).expect("nal_hrd_parameters"); // the NAL HRD (Type II, every NAL unit), else the VCL HRD (Type I: VCL + filler, SR1060)
     // cbr_flag 1: continuous arrival from t = 0 at BitRate; cbr_flag 0 (the VCL HRD, SR1060): on demand, `vbr_road` (C.1.2).
+    let cbr = h.cbr || sps.nal_hrd.is_none(); // H264ENCHRDVBRKAT (SR1034): the NAL HRD's cbr_flag 0 is the VBR replay (arrival at BitRate, the max, stops while the CPB is full: no overflow under VBR); the CBR arm unchanged, and the VCL-only replay (SR1060) keeps it before `vbr_road`
     let (nut, ts, br, cpb) = (nut as i128, ts as i128, h.bit_rate as i128, h.cpb_size as i128);
     let notes = seis(aus);
     let unit = 90_000 * ts;
     let tick = nut * 90_000;
     let (mut anchor, mut cum, mut fillers) = (None::<i128>, 0i128, 0usize); let mut road: Vec<(i128, i128, i128)> = Vec::new();
     let (mut margin, mut peak) = (i128::MAX, 0i128);
+    let (mut fill, mut last) = (0i128, 0i128); // SR1034: the VBR CPB fullness x unit after the last removal, and its time
     for (n, au) in aus.iter().enumerate() {
         let s = &notes[n];
         let (cpb_delay, _) = s.pt[0];
@@ -158,16 +161,20 @@ fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
             anchor = Some(t);
         }
         assert_eq!(t, aus_first(&notes, ts) + 2 * n as i128 * tick, "access unit {n}: removal times are one frame apart");
-        let before = br * t - cum * unit; // CPB fullness x unit just before the removal (bits arrived - bits removed)
+        let before = if cbr { br * t - cum * unit } else { (fill + br * (t - last)).min(cpb * unit) }; // CPB fullness x unit just before the removal (bits arrived - bits removed)
         let b = if sps.nal_hrd.is_some() { bits(au) } else { vcl_bits(au) }; cum += b; road.push((t, b, s.bp.first().map_or(road.last().map_or(0, |r| r.2), |&d| d as i128 * ts)));
-        let arrived = br * t - cum * unit; // >= 0: all of the access unit has arrived
+        let arrived = if cbr { br * t - cum * unit } else { before - b * unit }; // >= 0: all of the access unit has arrived
+        (fill, last) = (arrived, t); // SR1034
+        if let (false, Some(&d)) = (cbr, s.bp.first()) {
+            assert!(d as i128 * br * ts <= before, "access unit {n}: VBR initial_cpb_removal_delay {d} claims more than the CPB holds"); // SR1034: the delay is the fullness at the max rate (H264ENC-HRD-VBR-INITIAL-DELAY's rule)
+        }
         margin = margin.min(arrived / unit);
         peak = peak.max(before / unit);
         assert!(arrived >= 0, "access unit {n}: CPB underflow ({} bits short)", -arrived / unit);
         assert!(!h.cbr || before <= cpb * unit, "access unit {n}: CPB overflow ({} bits over {cpb})", (before - cpb * unit) / unit);
         fillers += au.nals.iter().filter(|x| x[0] & 0x1f == NAL_FILLER).count();
     }
-    if h.cbr { (fillers, margin, peak) } else { vbr_road(&road, br, cpb, unit, fillers) }
+    if h.cbr || sps.nal_hrd.is_some() { (fillers, margin, peak) } else { vbr_road(&road, br, cpb, unit, fillers) } // the NAL HRD (CBR, or SR1034's VBR arm) or the VCL HRD's cbr 1 road; the VCL-only cbr 0 road is `vbr_road` (SR1060)
 }
 
 fn aus_first(notes: &[Sei], ts: i128) -> i128 {
@@ -274,6 +281,121 @@ fn d_no_bucket_no_bytes_moved() {
     for au in run(Config { hrd: false, ..cbr400(30) }, N, false) {
         assert!(au.nals.iter().all(|x| !matches!(x[0] & 0x1f, NAL_SEI | NAL_FILLER)), "hrd off writes no SEI / filler");
     }
+}
+
+// ---- H264ENCHRDVBRKAT (LEDGER SR1034): VBR twins of the HRD KATs (named tail block) ----
+// `Config::hrd` under a VBR rate signals rc.rs's max bucket (`Rc::hrd_params`: BitRate = CpbSize = the max, cbr_flag 0) and each
+// buffering period's initial_cpb_removal_delay as the max bucket's fullness at the max rate (`Encoder::hrd_au`, x264's rule). The
+// twins replay it through `replay`'s cbr_flag 0 arm: bits arrive at the max rate and stop while the CPB is full, a picture never
+// leaves it short, and no delay claims more than the CPB holds.
+
+/// Encode `n` frames of tests/rc.rs's scene (the KATs above): `run_src` over [`scene`].
+fn run(cfg: Config, n: usize, decode: bool) -> Vec<Access> {
+    run_src(cfg, n, decode, scene)
+}
+
+/// VBR mean 300 / max `max` kbit/s at 30 fps (under the HRD both round down to 64: the mean to 299968, max 600 stays 600000, max 900 becomes 899968).
+fn vbr(max: u32, gop: u32) -> Config {
+    Config { rate: Some(RateControl::vbr(300, max, (FPS, 1))), ..cbr400(gop) }
+}
+
+/// A new scene: a dense hashed texture drifting one sample per frame right (an IDR here costs far more than [`scene`]'s).
+fn busy(t: usize) -> [Vec<u8>; 3] {
+    let hash = |x: usize, y: usize, k: u32| {
+        let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77) ^ k;
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2C1B_3C6D);
+        (h ^ (h >> 12)) >> 24
+    };
+    let mut p = [vec![0u8; W * H], vec![0u8; W * H / 4], vec![0u8; W * H / 4]];
+    for y in 0..H {
+        for x in 0..W {
+            p[0][y * W + x] = (32 + hash(x + 512 - t, y, 0) * 3 / 4) as u8;
+        }
+    }
+    for y in 0..H / 2 {
+        for x in 0..W / 2 {
+            p[1][y * (W / 2) + x] = (96 + hash(2 * x + 512 - t, y, 1) / 4) as u8;
+            p[2][y * (W / 2) + x] = (96 + hash(2 * x + 512 - t, y, 2) / 4) as u8;
+        }
+    }
+    p
+}
+
+#[test]
+fn e_vbr_sps_signals_the_max_bucket() {
+    for max in [600u32, 900] {
+        let v = sps_of(&run(vbr(max, 6), 1, false)[0].nals[0]);
+        println!("hrd sps vbr 300 / {max}: {v:?}");
+        assert_eq!(v.timing_info, Some((1, 2 * FPS, true)), "two ticks per frame");
+        let h = v.nal_hrd.expect("nal_hrd_parameters");
+        let lens = [h.initial_cpb_removal_delay_len, h.cpb_removal_delay_len, h.dpb_output_delay_len, h.time_offset_len];
+        assert_eq!((h.cpb_cnt, h.bit_rate, h.cpb_size, h.cbr, lens), (1, (max * 1000 & !63) as u64, (max * 1000 & !63) as u64, false, [24, 24, 24, 24]), "VBR {max}: BitRate / CpbSize the max bucket rounded to 64 (600000, 899968; not the mean 299968), cbr_flag 0");
+        assert!(v.vcl_hrd.is_none());
+        assert!(!v.low_delay_hrd);
+        assert_eq!(v.level_idc, 13, "level 1.3: the max past level 1.2's 384 x 1200 (the mean would fit 1.2)");
+    }
+}
+
+#[test]
+fn f_vbr_cpb_replay_never_underflows() {
+    for bframes in [0u8, 2] {
+        let aus = run(Config { bframes, ..vbr(600, 6) }, N, false);
+        assert_eq!(aus.len(), N);
+        let v = sps_of(&aus[0].nals[0]);
+        let (fillers, margin, peak) = replay(&aus, &v);
+        let total: i128 = aus.iter().map(bits).sum();
+        println!(
+            "hrd vbr 600 kbit/s bframes {bframes}: {N} access units, {total} bits ({:.1} kbit/s), arrival margin min {margin} bits, cpb peak {peak} / 600000 bits",
+            total as f64 * FPS as f64 / N as f64 / 1000.0
+        );
+        println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
+        assert_eq!(fillers, 0, "VBR pads nothing");
+        assert_eq!(peak, 600_000, "the CPB fills to CpbSize and stops (cbr_flag 0)");
+        assert!(margin >= 0);
+    }
+}
+
+#[test]
+fn g_vbr_every_picture_times_and_decodes() {
+    let aus = run(vbr(600, 6), N, true);
+    let v = sps_of(&aus[0].nals[0]);
+    replay(&aus, &v);
+    let notes = seis(&aus);
+    let mut idrs = 0;
+    for (n, au) in aus.iter().enumerate() {
+        let s = &notes[n];
+        assert_eq!(s.pt.len(), 1, "access unit {n}: one pic_timing");
+        let idr = au.nals.iter().any(|x| x[0] & 0x1f == NAL_IDR);
+        assert_eq!(s.bp.len(), idr as usize, "access unit {n}: a buffering_period exactly on an IDR");
+        assert_eq!(s.pt[0].1, 0, "no reorder: dpb_output_delay 0");
+        let since = n % 6;
+        let want = if since == 0 { if n == 0 { 0 } else { 12 } } else { 2 * since as u32 };
+        assert_eq!(s.pt[0].0, want, "access unit {n}: cpb_removal_delay");
+        idrs += idr as usize;
+        assert_eq!(au.nals.iter().position(|x| x[0] & 0x1f == NAL_SEI), Some(if idr { 2 } else { 0 }));
+        assert!(au.nals.iter().all(|x| x[0] & 0x1f != NAL_FILLER), "access unit {n}: VBR writes no filler");
+    }
+    assert_eq!(idrs, 2);
+    let aus = run(Config { bframes: 2, ..vbr(600, 6) }, N, false);
+    for (au, s) in aus.iter().zip(seis(&aus)) {
+        assert_eq!(s.pt[0].1 as u64, 2 * (au.pts - au.dts));
+    }
+}
+
+#[test]
+fn h_vbr_scene_change_stays_in_bucket() {
+    let aus = run_src(vbr(600, 6), N, true, |t| if t < 6 { scene(t) } else { busy(t) });
+    let v = sps_of(&aus[0].nals[0]);
+    let idr: Vec<i128> = aus.iter().filter(|a| a.nals.iter().any(|x| x[0] & 0x1f == NAL_IDR)).map(bits).collect();
+    let (fillers, margin, peak) = replay(&aus, &v);
+    let bp: Vec<u32> = seis(&aus).iter().flat_map(|s| s.bp.clone()).collect();
+    println!("hrd vbr scene change: idr {} -> {} bits, initial_cpb_removal_delay {bp:?}, arrival margin min {margin} bits, cpb peak {peak} / 600000 bits", idr[0], idr[1]);
+    println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
+    assert_eq!(idr.len(), 2);
+    assert!(idr[1] >= 2 * idr[0], "the scene change's IDR ({}) is not twice the first ({})", idr[1], idr[0]);
+    assert_eq!((fillers, bp.len()), (0, 2));
+    assert!(margin >= 0);
 }
 
 // ---- H264ENCHRDVCL (LEDGER SR1060): the VCL HRD beside the NAL HRD, replayed as Annex C's Type I point (named tail block) ----
