@@ -1509,3 +1509,109 @@ fn kit_b_body_equals_the_inline_b_cus() {
         assert_eq!(picture(&cfg, |e| bi_body(e, 2, m0, m1)), pin, "B POC {poc}");
     }
 }
+
+// ---- HEVCCONCEALBI444 (LEDGER SR845): bi concealment averaged on every chroma sample at chroma_format_idc 1 / 2 / 3 (named tail block) ----
+
+/// SR845: [`bidir_conceal_stream`]'s PRED_BI shape over the kit's [`head_fmt`] at chroma_format_idc `idc` (the non-linear
+/// pcm pattern): IDR0, P4 (skip-only: I0), B2 (StCurrBefore {0}, StCurrAfter {4}, two references per list; CTB 0 PRED_BI
+/// through the kit's `bi_body` with L0 mvd (32, 16) to POC 0 and L1 mvd (-64, 0) to POC 4, CTBs 1..3 skip-merge it),
+/// then P6 (skip-only, references only the lost POC 3). Returns the stream and the byte range of B2's NAL.
+fn bidir_conceal_stream_fmt(idc: u32) -> (Vec<u8>, std::ops::Range<usize>) {
+    let mut s = head_fmt(idc, &inter_sps(false), &PpsInter::default());
+    s.extend(picture(&p_slice(4, vec![(-4, true)]), skip_picture));
+    let bcfg = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 2,
+        neg: vec![(-2, true)],
+        pos: vec![(2, true)],
+        num_ref: Some((2, 2)),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    let start = s.len();
+    s.extend(picture(&bcfg, |e| bi_body(e, 2, [32, 16], [-64, 0])));
+    let b2 = start..s.len();
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    (s, b2)
+}
+
+/// SR845: [`conceal_bidir_averages_both_projections`] at chroma_format_idc `idc`. POC 3 is concealed from B2 along both
+/// lists: L0 (32, 16) rescaled by td 2, tb 1 to (16, 8) quarter samples, L1 (-64, 0) by td -2, tb 1 to (32, 0); dpb.rs
+/// `conceal_fetch` takes chroma mvC = mv * 2 / (SubWidthC, SubHeightC) ([`mvc_at`]): whole chroma samples on every format
+/// (4:2:0 (2, 1) / (4, 0), 4:2:2 (2, 2) / (4, 0), 4:4:4 (4, 2) / (8, 0)), so each 14-bit fetch is s << 6 and 8-262's
+/// `bi_default` is (s + t + 1) >> 1 exactly. P6 (the concealed picture's skip copy) equals that average of the two fetches
+/// of B2 on EVERY sample of every plane (the 4:4:4 concealed chroma block is 8x8 = 64: `second` filled whole), and differs
+/// from either fetch alone and (idc 2 / 3) from the previous format's mvC.
+fn conceal_bidir_averages_both_projections_at(idc: u32) {
+    let (sub, (cw, ch), prev) = if idc == 1 { ((2, 2), (16, 16), (2, 2)) } else { fmt_geom(idc) };
+    let (s, _) = bidir_conceal_stream_fmt(idc);
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3], "idc {idc}");
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }], "idc {idc}: every block bi");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "idc {idc}: output in decoding order");
+    let (b2, p6) = (by_poc(&f, 2), by_poc(&f, 6));
+    let avg = |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u8).collect::<Vec<u8>>();
+    let whole = |p: i32| (p + 32) >> 6;
+    let (pl, ql) = (fetch_map(&b2.planes[0], 0, 32, 32, [16, 8], whole), fetch_map(&b2.planes[0], 0, 32, 32, [32, 0], whole));
+    assert_eq!(p6.planes[0], avg(&pl, &ql), "idc {idc}: luma, the 8-262 average of (4, 2) and (8, 0)");
+    assert_ne!(p6.planes[0], pl, "idc {idc}: luma not the L0 projection alone");
+    assert_ne!(p6.planes[0], ql, "idc {idc}: luma not the L1 projection alone");
+    let (m0, m1) = (mvc_at([16, 8], sub), mvc_at([32, 0], sub));
+    for c in 1..3 {
+        let r = &b2.planes[c][..];
+        assert_eq!(p6.planes[c].len(), (cw * ch) as usize, "idc {idc} plane {c}: the format's sample count");
+        let (p, q) = (fetch_map(r, c, cw, ch, m0, whole), fetch_map(r, c, cw, ch, m1, whole));
+        let want = avg(&p, &q);
+        for i in 0..want.len() {
+            assert_eq!(p6.planes[c][i], want[i], "idc {idc} plane {c} sample ({}, {}): the average of mvC {m0:?} and {m1:?}", i as i32 % cw, i as i32 / cw);
+        }
+        assert_ne!(p6.planes[c], p, "idc {idc} plane {c}: not the L0 projection alone");
+        assert_ne!(p6.planes[c], q, "idc {idc} plane {c}: not the L1 projection alone");
+        if idc != 1 {
+            let (n0, n1) = (mvc_at([16, 8], prev), mvc_at([32, 0], prev));
+            assert_ne!(p6.planes[c], avg(&fetch_map(r, c, cw, ch, n0, whole), &fetch_map(r, c, cw, ch, n1, whole)), "idc {idc} plane {c}: not the previous format's mvC {n0:?} / {n1:?}");
+        }
+    }
+}
+
+/// SR845: the bi concealment at 4:2:0 over the kit's non-linear pattern (the gradient pin above unchanged).
+#[test]
+fn conceal_bidir_averages_both_projections_420_pattern() {
+    conceal_bidir_averages_both_projections_at(1);
+}
+
+/// SR845: the bi concealment at 4:2:2: 4x8 chroma blocks, both fetches averaged on every chroma sample.
+#[test]
+fn conceal_bidir_averages_both_projections_422() {
+    conceal_bidir_averages_both_projections_at(2);
+}
+
+/// SR845: the bi concealment at 4:4:4: 8x8 chroma blocks, `conceal_fetch`'s 64-sample `second` filled whole.
+#[test]
+fn conceal_bidir_averages_both_projections_444() {
+    assert!(!sps_cfg().separate_colour_plane, "the idc-3 SPS writes separate_colour_plane_flag 0");
+    conceal_bidir_averages_both_projections_at(3);
+}
+
+/// SR845: the fuzz-shape pin on the 4:4:4 bi concealment road: each byte of B2's slice NAL after its start code and
+/// two-byte header, xor-ed with 0xff and with 0x01 in turn, decodes (Ok or Err), flushes and yields its frames without
+/// a panic.
+#[test]
+fn conceal_bidir_444_damaged_b_decodes_without_panic() {
+    let (s, b2) = bidir_conceal_stream_fmt(3);
+    for i in b2.start + 6..b2.end {
+        for mask in [0xffu8, 0x01] {
+            let mut t = s.clone();
+            t[i] ^= mask;
+            let mut d = Decoder::new();
+            let _ = d.decode_annexb(&t);
+            d.flush();
+            let _ = d.take_frames();
+        }
+    }
+}
