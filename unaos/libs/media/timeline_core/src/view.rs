@@ -4234,3 +4234,65 @@ mod striakmultisel_tests {
         assert_eq!((st.selection, st.set.clone()), (Some((1, 0)), alloc::vec![(1, 0)]), "a plain marquee replaces the set");
     }
 }
+
+// ---- STRIAKTC (LEDGER SR9018): the playhead readout text, lifted from nle_face (named tail block) ----
+// SR872's `TcUnit` / `tc_text` and SR964's `tc_text_tb` moved byte for byte from `stria::nle_face` (which re-exports them), so
+// the host face's message-row readout and the kernel Player's view band (vplay.rs `band_tc`) read ONE text: [`tc_readout`] is
+// the face's rate rule (`Timeline::fps` else 25) over `tc_text_tb` (an NTSC base drop-frame through `edl::timecode_drop`).
+
+/// STRIATIMECODEDISPLAY (SR872): the playhead readout's unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcUnit {
+    Timecode,
+    Frames,
+    Seconds,
+}
+
+impl TcUnit {
+    /// The unit's word (the witness's `"tc"` value).
+    pub fn word(self) -> &'static str {
+        match self {
+            TcUnit::Timecode => "timecode",
+            TcUnit::Frames => "frames",
+            TcUnit::Seconds => "seconds",
+        }
+    }
+}
+
+/// STRIATIMECODEDISPLAY (SR872): tick `t` at `fps` in `unit`: `HH:MM:SS:FF` ([`edl::timecode`]), the tick count, or `S.CC s`
+/// (integer hundredths); a negative tick reads as 0.
+pub fn tc_text(t: i64, fps: u32, unit: TcUnit) -> alloc::string::String {
+    let (t, fps) = (t.max(0), fps.max(1) as i64);
+    match unit {
+        TcUnit::Timecode => edl::timecode(t, fps as u32),
+        TcUnit::Frames => alloc::format!("{}", t),
+        TcUnit::Seconds => {
+            let cs = t * 100 / fps;
+            alloc::format!("{}.{:02} s", cs / 100, cs % 100)
+        }
+    }
+}
+
+/// STRIATCMORE (SR964): tick `t` in `unit` at the time base `tb`; `fps` is the rate for any base that is not NTSC.
+pub fn tc_text_tb(t: i64, tb: crate::Timebase, fps: u32, unit: TcUnit) -> alloc::string::String {
+    let k = tb.den / 1000;
+    if tb.num != 1001 || tb.den % 1000 != 0 || k == 0 || k > u32::MAX as u64 {
+        return tc_text(t, fps, unit);
+    }
+    let t = t.max(0);
+    match unit {
+        TcUnit::Timecode if k == 30 || k == 60 => edl::timecode_drop(t, k as u32),
+        TcUnit::Timecode => edl::timecode(t, k as u32),
+        TcUnit::Frames => alloc::format!("{}", t),
+        TcUnit::Seconds => {
+            let cs = (t as i128 * 1001 * 100 / tb.den as i128) as i64;
+            alloc::format!("{}.{:02} s", cs / 100, cs % 100)
+        }
+    }
+}
+
+/// STRIAKTC (SR9018): THE playhead readout text both faces show: tick `t` of `tl` in `unit`, at `tl`'s rate
+/// (`Timeline::fps` else 25; an NTSC base at its real rate).
+pub fn tc_readout(tl: &Timeline, t: i64, unit: TcUnit) -> alloc::string::String {
+    tc_text_tb(t, tl.tb, tl.fps().unwrap_or(25).max(1), unit)
+}

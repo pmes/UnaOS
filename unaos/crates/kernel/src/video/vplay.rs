@@ -1986,7 +1986,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let px = pack(&view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, None), l, view::Order::Rgba, drag.as_ref()));
+    let px = pack(&view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, None), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref())); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -3072,4 +3072,26 @@ fn still_toggle(d: &timeline_core::view::Drag, st: &mut timeline_core::editor::E
     }
     serial_println!("[nle] drag toggle track={} clip={} selected={}", d.track, d.idx, st.set.len());
     true
+}
+
+// ---- STRIAKTC (LEDGER SR9018): the playhead timecode on the view band (named tail block) ----
+// handlers.md §5 NLE5b's NLE-TC-KERNEL. The band is the Tracks role (no message row, where the host face's `tc` readout
+// sits), so the Player shows the readout at the RULER's right end: a `view::RULER` rect clears the ticks / second labels
+// under it, then timeline_core's ONE readout text (`view::tc_readout`, the host face's: its rate rule, an NTSC base
+// drop-frame) goes through the band's ONE label hook ([`ViewLabels`], counted in `[nle] view .. labels=`). Always on in the
+// timecode unit: the Player has no unit word or key (owed NLE-TC-KERNEL-UNIT). A band narrower than the text paints nothing.
+
+/// The playhead's timecode over the ruler's right end of the painted band `px` (layout `l`, state `st`).
+fn band_tc(px: Vec<u8>, l: timeline_core::view::Layout, st: &timeline_core::editor::EditorState, lab: &mut ViewLabels) -> Vec<u8> {
+    use timeline_core::view;
+    let s = view::tc_readout(&st.timeline, st.playhead, view::TcUnit::Timecode);
+    let tw = super::text::advance(s.as_bytes(), false, super::text::Face::Body);
+    if (l.w as usize) < tw + 8 {
+        return px;
+    }
+    let x0 = l.w as usize - tw - 8;
+    let mut c = view::Canvas { w: l.w, h: l.h, order: view::Order::Rgba, px };
+    c.rect(x0 as i64, l.ruler_y as i64, l.w as i64, l.tracks_y as i64, view::RULER);
+    view::Text::text(lab, &mut c, &s, (x0 + 4) as f32, l.ruler_y as f32 + 9.0, (x0 as i32, l.w as i32));
+    c.px
 }

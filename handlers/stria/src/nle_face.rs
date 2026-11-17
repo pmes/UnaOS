@@ -3607,38 +3607,7 @@ impl Face {
 // the row exists only with labels on, as the message's. Timecode is `edl::timecode`; fps is the ruler's (`fps()` else 25).
 // Owed: NLE-TC-KERNEL (the kernel Player's message row), NLE-TC-KEY, NLE-TC-SET (`tc <unit>`), NLE-TC-DROPFRAME.
 
-/// STRIATIMECODEDISPLAY (SR872): the playhead readout's unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TcUnit {
-    Timecode,
-    Frames,
-    Seconds,
-}
-
-impl TcUnit {
-    /// The unit's word (the witness's `"tc"` value).
-    pub fn word(self) -> &'static str {
-        match self {
-            TcUnit::Timecode => "timecode",
-            TcUnit::Frames => "frames",
-            TcUnit::Seconds => "seconds",
-        }
-    }
-}
-
-/// STRIATIMECODEDISPLAY (SR872): tick `t` at `fps` in `unit`: `HH:MM:SS:FF` ([`timeline_core::edl::timecode`]), the tick count,
-/// or `S.CC s` (integer hundredths); a negative tick reads as 0.
-pub fn tc_text(t: i64, fps: u32, unit: TcUnit) -> String {
-    let (t, fps) = (t.max(0), fps.max(1) as i64);
-    match unit {
-        TcUnit::Timecode => timeline_core::edl::timecode(t, fps as u32),
-        TcUnit::Frames => t.to_string(),
-        TcUnit::Seconds => {
-            let cs = t * 100 / fps;
-            format!("{}.{:02} s", cs / 100, cs % 100)
-        }
-    }
-}
+pub use timeline_core::view::{TcUnit, tc_text, tc_text_tb}; // STRIAKTC (SR9018): the readout's unit and text, lifted into timeline_core::view (the kernel Player's band calls them too)
 
 impl Face {
     /// The `tc` word: the next unit in the cycle (off first); `None` for any other word.
@@ -3660,8 +3629,7 @@ impl Face {
     }
     /// The playhead in the readout's unit while it is on.
     pub fn tc_readout(&self) -> Option<String> {
-        let fps = self.state.timeline.fps().unwrap_or(25).max(1);
-        self.tc.map(|u| tc_text_tb(self.state.playhead, self.state.timeline.tb, fps, u)) // STRIATCMORE (SR964): an NTSC time base reads drop-frame at its real rate (file tail)
+        self.tc.map(|u| view::tc_readout(&self.state.timeline, self.state.playhead, u)) // STRIAKTC (SR9018): THE readout text, timeline_core's (the fps rule and SR964's NTSC base; the Player's band reads it too)
     }
     /// The message's left edge: 0 with the readout off, the row's middle with it on.
     fn tc_split(&self, l: Layout) -> u32 {
@@ -7737,23 +7705,7 @@ impl Face {
 // (23.976 at 24); frames the tick count; seconds `t * 1001 / den`. Every other base is `tc_text` as before (byte-identical).
 // Owed: NLE-TC-DROPFRAME-MODEL (no road builds a 1001 timeline; the EDL refuses drop-frame), NLE-TC-DROPFRAME-RULER.
 
-/// STRIATCMORE (SR964): tick `t` in `unit` at the time base `tb`; `fps` is the rate for any base that is not NTSC.
-pub fn tc_text_tb(t: i64, tb: timeline_core::Timebase, fps: u32, unit: TcUnit) -> String {
-    let k = tb.den / 1000;
-    if tb.num != 1001 || tb.den % 1000 != 0 || k == 0 || k > u32::MAX as u64 {
-        return tc_text(t, fps, unit);
-    }
-    let t = t.max(0);
-    match unit {
-        TcUnit::Timecode if k == 30 || k == 60 => timeline_core::edl::timecode_drop(t, k as u32),
-        TcUnit::Timecode => timeline_core::edl::timecode(t, k as u32),
-        TcUnit::Frames => t.to_string(),
-        TcUnit::Seconds => {
-            let cs = (t as i128 * 1001 * 100 / tb.den as i128) as i64;
-            format!("{}.{:02} s", cs / 100, cs % 100)
-        }
-    }
-}
+// STRIAKTC (SR9018): `tc_text_tb` lives in timeline_core::view now (re-exported at the SR872 block).
 
 #[cfg(test)]
 mod striatcmore_tests {

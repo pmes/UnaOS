@@ -3298,3 +3298,30 @@ mod striaktrackadd {
         assert_eq!(st.undo_depth(), depth, "a refusal commits nothing");
     }
 }
+
+// ---- STRIAKTC (LEDGER SR9018): the playhead readout text, lifted from nle_face (named tail block) ----
+
+/// `view::tc_readout` reads the timeline's rate: a 1/n base at n (SR872's values), an NTSC base at its real rate (SR964's
+/// drop-frame), any other base at the fallback 25; a negative tick reads 0; the unit words are the witness's.
+#[test]
+fn striaktc_tc_readout_reads_the_timeline() {
+    use timeline_core::Timebase;
+    use timeline_core::view::{TcUnit, tc_readout, tc_text};
+    let mut tl = Timeline::new(25);
+    assert_eq!(tc_readout(&tl, 312, TcUnit::Timecode), "00:00:12:12");
+    assert_eq!(tc_readout(&tl, 312, TcUnit::Frames), "312");
+    assert_eq!(tc_readout(&tl, 312, TcUnit::Seconds), "12.48 s");
+    assert_eq!(tc_readout(&tl, -3, TcUnit::Timecode), "00:00:00:00");
+    assert_eq!(tc_readout(&tl, -3, TcUnit::Frames), "0");
+    assert_eq!(tc_readout(&Timeline::new(30), 45, TcUnit::Timecode), "00:00:01:15");
+    assert_eq!(tc_readout(&Timeline::new(30), 45, TcUnit::Seconds), "1.50 s");
+    tl.tb = Timebase { num: 1001, den: 30000 };
+    assert_eq!(tc_readout(&tl, 1800, TcUnit::Timecode), "00:01:00;02");
+    assert_eq!(tc_readout(&tl, 1800, TcUnit::Frames), "1800");
+    assert_eq!(tc_readout(&tl, 1800, TcUnit::Seconds), "60.06 s");
+    tl.tb = Timebase { num: 2, den: 50 };
+    for u in [TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds] {
+        assert_eq!(tc_readout(&tl, 312, u), tc_text(312, 25, u), "a non-1/n base reads at 25");
+    }
+    assert_eq!([TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds].map(TcUnit::word), ["timecode", "frames", "seconds"]);
+}

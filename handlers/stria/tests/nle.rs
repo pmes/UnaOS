@@ -12302,3 +12302,26 @@ fn striamarkerjumpkeysnext_face_colour_range_note_and_refusals() {
     assert_eq!(f.state.timeline.marker_at(12).map(|m| m.len), Some(8));
     println!("striamarkerjumpkeysnext: M1 red -> blue, range 12..20, cleared, undone; EDL {}", text.lines().filter(|l| l.starts_with("* UNA M")).count());
 }
+
+// ---- STRIAKTC (LEDGER SR9018): the face's readout is timeline_core's one text (named tail block) ----
+
+/// Each unit's readout is `view::tc_readout` on the face's timeline and playhead (the text the kernel Player's band shows),
+/// on a 1/25 and on a 30000/1001 timeline; off, none.
+#[test]
+fn striaktc_face_readout_is_the_shared_text() {
+    use timeline_core::view::{TcUnit, tc_readout};
+    let mut face = striatimecodedisplay_face(false);
+    face.state.seek(12);
+    assert_eq!(face.tc_readout(), None, "off");
+    for tb in [timeline_core::Timebase { num: 1, den: 25 }, timeline_core::Timebase { num: 1001, den: 30000 }] {
+        face.state.timeline.tb = tb;
+        for (w, u) in [("tc timecode", TcUnit::Timecode), ("tc frames", TcUnit::Frames), ("tc seconds", TcUnit::Seconds)] {
+            assert!(face.verb(w));
+            assert_eq!(face.tc_readout(), Some(tc_readout(&face.state.timeline, face.state.playhead, u)), "{w}");
+        }
+    }
+    assert!(face.verb("tc off"));
+    assert_eq!(face.tc_readout(), None);
+    assert!(face.last_error.is_none());
+    println!("striaktc: face readout == view::tc_readout at {}", face.state.playhead);
+}
