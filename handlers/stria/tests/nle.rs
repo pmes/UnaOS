@@ -14728,3 +14728,85 @@ fn striaexportrange_marker_queues_behind_a_running_export() {
     let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&dir));
     println!("striaexportrange: queued behind the running export, dropped by Esc");
 }
+
+// ---- STRIAPROXYWATCH (LEDGER SR9079): one sources generation; a reload never waits on the worker, a result from before it is dropped (named tail block) ----
+
+/// Acting inputs (`zoom+` / `zoom-`, balanced on return) until the note names `reel` reloaded: every clone a job held is gone.
+/// At most 20 s.
+fn striaproxywatch_reload(face: &mut Face, reel: &str) -> String {
+    let (t0, want) = (std::time::Instant::now(), format!("watch: {reel}: reloaded"));
+    let mut k = 0u32;
+    loop {
+        face.on(&striaproxythree_input(if k % 2 == 0 { "zoom+" } else { "zoom-" }));
+        k += 1;
+        if let Some(n) = face.note.clone().filter(|n| n.starts_with(&want)) {
+            if k % 2 == 1 {
+                face.on(&striaproxythree_input("zoom-"));
+            }
+            return n;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the reload never landed: {:?}", face.note);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A proxy job whose thread ended (its clone dropped) but is not joined lets the reload through; its result, made from the
+/// old file, attaches nothing at the join: the reel rebuilds first on SR915's queue and the rebuilt proxy attaches.
+#[test]
+fn striaproxywatch_proxy_finished_before_a_reload_is_rebuilt() {
+    use stria::nle_face::{proxy_fresh, proxy_paths};
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("watch-proxy");
+    let a = tl.sources[0].id;
+    let xa = proxy_paths(&pa).0;
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.proxying());
+    let new = synth_source(5000, 50, 25);
+    std::fs::write(&pa, &new).unwrap();
+    let note = striaproxywatch_reload(&mut face, "A");
+    assert_eq!(note, format!("watch: A: reloaded {} bytes", new.len()), "nothing was attached yet: the reload queues nothing");
+    assert!(face.proxying(), "the ended job is not joined yet");
+    face.last_error = None;
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: built before the reel reloaded; rebuilds; A: building (stale) -> {}", xa.display())));
+    assert!(!face.has_proxy(a), "the old file's proxy never attached");
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: 50 frames -> {}", xa.display())));
+    assert!(face.has_proxy(a) && proxy_fresh(&pa));
+    assert_eq!(face.state.timeline.sources, tl.sources);
+    assert!(!face.dirty(), "a reload and a rebuild leave the document clean");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxywatch proxy: stale landing dropped, A rebuilt from the new file");
+}
+
+/// A served-face decode worker with jobs in flight no longer pins the sources: its lease is released by the reload, the
+/// reload lands once the jobs end, the head and table made from the old media are dropped with their placeholders, and the
+/// next paint asks again at the new generation (the synchronous face over the new bytes paints the same head and table).
+#[test]
+fn striaproxywatch_worker_in_flight_never_blocks_a_reload() {
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("watch-worker");
+    let a = tl.sources[0].id;
+    face.decode_off_thread();
+    assert!(face.bg_running());
+    let _ = face.paint();
+    assert!(face.thumbs_pending(), "heads and tables are out on the worker");
+    let new = synth_source(5000, 50, 25);
+    std::fs::write(&pa, &new).unwrap();
+    let note = striaproxywatch_reload(&mut face, "A");
+    assert_eq!(note, format!("watch: A: reloaded {} bytes", new.len()), "the worker held no clone past its jobs");
+    face.bg_settle();
+    assert!(face.thumb(a, 13).is_none(), "A's head from the old media is dropped with its placeholder");
+    assert!(face.wave_peaks(a).is_none(), "A's table from the old media is dropped");
+    let mut alt = Sources::new(&tl);
+    alt.add(a, new.clone()).unwrap();
+    alt.add(tl.sources[1].id, synth_source(1000, 50, 25)).unwrap();
+    let mut sync = Face::new(EditorState::new(tl.clone()), alt, (320, 160), PixelOrder::Rgba, false);
+    let _ = sync.paint();
+    let _ = face.paint();
+    face.bg_settle();
+    assert!(face.thumb(a, 13).is_some(), "the next paint asked A's head again");
+    assert_eq!(face.thumb(a, 13), sync.thumb(a, 13), "the head is the new file's");
+    assert_eq!(face.wave_peaks(a), sync.wave_peaks(a), "the table is the new file's");
+    assert!(!face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxywatch worker: reload landed with the worker running, stale head and table dropped, re-asked");
+}

@@ -207,6 +207,7 @@ pub struct Face {
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, note: Option<String>, pub note: Option<String>, // STRIATITLESTYLEFACE (SR9077): the message row's note, cleared by the next input (file tail); STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     pub scan: NormalizeScan, pub note: Option<String>, // STRIANORMALIZELUFS (SR9054): a success line on the message row, read after last_error, cleared by the next acting input (file tail); STRIANORMALIZETHREE (SR9035): the normalize scan (synchronous, or off the face's thread under `serve`; file tail)
+    sources_gen: u64, reloaded: Vec<(timeline_core::SourceId, u64)>, // STRIAPROXYWATCH (SR9079): the one sources generation and each source's last reload generation (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
     slip_view: Option<SlipView>, // STRIASLIPVIEW (SR858): a slip drag's first / last frame pair, cached and throttled (file tail)
@@ -242,7 +243,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None, xform_drag: None, note: None, note: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None, xform_drag: None, note: None, note: None, sources_gen: 0, reloaded: Vec::new() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -5332,6 +5333,7 @@ pub struct ProxyJob {
     total: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<Result<u64, String>>>,
     cancel: Arc<AtomicBool>, // STRIAPROXYOFF (SR915): Esc's ask to stop (`Face::cancel_proxy`)
+    sgen: u64, // STRIAPROXYWATCH (SR9079): the sources generation the job cloned (file tail)
 }
 
 /// STRIAPROXYMEDIA (LEDGER SR882): the proxy, its stamp and its transient export directory beside source file `src`
@@ -5426,7 +5428,7 @@ impl Face {
                 Ok(r.frames)
             })
             .map_err(|e| format!("{}: {e}", work.display()))?;
-        self.proxy = Some(ProxyJob { src, reel: reel.to_string(), path: proxy.clone(), done, total, handle: Some(handle), cancel });
+        self.proxy = Some(ProxyJob { src, reel: reel.to_string(), path: proxy.clone(), done, total, handle: Some(handle), cancel, sgen: self.sources_gen });
         Ok(format!("building ({why}) -> {}", proxy.display()))
     }
     /// One clock tick for the proxy job: a finished job attaches its proxy and reports; true then (the preview repaints).
@@ -5448,7 +5450,7 @@ impl Face {
     /// Join the job, attach the proxy (`Sources::set_proxy`) and put `proxy: <reel>: <n> frames -> <path>` (or the refusal)
     /// on the message line.
     fn finish_proxy(&mut self) {
-        let Some(mut j) = self.proxy.take() else { return };
+        let Some(mut j) = self.proxy.take() else { return }; if self.proxy_stale(&mut j) { return; } // STRIAPROXYWATCH (SR9079): a job cloned before its reel reloaded attaches nothing and rebuilds (file tail)
         let r = match j.handle.take().map(|h| h.join()) {
             Some(Ok(Ok(frames))) => std::fs::read(&j.path)
                 .map_err(|e| format!("{}: {e}", j.path.display()))
@@ -8607,7 +8609,7 @@ impl Face {
 // SR839's heads (`Thumbs::thumb_for`) and SR827's peak tables (`nle::scan_peaks`) were decoded on the face's thread inside the
 // paint: a long-GOP head held a paint for its run-up, a long source's first paint for its whole audio decode. `serve` (the
 // windowed face; its only caller is stria-view's window) now calls `Face::decode_off_thread`, which starts ONE worker thread
-// holding a clone of the face's `Arc<Sources>` (already shared with the export thread). RULES:
+// taking the face's `Arc<Sources>` per job (STRIAPROXYWATCH SR9079: no lifelong clone; see its tail block). RULES:
 // * ASK: with a worker, `thumb_for` sends a `BgJob::Head` for an absent key and caches a `None` placeholder (the body keeps its
 //   bar; `fill`'s `contains_key` asks once); `wave_fill` sends a `BgJob::Scan` and caches `None` (the body stays flat). The
 //   THUMBS_PER_PAINT / THUMB_BUDGET_MS rules are unchanged: they bound the requests one paint makes.
@@ -8624,15 +8626,15 @@ impl Face {
 /// STRIATHUMBNAILSNEXT (SR997): one job for the decode worker.
 enum BgJob {
     /// A head: the face's timeline with its tracks cleared (`thumb_for` builds its one-clip timeline from it) and the key.
-    Head(Timeline, timeline_core::SourceId, i64),
+    Head(Timeline, timeline_core::SourceId, i64, Arc<Sources>, u64), // STRIAPROXYWATCH (SR9079): the job's own clone and its generation
     /// A source's peak table.
-    Scan(timeline_core::SourceId),
+    Scan(timeline_core::SourceId, Arc<Sources>, u64), // STRIAPROXYWATCH (SR9079): the job's own clone and its generation
 }
 
 /// STRIATHUMBNAILSNEXT (SR997): one finished job (a head with the worker's decode count; a table).
 enum BgDone {
-    Head((timeline_core::SourceId, i64), Option<Still>, u32),
-    Scan(timeline_core::SourceId, Option<view::Peaks>),
+    Head((timeline_core::SourceId, i64), Option<Still>, u32, u64), // STRIAPROXYWATCH (SR9079): + the job's generation
+    Scan(timeline_core::SourceId, Option<view::Peaks>, u64), // STRIAPROXYWATCH (SR9079): + the job's generation
 }
 
 /// STRIATHUMBNAILSNEXT (SR997): the decode worker's channel ends and the jobs in flight.
@@ -8642,22 +8644,24 @@ struct Bg {
     out: u32,
     heads: Vec<(timeline_core::SourceId, i64)>,
     scans: Vec<timeline_core::SourceId>,
+    lease: Option<(Arc<Sources>, u64)>, // STRIAPROXYWATCH (SR9079): the face's parked clone and generation, taken at a paint, released by a reload
 }
 
 impl Bg {
     /// The worker thread over `sources`; it ends when the face's job sender drops. A refused spawn: `None` (synchronous).
-    fn start(sources: Arc<Sources>) -> Option<Bg> {
+    fn start() -> Option<Bg> { // STRIAPROXYWATCH (SR9079): no lifelong clone: each job carries its own
         let (tx, jobs) = std::sync::mpsc::channel::<BgJob>();
         let (done, rx) = std::sync::mpsc::channel::<BgDone>();
         let spawned = std::thread::Builder::new().name("nle-face-decode".into()).spawn(move || {
             for job in jobs {
                 let d = match job {
-                    BgJob::Head(tl, src, src_in) => {
+                    BgJob::Head(tl, src, src_in, sources, sgen) => {
                         let mut t = Thumbs::default();
                         let s = t.thumb_for(&tl, &sources, src, src_in).cloned();
-                        BgDone::Head((src, src_in), s, t.decodes)
+                        drop(sources);
+                        BgDone::Head((src, src_in), s, t.decodes, sgen)
                     }
-                    BgJob::Scan(id) => {
+                    BgJob::Scan(id, sources, sgen) => {
                         let p = match crate::nle::scan_peaks(&sources, id, view::PEAKS_PER_SEC) {
                             Ok(p) => p,
                             Err(e) => {
@@ -8665,7 +8669,8 @@ impl Bg {
                                 None
                             }
                         };
-                        BgDone::Scan(id, p)
+                        drop(sources);
+                        BgDone::Scan(id, p, sgen)
                     }
                 };
                 if done.send(d).is_err() {
@@ -8674,7 +8679,7 @@ impl Bg {
             }
         });
         match spawned {
-            Ok(_) => Some(Bg { tx, rx, out: 0, heads: Vec::new(), scans: Vec::new() }),
+            Ok(_) => Some(Bg { tx, rx, out: 0, heads: Vec::new(), scans: Vec::new(), lease: None }),
             Err(e) => {
                 log::warn!("[nle-face] decode worker: {e} (decoding on the face's thread)");
                 None
@@ -8695,7 +8700,7 @@ impl Thumbs {
             Some(bg) => {
                 let mut one = tl.clone();
                 one.tracks.clear();
-                let ok = bg.tx.send(BgJob::Head(one, src, src_in)).is_ok();
+                let ok = bg.lease.clone().is_some_and(|(s, g)| bg.tx.send(BgJob::Head(one, src, src_in, s, g)).is_ok()); // STRIAPROXYWATCH (SR9079): no lease: the face's own road
                 if ok {
                     bg.out += 1;
                     bg.heads.push((src, src_in));
@@ -8713,7 +8718,7 @@ impl Thumbs {
         match self.bg.as_mut() {
             None => false,
             Some(bg) => {
-                let ok = bg.tx.send(BgJob::Scan(id)).is_ok();
+                let ok = bg.lease.clone().is_some_and(|(s, g)| bg.tx.send(BgJob::Scan(id, s, g)).is_ok()); // STRIAPROXYWATCH (SR9079): no lease: the face's own road
                 if ok {
                     bg.out += 1;
                     bg.scans.push(id);
@@ -8730,7 +8735,7 @@ impl Thumbs {
 
 impl WavePeaks {
     /// STRIATHUMBNAILSNEXT (SR997): every finished job into the face's maps; `block`: wait until no job is out.
-    fn drain_bg(&mut self, block: bool) {
+    fn drain_bg(&mut self, block: bool, reloaded: &[(timeline_core::SourceId, u64)]) { // STRIAPROXYWATCH (SR9079): `reloaded` judges each result's generation
         use std::sync::mpsc::TryRecvError;
         loop {
             let Some(bg) = self.thumbs.bg.as_mut() else { return };
@@ -8744,15 +8749,15 @@ impl WavePeaks {
                     self.bg_lost();
                     return;
                 }
-                Ok(BgDone::Head(k, s, n)) => {
+                Ok(BgDone::Head(k, s, n, g)) => {
                     bg.out = bg.out.saturating_sub(1);
-                    bg.heads.retain(|h| *h != k);
+                    bg.heads.retain(|h| *h != k); if stale_in(reloaded, Some(k.0), g) { self.thumbs.map.remove(&k); continue; } // STRIAPROXYWATCH (SR9079): a head of the media before a reload: dropped with its placeholder (the face asks again)
                     self.thumbs.decodes += n;
                     self.thumbs.insert(k, s);
                 }
-                Ok(BgDone::Scan(id, p)) => {
+                Ok(BgDone::Scan(id, p, g)) => {
                     bg.out = bg.out.saturating_sub(1);
-                    bg.scans.retain(|x| *x != id);
+                    bg.scans.retain(|x| *x != id); if stale_in(reloaded, Some(id), g) { self.map.remove(&id); continue; } // STRIAPROXYWATCH (SR9079): a table of the media before a reload: dropped with its placeholder
                     self.map.insert(id, p);
                     self.scans += 1;
                 }
@@ -8777,12 +8782,12 @@ impl Face {
     /// STRIATHUMBNAILSNEXT (SR997): decode heads and peak tables on one worker thread from now on (`serve` calls it once).
     pub fn decode_off_thread(&mut self) {
         if self.peaks.thumbs.bg.is_none() {
-            self.peaks.thumbs.bg = Bg::start(self.sources.clone());
+            self.peaks.thumbs.bg = Bg::start(); // STRIAPROXYWATCH (SR9079): the lease is taken at the next paint
         }
     }
     /// STRIATHUMBNAILSNEXT (SR997): wait until the worker holds no job, every result in the face's maps.
     pub fn bg_settle(&mut self) {
-        self.peaks.drain_bg(true);
+        self.peaks.drain_bg(true, &self.reloaded); // STRIAPROXYWATCH (SR9079)
     }
     /// STRIATHUMBNAILSNEXT (SR997): the face decodes off its thread.
     pub fn bg_running(&self) -> bool {
@@ -9043,7 +9048,7 @@ impl Face {
         if changed.is_empty() {
             return;
         }
-        let Some(sources) = Arc::get_mut(&mut self.sources) else {
+        self.bg_release(); let Some(sources) = Arc::get_mut(&mut self.sources) else { // STRIAPROXYWATCH (SR9079): the decode worker's parked lease released first (file tail)
             let reels: Vec<String> = changed.into_iter().map(|(_, r, _, _)| r).collect();
             self.note = Some(format!("watch: {}: changed on disk; reloads after the running job", reels.join(", ")));
             return;
@@ -9055,7 +9060,7 @@ impl Face {
                 sources.add(src, b).map(|()| n).map_err(|e| e.to_string())
             });
             match r {
-                Ok(n) => {
+                Ok(n) => { self.sources_gen += 1; self.reloaded.retain(|(s, _)| *s != src); self.reloaded.push((src, self.sources_gen)); // STRIAPROXYWATCH (SR9079): the one generation moves (file tail)
                     let follow = sources.clear_proxy(src);
                     if follow {
                         queue.push((src, reel.clone()));
@@ -11211,5 +11216,68 @@ impl Face {
             }
         });
         Some(true)
+    }
+}
+
+// ---- STRIAPROXYWATCH (LEDGER SR9079): one sources generation; a reload releases and re-takes the shared sources, a job's result from before it is dropped (named tail block) ----
+// SR9026's reload (`watch_sources`) reopens a reel through `Arc::get_mut` on the face's `Arc<Sources>`, so it runs only while
+// no other clone lives. Two holes: SR997's decode worker held a clone for the face's whole life (a served face never
+// reloaded), and a job whose thread had ended but was not yet joined let the reload through and then landed a result made
+// from the OLD media (a proxy attached onto the new media, a head or a peak table cached for it). RULES:
+// * GENERATION: `Face.sources_gen` moves once per reel reloaded; `Face.reloaded` keeps each source's last reload generation.
+//   A job records `sources_gen` when it takes its clone; its result is STALE when its source (or, for a reader over the
+//   whole timeline, any source: `None`) reloaded at a later generation (`stale_in`, the one rule; `Face::sources_stale`).
+// * WORKER: `Bg` keeps no lifelong clone. `wave_fill` (every paint, before `Thumbs::fill`) parks a lease (`bg_lease`: the
+//   clone and the generation) on it; each `BgJob` carries its own clone of the lease, dropped by the worker before its
+//   result is sent; `watch_sources` releases the lease (`bg_release`) before its `Arc::get_mut`. A job in flight still holds
+//   its clone, so the reload waits (the note) and the next acting input retries: it never blocks. `drain_bg` drops a stale
+//   head or table with its placeholder, so the face asks again at the reload's generation.
+// * PROXY: `finish_proxy` asks `proxy_stale` first: a stale job attaches nothing; not cancelled, its reel goes to the front of
+//   SR915's `proxy_queue` (`proxy: <reel>: built before the reel reloaded; rebuilds`, then SR882's one `proxy_start`).
+// No lock: the generation is the face thread's own field, read at the clone and at the landing on that thread. Owed:
+// NLE-PROXY-WATCH-WORKER-SCAN (the normalize and loudness scans record `sources_gen` at their clone and their ticks drop a
+// stale result through `sources_stale`), NLE-PROXY-WATCH-EXPORT (an export started before a reload finishes on the old media),
+// NLE-PROXY-WATCH-CACHE (a reloaded source's heads and table cached BEFORE the reload stay until evicted).
+
+/// STRIAPROXYWATCH (LEDGER SR9079): a result taken at generation `sgen` is stale when `src` (any source: `None`) reloaded later.
+fn stale_in(reloaded: &[(timeline_core::SourceId, u64)], src: Option<timeline_core::SourceId>, sgen: u64) -> bool {
+    reloaded.iter().any(|(s, g)| *g > sgen && src.is_none_or(|x| x == *s))
+}
+
+impl Face {
+    /// STRIAPROXYWATCH (LEDGER SR9079): a job's result taken at `sgen` is stale ([`stale_in`] over this face's reloads).
+    fn sources_stale(&self, src: Option<timeline_core::SourceId>, sgen: u64) -> bool {
+        stale_in(&self.reloaded, src, sgen)
+    }
+    /// STRIAPROXYWATCH (LEDGER SR9079): park the sources' clone and generation on the decode worker (none: nothing).
+    fn bg_lease(&mut self) {
+        if self.peaks.thumbs.bg.is_some() {
+            let lease = (Arc::clone(&self.sources), self.sources_gen);
+            if let Some(bg) = self.peaks.thumbs.bg.as_mut() {
+                bg.lease = Some(lease);
+            }
+        }
+    }
+    /// STRIAPROXYWATCH (LEDGER SR9079): drop the decode worker's parked clone (the reload's `Arc::get_mut` needs it gone).
+    fn bg_release(&mut self) {
+        if let Some(bg) = self.peaks.thumbs.bg.as_mut() {
+            bg.lease = None;
+        }
+    }
+    /// STRIAPROXYWATCH (LEDGER SR9079): a proxy job cloned before its reel reloaded: joined and discarded (true); not
+    /// cancelled, its reel rebuilds first on SR915's queue. A current job: false (`finish_proxy` attaches it).
+    fn proxy_stale(&mut self, j: &mut ProxyJob) -> bool {
+        if !self.sources_stale(Some(j.src), j.sgen) {
+            return false;
+        }
+        let _ = j.handle.take().map(|h| h.join());
+        if j.cancel.load(Relaxed) {
+            self.last_error = Some(format!("proxy: {}: cancelled (the reel reloaded)", j.reel));
+        } else {
+            self.last_error = Some(format!("proxy: {}: built before the reel reloaded; rebuilds", j.reel));
+            self.proxy_queue.insert(0, (j.src, j.reel.clone()));
+        }
+        self.proxy_next();
+        true
     }
 }
