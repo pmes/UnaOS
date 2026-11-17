@@ -10966,4 +10966,139 @@ b</div>
         assert!([r, g, b].iter().all(|c| (110..=150).contains(c)), "armed: the parent's line under the child is half ink: {:?}", (r, g, b));
         assert!(color_alpha_ink(&mut e, "pc").0 < 30, "the child's glyphs are opaque black");
     }
+
+    // ---- AETHERSTICKYNESTEDSCROLLER (LEDGER SR1152): a sticky box holds against its nearest scrollport (named tail block) ----
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): 400x300 with `body` (margin 0) holding `pre`, then a 200px `overflow: auto`
+    /// panel `#p` at y 50 holding `inner`, then a 2000px spacer.
+    fn sticky_nested_scroller_engine(pre: &str, panel: &str, inner: &str) -> crate::AetherEngine {
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0">{pre}<div id="p" style="{panel}">{inner}</div><div style="height:2000px"></div></body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): the panel's fixture: a 30px spacer, the red 20px `#h` (`position: sticky;
+    /// top: 0`) as a DIRECT child of the panel, then 1000px of content (flow: `#h` at document y 80..99).
+    fn sticky_nested_scroller_panel() -> crate::AetherEngine {
+        sticky_nested_scroller_engine(
+            r#"<div style="height:50px"></div>"#,
+            "overflow:auto;height:200px",
+            r#"<div style="height:30px"></div><div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div><div style="height:1000px"></div>"#,
+        )
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): a wheel of `dy` over the panel (pointer at (10, 100)): the panel takes it, the
+    /// page does not move, and the frame repaints whole (a nested scroller's scroll is full damage).
+    fn sticky_nested_scroller_wheel(e: &mut crate::AetherEngine, dy: f64) {
+        e.handle_event(crate::api::events::Event::MouseMove(10.0, 100.0));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel, not the page");
+    }
+
+    const STICKY_NESTED_RED: (u8, u8, u8) = (255, 0, 0);
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): unscrolled, `#h` sits at its normal-flow place: rows 80..99 red, the panel's
+    /// top rows 50..79 and row 100 not.
+    #[test]
+    fn sticky_nested_scroller_unscrolled_flow_place() {
+        let e = sticky_nested_scroller_panel();
+        assert_eq!(imgalt_px(&e, 10, 80), STICKY_NESTED_RED, "#h's first row at its flow place");
+        assert_eq!(imgalt_px(&e, 10, 99), STICKY_NESTED_RED, "#h's last row at its flow place");
+        assert_ne!(imgalt_px(&e, 10, 60), STICKY_NESTED_RED, "the panel's top is the spacer");
+        assert_ne!(imgalt_px(&e, 10, 100), STICKY_NESTED_RED, "below #h");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): the PANEL scrolled 300px, `#h` holds at the panel's padding-box top: rows
+    /// 50..69 red, rows 49 and 70 not. Before SR1152 it held against the (unscrolled) viewport and scrolled away with
+    /// the panel's content.
+    #[test]
+    fn sticky_nested_scroller_panel_scroll_sticks() {
+        let mut e = sticky_nested_scroller_panel();
+        sticky_nested_scroller_wheel(&mut e, 300.0);
+        assert_eq!(imgalt_px(&e, 10, 50), STICKY_NESTED_RED, "#h stuck at the panel's top (armed: scrolled away before SR1152)");
+        assert_eq!(imgalt_px(&e, 10, 69), STICKY_NESTED_RED, "#h's last stuck row");
+        assert_ne!(imgalt_px(&e, 10, 49), STICKY_NESTED_RED, "above the panel");
+        assert_ne!(imgalt_px(&e, 10, 70), STICKY_NESTED_RED, "below the stuck #h");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): the direct-child header stays stuck after the panel scrolls 600px, three times
+    /// its 200px height: the containing block of a child of the scroller is the scroller's scrollable overflow (Chromium /
+    /// WebKit), not its client box moved by the scroll, which would have released it after one panel height.
+    #[test]
+    fn sticky_nested_scroller_direct_child_stays_past_panel_height() {
+        let mut e = sticky_nested_scroller_panel();
+        sticky_nested_scroller_wheel(&mut e, 600.0);
+        assert_eq!(imgalt_px(&e, 10, 50), STICKY_NESTED_RED, "#h still stuck at the panel's top after 600px");
+        assert_eq!(imgalt_px(&e, 10, 69), STICKY_NESTED_RED, "#h's last stuck row");
+        assert_ne!(imgalt_px(&e, 10, 70), STICKY_NESTED_RED, "below the stuck #h");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): the shell hit test follows the one origin fn: after the panel scroll, (10, 55)
+    /// hits the stuck `#h` (before SR1152: the panel's content under it).
+    #[test]
+    fn sticky_nested_scroller_hit_stuck_header() {
+        let mut e = sticky_nested_scroller_panel();
+        sticky_nested_scroller_wheel(&mut e, 300.0);
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 55.0), "h", "#h is hit where it is painted (armed)");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): `#h` inside a 400px wrapper in the panel keeps the wrapper as its containing
+    /// block: scrolled 390px, the wrapper's bottom is at y 60, so `#h` is pushed up to 40..59 and the panel clips it at 50:
+    /// rows 50..59 red, row 61 not (the clamp is kept when the parent is not the scroller).
+    #[test]
+    fn sticky_nested_scroller_cb_releases() {
+        let mut e = sticky_nested_scroller_engine(
+            r#"<div style="height:50px"></div>"#,
+            "overflow:auto;height:200px",
+            r#"<div style="height:400px"><div style="height:30px"></div><div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div></div><div style="height:1000px"></div>"#,
+        );
+        sticky_nested_scroller_wheel(&mut e, 390.0);
+        assert_eq!(imgalt_px(&e, 10, 50), STICKY_NESTED_RED, "#h's lower rows are still in the panel");
+        assert_eq!(imgalt_px(&e, 10, 59), STICKY_NESTED_RED, "#h ends at the wrapper's bottom, y 60");
+        assert_ne!(imgalt_px(&e, 10, 61), STICKY_NESTED_RED, "the containing block released #h");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): `overflow: hidden` IS a scroll container (css-overflow-3 §3, as Chromium): a
+    /// sticky box inside a 600px hidden panel holds to the panel, so a 400px PAGE scroll does not pull it to the viewport's
+    /// top: row 10 is not red (before SR1152 it held at the viewport: rows 0..19 red).
+    #[test]
+    fn sticky_nested_scroller_overflow_hidden_holds_to_panel() {
+        let mut e = sticky_nested_scroller_engine(
+            r#"<div style="height:50px"></div>"#,
+            "overflow:hidden;height:600px",
+            r#"<div style="height:30px"></div><div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div><div style="height:1000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_ne!(imgalt_px(&e, 10, 10), STICKY_NESTED_RED, "#h does not follow the viewport (armed: red before SR1152)");
+    }
+
+    /// AETHERSTICKYNESTEDSCROLLER (SR1152): `body { overflow-x: hidden }` propagates to the viewport (css-overflow-3 §3.3),
+    /// so the body is not the scrollport: a sticky `top: 0` red box at y 80 still holds at the viewport's top after a 400px
+    /// page scroll (rows 0..19 red, row 20 not).
+    #[test]
+    fn sticky_nested_scroller_body_overflow_x_hidden_viewport() {
+        let html = r#"<!doctype html><html><body style="margin:0;overflow-x:hidden">
+            <div style="height:80px"></div>
+            <div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 0), STICKY_NESTED_RED, "#h holds at the viewport's top");
+        assert_eq!(imgalt_px(&e, 10, 19), STICKY_NESTED_RED, "#h's last row");
+        assert_ne!(imgalt_px(&e, 10, 20), STICKY_NESTED_RED, "below #h");
+    }
 }
