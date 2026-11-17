@@ -1735,7 +1735,7 @@ impl EditorState {
     }
     /// The `opacity` word of [`EditorState::verb`]; `None` when `v` is not an `opacity` verb.
     fn opacity_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let mut w = v.split_ascii_whitespace();
+        if let Some(d) = opacity_step(v) { return Some(self.step_opacity(d)); } let mut w = v.split_ascii_whitespace(); // STRIAOPACITYFACE (SR898): the `opacity-` / `opacity+` step words (file tail)
         if w.next() != Some("opacity") {
             return None;
         }
@@ -1890,5 +1890,31 @@ impl EditorState {
             "track-down" => Some(self.move_track(false)),
             _ => None,
         }
+    }
+}
+
+// ---- STRIAOPACITYFACE (LEDGER SR898): the opacity step words (named tail block) ----
+// `opacity-` / `opacity+` (the face's buttons) step the primary selected clip's opacity by [`OPACITY_STEP`] percent,
+// clamped to 0..=[`crate::OPAQUE`], and set the whole selection to it through SR868's `EditorState::set_opacity` (ONE
+// commit; at a bound nothing commits). Refused by name: no selection `EditError::NoClip`; an audio clip `EditError::Opacity`.
+
+/// STRIAOPACITYFACE: one opacity step (percent).
+pub const OPACITY_STEP: i16 = 10;
+
+/// STRIAOPACITYFACE: the step of an opacity step word; `None` for every other word.
+fn opacity_step(v: &str) -> Option<i16> {
+    match v {
+        "opacity-" => Some(-OPACITY_STEP),
+        "opacity+" => Some(OPACITY_STEP),
+        _ => None,
+    }
+}
+
+impl EditorState {
+    /// STRIAOPACITYFACE: the selection at the primary selected clip's opacity + `d` (percent, clamped), one commit.
+    pub fn step_opacity(&mut self, d: i16) -> Result<(), EditError> {
+        let base = self.selected().ok_or(EditError::NoClip)?.opacity;
+        let pct = (base as i16 + d).clamp(0, crate::OPAQUE as i16) as u8;
+        self.set_opacity(pct)
     }
 }

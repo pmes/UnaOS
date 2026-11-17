@@ -330,9 +330,9 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             if x1 <= 0 || x0 >= w as i64 {
                 continue;
             }
-            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
+            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity));
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
-            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -2201,4 +2201,18 @@ fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState) {
             }
         }
     }
+}
+
+// ---- STRIAOPACITYFACE (LEDGER SR898): the clip body painted at its opacity (named tail block) ----
+// A clip below [`crate::OPAQUE`] paints its body blended from the row colour toward its reel colour by its percent (0 % is
+// the row itself); an opaque clip paints its reel colour unchanged, so every golden stays byte-identical. Both faces (the
+// host's `nle_face` and the kernel Player's view band) paint through `paint_in`, so both show it.
+
+/// STRIAOPACITYFACE: `c` over `row` at `pct` percent; `c` itself at [`crate::OPAQUE`] or above.
+pub fn opacity_colour(c: [u8; 4], row: [u8; 4], pct: u8) -> [u8; 4] {
+    if pct >= crate::OPAQUE {
+        return c;
+    }
+    let mix = |a: u8, b: u8| -> u8 { (b as i32 + ((a as i32 - b as i32) * pct as i32 * 2 + crate::OPAQUE as i32).div_euclid(2 * crate::OPAQUE as i32)) as u8 };
+    [mix(c[0], row[0]), mix(c[1], row[1]), mix(c[2], row[2]), 255]
 }
