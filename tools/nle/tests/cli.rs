@@ -227,7 +227,7 @@ fn cli_usage_lists_every_flag() {
     for a in &scanned {
         assert!(has_word(&usage, a), "{a}: an arm with no word in the usage");
     }
-    let flags: Vec<&str> = src.split_once("const FLAGS: ").and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default(); let (mut f, mut sc) = (flags.clone(), scanned.clone()); f.sort(); sc.sort(); assert_eq!(f, sc, "NLECLIDIDYOUMEAN (SR816): main.rs FLAGS is the option loop's arms"); // NLECLIDIDYOUMEAN (SR816): the did-you-mean list cannot drift from the arms
+    let flags: Vec<&str> = src.split_once("const FLAGS: ").and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default(); let (mut f, mut sc) = (flags.clone(), scanned.clone()); f.sort(); sc.sort(); sc.retain(|w| !const_words("COMPLETIONS_FLAGS").contains(w)); /* SR1011 */ assert_eq!(f, sc, "NLECLIDIDYOUMEAN (SR816): main.rs FLAGS is the option loop's arms"); // NLECLIDIDYOUMEAN (SR816): the did-you-mean list cannot drift from the arms
     for w in ["--make-src", "nle schedule", "nle render", "nle export", "nle size"] {
         assert!(usage.contains(w), "{w} in the usage");
     }
@@ -347,13 +347,13 @@ fn cli_completions_scripts() {
     }
     // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
     let fish = script("fish");
-    assert_eq!(fish.lines().count(), words.len() + 1, "{fish}"); /* SR847 */ // + the size policy line
+    assert_eq!(fish.lines().count(), words.len() + 5, "{fish}"); /* SR847 */ /* SR1019 */ /* SR1025 */ /* SR1033 */ // + the size policy line + the --install / --uninstall dir lines + the shells line + --force
     for w in &words {
         let line = match w.strip_prefix("--") {
-            Some(l) => format!("complete -c nle -l {l}"),
+            Some(l) => format!("complete -c nle{} -l {l}", fish_n(w)), /* SR1033 */
             None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
         };
-        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa ")) || x == format!("{line} -x")), "fish: {line:?} in {fish}"); /* SR847 */ /* SR1005 */
+        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa ")) || x == format!("{line} -x") || x == format!("{line} -r -F")), "fish: {line:?} in {fish}"); /* SR847 */ /* SR1005 */ /* SR1019 */
     }
     // Refusals by SR801's grammar, exit 1, nothing on stdout.
     let refused: [(&[&str], &str); 2] = [
@@ -371,7 +371,7 @@ fn cli_completions_scripts() {
     assert_eq!(lines.len(), 7, "the hint and six usage lines: {err}");
     assert_eq!(lines[0], "nle: completoins: unknown verb; did you mean completions?");
     assert_eq!(lines[1], USAGE_FIRST);
-    assert_eq!(lines[6], "       nle completions bash|zsh|fish");
+    assert_eq!(lines[6], "       nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"); /* SR1011 */ /* SR1025 */
 }
 
 // ---- NLECLICOMPLETIONSVALUES (LEDGER SR847): the words a flag's value takes in every completion script (named tail block) ----
@@ -383,6 +383,7 @@ fn completion_values() -> Vec<(&'static str, String)> {
         ("--video", VIDEO_NAMES.join(" ")),
         ("--audio", audio.join(" ")),
         ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect::<Vec<_>>().join(" ")),
+        ("--pass", const_words("PASS_WORDS").join(" ")), /* SR1019 */ // main.rs PASS_WORDS, two_pass_of's own table
     ]
 }
 
@@ -402,16 +403,16 @@ fn cli_completions_values() {
         let l = f.trim_start_matches('-');
         assert!(bash.contains(&format!("        {f}) w=\"{words}\" ;;\n")), "bash: {f} -> {words} in {bash}");
         assert!(zsh.contains(&format!(" '*{f}:{l}:({words})'")), "zsh: {f} -> {words} in {zsh}");
-        let fl = format!("complete -c nle -l {l} -xa \"{words}\"");
+        let fl = format!("complete -c nle{} -l {l} -xa \"{words}\"", fish_n(f)); /* SR1033 */
         assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
     }
     // Exactly the table's flags carry values (no word list the owners' tables do not hold).
     assert_eq!(bash.matches(") w=\"").count() - bash.matches(") w=\"\" ;;").count(), table.len(), "{bash}"); /* SR1005 */
     assert_eq!(zsh.matches(":(").count(), table.len() + 1, "{zsh}"); // + SR821's `1:verb:(..)`
-    assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
+    assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 2, "{fish}"); /* SR1033 */ // + the size line + the shells line
     // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
     assert!(bash.contains(&format!("[[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{size}\"\n")), "{bash}");
-    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else _files; fi}}'")), "{zsh}");
+    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/; else _files; fi; fi}}'")), "{zsh}"); /* SR1019 */ /* SR1025 */
     assert!(fish.contains(&format!("__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{size}\"\n")), "{fish}");
     // Each script parses in its own shell (`-n`: read, not run); zsh / fish skipped by name when the binary is absent.
     let dir = scratch("completions");
@@ -473,6 +474,7 @@ fn cli_completions_free() {
     for ((f, kind), a) in kinds.iter().zip(&arg) {
         let want = match *kind {
             "Required" if valued.contains(f) => "Words",
+            "Required" if const_words("PATH_FLAGS").contains(f) => "Path", /* SR1019 */
             "Required" => "Free",
             k => k,
         };
@@ -482,7 +484,7 @@ fn cli_completions_free() {
     let (free, opt, bare) = (of("Free"), of("Opt"), of("Bare"));
     assert_eq!(
         free,
-        ["--fps", "--out", "--qp", "--gop", "--bitrate", "--crf", "--min-keyint", "--pass", "--stats", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--src"],
+        ["--fps", "--qp", "--gop", "--bitrate", "--crf", "--min-keyint", "--qcomp", "--cplxblur", "--qblur", "--qpstep"], /* SR1019 */
         "the free-value flags"
     );
     assert_eq!(opt, ["--scenecut", "--aq"], "the optional-K flags");
@@ -494,7 +496,7 @@ fn cli_completions_free() {
     let (bash, zsh, fish) = (script("bash"), script("zsh"), script("fish"));
     // bash: ONE empty arm naming every Free flag; no arm for an Opt or Bare flag (they fall through to the verb / flag words).
     assert_eq!(bash.matches(") w=\"\" ;;").count(), 1, "{bash}");
-    assert!(bash.contains(&format!("        {}) w=\"\" ;;\n", free.join("|"))), "bash: the Free arm in {bash}");
+    assert!(bash.contains(&format!("        {}) compopt +o default; w=\"\" ;;\n", free.join("|"))), "bash: the Free arm in {bash}"); /* SR1019 */
     for f in opt.iter().chain(&bare) {
         assert!(!bash.contains(&format!("{f})")) && !bash.contains(&format!("{f}|")), "bash: no arm for {f} in {bash}");
     }
@@ -512,11 +514,499 @@ fn cli_completions_free() {
     }
     // fish: Free `-x` (a value required, no files, no words); Opt and Bare a plain `-l` line.
     for f in &free {
-        let line = format!("complete -c nle -l {} -x", f.trim_start_matches('-'));
+        let line = format!("complete -c nle{} -l {} -x", fish_n(f), f.trim_start_matches('-')); /* SR1033 */
         assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
     }
     for f in opt.iter().chain(&bare) {
-        let line = format!("complete -c nle -l {}", f.trim_start_matches('-'));
+        let line = format!("complete -c nle{} -l {}", fish_n(f), f.trim_start_matches('-')); /* SR1033 */
         assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
     }
+}
+
+// ---- NLECLICOMPLETIONSINSTALL (LEDGER SR1011): `nle completions <shell> --install [<dir>] [--force]` (named tail block) ----
+/// NLECLICOMPLETIONSINSTALL (SR1011): run the built `nle` with HOME / XDG_DATA_HOME / XDG_CONFIG_HOME REMOVED from its env and
+/// only the scratch values given set (the real HOME is never read or written), from `CARGO_TARGET_TMPDIR` (a relative
+/// path resolves there, never in the tree): (exit code, stdout, stderr).
+fn nle_env(args: &[&str], home: Option<&Path>, xdg: &[(&str, &Path)]) -> (i32, String, String) {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nle"));
+    c.args(args).current_dir(env!("CARGO_TARGET_TMPDIR")).env_remove("HOME").env_remove("XDG_DATA_HOME").env_remove("XDG_CONFIG_HOME");
+    if let Some(h) = home {
+        c.env("HOME", h);
+    }
+    for (k, v) in xdg {
+        c.env(k, v);
+    }
+    let out = c.output().expect("the built nle runs");
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): `nle completions <shell>`'s stdout, the bytes `--install` must write.
+fn completion_script(shell: &str) -> String {
+    let (code, out, err) = nle(&["completions", shell]);
+    assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+    out
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): the zsh fpath line for the file at `path` (empty for another shell).
+fn fpath_line(shell: &str, path: &Path) -> String {
+    if shell != "zsh" {
+        return String::new();
+    }
+    let d = path.parent().unwrap().display().to_string();
+    format!("zsh: add {d} to fpath before compinit, e.g. fpath=({d} $fpath) in ~/.zshrc\n")
+}
+
+#[test]
+fn cli_completions_install_paths() {
+    let dir = scratch("install-paths");
+    let home = dir.join("home");
+    let want = [("bash", ".local/share/bash-completion/completions/nle"), ("zsh", ".local/share/zsh/site-functions/_nle"), ("fish", ".config/fish/completions/nle.fish")];
+    for (shell, rel) in want {
+        let path = home.join(rel);
+        let script = completion_script(shell);
+        let args = ["completions", shell, "--install"];
+        let (code, out, err) = nle_env(&args, Some(&home), &[]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell}");
+        assert_eq!(out, format!("installed {}\n{}", path.display(), fpath_line(shell, &path)), "{shell}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script, "{shell}: the file is `nle completions {shell}`'s stdout");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Idempotent: the same bytes are found, not rewritten.
+        let (code, out, err) = nle_env(&args, Some(&home), &[]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell} again");
+        assert_eq!(out, format!("installed {} (unchanged)\n{}", path.display(), fpath_line(shell, &path)), "{shell} again");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime, "{shell}: unchanged keeps the mtime");
+    }
+    // XDG_DATA_HOME / XDG_CONFIG_HOME (absolute) win over HOME.
+    let (data, config) = (dir.join("data"), dir.join("config"));
+    for (shell, base, rel) in [("bash", &data, "bash-completion/completions/nle"), ("zsh", &data, "zsh/site-functions/_nle"), ("fish", &config, "fish/completions/nle.fish")] {
+        let path = base.join(rel);
+        let (code, out, err) = nle_env(&["completions", shell, "--install"], Some(&home), &[("XDG_DATA_HOME", data.as_path()), ("XDG_CONFIG_HOME", config.as_path())]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell} xdg");
+        assert_eq!(out, format!("installed {}\n{}", path.display(), fpath_line(shell, &path)), "{shell} xdg");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), completion_script(shell), "{shell} xdg");
+    }
+    // A relative XDG value is ignored (the XDG spec): HOME's path, already installed.
+    let (code, out, err) = nle_env(&["completions", "bash", "--install"], Some(&home), &[("XDG_DATA_HOME", Path::new("rel-data"))]);
+    assert_eq!((code, err.as_str()), (0, ""), "relative xdg");
+    assert_eq!(out, format!("installed {} (unchanged)\n", home.join(want[0].1).display()), "relative xdg");
+}
+
+#[test]
+fn cli_completions_install_force() {
+    let dir = scratch("install-force");
+    let home = dir.join("home");
+    let path = home.join(".config/fish/completions/nle.fish");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "# mine\n").unwrap();
+    // A differing file (a hand-edited script) is refused without --force, untouched.
+    let (code, out, err) = nle_env(&["completions", "fish", "--install"], Some(&home), &[]);
+    assert_eq!((code, out.as_str(), err), (1, "", format!("nle: exists {} (differs; --force to overwrite)\n", path.display())));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\n", "refused: the file is untouched");
+    // --force replaces it (`--install --force`: the flag is not taken as a dir).
+    let (code, out, err) = nle_env(&["completions", "fish", "--install", "--force"], Some(&home), &[]);
+    assert_eq!((code, err.as_str(), out), (0, "", format!("installed {}\n", path.display())));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), completion_script("fish"), "--force: replaced by the script");
+}
+
+#[test]
+fn cli_completions_install_dir() {
+    let dir = scratch("install-dir");
+    let target = dir.join("a").join("b");
+    let t = s(&target);
+    // An explicit dir: created, HOME not needed.
+    for (shell, file) in [("bash", "nle"), ("fish", "nle.fish")] {
+        let (code, out, err) = nle_env(&["completions", shell, "--install", &t], None, &[]);
+        assert_eq!((code, err.as_str(), out), (0, "", format!("installed {}\n", target.join(file).display())), "{shell}");
+        assert_eq!(std::fs::read_to_string(target.join(file)).unwrap(), completion_script(shell), "{shell}");
+    }
+}
+
+#[test]
+fn cli_completions_install_refusals() {
+    let dir = scratch("install-refuse");
+    let home = dir.join("home");
+    let refused: [(&[&str], &str); 4] = [
+        (&["completions", "nosuch", "--install"], "nle: completions nosuch: one of bash|zsh|fish\n"),
+        (&["completions", "bash", "--instal"], "nle: completions bash --instal: unknown flag; did you mean --install?\n"),
+        (&["completions", "bash", "--bogus"], "nle: completions bash --bogus: unknown flag (--install [<dir>], --uninstall [<dir>] or --force)\n"), /* SR1025 */
+        (&["completions", "bash", "--force"], "nle: completions bash: --force needs --install\n"),
+    ];
+    for (args, want) in refused {
+        let (code, out, err) = nle_env(args, Some(&home), &[]);
+        assert_eq!((code, out.as_str(), err.as_str()), (1, "", want), "{args:?}");
+    }
+    let (code, out, err) = nle_env(&["completions", "zsh", "--install"], None, &[]);
+    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "nle: completions zsh --install: HOME is not set (give --install <dir>)\n"));
+    assert!(!home.exists(), "refused: nothing written under HOME");
+}
+
+#[test]
+fn cli_completions_flags_pin() {
+    // COMPLETIONS_FLAGS is the completions verb's own arms: each an arm of main.rs, none in FLAGS (the export loop's words;
+    // SR816's pin subtracts these by name), each a word of the usage's completions line.
+    let src = include_str!("../src/main.rs");
+    let (own, flags) = (const_words("COMPLETIONS_FLAGS"), const_words("FLAGS"));
+    assert_eq!(own, ["--install", "--force", "--uninstall"], "main.rs COMPLETIONS_FLAGS"); /* SR1025 */
+    let usage = usage_text();
+    let line = usage.lines().find(|l| l.contains("nle completions ")).expect("the completions usage line");
+    for w in &own {
+        assert!(src.contains(&format!("\"{w}\" =>")), "{w}: an arm in main.rs");
+        assert!(!flags.contains(w), "{w}: not in FLAGS {flags:?}");
+        assert!(has_word(line, w), "{w}: in the usage line {line:?}");
+    }
+}
+
+// ---- NLECLICOMPLETIONSPASSWORDSFILES (LEDGER SR1019): --pass's words from PASS_WORDS; Path / Dir completion in every shell (named tail block) ----
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): `nle completions <shell>`'s stdout.
+fn script_of(shell: &str) -> String {
+    let (code, out, err) = nle(&["completions", shell]);
+    assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+    out
+}
+
+#[test]
+fn cli_completions_pass_words() {
+    let words = const_words("PASS_WORDS");
+    assert_eq!(words, ["1", "2"], "main.rs PASS_WORDS");
+    let w = words.join(" ");
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    assert!(bash.contains(&format!("        --pass) w=\"{w}\" ;;\n")), "bash: --pass words in {bash}");
+    assert!(zsh.contains(&format!(" '*--pass:pass:({w})'")), "zsh: --pass words in {zsh}");
+    let fl = format!("complete -c nle{} -l pass -xa \"{w}\"", fish_n("--pass")); /* SR1033 */
+    assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
+    // The refusals name the same words (two_pass_of's and what("--pass")'s texts are built from PASS_WORDS).
+    let (dir, edl, srcs) = fixture("pass-words");
+    let st = s(&dir.join("pass.stats"));
+    let or = words.join(" or ");
+    let refused: [(Vec<&str>, String); 2] = [
+        (vec!["--pass", "x"], format!("nle: --pass x: not {or}")),
+        (vec!["--pass", "3", "--stats", st.as_str(), "--bitrate", "40", "--video", "h264"], format!("nle: --pass takes {or}")),
+    ];
+    for (i, (extra, want)) in refused.iter().enumerate() {
+        let (code, out, err) = export(&edl, &srcs, &dir.join(format!("refused{i}")), extra);
+        assert_eq!((code, err, out.as_str()), (1, format!("{want}\n"), ""), "{extra:?}");
+    }
+    // Each word is a pass two_pass_of takes: past the word check, refused only for the missing --bitrate.
+    for p in &words {
+        let (code, out, err) = export(&edl, &srcs, &dir.join(format!("accepted{p}")), &["--pass", *p, "--stats", st.as_str()]);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, "nle: --pass needs --bitrate\n", ""), "--pass {p}");
+    }
+}
+
+#[test]
+fn cli_completions_files() {
+    // PATH_FLAGS is exactly FLAG_ARG's Path words, each a required value by SR1005's arm scan.
+    let paths = const_words("PATH_FLAGS");
+    assert_eq!(paths, ["--out", "--stats", "--src"], "main.rs PATH_FLAGS");
+    let tagged: Vec<&str> = arm_kinds().iter().zip(flag_arg_src()).filter(|(_, a)| *a == "Path").map(|((f, k), _)| {
+        assert_eq!(*k, "Required", "{f}: a Path flag reads a required value");
+        *f
+    }).collect();
+    assert_eq!(tagged, paths, "FLAG_ARG's Path words == PATH_FLAGS");
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    // bash: the numeric Free arm turns readline's filenames off; the Path arm keeps them (-o default); --install directories.
+    let free = bash.lines().find(|l| l.ends_with(") compopt +o default; w=\"\" ;;")).expect("bash: the Free arm");
+    assert!(free.contains("--fps|") && !paths.iter().any(|p| free.contains(&format!("{p}|")) || free.contains(&format!("{p})"))), "bash: Free arm {free:?}");
+    let path_arm = format!("        {}) w=\"\" ;;\n", paths.join("|"));
+    assert!(bash.contains(&path_arm), "bash: {path_arm:?} in {bash}");
+    assert!(bash.contains("        --install|--uninstall) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: the --install arm in {bash}"); /* SR1025 */
+    assert!(bash.contains("    [[ $COMP_CWORD == 2 && ${COMP_WORDS[1]} != completions && $cur != -* ]] && w=\"\"\n"), "bash: position 2 in {bash}");
+    assert!(bash.contains("    [[ $prev == = || $cur == = ]] && w=\"\"\n"), "bash: after REEL= in {bash}");
+    assert!(bash.ends_with("\ncomplete -o default -F _nle nle\n"), "{bash}");
+    // zsh: the path after the last `=` (else the word) on each Path flag; directories after --install; files at position 2+.
+    for p in &paths {
+        let l = p.trim_start_matches('-');
+        let spec = format!(" '*{p}:{l}:{{compset -P \"*=\"; _files}}'");
+        assert!(zsh.contains(&spec), "zsh: {spec:?} in {zsh}");
+    }
+    let file = "if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/; else _files; fi"; /* SR1025 */
+    assert!(zsh.contains(&format!(" '*:file:{{{file}}}'\n")), "zsh: the rest spec in {zsh}");
+    assert!(zsh.contains(&format!("else {file}; fi}}'")), "zsh: the size spec's else in {zsh}");
+    // fish: a Path flag's value is files; --install's directories under the completions verb only.
+    for p in &paths {
+        let line = format!("complete -c nle{} -l {} -r -F", fish_n(p), p.trim_start_matches('-')); /* SR1033 */
+        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
+    }
+    let install = "complete -c nle -n \"__fish_seen_subcommand_from completions\" -l install -x -a \"(__fish_complete_directories)\"";
+    assert_eq!(fish.lines().filter(|x| *x == install).count(), 1, "fish: {install:?} in {fish}");
+    // bash parses the script (`-n`: read, not run).
+    let dir = scratch("completions-files");
+    let p = dir.join("nle.bash");
+    std::fs::write(&p, &bash).unwrap();
+    let o = Command::new("bash").arg("-n").arg(&p).output().expect("bash runs");
+    assert!(o.status.success(), "bash -n: {}\n{bash}", String::from_utf8_lossy(&o.stderr));
+}
+
+// ---- NLECLICOMPLETIONSUNINSTALL (LEDGER SR1025): `nle completions <shell> --uninstall [<dir>] [--force]` (named tail block) ----
+#[test]
+fn cli_completions_uninstall() {
+    let dir = scratch("uninstall");
+    let home = dir.join("home");
+    let want = [("bash", ".local/share/bash-completion/completions/nle"), ("zsh", ".local/share/zsh/site-functions/_nle"), ("fish", ".config/fish/completions/nle.fish")];
+    for (shell, rel) in want {
+        let path = home.join(rel);
+        let (code, _, err) = nle_env(&["completions", shell, "--install"], Some(&home), &[]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell} install");
+        assert!(path.exists(), "{shell}: installed at {}", path.display());
+        // The SAME path --install wrote: removed, then absent (idempotent, exit 0 both).
+        let (code, out, err) = nle_env(&["completions", shell, "--uninstall"], Some(&home), &[]);
+        assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", path.display())), "{shell} uninstall");
+        assert!(!path.exists(), "{shell}: the file is gone");
+        let (code, out, err) = nle_env(&["completions", shell, "--uninstall"], Some(&home), &[]);
+        assert_eq!((code, err.as_str(), out), (0, "", format!("removed {} (absent)\n", path.display())), "{shell} again");
+    }
+    // An explicit dir: --uninstall <dir> removes what --install <dir> wrote, HOME not needed.
+    let target = dir.join("a").join("b");
+    let t = s(&target);
+    let (code, _, err) = nle_env(&["completions", "bash", "--install", &t], None, &[]);
+    assert_eq!((code, err.as_str()), (0, ""), "install <dir>");
+    let (code, out, err) = nle_env(&["completions", "bash", "--uninstall", &t], None, &[]);
+    assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", target.join("nle").display())), "uninstall <dir>");
+    assert!(!target.join("nle").exists() && target.exists(), "the file is gone, the dir kept");
+    // A file that is not ours (a hand-written _nle) is refused by name and left intact; --force removes it.
+    let path = home.join(want[1].1);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "#compdef nle\n# mine\n").unwrap();
+    let (code, out, err) = nle_env(&["completions", "zsh", "--uninstall"], Some(&home), &[]);
+    assert_eq!((code, out.as_str(), err), (1, "", format!("nle: {}: not nle's completion script (use --force)\n", path.display())));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "#compdef nle\n# mine\n", "refused: the file is intact");
+    let (code, out, err) = nle_env(&["completions", "zsh", "--uninstall", "--force"], Some(&home), &[]);
+    assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", path.display())), "--force");
+    assert!(!path.exists(), "--force: removed");
+    // --install with --uninstall is refused by name, nothing written.
+    let other = dir.join("other");
+    let (code, out, err) = nle_env(&["completions", "fish", "--install", "--uninstall"], Some(&other), &[]);
+    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "nle: completions fish: --install and --uninstall together (one at a time)\n"));
+    assert!(!other.exists(), "refused: nothing written");
+}
+
+#[test]
+fn cli_completions_uninstall_words() {
+    // --uninstall [<dir>] completes like --install in every shell (COMPLETIONS_ARG's Dir: SR1019's generators, no new road).
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    assert!(bash.contains("        --install|--uninstall) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: {bash}");
+    assert!(zsh.contains("if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/;"), "zsh: {zsh}");
+    let line = "complete -c nle -n \"__fish_seen_subcommand_from completions\" -l uninstall -x -a \"(__fish_complete_directories)\"";
+    assert_eq!(fish.lines().filter(|x| *x == line).count(), 1, "fish: {line:?} in {fish}");
+}
+
+// ---- NLECLICOMPLETIONSVERBFLAGS (LEDGER SR1033): each verb's own flag words in every completion script (named tail block) ----
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): main.rs `const VERB_FLAGS`'s rows read from the source — a `&["--x", ..]` list by its
+/// words, a `&NAME` list through [`const_words`] (FLAGS / COMPLETIONS_FLAGS).
+fn verb_flags() -> Vec<(&'static str, Vec<&'static str>)> {
+    let src: &'static str = include_str!("../src/main.rs");
+    let body = src.split_once("const VERB_FLAGS: ").and_then(|(_, r)| r.split_once("= [")).and_then(|(_, r)| r.split_once("\n];")).map(|(b, _)| b).expect("main.rs VERB_FLAGS");
+    body.split("(\"")
+        .skip(1)
+        .map(|e| {
+            let (verb, rest) = e.split_once('"').expect("a verb word");
+            let rest = rest.trim_start_matches(", ").trim_end().trim_end_matches(',').trim_end_matches(')');
+            let words = match rest.strip_prefix("&[") {
+                Some(l) => l.split('"').skip(1).step_by(2).collect(),
+                None => const_words(rest.trim_start_matches('&')),
+            };
+            (verb, words)
+        })
+        .collect()
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): fish's ` -n "__fish_seen_subcommand_from <verbs>"` token of `flag`'s `-l` line —
+/// the [`verb_flags`] verbs that take it, in VERBS order.
+fn fish_n(flag: &str) -> String {
+    let verbs: Vec<&str> = verb_flags().into_iter().filter(|(_, f)| f.contains(&flag)).map(|(v, _)| v).collect();
+    format!(" -n \"__fish_seen_subcommand_from {}\"", verbs.join(" "))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): `s` with every string literal's contents removed (the quotes kept), so a word inside
+/// a printed text (`"out={} .."`) is not read as the variable.
+fn code_only(s: &str) -> String {
+    let (mut out, mut in_str, mut esc) = (String::new(), false, false);
+    for c in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+                out.push(c);
+            }
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): `var` appears in `code` as a whole identifier (`out` is not found in `out_t`).
+fn reads_var(code: &str, var: &str) -> bool {
+    let id = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    code.match_indices(var).any(|(i, _)| code[..i].chars().next_back().is_none_or(|c| !id(c)) && code[i + var.len()..].chars().next().is_none_or(|c| !id(c)))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): the `"--x"` literals of `text` in order, each once, whose opening quote follows
+/// `before` and whose closing quote is followed by `after` (`== "--x"`: before `== `; an arm `"--x" =>`: after ` =>`).
+fn literals(text: &'static str, before: &str, after: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for (i, _) in text.match_indices("\"--") {
+        let Some(end) = text[i + 1..].find('"') else { continue };
+        let lit = &text[i + 1..i + 1 + end];
+        if text[..i].ends_with(before) && text[i + 2 + end..].starts_with(after) && !out.contains(&lit) {
+            out.push(lit);
+        }
+    }
+    out
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): what each verb READS, measured from main.rs. The option loop (schedule / render /
+/// export: ONE loop) gives each FLAGS arm's target variable (the first identifier after `=>`; a block arm's `X.push(`); a
+/// verb takes the flags whose variable the shared `load(` line or that verb's `match verb` arm reads. `size` is
+/// `size_verb`'s `== "--x"` literals, `--make-src` its block's `"--x"` literals but its own name, `completions`
+/// `completions_out`'s `"--x" =>` arms (in COMPLETIONS_FLAGS order), `help` / `--help` none.
+fn measured_verb_flags() -> Vec<(&'static str, Vec<&'static str>)> {
+    let src: &'static str = include_str!("../src/main.rs");
+    let flags = const_words("FLAGS");
+    let span = |from: &str, to: &str| -> &'static str {
+        let a = src.find(from).unwrap_or_else(|| panic!("main.rs: {from:?}"));
+        let b = src[a..].find(to).unwrap_or_else(|| panic!("main.rs: {to:?} after {from:?}"));
+        &src[a..a + b]
+    };
+    let ident_end = |s: &str| s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(s.len());
+    // The option loop's arms and the variable each sets.
+    let lp = span("let mut it = args[2..].iter();", "_ => die(unknown_flag(a))");
+    let mut at: Vec<(usize, &str)> = flags.iter().map(|f| (lp.find(&format!("\"{f}\" =>")).unwrap_or_else(|| panic!("{f}: an arm of the option loop")), *f)).collect();
+    at.sort();
+    let var_of = |f: &str| -> &'static str {
+        let i = at.iter().position(|(_, g)| *g == f).unwrap();
+        let start = at[i].0 + f.len() + 5;
+        let body = lp[start..at.get(i + 1).map_or(lp.len(), |n| n.0)].trim_start();
+        if body.starts_with('{') {
+            let head = &body[..body.find(".push(").unwrap_or_else(|| panic!("{f}: a block arm pushes"))];
+            &head[head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |j| j + 1)..]
+        } else {
+            &body[..ident_end(body)]
+        }
+    };
+    let common = code_only(span("let (tl, sources) = load(", "\n"));
+    let arms = span("match verb.as_str() {", "_ => usage(),");
+    let arm = |v: &str| -> String {
+        let a = arms.find(&format!("\"{v}\" =>")).unwrap_or_else(|| panic!("{v}: an arm of match verb"));
+        let next = ["\"schedule\" =>", "\"render\" =>", "\"export\" =>"].iter().filter_map(|p| arms[a + 1..].find(*p).map(|j| a + 1 + j)).min().unwrap_or(arms.len());
+        code_only(&arms[a..next])
+    };
+    let mut out: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    for v in ["schedule", "render", "export"] {
+        let code = arm(v);
+        out.push((v, flags.iter().copied().filter(|f| { let x = var_of(*f); reads_var(&common, x) || reads_var(&code, x) }).collect()));
+    }
+    out.push(("size", literals(span("fn size_verb(", "\n}\n"), "== ", "")));
+    out.push(("--make-src", literals(span("Some(\"--make-src\") {", "return;"), "", "").into_iter().filter(|w| *w != "--make-src").collect()));
+    let own = literals(span("fn completions_out(", "_ => die("), "", " =>");
+    let cf: Vec<&'static str> = const_words("COMPLETIONS_FLAGS").into_iter().filter(|w| own.contains(w)).collect();
+    assert_eq!(cf.len(), own.len(), "completions_out's arms {own:?} are COMPLETIONS_FLAGS words");
+    out.push(("completions", cf));
+    out.push(("help", Vec::new()));
+    out.push(("--help", Vec::new()));
+    out
+}
+
+#[test]
+fn cli_completions_verb_flags_scan() {
+    // VERB_FLAGS: one row per VERBS word, in order; each row exactly what that verb reads (both directions).
+    let table = verb_flags();
+    assert_eq!(table.iter().map(|(v, _)| *v).collect::<Vec<_>>(), const_words("VERBS"), "main.rs VERB_FLAGS in VERBS order");
+    let measured = measured_verb_flags();
+    for (v, flags) in &table {
+        let want = &measured.iter().find(|(m, _)| m == v).unwrap_or_else(|| panic!("{v}: a verb the scan measures")).1;
+        assert_eq!(flags, want, "{v}: VERB_FLAGS vs what main.rs reads for it");
+    }
+    // The GOAL's cases by name: export takes FLAGS; completions its own words, no export flag; size only --fps.
+    let of = |v: &str| table.iter().find(|(w, _)| *w == v).map(|(_, f)| f.clone()).unwrap();
+    assert_eq!(of("export"), const_words("FLAGS"));
+    assert_eq!(of("completions"), ["--install", "--force", "--uninstall"]);
+    assert_eq!(of("size"), ["--fps"]);
+    assert_eq!(of("schedule"), ["--fps", "--src"]);
+    assert_eq!(of("render"), ["--fps", "--out", "--src"]);
+    // Every FLAGS word is some verb's.
+    for f in const_words("FLAGS") {
+        assert!(table.iter().any(|(_, w)| w.contains(&f)), "{f}: in a VERB_FLAGS row");
+    }
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): bash's `_nle` run on `words` (COMP_WORDS; COMP_CWORD the last), the script sourced
+/// from `script`: COMPREPLY, one word each.
+fn bash_complete(script: &Path, words: &[&str]) -> Vec<String> {
+    let o = Command::new("bash")
+        .arg("-c")
+        .arg("source \"$1\"; shift; COMP_WORDS=(\"$@\"); COMP_CWORD=$((${#COMP_WORDS[@]} - 1)); _nle; printf '%s\\n' \"${COMPREPLY[@]}\"")
+        .arg("nle-complete")
+        .arg(script)
+        .args(words)
+        .output()
+        .expect("bash runs");
+    assert!(o.status.success(), "{words:?}: {}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
+}
+
+#[test]
+fn cli_completions_verb_flags_bash() {
+    let bash = script_of("bash");
+    assert!(bash.contains("    local f=\"\"\n    case ${COMP_WORDS[1]} in\n"), "bash: the verb case in {bash}");
+    assert!(bash.contains("    (( COMP_CWORD > 1 )) && w=$f\n"), "bash: the verb's words past word 1 in {bash}");
+    let p = scratch("verb-flags-bash").join("nle.bash");
+    std::fs::write(&p, &bash).unwrap();
+    let o = Command::new("bash").arg("-n").arg(&p).output().expect("bash runs");
+    assert!(o.status.success(), "bash -n: {}\n{bash}", String::from_utf8_lossy(&o.stderr));
+    let table = verb_flags();
+    let of = |v: &str| table.iter().find(|(w, _)| *w == v).map(|(_, f)| f.iter().map(|x| x.to_string()).collect::<Vec<String>>()).unwrap();
+    // `nle <verb> <edl> --<TAB>`: exactly that verb's flags (no `--qp` after completions, no `--video` after size).
+    let got = bash_complete(&p, &["nle", "completions", "bash", "--"]);
+    assert_eq!(got, of("completions"), "nle completions bash --<TAB>");
+    assert!(!got.iter().any(|w| w == "--qp"), "{got:?}");
+    assert_eq!(bash_complete(&p, &["nle", "export", "x.edl", "--"]), of("export"), "nle export x.edl --<TAB>");
+    assert_eq!(bash_complete(&p, &["nle", "size", "x.edl", "--"]), ["--fps"], "nle size x.edl --<TAB>");
+    assert_eq!(bash_complete(&p, &["nle", "schedule", "x.edl", "--"]), of("schedule"), "nle schedule x.edl --<TAB>");
+    assert_eq!(bash_complete(&p, &["nle", "render", "x.edl", "--"]), of("render"), "nle render x.edl --<TAB>");
+    // `nle completions <TAB>`: the shells.
+    let shells = const_words("SHELLS");
+    assert_eq!(shells, ["bash", "zsh", "fish"], "main.rs SHELLS");
+    assert_eq!(bash_complete(&p, &["nle", "completions", ""]), shells, "nle completions <TAB>");
+    assert_eq!(bash_complete(&p, &["nle", "completions", "z"]), ["zsh"], "nle completions z<TAB>");
+}
+
+#[test]
+fn cli_completions_verb_flags_text() {
+    let (zsh, fish) = (script_of("zsh"), script_of("fish"));
+    let shells = const_words("SHELLS").join(" ");
+    // zsh: ONE `case $words[2]`, each verb's `flags=(` arm naming exactly its specs; `_arguments` reads `$flags`.
+    assert!(zsh.starts_with("#compdef nle\nlocal -a flags\ncase $words[2] in\n"), "{zsh}");
+    assert!(zsh.contains("esac\n_arguments '1:verb:("), "{zsh}");
+    assert!(zsh.contains("' $flags '2:shell:"), "{zsh}");
+    for (v, flags) in verb_flags() {
+        let head = format!("    {v}) flags=(");
+        let line = zsh.lines().find(|l| l.starts_with(&head)).unwrap_or_else(|| panic!("zsh: {head:?} in {zsh}"));
+        assert!(line.ends_with(" ) ;;"), "zsh: {line:?}");
+        let named: Vec<&str> = line.match_indices(" '*--").map(|(i, _)| { let w = &line[i + 3..]; &w[..w.find([':', '\'']).unwrap()] }).collect();
+        assert_eq!(named, flags, "zsh: {v}'s specs in {line:?}");
+    }
+    let comp = zsh.lines().find(|l| l.starts_with("    completions) flags=(")).unwrap();
+    assert!(!comp.contains("'*--qp"), "zsh: no export flag after completions: {comp:?}");
+    assert!(zsh.contains(&format!(" '2:shell:{{if [[ $words[2] == completions ]]; then compadd -- {shells}; else ")), "zsh: the shells in {zsh}");
+    // fish: every `-l` line is under the verbs that take it; the shells line; --force under completions.
+    for f in const_words("FLAGS") {
+        let line = format!("complete -c nle{} -l {}", fish_n(f), f.trim_start_matches('-'));
+        assert_eq!(fish.lines().filter(|x| *x == line || x.starts_with(&format!("{line} "))).count(), 1, "fish: {line:?} in {fish}");
+    }
+    for l in fish.lines().filter(|l| l.contains(" -l ")) {
+        assert!(l.starts_with("complete -c nle -n \"__fish_seen_subcommand_from "), "fish: an unconditioned flag line {l:?}");
+    }
+    let sh = format!("complete -c nle -n \"__fish_seen_subcommand_from completions; and test (count (commandline -opc)) -eq 2\" -xa \"{shells}\"");
+    assert!(fish.lines().any(|x| x == sh), "fish: {sh:?} in {fish}");
+    assert!(fish.lines().any(|x| x == "complete -c nle -n \"__fish_seen_subcommand_from completions\" -l force"), "fish: --force in {fish}");
+    // The dispatch refusal names SHELLS, bytes unchanged.
+    let (code, out, err) = nle(&["completions", "tcsh"]);
+    assert_eq!((code, out.as_str(), err), (1, "", format!("nle: completions tcsh: one of {}\n", const_words("SHELLS").join("|"))));
 }
