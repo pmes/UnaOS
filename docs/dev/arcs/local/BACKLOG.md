@@ -67,7 +67,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 ## F. Cross-cutting
 40. STRIAPERFPAINTBUDGET — a per-paint time readout (ms) on stria-view (`"paint_ms"`) and a pin: a 60-clip timeline paints under 8 ms at 1920x1200 (measure first; name the hot spot if it fails).
 41. STRIAFACEGOLDENS — a golden-image table for the face at three sizes (320x160, 1280x720, 1920x1200) with a one-command re-pin script under unaos/scripts (the kernel face shares them: BP-handlers-4).
-42. STRIAUNDOHISTORY — `history` lists the undo stack's last 10 ops with their words on the message rows (needs op names on the undo entries: measure what the stack stores).
+42. [SR876 started] STRIAUNDOHISTORY — `history` lists the undo stack's last 10 ops with their words on the message rows (needs op names on the undo entries: measure what the stack stores).
 
 When fewer than ten unstarted entries remain, the local seat appends ten more HERE from the owed clauses in handlers.md
 L104 / L90 and pushes the file. There is no last arc.
