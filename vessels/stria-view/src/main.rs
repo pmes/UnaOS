@@ -186,6 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -519,6 +520,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
+        button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -941,6 +943,35 @@ mod striamarkers_tests {
         assert_eq!(markers_json(&face), r#","markers":[{"t":0,"name":"M1"},{"t":12,"name":"M2"}]"#);
         println!("striamarkers witness: {}", markers_json(&face));
         assert_eq!(drive(&mut face, "unmark,ruler:0,unmark"), vec!["unmarked M2 at 00:00:00:12".to_string(), "unmarked M1 at 00:00:00:00".to_string()]);
+        assert_eq!(markers_json(&face), "");
+    }
+}
+
+// ---- STRIAMARKERSMORE (LEDGER SR966): the Unmark All button and the `mark:<name>` token (named tail block) ----
+// The button fires THE `unmark all` word; `mark:<name>` is the witness's spelling of `mark <name>` (a name holding `:` or
+// `,` cannot ride a token). Both land on SR835 / SR895's words through `Face::verb`.
+
+#[cfg(test)]
+mod striamarkersmore_tests {
+    use super::*;
+
+    /// STRIAMARKERSMORE M3: the Unmark All button sits after Title and before help; `mark:<name>` names a marker and, on a
+    /// taken tick, renames it; `unmark all` as a token clears them all; bare `mark` stays the VERBS word.
+    #[test]
+    fn striamarkersmore_button_and_mark_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let at = row.iter().position(|b| matches!(b, TetraNode::Button { id, .. } if id == "unmark all")).expect("an unmark all button");
+        assert!(matches!(&row[at - 1], TetraNode::Button { id, .. } if id == "title"));
+        assert!(matches!(&row[at + 1], TetraNode::Button { id, .. } if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&face, "mark").as_deref(), Some([SMessage::Input { text, .. }]) if text == "mark"));
+        assert_eq!(drive(&mut face, "mark:Intro"), vec!["marked Intro at 00:00:00:00".to_string()]);
+        assert_eq!(drive(&mut face, "ruler:12,mark:Outro"), vec!["marked Outro at 00:00:00:12".to_string()]);
+        assert_eq!(drive(&mut face, "mark:Opening"), vec!["renamed Outro to Opening at 00:00:00:12".to_string()]);
+        assert_eq!(markers_json(&face), r#","markers":[{"t":0,"name":"Intro"},{"t":12,"name":"Opening"}]"#);
+        println!("striamarkersmore witness: {}", markers_json(&face));
+        assert_eq!(drive(&mut face, "unmark all"), vec!["unmarked 2 markers".to_string()]);
         assert_eq!(markers_json(&face), "");
     }
 }

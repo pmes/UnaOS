@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail)
+pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "unmark all", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -388,6 +388,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
+    ("Alt+m", "unmark all"), // STRIAMARKERSMORE (SR966): every marker removed (one commit)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2605,6 +2606,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("mark", "drop a marker at the playhead"), // STRIAMARKERS (SR835)
+    ("unmark all", "remove every marker"), // STRIAMARKERSMORE (SR966)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
