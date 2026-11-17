@@ -3034,13 +3034,13 @@ impl EditorState {
 impl EditorState {
     /// The preset / step words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xform_preset_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if let Some(r) = self.xform_nudge_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMMORE (SR975): `pip left|right|up|down` (file tail)
         let d = crate::Xform::SCALE_STEP as i32;
         let xf = match w.as_slice() {
             ["pip", c] => crate::Xform::corner(c)?,
             [step @ ("scale-" | "scale+")] => {
                 let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
-                match cur.stepped(if *step == "scale+" { d } else { -d }) {
+                match cur.fit_step(if *step == "scale+" { d } else { -d }) { // STRIAXFORMMORE (SR975): a step at an edge clamps (file tail)
                     Some(xf) => xf,
                     None => return Some(Err(EditError::Xform)),
                 }
@@ -3446,5 +3446,29 @@ impl EditorState {
             self.commit(tl);
         }
         Ok(())
+    }
+}
+
+// ---- STRIAXFORMMORE (LEDGER SR975): the placement's nudge words through the one commit (named tail block) ----
+// `pip left|right|up|down` move the selected clip's rect by [`crate::Xform::NUDGE_STEP`], stopped at the frame's edges
+// ([`crate::Xform::nudged`]), each ONE commit of SR879's [`EditorState::set_xform`]. Refused: no clip selected
+// `EditError::NoClip`; an audio clip `EditError::Kind`; a rect that cannot move that way (at the edge, or the whole
+// frame) `EditError::Xform`, committing nothing. Any other word falls through to SR938's presets / steps.
+impl EditorState {
+    /// The nudge words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn xform_nudge_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let n = crate::Xform::NUDGE_STEP as i32;
+        let (dx, dy) = match v.split_ascii_whitespace().collect::<Vec<&str>>().as_slice() {
+            ["pip", "left"] => (-n, 0),
+            ["pip", "right"] => (n, 0),
+            ["pip", "up"] => (0, -n),
+            ["pip", "down"] => (0, n),
+            _ => return None,
+        };
+        let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+        Some(match cur.nudged(dx, dy) {
+            Some(xf) => self.set_xform(xf),
+            None => self.set_xform(cur).and(Err(EditError::Xform)),
+        })
     }
 }

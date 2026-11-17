@@ -3541,3 +3541,37 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAXFORMMORE (LEDGER SR975): the placement's clamp, clamped step and nudge (named tail block) ----
+// ONE clamp pulls a rect into the frame ([`Xform::clamped`]); a `scale-` / `scale+` step that SR938's [`Xform::stepped`]
+// refuses at an edge is clamped instead ([`Xform::fit_step`], the centre kept as far as the frame lets), and `pip left` /
+// `right` / `up` / `down` move the rect by [`Xform::NUDGE_STEP`] ([`Xform::nudged`]). Both return `None` only when nothing
+// moves (the rect already at that limit), which editor.rs refuses as `EditError::Xform`. Pure geometry: the words are
+// editor.rs's (one `commit` through `EditorState::set_xform`).
+impl Xform {
+    /// The `pip left` / `right` / `up` / `down` step, 1/1000 of the frame (the corner presets' inset, 1/40).
+    pub const NUDGE_STEP: u16 = 25;
+    /// The rect of scale `s` at top-left (`x`, `y`) pulled inside the frame: `s` into 1..=1000, then `x`, `y` into
+    /// 0..=1000 - `s`.
+    pub fn clamped(s: i32, x: i32, y: i32) -> Xform {
+        let s = s.clamp(1, 1000);
+        let m = 1000 - s;
+        Xform { x: x.clamp(0, m) as u16, y: y.clamp(0, m) as u16, s: s as u16 }
+    }
+    /// The scale moved by `d` about the centre: [`Xform::stepped`] when it fits, else the clamped rect (the centre kept
+    /// as far as the frame lets); `None` when the result is this rect (nothing moves).
+    pub fn fit_step(self, d: i32) -> Option<Xform> {
+        if let Some(xf) = self.stepped(d) {
+            return Some(xf);
+        }
+        let (s, x, y) = (self.s as i32, self.x as i32, self.y as i32);
+        let t = (s + d).clamp(1, 1000);
+        let xf = Xform::clamped(t, (2 * x + s - t) / 2, (2 * y + s - t) / 2);
+        (xf != self).then_some(xf)
+    }
+    /// The rect moved by (`dx`, `dy`) (1/1000), stopped at the frame's edges; `None` when it does not move.
+    pub fn nudged(self, dx: i32, dy: i32) -> Option<Xform> {
+        let xf = Xform::clamped(self.s as i32, self.x as i32 + dx, self.y as i32 + dy);
+        (xf != self).then_some(xf)
+    }
+}

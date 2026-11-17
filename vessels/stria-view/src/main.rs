@@ -198,7 +198,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
@@ -2793,5 +2793,26 @@ mod striagapsmore_tests {
         assert_eq!(face.state.timeline, tl0.close_gaps_sync().unwrap());
         assert_eq!(tl0.sync_gaps(), vec![(20, 25)]);
         println!("striagapsmore witness: close-gaps:sync -> {:?}", face.state.timeline.tracks[0].clips);
+    }
+}
+
+// ---- STRIAXFORMMORE (LEDGER SR975): the witness's nudge tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformmore_tests {
+    use super::*;
+
+    /// STRIAXFORMMORE (SR975): `pip:down` / `pip:right` / `pip:left` / `pip:up` are timeline_core's nudge words on the
+    /// selected clip, one undo step each, no error; a nudge past the edge is refused by name and commits nothing.
+    #[test]
+    fn striaxformmore_witness_nudge_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,pip:tl,pip:down,pip:right");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.undo_depth(), 3);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform { x: 50, y: 50, s: 250 }));
+        assert!(drive(&mut face, "pip:up,pip:up").is_empty());
+        assert_eq!(drive(&mut face, "pip:up"), vec![format!("pip up: {}", timeline_core::EditError::Xform)]);
+        assert_eq!(face.state.undo_depth(), 5);
     }
 }
