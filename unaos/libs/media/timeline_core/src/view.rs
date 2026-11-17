@@ -7187,3 +7187,184 @@ mod striakwavepartial_tests {
         assert_ne!(half, full, "the unscanned part does not");
     }
 }
+
+// ---- STRIAKMETERRESET (LEDGER SR9101): a crossfade's two sources summed into one track reading (named tail block) ----
+//
+// The kernel Player plays a crossfade span's under layer on a SECOND mixer source (vplay.rs `snd`), written apart from the
+// top's in chunks, so one side runs ahead of the other. [`MeterPair`] holds each side's gained frames until the other's
+// arrive and returns their per-sample sum, so the track's ONE meter reads what the two sources play together (the host's
+// `mix_run` taps sum the layers the same way). It sums only a pair of one format: an under at another rate or channel
+// count is dropped (counted by [`MeterPair::skipped`]; owed NLE-METER-KERNEL-XFADE-RATE). With no span it passes the
+// top's frames through unchanged.
+
+/// The longest a side waits for the other, in seconds of its own frames; past it the excess goes to the meter alone.
+pub const PAIR_MAX_S: u32 = 2;
+
+/// One audio track's crossfade pairing (see the block head). One owner (the Player's sound task).
+#[derive(Debug, Clone, Default)]
+pub struct MeterPair {
+    /// The span's under source (`None` while only the top has written into it) and whether the span is open.
+    id: Option<u32>,
+    open: bool,
+    /// The span's format `(rate, ch)`: the first side's.
+    fmt: Option<(u32, u8)>,
+    top: Vec<f32>,
+    under: Vec<f32>,
+    /// The two sides' formats differ: the under's frames are dropped for the rest of the span.
+    mismatch: bool,
+    skipped: u64,
+}
+
+impl MeterPair {
+    /// One side's gained frames `f` (`ch` interleaved at `rate`): the frames the track's meter takes now. `under`: the
+    /// span's second source, mixer id `id` (a new id is a new span); else the top, `paired` while its span has an
+    /// under source. The top unpaired closes the span (what it held first, then `f`).
+    pub fn take(&mut self, under: bool, paired: bool, id: u32, rate: u32, ch: u8, f: Vec<f32>) -> Vec<f32> {
+        let ch = ch.max(1);
+        let mut out = Vec::new();
+        if under {
+            if self.id != Some(id) {
+                if self.open && self.id.is_none() {
+                    self.id = Some(id);
+                } else {
+                    out = self.close();
+                    self.start(Some(id));
+                }
+            }
+            if self.mismatch || self.fmt.is_some_and(|x| x != (rate, ch)) {
+                self.mismatch = self.open;
+                self.skipped += (f.len() / ch as usize) as u64;
+                return out;
+            }
+            if !self.open {
+                out.extend(f);
+                return out;
+            }
+            self.fmt = Some((rate, ch));
+            self.under.extend(f);
+        } else {
+            if !paired {
+                if self.open {
+                    out = self.close();
+                }
+                out.extend(f);
+                return out;
+            }
+            if !self.open {
+                self.start(None);
+            }
+            if self.mismatch {
+                out.extend(f);
+                return out;
+            }
+            if self.fmt.is_some_and(|x| x != (rate, ch)) {
+                self.mismatch = true;
+                let uch = self.fmt.map(|x| x.1.max(1) as usize).unwrap_or(1);
+                self.skipped += (self.under.len() / uch) as u64;
+                self.under.clear();
+                out.append(&mut self.top);
+                out.extend(f);
+                return out;
+            }
+            self.fmt = Some((rate, ch));
+            self.top.extend(f);
+        }
+        let n = self.top.len().min(self.under.len());
+        out.extend(self.top.iter().zip(self.under.iter()).take(n).map(|(a, b)| a + b));
+        self.top.drain(..n);
+        self.under.drain(..n);
+        let max = PAIR_MAX_S as usize * rate.max(1) as usize * ch as usize;
+        for q in [&mut self.top, &mut self.under] {
+            if q.len() > max {
+                let excess = q.len() - max;
+                out.extend(q.drain(..excess));
+            }
+        }
+        out
+    }
+
+    /// The under frames dropped for a format unlike their top's.
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    fn start(&mut self, id: Option<u32>) {
+        *self = MeterPair { id, open: true, skipped: self.skipped, ..MeterPair::default() };
+    }
+
+    /// The span closes: what either side still holds, alone (the under's later frames of this span pass alone).
+    fn close(&mut self) -> Vec<f32> {
+        self.open = false;
+        let mut out = core::mem::take(&mut self.top);
+        out.append(&mut self.under);
+        out
+    }
+}
+
+#[cfg(test)]
+mod striakmeterreset_tests {
+    use super::*;
+
+    const R: u32 = 48_000;
+
+    /// M3: with no span the top's frames pass through unchanged (a timeline without a crossfade meters as before).
+    #[test]
+    fn striakmeterreset_pair_passthrough_without_xfade() {
+        let mut p = MeterPair::default();
+        assert_eq!(p.take(false, false, 3, R, 2, vec![0.25, -0.5, 1.0, 0.0]), vec![0.25, -0.5, 1.0, 0.0]);
+        assert_eq!(p.skipped(), 0);
+    }
+
+    /// M3: the under source writes first, the top catches up: each frame the two share is summed, in order.
+    #[test]
+    fn striakmeterreset_pair_sums_per_frame() {
+        let mut p = MeterPair::default();
+        assert!(p.take(true, false, 7, R, 1, vec![0.125, 0.25, 0.5]).is_empty());
+        assert_eq!(p.take(false, true, 1, R, 1, vec![0.5, 0.5]), vec![0.625, 0.75]);
+        assert_eq!(p.take(false, true, 1, R, 1, vec![0.25, 0.25]), vec![0.75]);
+        assert_eq!(p.take(true, false, 7, R, 1, vec![0.5]), vec![0.75]);
+    }
+
+    /// M3: the top unpaired closes the span: what the under still held, then the top's frames; the under's later frames
+    /// of the same span pass alone.
+    #[test]
+    fn striakmeterreset_pair_close_flushes_leftover() {
+        let mut p = MeterPair::default();
+        assert!(p.take(true, false, 9, R, 1, vec![0.25, 0.5]).is_empty());
+        assert_eq!(p.take(false, true, 1, R, 1, vec![1.0]), vec![1.25]);
+        assert_eq!(p.take(false, false, 1, R, 1, vec![0.125]), vec![0.5, 0.125]);
+        assert_eq!(p.take(true, false, 9, R, 1, vec![0.25]), vec![0.25]);
+        assert_eq!(p.take(false, false, 1, R, 1, vec![0.5]), vec![0.5]);
+    }
+
+    /// M3: an under source at another rate than its top is dropped and counted; the top meters alone.
+    #[test]
+    fn striakmeterreset_pair_mismatch_drops_under() {
+        let mut p = MeterPair::default();
+        assert!(p.take(true, false, 4, 44_100, 1, vec![0.25, 0.25, 0.25]).is_empty());
+        assert_eq!(p.take(false, true, 1, R, 1, vec![0.5, 0.5]), vec![0.5, 0.5]);
+        assert_eq!(p.skipped(), 3);
+        assert!(p.take(true, false, 4, 44_100, 1, vec![0.25]).is_empty());
+        assert_eq!(p.skipped(), 4);
+        assert_eq!(p.take(false, true, 1, R, 1, vec![0.125]), vec![0.125]);
+    }
+
+    /// M3: a new under source is a new span: the old one's leftover goes alone, the new pair sums afresh.
+    #[test]
+    fn striakmeterreset_pair_new_id_new_span() {
+        let mut p = MeterPair::default();
+        assert!(p.take(true, false, 1, R, 1, vec![0.25]).is_empty());
+        assert_eq!(p.take(false, false, 1, R, 1, vec![]), vec![0.25]);
+        assert!(p.take(true, false, 2, R, 1, vec![0.5]).is_empty());
+        assert_eq!(p.take(false, true, 1, R, 1, vec![1.0]), vec![1.5]);
+    }
+
+    /// M3: a side waiting past `PAIR_MAX_S` of its frames gives its oldest excess to the meter alone.
+    #[test]
+    fn striakmeterreset_pair_caps_queue() {
+        let mut p = MeterPair::default();
+        let out = p.take(false, true, 1, 2, 1, vec![0.125, 0.25, 0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(out, vec![0.125, 0.25], "PAIR_MAX_S x rate 2 x 1 ch = 4 held");
+        assert_eq!(p.take(true, false, 5, 2, 1, vec![0.5]), vec![1.0]);
+    }
+}

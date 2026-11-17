@@ -460,7 +460,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+"), // STRIAGRADEMORE (SR957): the digits step the selected clip's grade (SR899's VERBS words, text keys)
     ("8", "opacity-"), ("9", "opacity+"), // STRIAOPACITYMORE (SR958): 8 / 9 (text keys) step the selection's opacity through the VERBS words
     ("Alt+Left", "pan-"), ("Alt+0", "pan"), ("Alt+Right", "pan+"), // STRIAPANMORE (SR959): Alt with Left / 0 / Right step / centre the selected clips' pan (SR897's face words; GTK names, AppKit owed)
-    ("Ctrl+Shift+M", "meters-reset"), ("Meta+Shift+M", "meters-reset"), // STRIAMETERSMORE (SR962): Ctrl / Cmd + Shift + M is the meters-reset word (GTK keeps the shifted keyval's Shift+), // STRIAROLLMORE (SR954): r (text) turns the roll tool on / off (file tail)
+    ("Ctrl+Shift+M", "meters-reset"), ("Meta+Shift+M", "meters-reset"), ("!", "meters-reset"), // STRIAKMETERRESET (SR9101): `!` (text) is the word too, the kernel Player's byte. STRIAMETERSMORE (SR962): Ctrl / Cmd + Shift + M is the meters-reset word (GTK keeps the shifted keyval's Shift+), // STRIAROLLMORE (SR954): r (text) turns the roll tool on / off (file tail)
     ("Alt+m", "unmark all"), // STRIAMARKERSMORE (SR966): every marker removed (one commit)
     ("Alt+l", "crop-l+"), // STRIACROPMORE (SR960): Alt+side crops a side in, Alt+Shift+SIDE out (SR900's step words; GTK names, no Meta twin)
     ("Alt+Shift+L", "crop-l-"),
@@ -11946,5 +11946,35 @@ impl Face {
         }
         let Some((rate, dur)) = self.sources.seq_rerate(&self.state.timeline, c.src, arg).map_err(|e| format!("{name}: {e}"))? else { return Ok(()) };
         self.state.set_seq_rate(c.src, rate, dur).map_err(|e| format!("{name}: {e}"))
+    }
+}
+
+// ---- STRIAKMETERRESET (LEDGER SR9101): `!` is the meters-reset word on both faces (named tail block) ----
+
+#[cfg(test)]
+mod striakmeterreset_tests {
+    use super::*;
+
+    /// M3: `!` (text) is a KEYS row for `meters-reset` (the kernel Player's EDIT_KEYS byte): it clears every latch and
+    /// hold, pushes no undo step, does not dirty the document, and the help names it on the meters-reset row.
+    #[test]
+    fn striakmeterreset_bang_is_meters_reset() {
+        assert!(KEYS.contains(&("!", "meters-reset")));
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.verb("play");
+        face.tick();
+        face.tick();
+        face.verb("play");
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        let (undo, dirty) = (face.state.undo_depth(), face.dirty());
+        assert!(face.on(&SMessage::BrowserText("!".into())));
+        assert!(face.meter_clipped().is_empty() && !face.meter_hold_pending());
+        assert_eq!((face.state.undo_depth(), face.dirty()), (undo, dirty));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        let rows = help_rows();
+        let row = rows.iter().find(|r| r.1 == help_phrase("meters-reset")).expect("a meters-reset help row");
+        assert!(row.0.split(" / ").any(|k| k == "!"), "{:?}", row.0);
     }
 }
