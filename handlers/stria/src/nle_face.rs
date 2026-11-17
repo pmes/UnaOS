@@ -5161,7 +5161,7 @@ impl Face {
     }
     /// STRIAAUTOSAVE (SR883): one clock tick of the autosave: a clean face removes the file it wrote; a dirty unwritten one
     /// counts the tick and writes once AUTOSAVE_EDITS edits or AUTOSAVE_SECS of ticks have passed. True only when a write
-    /// failed (`autosave: <path>: <why>` on the message row: repaint); each attempt restarts both counts.
+    /// failed (`autosave: <path>: <why>` on the message row: repaint) or the keep was named (SR933); each attempt restarts both counts.
     pub fn autosave_tick(&mut self) -> bool {
         let Some(doc) = self.doc_path.clone() else { return false };
         if !self.dirty() {
@@ -5184,8 +5184,8 @@ impl Face {
         }
         self.autosave.ticks = 0;
         self.autosave.depth = self.state.commits();
-        match self.write_autosave(&doc) {
-            Ok(()) => false,
+        let quiet = self.last_error.is_none(); match self.write_autosave(&doc) { // STRIAAUTOSAVEKEEPREAD (SR933): a keep note (no error before) repaints
+            Ok(()) => quiet && self.last_error.is_some(),
             Err(e) => {
                 self.last_error = Some(format!("autosave: {e}"));
                 true
@@ -5240,19 +5240,19 @@ impl Face {
     }
     /// STRIAAUTOSAVE (SR883): the `recover` word; a refusal is `recover: <why>` on the message row.
     fn autosave_verb(&mut self, v: &str) -> Option<bool> {
-        if v != "recover" {
+        if recover_generation(v).is_none() { // STRIAAUTOSAVEKEEPREAD (SR933): `recover` or `recover <n>` (file tail)
             return None;
         }
-        if let Err(e) = self.recover() {
+        if let Err(e) = self.recover_from(recover_generation(v).unwrap_or(0)) {
             self.last_error = Some(format!("recover: {e}"));
         }
         Some(true)
     }
     /// STRIAAUTOSAVE (SR883): read the autosave and apply it as ONE commit; the face is then dirty against the document and
     /// the file stays (it holds the timeline) until `save`.
-    pub fn recover(&mut self) -> Result<(), String> {
+    pub fn recover(&mut self) -> Result<(), String> { self.recover_from(0) } pub fn recover_from(&mut self, generation: usize) -> Result<(), String> { // STRIAAUTOSAVEKEEPREAD (SR933): 1 reads the kept file (file tail)
         let Some(doc) = self.doc_path.clone() else { return Err("no document path".into()) };
-        let path = autosave_path(&doc);
+        let path = autosave_generation_path(&doc, generation)?;
         if !path.is_file() {
             return Err(format!("no autosave ({})", path.display()));
         }
@@ -5261,7 +5261,7 @@ impl Face {
         if !self.state.restore(tl) {
             return Err("the autosave matches the timeline".into());
         }
-        self.autosave = Autosave { written: Some(self.state.timeline.clone()), depth: self.state.commits(), ticks: 0 };
+        self.autosave = Autosave { written: (generation == 0).then(|| self.state.timeline.clone()), depth: self.state.commits(), ticks: 0 };
         Ok(())
     }
 }
@@ -6161,7 +6161,7 @@ pub fn autosave_keep_path(doc: &std::path::Path) -> std::path::PathBuf {
 impl Face {
     /// STRIAAUTOSAVECAP (SR913): when this face holds no autosave of its own and `<stem>.autosave.edl` stands, rename it to
     /// [`autosave_keep_path`]; Err (`<path>: <why>`) when that rename fails.
-    fn keep_foreign_autosave(&self, doc: &std::path::Path) -> Result<(), String> {
+    fn keep_foreign_autosave(&mut self, doc: &std::path::Path) -> Result<(), String> {
         if self.autosave.written.is_some() {
             return Ok(());
         }
@@ -6170,7 +6170,49 @@ impl Face {
             return Ok(());
         }
         let keep = autosave_keep_path(doc);
-        std::fs::rename(&path, &keep).map_err(|e| format!("{} -> {}: {e}", path.display(), keep.display()))
+        std::fs::rename(&path, &keep).map_err(|e| format!("{} -> {}: {e}", path.display(), keep.display()))?; self.note_keep(&keep); Ok(()) // STRIAAUTOSAVEKEEPREAD (SR933): the keep named once (file tail)
+    }
+}
+
+// ---- STRIAAUTOSAVEKEEPREAD (LEDGER SR933): recover 1 reads the kept autosave; the keep named (named tail block) ----
+// `recover 1` applies `<stem>.autosave.1.edl` (SR913's kept file) through SR883's one recover road (`recover_from`): the same
+// refusals by name, one commit through `EditorState::restore`. The face does not own `<stem>.autosave.edl` after it (that
+// file does not hold the timeline), so `written` stays None and the dirty face writes its own autosave on the clock. When
+// SR913's rename keeps a file, the message row names it once, and only when no error already stands there.
+// Owed: NLE-HOST-AUTOSAVE-KEEP-OFFER (the kept file is not offered at open).
+
+/// STRIAAUTOSAVEKEEPREAD (SR933): the generation a `recover` word names: `recover` 0, `recover <n>` n (a word that is not
+/// a number: `usize::MAX`, refused by [`autosave_generation_path`]); None for any other word.
+fn recover_generation(v: &str) -> Option<usize> {
+    let mut words = v.split_whitespace();
+    if words.next() != Some("recover") {
+        return None;
+    }
+    match words.next() {
+        None => Some(0),
+        Some(w) => Some(w.parse::<usize>().unwrap_or(usize::MAX)),
+    }
+}
+
+/// STRIAAUTOSAVEKEEPREAD (SR933): the autosave file of `generation` beside `doc`: 0 [`autosave_path`], 1
+/// [`autosave_keep_path`]; any other is refused (one older autosave is kept).
+pub fn autosave_generation_path(doc: &std::path::Path, generation: usize) -> Result<std::path::PathBuf, String> {
+    match generation {
+        0 => Ok(autosave_path(doc)),
+        1 => Ok(autosave_keep_path(doc)),
+        _ => Err("one older autosave is kept: recover 1".into()),
+    }
+}
+
+impl Face {
+    /// STRIAAUTOSAVEKEEPREAD (SR933): name the kept file on the message row (`autosave: kept the older autosave as <name>`)
+    /// only when no message already stands there; a later failed write in the same call replaces it (the real error wins).
+    fn note_keep(&mut self, keep: &std::path::Path) {
+        if self.last_error.is_some() {
+            return;
+        }
+        let name = keep.file_name().map_or_else(|| keep.display().to_string(), |n| n.to_string_lossy().into_owned());
+        self.last_error = Some(format!("autosave: kept the older autosave as {name}"));
     }
 }
 

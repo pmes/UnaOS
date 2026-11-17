@@ -192,7 +192,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
@@ -2292,5 +2292,30 @@ mod striaproxybuttons_tests {
         assert_eq!(drive(&mut f, "proxy:purge"), vec!["proxy: no clip selected".to_string()]);
         assert_eq!(proxy_json(&f), "");
         println!("striaproxybuttons witness: no proxy -> no field; proxy:purge -> no clip selected");
+    }
+}
+
+// ---- STRIAAUTOSAVEKEEPREAD (LEDGER SR933): the witness's `recover:1` token (named tail block) ----
+#[cfg(test)]
+mod striaautosavekeepread_tests {
+    use super::*;
+
+    /// STRIAAUTOSAVEKEEPREAD M3: `recover:1` is the word `recover 1` at the face: with no kept file beside the document it
+    /// is refused by name (`recover: no autosave (<stem>.autosave.1.edl)`); `recover:2` is refused as one generation.
+    #[test]
+    fn striaautosavekeepread_witness_recover_1() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaautosavekeepread-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("cut.edl");
+        let (tl, src) = nle_face::synth_fixture();
+        std::fs::write(&doc, edl::write(&tl, "cut").unwrap()).unwrap();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+        let keep = nle_face::autosave_keep_path(&doc);
+        assert_eq!(drive(&mut face, "recover:1"), vec![format!("recover: no autosave ({})", keep.display())]);
+        assert_eq!(drive(&mut face, "recover:2"), vec!["recover: one older autosave is kept: recover 1".to_string()]);
+        assert_eq!(face.state.undo_depth(), 0, "a refused recover pushes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
