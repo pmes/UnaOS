@@ -302,7 +302,7 @@ fn striastack_three() -> Timeline {
 }
 
 /// Ticks 10..20: C's own step, vmix B at C's 50/100 continuing B's run, stack[0] A at its own tick at B's 40/100 (its
-/// own run: a seek at the first tick, none after), stack[1] empty; outside the overlay no stack; the SR868 two-layer
+/// run handed over from the mix slot: no seek, STRIASTACKKERNEL SR9092), stack[1] empty; outside the overlay no stack; the SR868 two-layer
 /// stack carries NO_STACK on every step.
 #[test]
 fn striastack_three_layers_bottom_to_top() {
@@ -316,7 +316,7 @@ fn striastack_three_layers_bottom_to_top() {
         assert_eq!((m.src, m.src_t, m.seek, m.t), (Some(SourceId(1)), t as i64, None, Frac { num: 50, den: 100 }), "tick {t}");
         let u = s.stack[0].expect("A under B");
         assert_eq!((u.kind, u.src, u.src_t, u.t), (TransitionKind::Dissolve, Some(SourceId(0)), t as i64, Frac { num: 40, den: 100 }));
-        assert_eq!(u.seek, if t == 10 { Some(10 * NS) } else { None }, "tick {t}");
+        assert_eq!(u.seek, None, "tick {t}"); // STRIASTACKKERNEL (SR9092): A continues the mix run it left (was: Some(10 * NS) at tick 10)
         assert_eq!(s.stack[1], None);
     }
     assert!(steps[..10].iter().chain(&steps[20..]).all(|s| s.stack == NO_STACK));
@@ -354,4 +354,83 @@ fn striastack_take_stack_drops_unused() {
     step.stack[0] = Some(VideoMix { src: None, ..m });
     timeline_core::vmix::take_stack(&step, &mut runs);
     assert_eq!(runs, [None, None]);
+}
+
+// ---- STRIASTACKKERNEL (LEDGER SR9092): a layer that changes slot continues its run; the ONE composite (named tail block) ----
+
+/// The runs a consumer holds (0 live, 1 mix, 2.. stack) walked through `vmix::hand_stack` then `vmix::take_outgoing`;
+/// every slot whose layer continues (seek none) must find its run; returns the opens (a seek, or a run on another source).
+fn striastackkernel_walk(steps: &[Step]) -> usize {
+    use timeline_core::schedule::{slots, STACK_UNDER};
+    let (mut live, mut mix, mut runs): (Option<SourceId>, Option<SourceId>, [Option<SourceId>; STACK_UNDER]) = (None, None, [None; STACK_UNDER]);
+    let mut opens = 0;
+    for s in steps.iter().filter(|s| s.kind == Kind::Video) {
+        timeline_core::vmix::hand_stack(s, &mut live, &mut mix, &mut runs, |x| *x);
+        timeline_core::vmix::take_outgoing(s, &mut live, &mut mix, |x| *x);
+        for (i, l) in slots(s).iter().enumerate() {
+            let Some((src, _, seek)) = *l else { continue };
+            let run = match i {
+                0 => &mut live,
+                1 => &mut mix,
+                k => &mut runs[k - 2],
+            };
+            if seek.is_none() {
+                assert_eq!(*run, Some(src), "tick {} slot {i}: a continuing layer finds its run", s.out_t);
+            } else {
+                *run = Some(src);
+                opens += 1;
+            }
+        }
+    }
+    opens
+}
+
+/// NLE-STACK-HANDOFF: as C forms the stack at tick 10, B (live -> mix) and A (mix -> stack[0]) continue; as it shrinks at
+/// tick 20, B (mix -> live) and A (stack[0] -> mix) continue; the whole run opens three times (B, A at 0; C at 10).
+#[test]
+fn striastackkernel_handoff_continues_runs() {
+    let steps = schedule(&striastack_three(), 0..30, &Gop { dur: 50 }).unwrap();
+    let (s10, s20) = (&steps[10], &steps[20]);
+    assert_eq!((s10.vmix.unwrap().seek, s10.stack[0].unwrap().seek), (None, None));
+    assert_eq!(s10.seek, Some(0), "C opens at its keyframe");
+    assert_eq!((s20.src, s20.seek), (Some(SourceId(1)), None), "B continues the mix run");
+    assert_eq!((s20.vmix.unwrap().src, s20.vmix.unwrap().seek), (Some(SourceId(0)), None), "A continues the stack run");
+    assert_eq!(striastackkernel_walk(&steps), 3);
+    println!("striastackkernel: three layers, three opens");
+}
+
+/// One reel on two layers (V3 is A again): the A slots keep their seeks (the consumers could not tell the runs apart).
+#[test]
+fn striastackkernel_same_reel_keeps_seeks() {
+    let mut tl = striastack_three();
+    tl.tracks[2].clips = vec![Clip::new(SourceId(0), 0, 10, 10).with_opacity(50)];
+    let steps = schedule(&tl, 0..30, &Gop { dur: 50 }).unwrap();
+    assert!(steps[10].stack[0].unwrap().seek.is_some(), "A under B, A on top: seeks");
+    assert!(steps[20].vmix.unwrap().seek.is_some(), "A held by two runs before: seeks");
+    striastackkernel_walk(&steps);
+}
+
+/// `vmix::stack_composite`: bottom black, layer 1 on at 40/100, `top` on at 50/100, each through `mix_step`;
+/// NO_STACK and an `Err` leave `top` untouched.
+#[test]
+fn striastackkernel_composite_one_order() {
+    use timeline_core::schedule::{Frac, NO_STACK, VideoMix};
+    use timeline_core::TransitionKind::Dissolve;
+    let m = |src: Option<SourceId>, num: i64| VideoMix { kind: Dissolve, src, src_t: 0, seek: None, t: Frac { num, den: 100 } };
+    let mut step = Step { kind: Kind::Video, track: Some(2), src: Some(SourceId(2)), src_t: 0, out_t: 0, len: 1, seek: None, vmix: Some(m(Some(SourceId(1)), 50)), stack: NO_STACK };
+    let (top, f1) = (vec![200u8, 10, 10, 255, 10, 200, 10, 255], vec![10u8, 10, 200, 255, 90, 90, 90, 255]);
+    let mut out = top.clone();
+    timeline_core::vmix::stack_composite(&step, &mut out, 2, 1, |_, _| -> Result<Vec<u8>, ()> { panic!("no layer") }).unwrap();
+    assert_eq!(out, top);
+    step.stack = [Some(m(None, 40)), Some(m(Some(SourceId(0)), 50))];
+    timeline_core::vmix::stack_composite(&step, &mut out, 2, 1, |j, _| -> Result<Vec<u8>, ()> {
+        assert_eq!(j, 1, "black asks for no frame");
+        Err(())
+    }).unwrap_err();
+    assert_eq!(out, top, "an Err leaves top");
+    timeline_core::vmix::stack_composite(&step, &mut out, 2, 1, |_, _| -> Result<Vec<u8>, ()> { Ok(f1.clone()) }).unwrap();
+    let mut model = [0u8, 0, 0, 255].repeat(2);
+    timeline_core::vmix::mix_step(Dissolve, Frac { num: 40, den: 100 }, &mut model, &f1, 2, 1);
+    timeline_core::vmix::mix_step(Dissolve, Frac { num: 50, den: 100 }, &mut model, &top, 2, 1);
+    assert_eq!(out, model);
 }

@@ -527,7 +527,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
         if sink.stop() { r.stopped = Some(s.out_t); break; } // NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
         match (s.kind, s.src) {
             (Kind::Video, None) => {
-                vmix_take(s, &mut vid, &mut vmix_run); timeline_core::vmix::take_stack(s, &mut stack_runs); // STRIASTACK (SR9066). NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
+                timeline_core::vmix::hand_stack(s, &mut vid, &mut vmix_run, &mut stack_runs, |v| v.src); vmix_take(s, &mut vid, &mut vmix_run); // STRIASTACKKERNEL (SR9092): a layer that changes slot keeps its run; STRIASTACK (SR9066). NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
                 match s.vmix {
                     Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &mut stack_runs, &black, w, h, tol, &mut r)?),
                     None => sink.frame(s.out_t, w, h, &black),
@@ -535,7 +535,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
-                vmix_take(s, &mut vid, &mut vmix_run); timeline_core::vmix::take_stack(s, &mut stack_runs); // STRIASTACK (SR9066): a stack index the step leaves empty drops its run
+                timeline_core::vmix::hand_stack(s, &mut vid, &mut vmix_run, &mut stack_runs, |v| v.src); vmix_take(s, &mut vid, &mut vmix_run); // STRIASTACKKERNEL (SR9092): a layer that changes slot keeps its run; STRIASTACK (SR9066): a stack index the step leaves empty drops its run
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
                 let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
                 sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &mut stack_runs, &rgba, w, h, tol, &mut r)?);
@@ -1013,27 +1013,11 @@ fn stack_rgba(
     if s.stack == timeline_core::schedule::NO_STACK {
         return Ok(top);
     }
-    let mut out: Option<Vec<u8>> = None;
-    let mut under_t = None;
-    for (j, m) in s.stack.iter().enumerate() {
-        let Some(m) = *m else { break };
-        let f = match m.src {
-            Some(src) => {
-                let a = vid_frame(tl, sources, &mut stack_runs[j], src, m.src_t, m.seek, tol, r)?;
-                reel_rgba(sources, src, &a, &mut stack_runs[j], w, h, reel_fit(tl, src, false))?.0
-            }
-            None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
-        };
-        out = Some(match (out, under_t) {
-            (Some(mut o), Some(t)) => {
-                timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, t, &mut o, &f, w, h);
-                o
-            }
-            _ => f,
-        });
-        under_t = Some(m.t);
-    }
-    let (Some(mut o), Some(t)) = (out, under_t) else { return Ok(top) };
-    timeline_core::vmix::mix_step(timeline_core::TransitionKind::Dissolve, t, &mut o, &top, w, h);
-    Ok(o)
+    let mut top = top; // STRIASTACKKERNEL (SR9092): the order is timeline_core's ONE `vmix::stack_composite`, the kernel Player's too
+    timeline_core::vmix::stack_composite(s, &mut top, w, h, |j, m| -> Result<Vec<u8>, RenderError> {
+        let src = m.src.expect("stack_composite asks only for a layer with a source");
+        let a = vid_frame(tl, sources, &mut stack_runs[j], src, m.src_t, m.seek, tol, r)?;
+        Ok(reel_rgba(sources, src, &a, &mut stack_runs[j], w, h, reel_fit(tl, src, false))?.0)
+    })?;
+    Ok(top)
 }

@@ -982,6 +982,8 @@ pub struct EdlReport {
     pub mix_what: &'static str,
     /// STRIASTACK (SR9066): video steps whose stack (layers under the mixed one) the two decoder slots cannot carry.
     pub stack_refused: u64,
+    /// STRIASTACKKERNEL (SR9092): video steps whose stack was decoded and composited (the third and fourth slots).
+    pub stacked: u64,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
 }
 
@@ -1078,13 +1080,13 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         None => return Err(("superseded", None)),
     }
     let mut run: Option<EdlRun> = None;
-    let mut mix: Option<EdlRun> = None; // NLE6MIX (B899): a transition's outgoing run, the second decoder slot
+    let mut stack: [Option<EdlRun>; timeline_core::schedule::STACK_UNDER] = Default::default(); let mut mix: Option<EdlRun> = None; // STRIASTACKKERNEL (SR9092): the third and fourth decoder slots, one per stack layer. NLE6MIX (B899): a transition's outgoing run, the second decoder slot
     for s in steps.iter().filter(|s| s.kind == Kind::Video) {
         let pts_ms = out_ms(s.out_t);
         if rep.plan.len() < SHOWN_CAP {
             rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
         }
-        stack_refuse(rep, s); rep.mix_what = mix_what(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIASTACK (SR9066): a stack deeper than two layers refused by name. STRIAOPACITYNEXT (SR993): an opacity tick's refusal names opacity (file tail)
+        timeline_core::vmix::hand_stack(s, &mut run, &mut mix, &mut stack, |x| x.src); rep.mix_what = mix_what(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIASTACKKERNEL (SR9092): a layer that changes slot keeps its run (timeline_core's one run handoff); STRIASTACK (SR9066). STRIAOPACITYNEXT (SR993): an opacity tick's refusal names opacity (file tail)
         let mut frame = match s.src {
             None => {
                 if s.vmix.is_none() {
@@ -1099,7 +1101,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         };
         match (s.vmix, refused) {
             (Some(_), Some(why)) => edl_refuse(rep, &why),
-            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, rep)?,
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, (s, &mut stack), rep)?, // STRIASTACKKERNEL (SR9092): the stack under the mixed layer
             (None, _) => {}
         }
         if pts_ms < seek_ms {
@@ -1202,6 +1204,7 @@ fn edl_mix(
     m: timeline_core::schedule::VideoMix,
     frame: &mut Frame,
     mix: &mut Option<EdlRun>,
+    stack: (&timeline_core::schedule::Step, &mut [Option<EdlRun>; timeline_core::schedule::STACK_UNDER]), // STRIASTACKKERNEL (SR9092): the step and its stack slots
     rep: &mut EdlReport,
 ) -> Result<(), (&'static str, Option<String>)> {
     let t0 = crate::hidstall::now_us();
@@ -1231,7 +1234,7 @@ fn edl_mix(
             }
         }
     };
-    let b = unpack(frame.px.rgb());
+    edl_stack(reels, tb, stack.0, stack.1, &mut a, w, h, rep)?; let b = unpack(frame.px.rgb()); // STRIASTACKKERNEL (SR9092): the outgoing composited over the stack under it (file tail)
     timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
     let sum = frame_fnv_rgba(&a);
     if rep.mixes.len() < SHOWN_CAP {
@@ -2694,16 +2697,70 @@ fn refuse_words(what: &str) -> (&'static str, &'static str) {
 // handlers.md NLE-OPACITY-STACK. timeline_core's step carries the layers under the mixed one in `Step::stack`; the Player has
 // two decoder slots (`run`, `mix`), so it shows the top two layers (the step's own picture over `vmix`'s source) and names
 // the rest: `[vplay] opacity: a stack of <n> layers refused (two decoder slots); the top two show` for the first four.
-// NLE-STACK-KERNEL (decoding the stack) stays owed.
+// NLE-STACK-KERNEL BUILT by STRIASTACKKERNEL (SR9092, the section below): the stack decodes, and the line names a refused slot's why.
 
-/// STRIASTACK: a step with any stack layer is counted and, for the first four, named on the wire.
-fn stack_refuse(rep: &mut EdlReport, s: &timeline_core::schedule::Step) {
-    let n = s.stack.iter().filter(|m| m.is_some()).count();
-    if n == 0 {
-        return;
-    }
+/// STRIASTACK: a refused stack (STRIASTACKKERNEL SR9092: only when a stack slot is refused, `why`) is counted and, for the
+/// first four, named on the wire; `n` is the stack's entries under the mixed layer.
+fn stack_refuse(rep: &mut EdlReport, n: usize, why: &str) {
     rep.stack_refused += 1;
     if rep.stack_refused <= 4 {
-        serial_println!("[vplay] opacity: a stack of {} layers refused (two decoder slots); the top two show", n + 2);
+        serial_println!("[vplay] opacity: a stack of {} layers refused ({}); the top two show", n + 2, why);
+    }
+}
+
+// ── STRIASTACKKERNEL (LEDGER SR9092): the Player decodes the stack through two more slots (named tail block) ─────────────
+// handlers.md NLE-STACK-KERNEL. A step's `stack` (timeline_core `Step::stack`, bottom to top) decodes each layer with a
+// source on its own slot (`stack[j]`, the third and fourth decoder slots) through THE `edl_frame` road (its opens counted
+// as `mix_seeks`); a slot about to open asks `slot_room` first. The layers and `a` (the mixed layer's frame) are
+// composited by timeline_core's ONE `vmix::stack_composite` (Stria's order), then `edl_mix` puts the step's own picture on.
+// A refused slot (heap, size, codec) drops the stack runs and is named by `stack_refuse`; the top two show. The runs move
+// between slots as a stack forms or shrinks by timeline_core's `vmix::hand_stack` (edl_run), the schedule's handoff's half.
+
+/// STRIASTACKKERNEL: `a` (the `vmix` source's RGBA, `w x h`) composited over `s.stack` (see the section head).
+#[allow(clippy::too_many_arguments)]
+fn edl_stack(
+    reels: &Reels,
+    tb: timeline_core::Timebase,
+    s: &timeline_core::schedule::Step,
+    stack: &mut [Option<EdlRun>; timeline_core::schedule::STACK_UNDER],
+    a: &mut Vec<u8>,
+    w: usize,
+    h: usize,
+    rep: &mut EdlReport,
+) -> Result<(), (&'static str, Option<String>)> {
+    if s.stack == timeline_core::schedule::NO_STACK {
+        return Ok(());
+    }
+    let n = s.stack.iter().filter(|m| m.is_some()).count();
+    // Err(Ok(why)): a refused slot (named, the top two show); Err(Err(e)): the job's own error.
+    let r = timeline_core::vmix::stack_composite(s, a, w as u32, h as u32, |j, m| -> Result<Vec<u8>, Result<String, (&'static str, Option<String>)>> {
+        let Some(src) = m.src else { return Ok([0u8, 0, 0, 255].repeat(w * h)) };
+        if m.seek.is_some() || stack[j].as_ref().map(|x| x.src) != Some(src) {
+            if let Err(why) = slot_room(w, h) {
+                return Err(Ok(why));
+            }
+        }
+        match edl_frame(reels, tb, &mut stack[j], src, m.src_t, m.seek.is_some(), rep, true) {
+            Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => Ok(unpack(px.rgb())),
+            Ok((ow, oh, _, _)) => Err(Ok(alloc::format!("size {}x{} != {}x{}", ow, oh, w, h))),
+            Err(("codec-refused", e)) => Err(Ok(alloc::format!("codec: {}", e.unwrap_or_default()))),
+            Err(e) => Err(Err(e)),
+        }
+    });
+    match r {
+        Ok(()) => {
+            rep.stacked += 1;
+            if rep.stacked == 1 {
+                let slots = 2 + s.stack.iter().filter(|m| m.is_some_and(|m| m.src.is_some())).count();
+                serial_println!("[vplay] opacity: a stack of {} layers decoded ({} decoder slots)", n + 2, slots);
+            }
+            Ok(())
+        }
+        Err(Ok(why)) => {
+            *stack = Default::default();
+            stack_refuse(rep, n, &why);
+            Ok(())
+        }
+        Err(Err(e)) => Err(e),
     }
 }

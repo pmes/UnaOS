@@ -138,7 +138,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
     let mut run = runs.iter().peekable();
     for t in range.clone() {
         if video {
-            let win = top(tl, Kind::Video, t);
+            let hp = (v_next, m_next, s_next); let win = top(tl, Kind::Video, t); // STRIASTACKKERNEL (SR9092): the previous tick's continuations, every slot (file tail)
             let step = match (black_over(tl, t, win.map(|w| w.0)), win) {
                 (Some((ti, x)), _) => black_step(tl, idx, ti, &x, t, &mut v_next, &mut m_next)?,
                 (None, Some((ti, ci))) => {
@@ -154,7 +154,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                     Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: None, stack: NO_STACK }
                 }
             };
-            if step.stack == NO_STACK { s_next = [None; STACK_UNDER]; } out.push(step);
+            let step = stack_handoff(step, hp); if step.stack == NO_STACK { s_next = [None; STACK_UNDER]; } out.push(step); // STRIASTACKKERNEL (SR9092): a layer that changes slot continues its run (file tail)
         }
         if let Some(r) = run.next_if(|r| r.out_t == t) {
             out.push(r.header());
@@ -652,4 +652,67 @@ fn stack_under(
         *next = stack[k].and_then(|m| m.src.map(|src| (src, m.src_t + 1)));
     }
     Ok(stack)
+}
+
+// ---- STRIASTACKKERNEL (LEDGER SR9092): a layer that changes slot as a stack forms or shrinks continues its run (named tail block) ----
+// NLE-STACK-HANDOFF. A step's video layers sit in SLOTS: 0 the step's own source, 1 `vmix`, 2.. `stack` bottom to top
+// ([`slots`], the ONE order the schedule and `vmix::hand_stack` share). When a stack forms (a third layer arrives) or
+// shrinks, a layer moves between slots; the per-slot rules above would reopen it at its keyframe. [`stack_handoff`]
+// clears that seek when the layer continues the ONE previous slot that held its source at exactly its tick, and only on
+// a step that carries a stack or follows one, so every two-layer schedule is byte-identical. A source named by two
+// slots (one reel on two layers) keeps its seeks: the consumers could not tell the two runs apart (SR993's caution).
+
+/// STRIASTACKKERNEL: a video step's slot count: its own source, `vmix`, and [`STACK_UNDER`] stack layers.
+pub const SLOTS: usize = 2 + STACK_UNDER;
+
+/// STRIASTACKKERNEL: `(source, source tick, seek)` of each of `s`'s slots (0 own, 1 `vmix`, 2.. `stack` bottom to top);
+/// `None` for a slot that names no source (black, unused).
+pub fn slots(s: &Step) -> [Option<(SourceId, i64, Option<i64>)>; SLOTS] {
+    let mut out = [None; SLOTS];
+    out[0] = s.src.map(|src| (src, s.src_t, s.seek));
+    for (o, m) in out[1..].iter_mut().zip(core::iter::once(s.vmix).chain(s.stack.iter().copied())) {
+        *o = m.and_then(|m| m.src.map(|src| (src, m.src_t, m.seek)));
+    }
+    out
+}
+
+/// STRIASTACKKERNEL: `step` with the seek of each slot that continues the previous tick's ONE slot on its source cleared;
+/// `prev` is `(v_next, m_next, s_next)` as they stood before the tick.
+fn stack_handoff(mut step: Step, prev: (Option<(SourceId, i64)>, Option<(SourceId, i64)>, [Option<(SourceId, i64)>; STACK_UNDER])) -> Step {
+    let (v, m, s) = prev;
+    if step.stack == NO_STACK && s.iter().all(|c| c.is_none()) {
+        return step;
+    }
+    let conts: [Option<(SourceId, i64)>; SLOTS] = core::array::from_fn(|i| match i {
+        0 => v,
+        1 => m,
+        k => s[k - 2],
+    });
+    let named = slots(&step);
+    for (i, l) in named.iter().enumerate() {
+        let Some((src, src_t, Some(_))) = *l else { continue };
+        let once = named.iter().filter(|n| n.is_some_and(|n| n.0 == src)).count() == 1;
+        let mut held = conts.iter().filter(|c| c.is_some_and(|c| c.0 == src));
+        if once && held.clone().count() == 1 && held.next() == Some(&Some((src, src_t))) {
+            clear_seek(&mut step, i);
+        }
+    }
+    step
+}
+
+/// STRIASTACKKERNEL: slot `i`'s seek (in [`slots`] order) set to `None`.
+fn clear_seek(step: &mut Step, i: usize) {
+    match i {
+        0 => step.seek = None,
+        1 => {
+            if let Some(m) = step.vmix.as_mut() {
+                m.seek = None;
+            }
+        }
+        k => {
+            if let Some(m) = step.stack[k - 2].as_mut() {
+                m.seek = None;
+            }
+        }
+    }
 }
