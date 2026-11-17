@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -692,13 +692,13 @@ impl EditorState {
         self.clipboard = c;
         Ok(())
     }
-    /// The clipboard laid at the playhead on the selected track (see the block comment; ONE commit).
-    pub fn paste(&mut self) -> Result<(), EditError> {
+    /// The clipboard laid at the playhead on the selected track (see the block comment; ONE commit). STRIAPASTEINSERT (SR896): `mode` as `Timeline::paste_as` (None never overwrites, Insert ripples, Overwrite carves).
+    pub fn paste_as(&mut self, mode: Option<crate::Mode>) -> Result<(), EditError> {
         let t0 = self.clipboard.iter().map(|e| e.0).min().ok_or(EditError::NoClip)?;
         let a0 = self.clipboard.iter().map(|e| e.2.at).min().ok_or(EditError::NoClip)?;
         let base = self.selection.map_or(t0, |p| p.0);
         let items: Vec<(usize, crate::Kind, Clip)> = self.clipboard.iter().map(|&(t, k, c)| (t - t0 + base, k, Clip { at: c.at - a0 + self.playhead, ..c })).collect();
-        let tl = self.timeline.paste(&items)?;
+        let tl = self.timeline.paste_as(&items, mode)?;
         self.commit(tl);
         self.set.clear();
         for &(t, _, c) in &items {
@@ -808,5 +808,106 @@ mod striacopypaste_tests {
         assert_eq!(st.verb("paste"), Some(Err(EditError::Kind)));
         assert_eq!((st.timeline == tl0, st.undo_depth()), (true, 0));
         assert_eq!(st.verb("copyx"), None);
+    }
+}
+
+// ---- STRIAPASTEINSERT (LEDGER SR896): paste-insert / paste-over through the one paste walk (named tail block) ----
+// `paste-insert` lays the clipboard through `Timeline::place(.., Mode::Insert)` (each target track ripples) and `paste-over`
+// through `Mode::Overwrite` WITHOUT SR854's overlap refusal (it carves): the same anchor rule as `paste` (lowest copied
+// track on the selected clip's track, earliest clip at the playhead), the same walk (`paste_as`), ONE commit each,
+// all-or-nothing; the pasted clips become the set and the playhead moves to their end.
+impl EditorState {
+    /// SR854's paste: the clipboard laid at the playhead, never overwriting (`paste_as(None)`).
+    pub fn paste(&mut self) -> Result<(), EditError> {
+        self.paste_as(None)
+    }
+    /// The `paste-insert` / `paste-over` words of [`EditorState::verb`]; `None` for any other word.
+    fn paste_mode_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match v {
+            "paste-insert" => self.paste_as(Some(crate::Mode::Insert)),
+            "paste-over" => self.paste_as(Some(crate::Mode::Overwrite)),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod striapasteinsert_tests {
+    use super::*;
+    use crate::{Kind, SourceId};
+
+    /// SR854's fixture: A 13..23 at 0, B 0..10 at 10, A 23..33 at 25 on V1 and on A1.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striapasteinsert_paste_insert_ripples_the_track_one_undo() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        let (a, b) = (SourceId(0), SourceId(1));
+        st.select(0, 1).unwrap();
+        st.verb("copy").unwrap().unwrap();
+        st.seek(12);
+        assert_eq!(st.verb("paste-insert"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips, alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 2, 10), Clip::new(b, 0, 10, 12), Clip::new(b, 2, 10, 22), Clip::new(a, 23, 33, 35)]);
+        assert_eq!(st.timeline.tracks[1], tl0.tracks[1], "only the selected track ripples");
+        assert_eq!((st.selection, st.set.clone(), st.playhead, st.undo_depth()), (Some((0, 2)), alloc::vec![(0, 2)], 22, 1));
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0, "one undo per paste-insert");
+    }
+
+    #[test]
+    fn striapasteinsert_paste_over_carves_one_undo() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        let (a, b) = (SourceId(0), SourceId(1));
+        st.select(0, 1).unwrap();
+        st.verb("copy").unwrap().unwrap();
+        st.seek(12);
+        assert_eq!(st.verb("paste"), Some(Err(EditError::Overlap)), "the plain paste still never overwrites");
+        assert_eq!(st.verb("paste-over"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips, alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 2, 10), Clip::new(b, 0, 10, 12), Clip::new(a, 23, 33, 25)]);
+        assert_eq!(st.timeline.tracks[1], tl0.tracks[1]);
+        assert_eq!((st.selection, st.playhead, st.undo_depth()), (Some((0, 2)), 22, 1));
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0);
+    }
+
+    #[test]
+    fn striapasteinsert_contiguous_set_inserts_contiguously() {
+        let mut st = state();
+        let (a, b) = (SourceId(0), SourceId(1));
+        st.select_many(&[(0, 1), (0, 0)], false);
+        st.verb("copy").unwrap().unwrap();
+        st.seek(25);
+        st.select(0, 2).unwrap();
+        assert_eq!(st.verb("paste-insert"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips, alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 13, 23, 25), Clip::new(b, 0, 10, 35), Clip::new(a, 23, 33, 45)]);
+        assert_eq!((st.set.clone(), st.playhead, st.undo_depth()), (alloc::vec![(0, 2), (0, 3)], 45, 1));
+    }
+
+    #[test]
+    fn striapasteinsert_refusals_by_name_leave_the_state() {
+        let mut st = state();
+        assert_eq!(st.verb("paste-insert"), Some(Err(EditError::NoClip)), "empty clipboard");
+        assert_eq!(st.verb("paste-over"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        st.verb("copy").unwrap().unwrap();
+        let tl0 = st.timeline.clone();
+        st.seek(35);
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("paste-insert"), Some(Err(EditError::Kind)));
+        assert_eq!(st.verb("paste-over"), Some(Err(EditError::Kind)));
+        assert_eq!((st.timeline == tl0, st.undo_depth()), (true, 0));
+        assert_eq!(st.verb("paste-under"), None);
     }
 }
