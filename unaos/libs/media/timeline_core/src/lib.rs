@@ -108,6 +108,7 @@ pub struct Clip {
     pub opacity: u8,
     pub group: u32, // STRIACLIPLINK (SR863): the link group (0 = none): clips sharing a nonzero id select, move, delete and split together
     pub grade: Grade, // STRIACOLORLIFT (SR869): the clip's colour grade, IDENTITY = none (file tail)
+    pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan, -128..=127 (0 = centre; -127 / -128 hard left, 127 hard right; schedule::pan_q16 is the law)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -116,7 +117,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0, grade: Grade::IDENTITY }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0, grade: Grade::IDENTITY, pan_cq8: 0 }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -2430,5 +2431,20 @@ impl Timeline {
         let Some(tr) = track.and_then(|i| self.tracks.get(i)) else { return Grade::IDENTITY };
         let c = if outgoing { tr.clips.iter().filter(|c| c.end() <= t).max_by_key(|c| c.end()) } else { tr.clips.iter().find(|c| c.covers(t)) };
         c.map_or(Grade::IDENTITY, |c| c.grade)
+    }
+}
+
+// ---- STRIAPAN (LEDGER SR861): per-clip pan (named tail block) ----
+// A clip carries [`Clip::pan_cq8`] (0 = centre, the default every constructor gives); `set_pan` is `set_gain`'s shape, the
+// editor's `pan <x>` word commits it, the EDL writes it as `* UNA PAN <cq8>`, and `schedule::audio_runs` copies it onto
+// each [`schedule::Layer`]. The ONE law is [`schedule::pan_q16`]; Stria's render applies it (the kernel Player plays it
+// centred: NLE-PAN-KERNEL).
+impl Timeline {
+    /// STRIAPAN: set a clip's pan (`pan_cq8`, -128..=127; every i8 is a pan, so only the clip's address is refused).
+    pub fn set_pan(&self, track: usize, idx: usize, pan_cq8: i8) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.pan_cq8 = pan_cq8;
+        tl.validate()?;
+        Ok(tl)
     }
 }

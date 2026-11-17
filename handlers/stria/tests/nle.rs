@@ -5735,3 +5735,36 @@ fn striacolorlift_face_word_grades_the_preview() {
     assert!(face.on(&input("undo")));
     assert_eq!(stria::nle_face::preview(&face.state.timeline, &src2, 12).unwrap().unwrap().rgba, before);
 }
+
+// ---- STRIAPAN (LEDGER SR861): per-clip pan — a mono render ignores it, the face's word sets it (named tail block) ----
+
+/// A mono project has one bus and no sides: two tracks panned hard left / hard right render byte-identical to centred.
+#[test]
+fn striapan_mono_render_ignores_pan() {
+    let (a, b) = (SourceId(0), SourceId(1));
+    let tracks = |pa: i8, pb: i8| vec![vec![Clip { pan_cq8: pa, ..Clip::new(a, 0, 20, 0) }], vec![Clip { pan_cq8: pb, ..Clip::new(b, 5, 15, 5) }]];
+    let (_, centre) = mix(&[0, 1000], tracks(0, 0), 20, SYNTH_RATE);
+    for (pa, pb) in [(-128, 127), (127, -127), (64, -1)] {
+        let (_, panned) = mix(&[0, 1000], tracks(pa, pb), 20, SYNTH_RATE);
+        assert_eq!(panned.pcm, centre.pcm, "pan ({pa}, {pb})");
+    }
+    println!("striapan: mono render of {} samples unchanged under pan", centre.pcm.len());
+}
+
+/// The face's `pan <x>` word reaches timeline_core's verb: the selected audio clip's pan, one undo step, saved as `* UNA PAN`.
+#[test]
+fn striapan_face_word_sets_the_pan() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 1).unwrap();
+    let d0 = face.state.undo_depth();
+    assert!(face.verb("pan 0.25"));
+    assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 32);
+    assert_eq!(face.state.undo_depth(), d0 + 1);
+    assert_eq!(face.last_error, None);
+    assert!(edl::write(&face.state.timeline, "T").unwrap().contains("* UNA PAN 32\n"));
+    assert!(!face.verb("pan 3"), "a malformed pan word is not a verb");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 0);
+    assert!(!VERBS.contains(&"pan"), "no button: NLE-PAN-FACE");
+}

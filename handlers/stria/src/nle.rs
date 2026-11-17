@@ -634,12 +634,12 @@ fn mix_run(
 /// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
 /// `env[0]` at the run's first sample toward `env[1]` at its end edge).
 fn mix_into(acc: &mut [i64], pcm: &[f32], l: &Layer, n: i64, ch: usize) {
-    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); // NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
+    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); let pw = pan_mix(l.pan_cq8, ch); // STRIAPAN (SR861): the pan factor per channel (file tail); NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
     let (e0, e1) = (l.env[0] as i64, l.env[1] as i64);
     for (j, frame) in pcm.chunks(ch).enumerate() {
         let e = gneiss_pal::dsp::audio::ramp::at(e0, e1, j as i64, n);
         for (c, &x) in frame.iter().enumerate() {
-            acc[j * ch + c] += (to_i16(x) * g * e) >> 32;
+            acc[j * ch + c] += (to_i16(x) * (g * pw[c.min(1)] >> 16) * e) >> 32;
         }
     }
 }
@@ -1173,4 +1173,53 @@ fn graded(g: timeline_core::Grade, mut rgba: Vec<u8>) -> Vec<u8> {
         g.apply(&mut rgba);
     }
     rgba
+}
+
+// ---- STRIAPAN (LEDGER SR861): the clip's pan in the mix (named tail block) ----
+
+/// STRIAPAN: the per-channel factor (Q16, 65536 = unity) `mix_into` multiplies a layer's gain by: on a stereo project
+/// timeline_core's ONE law ([`timeline_core::schedule::pan_q16`]) divided by its centre (the "-3 dB compensated" form:
+/// centre exactly unity, so a centred clip mixes byte-identically; hard to one side +3.01 dB on that channel and silence on
+/// the other, still constant power; a full-scale clip panned hard can exceed full scale there, and `out_f32`'s clamp catches
+/// it). A mono project (one bus, no sides) or more than two channels (NLE-PAN-SURROUND): unity, pan does nothing.
+fn pan_mix(pan_cq8: i8, ch: usize) -> [i64; 2] {
+    if ch != 2 {
+        return [65536; 2];
+    }
+    let (w, c) = (timeline_core::schedule::pan_q16(pan_cq8), timeline_core::schedule::pan_q16(0)[0] as i64);
+    [w[0] as i64 * 65536 / c, w[1] as i64 * 65536 / c]
+}
+
+#[cfg(test)]
+mod striapan_tests {
+    use super::*;
+    use timeline_core::SourceId;
+    use timeline_core::schedule::ENV_ONE;
+
+    fn layer(pan_cq8: i8) -> Layer {
+        Layer { track: 0, src: SourceId(0), src_t: 0, seek: None, gain_cdb: 0, pan_cq8, env: [ENV_ONE, ENV_ONE] }
+    }
+
+    /// A stereo frame through `mix_into` at centre is the unpanned arithmetic exactly; hard left / right keep their own
+    /// channel at +3.01 dB (x 92681 / 65536) and silence the other; mono ignores pan.
+    #[test]
+    fn striapan_mix_into_stereo_and_mono() {
+        let pcm = [0.5f32, -0.25, 0.125, 0.75];
+        let mix = |p: i8, ch: usize| {
+            let mut acc = vec![0i64; pcm.len()];
+            mix_into(&mut acc, &pcm, &layer(p), (pcm.len() / ch) as i64, ch);
+            acc
+        };
+        let plain: Vec<i64> = pcm.iter().map(|&x| to_i16(x)).collect();
+        assert_eq!(mix(0, 2), plain, "centre is unity");
+        assert_eq!(pan_mix(0, 2), [65536, 65536]);
+        assert_eq!(pan_mix(127, 2), [0, 92681]);
+        assert_eq!(pan_mix(-128, 2), [92681, 0]);
+        let g = |x: i64| (x * (65536 * 92681 >> 16) * 65536) >> 32;
+        assert_eq!(mix(-127, 2), vec![g(plain[0]), 0, g(plain[2]), 0]);
+        assert_eq!(mix(127, 2), vec![0, g(plain[1]), 0, g(plain[3])]);
+        assert_eq!(mix(127, 1), plain, "a mono render ignores pan");
+        assert_eq!(mix(-128, 1), plain);
+        println!("striapan: stereo hard right {:?}, centre {:?}", mix(127, 2), mix(0, 2));
+    }
 }

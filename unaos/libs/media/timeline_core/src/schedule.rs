@@ -191,6 +191,7 @@ pub struct Layer {
     pub seek: Option<i64>,
     /// The clip's gain plus its track's ([`Timeline::heard_cdb`], STRIATRACKGAIN SR864), centi-dB.
     pub gain_cdb: i32,
+    pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan (Stria's mix_into applies [`pan_q16`]; the kernel Player plays it centred, NLE-PAN-KERNEL)
     /// The fade envelope (Q16, [`ENV_ONE`] = full) at the run's first tick and at its end edge; linear between.
     pub env: [u32; 2],
 }
@@ -272,7 +273,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                     let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, c.src_at(end))); // STRIACLIPSPEED (SR829): where the run's source ends at the clip's rate (1x: src_t + (end - t))
-                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), pan_cq8: c.pan_cq8, env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
                 }
                 None => (next[ti], xnext[ti]) = (None, None),
             }
@@ -379,7 +380,7 @@ fn under_layer(
     *xnext = Some((o.src, src_t + (end - t)));
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_cq8, env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
@@ -561,4 +562,16 @@ fn opacity_mix(
 /// STRIAOPACITY: the highest video track below track `ti` with a clip at tick `t`: (track index, clip index).
 fn below(tl: &Timeline, ti: usize, t: i64) -> Option<(usize, usize)> {
     tl.tracks[..ti].iter().enumerate().rev().filter(|(_, tr)| tr.kind == Kind::Video).find_map(|(i, _)| tl.clip_at(i, t).map(|c| (i, c)))
+}
+
+// ---- STRIAPAN (LEDGER SR861): the ONE constant-power pan law over the quarter-wave table (named tail block) ----
+
+/// STRIAPAN: THE pan law: the (left, right) weights (Q16, [`ENV_ONE`] = unity) of a clip at pan `pan_cq8`, constant power
+/// over the same quarter-wave sine as [`xfade_weight`]: the phase `p = (pan + 127) * ENV_ONE / 254` (-128 is -127), and
+/// `[sin(pi/2 (1 - p)), sin(pi/2 p)]`. Hard left `[ENV_ONE, 0]`, centre `[46341, 46341]` (-3.01 dB each side), hard right
+/// `[0, ENV_ONE]`; `L^2 + R^2 = ENV_ONE^2` within the table's interpolation. Stria's `mix_into` divides by the centre (the
+/// "-3 dB compensated" form: centre unity, the hard side +3.01 dB on its own channel).
+pub fn pan_q16(pan_cq8: i8) -> [u32; 2] {
+    let p = ((pan_cq8.max(-127) as i64 + 127) * ENV_ONE as i64 / 254) as u32;
+    [qsin(ENV_ONE - p), qsin(p)]
 }
