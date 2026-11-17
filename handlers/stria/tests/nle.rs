@@ -7284,3 +7284,34 @@ fn striafreezeframe_face_holds_the_playhead_frame() {
     assert_eq!(edl::parse(&text, 25).unwrap(), fr, "the hold reopens through its M2 line");
     println!("striafreezeframe: freeze at 5 -> hold of A:18 over 5..55, preview equal on 5 / 30 / 54 / 55; one undo");
 }
+
+// ---- STRIACROPFACE (LEDGER SR900): the crop words and the badge on the face (named tail block) ----
+
+/// STRIACROPFACE (SR900): `crop` is a transport word just before `help`; `crop-l+` / `crop-r+` reach timeline_core's ONE
+/// dispatch through `Face::verb` (one undo step each); a refused step is named on the message row; the painted timeline of a
+/// cropped clip carries the CROP_BADGE glyph, and after `crop` clears it the canvas is the uncropped one, byte for byte.
+#[test]
+fn striacropface_face_words() {
+    let (tl, src) = synth_fixture();
+    assert_eq!(VERBS[VERBS.len() - 2], "crop");
+    assert_eq!(VERBS.last(), Some(&"help"));
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    let before = stria::nle_face::paint(&face.state, 320, 160, PixelOrder::Rgba, None, None);
+    assert!(face.verb("crop-l+"));
+    assert!(face.verb("crop-r+"));
+    assert_eq!(face.last_error.take(), None);
+    let s = timeline_core::editor::CROP_STEP;
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: s, t: 0, r: s, b: 0 }));
+    assert_eq!(face.state.undo_depth(), 2);
+    let cut = stria::nle_face::paint(&face.state, 320, 160, PixelOrder::Rgba, None, None);
+    assert!(cut.as_chunks::<4>().0.contains(&timeline_core::view::CROP_BADGE), "the badge on the cropped clip");
+    assert!(face.verb("crop"));
+    assert_eq!((face.last_error.take(), face.state.undo_depth()), (None, 3));
+    assert_eq!(stria::nle_face::paint(&face.state, 320, 160, PixelOrder::Rgba, None, None), before, "cleared: no badge");
+    assert!(face.verb("crop 500 0 490 0"));
+    assert!(face.verb("crop-l+"));
+    assert_eq!(face.last_error.take(), Some(format!("crop-l+: {}", EditError::Crop)));
+    assert_eq!(face.state.undo_depth(), 4);
+    println!("striacropface: crop-l+ crop-r+ -> {s}/0/{s}/0 badge painted; crop clears; crop-l+ past the frame refused");
+}

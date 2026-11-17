@@ -332,7 +332,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity));
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
-            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail) paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -2305,4 +2305,29 @@ fn pan_tick(c: &mut Canvas, kind: Kind, clip: &crate::Clip, x0: i64, x1: i64, y0
     let half = ((x1 - x0) / 2 - HANDLE_W - 1).max(0);
     let xm = (x0 + x1) / 2 + half * (clip.pan_cq8 as i64).clamp(-127, 127) / 127;
     c.rect(xm - 1, y0 + 2, xm + 1, y0 + 6, TICK);
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the crop badge on a cropped clip's body (named tail block) ----
+/// STRIACROPFACE (SR900): the crop badge's glyph colour.
+pub const CROP_BADGE: [u8; 4] = [0xff, 0xa0, 0x20, 255];
+/// The crop glyph, 7x7 (bit 6 the leftmost column): two interlocking corners.
+const CROP_GLYPH: [u8; 7] = [0x20, 0x7c, 0x24, 0x24, 0x24, 0x3f, 0x04];
+
+/// A clip body `x0..x1` on the row at `y0` carrying `crop`: a 9x9 [`FIELD`] box at the body's top right (`x1 - 11 ..
+/// x1 - 2`, `y0 + 3 .. y0 + 12`) holding [`CROP_GLYPH`] in [`CROP_BADGE`]. No crop, or a body under 16 px: nothing painted
+/// (every golden stays byte-identical).
+fn paint_crop_badge(c: &mut Canvas, crop: crate::Crop, x0: i64, x1: i64, y0: i64) {
+    if crop == crate::Crop::NONE || x1 - x0 < 16 {
+        return;
+    }
+    let (bx, by) = (x1 - 11, y0 + 3);
+    c.rect(bx, by, bx + 9, by + 9, FIELD);
+    for (dy, bits) in CROP_GLYPH.iter().enumerate() {
+        for dx in 0..7i64 {
+            if bits & (0x40 >> dx) != 0 {
+                let (px, py) = (bx + 1 + dx, by + 1 + dy as i64);
+                c.rect(px, py, px + 1, py + 1, CROP_BADGE);
+            }
+        }
+    }
 }

@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.freeze_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail)
+        if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -696,7 +696,7 @@ pub const GAIN_STEP_CDB: i32 = 100;
 impl EditorState {
     /// The selected clip's gain set to `cdb` centi-dB (`Timeline::set_gain`, ONE commit; the same gain commits nothing).
     pub fn set_selected_gain(&mut self, cdb: i32) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if self.set.len() > 1 { return self.crop_set(|_| crop); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIACROPFACE (SR900): a set of more than one clip crops through `crop_set` (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.gain_cdb == cdb {
             return Ok(());
@@ -2225,5 +2225,140 @@ impl EditorState {
         let k = ((m + m.signum() * 63) / 127 + d).clamp(-8, 8);
         let n = k * 127;
         Some(((n + n.signum() * 4) / 8) as i8)
+    }
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the crop words and the crop over the whole selection set (named tail block) ----
+// SR867's crop reaches the face: bare `crop` clears it, `crop-l+` / `crop-l-` (and `t`, `r`, `b`) step one side by
+// [`CROP_STEP`] (1/1000 of the frame; a minus stops at 0). Every crop word, and `crop <l> <t> <r> <b>` on a set of more than
+// one clip (through [`EditorState::set_crop`]), acts on the whole selection SET by [`EditorState::crop_set`], the shape of
+// SR853's `gain_set`: `Timeline::set_crop` (its own refusals) folded over every VIDEO clip of `set` into ONE `commit`; the
+// set's audio clips are skipped (a crop has no audio meaning), a set with no video clip is `EditError::Kind`, any clip
+// refused refuses the whole edit and leaves the state, and an edit changing no clip commits nothing.
+/// STRIACROPFACE (SR900): one press of a `crop-<side>±` word, 1/1000 of the frame.
+pub const CROP_STEP: u16 = 10;
+
+impl EditorState {
+    /// Every selected video clip's crop set to `crop(its own crop)` (ONE commit; refused whole; no change commits nothing;
+    /// audio clips of the set skipped; no video clip in the set `EditError::Kind`).
+    pub fn crop_set(&mut self, crop: impl Fn(crate::Crop) -> crate::Crop) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let mut tl = self.timeline.clone();
+        let (mut video, mut changed) = (false, false);
+        for &(t, i) in &self.set {
+            if tl.tracks.get(t).ok_or(EditError::NoTrack)?.kind != crate::Kind::Video {
+                continue;
+            }
+            video = true;
+            let c = tl.tracks[t].clips.get(i).copied().ok_or(EditError::NoClip)?;
+            let k = crop(c.crop);
+            if k != c.crop {
+                tl = tl.set_crop(t, i, k)?;
+                changed = true;
+            }
+        }
+        if !video {
+            return Err(EditError::Kind);
+        }
+        if changed {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+    /// The face's crop words of [`EditorState::verb`] (bare `crop`, `crop-[ltrb][+-]`); `None` when `v` is none of them.
+    fn crop_face_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        if v == "crop" {
+            return Some(self.crop_set(|_| crate::Crop::NONE));
+        }
+        let (side, plus) = match v.strip_prefix("crop-")?.as_bytes() {
+            [s @ (b'l' | b't' | b'r' | b'b'), g @ (b'+' | b'-')] => (*s, *g == b'+'),
+            _ => return None,
+        };
+        Some(self.crop_set(|c| crop_step(c, side, plus)))
+    }
+}
+
+/// STRIACROPFACE: `c` with side `side` (`b'l'`, `b't'`, `b'r'`, `b'b'`) one [`CROP_STEP`] wider (`plus`) or narrower (stops
+/// at 0); a step keeping no picture is refused by `Timeline::set_crop`.
+fn crop_step(c: crate::Crop, side: u8, plus: bool) -> crate::Crop {
+    let f = |x: u16| if plus { x.saturating_add(CROP_STEP) } else { x.saturating_sub(CROP_STEP) };
+    let mut c = c;
+    match side {
+        b'l' => c.l = f(c.l),
+        b't' => c.t = f(c.t),
+        b'r' => c.r = f(c.r),
+        _ => c.b = f(c.b),
+    }
+    c
+}
+
+#[cfg(test)]
+mod striacropface_tests {
+    use super::*;
+    use crate::{Crop, Kind};
+
+    /// V1: A 0..10 at 0, B 0..10 at 10, C 0..10 at 20; A1: A 0..20 at 0. The set: V1's A (primary), V1's C and A1's clip.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 10, 20, 20)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 2).unwrap();
+        st.select_add(1, 0).unwrap();
+        st
+    }
+    fn crops(st: &EditorState) -> [Crop; 3] {
+        let c = |i: usize| st.timeline.tracks[0].clips[i].crop;
+        [c(0), c(1), c(2)]
+    }
+
+    #[test]
+    fn striacropface_steps_and_clear_over_the_set_one_commit() {
+        let mut st = state();
+        let l = Crop { l: CROP_STEP, t: 0, r: 0, b: 0 };
+        assert_eq!(st.verb("crop-l+"), Some(Ok(())));
+        assert_eq!(crops(&st), [l, Crop::NONE, l], "every selected video clip; the unselected B stays");
+        assert_eq!(st.timeline.tracks[1].clips[0].crop, Crop::NONE, "the audio clip skipped");
+        assert_eq!(st.undo_depth(), 1, "ONE commit for the whole set");
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 0)), alloc::vec![(0, 0), (0, 2), (1, 0)]));
+        assert_eq!(st.verb("crop-l-"), Some(Ok(())));
+        assert_eq!(st.verb("crop-l-"), Some(Ok(())));
+        assert_eq!((crops(&st)[0], st.undo_depth()), (Crop::NONE, 2), "a minus stops at 0 and commits nothing more");
+        assert_eq!(st.verb("crop-b+"), Some(Ok(())));
+        assert_eq!(crops(&st)[2], Crop { l: 0, t: 0, r: 0, b: CROP_STEP });
+        assert_eq!(st.verb("crop"), Some(Ok(())));
+        assert_eq!((crops(&st), st.undo_depth()), ([Crop::NONE; 3], 4));
+        assert_eq!(st.verb("crop"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 4, "already clear: no step");
+        assert!(st.undo());
+        assert_eq!(crops(&st)[0], Crop { l: 0, t: 0, r: 0, b: CROP_STEP });
+        assert_eq!(st.verb("crop-x+"), None);
+        assert_eq!(st.verb("crop-l"), None);
+        st.deselect();
+        assert_eq!(st.verb("crop"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("crop-t+"), Some(Err(EditError::NoClip)));
+    }
+
+    #[test]
+    fn striacropface_set_crop_refusals_refuse_the_whole_set() {
+        let mut st = state();
+        assert_eq!(st.verb("crop 250 0 250 0"), Some(Ok(())));
+        let c = Crop { l: 250, t: 0, r: 250, b: 0 };
+        assert_eq!((crops(&st), st.undo_depth()), ([c, Crop::NONE, c], 1), "`crop l t r b` over the set");
+        assert_eq!(st.verb("crop 600 0 400 0"), Some(Err(EditError::Crop)));
+        let before = st.timeline.clone();
+        st.timeline = st.timeline.set_crop(0, 2, Crop { l: 250, t: 0, r: 745, b: 0 }).unwrap();
+        let before2 = st.timeline.clone();
+        assert_eq!(st.verb("crop-r+"), Some(Err(EditError::Crop)), "C would keep no picture");
+        assert_eq!(st.timeline, before2, "refused whole: A did not step either");
+        st.timeline = before;
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("crop"), Some(Err(EditError::Kind)), "an audio-only set");
+        assert_eq!(st.undo_depth(), 1);
     }
 }

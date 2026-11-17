@@ -194,6 +194,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
+        [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -550,6 +551,7 @@ fn transport() -> TetraNode {
         button("recover", "Recover"), // STRIAAUTOSAVE (SR883): loads the document's newer autosave (`<stem>.autosave.edl`) as one undo step
         button("history", "History"), button("freeze", "Freeze"), // STRIAFREEZEFRAME (SR880): a 2 s hold of the playhead's frame (THE `freeze` verb)
         button("pan-", "Pan L"), button("pan", "Pan C"), button("pan+", "Pan R"), // STRIAPANFACE (SR897): step / centre the selected clip's pan
+        button("crop", "Uncrop"), // STRIACROPFACE (SR900): clears the selection's crop (THE `crop` word)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1806,5 +1808,31 @@ mod striapanface_tests {
         assert_eq!(lines, ["pan: R 13", "pan: R 25"]);
         assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 32);
         println!("striapanface witness: pan+ x2 -> {lines:?}");
+    }
+}
+
+// ---- STRIACROPFACE (LEDGER SR900): the witness's crop words and the Uncrop button (named tail block) ----
+#[cfg(test)]
+mod striacropface_tests {
+    use super::*;
+
+    /// STRIACROPFACE (SR900): `crop-l+` / `crop-r+` step the selected clip's crop (one undo step each); `crop` clears it (a
+    /// third); the transport's button before `?` is `Uncrop`, firing the `crop` word.
+    #[test]
+    fn striacropface_witness_crop_words() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,crop-l+,crop-r+");
+        assert!(errors.is_empty(), "{errors:?}");
+        let s = timeline_core::editor::CROP_STEP;
+        assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: s, t: 0, r: s, b: 0 }));
+        assert_eq!(face.state.undo_depth(), 2);
+        assert!(drive(&mut face, "crop").is_empty());
+        assert_eq!((face.state.selected().map(|c| c.crop), face.state.undo_depth()), (Some(timeline_core::Crop::NONE), 3));
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("crop", "Uncrop"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "crop"));
     }
 }
