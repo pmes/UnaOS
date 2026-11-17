@@ -1846,7 +1846,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 20] = [
+const EDIT_KEYS: [(u8, &str); 2021] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1869,6 +1869,7 @@ const EDIT_KEYS: [(u8, &str); 20] = [
     (b'(', "nudge-"), (b')', "nudge+"), // STRIANUDGENEXT (LEDGER SR986): `(` / `)` (Shift+9 / Shift+0) nudge the shown clip one frame (STRIANUDGE SR855's words, `EditorState::move_set`, one undo step); `<` / `>` are the host face's slide keys
     (b',', "slip-"), (b'.', "slip+"), // STRIAKSLIP (LEDGER SR9002): `,` / `.` slip the shown clip one frame back / on (timeline_core's step words, the host KEYS' bytes)
     (b'm', "mark"), (b'M', "unmark"), // STRIAKMARKERS (SR9001): a marker at / off the playhead (file tail)
+    (b'r', "roll-tool"), (b'(', "roll-"), (b')', "roll+"), // STRIAKROLL (LEDGER SR9003): r the roll tool on / off, ( / ) roll the shown clip's out cut one frame (the host KEYS words; file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1905,7 +1906,7 @@ fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
 /// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
 /// unchanged, or no EDL open at `path`.
 pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
-    let verb = edit_verb(b)?;
+    let verb = edit_verb(b)?; if verb == "roll-tool" { return edit_roll_tool(path); } // STRIAKROLL (LEDGER SR9003): the roll tool is face state, not an editor word (file tail)
     let (at, tl, clips, undo, back) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
@@ -1950,7 +1951,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2268,11 +2269,11 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
-    serial_println!("[nle] drag press {} at={} track={} clip={}", drag_word(d.kind), d.origin_tick, d.track, d.idx);
+    serial_println!("[nle] drag press {} at={} track={} clip={}", drag_name(&d), d.origin_tick, d.track, d.idx);
     true
 }
 
@@ -2291,7 +2292,7 @@ pub fn edit_drag_move(x: usize, y: usize) {
 pub fn edit_drag_end(path: &str) -> Option<u64> {
     use timeline_core::view::DragKind;
     let (_, d) = DRAG.lock().take()?; BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the guide and preview go (file tail)
-    let word = drag_word(d.kind);
+    let word = drag_name(&d); // STRIAKROLL (LEDGER SR9003): a rolled drag says roll (file tail)
     let (from, to) = (d.origin_tick, d.origin_tick + d.delta);
     let (tl, clips, undo, back, snapped) = {
         let mut g = EDIT.lock();
@@ -2738,3 +2739,42 @@ fn edl_grade(g: timeline_core::Grade, px: Px) -> Px {
 // paints every marker on the ruler, and the schedule never reads them. Wire: `[nle] edit mark|unmark at=<tick> clips=<n>
 // undo=<n> saved=<bytes>`, or `[nle] edit mark|unmark at=<tick> refused (one marker per tick (...))`. Host check:
 // timeline_core tests/edl.rs `striakmarkers_*`; the Player side is unexercised (owed NLE-MARKERS-KERNEL-WITNESS).
+
+// ---- STRIAKROLL (LEDGER SR9003): the Player's roll keys and roll tool (named tail block) ----
+// handlers.md §5 NLE5b's NLE-ROLL-KERNEL and NLE-ROLL-TOOL-KERNEL. [`EDIT_KEYS`] gains `(` / `)` (`roll-` / `roll+`, SR851's
+// editor words through `EditorState::roll_selected`: the cut at the shown clip's out edge, one undo step, the EDL saved)
+// and `r` (`roll-tool`, the host KEYS words). The roll tool is FACE state (the host's `Face.roll_tool`), so `r` never
+// reaches `EditorState::verb`: [`edit_roll_tool`] flips [`ROLL_TOOL`] (a live drag dropped uncommitted, as the host does;
+// no save, no undo step, no seek), and [`edit_press`] hands the begun drag to timeline_core's `Drag::rolled` (the ONE
+// roll-tool rule), whose `finish` / `shown` / snap already carry a roll. Closing the Player clears the tool.
+// Wire: `[nle] edit roll-tool on|off [dropped=<kind>]`, `[nle] drag press roll ...`, `[nle] drag roll from= to= ...`.
+// Owed: NLE-ROLL-KERNEL-WITNESS (player.rs `tests nle`), NLE-ROLL-STEP-KERNEL (the ten-frame chords), NLE-ROLL-TOOL-PAINT.
+
+/// The kernel face's roll tool: a trim-handle drag rolls its cut (`view::Drag::rolled`).
+static ROLL_TOOL: AtomicBool = AtomicBool::new(false);
+
+/// The `r` key on the Player's EDL at `path`: the roll tool on / off, a live drag dropped uncommitted (its capture ends
+/// at the release: [`edit_drag_move`] / [`edit_drag_end`] find no drag). Always `None`: nothing to save or seek.
+fn edit_roll_tool(path: &str) -> Option<u64> {
+    if !EDIT.lock().as_ref().is_some_and(|e| e.path == path) {
+        return None;
+    }
+    let on = !ROLL_TOOL.load(Ordering::Acquire);
+    ROLL_TOOL.store(on, Ordering::Release);
+    let dropped = DRAG.lock().take().map(|(_, d)| drag_name(&d));
+    BAND_DIRTY.store(true, Ordering::Release);
+    match dropped {
+        Some(k) => {
+            serial_println!("[nle] edit roll-tool {} dropped={}", if on { "on" } else { "off" }, k);
+        }
+        None => {
+            serial_println!("[nle] edit roll-tool {}", if on { "on" } else { "off" });
+        }
+    }
+    None
+}
+
+/// A drag's wire word: `roll` for a trim the roll tool turned into a roll, else its kind's ([`drag_word`]).
+fn drag_name(d: &timeline_core::view::Drag) -> &'static str {
+    if d.roll { "roll" } else { drag_word(d.kind) }
+}
