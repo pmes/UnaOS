@@ -1971,12 +1971,12 @@ pub const MARKER_W: i64 = 4;
 fn paint_markers(c: &mut Canvas, l: Layout, tl: &Timeline, labels: &mut Option<&mut dyn Text>) {
     let (ry, w) = (l.ruler_y as i64, l.w as i64);
     for m in &tl.markers {
-        let x = l.x_of(m.at);
+        let x = l.x_of(m.at); paint_marker_range(c, l, m, w); // STRIAMARKERJUMPKEYSNEXT (SR984): a range marker's bar, before the off-view skip (file tail)
         if x + MARKER_W < 0 || x - MARKER_W >= w {
             continue;
         }
         for k in 0..=MARKER_W {
-            c.rect(x - (MARKER_W - k), ry + k, x + (MARKER_W - k) + 1, ry + k + 1, MARKER);
+            c.rect(x - (MARKER_W - k), ry + k, x + (MARKER_W - k) + 1, ry + k + 1, marker_rgba(m.colour)); // STRIAMARKERJUMPKEYSNEXT (SR984): the marker's colour (file tail)
         }
         if let Some(text) = labels.as_mut() {
             text.text(c, &m.name, (x + MARKER_W + 2) as f32, ry as f32 + 9.0, ((x + MARKER_W + 1) as i32, w as i32));
@@ -4100,5 +4100,88 @@ impl Drag {
     fn finish_pan(&self, st: &mut EditorState) -> Result<(), EditError> {
         let (p0, _) = self.pan_origin(st).ok_or(EditError::NoClip)?;
         st.set_selected_pan((p0 + self.delta).clamp(-127, 127) as i8)
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): a marker's colour and range bar on the ruler (named tail block) ----
+// [`paint_markers`] paints each triangle in [`marker_rgba`] of the marker's colour (index 0 is SR835's [`MARKER`], so a
+// default marker paints byte-identical) and, for a range marker (`len > 0`), a [`MARKER_BAR_H`]-row bar along the ruler's
+// top from the marker's tick to its end, in the same colour, under the triangle; a point marker paints no bar. Both faces
+// paint it through [`paint_in`].
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): the marker colours' pixels, in `crate::MARKER_COLOURS` order ([0] == [`MARKER`]).
+pub const MARKER_RGBA: [[u8; 4]; 8] = [
+    MARKER,
+    [0xe8, 0x3a, 0x3a, 255],
+    [0xf2, 0xd4, 0x2c, 255],
+    [0x4c, 0xc2, 0x5a, 255],
+    [0x3c, 0xc8, 0xd8, 255],
+    [0x46, 0x7c, 0xf0, 255],
+    [0xa0, 0x5c, 0xe0, 255],
+    [0xf0, 0x6c, 0xb8, 255],
+];
+/// STRIAMARKERJUMPKEYSNEXT (SR984): a range marker's bar height (px), from the ruler's top.
+pub const MARKER_BAR_H: i64 = 2;
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): the pixel of marker colour `c` (an index past the table paints [`MARKER`]).
+pub fn marker_rgba(c: u8) -> [u8; 4] {
+    MARKER_RGBA.get(usize::from(c)).copied().unwrap_or(MARKER)
+}
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): the bar of a range marker `m` over the ruler of `l` (canvas width `w`), clipped to
+/// `0..w`; nothing for a point marker or a range narrower than a pixel.
+fn paint_marker_range(c: &mut Canvas, l: Layout, m: &crate::Marker, w: i64) {
+    if m.len <= 0 {
+        return;
+    }
+    let (x0, x1) = (l.x_of(m.at).max(0), l.x_of(m.at + m.len).min(w));
+    if x1 > x0 {
+        let ry = l.ruler_y as i64;
+        c.rect(x0, ry, x1, ry + MARKER_BAR_H, marker_rgba(m.colour));
+    }
+}
+
+#[cfg(test)]
+mod striamarkerjumpkeysnext_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 30, 0)];
+        tl.mark(5, "M1").unwrap()
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: an orange point marker paints exactly as before (its colour is index 0); a red one
+    /// paints its apex red; a range marker adds a bar only inside the ruler band, ending at the range's end.
+    #[test]
+    fn striamarkerjumpkeysnext_colour_and_range_paint() {
+        assert_eq!((MARKER_RGBA[0], MARKER_RGBA.len()), (MARKER, crate::MARKER_COLOURS.len()));
+        let (w, h) = (320u32, 160u32);
+        let point = EditorState::new(tl());
+        let l = Layout::of(w, h, &point);
+        let px = |st: &EditorState| paint(st, w, h, Order::Rgba, None, None);
+        let at = |x: i64, y: i64| ((y as usize) * w as usize + x as usize) * 4;
+        let base = px(&point);
+        let red = px(&EditorState::new(tl().colour_marker(5, 1).unwrap()));
+        let (x, ry) = (l.x_of(5), l.ruler_y as i64);
+        assert_eq!(red[at(x, ry)..at(x, ry) + 4], MARKER_RGBA[1]);
+        let ranged = px(&EditorState::new(tl().range_marker(5, 15).unwrap()));
+        let (mut inside, mut outside) = (0usize, 0usize);
+        for y in 0..h as usize {
+            for xx in 0..w as usize {
+                let i = (y * w as usize + xx) * 4;
+                if base[i..i + 4] != ranged[i..i + 4] {
+                    if (l.ruler_y as usize..l.tracks_y as usize).contains(&y) { inside += 1 } else { outside += 1 }
+                }
+            }
+        }
+        assert_eq!(outside, 0, "a range paints nothing outside the ruler");
+        assert!(inside > 0, "the bar shows");
+        let x1 = l.x_of(20);
+        assert_eq!(ranged[at(x1 - 1, ry)..at(x1 - 1, ry) + 4], MARKER, "the bar reaches the range's end");
+        assert_eq!(ranged[at(x1, ry)..at(x1, ry) + 4], base[at(x1, ry)..at(x1, ry) + 4], "and stops there");
     }
 }

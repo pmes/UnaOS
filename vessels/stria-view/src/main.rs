@@ -575,6 +575,7 @@ fn transport() -> TetraNode {
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
+        button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), // STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -1032,7 +1033,7 @@ fn markers_json(face: &Face) -> String {
     if m.is_empty() {
         return String::new();
     }
-    let items: Vec<String> = m.iter().map(|k| format!("{{\"t\":{},\"name\":\"{}\"}}", k.at, k.name.replace('"', "'"))).collect();
+    let items: Vec<String> = m.iter().map(|k| format!("{{\"t\":{},\"name\":\"{}\"{}}}", k.at, k.name.replace('"', "'"), marker_style_json(k))).collect(); // STRIAMARKERJUMPKEYSNEXT (SR984): `"colour"` / `"len"` when not the default (file tail)
     format!(",\"markers\":[{}]", items.join(","))
 }
 
@@ -3085,5 +3086,45 @@ mod striapannext_tests {
         face.on(&SMessage::BrowserKey("Home".into()));
         assert_eq!(note_json(&face), "");
         println!("striapannext witness: pan+ -> note pan: R 13");
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): the Marker Colour / Marker Range buttons, the markers' style keys (named tail block) ----
+/// A marker's style keys inside its `"markers"` item: `,"colour":"<name>"` when not orange, `,"len":<ticks>` when a range;
+/// empty for a default marker (so the pinned witness lines are unchanged).
+fn marker_style_json(m: &timeline_core::Marker) -> String {
+    let mut s = String::new();
+    if m.colour != 0 {
+        s += &format!(",\"colour\":\"{}\"", timeline_core::MARKER_COLOURS.get(usize::from(m.colour)).copied().unwrap_or("?"));
+    }
+    if m.len != 0 {
+        s += &format!(",\"len\":{}", m.len);
+    }
+    s
+}
+
+#[cfg(test)]
+mod striamarkerjumpkeysnext_tests {
+    use super::*;
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: the two buttons sit right before `?`; a marker coloured and ranged through the face shows
+    /// `"colour"` and `"len"` in the witness, a default one neither.
+    #[test]
+    fn striamarkerjumpkeysnext_buttons_and_marker_style_json() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let n = row.len();
+        assert!(matches!(&row[n - 3], TetraNode::Button { id, .. } if id == "marker colour"));
+        assert!(matches!(&row[n - 2], TetraNode::Button { id, .. } if id == "marker range"));
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.state.seek(12);
+        assert!(face.verb("mark"));
+        assert_eq!(markers_json(&face), r#","markers":[{"t":12,"name":"M1"}]"#);
+        assert!(face.verb("marker colour"));
+        face.state.seek(20);
+        assert!(face.verb("marker range"));
+        assert_eq!(markers_json(&face), r#","markers":[{"t":12,"name":"M1","colour":"red","len":8}]"#);
+        println!("striamarkerjumpkeysnext witness: {}", markers_json(&face));
     }
 }

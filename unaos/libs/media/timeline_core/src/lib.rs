@@ -1860,6 +1860,8 @@ mod striaclipspeed_tests {
 pub struct Marker {
     pub at: i64,
     pub name: String,
+    pub colour: u8, // STRIAMARKERJUMPKEYSNEXT (SR984): an index into `MARKER_COLOURS` (0 = SR835's orange) (file tail)
+    pub len: i64, // STRIAMARKERJUMPKEYSNEXT (SR984): a range marker's length in ticks (0 = a point marker) (file tail)
 }
 
 impl Timeline {
@@ -1874,7 +1876,7 @@ impl Timeline {
             Err(i) => i,
         };
         let mut tl = self.clone();
-        tl.markers.insert(i, Marker { at, name: String::from(name) });
+        tl.markers.insert(i, Marker { at, name: String::from(name), colour: 0, len: 0 });
         Ok(tl)
     }
     /// The timeline without the marker at tick `at`; `None` when no marker stands there.
@@ -1894,10 +1896,10 @@ impl Timeline {
     }
     /// Every marker at a tick `>= 0` and the ticks strictly ascending.
     fn validate_markers(&self) -> Result<(), EditError> {
-        if self.markers.iter().any(|m| m.at < 0) {
+        if self.markers.iter().any(|m| m.at < 0 || m.len < 0) { // STRIAMARKERJUMPKEYSNEXT (SR984): a negative length
             return Err(EditError::Negative);
         }
-        if self.markers.windows(2).any(|w| w[0].at >= w[1].at) {
+        if self.markers.windows(2).any(|w| w[0].at >= w[1].at) || self.markers.iter().any(|m| usize::from(m.colour) >= MARKER_COLOURS.len()) { // STRIAMARKERJUMPKEYSNEXT (SR984): a colour outside the table
             return Err(EditError::Marker);
         }
         Ok(())
@@ -1920,7 +1922,7 @@ mod striamarkers_tests {
     #[test]
     fn striamarkers_mark_sorted_insert_and_refusals() {
         let t = tl().mark(5, "B").unwrap().mark(2, "A").unwrap();
-        assert_eq!(t.markers, alloc::vec![Marker { at: 2, name: "A".into() }, Marker { at: 5, name: "B".into() }]);
+        assert_eq!(t.markers, alloc::vec![Marker { at: 2, name: "A".into(), colour: 0, len: 0 }, Marker { at: 5, name: "B".into(), colour: 0, len: 0 }]);
         assert_eq!(t.validate(), Ok(()));
         assert_eq!(t.mark(5, "C"), Err(EditError::Marker));
         assert_eq!(t.mark(-1, "C"), Err(EditError::Negative));
@@ -1947,11 +1949,11 @@ mod striamarkers_tests {
     #[test]
     fn striamarkers_validate_refuses_disorder() {
         let mut t = tl();
-        t.markers = alloc::vec![Marker { at: 5, name: "a".into() }, Marker { at: 2, name: "b".into() }];
+        t.markers = alloc::vec![Marker { at: 5, name: "a".into(), colour: 0, len: 0 }, Marker { at: 2, name: "b".into(), colour: 0, len: 0 }];
         assert_eq!(t.validate(), Err(EditError::Marker));
-        t.markers = alloc::vec![Marker { at: 2, name: "a".into() }, Marker { at: 2, name: "b".into() }];
+        t.markers = alloc::vec![Marker { at: 2, name: "a".into(), colour: 0, len: 0 }, Marker { at: 2, name: "b".into(), colour: 0, len: 0 }];
         assert_eq!(t.validate(), Err(EditError::Marker));
-        t.markers = alloc::vec![Marker { at: -2, name: "a".into() }];
+        t.markers = alloc::vec![Marker { at: -2, name: "a".into(), colour: 0, len: 0 }];
         assert_eq!(t.validate(), Err(EditError::Negative));
     }
 }
@@ -3686,5 +3688,98 @@ impl Timeline {
         }
         pre.audio_xfades.sort_by_key(|x| (x.track, x.at));
         pre
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): a marker's colour and range length (named tail block) ----
+// SR835's `Marker` carries a colour (`colour`, an index into [`MARKER_COLOURS`], 0 = the orange every marker had) and a
+// range length (`len` ticks from `at`, 0 = a point marker). Both are set only through the pure ops below and the editor's
+// ONE commit; the defaults paint (view.rs) and write (edl.rs) byte-identical to a marker without them. `validate` refuses a
+// negative length (`Negative`) and a colour outside the table (`Marker`).
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): the marker colours by name; a marker's `colour` indexes this table (view.rs
+/// `MARKER_RGBA` holds the pixels, same order).
+pub const MARKER_COLOURS: [&str; 8] = ["orange", "red", "yellow", "green", "cyan", "blue", "purple", "pink"];
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): the index of the colour named `name` (trimmed, ASCII case ignored).
+pub fn marker_colour(name: &str) -> Option<u8> {
+    let name = name.trim();
+    MARKER_COLOURS.iter().position(|c| c.eq_ignore_ascii_case(name)).map(|i| i as u8)
+}
+
+impl Timeline {
+    /// The last marker at or before tick `t`.
+    pub fn marker_before(&self, t: i64) -> Option<&Marker> {
+        self.markers.iter().rev().find(|m| m.at <= t)
+    }
+    /// The timeline with the marker at tick `at` coloured `colour`; `None` when no marker stands there, the colour is
+    /// outside [`MARKER_COLOURS`], or the marker already has it.
+    pub fn colour_marker(&self, at: i64, colour: u8) -> Option<Timeline> {
+        let i = self.markers.binary_search_by_key(&at, |m| m.at).ok()?;
+        if usize::from(colour) >= MARKER_COLOURS.len() || self.markers[i].colour == colour {
+            return None;
+        }
+        let mut tl = self.clone();
+        tl.markers[i].colour = colour;
+        Some(tl)
+    }
+    /// The timeline with the marker at tick `at` spanning `len` ticks (0: a point marker again); `None` when no marker
+    /// stands there, `len < 0`, or the marker already spans `len`.
+    pub fn range_marker(&self, at: i64, len: i64) -> Option<Timeline> {
+        let i = self.markers.binary_search_by_key(&at, |m| m.at).ok()?;
+        if len < 0 || self.markers[i].len == len {
+            return None;
+        }
+        let mut tl = self.clone();
+        tl.markers[i].len = len;
+        Some(tl)
+    }
+}
+
+#[cfg(test)]
+mod striamarkerjumpkeysnext_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.mark(5, "A").unwrap().mark(12, "B").unwrap()
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: colour names resolve in table order; `colour_marker` sets only the marker at the tick
+    /// and refuses no marker, a colour off the table and the same colour.
+    #[test]
+    fn striamarkerjumpkeysnext_colour_marker() {
+        assert_eq!((marker_colour("orange"), marker_colour(" Red "), marker_colour("pink"), marker_colour("mauve")), (Some(0), Some(1), Some(7), None));
+        let t = tl().colour_marker(12, 1).expect("B turns red");
+        assert_eq!((t.markers[0].colour, t.markers[1].colour), (0, 1));
+        assert_eq!(t.validate(), Ok(()));
+        assert!(t.colour_marker(12, 1).is_none(), "already red");
+        assert!(tl().colour_marker(6, 1).is_none(), "no marker at 6");
+        assert!(tl().colour_marker(5, 8).is_none(), "off the table");
+        let mut bad = tl();
+        bad.markers[0].colour = 8;
+        assert_eq!(bad.validate(), Err(EditError::Marker));
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: `range_marker` sets the length, 0 clears it; no marker, a negative length and the same
+    /// length are refused; `marker_before` is the last marker at or before a tick.
+    #[test]
+    fn striamarkerjumpkeysnext_range_marker() {
+        let t = tl().range_marker(5, 4).expect("A spans 4");
+        assert_eq!((t.markers[0].len, t.markers[1].len), (4, 0));
+        assert_eq!(t.validate(), Ok(()));
+        assert!(t.range_marker(5, 4).is_none(), "unchanged");
+        assert_eq!(t.range_marker(5, 0).expect("cleared"), tl());
+        assert!(tl().range_marker(6, 3).is_none(), "no marker at 6");
+        assert!(tl().range_marker(5, -1).is_none(), "negative");
+        assert_eq!(tl().marker_before(11).map(|m| m.at), Some(5));
+        assert_eq!(tl().marker_before(12).map(|m| m.at), Some(12));
+        assert!(tl().marker_before(4).is_none());
+        let mut bad = tl();
+        bad.markers[1].len = -1;
+        assert_eq!(bad.validate(), Err(EditError::Negative));
     }
 }

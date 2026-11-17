@@ -309,7 +309,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail)
+        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -4001,5 +4001,133 @@ mod striamultiselectnext_tests {
         assert_eq!(xs, alloc::vec![(2, 13, 4)]);
         assert!(moved.tracks[0].clips.is_empty());
         assert_eq!(tl.move_many_track(&[(0, 1)], 2, 3), Err(EditError::Transition), "half picked: refused");
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): `marker colour` / `marker range` through the one commit (named tail block) ----
+// `marker colour` cycles the colour of the marker AT the playhead to the next of `MARKER_COLOURS`, `marker colour <name>`
+// sets it (an unknown name is not a word); `marker range` gives the last marker at or before the playhead the length
+// playhead - at (on the marker's own tick: 0, a point marker again). Each is ONE commit (undo step, dirty); nothing to
+// change (no marker, the same colour / length) is `EditError::Marker` with no commit. Neither word starts `mark `, so
+// SR835's `marker_word` never takes it as a marker name, and neither is SR894's jump word.
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): a marker style word of [`EditorState::verb`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerStyle {
+    /// `marker colour` (`None`: the next colour) or `marker colour <name>`.
+    Colour(Option<u8>),
+    /// `marker range`.
+    Range,
+}
+
+/// STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour`, `marker colour <name>`, `marker range` (trimmed); `None` for any
+/// other word, an unknown colour name included.
+pub fn marker_style_word(v: &str) -> Option<MarkerStyle> {
+    let mut w = v.split_ascii_whitespace();
+    if w.next() != Some("marker") {
+        return None;
+    }
+    let s = match (w.next()?, w.next()) {
+        ("range", None) => MarkerStyle::Range,
+        ("colour", None) => MarkerStyle::Colour(None),
+        ("colour", Some(name)) => MarkerStyle::Colour(Some(crate::marker_colour(name)?)),
+        _ => return None,
+    };
+    if w.next().is_some() {
+        return None;
+    }
+    Some(s)
+}
+
+impl EditorState {
+    /// The marker at the playhead coloured `colour` (`None`: the next colour of the table, wrapping): ONE commit.
+    /// Refused: no marker there, or it already has the colour (`EditError::Marker`).
+    pub fn colour_marker(&mut self, colour: Option<u8>) -> Result<(), EditError> {
+        let m = self.timeline.marker_at(self.playhead).ok_or(EditError::Marker)?;
+        let c = colour.unwrap_or(((usize::from(m.colour) + 1) % crate::MARKER_COLOURS.len()) as u8);
+        let tl = self.timeline.colour_marker(self.playhead, c).ok_or(EditError::Marker)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The last marker at or before the playhead spanning to the playhead: ONE commit. Refused: no such marker, or it
+    /// already ends there (`EditError::Marker`).
+    pub fn range_marker(&mut self) -> Result<(), EditError> {
+        let at = self.timeline.marker_before(self.playhead).ok_or(EditError::Marker)?.at;
+        let tl = self.timeline.range_marker(at, self.playhead - at).ok_or(EditError::Marker)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The marker style words of [`EditorState::verb`]; `None` for any other word.
+    fn marker_style_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match marker_style_word(v)? {
+            MarkerStyle::Colour(c) => self.colour_marker(c),
+            MarkerStyle::Range => self.range_marker(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod striamarkerjumpkeysnext_tests {
+    use super::*;
+    use crate::Kind;
+
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 35, 0)];
+        EditorState::new(tl.mark(12, "M1").unwrap())
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: the words parse; no other word (a marker name, a jump word) is taken.
+    #[test]
+    fn striamarkerjumpkeysnext_words() {
+        assert_eq!(marker_style_word(" marker colour "), Some(MarkerStyle::Colour(None)));
+        assert_eq!(marker_style_word("marker colour green"), Some(MarkerStyle::Colour(Some(3))));
+        assert_eq!(marker_style_word("marker range"), Some(MarkerStyle::Range));
+        for v in ["marker colour mauve", "marker range 3", "marker", "marker+", "mark colour", "marker colour red x"] {
+            assert_eq!(marker_style_word(v), None, "{v}");
+        }
+        assert_eq!(marker_word("marker colour"), None, "SR835's mark road never takes a style word");
+        assert_eq!(jump_word("marker range"), None);
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: `marker colour` cycles and `marker colour <name>` sets the playhead's marker, one undo
+    /// step each; with no marker there, or the same colour, nothing is committed.
+    #[test]
+    fn striamarkerjumpkeysnext_colour_is_one_commit() {
+        let mut st = state();
+        assert_eq!(st.verb("marker colour"), Some(Err(EditError::Marker)), "no marker at 0");
+        assert_eq!(st.undo_depth(), 0);
+        st.seek(12);
+        assert_eq!(st.verb("marker colour"), Some(Ok(())));
+        assert_eq!((st.timeline.markers[0].colour, st.undo_depth()), (1, 1));
+        assert_eq!(st.verb("marker colour green"), Some(Ok(())));
+        assert_eq!((st.timeline.markers[0].colour, st.undo_depth()), (3, 2));
+        assert_eq!(st.verb("marker colour green"), Some(Err(EditError::Marker)), "already green");
+        assert_eq!(st.undo_depth(), 2);
+        assert_eq!(st.verb("marker colour pink"), Some(Ok(())));
+        assert_eq!(st.verb("marker colour"), Some(Ok(())));
+        assert_eq!(st.timeline.markers[0].colour, 0, "the cycle wraps to orange");
+        assert!(st.undo());
+        assert_eq!(st.timeline.markers[0].colour, 7);
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: `marker range` spans the last marker at or before the playhead to the playhead; on
+    /// its own tick it clears; before every marker, or unchanged, nothing is committed.
+    #[test]
+    fn striamarkerjumpkeysnext_range_is_one_commit() {
+        let mut st = state();
+        st.seek(5);
+        assert_eq!(st.verb("marker range"), Some(Err(EditError::Marker)), "no marker at or before 5");
+        st.seek(20);
+        assert_eq!(st.verb("marker range"), Some(Ok(())));
+        assert_eq!((st.timeline.markers[0].len, st.undo_depth()), (8, 1));
+        assert_eq!(st.verb("marker range"), Some(Err(EditError::Marker)), "already ends at 20");
+        assert_eq!(st.undo_depth(), 1);
+        st.seek(12);
+        assert_eq!(st.verb("marker range"), Some(Ok(())));
+        assert_eq!((st.timeline.markers[0].len, st.undo_depth()), (0, 2));
+        assert_eq!(st.timeline.validate(), Ok(()));
     }
 }
