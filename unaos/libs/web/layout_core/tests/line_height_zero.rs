@@ -100,10 +100,10 @@ fn percent_under_zero_font_size_is_the_zero_marker() {
 }
 
 /// AETHERLINEHEIGHTNEGATIVEREFUSED (SR1017): a negative calc() is not refused (css-values-4 §10.12 clamps it);
-/// pinned as today's clamp to 0.0 (AETHER-LINE-HEIGHT-CALC-NEGATIVE-CLAMP owed: the zero marker).
+/// AETHER-LINE-HEIGHT-CALC-NEGATIVE-CLAMP BUILT by SR1054: it clamps to the zero marker (it read 0.0, `normal`).
 #[test]
-fn negative_calc_keeps_todays_clamp() {
-    assert_eq!(lh(&[("line-height", "calc(10px - 20px)")]), Some(0.0));
+fn negative_calc_is_the_zero_marker() {
+    assert_eq!(lh(&[("line-height", "calc(10px - 20px)")]), Some(LINE_HEIGHT_ZERO) /* SR1054 */);
 }
 
 /// AETHERLINEHEIGHTNEGATIVEREFUSED (SR1017): through `layout`, `font-size: 0; line-height: 50%` is the zero marker after
@@ -118,4 +118,31 @@ fn layout_percent_under_zero_font_size() {
     let at = |id: &str| tree.paint_map.get(&id_of(&tree, &doc.by_id(id))).and_then(|p| p.line_height);
     assert_eq!(at("f0"), Some(LINE_HEIGHT_ZERO), "50% of 0px");
     assert_eq!(at("f20"), Some(-10.0), "50% of 20px");
+}
+
+// ---- AETHERLINEHEIGHTCALCNEGATIVECLAMP (LEDGER SR1054): a negative calc() line-height clamps to the zero marker (named tail block) ----
+
+/// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): css-values-4 §10.9: an out-of-range calc() is clamped, not refused, so a
+/// negative calc() length is a zero line box (Chromium reads `0px`); it read -0.0, which the encoding takes as `normal`.
+/// A unitless calc() term rides the px road (AETHER-LINE-HEIGHT-CALC-NUMBER owed), so `calc(-1)` lands on the marker too.
+#[test]
+fn negative_calc_clamps_to_the_zero_marker() {
+    for v in ["calc(-10px)", "calc(0px - 5px)", "calc(-1)", "calc(5px - 5px)"] {
+        assert_eq!(lh(&[("line-height", v)]), Some(LINE_HEIGHT_ZERO), "line-height: {v}");
+    }
+}
+
+/// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): a positive calc() is its length (armed), and a bare negative is still
+/// refused (SR1017): the earlier declaration stands.
+#[test]
+fn positive_calc_and_bare_negative_unchanged() {
+    assert_eq!(lh(&[("line-height", "calc(10px)")]), Some(-10.0));
+    assert_eq!(lh(&[("line-height", "2"), ("line-height", "-10px")]), Some(2.0), "bare -10px refused");
+}
+
+/// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): a calc() with a % term has no basis on the px road (`eval_length` with no
+/// reference), so it is dropped and the earlier declaration stands: pinned as today (AETHER-LINE-HEIGHT-CALC-NUMBER owed).
+#[test]
+fn percent_calc_dropped_pinned_as_today() {
+    assert_eq!(lh(&[("line-height", "2"), ("line-height", "calc(-50%)")]), Some(2.0));
 }
