@@ -171,6 +171,12 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "stria-view (`remember_recent` through quartzite `chrome_rows::stored_str` / `store_str`, at a window's open; the witness's `recent` token)",
         doc: "The last five EDL documents a Stria window opened, newest first, one absolute path per line, a repeat moved to the front (STRIARECENTFILES, SR884).",
     },
+    // ── stria — the editor (STRIAKEYMAPSTORE, SR917) ──
+    Key {
+        ns: "stria", key: "keys", kind: Kind::Str { max_len: 2048, printable: false }, default: Default::Consumer("empty: the built-in KEYS table"),
+        writers: OP, reader: "stria-view (`window_keys` through quartzite `chrome_rows::stored_str`, at a window's open; `--keys` wins; the witness never reads it), handed to `nle_face::Face::with_keys`",
+        doc: "The editor's key overlay over its built-in table: `<key> <action>` entries split on a newline or `;` (`Space` names the space bar, an action is a VERBS word or a KEYS action, `none` unbinds); a refused map (an unknown action, a key named twice, no key showing the help) keeps the built-in table and says why on the message row (STRIAKEYMAPSTORE, SR917).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
     //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──
