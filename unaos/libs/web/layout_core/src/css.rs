@@ -3143,7 +3143,7 @@ fn apply_display<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
 /// 3 double); the 3D styles paint solid in their colour.
-fn border_style_code(v: &str) -> Option<u8> {
+pub fn border_style_code(v: &str) -> Option<u8> {
     match v.trim() {
         "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
         "dashed" => Some(1),
@@ -3606,7 +3606,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" => "auto", // SR1014 fold: the branch's table row; SR1045 the offset's
+        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" if value.eq_ignore_ascii_case("initial") => "auto", // SR1116: unset reaches css_wide (inherited); SR1014 fold: the branch's table row; SR1045 the offset's
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -4326,9 +4326,10 @@ pub fn underline_position_code(v: &str) -> Option<u8> {
 }
 
 /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-offset` value (css-text-decor-4 §2.6) in the
-/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial` / `unset`, which SR832's table rewrites to it)
+/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial`, which SR832's table rewrites to it)
 /// is `Some(None)`; a length, negative allowed, is `Some(Some(px))` through [`parse_px`] (em at the parse context's
-/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number, `inherit` or anything else None.
+/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number or anything else None. SR1116: `inherit` /
+/// `unset` / `revert` never reach here: [`css_wide`] takes them through `INHERIT_UNDERLINE_OFFSET` (the `unset` literal stays, unreachable).
 fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
@@ -4819,6 +4820,17 @@ fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
     }
 }
 
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): the text-decoration-style and text-underline-position codes back to their keywords (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`deco_style_code`] (0 solid 1 double 2 dotted 3 dashed 4 wavy).
+pub fn text_decoration_style_word(code: u8) -> &'static str {
+    ["solid", "double", "dotted", "dashed", "wavy"].get(code as usize).copied().unwrap_or("solid")
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the inverse of [`underline_position_code`] (0 auto 1 from-font 2 under).
+pub fn underline_position_word(code: u8) -> &'static str {
+    ["auto", "from-font", "under"].get(code as usize).copied().unwrap_or("auto")
+}
 
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
@@ -5183,4 +5195,17 @@ pub fn alignment_valid(prop: &str, value: &str) -> bool {
 /// a declared colour's alpha through [`color_alpha`] (`transparent` 0), None when opaque or currentcolor (SR1126's shape).
 fn deco_alpha_of<H: Host>(c: Option<Option<(u8, u8, u8)>>, v: &str) -> Option<f32> {
     c.flatten().and(Some(color_alpha::<H>(v)).filter(|a| *a < 1.0))
+}
+
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): the border-style paint code back to its keyword (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the inverse of [`border_style_code`] — 1 dashed, 2 dotted, 3 double,
+/// every other code `solid` (the render's `style_on` default; groove / ridge / inset / outset collapse to 0 and read solid).
+pub fn border_style_word(code: u8) -> &'static str {
+    match code {
+        1 => "dashed",
+        2 => "dotted",
+        3 => "double",
+        _ => "solid",
+    }
 }

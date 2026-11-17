@@ -1280,11 +1280,14 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 34; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 45; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
     "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
     "margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width", // SR1096
+    "border-right-style", "border-bottom-style", "border-left-style", // SR1103
+    "border-top-color", "border-right-color", "border-bottom-color", // SR1104
+    "text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color", // SR1108
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1307,14 +1310,14 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         text_align: u8,
         underline: bool,
         nowrap: bool, white_space: u8, list_style: u8, rtl: bool,
-        hidden: bool,
+        hidden: bool, ul_pos: u8, caret: Option<(u8, u8, u8, u8)>, ul_offset: Option<f32>,
     }
     fn num(v: f32) -> String {
         let a = (v as f64).abs(); let d = if a > 0.0 && a.is_finite() { (5 - a.log10().floor() as i32).clamp(0, 15) } else { 0 }; let k = 10f64.powi(d); let r = (v as f64 * k).round() / k; // SR1023: 6 significant digits (Blink's CSS number serialization)
         if r == r.trunc() { format!("{}", r as i64) } else { format!("{r}") }
     }
     let px = |v: f32| format!("{}px", num(v));
-    let rgb = |c: (u8, u8, u8)| format!("rgb({}, {}, {})", c.0, c.1, c.2);
+    let rgb = |c: (u8, u8, u8)| rgba(c, 1.0); // AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): every report colour through ONE alpha-aware serializer
     let lp = |v: LengthPercentage| {
         use taffy::style::ExpandedLengthPercentage as E;
         match v.expand() {
@@ -1346,7 +1349,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), color_alpha: 1.0, font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false, ul_pos: 0, caret: None, ul_offset: None,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1383,7 +1386,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); me.color_alpha = crate::render::color_alpha_of(&paint, tag, parent.color_alpha);
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); me.color_alpha = crate::render::color_alpha_of(&paint, tag, parent.color_alpha); if let Some(p) = paint.underline_position { me.ul_pos = p; } if let Some(c) = paint.caret_color { me.caret = c; } if let Some(o) = paint.underline_offset { me.ul_offset = o; } // SR1108: deco_ink's ul_pos and caret_inherit, verbatim
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1411,7 +1414,8 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 _ => "row",
             };
             let side = |i: usize| paint.border.map(|b| layout_core::paint::border_ink(b, paint.currentcolor, me.color)).and_then(|b| b[i]);
-            let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
+            let sstyle = |i: usize| { let w = paint.border_width.and_then(|w| w[i]).or(side(i).map(|s| s.0)).unwrap_or(0.0); (if side(i).is_some() && w > 0.0 { layout_core::css::border_style_word(paint.border_style.map_or(0, |s| s[i])) } else { "none" }).to_string() }; // AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the four border-style columns, the render's paint rule
+            let scolor = |i: usize| { let c = side(i).map(|s| s.1).unwrap_or(me.color); css_core::color::Rgba { r: c.0 as f64, g: c.1 as f64, b: c.2 as f64, a: (if side(i).is_some() { layout_core::css::border_side_alpha_ink(&paint, i, me.color_alpha) } else { me.color_alpha }) as f64 }.serialize() }; // AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): the four border-color columns, one rule (an unpainted side reads the element's color; SR1134's per-side alpha kept by the fold compose)
             // AETHERCSSOMBOXSIDECOLUMNS (SR1096): the box-side columns, one expression per property for all four sides (i: top, right, bottom, left).
             let mside = |i: usize| st.as_ref().map(|s| lpa_s(rect_side(&s.margin, i))).unwrap_or_else(|| px(0.0));
             let pside = |i: usize| st.as_ref().map(|s| lp(rect_side(&s.padding, i))).unwrap_or_else(|| px(0.0));
@@ -1436,8 +1440,8 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 if me.hidden { "hidden" } else { "visible" }.to_string(),
                 list_style_word(me.list_style).to_string(),
                 bside(0),
-                if side(0).is_some() && bw_top > 0.0 { "solid" } else { "none" }.to_string(),
-                { let c = side(3).map(|s| s.1).unwrap_or(me.color); css_core::color::Rgba { r: c.0 as f64, g: c.1 as f64, b: c.2 as f64, a: (if side(3).is_some() { layout_core::css::border_side_alpha_ink(&paint, 3, me.color_alpha) } else { me.color_alpha }) as f64 }.serialize() },
+                sstyle(0),
+                scolor(3),
                 pside(0),
                 mside(0),
                 flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(), unicode_bidi_word(crate::render::unicode_bidi_of(tag, &paint, &any.node_at(id))).to_string(),
@@ -1445,6 +1449,10 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 white_space_longhands(me.white_space).1.to_string(),
                 rgb(paint.decoration_color.flatten().unwrap_or(me.color)),
                 mside(1), mside(2), mside(3), pside(1), pside(2), pside(3), bside(1), bside(2), bside(3), // SR1096
+                sstyle(1), sstyle(2), sstyle(3), // SR1103
+                scolor(0), scolor(1), scolor(2), // SR1104
+                layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
+                me.ul_offset.map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), me.caret.map_or_else(|| rgb(me.color), |c| rgba((c.0, c.1, c.2), c.3 as f32 / 255.0)), // SR1108
             ];
             out.insert(id, values);
             inh.insert(id, me);
@@ -1971,4 +1979,13 @@ pub(crate) fn line_height_used_px(paint: &crate::layout::PaintStyle, mult: f32, 
 /// [`computed_report`] reads margin / padding for every side through one expression.
 fn rect_side<T: Copy>(r: &taffy::geometry::Rect<T>, i: usize) -> T {
     [r.top, r.right, r.bottom, r.left][i]
+}
+
+// ---- AETHERCSSOMBORDERSIDEALPHAREAD (LEDGER SR1115): the report's colour columns serialize alpha (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): [`computed_report`]'s ONE colour serializer: `c` at alpha `a` through
+/// css_core's [`css_core::color::Rgba::serialize`] (the tree's one: `rgb(r, g, b)` at a >= 1, else `rgba(r, g, b, a)` with
+/// a through 8 bits as the shortest round-tripping decimal), so a half-alpha border side reads `rgba(255, 0, 0, 0.5)`.
+fn rgba(c: (u8, u8, u8), a: f32) -> String {
+    css_core::color::Rgba { r: c.0 as f64, g: c.1 as f64, b: c.2 as f64, a: a as f64 }.serialize()
 }
