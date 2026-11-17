@@ -1842,7 +1842,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 20] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1861,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'm', "mark"), (b'M', "unmark"), // STRIAKMARKERS (SR9001): a marker at / off the playhead (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -2665,3 +2666,12 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
     }
     Some((dw, dh))
 }
+
+// ---- STRIAKMARKERS (LEDGER SR9001): the Player's marker keys (named tail block) ----
+// `m` / `M` in [`EDIT_KEYS`] name timeline_core's marker words `mark` / `unmark` (`EditorState::verb` -> `marker_verb`, the
+// ONE dispatch the host face calls; the host's KEYS binds `m` to the same word and leaves `M` unbound). [`edit_key`] does the
+// rest unchanged: the playhead at the shown frame, the word through the one `commit` (one undo step), the save through
+// `edl::write` (`* UNA MARKER`), the seek door re-presents. The band needs nothing: [`view_band`]'s `view::paint_in` already
+// paints every marker on the ruler, and the schedule never reads them. Wire: `[nle] edit mark|unmark at=<tick> clips=<n>
+// undo=<n> saved=<bytes>`, or `[nle] edit mark|unmark at=<tick> refused (one marker per tick (...))`. Host check:
+// timeline_core tests/edl.rs `striakmarkers_*`; the Player side is unexercised (owed NLE-MARKERS-KERNEL-WITNESS).

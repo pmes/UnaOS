@@ -392,3 +392,50 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.verb("mark sideways"), Some(Ok(())), "STRIAMARKERS (SR835): a marker named sideways"); assert!(st.undo());
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }
+
+// ---- STRIAKMARKERS (LEDGER SR9001): the kernel Player's marker keys' calls, host side (named tail block) ----
+
+/// The Player's `m` / `M` bytes (vplay.rs `EDIT_KEYS`) name exactly `mark` / `unmark`; `edit_key` runs them through
+/// `EditorState::verb` at the playhead, saves through `edl::write`, and `view_band` paints `view::paint_in` at
+/// `Role::Tracks`. This is those same calls: one commit per word, the marker saved and re-read, the band showing it on the
+/// ruler only, and `unmark` writing the EDL back byte for byte. The Player itself is unexercised (NLE-MARKERS-KERNEL-WITNESS).
+#[test]
+fn striakmarkers_the_players_key_words_mark_save_and_paint_the_band() {
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, Layout, Order, Role};
+    let mut st = EditorState::open(CUT, 25).unwrap();
+    st.seek(5);
+    let w = 320u32;
+    let h = view::RULER_H + st.timeline.tracks.len() as u32 * view::ROW_H;
+    let plain = view::paint_in(&st, Layout::of_role(Role::Tracks, w, h, &st), Order::Rgba, None, None);
+    assert_eq!(st.verb("mark"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1, "one commit");
+    assert_eq!(st.timeline.markers, vec![timeline_core::Marker { at: 5, name: "M1".into() }]);
+    assert_eq!(st.verb("mark"), Some(Err(EditError::Marker)), "a taken tick");
+    assert_eq!(st.undo_depth(), 1, "a refused mark commits nothing");
+    let text = edl::write(&st.timeline, "CUT ONE").unwrap();
+    assert!(text.contains("* UNA MARKER 00:00:00:05 \"M1\"\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().markers, st.timeline.markers, "the saved marker re-reads");
+    let l = Layout::of_role(Role::Tracks, w, h, &st);
+    let marked = view::paint_in(&st, l, Order::Rgba, None, None);
+    assert_eq!((plain.len(), marked.len()), ((w * h * 4) as usize, (w * h * 4) as usize));
+    let mut inside = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = (y * w as usize + x) * 4;
+            if plain[i..i + 4] != marked[i..i + 4] {
+                assert!((l.ruler_y as usize..l.tracks_y as usize).contains(&y), "a marker paints only on the ruler (y={y})");
+                inside += 1;
+            }
+        }
+    }
+    assert!(inside > 0, "the band shows the marker");
+    let (x, y) = ((l.x_of(5) - 1) as usize, l.ruler_y as usize); // the playhead line owns the apex column itself
+    assert_eq!(marked[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4], view::MARKER);
+    assert_eq!(st.verb("unmark"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 2, "one commit");
+    assert!(st.timeline.markers.is_empty());
+    assert_eq!(st.verb("unmark"), Some(Err(EditError::Marker)), "nothing to remove");
+    assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT, "unmark writes the EDL back byte for byte");
+    println!("striakmarkers: mark -> M1 @5 saved, painted on the ruler ({inside} px); unmark -> CUT byte for byte");
+}

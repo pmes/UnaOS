@@ -3936,3 +3936,14 @@ fn striamarkersmore_alt_m_unmarks_all_and_help_row() {
     assert!(help_rows().iter().any(|(k, p)| k == "Alt+m" && *p == help_phrase("unmark all") && *p == "remove every marker"));
     println!("striamarkersmore: Alt+m -> unmarked 2 markers; none -> refused; help row Alt+m -> {}", help_phrase("unmark all"));
 }
+
+// ---- STRIAKMARKERS (LEDGER SR9001): the host KEYS the kernel Player's `m` / `M` must agree with (named tail block) ----
+
+/// The kernel Player binds `m` -> `mark` and `M` -> `unmark` (vplay.rs `EDIT_KEYS`): the host's `m` names the same word,
+/// and the host leaves `M` unbound, so no key means two things on the two faces.
+#[test]
+fn striakmarkers_host_keys_agree_with_the_players_m_and_shift_m() {
+    use stria::nle_face::KEYS;
+    assert!(KEYS.contains(&("m", "mark")));
+    assert!(!KEYS.iter().any(|&(k, _)| k == "M"), "M is unbound on the host");
+}
