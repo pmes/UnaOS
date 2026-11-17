@@ -1702,3 +1702,9 @@ hevctestkitpbody|exec-rmbp-hevctestkitpbody|644c0c7bf
 nle5dexportmessageetasmooth|exec-rmbp-nle5dexportmessageetasmooth|83a77236f
 h264enctwopassqpstepscenecut|exec-rmbp-h264enctwopassqpstepscenecut|541c093de
 aetherfontshorthandreset|exec-rmbp-aetherfontshorthandreset|48566bd03
+aetherfontshorthandinherit|exec-rmbp-aetherfontshorthandinherit|cut 2b0c544f3
+nle5dexportmessageetastall|exec-rmbp-nle5dexportmessageetastall|cut 2b0c544f3
+hevctestkitpbodyshared|exec-rmbp-hevctestkitpbodyshared|cut 2b0c544f3
+texthostfallbacksynthptrflake|exec-rmbp-texthostfallbacksynthptrflake|cut 2b0c544f3
+nleclirefusalsrest|exec-rmbp-nleclirefusalsrest|cut 2b0c544f3
+aetherfontvariantcapsall|exec-rmbp-aetherfontvariantcapsall|a7da0a7b3
