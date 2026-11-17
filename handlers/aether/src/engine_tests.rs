@@ -11213,4 +11213,115 @@ b</div>
         let got = font_synth_eval(&mut e, "var s = document.getElementById('d').style; s['white-space-collapse'] = 'preserve-breaks'; [s['white-space-collapse'], s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse')].join('|')");
         assert_eq!(got, "preserve-breaks|preserve-breaks|preserve-breaks");
     }
+
+    // ---- AETHERPAINTINDEXNONIFCTEXT (LEDGER SR1153): a text run outside an IFC is bounded by the lines draw_lines breaks it into (named tail block) ----
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): the fixed header as a flex container (`is_ifc_root` is false for a flex
+    /// container, so its bare text is a leaf painted by the non-IFC road), with `shadow` and `extra`.
+    fn non_ifc_text_engine(shadow: &str, extra: &str) -> crate::AetherEngine {
+        let e = damage_rects_engine(&text_shadow_holder_body(shadow, &format!("display:flex;{extra}")));
+        let lt = e.layout_tree.as_ref().expect("laid out");
+        let holders = crate::scroll_holders(Some(lt));
+        assert_eq!(holders.len(), 1, "one holder: the header");
+        // The road witness: neither the header nor any child of it is an IFC root, so its text paints outside an IFC.
+        assert!(lt.inline.get(&holders[0]).is_none(), "the flex header is not an IFC root");
+        for k in lt.taffy.children(holders[0]).unwrap_or_default() {
+            assert!(lt.inline.get(&k).is_none(), "no IFC under the flex header");
+        }
+        e
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): a plain flex header's ink is finite (armed: the non-IFC text road recorded
+    /// INK_ALL, the only unbounded term in this subtree) and holds every pixel of the full repaint.
+    #[test]
+    fn paint_index_non_ifc_text_ink_finite_contains_painted() {
+        let e = non_ifc_text_engine("none", "");
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+        let s = e.surface();
+        let dark = (0..30usize).any(|y| (0..200usize).any(|x| { let i = (y * 400 + x) * 4; s[i] < 100 && s[i + 1] < 100 && s[i + 2] < 100 }));
+        assert!(dark, "the header's black text painted");
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): a 60px-wide flex header wraps its text onto several lines: glyph pixels lie
+    /// below the first line and every painted pixel lies inside the ink.
+    #[test]
+    fn paint_index_non_ifc_text_wrapped_two_lines() {
+        let e = damage_rects_engine(&r#"<div style="position:fixed;top:0;left:0;display:flex;width:60px;height:60px;background-color:rgb(200, 200, 200);font-size:16px;color:rgb(0, 0, 0)">Header text wraps here</div>
+        <div style="height:2000px"></div>"#.to_string());
+        text_shadow_ink_holds_painted(&e);
+        let s = e.surface();
+        let dark_at = |y0: usize, y1: usize| (y0..y1).any(|y| (0..120usize).any(|x| { let i = (y * 400 + x) * 4; s[i] < 100 && s[i + 1] < 100 && s[i + 2] < 100 }));
+        assert!(dark_at(0, 20), "the first line painted");
+        assert!(dark_at(24, 80), "a second line painted below the first");
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): a +50 scroll keeps the blit: the strip first, then rects inside the flex
+    /// header's ink — not the viewport (armed: the non-IFC text made the ink unbounded).
+    #[test]
+    fn paint_index_non_ifc_text_scroll_damage_is_strip_plus_header() {
+        let mut e = non_ifc_text_engine("none", "");
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        let ink = crate::render::subtree_ink(&holders).0.expect("finite ink");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "the viewport is not the damage (armed)");
+        assert_eq!(e.damage_rects.first(), Some(&(0, 250, 400, 50)), "the strip first");
+        assert!(e.damage_rects.len() >= 2, "the header is damaged too: {:?}", e.damage_rects);
+        for &(x, y, w, h) in &e.damage_rects[1..] {
+            assert!(
+                x as f32 >= ink.0.floor().max(0.0) && y as f32 >= ink.1.floor().max(0.0) && (x + w) as f32 <= ink.2.ceil() && (y + h) as f32 <= ink.3.ceil(),
+                "damage ({x}, {y}, {w}, {h}) lies inside the header ink {ink:?}"
+            );
+        }
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): +50, +50, -30 with the flex header over coloured rows: each blitted frame
+    /// equals a control engine scrolled there and repainted whole.
+    #[test]
+    fn paint_index_non_ifc_text_pixels_match_full_repaint() {
+        let mut body = text_shadow_holder_body("none", "display:flex");
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): the flex header with a blurred red text-shadow: finite, holds every painted
+    /// pixel (the shadow's included), and the red shows.
+    #[test]
+    fn paint_index_non_ifc_text_shadow() {
+        let e = non_ifc_text_engine(TEXT_SHADOW_HOLDER, "");
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+        let s = e.surface();
+        let reddish = (0..30usize).any(|y| (0..200usize).any(|x| { let i = (y * 400 + x) * 4; s[i + 2] > s[i + 1].saturating_add(20) }));
+        assert!(reddish, "the red text shadow shows in the header");
+    }
+
+    /// AETHERPAINTINDEXNONIFCTEXT (SR1153): the index walk now runs the non-IFC paint twin up to the draw; it writes no
+    /// pixel and draws no glyph. A frame damaging only a bottom strip: the header's pixels are untouched and the glyph
+    /// counters (bumped only by `draw_shaped`) stay at zero (armed: the INK_ALL header met the strip and drew its run).
+    #[test]
+    fn paint_index_non_ifc_text_index_walk_draws_nothing() {
+        crate::perf::set_scoped(true);
+        let mut e = non_ifc_text_engine("none", "");
+        let header = |e: &crate::AetherEngine| { let s = e.surface(); (0..30usize).flat_map(|y| (0..200usize).map(move |x| (y * 400 + x) * 4)).map(|i| (s[i], s[i + 1], s[i + 2])).collect::<Vec<_>>() };
+        let before = header(&e);
+        crate::perf::reset();
+        e.damage_rects.clear();
+        e.damage_rects.push((0, 250, 400, 50));
+        e.render_frame();
+        let c = crate::perf::counters();
+        assert_eq!(c.glyph_hits + c.glyph_misses, 0, "no glyph run drawn: the index walk ran the twin without drawing and the paint walk skipped the header");
+        assert!(header(&e) == before, "the header's pixels are untouched");
+    }
 }
