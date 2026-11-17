@@ -892,3 +892,39 @@ fn striatransitionlength_dur_refusals_by_name() {
     assert_eq!(st.verb("durx 3"), None);
     assert_eq!(st.verb("play"), None);
 }
+
+// ---- STRIATRANSITIONMORE (LEDGER SR956): `dur` reads a timecode count (named tail block) ----
+
+#[test]
+fn striatransitionmore_dur_timecode() {
+    let mut st = striatransitionlength_state();
+    let (tl0, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("dur 00:00:00:07"), Some(Ok(())));
+    let mut by_ticks = striatransitionlength_state();
+    assert_eq!(by_ticks.verb("dur 7"), Some(Ok(())));
+    assert_eq!(st.timeline, by_ticks.timeline, "a timecode count is the same length as the ticks");
+    assert_eq!(st.undo_depth(), depth + 1, "one undo step");
+    assert_eq!(st.verb("dur 00:00:00:07"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), depth + 1, "the same length by timecode commits nothing");
+    for (v, e) in [
+        ("dur 00:00:00:25", EditError::Transition),
+        ("dur 00;00;00;07", EditError::Transition),
+        ("dur 0:7", EditError::Transition),
+        ("dur 00:00:00:00", EditError::Transition),
+        ("dur 00:00:01:00", EditError::Handle),
+    ] {
+        let before = st.clone();
+        assert_eq!(st.verb(v), Some(Err(e)), "{v}");
+        assert_eq!(st, before, "{v}");
+    }
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl0);
+    // a time base that is not 1/fps: ticks only
+    let mut tl = cuts().add_transition(0, 20, TransitionKind::Dissolve, 4).unwrap();
+    tl.tb.num = 1001;
+    let mut st = timeline_core::editor::EditorState::new(tl);
+    st.select_transition(0, 0).unwrap();
+    assert_eq!(st.verb("dur 00:00:00:07"), Some(Err(EditError::Transition)));
+    assert_eq!(st.verb("dur 7"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 7);
+}

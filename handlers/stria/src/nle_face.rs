@@ -2589,8 +2589,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("save", "save"),
     ("nudge-", "move the selection one frame earlier"),
     ("nudge+", "move the selection one frame later"),
-    ("[", "clip start one frame earlier"),
-    ("]", "clip start one frame later"),
+    ("[", "clip start one frame earlier; a selected transition one frame shorter"), // STRIATRANSITIONMORE (SR956): the key's two roads (Face::transition_verb first)
+    ("]", "clip start one frame later; a selected transition one frame longer"),
     ("mark in", "export from the playhead"),
     ("mark out", "export up to the playhead"),
     ("mark clear", "export the whole timeline"),

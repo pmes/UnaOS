@@ -672,10 +672,21 @@ impl EditorState {
     fn transition_dur_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let mut w = v.split_ascii_whitespace();
         w.next().filter(|&w| w == "dur")?;
-        Some(match (self.selected_transition(), w.next().map(str::parse::<i64>), w.next()) {
+        Some(match (self.selected_transition(), w.next().map(|s| dur_count(s, self.timeline.fps())), w.next()) {
             (Some(x), Some(Ok(n)), None) if n == x.dur => Ok(()),
             (Some(_), Some(Ok(n)), None) => self.set_transition_dur(n),
             _ => Err(EditError::Transition),
         })
     }
+}
+
+// ---- STRIATRANSITIONMORE (LEDGER SR956): `dur` reads a timecode count too (named tail block) ----
+// `dur <n>` takes an integer tick count, or an EDL timecode `HH:MM:SS:FF` at the timeline's fps through THE one parser
+// `edl::parse_tc` (drop-frame `;`, malformed fields and FF >= fps refused). A timeline with no integer fps takes ticks only.
+/// The count of the `dur` word: ticks, else a timecode at `fps`; `Err` refuses it (`EditError::Transition` at the caller).
+fn dur_count(s: &str, fps: Option<u32>) -> Result<i64, ()> {
+    if let Ok(n) = s.parse::<i64>() {
+        return Ok(n);
+    }
+    fps.and_then(|f| edl::parse_tc(s, f, 0).ok()).ok_or(())
 }

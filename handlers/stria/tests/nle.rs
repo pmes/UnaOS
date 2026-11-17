@@ -3576,3 +3576,26 @@ fn striatransitionlength_face_dur_input() {
     assert!(face.verb("["));
     assert_eq!(face.state.selected_transition().map(|x| x.dur), Some(5));
 }
+
+// ---- STRIATRANSITIONMORE (LEDGER SR956): the `[` / `]` help names both roads; a typed timecode `dur` (named tail block) ----
+
+/// M3: the help rows of `[` and `]` name the clip trim and the selected transition's step; typed `dur 00:00:00:06` on a
+/// selected dissolve gives it 6 ticks in one undo step, no error.
+#[test]
+fn striatransitionmore_bracket_help_names_the_transition() {
+    use bandy::SMessage;
+    use stria::nle_face::SURFACE;
+    let rows = help_rows();
+    for k in ["[", "]"] {
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert!(row.1.contains("clip start") && row.1.contains("transition"), "{k}: {:?}", row.1);
+    }
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.on(&SMessage::Input { target: SURFACE.into(), text: "dur 00:00:00:06".into() }));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl0.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 6).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+}
