@@ -1315,7 +1315,7 @@ pub fn paint_xform_drag(px: Vec<u8>, l: Layout, order: Order, drag: Option<&Xfor
     }
     let mut c = Canvas { w: l.w, h: l.h, order, px };
     let (x0, y0, x1, y1) = d.rect();
-    c.frame(x0, y0, x1, y1, HANDLE);
+    paint_xform_guides(&mut c, d); c.frame(x0, y0, x1, y1, HANDLE); // STRIAXFORMHOVER (SR9107): the snapped frame lines under the outline (file tail)
     c.px
 }
 
@@ -1481,7 +1481,7 @@ pub fn paint_xform_handles(px: Vec<u8>, l: Layout, order: Order, d: Option<&Xfor
     let (x0, y0, x1, y1) = d.rect();
     let h = XFORM_HANDLE / 2;
     for (cx, cy) in [(x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)] {
-        c.rect(cx - h, cy - h, cx - h + XFORM_HANDLE, cy - h + XFORM_HANDLE, HANDLE);
+        let (a, b, e, f) = d.handle_rect(((cx != x0) as u8) | (((cy != y0) as u8) << 1)); c.rect(a, b, e, f, HANDLE); debug_assert_eq!((a, b), (cx - h, cy - h)); // STRIAXFORMHOVER (SR9107): ONE square formula, `XformDrag::handle_rect` (file tail)
     }
     c.px
 }
@@ -1553,5 +1553,152 @@ mod striaxformhandles_tests {
             assert_eq!(at(x, y), &HANDLE, "corner {x},{y}");
         }
         assert_eq!(at(216, 76), &[0u8; 4], "the rect's centre untouched");
+    }
+}
+
+// ---- STRIAXFORMHOVER (LEDGER SR9107): the hovered handle and the snap guides (named tail block) ----
+// NLE-XFORM-HANDLES-HOVER: the hovered handle IS the corner SR9033's press rule would grab ([`XformDrag::hover`] is
+// [`XformDrag::begin`] at the pointer, kept only with a corner); [`paint_xform_hover`] paints that corner's square
+// ([`XformDrag::handle_rect`], the one square formula `paint_xform_handles` also reads) in [`SELECT`]; the face hands it
+// the live corner drag's held corner too (NLE-XFORM-HOVER-DRAG). NLE-XFORM-DRAG-GUIDES: [`XformDrag::guides`] reads the
+// snap off the drag's own results (`xform` against its no-snap twin, SR9068's `nosnap` road, no second search): an axis
+// the snap changed shows the frame line (0 / 500 / 1000) the rect's line now sits on, drawn by `paint_xform_guides` as a
+// 1 px line in the timeline guide's ink ([`GUIDE`]) across the picture `q`, under `paint_xform_drag`'s outline. No pointer
+// on a handle and no snapped drag paint nothing: every golden is byte-identical. Owed: NLE-XFORM-HOVER-SPLIT,
+// NLE-XFORM-HOVER-CURSOR, NLE-XFORM-GUIDES-ALIGNED.
+
+impl XformDrag {
+    /// STRIAXFORMHOVER (SR9107): the handle under the pointer `(x, y)`: the press rule ([`XformDrag::begin`]) there when it
+    /// grabs a corner; `None` off every corner, or with no placed clip selected at the playhead.
+    pub fn hover(st: &EditorState, l: Layout, sw: u32, sh: u32, x: f64, y: f64) -> Option<XformDrag> {
+        XformDrag::begin(st, l, sw, sh, x, y).filter(|d| d.corner.is_some())
+    }
+    /// STRIAXFORMHOVER (SR9107): corner `c`'s [`XFORM_HANDLE`] px square on the rect (bit 1 right, bit 2 bottom), centred on
+    /// the corner's pixel: `(x0, y0, x1, y1)` canvas px.
+    pub fn handle_rect(&self, c: u8) -> (i64, i64, i64, i64) {
+        let (x0, y0, x1, y1) = self.rect();
+        let (cx, cy) = (if c & 1 != 0 { x1 - 1 } else { x0 }, if c & 2 != 0 { y1 - 1 } else { y0 });
+        let h = XFORM_HANDLE / 2;
+        (cx - h, cy - h, cx - h + XFORM_HANDLE, cy - h + XFORM_HANDLE)
+    }
+    /// STRIAXFORMHOVER (SR9107): the frame lines (1/1000: 0, 500 or 1000) the snapped rect sits on, `(vertical, horizontal)`:
+    /// per axis the snap changed (the result against its no-snap twin), a move's left / centre / right (top / middle /
+    /// bottom) line, a corner's moving edge; `(None, None)` under `nosnap` or when the snap changed nothing.
+    pub fn guides(&self) -> (Option<i32>, Option<i32>) {
+        if self.nosnap {
+            return (None, None);
+        }
+        let (xf, raw) = (self.xform(), XformDrag { nosnap: true, ..*self }.xform());
+        if xf == raw {
+            return (None, None);
+        }
+        let on = |lines: &[i32]| lines.iter().copied().find(|v| [0, 500, 1000].contains(v));
+        let (s, x, y) = (xf.s as i32, xf.x as i32, xf.y as i32);
+        match self.corner {
+            None => (
+                if xf.x != raw.x { on(&[x, x + s / 2, x + s]) } else { None },
+                if xf.y != raw.y { on(&[y, y + s / 2, y + s]) } else { None },
+            ),
+            Some(c) => (on(&[if c & 1 != 0 { x + s } else { x }]), on(&[if c & 2 != 0 { y + s } else { y }])),
+        }
+    }
+}
+
+/// STRIAXFORMHOVER (SR9107): `d`'s snapped frame lines ([`XformDrag::guides`]) as 1 px [`GUIDE`] lines across the picture
+/// `q` (the frame's 1000 on the last column / row inside it); nothing when the drag is not snapped.
+fn paint_xform_guides(c: &mut Canvas, d: &XformDrag) {
+    let (gx, gy) = d.guides();
+    let (qx, qy, qw, qh) = (d.q.x as i64, d.q.y as i64, d.q.w as i64, d.q.h as i64);
+    if let Some(v) = gx {
+        let x = (qx + qw * v as i64 / 1000).min(qx + qw - 1);
+        c.rect(x, qy, x + 1, qy + qh, GUIDE);
+    }
+    if let Some(v) = gy {
+        let y = (qy + qh * v as i64 / 1000).min(qy + qh - 1);
+        c.rect(qx, y, qx + qw, y + 1, GUIDE);
+    }
+}
+
+/// STRIAXFORMHOVER (SR9107): the hovered (or held) corner's square of `d` ([`XformDrag::handle_rect`] of `d.corner`) in
+/// [`SELECT`] over the painted handles; `None`, a drag with no corner, or a canvas of another size comes back untouched.
+pub fn paint_xform_hover(px: Vec<u8>, l: Layout, order: Order, d: Option<&XformDrag>) -> Vec<u8> {
+    let Some((d, k)) = d.and_then(|d| Some((d, d.corner?))) else { return px };
+    if px.len() != l.w as usize * l.h as usize * 4 {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x0, y0, x1, y1) = d.handle_rect(k);
+    c.rect(x0, y0, x1, y1, SELECT);
+    c.px
+}
+
+#[cfg(test)]
+mod striaxformhover_tests {
+    use super::*;
+    use crate::{Clip, Timeline, Xform};
+
+    /// SR9068's fixture: V1 A 0..20 placed at [`Xform::PIP`], A1 A 0..20; V1's clip selected, playhead 5; the band 320 x 90
+    /// over a 160 x 90 still: `q` 160 x 90 at (80, 0), the PIP rect (196, 65)..(236, 87).
+    fn fixture() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let tl = tl.set_xform(0, 0, Xform::PIP).unwrap();
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.playhead = 5;
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        (st, l)
+    }
+
+    /// A move snapped to the frame's centre draws the vertical guide at q's middle column; snapped at the bottom too, the
+    /// horizontal guide on q's last row; a corner snapped on both edges names both lines; an unsnapped move, or Alt at the
+    /// press, draws none.
+    #[test]
+    fn striaxformhover_guides_follow_the_snap() {
+        let (st, l) = fixture();
+        let px = alloc::vec![0u8; l.w as usize * l.h as usize * 4];
+        let at = |out: &[u8], x: usize, y: usize| out[(y * l.w as usize + x) * 4..(y * l.w as usize + x) * 4 + 4].to_vec();
+        let mut d = XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).unwrap();
+        d.update(200.0, 76.0);
+        assert_eq!(d.guides(), (None, None), "x 625: not snapped");
+        assert_eq!(at(&paint_xform_drag(px.clone(), l, Order::Rgba, Some(&d)), 160, 10), alloc::vec![0u8; 4]);
+        d.update(162.0, 76.0);
+        assert_eq!(d.guides(), (Some(500), None), "centre 513 -> 500; no vertical travel");
+        let out = paint_xform_drag(px.clone(), l, Order::Rgba, Some(&d));
+        assert_eq!(at(&out, 160, 10), GUIDE.to_vec(), "the centre line, q.x + 80");
+        d.update(162.0, 77.0);
+        assert_eq!(d.guides(), (Some(500), Some(1000)), "bottom 986 -> 1000");
+        let out = paint_xform_drag(px.clone(), l, Order::Rgba, Some(&d));
+        assert_eq!(at(&out, 100, 89), GUIDE.to_vec(), "the frame's bottom on q's last row");
+        let mut tl = XformDrag::begin(&st, l, 160, 90, 197.0, 66.0).unwrap();
+        tl.update(162.0, 46.0);
+        assert_eq!(tl.guides(), (Some(500), Some(500)), "the top-left corner's edges land on the centre lines");
+        let mut free = XformDrag::begin_nosnap(&st, l, 160, 90, 216.0, 76.0, true).unwrap();
+        free.update(162.0, 76.0);
+        assert_eq!(free.guides(), (None, None), "Alt: no snap, no guide");
+        assert_eq!(at(&paint_xform_drag(px.clone(), l, Order::Rgba, Some(&free)), 160, 10), alloc::vec![0u8; 4]);
+    }
+
+    /// The hovered handle is the press rule's corner; its square paints in SELECT, the others untouched; off the corners,
+    /// or `None`, nothing paints.
+    #[test]
+    fn striaxformhover_hover_paints_the_corner() {
+        let (st, l) = fixture();
+        let h = XformDrag::hover(&st, l, 160, 90, 197.0, 66.0).expect("on the top-left handle");
+        assert_eq!((h.corner, h.handle_rect(0)), (Some(0), (194, 63, 199, 68)));
+        assert!(XformDrag::hover(&st, l, 160, 90, 216.0, 76.0).is_none(), "the rect's body is no handle");
+        assert!(XformDrag::hover(&st, l, 160, 90, 120.0, 30.0).is_none(), "off the rect");
+        let px = alloc::vec![0u8; l.w as usize * l.h as usize * 4];
+        assert_eq!(paint_xform_hover(px.clone(), l, Order::Rgba, None), px, "no hover: byte-identical");
+        let body = XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).unwrap();
+        assert_eq!(paint_xform_hover(px.clone(), l, Order::Rgba, Some(&body)), px, "a move drag holds no corner");
+        let out = paint_xform_hover(px.clone(), l, Order::Rgba, Some(&h));
+        let at = |x: usize, y: usize| &out[(y * l.w as usize + x) * 4..(y * l.w as usize + x) * 4 + 4];
+        assert_eq!(at(196, 65), &SELECT, "the hovered corner");
+        assert_eq!(at(235, 65), &[0u8; 4], "another corner untouched");
     }
 }

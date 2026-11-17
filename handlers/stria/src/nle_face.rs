@@ -453,7 +453,7 @@ impl Face {
     }
     /// The pointer moved: a live drag follows it.
     fn hover(&mut self, x: f64, y: f64) -> bool {
-        if let Some(r) = self.hover_message(x, y) { return r; } // STRIAINFOREELHOVER (SR762): no drag: the pointer moves and the message follows the clip under it (file tail)
+        let hc = self.xform_hover_corner(); if let Some(r) = self.hover_message(x, y) { return r || self.xform_hover_corner() != hc; } // STRIAXFORMHOVER (SR9107): a bare move repaints when the hovered placement handle changed (file tail); STRIAINFOREELHOVER (SR762): no drag: the pointer moves and the message follows the clip under it (file tail)
         let Some(d) = self.drag.as_mut() else { return false };
         let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
@@ -1602,7 +1602,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(view::paint_xform_handles(view::paint_xform_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, role); // STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(view::paint_xform_hover(view::paint_xform_handles(view::paint_xform_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, vo(self.order), self.xform_hover(st, l, role).as_ref()), l, role); // STRIAXFORMHOVER (SR9107): the hovered (or held) handle in SELECT (file tail); STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3219,5 +3219,37 @@ impl Face {
         }
         let s = self.still.as_ref()?;
         view::XformDrag::rest(st, l, s.width, s.height)
+    }
+}
+
+// ---- STRIAXFORMHOVER (LEDGER SR9107): the hovered placement handle on the preview picture (named tail block) ----
+// NLE-XFORM-HANDLES-HOVER on the face: `paint_role`'s paint line hands [`Face::xform_hover`] to timeline_core's
+// `view::paint_xform_hover`: on the one-Surface face, the corner a press at THE pointer (`self.pointer`, the pointer the face
+// already keeps) would grab (`view::XformDrag::hover` over the painted state, layout and still); `Face::hover`'s first line
+// compares [`Face::xform_hover_corner`] before and after the move, so a bare move repaints only when that corner changed.
+// NLE-XFORM-HOVER-DRAG: a live corner drag's held corner is the same square (no new state). Nothing on the tracks Surface,
+// under the help, or on the split preview Surface without a drag (its pointer is not the face's: NLE-XFORM-HOVER-SPLIT).
+
+impl Face {
+    /// STRIAXFORMHOVER (SR9107): the drag whose `corner` is highlighted on `role`'s paint of `st` over layout `l`: a live
+    /// corner drag's held corner, else (one Surface) the handle under the pointer; `None` otherwise.
+    fn xform_hover(&self, st: &EditorState, l: Layout, role: Role) -> Option<view::XformDrag> {
+        if role == Role::Tracks || self.help {
+            return None;
+        }
+        if let Some(d) = self.xform_drag {
+            return d.corner.is_some().then_some(d);
+        }
+        if role != Role::Whole {
+            return None;
+        }
+        let (x, y) = self.pointer?;
+        let s = self.still.as_ref()?;
+        view::XformDrag::hover(st, l, s.width, s.height, x, y)
+    }
+    /// STRIAXFORMHOVER (SR9107): the corner [`Face::xform_hover`] highlights on the pointer's Surface now.
+    fn xform_hover_corner(&self) -> Option<u8> {
+        let role = self.pointer_role();
+        self.xform_hover(&self.state, self.layout_for(role).with_message(self.labels.is_some()), role).and_then(|d| d.corner)
     }
 }
