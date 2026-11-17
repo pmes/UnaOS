@@ -1356,7 +1356,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let paint = tid.and_then(|t| tree.paint_map.get(&t)).cloned().unwrap_or_default();
             let spec = tid.and_then(|t| last.get(&t)).cloned();
             let mut me = parent.clone();
-            me.font_size = paint.font_size.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_FONT_SIZE, parent.font_size, |fs| crate::layout::default_font_size(tag, fs)));
+            me.font_size = paint.font_size.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_FONT_SIZE, parent.font_size, |fs| crate::layout::default_font_size(tag, fs))); me.font_size = font_size_used(&paint, me.font_size);
             me.weight = paint
                 .weight
                 .map(|w| w.resolve(parent.weight))
