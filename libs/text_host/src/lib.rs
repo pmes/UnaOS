@@ -106,7 +106,7 @@ impl Face {
 
 /// The bytes of a font file, read once and kept for the process.
 fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
-    static FILES: OnceLock<Mutex<HashMap<PathBuf, Option<&'static [u8]>>>> = OnceLock::new();
+    use crate::FONT_FILES as FILES; // TEXTHOST-FACE-BYTES-WITNESS (SR1012): the same file cache, hoisted to the file tail so `files_loaded_bytes` reads it
     let m = FILES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(b) = m.lock().ok()?.get(path) {
         return *b;
@@ -119,21 +119,21 @@ fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
 type LoadedMap = HashMap<FaceKey, &'static Face>;
 
 /// The ONE loaded-face cache and its contract (TEXTHOSTFACECACHECONTRACT SR822): ONE `&'static Face` per [`FaceKey`]
-/// (built by `face_key` alone) for the process's life. The first loader wins (`load_face_synth`'s `or_insert`, the
+/// (built by `face_key` alone) for the process's life. The first loader wins (`remember`'s vacant-entry insert, the
 /// single guard of `load_face_instance` and `installed_twin`); an entry is never evicted, replaced or cleared, so a
 /// reader may hold the reference forever and a caller may compare faces by pointer (`std::ptr::eq`); `Face.id` is
 /// unique per key, which the glyph and shaping caches key on. Its writers: `load_face_synth`, `load_face_instance`,
-/// `installed_twin`; its reader by id: `is_installed`.
-fn faces_loaded() -> &'static Mutex<LoadedMap> {
-    static F: OnceLock<Mutex<LoadedMap>> = OnceLock::new();
-    F.get_or_init(|| Mutex::new(HashMap::new()))
+/// `installed_twin`; its readers by id: `is_installed` and `installed_twin`, through `Loaded::by_id` (TEXTHOSTFACECACHEIDINDEX SR846).
+fn faces_loaded() -> &'static Mutex<Loaded> {
+    static F: OnceLock<Mutex<Loaded>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(Loaded::default()))
 }
 
 /// A fresh face id (for faces built outside [`load_face`], e.g. Aether's `@font-face` faces).
 /// True for a face loaded from the host's font directories (not `@font-face`, not a fallback twin): these get
 /// fontconfig's per-face hinting in [`raster`] (FONTHINT SR62); web fonts are drawn unhinted, as Chromium does.
 pub fn is_installed(face: &Face) -> bool {
-    faces_loaded().lock().map(|m| m.values().any(|f| f.id == face.id)).unwrap_or(false)
+    faces_loaded().lock().map(|m| m.by_id.contains_key(&face.id)).unwrap_or(false)
 }
 
 pub fn next_face_id() -> u32 {
@@ -161,7 +161,7 @@ pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'s
         family: info.families.first().cloned().unwrap_or_default(),
         style: info.style,
     }));
-    let face: &'static Face = *faces_loaded().lock().ok()?.entry(face_key(info.path.clone(), info.index, bold, oblique, Vec::new())).or_insert(face); // TEXTHOST-FALLBACKSYNTH-PTR-FLAKE (SR813): first writer wins, so the cache's one object per key holds under parallel first loads
+    let face: &'static Face = remember(&mut *faces_loaded().lock().ok()?, face_key(info.path.clone(), info.index, bold, oblique, Vec::new()), face); // TEXTHOST-FALLBACKSYNTH-PTR-FLAKE (SR813): first writer wins, so the cache's one object per key holds under parallel first loads
     Some(face)
 }
 
@@ -231,6 +231,7 @@ pub fn axes_for(font: &Font, want: Style, size_px: Option<f32>) -> Vec<([u8; 4],
 /// ONE loaded-face cache, so two requests for the same weight share it and the raster caches (keyed on the id) see
 /// a distinct face per instance.
 /// The cache's contract is `faces_loaded`'s (one object per `face_key`, first loader wins, never evicted).
+/// Past [`INSTANCES_MAX`] instances of one (file, index, synthesis) a new coords tuple returns the nearest loaded one ([`snap_instance`], TEXTHOSTFACECACHEEVICTION SR1004).
 pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([u8; 4], f32)]) -> Option<&'static Face> {
     let base = load_face_synth(info, bold, oblique)?;
     let font = base.font.with_variations(axes);
@@ -242,6 +243,7 @@ pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([
     if let Some(f) = cache_get(&m, &info.path, info.index, bold, oblique, &coords[..font.coords().len()]) {
         return Some(f);
     }
+    if let Some(f) = snap_instance(&m, &info.path, info.index, bold, oblique, &coords[..font.coords().len()]) { return Some(f); } // TEXTHOST-FACE-CACHE-EVICTION (SR1004): a full family snaps, never grows
     let face: &'static Face = Box::leak(Box::new(Face {
         id: next_face_id(),
         font,
@@ -250,7 +252,7 @@ pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([
         family: base.family.clone(),
         style: base.style,
     }));
-    m.insert(face_key(info.path.clone(), info.index, bold, oblique, coords[..font.coords().len()].to_vec()), face);
+    remember(&mut m, face_key(info.path.clone(), info.index, bold, oblique, coords[..font.coords().len()].to_vec()), face);
     Some(face)
 }
 
@@ -640,7 +642,7 @@ mod fallbacksynthstylematch_tests {
 /// The cache's contract is `faces_loaded`'s; the twin's key is `face_key` of the face's own key with the new flags.
 pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<&'static Face> {
     let mut m = faces_loaded().lock().ok()?;
-    let (path, index, _, _, coords) = m.iter().find(|(_, f)| f.id == face.id)?.0;
+    let (path, index, _, _, coords) = m.by_id.get(&face.id)?;
     if let Some(f) = cache_get(&m, path, *index, bold, oblique, coords) {
         return Some(f);
     }
@@ -653,7 +655,7 @@ pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<
         style: face.style,
     }));
     let key = face_key(path.clone(), *index, bold, oblique, coords.clone());
-    m.insert(key, twin);
+    remember(&mut m, key, twin);
     Some(twin)
 }
 
@@ -883,5 +885,365 @@ mod facecache_key_variation_tests {
         let got = cache_get(&faces_loaded().lock().unwrap(), &info.path, info.index, false, true, &[]);
         assert!(got.is_some_and(|g| std::ptr::eq(g, face)), "cache_get is the cache's entry");
         assert!(std::ptr::eq(face, load_face_synth(&info, false, true).unwrap()), "the hit road returns the one object");
+    }
+}
+
+// ---- TEXTHOSTFACECACHEIDINDEX (LEDGER SR846): the loaded-face cache's id index beside its map under its one lock (named tail block) ----
+
+/// TEXTHOSTFACECACHEIDINDEX (SR846): the loaded-face cache (`faces_loaded`, whose doc is the contract) and its index by
+/// `Face.id` under the ONE lock: `by_id` holds exactly the ids of `map`'s values, each to the key its face sits under (one
+/// face per key, one fresh id per face), so `is_installed` and `installed_twin` read by id without scanning the map.
+/// Reads go through the map (`Deref`, read-only); the ONE writer is [`remember`].
+#[derive(Default)]
+struct Loaded {
+    map: LoadedMap,
+    by_id: HashMap<u32, FaceKey>,
+}
+
+impl std::ops::Deref for Loaded {
+    type Target = LoadedMap;
+    fn deref(&self) -> &LoadedMap {
+        &self.map
+    }
+}
+
+/// TEXTHOSTFACECACHEIDINDEX (SR846): the ONE insert into the loaded-face cache (`load_face_synth`, `load_face_instance`,
+/// `installed_twin` call it under their guard): the first writer wins (SR813: an occupied key returns its cached
+/// object), and a vacant key writes the id index with the map entry; the key is cloned on this miss path only.
+fn remember(l: &mut Loaded, key: FaceKey, face: &'static Face) -> &'static Face {
+    match l.map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            l.by_id.insert(face.id, v.key().clone());
+            *v.insert(face)
+        }
+    }
+}
+
+#[cfg(test)]
+mod facecache_id_index_tests {
+    use super::*;
+
+    /// The pre-SR846 `is_installed`: a scan of the map's values by id (the oracle).
+    fn scan_installed(face: &Face) -> bool {
+        faces_loaded().lock().unwrap().values().any(|f| f.id == face.id)
+    }
+
+    /// The pre-SR846 `installed_twin` key search: a scan of the map's entries by id (the oracle).
+    fn scan_key(face: &Face) -> Option<FaceKey> {
+        faces_loaded().lock().unwrap().iter().find(|(_, f)| f.id == face.id).map(|(k, _)| k.clone())
+    }
+
+    fn addr(f: &Face) -> usize {
+        f as *const Face as usize
+    }
+
+    /// K = 16 objects through the three roads (the static fixture's synth road x4 flag pairs, Inter plain and five
+    /// instances, six twins), all keys fresh to this test (a distinct `tools/..` path component): for each, the index
+    /// answers as the old scans did: `is_installed` == the value scan, `by_id` names the scanned key, and
+    /// `installed_twin` under every flag pair is the map's entry under that key with those flags; the bold twin of the
+    /// installed static face is the synth road's object; a face never inserted is not installed and has no twin; and
+    /// under the lock the index is the map's bijection. Neither reader allocates (counted by reading: a `contains_key`;
+    /// a `get` then `cache_get` by borrowed parts).
+    #[test]
+    fn facecache_id_index_matches_scan_kat() {
+        let fresh = |rel: &str| {
+            let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/..").join(rel);
+            db::faces_in_file(&p).into_iter().next().unwrap_or_else(|| panic!("{rel}: the tree's fixture face"))
+        };
+        let s = fresh("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let inter = fresh("fonts/inter/InterVariable.ttf");
+        let flags = [(false, false), (true, false), (false, true), (true, true)];
+        let mut faces: Vec<&'static Face> = flags.iter().map(|&(b, o)| load_face_synth(&s, b, o).expect("the static fixture loads")).collect();
+        let inter_plain = load_face(&inter).expect("Inter loads");
+        faces.push(inter_plain);
+        let insts: Vec<&'static Face> = [300.0, 500.0, 600.0, 700.0, 800.0]
+            .iter()
+            .map(|&w| load_face_instance(&inter, false, false, &[(*b"wght", w)]).expect("Inter instances"))
+            .collect();
+        faces.extend(&insts);
+        for &i in &insts {
+            faces.push(installed_twin(i, false, true).expect("an installed instance twins"));
+        }
+        faces.push(installed_twin(inter_plain, true, false).expect("an installed face twins"));
+        let distinct: std::collections::HashSet<usize> = faces.iter().map(|f| addr(f)).collect();
+        assert_eq!(distinct.len(), 16, "K = 16 distinct objects");
+        for &f in &faces {
+            assert!(is_installed(f) && scan_installed(f), "installed through the index and the scan");
+            let key = scan_key(f).expect("the scan finds every loaded face");
+            assert_eq!(faces_loaded().lock().unwrap().by_id.get(&f.id), Some(&key), "by_id names the scanned key");
+            for &(b, o) in &flags {
+                let twin = installed_twin(f, b, o).expect("an installed face twins");
+                let m = faces_loaded().lock().unwrap();
+                let entry = cache_get(&m, &key.0, key.1, b, o, &key.4);
+                assert!(entry.is_some_and(|e| std::ptr::eq(e, twin)), "installed_twin is the map's entry under the scanned key");
+            }
+        }
+        assert!(std::ptr::eq(installed_twin(faces[0], true, false).unwrap(), load_face_synth(&s, true, false).unwrap()), "the bold twin through the index");
+        let stray: &'static Face = Box::leak(Box::new(Face {
+            id: next_face_id(),
+            font: faces[0].font,
+            synth_bold: false,
+            synth_oblique: false,
+            family: faces[0].family.clone(),
+            style: faces[0].style,
+        }));
+        assert!(!is_installed(stray) && !scan_installed(stray), "a face never inserted is not installed");
+        assert!(installed_twin(stray, true, false).is_none() && scan_key(stray).is_none(), "nor has it a twin");
+        let m = faces_loaded().lock().unwrap();
+        assert_eq!(m.by_id.len(), m.map.len(), "one index entry per map entry");
+        for (id, key) in &m.by_id {
+            assert_eq!(m.map.get(key).map(|f| f.id), Some(*id), "the index's key holds the face with its id");
+        }
+    }
+}
+
+// ---- TEXTHOSTFACECACHEEVICTION (LEDGER SR1004): the instance bound and its snap (named tail block) ----
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): the most instances (non-empty coords) one (file, index, synthetic bold,
+/// synthetic oblique) family holds in the loaded-face cache (`faces_loaded`); past it [`load_face_instance`] returns
+/// the nearest loaded instance ([`snap_instance`]) instead of loading another. A BOUND, not an eviction (measured):
+/// every [`Face`] and its file bytes are `Box::leak`ed (nothing to free), and `&'static Face` / `Face.id` are held
+/// across frames (aether's `STACKS` / `FALLBACK` / `fallback_variant`, raster's `GLYPHS` / `HINTERS`), so dropping an
+/// entry would break the cache's contract; a snap inserts nothing, so the contract and `by_id` stand. A Face is its
+/// inline `Font` (borrowed tables, no owned buffer) plus a family String: <= 16 x ~2.2 KB per family.
+pub const INSTANCES_MAX: usize = 16;
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): the loaded instance a miss at `coords` snaps to once its family (`path`,
+/// `index`, `bold`, `oblique`, non-empty coords; the default instance is neither counted nor a target) holds
+/// [`INSTANCES_MAX`] entries: the least L1 distance over the F2Dot14 coords (a missing axis as 0), ties to the lower
+/// `Face.id` (the oldest). None while the family has room. The caller holds the guard; one scan, on a miss only.
+fn snap_instance(m: &LoadedMap, path: &std::path::Path, index: u32, bold: bool, oblique: bool, coords: &[i16]) -> Option<&'static Face> {
+    let family = move || m.iter().filter(move |(k, _)| !k.4.is_empty() && k.0.as_path() == path && k.1 == index && k.2 == bold && k.3 == oblique);
+    if family().count() < INSTANCES_MAX {
+        return None;
+    }
+    let l1 = |c: &[i16]| -> i32 {
+        (0..c.len().max(coords.len())).map(|i| (*c.get(i).unwrap_or(&0) as i32 - *coords.get(i).unwrap_or(&0) as i32).abs()).sum()
+    };
+    family().min_by_key(|(k, f)| (l1(&k.4), f.id)).map(|(_, f)| *f)
+}
+
+/// TEXTHOSTFACECACHEEVICTION (SR1004): how many faces the loaded-face cache holds (its map's len under the ONE lock),
+/// the witness metric (owed TEXTHOST-FACE-BYTES-WITNESS puts it on stria-view / aether's witness).
+pub fn faces_loaded_count() -> usize {
+    faces_loaded().lock().map(|m| m.map.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod facecache_eviction_tests {
+    use super::*;
+
+    fn addr(f: &Face) -> usize {
+        f as *const Face as usize
+    }
+
+    /// The (path, index, no synthesis) instance family of `info` under the lock.
+    fn family_len(info: &FaceInfo) -> usize {
+        let m = faces_loaded().lock().unwrap();
+        m.keys().filter(|k| !k.4.is_empty() && k.0 == info.path && k.1 == info.index && !k.2 && !k.3).count()
+    }
+
+    /// Inter (a distinct `docs/..` path component, so every key is this test's alone) at 20 distinct weights 100, 140,
+    /// ... 860: the first 16 load 16 objects, the family stays at INSTANCES_MAX, 740..860 snap to the 700 object (the
+    /// nearest: the axis map is monotonic), 341 to the 340 object, 900 (far, the axis max) to 700 (pinned), 340 again
+    /// is a plain hit; a bold instance is a new family's object; the snap inserted nothing (`by_id` == map len);
+    /// `faces_loaded_count` brackets the lock's len; a Face's inline size is bounded.
+    #[test]
+    fn facecache_instance_bound_snap_kat() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/..").join("fonts/inter/InterVariable.ttf");
+        let inter = db::faces_in_file(&p).into_iter().next().expect("the tree's Inter face");
+        let at = |w: f32| load_face_instance(&inter, false, false, &[(*b"wght", w)]).expect("Inter instances");
+        let weights: Vec<f32> = (0..20).map(|i| 100.0 + 40.0 * i as f32).collect();
+        let faces: Vec<&'static Face> = weights.iter().map(|&w| at(w)).collect();
+        let first: std::collections::HashSet<usize> = faces[..16].iter().map(|f| addr(f)).collect();
+        assert_eq!(first.len(), 16, "the first INSTANCES_MAX load distinct objects");
+        assert_eq!(family_len(&inter), INSTANCES_MAX, "the family is capped");
+        let w700 = faces[15];
+        assert_eq!(weights[15], 700.0);
+        for f in &faces[16..] {
+            assert!(std::ptr::eq(*f, w700), "740..860 snap to the nearest loaded instance, 700");
+        }
+        assert!(std::ptr::eq(at(341.0), faces[6]), "341 snaps to the 340 object");
+        assert_eq!(weights[6], 340.0);
+        assert!(std::ptr::eq(at(900.0), w700), "a far request still snaps (pinned)");
+        assert!(std::ptr::eq(at(340.0), faces[6]), "a loaded weight is a plain hit");
+        assert_eq!(family_len(&inter), INSTANCES_MAX, "snaps load nothing");
+        let bold = load_face_instance(&inter, true, false, &[(*b"wght", 900.0)]).expect("Inter instances bold");
+        assert!(bold.synth_bold && !faces.iter().any(|f| std::ptr::eq(*f, bold)), "the bound is per synthesis family");
+        {
+            let m = faces_loaded().lock().unwrap();
+            assert_eq!(m.by_id.len(), m.map.len(), "one index entry per map entry");
+        }
+        let a = faces_loaded_count();
+        let len = faces_loaded().lock().unwrap().map.len();
+        let b = faces_loaded_count();
+        assert!(a <= len && len <= b && a > 0, "the count is the lock's len (the map never shrinks): {a} {len} {b}");
+        assert!(std::mem::size_of::<Face>() <= 2048, "a Face is {} bytes inline", std::mem::size_of::<Face>());
+    }
+}
+
+// ---- TEXTHOSTFACEBYTESWITNESS (LEDGER SR1012): the face cache's count x bytes and its report line (named tail block) ----
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): `file_bytes`'s cache of font files (one leaked slice per path, None for an
+/// unreadable one), at the file tail so [`files_loaded_bytes`] reads it; `file_bytes` names it through a `use`.
+type FontFiles = Mutex<HashMap<PathBuf, Option<&'static [u8]>>>;
+static FONT_FILES: OnceLock<FontFiles> = OnceLock::new();
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the loaded-face cache (`faces_loaded`) and the font-file cache, counted by
+/// reading: `faces` entries, of which `instances` carry coords, in `families` instance families (the (file, index,
+/// synthetic bold, synthetic oblique) unit [`INSTANCES_MAX`] bounds); `face_bytes` the bytes those entries own
+/// ([`face_bytes`]); `files` font files read, `file_bytes` their leaked bytes (shared by every face of a file).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FacesReport {
+    pub faces: usize,
+    pub instances: usize,
+    pub families: usize,
+    pub face_bytes: usize,
+    pub files: usize,
+    pub file_bytes: usize,
+}
+
+impl FacesReport {
+    /// The report as one line (the devtools Performance panel's): `fonts: 23 faces (16 instances, 1 families) in
+    /// 51 KB + 1840 KB files (3)`, KB rounded to the nearest 1024 bytes.
+    pub fn line(&self) -> String {
+        let kb = |b: usize| (b + 512) / 1024;
+        format!(
+            "fonts: {} faces ({} instances, {} families) in {} KB + {} KB files ({})",
+            self.faces,
+            self.instances,
+            self.families,
+            kb(self.face_bytes),
+            kb(self.file_bytes),
+            self.files
+        )
+    }
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the bytes one loaded-face cache entry owns, by reading: the leaked `Face`
+/// (inline `Font`, which owns no buffer) and its family String's heap, the map's key (inline [`FaceKey`] + the
+/// PathBuf's and the coords Vec's heap) and value pointer, and `by_id`'s clone of the key and its u32. The hash
+/// tables' slot overhead and the allocator's rounding are not counted; the file bytes are [`files_loaded_bytes`]'s.
+fn face_bytes(face: &Face, key: &FaceKey) -> usize {
+    let key_bytes = std::mem::size_of::<FaceKey>() + key.0.capacity() + key.4.capacity() * std::mem::size_of::<i16>();
+    std::mem::size_of::<Face>() + face.family.capacity() + 2 * key_bytes + std::mem::size_of::<&Face>() + std::mem::size_of::<u32>()
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the face half of a [`FacesReport`] read off the held cache (the caller holds
+/// `faces_loaded`'s guard); families are counted without a set (an instance key counts when no earlier instance
+/// key shares its family). The file fields stay 0.
+fn report_of(l: &Loaded) -> FacesReport {
+    let inst = || l.map.keys().filter(|k| !k.4.is_empty());
+    let families =
+        inst().enumerate().filter(|(i, k)| !inst().take(*i).any(|j| j.0 == k.0 && j.1 == k.1 && j.2 == k.2 && j.3 == k.3)).count();
+    FacesReport {
+        faces: l.map.len(),
+        instances: inst().count(),
+        families,
+        face_bytes: l.map.iter().map(|(k, f)| face_bytes(f, k)).sum(),
+        files: 0,
+        file_bytes: 0,
+    }
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): (files read, their leaked bytes) off the held font-file cache.
+fn files_of(m: &HashMap<PathBuf, Option<&'static [u8]>>) -> (usize, usize) {
+    m.values().flatten().fold((0usize, 0usize), |(n, b), s| (n + 1, b + s.len()))
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the bytes of every font file read and kept for the process (`file_bytes`).
+pub fn files_loaded_bytes() -> usize {
+    FONT_FILES.get().and_then(|m| m.lock().ok()).map_or(0, |m| files_of(&m).1)
+}
+
+/// TEXTHOSTFACEBYTESWITNESS (SR1012): the face cache's report: its face half under `faces_loaded`'s ONE lock, then
+/// its file half under the font-file cache's lock (taken one after the other, never nested), by reading only.
+pub fn faces_report() -> FacesReport {
+    let mut r = faces_loaded().lock().map(|l| report_of(&l)).unwrap_or_default();
+    let (files, file_bytes) = FONT_FILES.get().and_then(|m| m.lock().ok()).map_or((0, 0), |m| files_of(&m));
+    r.files = files;
+    r.file_bytes = file_bytes;
+    r
+}
+
+#[cfg(test)]
+mod facebytes_witness_tests {
+    use super::*;
+
+    /// Inter through a `fonts/..` path component (PathBuf equality keeps `..`, so these keys are this test's alone).
+    fn inter() -> FaceInfo {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts/..").join("fonts/inter/InterVariable.ttf");
+        db::faces_in_file(&p).into_iter().next().expect("the tree's Inter face")
+    }
+
+    /// K loads (the base, five weight instances, the synthetic-bold base: 7 keys of this path, 5 of them instances):
+    /// on ONE guard the report's counts are the map's own, its bytes the sum of `face_bytes`, the instances within
+    /// SR1004's bound; this path's 7 entries own between the by-length estimate x their count and 5 % over it; the
+    /// public report's count is at least this test's keys (the map never shrinks).
+    #[test]
+    fn facebytes_witness_report_kat() {
+        let info = inter();
+        load_face(&info).expect("Inter loads");
+        for w in [300.0, 500.0, 600.0, 700.0, 800.0] {
+            load_face_instance(&info, false, false, &[(*b"wght", w)]).expect("Inter instances");
+        }
+        load_face_synth(&info, true, false).expect("Inter synthetic bold");
+        {
+            let g = faces_loaded().lock().unwrap();
+            let r = report_of(&g);
+            assert_eq!(r.faces, g.map.len());
+            assert_eq!(r.instances, g.map.keys().filter(|k| !k.4.is_empty()).count());
+            let fams: std::collections::HashSet<(PathBuf, u32, bool, bool)> =
+                g.map.keys().filter(|k| !k.4.is_empty()).map(|k| (k.0.clone(), k.1, k.2, k.3)).collect();
+            assert_eq!(r.families, fams.len());
+            assert_eq!(r.face_bytes, g.map.iter().map(|(k, f)| face_bytes(f, k)).sum::<usize>());
+            assert!(r.instances <= r.families * INSTANCES_MAX, "SR1004's bound: {r:?}");
+            assert_eq!((r.files, r.file_bytes), (0, 0), "the face half carries no file bytes");
+            let mine: Vec<(&FaceKey, &&'static Face)> = g.map.iter().filter(|(k, _)| k.0 == info.path).collect();
+            assert_eq!(mine.len(), 7, "base + 5 instances + synthetic bold");
+            assert_eq!(mine.iter().filter(|(k, _)| !k.4.is_empty()).count(), 5);
+            let est: usize = mine
+                .iter()
+                .map(|(k, f)| {
+                    std::mem::size_of::<Face>()
+                        + f.family.len()
+                        + 2 * (std::mem::size_of::<FaceKey>() + k.0.as_os_str().len() + k.4.len() * 2)
+                        + std::mem::size_of::<&Face>()
+                        + std::mem::size_of::<u32>()
+                })
+                .sum();
+            let got: usize = mine.iter().map(|(k, f)| face_bytes(f, k)).sum();
+            assert!(est <= got && got * 100 <= est * 105, "7 entries own {got} bytes, estimate {est}");
+        }
+        let r = faces_report();
+        assert!(r.faces >= 7 && r.instances >= 5 && r.families >= 1 && r.face_bytes > 0, "{r:?}");
+        assert!(r.files >= 1 && r.file_bytes > 0, "Inter's file is counted: {r:?}");
+    }
+
+    /// The font-file cache's half: on ONE guard `files_of` is the sum of the leaked slices' lengths and their count;
+    /// Inter's entry is its file's length on disk; `files_loaded_bytes` holds at least it.
+    #[test]
+    fn facebytes_witness_files_kat() {
+        let info = inter();
+        load_face(&info).expect("Inter loads");
+        let disk = std::fs::metadata(&info.path).expect("Inter on disk").len() as usize;
+        {
+            let g = FONT_FILES.get().expect("a file was read").lock().unwrap();
+            let want = g.values().filter_map(|b| *b).fold((0usize, 0usize), |(n, s), b| (n + 1, s + b.len()));
+            assert_eq!(files_of(&g), want);
+            assert_eq!(g.get(&info.path).copied().flatten().map(|b| b.len()), Some(disk), "the leaked slice is the file");
+        }
+        assert!(files_loaded_bytes() >= disk);
+    }
+
+    /// The panel line's format, pinned on literal reports (KB to the nearest 1024 bytes).
+    #[test]
+    fn facebytes_witness_line_kat() {
+        let r = FacesReport { faces: 23, instances: 16, families: 1, face_bytes: 52_000, files: 3, file_bytes: 1_884_160 };
+        assert_eq!(r.line(), "fonts: 23 faces (16 instances, 1 families) in 51 KB + 1840 KB files (3)");
+        assert_eq!(FacesReport::default().line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 0 KB files (0)");
+        let r = FacesReport { face_bytes: 511, file_bytes: 512, ..FacesReport::default() };
+        assert_eq!(r.line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 1 KB files (0)");
     }
 }
