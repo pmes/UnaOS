@@ -407,7 +407,7 @@ pub enum EditError {
     Xform,
     NoMarks, // STRIAINSERTMARKS (SR905): `insert-marked` / `overwrite-marked` with an export mark unset
     InsertForm, // STRIAINSERTMARKS (SR905): an `insert` / `overwrite` word in a shape other than bare or `<reel> <in> <out>`
-    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies
+    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold,
 }
 
 impl core::fmt::Display for EditError {
@@ -436,7 +436,7 @@ impl core::fmt::Display for EditError {
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
             EditError::NoMarks => "no in / out marks set", // STRIAINSERTMARKS (SR905)
             EditError::InsertForm => "insert / overwrite take nothing or <reel> <in> <out>", // STRIAINSERTMARKS (SR905)
-            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies",
+            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916)
         })
     }
 }
@@ -2601,7 +2601,7 @@ impl Timeline {
         let (track, ci) = crate::schedule::top(self, Kind::Video, t).ok_or(EditError::NoClip)?;
         let c = self.tracks[track].clips[ci];
         let f = c.src_at(t);
-        let hold = Clip::new(c.src, f, f + 1, t).at_rate(hold_rate(ticks));
+        let hold = Clip::new(c.src, f, f + 1, t).at_rate(hold_rate(ticks)); if hold.len() != ticks { return Err(EditError::Hold); } // STRIAFREEZELEN (SR916): an inexact hold refused by name
         Ok((self.place(track, hold, Mode::Insert)?, track))
     }
 }
@@ -2921,5 +2921,144 @@ impl Timeline {
             }
         }
         Ok(())
+    }
+}
+// ---- STRIAFREEZELEN (LEDGER SR916): the hold's length and its sync choice — Timeline::freeze_all, ripple_gap (named tail block) ----
+// `Timeline::freeze` stays THE one hold road; it now refuses by name (`EditError::Hold`) a length the one-tick hold rate cannot
+// lay exactly: `len(hold) == ticks` holds for 511 counts in 1..=65536 (every n <= 256, n(n-1) <= 0x1_0000 being sufficient, not
+// necessary: 258, 512, 65536 are exact, 257 and 500 are not). `freeze_all` is `freeze` and then, on EVERY other track, the same
+// gap opened at the playhead (`ripple_gap`: `place` Insert's room-making without the clip), in ONE value: a refusal on any track
+// (`Rate` off a rated clip's grid, `Transition` for a transition or audio crossfade on a cut at the playhead) refuses the whole
+// op. The export marks do not move (NLE-FREEZE-MARKS owed).
+impl Timeline {
+    /// STRIAFREEZELEN: [`Timeline::freeze`] at tick `t` for `ticks` ticks, and every other track rippled by `ticks` at `t` (the
+    /// clip spanning `t` split, every clip from `t` on moved later), so picture and sound stay in sync after the hold. Returns
+    /// the new timeline and the hold's track. Refused by name: `freeze`'s own refusals, and any track's `ripple_gap` refusal.
+    pub fn freeze_all(&self, t: i64, ticks: i64) -> Result<(Timeline, usize), EditError> {
+        let (mut tl, track) = self.freeze(t, ticks)?;
+        for k in (0..tl.tracks.len()).filter(|&k| k != track) {
+            tl = tl.ripple_gap(k, t, ticks)?;
+        }
+        Ok((tl, track))
+    }
+
+    /// STRIAFREEZELEN: open a gap of `len` ticks at tick `at` on `track`: the clip strictly spanning `at` is split there (a
+    /// rated clip off its frame grid `Rate`), every clip from `at` on moves later by `len`, the track's transitions and audio
+    /// crossfades follow (`retarget_transitions`; one on a cut at `at` is gone: `Transition`); `validate` is the gate.
+    fn ripple_gap(&self, track: usize, at: i64, len: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        if !cut_clean(t, at) {
+            return Err(EditError::Rate);
+        }
+        split_at(t, at);
+        for c in t.clips.iter_mut().filter(|c| c.at >= at) {
+            c.at += len;
+        }
+        tl.retarget_transitions(self)?;
+        tl.validate()?;
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striafreezelen_tests {
+    extern crate std;
+    use super::*;
+
+    /// V1 and A1 alike: A[0,20)@0 and B[0,10)@30.
+    fn fixture() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for k in 0..2 {
+            tl.tracks[k].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 30)];
+        }
+        tl
+    }
+
+    #[test]
+    fn striafreezelen_exact_or_refused() {
+        let tl = fixture();
+        assert_eq!(tl.freeze(7, 257), Err(EditError::Hold), "257 would lay 256");
+        assert_eq!(tl.freeze(7, 500), Err(EditError::Hold), "500 would lay 497");
+        assert_eq!(tl.freeze_all(7, 257), Err(EditError::Hold));
+        let (big, _) = tl.freeze(7, 512).unwrap();
+        assert_eq!((big.tracks[0].clips[1].rate_q16, big.tracks[0].clips[1].len()), (128, 512), "past 256, an exact count is laid");
+        let (two, _) = tl.freeze(7, 50).unwrap();
+        assert_eq!(two.tracks[0].clips[1].len(), 50, "SR880's 2 s hold unchanged");
+        std::println!("striafreezelen: 257 / 500 refused Hold; 512 laid at rate 128; 50 as before");
+    }
+
+    #[test]
+    fn striafreezelen_all_ripples_every_track() {
+        let mut tl = fixture();
+        let b = SourceId(1);
+        tl.add_track(Kind::Video);
+        tl.tracks[2].clips = alloc::vec![Clip::new(b, 20, 30, 5)];
+        let (fr, track) = tl.freeze_all(7, 50).unwrap();
+        assert_eq!(track, 2, "the hold sits on the topmost video track, as in the preview");
+        let v2 = &fr.tracks[2].clips;
+        assert_eq!((v2[1].src_in, v2[1].src_out, v2[1].at, v2[1].len()), (22, 23, 7, 50));
+        assert_eq!((v2[2].src_in, v2[2].at), (22, 57));
+        let v1: Vec<(i64, i64, i64)> = fr.tracks[0].clips.iter().map(|c| (c.src_in, c.src_out, c.at)).collect();
+        assert_eq!(v1, alloc::vec![(0, 7, 0), (7, 20, 57), (0, 10, 80)], "V1 split at 7 and rippled by 50");
+        assert_eq!(fr.tracks[1].clips, fr.tracks[0].clips, "A1 takes the same gap: picture and sound stay in sync");
+        assert_eq!(fr.end(), tl.end() + 50);
+        let (one, _) = tl.freeze(7, 50).unwrap();
+        assert_eq!(&one.tracks[..2], &tl.tracks[..2], "plain freeze ripples the hold's track only");
+        std::println!("striafreezelen: freeze-all at 7 -> hold on V2, V1 and A1 split at 7 and moved by 50");
+    }
+
+    #[test]
+    fn striafreezelen_all_or_nothing() {
+        let mut slow = fixture();
+        slow.tracks[1].clips[0] = Clip::new(SourceId(0), 0, 10, 0).at_rate(0x8000);
+        assert_eq!(slow.freeze_all(3, 50), Err(EditError::Rate), "A1's 0.5x clip is off its grid at 3");
+        assert!(slow.freeze(3, 50).is_ok(), "the hold's own track alone is fine");
+        let mut xf = Timeline::new(25);
+        let a = xf.add_source("A", 50);
+        let b = xf.add_source("B", 50);
+        xf.add_track(Kind::Video);
+        xf.add_track(Kind::Audio);
+        xf.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
+        xf.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 20)];
+        let xf = xf.add_audio_xfade(1, 20, 4, Curve::Linear).unwrap();
+        assert_eq!(xf.freeze_all(20, 50), Err(EditError::Transition), "a gap on the crossfaded cut is refused, never dropped");
+        assert!(xf.freeze(20, 50).is_ok());
+        assert_eq!(xf.freeze_all(10, 50).map(|(t, _)| t.audio_xfades[0].at), Ok(70), "a crossfade past the playhead moves");
+    }
+
+    #[test]
+    fn striafreezelen_words() {
+        use crate::editor::freeze_words;
+        assert_eq!(freeze_words("freeze", Some(25)), Some(Ok((50, false))));
+        assert_eq!(freeze_words("freeze-all", Some(25)), Some(Ok((50, true))));
+        assert_eq!(freeze_words("freeze 1.5", Some(25)), Some(Ok((38, false))), "37.5 ticks rounds half up");
+        assert_eq!(freeze_words("freeze 0.5", Some(25)), Some(Ok((13, false))));
+        assert_eq!(freeze_words("freeze-all 00:00:01:05", Some(25)), Some(Ok((30, true))));
+        assert_eq!(freeze_words("freeze 00:00:01:30", Some(25)), Some(Err(EditError::Hold)), "frames past the rate");
+        assert_eq!(freeze_words("freeze x", Some(25)), Some(Err(EditError::Hold)));
+        assert_eq!(freeze_words("freeze 1 2", Some(25)), Some(Err(EditError::Hold)));
+        assert_eq!(freeze_words("freeze", None), Some(Err(EditError::Rate)));
+        assert_eq!(freeze_words("freezer", Some(25)), None);
+        assert_eq!(freeze_words("split", Some(25)), None);
+    }
+
+    #[test]
+    fn striafreezelen_one_undo_step() {
+        let tl = fixture();
+        let mut st = crate::editor::EditorState::new(tl.clone());
+        st.seek(7);
+        assert_eq!(st.verb("freeze-all 1"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selection, st.timeline.end()), (1, Some((0, 1)), tl.end() + 25));
+        assert_eq!(st.timeline.tracks[1].clips[1].at, 32, "A1 rippled in the same commit");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl, "one undo restores every track");
+        assert_eq!(st.verb("freeze 20"), Some(Err(EditError::Hold)), "500 ticks is not an exact hold");
+        assert_eq!(st.verb("freeze 0"), Some(Err(EditError::Empty)));
+        assert_eq!(st.undo_depth(), 0, "a refusal pushes no undo step");
     }
 }

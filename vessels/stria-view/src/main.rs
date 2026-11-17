@@ -554,6 +554,7 @@ fn transport() -> TetraNode {
         button("normalize", "Normalize"), // STRIANORMALIZE (SR878): the selected audio clip's gain to its exact peak at -1 dBFS
         button("recover", "Recover"), // STRIAAUTOSAVE (SR883): loads the document's newer autosave (`<stem>.autosave.edl`) as one undo step
         button("history", "History"), button("freeze", "Freeze"), // STRIAFREEZEFRAME (SR880): a 2 s hold of the playhead's frame (THE `freeze` verb)
+        button("freeze-all", "Freeze all"), // STRIAFREEZELEN (SR916): a 2 s hold that ripples every track (THE `freeze-all` verb)
         button("pan-", "Pan L"), button("pan", "Pan C"), button("pan+", "Pan R"), // STRIAPANFACE (SR897): step / centre the selected clip's pan
         button("crop", "Uncrop"), // STRIACROPFACE (SR900): clears the selection's crop (THE `crop` word)
         button("proxy", "Proxy"), // STRIAPROXYMEDIA (SR882): a half-size H.264 of the selected clip's source, beside it; the preview reads it, an export never

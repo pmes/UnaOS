@@ -8691,3 +8691,51 @@ fn striaproxyoff_usage_and_refusals() {
     assert!(!VERBS.contains(&"proxy off") && !VERBS.contains(&"proxy all"));
     println!("striaproxyoff usage: proxy [off|all]");
 }
+
+// ---- STRIAFREEZELEN (LEDGER SR916): the hold's length and `freeze-all` through the face (named tail block) ----
+
+/// synth_fixture (V1 = A1: A[13,23)@0 | B@10 | A@25, 25 fps): `freeze-all 1` at tick 5 lays a 25-tick hold on V1 and opens the
+/// same gap on A1, so every clip after the hold sits where its A1 twin sits; one undo restores both tracks.
+#[test]
+fn striafreezelen_face_freeze_all_keeps_sync() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    assert_eq!(VERBS.iter().position(|v| *v == "freeze-all").map(|i| (VERBS[i - 1], VERBS[i + 1])), Some(("freeze", "help")), "freeze-all sits between freeze and help");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(5);
+    assert!(face.verb("freeze-all 1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let fr = face.state.timeline.clone();
+    assert_eq!(fr.end(), tl.end() + 25, "a 1 s hold at 25 fps");
+    let h = fr.tracks[0].clips[1];
+    assert_eq!((h.src_in, h.src_out, h.at, h.len()), (18, 19, 5, 25));
+    let mut v1 = fr.tracks[0].clips.clone();
+    v1.remove(1);
+    assert_eq!(v1, fr.tracks[1].clips, "V1 without the hold is A1: picture and sound stay in sync");
+    assert_eq!(fr.tracks[1].clips.iter().map(|c| c.at).collect::<Vec<_>>(), vec![0, 30, 35, 50], "A1 split at 5 and rippled by 25");
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "one undo step");
+    println!("striafreezelen: freeze-all 1 at 5 -> hold 5..30 on V1, A1 gapped 5..30, one undo");
+}
+
+/// `freeze <len>`: decimal seconds round half up to a tick, a timecode reads as the EDL's, an inexact hold is refused by name
+/// on the message line and pushes no undo step.
+#[test]
+fn striafreezelen_face_lengths() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(5);
+    for (word, ticks) in [("freeze 0.5", 13), ("freeze 00:00:01:05", 30), ("freeze", 50)] {
+        assert!(face.verb(word));
+        assert!(face.last_error.is_none(), "{word}: {:?}", face.last_error);
+        assert_eq!((face.state.timeline.end(), face.state.timeline.tracks[0].clips[1].len()), (tl.end() + ticks, ticks), "{word}");
+        assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "{word}: plain freeze leaves A1");
+        assert!(face.state.undo());
+    }
+    assert!(face.verb("freeze 20"));
+    assert!(face.last_error.as_deref().is_some_and(|e| e.contains("no exact one-frame hold")), "{:?}", face.last_error);
+    assert_eq!((face.state.undo_depth(), &face.state.timeline), (0, &tl), "a refusal leaves the state");
+    println!("striafreezelen: freeze 0.5 -> 13, 00:00:01:05 -> 30, bare -> 50; freeze 20 (500 ticks) refused Hold");
+}
