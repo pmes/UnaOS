@@ -753,7 +753,7 @@ pub const SNAP_PX: f64 = 6.0;
 pub const MARQUEE_MIN: f64 = 3.0;
 
 /// Where a moving edge may snap: every clip's `at` and `end` on any track except the `exclude`d clips', plus the
-/// playhead when `playhead`; sorted, deduped.
+/// playhead when `playhead`; sorted, deduped; STRIASNAPDRAG (SR836): tick 0 and the set in / out marks.
 pub fn snap_targets(st: &EditorState, exclude: &[(usize, usize)], playhead: bool) -> Vec<i64> {
     let mut v = Vec::new();
     for (t, tr) in st.timeline.tracks.iter().enumerate() {
@@ -767,6 +767,7 @@ pub fn snap_targets(st: &EditorState, exclude: &[(usize, usize)], playhead: bool
     if playhead {
         v.push(st.playhead);
     }
+    v.extend(fixed_targets(&st.timeline)); // STRIASNAPDRAG (SR836): tick 0 and the set in / out marks (file tail)
     v.sort_unstable();
     v.dedup();
     v
@@ -1425,5 +1426,113 @@ mod waveform_tests {
         assert!(q1 < q3, "the fade tapers the first half: {q1} vs {q3}");
         assert_eq!(q3, 36);
         assert_eq!(bar(&buf, &l, 1), 0, "silent at the clip's first tick");
+    }
+}
+
+// ---- STRIASNAPDRAG (LEDGER SR836): tick 0 and the in / out marks are snap targets (named tail block) ----
+// NLE2c (SR217) snaps a moving edge to every other clip's edges and the playhead; NLE6FACEDRAG / NLE6DRAGSNAP (B975 / B977)
+// moved that into this view so both faces share it. The ONE target list, [`snap_targets`], also takes the timeline's start
+// and the export marks (`Timeline::marks`, NLE5DRANGESAVE SR723) when set, so every snapping drag (move, trims, slide,
+// scrub, transition edges) on the host face and the kernel band gains them at once. Owed: NLE-SNAP-MARKERS (SR835's
+// markers here once landed), NLE-SNAP-TOGGLE, NLE-SNAP-MAGNET-AUDIO.
+
+/// The targets every drag has whatever moves: tick 0 and each set in / out mark.
+fn fixed_targets(tl: &Timeline) -> impl Iterator<Item = i64> {
+    [Some(0), tl.marks.0, tl.marks.1].into_iter().flatten()
+}
+
+#[cfg(test)]
+mod striasnapdrag_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// V: A 4..14 and A 30..40; A: A 16..24; no clip starts at 0. The marks as given.
+    fn fixture(marks: (Option<i64>, Option<i64>)) -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 4), Clip::new(a, 20, 30, 30)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 8, 16)];
+        EditorState::new(tl.set_marks(marks).unwrap())
+    }
+
+    /// M3: the list carries every other clip edge once (the dragged clip's excluded), tick 0, each set mark and the
+    /// playhead when asked; no marks adds only tick 0.
+    #[test]
+    fn striasnapdrag_targets_carry_zero_and_the_marks() {
+        let mut st = fixture((Some(50), Some(70)));
+        st.seek(20);
+        assert_eq!(snap_targets(&st, &[(0, 0)], true), alloc::vec![0, 16, 20, 24, 30, 40, 50, 70]);
+        let st = fixture((Some(50), None));
+        assert_eq!(snap_targets(&st, &[(0, 0)], false), alloc::vec![0, 16, 24, 30, 40, 50]);
+        let st = fixture((None, None));
+        assert_eq!(snap_targets(&st, &[], false), alloc::vec![0, 4, 14, 16, 24, 30, 40]);
+    }
+
+    /// M3: a body drag of A 30..40 whose in edge lands 3 px short of the in mark at 50 (raw 19 ticks) snaps to it
+    /// (delta 20, the guide at 50) and commits flush on the mark; with no mark, or begun with no-snap, the raw 19 stands.
+    #[test]
+    fn striasnapdrag_move_snaps_to_a_mark() {
+        let st0 = fixture((Some(50), None));
+        let l = Layout::of_role(Role::Tracks, 800, 96, &st0);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        let x = l.x_of(35) as f64 + 1.0;
+        let to = x + 20.0 * z - 3.0;
+        let mut st = st0.clone();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        assert_eq!((d.kind, d.idx, d.origin_tick), (DragKind::Move, 1, 35));
+        d.update(&st, to, y);
+        assert_eq!(l.tick_at(to) - d.origin_tick, 19, "the raw delta");
+        assert_eq!((d.delta, d.guide), (20, Some(50)));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline.tracks[0].clips[1].at, 50, "flush on the mark");
+        let mut st = fixture((None, None));
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        d.update(&st, to, y);
+        assert_eq!((d.delta, d.guide), (19, None), "no mark: nothing in reach");
+        let mut st = st0.clone();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap();
+        d.update(&st, to, y);
+        assert_eq!((d.delta, d.guide), (19, None), "no-snap");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline.tracks[0].clips[1].at, 49);
+    }
+
+    /// M3: at zoom 1 (1 px a tick) a trim-in of the selected A 3..13 (source in 10) pressed at x 4 and dragged to x 2 puts
+    /// its in edge 1 px from tick 0 (raw -2) and snaps there (delta -3, the guide at 0; the playhead sits at the timeline's end, 13 px off).
+    #[test]
+    fn striasnapdrag_trim_in_snaps_to_tick_zero() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 10, 20, 3)];
+        let mut st = EditorState::new(tl);
+        st.zoom = 1;
+        st.seek(13);
+        st.select(0, 0).unwrap();
+        let l = Layout::of_role(Role::Tracks, 800, 96, &st);
+        assert_eq!((l.zoom, l.t0), (1, 0));
+        let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
+        let mut d = Drag::begin_with(&mut st, l, 4.0, y, false, false, false).unwrap();
+        assert_eq!((d.kind, d.origin_tick), (DragKind::TrimIn, 4));
+        d.update(&st, 2.0, y);
+        assert_eq!((d.delta, d.guide), (-3, Some(0)));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline.tracks[0].clips[0], Clip::new(a, 7, 20, 0));
+    }
+
+    /// M3: a ruler scrub pressed at tick 60 and moved 3 px short of the out mark at 70 (raw 69) snaps the playhead there.
+    #[test]
+    fn striasnapdrag_scrub_snaps_to_the_out_mark() {
+        let mut st = fixture((Some(50), Some(70)));
+        let l = Layout::of_role(Role::Tracks, 800, 96, &st);
+        let y = l.ruler_y as f64 + 5.0;
+        let mut d = Drag::begin_with(&mut st, l, l.x_of(60) as f64 + 1.0, y, false, false, false).unwrap();
+        assert_eq!((d.kind, d.origin_tick), (DragKind::Scrub, 60));
+        let to = l.x_of(70) as f64 - 3.0;
+        d.update(&st, to, y);
+        assert_eq!(l.tick_at(to), 69, "the raw tick");
+        assert_eq!((d.origin_tick + d.delta, d.guide), (70, Some(70)));
     }
 }
