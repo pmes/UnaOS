@@ -813,7 +813,7 @@ fn t_monochrome_picture_hash_sei_gives_a_verdict() {
         let crc = plane_crc(&Plane { w: 8, h: 8, data: y.to_vec() }, 8).wrapping_add(delta);
         vec![132, 3, 1, (crc >> 8) as u8, crc as u8, 0x80]
     };
-    for (delta, want) in [(0u16, HashCheck::Match), (1, HashCheck::Mismatch(0))] {
+    for (delta, want) in [(0u16, HashCheck::Match), (1, HashCheck::Mismatch(0b001))] { // SR1090: cIdx mask
         let f = crc_sei(delta);
         let (s, _) = mono_pcm(1, Some(&f as &dyn Fn(&[u16]) -> Vec<u8>));
         let mut d = Decoder::new();
@@ -892,7 +892,7 @@ fn v_monochrome_picture_md5_sei_gives_a_verdict() {
         rbsp.push(0x80);
         rbsp
     };
-    for (delta, want) in [(0u8, HashCheck::Match), (1, HashCheck::Mismatch(0))] {
+    for (delta, want) in [(0u8, HashCheck::Match), (1, HashCheck::Mismatch(0b001))] { // SR1090: cIdx mask
         let f = md5_sei(delta);
         let (s, _) = mono_pcm(1, Some(&f as &dyn Fn(&[u16]) -> Vec<u8>));
         let mut d = Decoder::new();
