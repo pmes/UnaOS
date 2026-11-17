@@ -4020,3 +4020,21 @@ fn striaspeedreverse_face_word_toggles_in_one_step_and_saves_the_sign() {
     assert_eq!(face.state.timeline, tl, "undo restores");
     println!("striaspeedreverse: face `reverse` -> M2 -025.0; `[` -> {}", timeline_core::EditError::Rate);
 }
+
+// ---- STRIAKREVERSE (LEDGER SR9095): `a` is the word `reverse` on the host face (the kernel Player's EDIT_KEYS `a` too) (named tail block) ----
+
+/// `a` (text) toggles the selected clip's reverse through the ONE word (one undo step each way), and the help names it.
+#[test]
+fn striakreverse_key_a_toggles_reverse_in_one_step() {
+    assert!(KEYS.contains(&("a", "reverse")));
+    assert_eq!(help_phrase("reverse"), "play the clip backwards (again: forwards)");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    assert!(nle5drangekeys_press(&mut face, "a"));
+    assert_eq!((face.state.selected().map(|c| c.reverse), face.state.undo_depth()), (Some(true), 1));
+    assert!(nle5drangekeys_press(&mut face, "a"));
+    assert_eq!((face.state.selected().map(|c| c.reverse), face.state.undo_depth()), (Some(false), 2));
+    assert_eq!(face.state.timeline, tl, "two presses restore the forward clip");
+    println!("striakreverse: key a -> reverse x2, undo={}", face.state.undo_depth());
+}

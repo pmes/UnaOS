@@ -44,6 +44,7 @@
 //! transition TO black fades the outgoing's handle out in the track's gap ([`crate::Timeline::fade_to_silence`]): the
 //! clip's layer continues past its end under the falling weight, on its own slot.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -514,5 +515,134 @@ impl AudioRun {
             return None;
         }
         tl.clip_at(l.track, self.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src)
+    }
+}
+
+// ---- STRIAKREVERSE (LEDGER SR9095): the back-cache rule and the reversed layer, both faces (named tail block) ----
+// A reversed clip's source ticks DESCEND (THE `Clip::src_at`); a decoder runs forward only. The host's render (nle.rs
+// `vid_back` / `take_reversed`) and the kernel Player (vplay.rs `edl_back` / `snd::seat_rev`) serve it by ONE rule:
+// VIDEO: a continuing run (same source, no seek) steps by [`back_step`]: on or past the frame it last showed with no cache
+// is the forward road; with a cache, the same frame holds and a later one drops the run (the forward road re-opens it);
+// behind it, the newest cached frame at or before the target ([`back_pick`]) is served, else the run is refilled from the
+// keyframe at or before the target, keeping the last [`BACK_CACHE`] frames ([`back_keep`]). AUDIO: a reversed layer's run
+// hears source ticks `reversed_lo ..= src_at(out_t)`; it is read FORWARD from [`AudioRun::reversed_lo`] and its frames
+// turned round by [`reverse_frames`].
+
+/// STRIAKREVERSE: how many decoded frames a backward run keeps (both faces).
+pub const BACK_CACHE: usize = 16;
+
+/// STRIAKREVERSE: what a continuing video run does for its next target ([`back_step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackStep {
+    /// Not behind the shown frame and no cache: the forward road (every forward run).
+    Forward,
+    /// Within `tol` of the shown frame, a cache held: the shown frame again.
+    Hold,
+    /// Past the shown frame with a cache: drop the run, the forward road re-opens it.
+    Drop,
+    /// Behind the shown frame and the cache reaches the target: serve [`back_pick`].
+    Cached,
+    /// Behind the shown frame and the cache does not reach it: re-open at the keyframe and decode up to the target.
+    Refill,
+}
+
+/// STRIAKREVERSE: the step for `target` (ns) when the run last showed `shown` (ns); `front`: the oldest cached frame's ns
+/// (`None`: no cache); `tol` the faces' half tick.
+pub fn back_step(target: i64, shown: i64, tol: i64, front: Option<i64>) -> BackStep {
+    if target >= shown - tol {
+        return match front {
+            None => BackStep::Forward,
+            Some(_) if target <= shown + tol => BackStep::Hold,
+            Some(_) => BackStep::Drop,
+        };
+    }
+    if front.is_some_and(|f| f <= target + tol) { BackStep::Cached } else { BackStep::Refill }
+}
+
+/// STRIAKREVERSE: keep `f` as the newest cached frame, the oldest dropped past [`BACK_CACHE`].
+pub fn back_keep<T>(q: &mut VecDeque<T>, f: T) {
+    q.push_back(f);
+    while q.len() > BACK_CACHE {
+        q.pop_front();
+    }
+}
+
+/// STRIAKREVERSE: the newest cached frame at or before `target + tol` (`ns` reads a frame's time).
+pub fn back_pick<T>(q: &VecDeque<T>, target: i64, tol: i64, ns: impl Fn(&T) -> i64) -> Option<&T> {
+    q.iter().rev().find(|f| ns(f) <= target + tol)
+}
+
+/// STRIAKREVERSE: interleaved frames of `ch` channels turned round in place (the channel order inside a frame kept).
+pub fn reverse_frames<T>(pcm: &mut [T], ch: usize) {
+    let ch = ch.max(1);
+    let n = pcm.len() / ch * ch;
+    pcm[..n].reverse();
+    for f in pcm[..n].chunks_mut(ch) {
+        f.reverse();
+    }
+}
+
+impl AudioRun {
+    /// STRIAKREVERSE: the lowest source tick layer `li` hears when it plays a reversed clip ([`AudioRun::layer_clip`]):
+    /// `src_at` of the run's last tick; `None` for a forward layer, an under layer or a handle.
+    pub fn reversed_lo(&self, tl: &Timeline, li: usize) -> Option<i64> {
+        let c = self.layer_clip(tl, li).filter(|c| c.reverse)?;
+        Some(c.src_at(self.out_t + self.len - 1))
+    }
+}
+
+#[cfg(test)]
+mod striakreverse_tests {
+    extern crate std;
+    use super::*;
+    use crate::Clip;
+
+    #[test]
+    fn striakreverse_back_step_names_each_arm() {
+        assert_eq!(back_step(40, 40, 20, None), BackStep::Forward);
+        assert_eq!(back_step(80, 40, 20, None), BackStep::Forward);
+        assert_eq!(back_step(40, 40, 20, Some(0)), BackStep::Hold);
+        assert_eq!(back_step(80, 40, 20, Some(0)), BackStep::Drop);
+        assert_eq!(back_step(0, 40, 10, Some(0)), BackStep::Cached);
+        assert_eq!(back_step(0, 40, 10, Some(20)), BackStep::Refill);
+        assert_eq!(back_step(0, 40, 10, None), BackStep::Refill);
+    }
+
+    #[test]
+    fn striakreverse_back_keep_caps_and_back_pick_takes_the_newest_at_or_before() {
+        let mut q = VecDeque::new();
+        for i in 0..(BACK_CACHE as i64 + 4) {
+            back_keep(&mut q, i * 10);
+        }
+        assert_eq!(q.len(), BACK_CACHE);
+        assert_eq!(q.front().copied(), Some(40), "the oldest four dropped");
+        assert_eq!(back_pick(&q, 95, 4, |f| *f).copied(), Some(90));
+        assert_eq!(back_pick(&q, 96, 4, |f| *f).copied(), Some(100));
+        assert_eq!(back_pick(&q, 30, 4, |f| *f), None);
+    }
+
+    #[test]
+    fn striakreverse_reverse_frames_keeps_the_channel_order() {
+        let mut st = [1, 2, 3, 4, 5, 6];
+        reverse_frames(&mut st, 2);
+        assert_eq!(st, [5, 6, 3, 4, 1, 2]);
+        let mut mono = [1.0f32, 2.0, 3.0];
+        reverse_frames(&mut mono, 1);
+        assert_eq!(mono, [3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn striakreverse_reversed_lo_is_the_runs_lowest_source_tick() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 10, 15, 0).reversed(true)];
+        let layer = Layer { track: 0, src: a, src_t: 14, seek: None, gain_cdb: 0, env: [ENV_ONE, ENV_ONE] };
+        let whole = AudioRun { out_t: 0, len: 5, layers: alloc::vec![layer] };
+        assert_eq!(whole.reversed_lo(&tl, 0), Some(10));
+        let head = AudioRun { out_t: 0, len: 2, layers: alloc::vec![layer] };
+        assert_eq!(head.reversed_lo(&tl, 0), Some(13));
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 10, 15, 0)];
+        assert_eq!(whole.reversed_lo(&tl, 0), None, "a forward clip");
     }
 }
