@@ -979,6 +979,7 @@ pub struct EdlReport {
     pub swaps: u64,
     pub stand_in_frames: u64,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
+    pub layer: Option<u8>, pub layer_mixed: u64, pub layer_refused: u64, // STRIAKOPACITY (SR9013): this step's layer opacity (`schedule::step_opacity`), opacity ticks mixed and refused (file tail)
 }
 
 static NLE: crate::sync::Mutex<Option<EdlReport>> = crate::sync::Mutex::new(None);
@@ -1008,7 +1009,7 @@ fn edl_task(arg: usize) {
         "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={} swaps={} standin={}",
         rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max, rep.swaps, rep.stand_in_frames
     );
-    let frames = rep.frames;
+    let frames = rep.frames; layer_exit(&rep); // STRIAKOPACITY (SR9013): the opacity ticks' counts, only when nonzero (file tail)
     *NLE.lock() = Some(rep);
     let why = match r {
         Ok(()) => {
@@ -1080,7 +1081,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if rep.plan.len() < SHOWN_CAP {
             rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
         }
-        let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err();
+        rep.layer = timeline_core::schedule::step_opacity(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIAKOPACITY (SR9013): the step's layer opacity names its mix on the wire (file tail)
         let mut frame = match s.src {
             None => {
                 if s.vmix.is_none() {
@@ -1234,7 +1235,7 @@ fn edl_mix(
         rep.mixes.push((out_t, sum));
     }
     frame.px = pack(&a).into();
-    rep.mixed += 1;
+    rep.mixed += 1; rep.layer_mixed += rep.layer.is_some() as u64; // STRIAKOPACITY (SR9013): an opacity tick mixed (file tail)
     rep.mix_us_max = rep.mix_us_max.max(crate::hidstall::now_us().saturating_sub(t0));
     Ok(())
 }
@@ -1253,9 +1254,9 @@ fn slot_room(w: usize, h: usize) -> Result<(), String> {
 
 /// A refused second slot: counted, and named on the wire for the first four.
 fn edl_refuse(rep: &mut EdlReport, why: &str) {
-    rep.mix_refused += 1;
+    rep.mix_refused += 1; rep.layer_refused += rep.layer.is_some() as u64; // STRIAKOPACITY (SR9013): an opacity tick refused (file tail)
     if rep.mix_refused <= 4 {
-        serial_println!("[vplay] transition: second decoder slot refused ({})", why);
+        if !layer_refused_line(rep, why) { serial_println!("[vplay] transition: second decoder slot refused ({})", why); } // STRIAKOPACITY (SR9013): an opacity tick's refusal names its layer (file tail)
     }
 }
 
@@ -1842,7 +1843,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 20] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1862,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'8', "opacity-"), (b'9', "opacity+"), // STRIAKOPACITY (SR9013): the host's KEYS 8 / 9, the shown clip's opacity 10 % down / up (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1916,7 +1918,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         }
         let before = st.timeline.clone();
         match st.verb(verb) {
-            Some(Ok(())) if st.timeline != before => edit_size_note(st, verb, at), // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
+            Some(Ok(())) if st.timeline != before => { edit_size_note(st, verb, at); edit_opacity_note(st, verb, at) } // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail); STRIAKOPACITY (SR9013): the opacity key's new percent (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
                 return None;
@@ -2664,4 +2666,37 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKOPACITY (LEDGER SR9013): the opacity layer's wire and the Player's opacity keys (named tail block) ----
+// The Player already blends a non-opaque winner through SR868's Dissolve `VideoMix` (`edl_mix`, the ONE `vmix::mix_step`).
+// Each video step's layer opacity is timeline_core's `schedule::step_opacity` (`EdlReport.layer`): a refused second slot on
+// an opacity tick reads `[vplay] opacity: <pct>% layer's second decoder slot refused (<why>); the top shows opaque` instead
+// of the transition line, and the job's opacity ticks are counted, `[nle] opacity layer mixed=<n> refused=<n>` after
+// `[nle] job exit` (only when nonzero: an opaque or transition EDL's serial is byte-identical). [`EDIT_KEYS`] `8` / `9`
+// are the host KEYS' `opacity-` / `opacity+` on the clip [`edit_key`] selects ([`shown_clip`]: the top layer, the clip whose
+// opacity shows), through `EditorState::verb`'s one commit; `[nle] edit opacity<-|+> -> <pct>% at=<tick>`.
+
+/// STRIAKOPACITY: an opacity tick's refused second slot named by its layer; false (nothing printed) off an opacity tick.
+fn layer_refused_line(rep: &EdlReport, why: &str) -> bool {
+    let Some(p) = rep.layer else { return false };
+    serial_println!("[vplay] opacity: {}% layer's second decoder slot refused ({}); the top shows opaque", p, why);
+    true
+}
+
+/// STRIAKOPACITY: the job's opacity ticks, mixed and refused; nothing when the EDL has none.
+fn layer_exit(rep: &EdlReport) {
+    if rep.layer_mixed == 0 && rep.layer_refused == 0 {
+        return;
+    }
+    serial_println!("[nle] opacity layer mixed={} refused={}", rep.layer_mixed, rep.layer_refused);
+}
+
+/// STRIAKOPACITY: after an `opacity-` / `opacity+` key changed the timeline, the selected clip's new percent.
+fn edit_opacity_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) {
+    if verb != "opacity-" && verb != "opacity+" {
+        return;
+    }
+    let Some(c) = st.selected() else { return };
+    serial_println!("[nle] edit {} -> {}% at={}", verb, c.opacity, at);
 }

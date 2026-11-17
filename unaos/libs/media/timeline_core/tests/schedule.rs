@@ -246,3 +246,30 @@ fn striaopacity_validate_refuses_by_name() {
     assert_eq!(tl.set_opacity(&[(a, 0)], 100).map(|t| t.tracks[a].clips[0].opacity), Ok(100));
     assert_eq!(EditError::Opacity.to_string(), "opacity is a percent 0..=100, and video only");
 }
+
+// ---- STRIAKOPACITY (LEDGER SR9013): a step's layer opacity, the read the kernel Player names its mix by (named tail block) ----
+
+/// 50%: `step_opacity` is `Some(50)` on the overlay ticks 10..20 and `None` outside; an opaque top is `None` everywhere;
+/// 0% is `Some(0)`; a transition's mixed steps (V1 alone, a dissolve at 15) are `None`.
+#[test]
+fn striakopacity_step_opacity_names_the_layer() {
+    use timeline_core::TransitionKind;
+    use timeline_core::schedule::step_opacity;
+    let g = Gop { dur: 50 };
+    let tl = striaopacity_stack(50);
+    for s in schedule(&tl, 0..30, &g).unwrap() {
+        assert_eq!(step_opacity(&tl, &s), (10..20).contains(&s.out_t).then_some(50), "tick {}", s.out_t);
+    }
+    let op = striaopacity_stack(timeline_core::OPAQUE);
+    assert!(schedule(&op, 0..30, &g).unwrap().iter().all(|s| step_opacity(&op, s).is_none()));
+    let zero = striaopacity_stack(0);
+    assert_eq!(schedule(&zero, 10..11, &g).unwrap().iter().map(|s| step_opacity(&zero, s)).collect::<Vec<_>>(), [Some(0)]);
+    let mut tl = striaopacity_stack(timeline_core::OPAQUE);
+    tl.tracks[1].clips.clear();
+    tl.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 15, 0), Clip::new(SourceId(0), 20, 35, 15)];
+    let tl = tl.add_transition(0, 15, TransitionKind::Dissolve, 3).unwrap();
+    let steps = schedule(&tl, 0..30, &g).unwrap();
+    assert!(steps.iter().any(|s| s.vmix.is_some()), "the dissolve mixes");
+    assert!(steps.iter().all(|s| step_opacity(&tl, s).is_none()), "a transition is not an opacity layer");
+    println!("striakopacity: 50% overlay ticks 10..20 Some(50); opaque, transition None; 0% Some(0)");
+}
