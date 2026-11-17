@@ -1391,7 +1391,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.stretch = Some(p);
             }
         }
-        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => apply_font_synthesis(prop, value, &mut style.paint),
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => apply_font_synthesis(prop, value, &mut style.paint), "font-variant" | "font-variant-caps" => apply_font_variant_caps(prop, value, &mut style.paint),
         // css-text-3 §7.1
         "word-spacing" => {
             if value == "normal" {
@@ -1431,7 +1431,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 let h = head.trim().to_ascii_lowercase();
                 if h == "italic" || h == "oblique" {
                     style.paint.italic = Some(true);
-                } else if h == "normal" || h == "small-caps" {
+                } else if h == "normal" || h == "small-caps" { if h == "small-caps" { style.paint.small_caps = Some(true); }
                     // no effect here, but still part of the prefix
                 } else if let Some(p) = parse_font_stretch(&h).filter(|_| !h.ends_with('%')) {
                     style.paint.stretch = Some(p);
@@ -2593,7 +2593,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps,
+        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
     if let Some(src_list) = &src.font_rel {
@@ -3540,4 +3540,50 @@ pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Op
         },
     };
     Some((w, s, c))
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): css-fonts-4 §6.6 font-variant-caps and font-variant's caps half (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `font-variant-caps: normal | small-caps` and the caps half of the `font-variant`
+/// shorthand into `PaintStyle::small_caps` (inherited by the walkers' caps mask, `PaintStyle::caps`). The other caps
+/// keywords and the other font-variant longhands are parsed and dropped (owed: AETHER-FONT-VARIANT-CAPS-ALL / -OTHERS).
+fn apply_font_variant_caps<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
+    match parse_font_variant_caps(prop, value) {
+        Some(on) => paint.small_caps = Some(on),
+        None => {
+            if !is_neutral_keyword(value) {
+                H::record_css(&format!("{prop}-value:{}", clip(value)));
+            }
+        }
+    }
+}
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the caps value a `font-variant-caps` / `font-variant` declaration sets: Some(true)
+/// = small-caps, Some(false) = normal (`initial`; the shorthand's `normal` / `none` and any value without a caps keyword:
+/// the shorthand resets its caps longhand), None for a caps keyword not taken (all-small-caps, petite-caps,
+/// all-petite-caps, unicase, titling-caps), an invalid longhand value and `inherit` / `unset` (the property inherits).
+pub fn parse_font_variant_caps(prop: &str, value: &str) -> Option<bool> {
+    const NOT_TAKEN: [&str; 5] = ["all-small-caps", "petite-caps", "all-petite-caps", "unicase", "titling-caps"];
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "initial" => return Some(false),
+        "inherit" | "unset" | "revert" | "revert-layer" | "" => return None,
+        _ => {}
+    }
+    if prop == "font-variant-caps" {
+        return match v.as_str() {
+            "normal" => Some(false),
+            "small-caps" => Some(true),
+            _ => None,
+        };
+    }
+    let mut caps = Some(false);
+    for k in v.split_whitespace() {
+        if k == "small-caps" {
+            caps = Some(true);
+        } else if NOT_TAKEN.contains(&k) {
+            return None;
+        }
+    }
+    caps
 }
