@@ -114,9 +114,9 @@ fn cli_no_verb_prints_usage() {
         assert_eq!(code, 2, "{road:?}: usage exits 2");
         assert_eq!(out, "", "{road:?}: nothing on stdout");
         let lines: Vec<&str> = err.lines().collect();
-        assert_eq!(lines.len(), 5, "{road:?}: five usage lines: {err}");
+        assert_eq!(lines.len(), 6, "{road:?}: six usage lines: {err}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
         assert_eq!(lines[0], USAGE_FIRST, "{road:?}");
-        for (l, head) in lines[1..].iter().zip(["       nle render ", "       nle export ", "       nle --make-src ", "       nle size "]) {
+        for (l, head) in lines[1..].iter().zip(["       nle render ", "       nle export ", "       nle --make-src ", "       nle size ", "       nle completions "]) {
             assert!(l.starts_with(head), "{road:?}: {l:?} starts {head:?}");
         }
     }
@@ -130,7 +130,7 @@ fn cli_export_refuses_by_name() {
     // Refused BY NAME: `nle: <msg>` on stderr, exit 1 (NLECLIREFUSALSBYNAME SR801: every refusal; the table words from stria's).
     let video_want = format!("nle: --video bogus: one of {}", VIDEO_NAMES.join("|"));
     let audio_want = format!("nle: --audio bogus: one of {}|aac:KBPS", AUDIO_NAMES.join("|"));
-    let named: [(&[&str], &str); 22] = [
+    let named: [(&[&str], &str); 24] = [
         (&["--qblur", "17"], "nle: --qblur 17: not a number within 0..=16"),
         (&["--qblur", "x"], "nle: --qblur x: not a number within 0..=16"),
         (&["--qcomp", "2"], "nle: --qcomp 2: not a fraction within 0..=1"),
@@ -153,6 +153,8 @@ fn cli_export_refuses_by_name() {
         (&["--out"], "nle: --out: a value is required"),
         (&["--qpstep"], "nle: --qpstep: a value is required"), // NLECLIREFUSALSREST (SR814): SR773's arm through `value`
         (&["--qpstep", "x"], "nle: --qpstep x: not an integer within 0..=51"),
+        (&["--pass2"], "nle: --pass2: a value is required"), // NLECLIPASS2VALUE (SR821): SR790's arm through `value`
+        (&["--pass2", "qpstep=52"], "nle: --pass2 qpstep 52: not an integer within 0..=51"), // NLECLIPASS2VALUE (SR821): pass2_cli_of's own text by name
     ];
     for (i, (extra, want)) in named.iter().enumerate() {
         let out = dir.join(format!("named{i}"));
@@ -244,7 +246,7 @@ fn cli_help_exits_zero_on_stdout() {
         let (code, out, err) = nle(road);
         assert_eq!(code, 0, "{road:?}: a person asked for it, exit 0");
         assert_eq!(err, "", "{road:?}: nothing on stderr");
-        assert_eq!(out.lines().count(), 5, "{road:?}: five usage lines: {out}");
+        assert_eq!(out.lines().count(), 6, "{road:?}: six usage lines: {out}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
         assert_eq!(out.lines().next(), Some(USAGE_FIRST), "{road:?}");
         assert_eq!(out, usage, "{road:?}: stdout carries the same usage `nle` prints on stderr");
     }
@@ -306,9 +308,120 @@ fn cli_unknown_word_did_you_mean() {
         let (code, stdout, err) = nle(road);
         assert_eq!((code, stdout.as_str()), (2, ""), "{road:?}");
         let lines: Vec<&str> = err.lines().collect();
-        assert_eq!(lines.len(), 6, "{road:?}: the hint and five usage lines: {err}");
+        assert_eq!(lines.len(), 7, "{road:?}: the hint and six usage lines: {err}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
         assert_eq!(lines[0], "nle: exprot: unknown verb; did you mean export?", "{road:?}");
         assert_eq!(lines[1], USAGE_FIRST, "{road:?}");
         assert!(!out.exists(), "{road:?}: nothing written");
+    }
+}
+
+// ---- NLECLIPASS2VALUE (LEDGER SR821): `nle completions bash|zsh|fish` from main.rs FLAGS / VERBS (named tail block) ----
+/// The words of main.rs `const <name>: [...]` (FLAGS / VERBS), read from the source as SR816's FLAGS pin reads them.
+fn const_words(name: &str) -> Vec<&'static str> {
+    let src: &'static str = include_str!("../src/main.rs");
+    src.split_once(&format!("const {name}: ")).and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default()
+}
+
+#[test]
+fn cli_completions_scripts() {
+    let (flags, verbs) = (const_words("FLAGS"), const_words("VERBS"));
+    assert!(!flags.is_empty() && !verbs.is_empty(), "FLAGS / VERBS read from main.rs");
+    assert!(verbs.contains(&"completions"), "the verb is in VERBS: {verbs:?}");
+    let words: Vec<&str> = verbs.iter().chain(flags.iter()).copied().collect();
+    let script = |shell: &str| {
+        let (code, out, err) = nle(&["completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+        out
+    };
+    // bash: the `_nle` fn naming every word, then ONE `complete -F` line (NLECLICOMPLETIONSVALUES SR847).
+    let bash = script("bash");
+    assert!(bash.starts_with("_nle() {\n"), "{bash}"); /* SR847 */
+    assert!(bash.ends_with("\ncomplete -o default -F _nle nle\n"), "{bash}"); /* SR847 */
+    // zsh: `#compdef nle` first, every word in the script.
+    let zsh = script("zsh");
+    assert_eq!(zsh.lines().next(), Some("#compdef nle"), "{zsh}");
+    for (shell, text) in [("bash", &bash), ("zsh", &zsh)] {
+        for w in &words {
+            assert!(has_word(text, w), "{shell}: {w} in {text}");
+        }
+    }
+    // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
+    let fish = script("fish");
+    assert_eq!(fish.lines().count(), words.len() + 1, "{fish}"); /* SR847 */ // + the size policy line
+    for w in &words {
+        let line = match w.strip_prefix("--") {
+            Some(l) => format!("complete -c nle -l {l}"),
+            None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
+        };
+        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa "))), "fish: {line:?} in {fish}"); /* SR847 */
+    }
+    // Refusals by SR801's grammar, exit 1, nothing on stdout.
+    let refused: [(&[&str], &str); 2] = [
+        (&["completions", "tcsh"], "nle: completions tcsh: one of bash|zsh|fish\n"),
+        (&["completions"], "nle: completions: a value is required\n"),
+    ];
+    for (args, want) in refused {
+        let (code, out, err) = nle(args);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, want, ""), "{args:?}");
+    }
+    // A misspelt verb: SR816's hint names it, then the usage, exit 2.
+    let (code, out, err) = nle(&["completoins", "bash"]);
+    assert_eq!((code, out.as_str()), (2, ""));
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 7, "the hint and six usage lines: {err}");
+    assert_eq!(lines[0], "nle: completoins: unknown verb; did you mean completions?");
+    assert_eq!(lines[1], USAGE_FIRST);
+    assert_eq!(lines[6], "       nle completions bash|zsh|fish");
+}
+
+// ---- NLECLICOMPLETIONSVALUES (LEDGER SR847): the words a flag's value takes in every completion script (named tail block) ----
+/// NLECLICOMPLETIONSVALUES (SR847): the value table built from the OWNERS' tables (stria's `VIDEO_NAMES` / `AUDIO_NAMES` +
+/// `aac:` / `PASS2_KEYS` as `k=`), never from literals: a new word in a table must reach every script.
+fn completion_values() -> Vec<(&'static str, String)> {
+    let audio: Vec<String> = AUDIO_NAMES.iter().map(|w| w.to_string()).chain(["aac:".to_string()]).collect();
+    vec![
+        ("--video", VIDEO_NAMES.join(" ")),
+        ("--audio", audio.join(" ")),
+        ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect::<Vec<_>>().join(" ")),
+    ]
+}
+
+#[test]
+fn cli_completions_values() {
+    let flags = const_words("FLAGS");
+    let table = completion_values();
+    let size = timeline_core::SizePolicy::ALL.map(timeline_core::SizePolicy::name).join(" ");
+    let script = |shell: &str| {
+        let (code, out, err) = nle(&["completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+        out
+    };
+    let (bash, zsh, fish) = (script("bash"), script("zsh"), script("fish"));
+    for (f, words) in &table {
+        assert!(flags.contains(f), "{f}: a valued flag is in main.rs FLAGS {flags:?}");
+        let l = f.trim_start_matches('-');
+        assert!(bash.contains(&format!("        {f}) w=\"{words}\" ;;\n")), "bash: {f} -> {words} in {bash}");
+        assert!(zsh.contains(&format!(" '*{f}:{l}:({words})'")), "zsh: {f} -> {words} in {zsh}");
+        let fl = format!("complete -c nle -l {l} -xa \"{words}\"");
+        assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
+    }
+    // Exactly the table's flags carry values (no word list the owners' tables do not hold).
+    assert_eq!(bash.matches(") w=\"").count(), table.len(), "{bash}");
+    assert_eq!(zsh.matches(":(").count(), table.len() + 1, "{zsh}"); // + SR821's `1:verb:(..)`
+    assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
+    // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
+    assert!(bash.contains(&format!("[[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{size}\"\n")), "{bash}");
+    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else _files; fi}}'")), "{zsh}");
+    assert!(fish.contains(&format!("__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{size}\"\n")), "{fish}");
+    // Each script parses in its own shell (`-n`: read, not run); zsh / fish skipped by name when the binary is absent.
+    let dir = scratch("completions");
+    for (shell, text) in [("bash", &bash), ("zsh", &zsh), ("fish", &fish)] {
+        let p = dir.join(format!("nle.{shell}"));
+        std::fs::write(&p, text).unwrap();
+        match Command::new(shell).arg("-n").arg(&p).output() {
+            Ok(o) => assert!(o.status.success(), "{shell} -n: {}\n{text}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) if shell != "bash" => eprintln!("cli_completions_values: {shell} -n skipped: {shell} absent ({e})"),
+            Err(e) => panic!("bash -n: {e}"),
+        }
     }
 }
