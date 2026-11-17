@@ -1083,3 +1083,29 @@ fn btrt_box(data: &[u8], kids: &[BoxHeader]) -> Option<(u32, u32, u32)> {
     let mut r = body(data, b);
     Some((r.u32().ok()?, r.u32().ok()?, r.u32().ok()?))
 }
+
+// ---- STRIACHAPTERSMKV (LEDGER SR9096): the Nero chapters read back (named tail block) ----
+// NLE-CHAPTERS-PROBE: `moov/udta/chpl` as SR9076 writes it (and ffmpeg's movenc): a FullBox (version 1 adds a u32), a
+// u8 count, per chapter a u64 start in 100 ns units, a u8 title length, the title bytes (UTF-8, lossy). A short read keeps
+// the chapters read so far; a file cut short is walked as `Demuxer::open_partial` walks it.
+
+/// STRIACHAPTERSMKV (SR9096): the file's `chpl` chapters as (start ns, title), in file order; empty when it has none.
+pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    let top = boxes_partial(data);
+    let Some(moov) = child(&top, b"moov") else { return out };
+    let Some(udta) = children(data, moov).ok().and_then(|k| child(&k, b"udta").copied()) else { return out };
+    let Some(chpl) = children(data, &udta).ok().and_then(|k| child(&k, b"chpl").copied()) else { return out };
+    let mut r = body(data, &chpl);
+    let Ok((version, _)) = full(&mut r) else { return out };
+    if version == 1 && r.skip(4).is_err() {
+        return out;
+    }
+    let Ok(n) = r.u8() else { return out };
+    for _ in 0..n {
+        let (Ok(start), Ok(len)) = (r.u64(), r.u8()) else { break };
+        let Ok(title) = r.bytes(len as usize) else { break };
+        out.push((start.saturating_mul(100).min(i64::MAX as u64) as i64, String::from_utf8_lossy(title).into_owned()));
+    }
+    out
+}

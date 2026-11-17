@@ -760,7 +760,7 @@ impl Sources {
             tl = tl.lay_edit_list(track, src, m.demux.edit_list(i), tb, origin).map_err(RenderError::Edit)?;
             applied.get_or_insert(tl.tracks[track].clips.len());
         }
-        sources.applied.push((src, applied.unwrap_or(0)));
+        sources.applied.push((src, applied.unwrap_or(0))); let tl = tl.with_chapters(&gneiss_pal::dsp::demux::facts::chapters_of(bytes)); // STRIACHAPTERSMKV (SR9096): the file's chapters (chpl / Matroska Chapters) as point markers (timeline_core tail)
         Ok(Some((tl, sources)))
     }
 }

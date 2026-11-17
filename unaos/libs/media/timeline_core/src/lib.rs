@@ -1818,9 +1818,9 @@ impl Timeline {
         self.markers.iter().filter(|m| m.at >= span.start && m.at < span.end).collect()
     }
 
-    /// The markers inside `span` as (start in ns from `span.start` by `Timebase::to_ns`, name): an export's MP4 chapters.
-    pub fn chapter_starts(&self, span: core::ops::Range<i64>) -> Vec<(i64, String)> {
-        self.markers_in(&span).into_iter().map(|m| (self.tb.to_ns(m.at - span.start), m.name.clone())).collect()
+    /// The markers inside `span` as (start in ns from `span.start` by `Timebase::to_ns`, name, a ranged marker's end ns): an export's chapters.
+    pub fn chapter_starts(&self, span: core::ops::Range<i64>) -> Vec<(i64, String, Option<i64>)> {
+        self.markers_in(&span).into_iter().map(|m| (self.tb.to_ns(m.at - span.start), m.name.clone(), self.chapter_end(m, &span))).collect() // STRIACHAPTERSMKV (SR9096): the ranged marker's end, Matroska's ChapterTimeEnd (file tail)
     }
 }
 
@@ -1836,9 +1836,54 @@ mod striachaptersmp4_tests {
         tl.add_track(Kind::Video);
         tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
         let t = tl.mark(5, "Intro").unwrap().mark(12, "Act=1; #2").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap();
-        assert_eq!(t.chapter_starts(10..30), alloc::vec![(80_000_000, String::from("Act=1; #2")), (400_000_000, String::from("End"))]);
+        assert_eq!(t.chapter_starts(10..30), alloc::vec![(80_000_000, String::from("Act=1; #2"), None), (400_000_000, String::from("End"), Some(800_000_000))]); // STRIACHAPTERSMKV (SR9096): the ranged End ends at the range end
         assert_eq!(t.markers_in(&(0..t.end())).len(), 3);
         assert!(t.chapter_starts(21..30).is_empty());
         assert!(Timeline::new(25).chapter_starts(0..10).is_empty());
+    }
+}
+
+// ---- STRIACHAPTERSMKV (LEDGER SR9096): a chapter's end and chapters laid back as markers (named tail block) ----
+// A ranged marker's chapter ends where SR9046's ffmetadata ends it (`min(at + len, span.end)`, ns from the range start);
+// a point marker carries no end (the next chapter's start is the reader's). A media file's chapters ((start ns, title),
+// demux_core `facts::chapters_of`) come back as point markers through `mark`, ticks by `Timebase::from_ns`.
+
+impl Timeline {
+    /// The end in ns from `span.start` of marker `m`'s chapter when it is a ranged marker (`len > 0`), else None.
+    pub fn chapter_end(&self, m: &Marker, span: &core::ops::Range<i64>) -> Option<i64> {
+        (m.len > 0).then(|| self.tb.to_ns(m.at.saturating_add(m.len).min(span.end) - span.start))
+    }
+
+    /// The timeline with a point marker per chapter of `ch` ((start ns, title)) at tick `tb.from_ns(start)`; a chapter
+    /// `mark` refuses (a negative tick, a tick already marked) is skipped, so the first at a tick wins.
+    pub fn with_chapters(&self, ch: &[(i64, String)]) -> Timeline {
+        let mut tl = self.clone();
+        for (ns, name) in ch {
+            if let Ok(t) = tl.mark(self.tb.from_ns(*ns), name) {
+                tl = t;
+            }
+        }
+        tl
+    }
+}
+
+#[cfg(test)]
+mod striachaptersmkv_tests {
+    use super::*;
+
+    /// STRIACHAPTERSMKV M3: chapters at 25 fps land on ticks (80 ms -> 2, 400 ms -> 10); a second chapter at a taken
+    /// tick and a negative one are skipped; no chapters = the same timeline; a ranged marker's end is clamped to the span.
+    #[test]
+    fn striachaptersmkv_with_chapters() {
+        let tl = Timeline::new(25);
+        let ch = alloc::vec![(80_000_000, String::from("Act 1")), (400_000_000, String::from("End")), (401_000_000, String::from("Dup")), (-40_000_000, String::from("Neg"))];
+        let t = tl.with_chapters(&ch);
+        assert_eq!(t.markers.iter().map(|m| (m.at, m.name.as_str(), m.len)).collect::<Vec<_>>(), alloc::vec![(2, "Act 1", 0), (10, "End", 0)]);
+        assert_eq!(tl.with_chapters(&[]), tl);
+        let r = tl.mark(20, "R").unwrap().range_marker(20, 30).unwrap();
+        assert_eq!(r.chapter_end(&r.markers[0], &(10..30)), Some(800_000_000));
+        assert_eq!(r.chapter_end(&r.markers[0], &(10..100)), Some(1_600_000_000));
+        let p = tl.mark(20, "P").unwrap();
+        assert_eq!(p.chapter_end(&p.markers[0], &(10..30)), None);
     }
 }

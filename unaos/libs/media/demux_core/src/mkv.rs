@@ -859,3 +859,43 @@ fn colour_master(data: &[u8], e: &El) -> Option<crate::colour::Colour> {
     }
     Some(c)
 }
+
+// ---- STRIACHAPTERSMKV (LEDGER SR9096): the Matroska chapters read back (named tail block) ----
+// NLE-CHAPTERS-PROBE: Chapters 0x1043A770 -> the first EditionEntry 0x45B9 holding a ChapterAtom 0xB6 -> each atom's
+// ChapterTimeStart 0x91 (ns) and its first ChapterDisplay 0x80's ChapString 0x85. The Segment's top level is walked by
+// `read_el` up to an unknown-size element (a live Cluster); nested chapters and ChapterTimeEnd are not read.
+
+/// STRIACHAPTERSMKV (SR9096): the file's chapters as (start ns, title), sorted by start; empty when it has none.
+pub fn chapters(data: &[u8]) -> Vec<(i64, String)> {
+    let mut out = Vec::new();
+    let Ok((_, seg)) = segment(data) else { return out };
+    let mut p = seg.body;
+    while p < seg.end {
+        let Ok(e) = read_el(data, p, seg.end) else { break };
+        if e.id == 0x1043_A770 {
+            for ed in kids(data, e.body, e.end).unwrap_or_default().iter().filter(|x| x.id == 0x45B9) {
+                for atom in kids(data, ed.body, ed.end).unwrap_or_default().iter().filter(|x| x.id == 0xB6) {
+                    let parts = kids(data, atom.body, atom.end).unwrap_or_default();
+                    let start = parts.iter().find(|x| x.id == 0x91).and_then(|x| uint(data, x).ok()).unwrap_or(0);
+                    let title = parts
+                        .iter()
+                        .find(|x| x.id == 0x80)
+                        .and_then(|d| kids(data, d.body, d.end).ok()?.into_iter().find(|x| x.id == 0x85))
+                        .map(|s| string(data, &s))
+                        .unwrap_or_default();
+                    out.push((start.min(i64::MAX as u64) as i64, title));
+                }
+                if !out.is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        if e.unknown {
+            break;
+        }
+        p = e.end;
+    }
+    out.sort_by_key(|c| c.0);
+    out
+}

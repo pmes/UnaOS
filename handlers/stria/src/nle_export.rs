@@ -314,7 +314,7 @@ pub struct ExportSink {
     /// EXPORTCOLOURPRIM (B979): the reels' one (primaries, transfer), set by [`export`]; (2, 2) otherwise.
     reels: (u8, u8),
     /// NLE6EXPORTMKV (rmbp-ledger B966): the muxed file's container (its name's extension, `build::Container`).
-    container: build::Container, chapters: Vec<(i64, String)>, // STRIACHAPTERSMP4 (SR9076): the range's markers as (start ns, title), the MP4's `chpl`
+    container: build::Container, chapters: Vec<(i64, String, Option<i64>)>, // STRIACHAPTERSMKV (SR9096): a ranged marker's end too, the Matroska ChapterTimeEnd; STRIACHAPTERSMP4 (SR9076): the range's markers as (start ns, title), the MP4's `chpl`
 }
 
 impl ExportSink {
