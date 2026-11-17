@@ -5102,4 +5102,64 @@ mod tests {
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('sw')).fontSynthesis"), "weight style");
     }
 
+    // ---- AETHERIMGALTINLINEICONFLOAT (LEDGER SR779): the inline alt's icon floats beside every line it spans (named tail block) ----
+
+    /// AETHERIMGALTINLINEICONFLOAT (SR779): the 20-word alt in a 100px column at `font` (a 12px face), as `id`.
+    fn img_alt_float_page(dir: &str, font: &str) -> crate::AetherEngine {
+        let alt = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0;font:16px sans-serif">
+            <div{dir} style="width:100px;font:{font}"><img id="f" src="missing.png" alt="{alt}"></div>
+            <div style="width:100px;font:{font}"><img id="g" src="missing.png" alt="{alt}"></div>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERIMGALTINLINEICONFLOAT (SR779): Chromium's 16x16 icon is a float, so at a 12px line height lines 1 AND 2 sit
+    /// beside it (no text ink in the icon's 16 columns on their rows) and line 3 starts at the box's left (ink there);
+    /// at a 16px line height only line 1 is indented (SR726's rule). The box is whole lines tall.
+    #[test]
+    fn img_alt_inline_icon_floats_past_short_lines() {
+        let mut engine = img_alt_float_page("", "12px/12px sans-serif");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "f");
+        assert!(w <= 100.5 && h >= 36.0 && (h / 12.0 - (h / 12.0).round()).abs() < 0.05, "f: three or more 12px lines inside the column ({w}x{h})");
+        let (lw, tt) = (l.round() as usize, t.round() as usize);
+        let band = |i: usize| (tt + 12 * i + 2, tt + 12 * i + 10);
+        for i in 0..2 {
+            let (y0, y1) = band(i);
+            assert_eq!(imgalt_ink(&engine, lw, lw + 16, y0, y1), 0, "f: line {} is beside the icon", i + 1);
+            assert!(imgalt_ink(&engine, lw + 16, (l + w).ceil() as usize, y0, y1) > 0, "f: line {} paints after the icon", i + 1);
+        }
+        let (y0, y1) = band(2);
+        assert!(imgalt_ink(&engine, lw, lw + 16, y0, y1) > 0, "f: line 3 starts at the box's left");
+        let mut engine = img_alt_float_page("", "12px/16px sans-serif");
+        let (l, t, _, _) = imgalt_rect(&mut engine, "f");
+        let (lw, tt) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_ink(&engine, lw, lw + 16, tt + 2, tt + 14), 0, "16px lines: line 1 is beside the icon");
+        assert!(imgalt_ink(&engine, lw, lw + 16, tt + 18, tt + 30) > 0, "16px lines: line 2 is not indented");
+    }
+
+    /// AETHERIMGALTINLINEICONFLOAT (SR779): in an rtl column Chromium floats the icon RIGHT: its page outline grey sits at
+    /// the box's (width - 16 + 1, 5), lines 1 and 2 (12px lines) end before the icon's 16 columns, and the box is as wide
+    /// as the ltr twin's (the measure is direction-agnostic).
+    #[test]
+    fn img_alt_inline_icon_floats_right_in_rtl() {
+        let mut engine = img_alt_float_page(r#" dir="rtl""#, "12px/12px sans-serif");
+        let (l, t, w, h) = imgalt_rect(&mut engine, "f");
+        let (_, _, gw, gh) = imgalt_rect(&mut engine, "g");
+        assert!((w - gw).abs() <= 0.5 && (h - gh).abs() <= 0.5, "rtl box {w}x{h} vs the ltr twin {gw}x{gh}");
+        let (r, tt) = ((l + w).round() as usize, t.round() as usize);
+        let grey = (r - 17..=r - 13).any(|x| (tt + 4..=tt + 6).any(|y| imgalt_px(&engine, x, y) == (128, 128, 128)));
+        assert!(grey, "rtl: the icon's page outline at the box's right edge");
+        for i in 0..2 {
+            let (y0, y1) = (tt + 12 * i + 2, tt + 12 * i + 10);
+            assert_eq!(imgalt_ink(&engine, r - 16, r, y0, y1), 0, "rtl: line {} ends before the icon", i + 1);
+            assert!(imgalt_ink(&engine, l.floor() as usize, r - 16, y0, y1) > 0, "rtl: line {} paints", i + 1);
+        }
+    }
 }

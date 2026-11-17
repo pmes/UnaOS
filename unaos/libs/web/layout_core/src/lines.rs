@@ -23,7 +23,7 @@ fn ch<F: Fonts + ?Sized>(f: &F, adv: &Adv, c: char) -> f32 {
 
 /// Breaks `text` into lines no wider than `max_width` (when the mode wraps).
 pub fn break_lines<F: Fonts + ?Sized>(f: &F, adv: &Adv, text: &str, mode: &TextMode, max_width: f32) -> Vec<Line> {
-    break_lines_from(f, adv, text, mode, max_width, 0.0, false)
+    break_lines_from(f, adv, text, mode, max_width, 0.0, 1, false)
 }
 
 /// The line being filled: its text so far, plus what earlier inline items
@@ -35,12 +35,14 @@ struct Cur {
     /// The next word continues the previous item's word (no space between
     /// the items): there is no break opportunity before it (css-text-3 §5.1).
     glued: bool,
+    /// AETHERIMGALTINLINEICONFLOAT (SR779): (start_x, how many further lines still start there): a float beside them.
+    float: (f32, usize),
 }
 
 impl Cur {
     fn push(&mut self, out: &mut Vec<Line>) {
         out.push(core::mem::replace(&mut self.line, Line { text: String::new(), width: 0.0 }));
-        self.offset = 0.0;
+        self.offset = if self.float.1 > 0 { self.float.1 -= 1; self.float.0 } else { 0.0 };
         self.prior = false;
         self.glued = false;
     }
@@ -51,8 +53,9 @@ impl Cur {
 /// content, so a break may come before this run's first word). The first
 /// returned line is what joins the current line (its `text` may be empty
 /// when even the first word must move down); each further line is a new
-/// line box. `break_lines` is the `start_x = 0` case.
-pub fn break_lines_from<F: Fonts + ?Sized>(f: &F, adv: &Adv, text: &str, mode: &TextMode, max_width: f32, start_x: f32, prior: bool) -> Vec<Line> {
+/// line box. `break_lines` is the `start_x = 0` case. The first `first_n` lines (at least one) all start at
+/// `start_x` (AETHERIMGALTINLINEICONFLOAT SR779: a float beside them, the InlineAlt icon); later lines at 0.
+pub fn break_lines_from<F: Fonts + ?Sized>(f: &F, adv: &Adv, text: &str, mode: &TextMode, max_width: f32, start_x: f32, first_n: usize, prior: bool) -> Vec<Line> {
     let max = if wraps(mode) { max_width.max(0.0) } else { f32::MAX };
     let mut out: Vec<Line> = Vec::new();
     // Forced breaks split the run into paragraphs first.
@@ -64,6 +67,7 @@ pub fn break_lines_from<F: Fonts + ?Sized>(f: &F, adv: &Adv, text: &str, mode: &
         offset: start_x,
         prior,
         glued: prior && !mode.lead && !(starts_space && !collapses(mode)),
+        float: (start_x, first_n.saturating_sub(1)),
     };
     for (pi, para) in paragraphs.into_iter().enumerate() {
         if collapses(mode) {

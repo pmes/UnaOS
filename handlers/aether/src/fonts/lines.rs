@@ -69,7 +69,7 @@ pub struct Line {
 
 /// Breaks `text` into lines no wider than `max_width` (when the mode wraps).
 pub fn break_lines(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32) -> Vec<Line> {
-    break_lines_from(adv, text, mode, max_width, 0.0, false)
+    break_lines_from(adv, text, mode, max_width, 0.0, 1, false)
 }
 
 /// The line being filled: its text so far, plus what earlier inline items
@@ -81,12 +81,14 @@ struct Cur {
     /// The next word continues the previous item's word (no space between
     /// the items): there is no break opportunity before it (css-text-3 §5.1).
     glued: bool,
+    /// AETHERIMGALTINLINEICONFLOAT (SR779): (start_x, how many further lines still start there): a float beside them.
+    float: (f32, usize),
 }
 
 impl Cur {
     fn push(&mut self, out: &mut Vec<Line>) {
         out.push(std::mem::replace(&mut self.line, Line { text: String::new(), width: 0.0 }));
-        self.offset = 0.0;
+        self.offset = if self.float.1 > 0 { self.float.1 -= 1; self.float.0 } else { 0.0 };
         self.prior = false;
         self.glued = false;
     }
@@ -97,8 +99,9 @@ impl Cur {
 /// content, so a break may come before this run's first word). The first
 /// returned line is what joins the current line (its `text` may be empty
 /// when even the first word must move down); each further line is a new
-/// line box. `break_lines` is the `start_x = 0` case.
-pub fn break_lines_from(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32, start_x: f32, prior: bool) -> Vec<Line> {
+/// line box. `break_lines` is the `start_x = 0` case. The first `first_n` lines (at least one) all start at
+/// `start_x` (AETHERIMGALTINLINEICONFLOAT SR779: a float beside them, the InlineAlt icon); later lines at 0.
+pub fn break_lines_from(adv: &Advancer, text: &str, mode: &TextMode, max_width: f32, start_x: f32, first_n: usize, prior: bool) -> Vec<Line> {
     let max = if mode.wraps() { max_width.max(0.0) } else { f32::MAX };
     let mut out: Vec<Line> = Vec::new();
     // Forced breaks split the run into paragraphs first.
@@ -110,6 +113,7 @@ pub fn break_lines_from(adv: &Advancer, text: &str, mode: &TextMode, max_width: 
         offset: start_x,
         prior,
         glued: prior && !mode.lead && !(starts_space && !mode.collapses()),
+        float: (start_x, first_n.saturating_sub(1)),
     };
     for (pi, para) in paragraphs.into_iter().enumerate() {
         if mode.collapses() {
@@ -324,13 +328,13 @@ mod tests {
             let cw = a.char('x');
             let m = TextMode::default();
             // 6 chars already on a 10-char line: "bb" joins it, "cccc" wraps.
-            let l = break_lines_from(a, "bb cccc dd", &TextMode { lead: true, ..m }, cw * 10.0, cw * 6.0, true);
+            let l = break_lines_from(a, "bb cccc dd", &TextMode { lead: true, ..m }, cw * 10.0, cw * 6.0, 1, true);
             assert_eq!(texts(&l), vec![" bb", "cccc dd"]);
             // Even the first word does not fit: the joining line is empty.
-            let l = break_lines_from(a, "bbbbb", &TextMode { lead: true, ..m }, cw * 10.0, cw * 8.0, true);
+            let l = break_lines_from(a, "bbbbb", &TextMode { lead: true, ..m }, cw * 10.0, cw * 8.0, 1, true);
             assert_eq!(texts(&l), vec![" ", "bbbbb"]);
             // No space between the items: no break opportunity before "bbbbb".
-            let l = break_lines_from(a, "bbbbb cc", &m, cw * 10.0, cw * 8.0, true);
+            let l = break_lines_from(a, "bbbbb cc", &m, cw * 10.0, cw * 8.0, 1, true);
             assert_eq!(texts(&l), vec!["bbbbb", "cc"]);
         });
     }
