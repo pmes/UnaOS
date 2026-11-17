@@ -10107,4 +10107,72 @@ b</div>
         assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('i4')).length)"), "53");
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('i4')).item(52)"), "left");
     }
+
+    // ---- AETHERCSSOMINSETFONTRELATIVE (LEDGER SR1133): a font-relative inset reads its px at the element's font, not the cascade's 16px basis (named tail block) ----
+
+    fn inset_font_relative_engine(root_style: &str) -> crate::AetherEngine {
+        let html = format!(r#"<!doctype html><html style="{root_style}"><body style="margin:0">
+            <div id="f1" style="position:relative;font-size:20px;top:1em">a</div>
+            <div id="f2" style="position:relative;font-size:20px;top:1rem">b</div>
+            <div id="f3" style="position:relative;font-size:20px;top:10px">c</div>
+            <div id="f4" style="position:relative;font-size:20px;inset:1em">d</div>
+            <div id="f5" style="position:relative;font-size:20px;inset:1em;top:5px">e</div>
+            <div id="f6" style="position:relative;font-size:20px;top:calc(1em + 2px)">f</div>
+            <div id="f7" style="position:relative;font-size:200%;top:1em">g</div>
+            <div id="f8" style="position:relative;font-size:20px;top:1em;inset:5px">h</div>
+            <div id="r1" style="position:relative;top:2rem">i</div>
+        </body></html>"#);
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): `font-size: 20px; top: 1em` reads `20px` (Chromium), not the cascade's 16px.
+    #[test]
+    fn inset_font_relative_em() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f1", "top"), "20px", "armed: #f1 read 16px before SR1133");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): rem resolves against the root's font, not the element's.
+    #[test]
+    fn inset_font_relative_rem_root() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f2", "top"), "16px", "#f2: 1rem under a 20px element, root 16px");
+        let mut e = inset_font_relative_engine("font-size:10px");
+        assert_eq!(font_shorthand_cs(&mut e, "r1", "top"), "20px", "armed: #r1 2rem at a 10px root read 32px before");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): a px inset keeps SR1127's spec road.
+    #[test]
+    fn inset_font_relative_px_spec_road() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f3", "top"), "10px", "#f3: top 10px");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): the `inset` shorthand is recorded as one entry and replayed per side; the
+    /// later declaration wins in either order.
+    #[test]
+    fn inset_font_relative_shorthand() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(inset_columns_of(&mut e, "f4"), ["20px", "20px", "20px", "20px"], "armed: #f4 inset 1em read 16px before");
+        assert_eq!(inset_columns_of(&mut e, "f5"), ["5px", "20px", "20px", "20px"], "#f5: inset 1em then top 5px");
+        assert_eq!(inset_columns_of(&mut e, "f8"), ["5px", "5px", "5px", "5px"], "#f8: top 1em then inset 5px");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): em inside calc() re-resolves at the element's font.
+    #[test]
+    fn inset_font_relative_calc() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f6", "top"), "22px", "armed: #f6 calc(1em + 2px) read 18px before");
+    }
+
+    /// AETHERCSSOMINSETFONTRELATIVE (SR1133): a percentage font-size feeds em through the used font (200% of 16 = 32).
+    #[test]
+    fn inset_font_relative_percent_font() {
+        let mut e = inset_font_relative_engine("");
+        assert_eq!(font_shorthand_cs(&mut e, "f7", "top"), "32px", "armed: #f7 read 16px before");
+    }
 }
