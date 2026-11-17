@@ -669,7 +669,7 @@ impl Drag {
         }
         match l.hit(&st.timeline, x, y) {
             Hit::Clip(track, idx, _) => { let toggle = shift && st.set.contains(&(track, idx)); // STRIAMULTISELECTMORE (SR950): a shift-press on a member toggles it out if released still (file tail)
-                if shift || st.set.contains(&(track, idx)) {
+                if toggle {} else if shift || st.set.contains(&(track, idx)) { // STRIAMULTISELECTNEXT (SR998): a member's shift-press keeps the primary until the drag commits (`finish`)
                     st.select_add(track, idx).ok()?;
                 } else {
                     st.select(track, idx).ok()?;
@@ -720,7 +720,7 @@ impl Drag {
             DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st),
             _ => {}
         }
-        if st.selection != Some((self.track, self.idx)) {
+        if self.toggle { st.select_add(self.track, self.idx)?; } else if st.selection != Some((self.track, self.idx)) { // STRIAMULTISELECTNEXT (SR998): a shift-pressed member becomes primary only now, the set kept
             st.select(self.track, self.idx)?;
         }
         match self.kind {
@@ -3997,5 +3997,52 @@ mod striarollnext_tests {
         let before = (st.selection, st.set.clone(), st.undo_depth(), st.timeline.clone());
         let _ = roll_cuts(&st, l);
         assert_eq!((st.selection, st.set.clone(), st.undo_depth(), st.timeline.clone()), before);
+    }
+}
+
+// ---- STRIAMULTISELECTNEXT (LEDGER SR998): a shift-press on a set member keeps the primary (named tail block) ----
+// `begin_with` no longer makes a shift-pressed member primary at the press; `finish` does it (`select_add`, the set kept)
+// when the drag commits, so a still release (`release_still`) takes the member out with the user's primary intact.
+#[cfg(test)]
+mod striamultiselectnext_tests {
+    use super::*;
+    use crate::Clip;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10, A 20..30 at 20; the set all three, primary the last.
+    fn state() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 20, 30, 20)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        st.select_add(0, 2).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 136, &st);
+        (st, l)
+    }
+
+    #[test]
+    fn striamultiselectnext_toggle_keeps_the_primary() {
+        let (mut st, l) = state();
+        assert_eq!(st.selection, Some((0, 2)));
+        let (x, y) = l.point(0, 15);
+        let d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert!(d.toggle);
+        assert_eq!((st.selection, st.set.len()), (Some((0, 2)), 3), "the press changes nothing");
+        assert!(d.release_still(&mut st));
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 2)), alloc::vec![(0, 0), (0, 2)]), "the primary stays");
+        assert_eq!(st.undo_depth(), 0);
+        let (mut st, l) = state();
+        let tl0 = st.timeline.clone();
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, true, false).unwrap();
+        let (x2, _) = l.point(0, 20);
+        d.update(&st, x2, y);
+        assert_eq!((d.delta, d.to_track), (5, 0));
+        assert!(!d.release_still(&mut st));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl0.move_many(&[(0, 0), (0, 1), (0, 2)], 5).unwrap(), "a shift-drag of a member moves the set");
+        assert_eq!((st.selection, st.set.len(), st.undo_depth()), (Some((0, 1)), 3, 1), "the pressed clip is primary after");
     }
 }

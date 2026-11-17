@@ -3940,3 +3940,66 @@ impl EditorState {
         })
     }
 }
+
+// ---- STRIAMULTISELECTNEXT (LEDGER SR998): a set's transitioned cuts follow it across tracks (named tail block) ----
+// Tests only: the carry lives in lib.rs `Timeline::carry_cuts`, read by `move_many_track`'s one `retarget_transitions`.
+#[cfg(test)]
+mod striamultiselectnext_tests {
+    use super::*;
+    use crate::{Curve, Kind, TransitionKind};
+
+    /// V1: A 0..10 at 0, B 0..10 at 10, a 4-tick dissolve on the cut at 10; A1 empty; V2 (track 2) empty.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        let tl = tl.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        st
+    }
+
+    #[test]
+    fn striamultiselectnext_set_carries_its_dissolve_down_a_track() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.move_set_track(2, 5), Ok(()));
+        assert!(st.timeline.tracks[0].clips.is_empty() && st.timeline.tracks[0].transitions.is_empty());
+        let ats: Vec<i64> = st.timeline.tracks[2].clips.iter().map(|c| c.at).collect();
+        assert_eq!(ats, alloc::vec![5, 15]);
+        let xs: Vec<(i64, i64)> = st.timeline.tracks[2].transitions.iter().map(|x| (x.at, x.dur)).collect();
+        assert_eq!(xs, alloc::vec![(15, 4)], "the dissolve rides with its two clips");
+        assert_eq!(st.undo_depth(), 1, "ONE commit");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0);
+    }
+
+    #[test]
+    fn striamultiselectnext_half_picked_cut_still_refused() {
+        let st = state();
+        assert_eq!(st.timeline.move_many_track(&[(0, 1)], 2, 5), Err(EditError::Transition), "the outgoing stays behind");
+        assert_eq!(st.timeline.move_many_track(&[(0, 0)], 2, 5), Err(EditError::Transition), "the incoming stays behind");
+    }
+
+    #[test]
+    fn striamultiselectnext_audio_xfade_follows_the_set() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        let tl = tl.add_audio_xfade(0, 10, 4, Curve::EqualPower).unwrap();
+        let moved = tl.move_many_track(&[(0, 0), (0, 1)], 2, 3).unwrap();
+        let xs: Vec<(usize, i64, i64)> = moved.audio_xfades.iter().map(|x| (x.track, x.at, x.dur)).collect();
+        assert_eq!(xs, alloc::vec![(2, 13, 4)]);
+        assert!(moved.tracks[0].clips.is_empty());
+        assert_eq!(tl.move_many_track(&[(0, 1)], 2, 3), Err(EditError::Transition), "half picked: refused");
+    }
+}
