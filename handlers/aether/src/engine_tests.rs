@@ -10270,6 +10270,105 @@ b</div>
         assert_ne!(hit_sticky_origin_id(&e, 10.0, 50.0), "f", "below #f's 30px");
     }
 
+    // ---- AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (LEDGER SR1145): a box shadow's ink is its painted extent, not unbounded (named tail block) ----
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): SR1139's fixed 100x20 header with `extra` in its style, on a 2000px page.
+    fn shadow_holder_body(extra: &str) -> String {
+        format!(
+            r#"<div style="position:fixed;top:0;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0);{extra}"></div>
+        <div style="height:2000px"></div>"#
+        )
+    }
+
+    const SHADOW_HOLDER: &str = "box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5)";
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): the shadowed header's ink is its border box grown by the shadow's
+    /// reach (blur 4 + 1 around the shape offset 2 down): (-5, -3, 105, 27). A +50 scroll damages the strip and that rect
+    /// (its ghost off-screen); at 100 a -50 scroll damages the strip, the header and its ghost 50 rows lower (apart) —
+    /// not the viewport (armed: the shadow made the ink unbounded and the damage the viewport).
+    #[test]
+    fn scroll_damage_shadow_holder_damage_is_header_plus_reach() {
+        let mut e = damage_rects_engine(&shadow_holder_body(SHADOW_HOLDER));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 105, 27)], "+50: the strip and the shadowed header (armed)");
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 50), (0, 0, 105, 27), (0, 47, 105, 30)], "-50: the strip, the header, its ghost");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): THE pin: +50, +50, -30 with the shadowed header over coloured rows:
+    /// after each blitted frame the whole surface equals a control engine scrolled there and repainted whole (no
+    /// clipped shadow rows), and the damage was not the viewport.
+    #[test]
+    fn scroll_damage_shadow_holder_pixels_match_full_repaint() {
+        let mut body = shadow_holder_body(SHADOW_HOLDER);
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): the shadowed header's subtree ink is finite and holds every pixel of a
+    /// full repaint that differs from the page background (header and shadow): the extent is the painter's.
+    #[test]
+    fn scroll_damage_shadow_holder_ink_contains_painted() {
+        let e = damage_rects_engine(&shadow_holder_body(SHADOW_HOLDER));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(holders.len(), 1, "one holder: the header");
+        let (ink, _) = crate::render::subtree_ink(&holders);
+        let ink = ink.expect("a box shadow alone leaves the ink finite");
+        let s = e.surface();
+        let px = |x: usize, y: usize| { let i = (y * 400 + x) * 4; (s[i], s[i + 1], s[i + 2]) };
+        let bg = px(399, 299);
+        let mut painted = 0;
+        for y in 0..300usize {
+            for x in 0..400usize {
+                if px(x, y) != bg {
+                    painted += 1;
+                    assert!(
+                        (x as f32) + 1.0 > ink.0 && (x as f32) < ink.2 && (y as f32) + 1.0 > ink.1 && (y as f32) < ink.3,
+                        "pixel ({x}, {y}) lies outside the ink {ink:?}"
+                    );
+                }
+            }
+        }
+        assert!(painted > 100 * 20, "the header and its shadow painted ({painted})");
+        assert!(px(50, 23) != bg, "the shadow shows below the header");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): a transformed shadowed fixed header: the transform group's ink stays
+    /// unbounded, so the scroll damages the viewport (SR1135's net).
+    #[test]
+    fn scroll_damage_shadow_holder_transform_falls_back() {
+        let mut e = damage_rects_engine(&shadow_holder_body(&format!("{SHADOW_HOLDER};transform:translateX(10px)")));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): an inset shadow paints inside the padding box: the ink is the plain
+    /// element ink (-2, -2, 102, 22) and the +50 damage is SR1139's header rect.
+    #[test]
+    fn scroll_damage_shadow_holder_inset_adds_nothing() {
+        let mut e = damage_rects_engine(&shadow_holder_body("box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5)"));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(crate::render::subtree_ink(&holders).0, Some((-2.0, -2.0, 102.0, 22.0)), "the inset shadow adds nothing");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 102, 22)], "+50: the strip and the header");
+    }
+
     // ---- AETHERCSSBORDERALPHACORNEROVERLAP (LEDGER SR1143): each plain border pixel composites once, the corners stay the vertical side's (named tail block) ----
 
     /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): 40x20 boxes (48x28 with the frame) on white, rows 12px apart: `#ha` a
@@ -10427,6 +10526,103 @@ b</div>
         for id in ["e", "c", "ke", "kc"] {
             assert_eq!(rect_by_id(&t, id).unwrap().2, 100.0, "#{id}: 10 x 20 / 2 with no face");
         }
+    }
+
+    // ---- AETHERCSSOMBOUNDINGSTICKY (LEDGER SR1144): a stuck sticky box's CSSOM rects read at its held place (named tail block) ----
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolls `e` by `dy`, repaints, and syncs the page's scroll into the CSSOM (the
+    /// shell's per-turn `tick` hands it over through `set_viewport`).
+    fn bounding_sticky_scroll(e: &mut crate::AetherEngine, dy: f64) {
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        e.tick();
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): the id of `document.elementFromPoint(x, y)` ("" for none or an id-less element).
+    fn bounding_sticky_from_point(e: &mut crate::AetherEngine, x: f64, y: f64) -> String {
+        let src = format!("(function(){{var el = document.elementFromPoint({x}, {y}); return el ? el.id : '';}})()");
+        e.js_engine.as_mut().unwrap().eval_string(&src).unwrap()
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): 400x300: a 100px spacer, `#s` sticky `top: 10px` 40px tall holding a 15px block
+    /// then `#k` 10px tall, then a 2000px spacer.
+    fn bounding_sticky_child_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="height:100px"></div>
+            <div id="s" style="position:sticky;top:10px;height:40px"><div style="height:15px"></div><div id="k" style="height:10px"></div></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolled 400px, SR1130's red `#d` is painted stuck at rows 20..39; its
+    /// getBoundingClientRect() and getClientRects() read top 20, and elementFromPoint(10, 25) is `#d`. Before SR1144 the
+    /// rect read its normal-flow place (80 - 400 = -320) and the point hit what flowed beneath.
+    #[test]
+    fn bounding_sticky_stuck_box_reads_painted_place() {
+        let mut e = sticky_em_inset_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d is painted stuck at row 20");
+        assert_eq!(imgalt_rect(&mut e, "d").1, 20.0, "#d's bounding top is its painted top (armed: -320 before SR1144)");
+        assert_eq!(js_num(&mut e, "document.getElementById('d').getClientRects()[0].top"), 20.0, "getClientRects follows the same conversion");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 25.0), "d", "elementFromPoint at #d's painted pixels (armed before SR1144)");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): a child of a stuck box moves with its hold: scrolled 400px `#s` holds at 10
+    /// and `#k` (15px into it) reads 25 (armed: 115 - 400 = -285 before SR1144).
+    #[test]
+    fn bounding_sticky_child_moves_with_hold() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(imgalt_rect(&mut e, "s").1, 10.0, "#s holds at top: 10px");
+        assert_eq!(imgalt_rect(&mut e, "k").1, 25.0, "#k moves with #s's hold (armed: -285 before SR1144)");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): unscrolled the rects are the flow rects (`#s` 100, `#k` 115; SR1130's `#a` 20,
+    /// `#b` 40, `#d` 80), and scrolled 50px `#s` is not yet stuck (flow 100 - 50 = 50 > its 10px inset).
+    #[test]
+    fn bounding_sticky_unstuck_is_flow_place() {
+        let mut e = bounding_sticky_child_engine();
+        assert_eq!(imgalt_rect(&mut e, "s").1, 100.0, "#s at its normal-flow y");
+        assert_eq!(imgalt_rect(&mut e, "k").1, 115.0, "#k at its normal-flow y");
+        bounding_sticky_scroll(&mut e, 50.0);
+        assert_eq!(imgalt_rect(&mut e, "s").1, 50.0, "#s scrolls with the page until it reaches its inset");
+        let mut d = sticky_em_inset_engine();
+        assert_eq!(imgalt_rect(&mut d, "a").1, 20.0, "#a unchanged");
+        assert_eq!(imgalt_rect(&mut d, "b").1, 40.0, "#b unchanged");
+        assert_eq!(imgalt_rect(&mut d, "d").1, 80.0, "#d unchanged");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolled 120px, `#s`'s flow place is viewport y -20..19 but it is held at
+    /// 10..49: elementFromPoint(10, 5) is not `#s` (its flow place, empty now), (10, 45) is `#s` and (10, 30) is `#k`
+    /// (held 25..34). Before SR1144 the point at 5 found `#s` and the one at 45 did not.
+    #[test]
+    fn bounding_sticky_flow_place_misses() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 120.0);
+        assert_eq!(e.scroll_y, 120.0, "the page scrolled 120px");
+        assert_ne!(bounding_sticky_from_point(&mut e, 10.0, 5.0), "s", "#s's flow place is not it (armed: #s before SR1144)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 45.0), "s", "#s at its held place (armed before SR1144)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 30.0), "k", "#k moves with the hold");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): the claim — scrolled 400px, the shell's hit test (SR1141, through the painter's
+    /// `placed_origin`) and the CSSOM's elementFromPoint (through `client_rect`, the same fn) name the same element at
+    /// three points: `#d`'s painted rows, `#b`'s stuck strip above them, and the spacer below.
+    #[test]
+    fn bounding_sticky_shell_and_cssom_agree() {
+        let mut e = sticky_em_inset_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        for (x, y) in [(10.0, 25.0), (10.0, 17.0), (10.0, 100.0)] {
+            let shell = hit_sticky_origin_id(&e, x, y);
+            assert_eq!(bounding_sticky_from_point(&mut e, x, y), shell, "shell hit test and elementFromPoint agree at ({x}, {y})");
+        }
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "the sample at #d's painted rows is #d");
     }
 
     // ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration line composites at its colour's alpha (named tail block) ----

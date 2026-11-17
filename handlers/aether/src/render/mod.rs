@@ -106,7 +106,7 @@ pub fn text_boxes() -> Vec<TextBox> {
 // paint's own control flow with no pixels — every box at the place the paint puts it (placed_origin, the
 // multicol shift, scroll offsets, atomic inlines, stacking-context layers) — and records each `draw_node`
 // call's SUBTREE INK: the screen rect every pixel its paint (its own and its nested calls') can touch, or
-// unbounded when the shape is not bounded here (transforms, filters, clip-paths, backdrop filters, box shadows,
+// unbounded when the shape is not bounded here (transforms, filters, clip-paths, backdrop filters,
 // text shadows, vertical writing, column fragments, multicol rules, scrollbars, form controls and media,
 // author ::marker text, text outside an inline formatting context). It records the text boxes too. The PAINT
 // walk then skips a `draw_node` call whose subtree ink meets no damage rect: such a box writes no pixel of the
@@ -408,7 +408,6 @@ fn ink_element(
 ) {
     let bars = layout_core::scroll::scrollbars(layout, node_id);
     let unbounded = layout.col_frags.get(&node_id).is_some_and(|f| !f.is_empty())
-        || spec.shadows.as_ref().is_some_and(|s| !s.is_empty())
         || layout.multicol.contains_key(&node_id)
         || bars.v.is_some()
         || bars.h.is_some()
@@ -428,6 +427,7 @@ fn ink_element(
         r.1 -= 4.0 * fs; // the marker's glyphs about the first baseline (an empty item's sits below its top)
         r.3 += 4.0 * fs;
     }
+    for s in spec.shadows.iter().flatten().filter(|s| !s.inset) { r = ink_union(r, effects::shadow_extent(s, box_sx, box_sy, bw, bh)); }
     ink_add(r);
 }
 
