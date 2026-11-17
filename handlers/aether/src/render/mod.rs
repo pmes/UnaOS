@@ -659,13 +659,8 @@ fn draw_text_shadows(
     let placed = adv.place(text);
     for sh in shadows.iter().rev() {
         let sigma = (sh.blur / 2.0).max(0.0);
-        let pad = (sigma * 3.0).ceil() as i32 + 1;
         // the coverage mask of the run, in a box around its ink
-        let lw = adv.str(text);
-        let x0 = (origin_x + sh.dx).floor() as i32 - pad - 2;
-        let y0 = (baseline_y + sh.dy - adv.size * 1.5).floor() as i32 - pad;
-        let mw = (lw + adv.size).ceil() as i32 + 2 * pad + 4;
-        let mh = (adv.size * 2.5).ceil() as i32 + 2 * pad;
+        let (x0, y0, mw, mh) = text_shadow_mask(adv.str(text), adv.size, origin_x, baseline_y, sh);
         if mw <= 0 || mh <= 0 || mw as i64 * mh as i64 > 1 << 24 {
             continue;
         }
@@ -3825,11 +3820,11 @@ fn frame_walk(
                         if walk_mode() == 1 {
                             let fs = i.font_size;
                             let m = 2.0 * fs + 4.0 + i.letter_spacing.abs() + i.word_spacing.abs();
-                            if i.shadows(layout).is_empty() {
+                            let run = (ox - m, ltop.min(by - 3.0 * fs) - 4.0, ox + fw + m, lbot.max(by + 2.0 * fs) + 4.0); if i.shadows(layout).is_empty() {
                                 // 3 em above the baseline, 2 em below it, 2 em and the spacing either side.
-                                ink_add((ox - m, ltop.min(by - 3.0 * fs) - 4.0, ox + fw + m, lbot.max(by + 2.0 * fs) + 4.0));
+                                ink_add(run);
                             } else {
-                                ink_add(INK_ALL);
+                                ink_add(text_shadows_ink(run, text, &adv, ox, by, i.shadows(layout)));
                             }
                             continue;
                         }
@@ -4921,4 +4916,40 @@ fn deco_px(surface: &mut [u8], width: u32, x: u32, y: u32, color: (u8, u8, u8), 
         0 => {}
         _ => blend_px(surface, width, x, y, color, k),
     }
+}
+
+// ---- AETHERPAINTINDEXTEXTSHADOW (LEDGER SR1150): a text shadow's ink is its mask rect, the one the painter allocates (named tail block) ----
+
+/// AETHERPAINTINDEXTEXTSHADOW (SR1150): the coverage mask rect (x0, y0, w, h) of one text-shadow layer of a run `lw`
+/// wide at `size` — the box `draw_text_shadows` allocates around the run's ink, grown by the blur's reach and shifted
+/// by the offset. The painter writes no pixel outside it, so it is also the layer's painted extent.
+fn text_shadow_mask(lw: f32, size: f32, origin_x: f32, baseline_y: f32, sh: &effects::Shadow) -> (i32, i32, i32, i32) {
+    let sigma = (sh.blur / 2.0).max(0.0);
+    let pad = (sigma * 3.0).ceil() as i32 + 1;
+    let x0 = (origin_x + sh.dx).floor() as i32 - pad - 2;
+    let y0 = (baseline_y + sh.dy - size * 1.5).floor() as i32 - pad;
+    let mw = (lw + size).ceil() as i32 + 2 * pad + 4;
+    let mh = (size * 2.5).ceil() as i32 + 2 * pad;
+    (x0, y0, mw, mh)
+}
+
+/// AETHERPAINTINDEXTEXTSHADOW (SR1150): the screen rect one shadow layer of `text` can touch, through the same dispatch
+/// as `draw_text_shadows`: a small-caps run piece by piece at the pens [`small_caps_shadows`] paints them at.
+fn text_shadow_extent(text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, sh: &effects::Shadow) -> Ink {
+    if adv.small_caps != 0 {
+        let (mut pen, mut r) = (0.0f32, INK_NONE);
+        for (t, a) in adv.small_caps_pieces(text) {
+            r = ink_union(r, text_shadow_extent(&t, &a, origin_x + pen, baseline_y, sh));
+            pen += a.str(&t);
+        }
+        return r;
+    }
+    let (x0, y0, mw, mh) = text_shadow_mask(adv.str(text), adv.size, origin_x, baseline_y, sh);
+    (x0 as f32, y0 as f32, (x0 + mw) as f32, (y0 + mh) as f32)
+}
+
+/// AETHERPAINTINDEXTEXTSHADOW (SR1150): a text fragment's ink with its shadows: its own rect `run` and every layer's
+/// extent (the index walk's term in place of the unbounded ink).
+fn text_shadows_ink(run: Ink, text: &str, adv: &Advancer, ox: f32, by: f32, shadows: &[effects::Shadow]) -> Ink {
+    shadows.iter().fold(run, |r, sh| ink_union(r, text_shadow_extent(text, adv, ox, by, sh)))
 }
