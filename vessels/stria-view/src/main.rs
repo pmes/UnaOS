@@ -3543,3 +3543,34 @@ mod striagainenvcurve_tests {
         println!("striagainenvcurve witness: at:12:1,env:-6,env-curve -> equal-power; env-curve -> linear");
     }
 }
+
+// ---- STRIASOURCEDRAG (LEDGER SR9081): the witness drags the loaded source from the preview Surface onto a track (named tail block) ----
+// No new token: under `--split`, `aux:press` / `aux:move` / `aux:release` already reach the face stamped with the preview
+// Surface's number, which is the source drag's road (nle_face `source_drag_input`).
+
+#[cfg(test)]
+mod striasourcedrag_tests {
+    use super::*;
+    use timeline_core::{Clip, Mode, SourceId};
+
+    /// `binload:1` loads B, the words mark 1..3, and an `aux:` press on the preview Surface dragged onto V1 at tick 15 and
+    /// released lays B 1..3 there on V1 and A1 (Overwrite, one undo step).
+    #[test]
+    fn striasourcedrag_witness_aux_drag_overwrites() {
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true };
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        let s = face.split().expect("split");
+        let (x, yt) = face.layout().point(0, 15);
+        let y = yt + s.preview_canvas.1 as f64;
+        let script = format!("binload:1,src-next,src-in,src-next,src-next,src-out,aux:alt:press:20:10,aux:move:{x}:{y},aux:release");
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, &script, Some((s.tracks, s.preview)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        let b = Clip::new(SourceId(1), 1, 3, 15);
+        assert_eq!(face.state.timeline, tl0.place(0, b, Mode::Overwrite).unwrap().place(1, b, Mode::Overwrite).unwrap());
+        assert_eq!(face.state.undo_depth(), 1);
+        println!("striasourcedrag witness: --split --bin --do binload:1,src-next,src-in,src-next,src-next,src-out,aux:alt:press:20:10,aux:move:{x}:{y},aux:release -> B 1..3 at 15 on V1 + A1, undo 1");
+    }
+}

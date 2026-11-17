@@ -250,7 +250,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if let Some(r) = self.xform_drag_on(msg) { return r; } if let Some(r) = self.preview_history_input(msg) { return r; } if let Some(r) = self.source_ruler_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail); STRIATITLESTYLEFACE (SR9077): an input clears the note (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if let Some(r) = self.xform_drag_on(msg) { return r; } if let Some(r) = self.preview_history_input(msg) { return r; } if let Some(r) = self.source_ruler_input(msg) { return r; } if let Some(r) = self.source_drag_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail); STRIATITLESTYLEFACE (SR9077): an input clears the note (file tail); STRIASOURCEDRAG (SR9081): the split preview Surface's source drag (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text), SMessage::ConsoleInput(q) => self.help_field(q), // STRIAHELPMORE (SR977): the bar's help query field, its Enter (file tail)
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -507,7 +507,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
-        if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
+        if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_source(x, y, mods) { return r; } if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; } // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview band begins the source drag (file tail)
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -10930,5 +10930,141 @@ impl Face {
             None => return None,
         }
         Some(true)
+    }
+}
+
+// ---- STRIASOURCEDRAG (LEDGER SR9081): the loaded source's preview dragged onto a track (named tail block) ----
+// While a source is loaded (SR9045's `EditorState::source`), a press on the preview begins THE drag model's source drag
+// (`Drag::begin_source`): one Surface, a press in the band above the ruler; split, a press on the PREVIEW Surface, its moves
+// and its release (the platform's implicit grab keeps them there) taken before `takes` and translated into the tracks
+// Surface's pixels by the `on_surfaces` cut (the preview band directly above the tracks, same x). The existing `press` /
+// `hover` / `release` bodies then run: the drag's preview state shows the clip laid at the drop, and the release's
+// `Drag::finish` is ONE `EditorState::drop_source` (Overwrite; Shift at the press: Insert; off the tracks: nothing).
+// `pointer` keeps the raw Surface pixels. Nothing loaded: every path is as before.
+
+impl Face {
+    /// One Surface: a press in the preview band with a source loaded begins the source drag; `None` otherwise.
+    fn press_source(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
+        if self.split.is_some() {
+            return None;
+        }
+        self.state.source.as_ref()?;
+        let l = self.layout();
+        if x < 0.0 || y < 0.0 || x >= l.w as f64 || y >= l.ruler_y as f64 {
+            return None;
+        }
+        self.begin_source_drag(x, y, mods)
+    }
+    /// The source drag at `(x, y)` (the pointer Surface's pixels), a live drag dropped uncommitted; `None` with nothing loaded.
+    fn begin_source_drag(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
+        let d = Drag::begin_source(&self.state, self.layout(), x, y, mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0)?;
+        self.drag = Some(d);
+        Some(true)
+    }
+    /// Split: the preview Surface's press (a source loaded) begins the source drag, and while one lives its moves and
+    /// release follow it, in tracks pixels; `None` for every other message (the existing road).
+    fn source_drag_input(&mut self, msg: &SMessage) -> Option<bool> {
+        let s = self.split?;
+        if msg.surface() != Some(s.preview) || s.preview == s.tracks {
+            return None;
+        }
+        let dy = s.preview_canvas.1 as f64;
+        let live = self.drag.is_some_and(|d| d.kind == DragKind::Source);
+        let r = match *msg {
+            SMessage::BrowserButton { down: true, x, y, mods, .. } => {
+                self.state.source.as_ref()?;
+                self.buttons = true;
+                let r = self.begin_source_drag(x, y - dy, mods)?;
+                self.pointer = Some((x, y));
+                r
+            }
+            SMessage::BrowserMouseMove(x, y, _) if live => {
+                let r = self.hover(x, y - dy);
+                self.pointer = Some((x, y));
+                r
+            }
+            SMessage::BrowserButton { down: false, x, y, .. } if live => {
+                let r = self.release(x, y - dy);
+                self.pointer = Some((x, y));
+                r
+            }
+            _ => return None,
+        };
+        Some(r)
+    }
+}
+
+#[cfg(test)]
+mod striasourcedrag_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    /// The synth fixture with B loaded for video and audio, marked 1..3.
+    fn loaded() -> Face {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(f.state.load_source(SourceId(1), &[Kind::Video, Kind::Audio]), Ok(()));
+        f.state.source.as_mut().unwrap().marks = (Some(1), Some(3));
+        f
+    }
+
+    fn laid(tl: &Timeline, at: i64, mode: Mode) -> Timeline {
+        let c = Clip::new(SourceId(1), 1, 3, at);
+        tl.place(0, c, mode).unwrap().place(1, c, mode).unwrap()
+    }
+
+    /// One Surface: a press in the preview band dragged onto V1 at tick 15 overwrites B 1..3 there on V1 and A1 at the
+    /// release, in one undo step; nothing is committed while the pointer moves.
+    #[test]
+    fn striasourcedrag_preview_band_drop_overwrites() {
+        let mut f = loaded();
+        let tl0 = f.state.timeline.clone();
+        let l = f.layout();
+        assert!(10 < l.ruler_y, "the press is in the preview band");
+        assert!(f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: bandy::MOD_ALT, surface: 0 }));
+        assert_eq!(f.dragging().map(|d| d.kind), Some(DragKind::Source));
+        let (x, y) = l.point(0, 15);
+        assert!(f.on(&SMessage::BrowserMouseMove(x, y, 0)));
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0));
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.timeline, laid(&tl0, 15, Mode::Overwrite));
+        assert_eq!((f.state.undo_depth(), f.dragging().is_none()), (1, true));
+    }
+
+    /// Shift at the press is Insert; with nothing loaded a press in the preview band begins no drag, as before.
+    #[test]
+    fn striasourcedrag_shift_inserts_and_unloaded_is_unchanged() {
+        let mut f = loaded();
+        let tl0 = f.state.timeline.clone();
+        let l = f.layout();
+        assert!(f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: bandy::MOD_SHIFT | bandy::MOD_ALT, surface: 0 }));
+        let (x, y) = l.point(1, 15);
+        f.on(&SMessage::BrowserMouseMove(x, y, 0));
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+        assert_eq!(f.state.timeline, laid(&tl0, 15, Mode::Insert));
+        assert!(f.verb("unload"));
+        f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: 0, surface: 0 });
+        assert!(f.dragging().is_none(), "no source loaded: no drag");
+    }
+
+    /// Split: the preview Surface's press, move and release (its implicit grab) drop onto the tracks Surface below it;
+    /// with nothing loaded the preview Surface's press is dropped, as before.
+    #[test]
+    fn striasourcedrag_split_preview_surface_drop() {
+        let mut f = loaded().on_surfaces(0, 1);
+        let tl0 = f.state.timeline.clone();
+        let ph = f.split().unwrap().preview_canvas.1 as f64;
+        let (x, yt) = f.layout().point(0, 15);
+        assert!(f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: bandy::MOD_ALT, surface: 0 }));
+        assert_eq!(f.dragging().map(|d| d.kind), Some(DragKind::Source));
+        assert!(f.on(&SMessage::BrowserMouseMove(x, yt + ph, 0)));
+        assert_eq!(f.pointer(), Some((x, yt + ph)), "the raw Surface pixels");
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y: yt + ph, mods: 0, surface: 0 }));
+        assert_eq!(f.state.timeline, laid(&tl0, 15, Mode::Overwrite));
+        assert_eq!(f.state.undo_depth(), 1);
+        assert!(f.verb("unload"));
+        assert!(!f.on(&SMessage::BrowserButton { down: true, x: 20.0, y: 10.0, mods: 0, surface: 0 }));
+        assert!(f.dragging().is_none());
     }
 }

@@ -2336,7 +2336,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it) DragKind::XfadeIn => "xfade-in", DragKind::XfadeOut => "xfade-out", // STRIAXFADETHREE (SR9023): the audio crossfade bracket's edges (the Player's press never begins them)
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it) DragKind::XfadeIn => "xfade-in", DragKind::XfadeOut => "xfade-out", // STRIAXFADETHREE (SR9023): the audio crossfade bracket's edges (the Player's press never begins them) DragKind::Source => "source", // STRIASOURCEDRAG (SR9081): never begun here (the Player loads no source); named for the exhaustive match
     }
 }
 

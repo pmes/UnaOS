@@ -4688,7 +4688,7 @@ impl EditorState {
     pub fn insert_source(&mut self, mode: crate::Mode) -> Option<Result<(), EditError>> {
         let m = self.source.clone()?;
         let Some(dur) = self.timeline.source(m.src).map(|s| s.duration) else { return Some(Err(EditError::NoSource)) };
-        let (a, b) = (m.marks.0.unwrap_or(0), m.marks.1.unwrap_or(dur));
+        let (a, b) = source_marked(&m, dur); // STRIASOURCEDRAG (SR9081): the one marked-range rule, shared with the drop (file tail)
         let tracks = self.source_tracks();
         Some(self.place_tracks_at_playhead(&tracks, m.src, a, b, mode))
     }
@@ -5850,5 +5850,89 @@ mod striakinsertall_tests {
         st.seek(15);
         assert_eq!(st.verb("overwrite"), Some(Ok(())));
         assert_eq!(st.laid_line("overwrite").as_deref(), Some("overwrite: B 10 at 15"));
+    }
+}
+
+// ---- STRIASOURCEDRAG (LEDGER SR9081): the loaded source dropped on a track at a tick through the one placing road (named tail block) ----
+// THE drag model's `DragKind::Source` (view.rs) finishes here: the loaded source's marked range (`source_marked`, the rule
+// `insert_source` reads too) laid at the drop tick through SR976's `place_tracks_at_playhead` (ONE commit, one undo) on
+// `source_tracks` with the dropped row in place of its kind's track (an AV reel dropped on V2 lays V2 and A1). The tick
+// is reached by `seek` (clamped to the timeline: a drop past the end lays at the end); after the drop the playhead sits at
+// the laid clip's end, as after an insert; refused: the playhead restored and nothing committed.
+
+/// A loaded source's marked range: in or 0 .. out or the reel's duration `dur`.
+fn source_marked(m: &SourceMon, dur: i64) -> (i64, i64) {
+    (m.marks.0.unwrap_or(0), m.marks.1.unwrap_or(dur))
+}
+
+impl EditorState {
+    /// Lay the loaded source's marked range at tick `at` with `track` as its kind's track (`mode`, ONE commit). Nothing
+    /// loaded: `EditError::NoSource`; `track` missing or of a kind the source is not laid on: `EditError::NoTrack`.
+    pub fn drop_source(&mut self, track: usize, at: i64, mode: crate::Mode) -> Result<(), EditError> {
+        let m = self.source.clone().ok_or(EditError::NoSource)?;
+        let dur = self.timeline.source(m.src).ok_or(EditError::NoSource)?.duration;
+        let kind = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?.kind;
+        if !m.kinds.contains(&kind) {
+            return Err(EditError::NoTrack);
+        }
+        let tracks: Vec<usize> = self.source_tracks().into_iter().map(|t| if self.timeline.tracks[t].kind == kind { track } else { t }).collect();
+        let (a, b) = source_marked(&m, dur);
+        let ph = self.playhead;
+        self.seek(at);
+        let r = self.place_tracks_at_playhead(&tracks, m.src, a, b, mode);
+        if r.is_err() {
+            self.seek(ph);
+        }
+        r
+    }
+}
+
+#[cfg(test)]
+mod striasourcedrag_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// A 13..23 at 0 on V1, V2 and A1; B (50 ticks) on no track, loaded for video and audio.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..3 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0)];
+        }
+        let mut st = EditorState::new(tl);
+        assert_eq!(st.load_source(SourceId(1), &[Kind::Video, Kind::Audio]), Ok(()));
+        st
+    }
+
+    /// Dropped on V2 at 4, B's marked range overwrites V2 and A1 (V1 untouched) in ONE undo step; the source stays loaded.
+    #[test]
+    fn striasourcedrag_drop_on_the_named_row_one_commit() {
+        let mut st = state();
+        st.source.as_mut().unwrap().marks = (Some(2), None);
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.drop_source(1, 4, Mode::Overwrite), Ok(()));
+        let c = Clip::new(SourceId(1), 2, 50, 4);
+        assert_eq!(st.timeline, tl0.place(1, c, Mode::Overwrite).unwrap().place(2, c, Mode::Overwrite).unwrap());
+        assert_eq!((st.undo_depth(), st.playhead, st.source.is_some()), (1, 52, true));
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// Refusals commit nothing and leave the playhead: nothing loaded, no such track, a kind the source is not laid on.
+    #[test]
+    fn striasourcedrag_drop_refusals() {
+        let mut st = state();
+        st.seek(7);
+        st.source.as_mut().unwrap().kinds = alloc::vec![Kind::Video];
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.drop_source(2, 3, Mode::Insert), Err(EditError::NoTrack), "A1 with a video-only source");
+        assert_eq!(st.drop_source(9, 3, Mode::Insert), Err(EditError::NoTrack));
+        st.source = None;
+        assert_eq!(st.drop_source(0, 3, Mode::Insert), Err(EditError::NoSource));
+        assert_eq!((&st.timeline, st.undo_depth(), st.playhead), (&tl0, 0, 7));
     }
 }
