@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "title", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -387,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2603,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("mark", "drop a marker at the playhead"), // STRIAMARKERS (SR835)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3056,4 +3058,31 @@ pub fn add_title(st: &mut EditorState, text: &str) -> Result<(), EditError> {
     let tb = st.timeline.tb;
     let dur = (TITLE_SECS * tb.den / tb.num.max(1)) as i64;
     st.add_title(text, dur)
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): the marker words' message line (named tail block) ----
+// `mark [<name>]` / `unmark` (the Mark / Unmark buttons, the `m` key) are timeline_core's `EditorState::verb` words (ONE commit
+// each); the face only words THE message (`last_error`) around them: `marked <name> at <tc>`, `unmarked <name> at <tc>`,
+// `mark: <name> is already at <tc>`, `unmark: no marker at <tc>` (tc the playhead's `HH:MM:SS:FF`, its tick when the rate is
+// not an integer fps).
+
+impl Face {
+    /// The marker words (`timeline_core::editor::marker_word`) through the one dispatch, with their message; `None` for any
+    /// other word.
+    fn marker_verb(&mut self, v: &str) -> Option<bool> {
+        let word = timeline_core::editor::marker_word(v)?;
+        let ph = self.state.playhead;
+        let tc = self.state.timeline.fps().map_or_else(|| ph.to_string(), |f| timeline_core::edl::timecode(ph, f));
+        let before = self.state.timeline.marker_at(ph).map(|m| m.name.clone());
+        let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
+        let now = self.state.timeline.marker_at(ph).map(|m| m.name.clone());
+        self.last_error = Some(match (word, r, before) {
+            (timeline_core::editor::MarkerWord::Mark(_), Ok(()), _) => format!("marked {} at {tc}", now.unwrap_or_default()),
+            (timeline_core::editor::MarkerWord::Unmark, Ok(()), b) => format!("unmarked {} at {tc}", b.unwrap_or_default()),
+            (timeline_core::editor::MarkerWord::Mark(_), Err(EditError::Marker), Some(b)) => format!("mark: {b} is already at {tc}"),
+            (timeline_core::editor::MarkerWord::Unmark, Err(EditError::Marker), None) => format!("unmark: no marker at {tc}"),
+            (_, Err(e), _) => format!("{}: {e}", v.trim()),
+        });
+        Some(true)
+    }
 }

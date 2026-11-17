@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &markers_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAMARKERS (SR835): the markers (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
@@ -857,5 +858,43 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): the witness's markers (named tail block) ----
+/// The witness's `"markers"` field: every marker as `{"t":<tick>,"name":"<name>"}` in tick order, only when the timeline
+/// holds one (a `"` in a name shown `'`, `reel_json`'s rule); the default line is unchanged.
+fn markers_json(face: &Face) -> String {
+    let m = &face.state.timeline.markers;
+    if m.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = m.iter().map(|k| format!("{{\"t\":{},\"name\":\"{}\"}}", k.at, k.name.replace('"', "'"))).collect();
+    format!(",\"markers\":[{}]", items.join(","))
+}
+
+#[cfg(test)]
+mod striamarkers_tests {
+    use super::*;
+
+    /// STRIAMARKERS M3: the Mark / Unmark buttons sit before Title (help stays last) and fire the face's words; the
+    /// witness carries no `"markers"` on a fresh face, `[{"t":0,"name":"M1"}]` after `mark`, nothing again after `unmark`.
+    #[test]
+    fn striamarkers_witness_markers_field() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let at = row.iter().position(|b| matches!(b, TetraNode::Button { id, .. } if id == "mark")).expect("a mark button");
+        assert!(matches!(&row[at + 1], TetraNode::Button { id, .. } if id == "unmark"));
+        assert!(matches!(&row[at + 2], TetraNode::Button { id, .. } if id == "title"));
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(markers_json(&face), "");
+        assert_eq!(drive(&mut face, "mark"), vec!["marked M1 at 00:00:00:00".to_string()]);
+        assert_eq!(markers_json(&face), r#","markers":[{"t":0,"name":"M1"}]"#);
+        assert_eq!(drive(&mut face, "ruler:12,mark"), vec!["marked M2 at 00:00:00:12".to_string()]);
+        assert_eq!(markers_json(&face), r#","markers":[{"t":0,"name":"M1"},{"t":12,"name":"M2"}]"#);
+        println!("striamarkers witness: {}", markers_json(&face));
+        assert_eq!(drive(&mut face, "unmark,ruler:0,unmark"), vec!["unmarked M2 at 00:00:00:12".to_string(), "unmarked M1 at 00:00:00:00".to_string()]);
+        assert_eq!(markers_json(&face), "");
     }
 }

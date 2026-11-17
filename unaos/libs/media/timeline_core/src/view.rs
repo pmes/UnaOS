@@ -320,7 +320,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             c.rect(x, ty - 3, x + 1, ty, TICK);
         }
     }
-    // The tracks and their clips.
+    paint_markers(&mut c, l, tl, &mut labels); // The tracks and their clips.
     for (row, track) in tl.tracks.iter().enumerate() {
         let y0 = l.row_y(row);
         let y1 = y0 + ROW_H as i64;
@@ -1187,5 +1187,71 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): the named markers on the ruler (named tail block) ----
+// Each marker in view paints from [`paint_in`]'s ruler arm: a down-pointing triangle at the ruler's top (rows `ruler_y ..
+// ruler_y + MARKER_W + 1`, inside the ruler band) in the named [`MARKER`] colour, and its name through the [`Text`] hook
+// (the labels' style and ink) beside it. Both faces paint it (the host face and the kernel Player's view band); a timeline
+// with no marker paints byte-identical.
+
+/// STRIAMARKERS (SR835): a marker's colour (the editor table's; NLE6VIEW-TOKENS owes palette_core).
+pub const MARKER: [u8; 4] = [0xff, 0x9a, 0x30, 255];
+/// STRIAMARKERS (SR835): the marker triangle's half width (px); it is `MARKER_W + 1` rows tall.
+pub const MARKER_W: i64 = 4;
+
+/// STRIAMARKERS (SR835): the markers over the ruler band of `l`.
+fn paint_markers(c: &mut Canvas, l: Layout, tl: &Timeline, labels: &mut Option<&mut dyn Text>) {
+    let (ry, w) = (l.ruler_y as i64, l.w as i64);
+    for m in &tl.markers {
+        let x = l.x_of(m.at);
+        if x + MARKER_W < 0 || x - MARKER_W >= w {
+            continue;
+        }
+        for k in 0..=MARKER_W {
+            c.rect(x - (MARKER_W - k), ry + k, x + (MARKER_W - k) + 1, ry + k + 1, MARKER);
+        }
+        if let Some(text) = labels.as_mut() {
+            text.text(c, &m.name, (x + MARKER_W + 2) as f32, ry as f32 + 9.0, ((x + MARKER_W + 1) as i32, w as i32));
+        }
+    }
+}
+
+#[cfg(test)]
+mod striamarkers_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// STRIAMARKERS M3: at 320x160 a marker at tick 5 changes pixels only inside the ruler band (`ruler_y..tracks_y`):
+    /// none outside, some inside, the triangle's apex column at the ruler's top in MARKER.
+    #[test]
+    fn striamarkers_marker_paints_only_in_the_ruler() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(a, 0, 10, 10)];
+        }
+        let plain = EditorState::new(tl.clone());
+        let marked = EditorState::new(tl.mark(5, "M1").unwrap());
+        let (w, h) = (320u32, 160u32);
+        let l = Layout::of(w, h, &marked);
+        let (a, b) = (paint(&plain, w, h, Order::Rgba, None, None), paint(&marked, w, h, Order::Rgba, None, None));
+        let (mut inside, mut outside) = (0usize, 0usize);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let i = (y * w as usize + x) * 4;
+                if a[i..i + 4] != b[i..i + 4] {
+                    if (l.ruler_y as usize..l.tracks_y as usize).contains(&y) { inside += 1 } else { outside += 1 }
+                }
+            }
+        }
+        assert_eq!(outside, 0, "a marker paints nothing outside the ruler");
+        assert!(inside > 0, "the marker shows on the ruler");
+        let (x, y) = (l.x_of(5) as usize, l.ruler_y as usize);
+        assert_eq!(b[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4], MARKER);
+        assert_eq!(inside as i64, (0..=MARKER_W).map(|k| 2 * (MARKER_W - k) + 1).sum::<i64>(), "the triangle alone (labels off)");
     }
 }
