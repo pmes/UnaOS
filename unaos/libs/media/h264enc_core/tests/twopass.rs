@@ -806,3 +806,63 @@ fn z_first_p_held_against_the_seed() {
     assert!((held[1] - (held[0] + IP_QP_OFFSET)).abs() <= 2 * 4, "the first P within 2 x qpstep of the IDR's QP + IP_QP_OFFSET: {held:?}");
     assert_ne!(held[1], free[1], "the seed moves the first P: {held:?} vs {free:?}");
 }
+
+// ---- H264ENCTWOPASSQPSTEPSCENECUT (LEDGER SR809): the post-cut P against the clamp (named tail block) ----
+
+/// A still smooth picture (a luma gradient, flat chroma): nothing in common with scene(), and its P pictures cost almost nothing.
+fn flat(_t: usize) -> [Vec<u8>; 3] {
+    let y = (0..W * H).map(|i| (200 - (i % W) * 60 / W - (i / W) * 40 / H) as u8).collect();
+    [y, vec![60u8; W * H / 4], vec![180u8; W * H / 4]]
+}
+
+/// scene() up to picture CUT_AT, then flat(): a hard cut down to cheap content.
+fn cut_src(t: usize) -> [Vec<u8>; 3] {
+    if t < CUT_AT { scene(t) } else { flat(t) }
+}
+
+const CUT_AT: usize = 15;
+const CUT_KBPS: u32 = RT_KBPS;
+
+/// Under `Config::scenecut` Some(40): the CBR first pass of cut_src at `kbps`, then the second pass planned from it with `opts`:
+/// (the plan's QPs, the second pass's kinds, its coded SliceQPY per picture). The second pass's kinds are asserted equal to the
+/// first's (the cut is decided from the source in both passes).
+fn cut_encode(kbps: u32, opts: &Pass2Opts) -> (Vec<i32>, Vec<Pic>, Vec<i32>) {
+    let cfg = |r| Config { scenecut: Some(40), ..base(Some(r)) };
+    let mut one = Encoder::new(cfg(RateControl::cbr(kbps, (FPS, 1)))).unwrap();
+    for t in 0..N {
+        one.encode(&frame(&cut_src(t))).unwrap();
+    }
+    let stats = one.stats().to_vec();
+    let plan = pass2_qps(&stats, kbps as u64 * 1000 * N as u64 / FPS as u64, QP_MIN, opts);
+    let mut two = Encoder::new(cfg(RateControl::two_pass(kbps, (FPS, 1)))).unwrap().planned_with(&stats, opts).unwrap();
+    for t in 0..N {
+        two.encode(&frame(&cut_src(t))).unwrap();
+    }
+    let kinds: Vec<Pic> = two.stats().iter().map(|p| p.kind).collect();
+    assert_eq!(kinds, stats.iter().map(|p| p.kind).collect::<Vec<_>>(), "pass 2 decides the cuts pass 1 recorded");
+    (plan, kinds, two.stats().iter().map(|p| p.qp).collect())
+}
+
+// (za) MEASURED, the arc's rule fixed before the run (design.md): the clamp counts as costly ((b): reseed at a cut) only if it holds
+// the post-cut P more than 2 x qpstep from the plan for more than 2 pictures. Measured on the tree before SR809 (cut_src at 60
+// kbps, Default Pass2Opts, qpstep 4): IDRs [0, 15]; plan P 24 before the cut, I 16 / P 16 after; coded pre-cut P 26, cut IDR 16,
+// post-cut P 22 22 22 at qpstep 4 and the same 22 22 22 at qpstep 0 (the runtime `off` lifts the pick onto the narrow bound
+// 26 - 4 itself, so the old P's hold does not bind): 6 QP from the plan, no post-cut picture past 2 x qpstep. (c): no reseed;
+// SR769's clamp keeps holding the first post-cut P against the last P before the cut (`types` is never reset), pinned here.
+#[test]
+fn za_scene_cut_kinds_and_hold() {
+    let (plan, kinds, held) = cut_encode(CUT_KBPS, &Pass2Opts::default());
+    let (_, _, free) = cut_encode(CUT_KBPS, &Pass2Opts { qpstep: 0, ..Pass2Opts::default() });
+    let idrs: Vec<usize> = (0..N).filter(|&i| kinds[i] == Pic::Idr).collect();
+    let past: Vec<usize> = (CUT_AT + 1..N).filter(|&i| (held[i] - plan[i]).abs() > 2 * QP_STEP as i32).collect();
+    println!("twopassqpstepscenecut idrs={idrs:?}");
+    println!("twopassqpstepscenecut plan {plan:?}");
+    println!("twopassqpstepscenecut qpstep=0 {free:?}");
+    println!("twopassqpstepscenecut qpstep=4 {held:?}");
+    println!("twopassqpstepscenecut pre-cut P {} cut IDR {} post-cut P {:?} plan {:?} held_past_2step={past:?}", held[CUT_AT - 1], held[CUT_AT], &held[CUT_AT + 1..CUT_AT + 4], &plan[CUT_AT + 1..CUT_AT + 4]);
+    assert_eq!(idrs, [0, CUT_AT], "the premise: one scene-cut IDR, at the cut");
+    let step = 2 * QP_STEP as i32;
+    assert!((held[CUT_AT - 1] - plan[CUT_AT + 1]).abs() > step, "the premise: the plan moves the post-cut P past 2 x qpstep from the P before the cut: {held:?} vs {plan:?}");
+    assert!((CUT_AT + 1..=CUT_AT + 2).all(|i| (held[i] - plan[i]).abs() <= step), "the post-cut P within 2 x qpstep of the plan by picture n + 2: {held:?} vs {plan:?}");
+    assert!(past.len() <= 2, "the clamp never holds the post-cut P past 2 x qpstep from the plan for more than 2 pictures: {past:?}");
+}
