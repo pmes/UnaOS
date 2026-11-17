@@ -1245,7 +1245,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
         let Some(tag) = tree.node_map.get(&k).and_then(|n| n.tag()) else { continue };
         let table = tag == "table";
         if (!table && is_table_part(&tag)) || (!table && (kst.size.width.is_auto() || kst.size.width == Dimension::percent(1.0))) {
-            continue;
+            if !table && kst.size.width.is_auto() && !is_table_part(&tag) && tree.paint_map.get(&k).and_then(|p| p.float).unwrap_or(0) == 0 && !centres_as_block(tree, k) { let mut n = kst; n.align_self = Some(taffy::style::AlignSelf::STRETCH); tree.rule_align.insert(k, taffy::style::AlignSelf::STRETCH); let _ = tree.taffy.set_style(k, n); } continue; // AETHERCENTERAUTOWIDTH (SR1159)
         }
         let mut n = kst;
         n.align_self = Some(to); tree.rule_align.insert(k, to);
@@ -4046,4 +4046,30 @@ pub fn font_units<F: Fonts + ?Sized>(fonts: &F, sel: FontSel, fs: f32, root_fs: 
     let ex = fonts.x_height(sel, fs);
     let ch = fonts.measure("0", &Adv::new(sel, fs, 0.0));
     (fs, root_fs, if ex > 0.0 { ex } else { fs * 0.5 }, ch)
+}
+
+// ---- AETHERCENTERAUTOWIDTH (LEDGER SR1159): which blocks the centring road centres (named tail block) ----
+
+/// AETHERCENTERAUTOWIDTH (SR1159): whether in-flow block child `k` is one the text-align centring road (`<center>`,
+/// `align=center`, `-webkit-center`, and the column's align_items CENTER / END) may move, or whether it fills its line.
+/// Blink's -webkit-center moves only a block narrower than its containing block; CSS 2.1 §10.3.3 makes a non-replaced
+/// `width: auto` block exactly as wide as the line, so it never moves. True for: a definite width (not auto, not the
+/// builder's 100% placeholder), a max-width (clamped narrower; owed AETHER-CENTER-MAXWIDTH), a table (shrink-to-fit,
+/// §17.5.2), a replaced or widget element (intrinsic width, §10.3.4), and an author flex / grid container (left as it
+/// was: owed AETHER-CENTER-AUTOWIDTH-FLEX-CHILD). `place_narrow_blocks` gives every other auto-width block STRETCH.
+fn centres_as_block<H: Host>(tree: &LayoutTree<H>, k: taffy::NodeId) -> bool {
+    let Ok(st) = tree.taffy.style(k) else { return true };
+    let tag = tree.node_map.get(&k).and_then(|n| n.tag()).unwrap_or_default();
+    (!st.size.width.is_auto() && st.size.width != Dimension::percent(1.0))
+        || !st.max_size.width.is_auto()
+        || tag == "table"
+        || matches!(tag.as_str(), "img" | "video" | "audio" | "canvas" | "iframe" | "embed" | "object" | "svg" | "input" | "select" | "textarea" | "button" | "meter" | "progress")
+        || tree.paint_map.get(&k).and_then(|p| p.flex_container) == Some(true)
+        || st.display == Display::Grid
+}
+
+/// AETHERCENTERAUTOWIDTH (SR1159): the align-self the centring road last wrote on box `id` (its `rule_align` mark),
+/// None when the rule holds no mark for it; read by the center_layout tests to see the undo road clear a mark.
+pub fn rule_align_mark<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> Option<taffy::style::AlignSelf> {
+    tree.rule_align.get(&id).copied()
 }
