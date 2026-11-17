@@ -1551,9 +1551,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "text-decoration" | "text-decoration-line" => {
             let v = value.trim(); deco_shorthand_rest::<H>(prop, v, &mut style.paint, cx);
-            if let Some((u, lt)) = deco_line_flags(prop, v) {
+            if let Some((u, lt, o)) = deco_line_flags(prop, v) {
                 style.paint.underline = Some(u);
-                style.paint.line_through = Some(lt);
+                style.paint.line_through = Some(lt); style.paint.overline = Some(o);
             }
         }
         "text-decoration-color" => {
@@ -2522,7 +2522,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
-        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, overline, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, unicode_bidi, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
@@ -5125,8 +5125,8 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
 /// only the strike). The shorthand's omitted line is `none` (`text-decoration: red` is (false, false)); its other words
 /// are [`deco_shorthand_rest`]'s. The longhand takes `none` alone or a set of underline / overline / line-through / blink,
 /// each once, else None (invalid: dropped). The CSS-wide keywords are None, untouched as before (no inherit bit:
-/// AETHER-CSS-TEXT-DECORATION-LINE-CSSWIDE owed).
-fn deco_line_flags(prop: &str, v: &str) -> Option<(bool, bool)> {
+/// AETHER-CSS-TEXT-DECORATION-LINE-CSSWIDE owed). AETHERCSSTEXTDECORATIONOVERLINE (SR1128): the set is (underline, line_through, overline).
+fn deco_line_flags(prop: &str, v: &str) -> Option<(bool, bool, bool)> {
     if v.is_empty() || ["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|k| v.eq_ignore_ascii_case(k)) {
         return None;
     }
@@ -5141,5 +5141,5 @@ fn deco_line_flags(prop: &str, v: &str) -> Option<(bool, bool)> {
             return None;
         }
     }
-    Some((has("underline"), has("line-through")))
+    Some((has("underline"), has("line-through"), has("overline")))
 }
