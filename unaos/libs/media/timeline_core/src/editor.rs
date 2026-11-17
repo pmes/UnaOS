@@ -680,7 +680,7 @@ impl EditorState {
     }
     /// The `pan <x>` word of [`EditorState::verb`]; `None` when `v` is not that shape.
     fn pan_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        pan_words(v).map(|p| self.set_selected_pan(p))
+        pan_words(v).or_else(|| self.pan_step(v)).map(|p| self.set_selected_pan(p)) // STRIAPANFACE (SR897): and the face's `pan` / `pan-` / `pan+` (file tail)
     }
 }
 
@@ -692,4 +692,26 @@ fn pan_words(v: &str) -> Option<i8> {
     }
     let x = w.next()?.parse::<f64>().ok().filter(|x| (-1.0..=1.0).contains(x))?;
     w.next().is_none().then_some(libm::round(x * 127.0) as i8)
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the face's pan words — centre and a step of 1/8 on the eighth grid (named tail block) ----
+// `pan` centres the selected clip; `pan-` / `pan+` step it one eighth of the swing left / right on the grid
+// `round(k * 127 / 8)`, k in -8..=8 (0, 16, 32, 48, 64, 79, 95, 111, 127: the values `pan 0.125` ... `pan 1` give). An
+// off-grid pan steps from its nearest grid point. At a hard end the step repeats the value (Ok, no commit). All ride
+// SR861's `set_selected_pan` and its ONE `commit`; with nothing selected it refuses `EditError::NoClip`.
+impl EditorState {
+    /// The pan the word `v` sets (`pan`, `pan-`, `pan+`); `None` for any other word.
+    fn pan_step(&self, v: &str) -> Option<i8> {
+        let d: i32 = match v {
+            "pan" => return Some(0),
+            "pan-" => -1,
+            "pan+" => 1,
+            _ => return None,
+        };
+        let cur = self.selected().map_or(0, |c| c.pan_cq8) as i32;
+        let m = cur * 8;
+        let k = ((m + m.signum() * 63) / 127 + d).clamp(-8, 8);
+        let n = k * 127;
+        Some(((n + n.signum() * 4) / 8) as i8)
+    }
 }

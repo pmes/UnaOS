@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("pan-", "Pan L"), button("pan", "Pan C"), button("pan+", "Pan R"), // STRIAPANFACE (SR897): step / centre the selected clip's pan
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -915,5 +916,26 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the three pan buttons before `?` (named tail block) ----
+#[cfg(test)]
+mod striapanface_tests {
+    use super::*;
+
+    /// The transport row's three buttons just before `?` are `pan-` / `pan` / `pan+`; `--do at:12:1,pan+,pan+` pans the
+    /// selected audio clip two eighths right and each press reads the pan on the message row.
+    #[test]
+    fn striapanface_buttons_pan_the_clip() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<&str> = row[row.len() - 4..].iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids, ["pan-", "pan", "pan+", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let lines = drive(&mut face, "at:12:1,pan+,pan+");
+        assert_eq!(lines, ["pan: R 13", "pan: R 25"]);
+        assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 32);
+        println!("striapanface witness: pan+ x2 -> {lines:?}");
     }
 }

@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "pan-", "pan", "pan+", "help"]; // STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } // STRIAPANFACE (SR897): the pan words and their readout (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3095,5 +3095,35 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the pan words on the face and their message-row readout (named tail block) ----
+// The three face words `pan-` / `pan` / `pan+` (VERBS, with their stria-view buttons) go through timeline_core's ONE verb
+// dispatch (SR861's `pan_verb` -> `set_selected_pan` -> one `commit`); after it the message row reads the selected clip's
+// pan ([`pan_line`]), or `pan: <why>` on a refusal. `pan <x>` (SR861) stays silent: it is not one of these words.
+impl Face {
+    /// The `pan-` / `pan` / `pan+` words; `None` for any other word.
+    fn pan_face_verb(&mut self, v: &str) -> Option<bool> {
+        if !matches!(v, "pan-" | "pan" | "pan+") {
+            return None;
+        }
+        let Some(r) = self.state.verb(v) else { return Some(false) };
+        self.last_error = Some(match r {
+            Ok(()) => pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)),
+            Err(e) => format!("pan: {e}"),
+        });
+        Some(true)
+    }
+}
+
+/// The message row's pan reading: `pan: centre`, `pan: L <p>` or `pan: R <p>`, `p` the percent of the swing
+/// (`|pan_cq8| * 100 / 127` rounded, at most 100): -64 reads `pan: L 50`, 32 `pan: R 25`, 127 `pan: R 100`.
+pub fn pan_line(pan_cq8: i8) -> String {
+    let p = ((pan_cq8 as i32).abs() * 100 + 63) / 127;
+    match pan_cq8 {
+        0 => "pan: centre".to_string(),
+        n if n < 0 => format!("pan: L {}", p.min(100)),
+        _ => format!("pan: R {}", p.min(100)),
     }
 }

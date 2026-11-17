@@ -400,7 +400,7 @@ fn striapan_verb_one_undo_step_and_refusals() {
     assert_eq!(st.timeline, two_tracks());
     assert!(st.undo());
     assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127, "one undo step per pan");
-    for bad in ["pan", "pan 2", "pan -1.01", "pan x", "pan 0.5 0.5", "pan NaN", "pan inf", "pans 0.5"] {
+    for bad in ["pan 2", "pan -1.01", "pan x", "pan 0.5 0.5", "pan NaN", "pan inf", "pans 0.5"] {
         assert_eq!(st.verb(bad), None, "{bad}");
     }
     assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127);
@@ -427,4 +427,78 @@ fn striapan_edl_round_trip_and_refusals() {
         let t = lines.join("\n");
         assert_eq!(edl::parse(&t, 25).map(|_| ()), Err(edl::EdlError::Syntax { line: at + 1 }), "{bad}");
     }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the face's pan words on the eighth grid, the pan tick on the body (named tail block) ----
+use timeline_core::view::{self, HANDLE_W, Order, TICK, clip_colour};
+
+/// `pan+` x8 walks the eighth grid to hard right (127), a 9th commits nothing; `pan-` steps back; bare `pan` centres; an
+/// off-grid pan steps from its nearest grid point; each step is one undo step; nothing selected refuses `NoClip`.
+#[test]
+fn striapanface_step_words_on_the_eighth_grid() {
+    let mut st = EditorState::new(two_tracks());
+    for w in ["pan", "pan-", "pan+"] {
+        assert_eq!(st.verb(w), Some(Err(EditError::NoClip)), "{w}");
+    }
+    st.select(1, 0).unwrap();
+    let d0 = st.undo_depth();
+    let grid = [16i8, 32, 48, 64, 79, 95, 111, 127];
+    for (i, want) in grid.iter().enumerate() {
+        assert_eq!(st.verb("pan+"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, *want, "step {}", i + 1);
+        assert_eq!(st.undo_depth(), d0 + i + 1, "one undo step per pan word");
+    }
+    assert_eq!(st.verb("pan+"), Some(Ok(())));
+    assert_eq!((st.timeline.tracks[1].clips[0].pan_cq8, st.undo_depth()), (127, d0 + 8), "hard right: no commit");
+    assert_eq!(st.verb("pan-"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, 111);
+    assert_eq!(st.verb("pan"), Some(Ok(())));
+    assert_eq!(st.timeline, two_tracks(), "bare pan centres");
+    assert_eq!(st.verb("pan 0.3"), Some(Ok(()))); // 38: nearest grid point 32 (k = 2)
+    assert_eq!(st.verb("pan+"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, 48);
+    assert_eq!(st.verb("pan -1"), Some(Ok(())));
+    assert_eq!(st.verb("pan-"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127, "hard left stays");
+    assert_eq!(st.verb("pan+"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -111);
+    assert!(st.undo());
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127);
+    println!("striapanface: pan+ grid {grid:?}");
+}
+
+/// The pan tick: a centred clip paints as before; a panned audio clip gains exactly the 2 x 4 px TICK mark at its pan
+/// along the body's top edge; a panned VIDEO clip paints nothing new.
+#[test]
+fn striapanface_tick_paints_only_off_centre() {
+    let (w, h) = (320u32, 160u32);
+    let base = EditorState::new(two_tracks());
+    let plain = view::paint(&base, w, h, Order::Rgba, None, None);
+    let mut st = EditorState::new(two_tracks());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("pan"), Some(Ok(())));
+    st.deselect();
+    assert_eq!(view::paint(&st, w, h, Order::Rgba, None, None), plain, "pan 0 paints nothing");
+
+    let panned = EditorState::new(two_tracks().set_pan(0, 0, 127).unwrap());
+    let px = view::paint(&panned, w, h, Order::Rgba, None, None);
+    let l = view::Layout::of(w, h, &panned);
+    let (x0, x1, y0) = (l.x_of(0), l.x_of(20), l.row_y(0));
+    let xm = (x0 + x1) / 2 + ((x1 - x0) / 2 - HANDLE_W - 1);
+    let at = |x: i64, y: i64| &px[((y as usize) * w as usize + x as usize) * 4..][..4];
+    assert_eq!(at(xm - 1, y0 + 2), TICK);
+    assert_eq!(at(xm, y0 + 5), TICK);
+    assert_eq!(at(xm + 1, y0 + 3), clip_colour(0, Kind::Audio));
+    assert_eq!(at(xm, y0 + 6), clip_colour(0, Kind::Audio));
+    let changed = px.chunks(4).zip(plain.chunks(4)).filter(|(a, b)| a != b).count();
+    assert_eq!(changed, 8, "only the tick's 2 x 4 pixels");
+
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    let v0 = view::paint(&EditorState::new(tl.clone()), w, h, Order::Rgba, None, None);
+    let v1 = view::paint(&EditorState::new(tl.set_pan(0, 0, -100).unwrap()), w, h, Order::Rgba, None, None);
+    assert_eq!(v0, v1, "no tick on a video clip");
+    println!("striapanface: tick at x {xm}, y {}..{}", y0 + 2, y0 + 6);
 }
