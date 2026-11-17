@@ -748,3 +748,16 @@ mod striagainenvelope_tests {
         assert!((32_700..=32_900).contains(&cdb_q16(-602)), "{}", cdb_q16(-602));
     }
 }
+
+// ---- STRIAKOPACITY (LEDGER SR9013): a step's layer opacity (named tail block) ----
+
+/// STRIAKOPACITY: the percent of step `s`'s winning clip when the step mixes the track below by opacity: `s` carries a
+/// [`VideoMix`] and its winner (clip at `s.out_t` on `s.track`) is below [`crate::OPAQUE`]. [`opacity_mix`] refuses a
+/// transition on a non-opaque cut, so such a mix is always the opacity one. `None` for a transition, a gap, an opaque
+/// winner, an audio step. The kernel Player names an opacity tick's mix on its wire by it.
+pub fn step_opacity(tl: &Timeline, s: &Step) -> Option<u8> {
+    s.vmix?;
+    let ti = s.track?;
+    let c = tl.tracks.get(ti)?.clips.get(tl.clip_at(ti, s.out_t)?)?;
+    (c.opacity < crate::OPAQUE).then_some(c.opacity)
+}
