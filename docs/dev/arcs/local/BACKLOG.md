@@ -36,7 +36,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 16. STRIAMETERSCLIPHOLD — the meters hold the peak for 2 s and show a red clip indicator that stays until clicked (`paint_meters` :1350; `MeterLevel`).
 17. STRIAAUDIOSCRUB — scrubbing the ruler plays the audio under the playhead (a one-frame PCM burst per scrub step through the existing play road: measure the Player / audio sink).
 18. STRIANORMALIZE — `normalize [<dBFS>]` sets the selected clip's gain so its peak (SR827's Peaks table: REUSE) hits the target (default -1 dBFS).
-19. STRIALOUDNESSREADOUT — integrated loudness (ITU-R BS.1770 K-weighting + gating) for the export range on the message row (`loudness` verb); ONE pure fn in audio_core or timeline_core (name which).
+19. [SR866 started] STRIALOUDNESSREADOUT — integrated loudness (ITU-R BS.1770 K-weighting + gating) for the export range on the message row (`loudness` verb); ONE pure fn in audio_core or timeline_core (name which).
 
 ## C. Video (nle.rs render + export)
 20. STRIACROP — per-clip crop (l / t / r / b in 1/1000 of the frame) applied in the render step before the size policy; verb `crop`; EDL `* UNA CROP`.
