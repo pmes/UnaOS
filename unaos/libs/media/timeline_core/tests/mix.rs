@@ -502,3 +502,28 @@ fn striapanface_tick_paints_only_off_centre() {
     assert_eq!(v0, v1, "no tick on a video clip");
     println!("striapanface: tick at x {xm}, y {}..{}", y0 + 2, y0 + 6);
 }
+
+// ---- STRIAPANMORE (LEDGER SR959): the pan on the whole selection set (named tail block) ----
+
+/// A set of two audio clips takes `pan <x>` on both in ONE undo step; the same pan again commits nothing; `pan+` steps from
+/// the primary's pan and the whole set takes it; undo restores both; a one-clip selection still pans one clip.
+#[test]
+fn striapanmore_set_pans_every_clip_in_one_step() {
+    let mut st = EditorState::new(two_tracks());
+    st.select(0, 0).unwrap();
+    st.select_add(1, 0).unwrap();
+    let d0 = st.undo_depth();
+    let pans = |st: &EditorState| (st.timeline.tracks[0].clips[0].pan_cq8, st.timeline.tracks[1].clips[0].pan_cq8);
+    assert_eq!(st.verb("pan 0.5"), Some(Ok(())));
+    assert_eq!((pans(&st), st.undo_depth()), ((64, 64), d0 + 1));
+    assert_eq!(st.verb("pan 0.5"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1, "the same pan on the whole set commits nothing");
+    assert_eq!(st.verb("pan+"), Some(Ok(())));
+    assert_eq!((pans(&st), st.undo_depth()), ((79, 79), d0 + 2));
+    assert!(st.undo());
+    assert_eq!(pans(&st), (64, 64), "one undo step for the whole set");
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("pan -1"), Some(Ok(())));
+    assert_eq!(pans(&st), (64, -127), "a set of one: only the selected clip");
+    println!("striapanmore: set pan 0.5 -> {:?}", pans(&st));
+}

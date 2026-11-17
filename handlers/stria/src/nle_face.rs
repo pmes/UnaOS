@@ -386,6 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("Alt+Left", "pan-"), ("Alt+0", "pan"), ("Alt+Right", "pan+"), // STRIAPANMORE (SR959): Alt with Left / 0 / Right step / centre the selected clips' pan (SR897's face words; GTK names, AppKit owed)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2602,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("pan-", "pan the clip one eighth left"), ("pan", "centre the clip's pan"), ("pan+", "pan the clip one eighth right"), // STRIAPANMORE (SR959): the Alt pan keys' phrases
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
