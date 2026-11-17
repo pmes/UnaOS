@@ -458,7 +458,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
         }
         "gap" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("row-gap", c)),
         "overflow" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"))),
-        "place-content" | "place-items" | "place-self" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase())),
+        "place-content" | "place-items" | "place-self" | "align-content" | "justify-content" | "align-items" | "justify-items" | "align-self" | "justify-self" => alignment_expand(prop, tv),
         "flex" => {
             let parts = split_values(v);
             let num_of = |c: &CV| match c {
@@ -2026,7 +2026,7 @@ top>inset";
         "margin-block", "margin-inline", "padding-block", "padding-inline",
     ];
 
-    const PROBES: [&str; 7] = ["1px", "solid", "red", "1px solid red", "hidden", "1", "weight style small-caps"];
+    const PROBES: [&str; 8] = ["1px", "solid", "red", "1px solid red", "hidden", "1", "weight style small-caps", "center" /* SR1102: an alignment word for the place-* rows under alignment_expand */];
 
     fn universe() -> Vec<String> {
         let mut names: Vec<String> = PROPERTIES.iter().map(|s| s.to_string()).collect();
@@ -2680,7 +2680,7 @@ mod shorthand_table_expand_tests {
 // ---- AETHERCSSOMPLACEEXPAND (LEDGER SR1087): place-* as PLAIN_N n = 2 rows (named tail block) ----
 
 /// AETHERCSSOMPLACEEXPAND (SR1087): css-align-3 §6.4 / §7.4 / §8.3's two-longhand shorthands (align-* then justify-*),
-/// the [`SHORTHANDS`] rows past SR786's capture; each is a [`PLAIN_N`] n = 2 row expanded through [`plain_expand`].
+/// the [`SHORTHANDS`] rows past SR786's capture; each is a [`PLAIN_N`] n = 2 row expanded through [`alignment_expand`] (SR1102).
 #[cfg(test)]
 const PLACE_SHORTHANDS: [&str; 3] = ["place-content", "place-items", "place-self"];
 
@@ -2743,12 +2743,12 @@ mod cssom_place_tests {
         assert_eq!(b.serialize(), before);
     }
 
-    /// No alignment keyword list on the align-* longhand road (normalize_value stores any identifier), so an unknown
-    /// identifier is stored to both longhands, as `align-items: bogus` is; a non-identifier token refuses.
+    /// AETHERCSSOMALIGNWORDSONE (SR1102) flipped this pin: place-* and the align-* longhands validate through layout_core's
+    /// alignment grammar ([`alignment_expand`]), so an unknown identifier is REFUSED (it was stored to both longhands).
     #[test]
     fn cssom_place_ident_only_validator() {
         let b = Block::parse("place-items: bogus");
-        assert_eq!((b.get("align-items"), b.get("justify-items")), ("bogus".to_string(), "bogus".to_string()));
+        assert_eq!((b.get("align-items"), b.get("justify-items")), (String::new(), String::new()), "SR1102: refused (was stored)");
         let mut b = Block::default();
         assert!(!b.set("place-items", &cv("10px"), false));
         assert!(!b.set("place-self", &cv("center 7"), false));
@@ -2785,6 +2785,128 @@ mod cssom_place_tests {
             assert_eq!(longhands(sh), Some(vec![a.to_string(), j.to_string()]), "{sh}");
             assert_eq!(shorthands_of(a), vec![sh]);
             assert_eq!(shorthands_of(j), vec![sh]);
+        }
+    }
+}
+
+// ---- AETHERCSSOMALIGNWORDSONE (LEDGER SR1102): place-* and the six align longhands through layout_core's alignment grammar (named tail block) ----
+
+/// AETHERCSSOMALIGNWORDSONE (SR1102): a place-* shorthand or an align- / justify- content / items / self longhand.
+/// Idents only (lowercased), grouped into alignment values through `layout_core::css::alignment_words` (`safe center` /
+/// `first baseline` is ONE value), 1..=n groups for its n longhands (a shorthand's one value fills both halves), each
+/// (longhand, value) through `layout_core::css::alignment_valid`; any refusal refuses the declaration.
+fn alignment_expand(prop: &str, toks: &[CV]) -> Result<Vec<(String, String)>, ()> {
+    let words: Vec<String> = split_values(toks).iter().map(|c| ident_of(c).map(|i| i.to_ascii_lowercase())).collect::<Option<Vec<String>>>().ok_or(())?;
+    let mut groups: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let pair = words.get(i + 1).map(|b| format!("{} {}", words[i], b)).filter(|p| layout_core::css::alignment_words(p).is_some());
+        i += if pair.is_some() { 2 } else { 1 };
+        groups.push(pair.unwrap_or_else(|| words[i - 1].clone()));
+    }
+    let ls = longhands(prop).unwrap_or_else(|| vec![prop.to_string()]);
+    if groups.is_empty() || groups.len() > ls.len() {
+        return Err(());
+    }
+    let out: Vec<(String, String)> = ls.into_iter().enumerate().map(|(k, l)| (l, groups[k.min(groups.len() - 1)].clone())).collect();
+    if out.iter().all(|(l, v)| layout_core::css::alignment_valid(l, v)) { Ok(out) } else { Err(()) }
+}
+
+#[cfg(test)]
+mod cssom_align_words_one_tests {
+    use super::*;
+
+    fn cv(value: &str) -> Vec<CV> {
+        css_core::parser::parse_component_values(value)
+    }
+
+    fn pair(b: &Block, a: &str, j: &str) -> (String, String) {
+        (b.get(a), b.get(j))
+    }
+
+    #[test]
+    fn cssom_align_words_one_place_items_safe_center() {
+        let b = Block::parse("place-items: safe center");
+        assert_eq!(pair(&b, "align-items", "justify-items"), ("safe center".to_string(), "safe center".to_string()), "one group, both halves (was safe / center)");
+        assert_eq!(b.get("place-items"), "safe center");
+    }
+
+    #[test]
+    fn cssom_align_words_one_place_content_two_groups() {
+        let b = Block::parse("place-content: first baseline space-between");
+        assert_eq!(pair(&b, "align-content", "justify-content"), ("first baseline".to_string(), "space-between".to_string()));
+        assert_eq!(b.get("place-content"), "first baseline space-between");
+        let b = Block::parse("place-content: unsafe end safe start");
+        assert_eq!(pair(&b, "align-content", "justify-content"), ("unsafe end".to_string(), "safe start".to_string()));
+    }
+
+    #[test]
+    fn cssom_align_words_one_place_self_unchanged() {
+        let b = Block::parse("place-self: center start");
+        assert_eq!(pair(&b, "align-self", "justify-self"), ("center".to_string(), "start".to_string()));
+        assert_eq!(b.get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_align_words_one_bogus_refused() {
+        let mut b = Block::parse("color: red");
+        for (p, v) in [("place-items", "bogus"), ("align-items", "bogus"), ("align-items", "space-between"), ("align-items", "auto"), ("justify-content", "first baseline"), ("align-self", "left"), ("align-content", "safe"), ("place-items", "safe safe center")] {
+            assert!(!b.set(p, &cv(v), false), "{p}: {v} refused (armed: it was stored)");
+        }
+        assert_eq!(b.serialize(), "color: red;");
+    }
+
+    #[test]
+    fn cssom_align_words_one_longhands_stored() {
+        let mut b = Block::default();
+        for (p, v) in [("align-items", "safe center"), ("justify-content", "space-evenly"), ("justify-self", "LEFT"), ("align-self", "last baseline"), ("justify-items", "self-end")] {
+            assert!(b.set(p, &cv(v), false), "{p}: {v} stored");
+            assert_eq!(b.get(p), v.to_ascii_lowercase(), "{p}: {v} is one value");
+        }
+    }
+
+    #[test]
+    fn cssom_align_words_one_three_groups_refused() {
+        let mut b = Block::default();
+        for v in ["safe center start end", "center start end", "first baseline center end"] {
+            assert!(!b.set("place-items", &cv(v), false), "{v}: three groups refused");
+        }
+        assert!(!b.set("align-items", &cv("center start"), false), "a longhand takes one group");
+        assert_eq!(b.serialize(), "");
+    }
+
+    #[test]
+    fn cssom_align_words_one_round_trip_collapses() {
+        assert_eq!(Block::parse("align-items: safe center; justify-items: safe center").serialize(), "place-items: safe center;");
+        assert_eq!(Block::parse("align-content: first baseline; justify-content: space-between").serialize(), "place-content: first baseline space-between;");
+        assert_eq!(Block::parse("align-items: safe center; justify-items: center").get("place-items"), "safe center center");
+        assert_eq!(Block::parse("place-items: safe center center").get("justify-items"), "center");
+    }
+
+    /// The pin: every word each layout_core arm maps (the justify-content arm, apply_align_content, self_alignment), and
+    /// its safe / first-baseline forms, is valid for that property; every value alignment_valid takes, alignment_words takes.
+    #[test]
+    fn cssom_align_words_one_superset_of_layout_arms() {
+        use layout_core::css::{alignment_valid, alignment_words};
+        let jc: &[&str] = &["center", "flex-end", "end", "flex-start", "start", "normal", "space-between", "space-around", "space-evenly", "safe center", "unsafe end"];
+        let ac: &[&str] = &["normal", "flex-start", "start", "flex-end", "end", "center", "stretch", "space-between", "space-around", "space-evenly", "safe center", "first baseline"];
+        let items: &[&str] = &["center", "flex-end", "end", "flex-start", "start", "baseline", "stretch", "normal", "first baseline", "last baseline", "safe center"];
+        for (props, words) in [(&["justify-content"][..], jc), (&["align-content"][..], ac), (&["align-items", "justify-items", "align-self", "justify-self"][..], items)] {
+            for p in props {
+                for w in words {
+                    assert!(alignment_valid(p, w), "{p}: {w} (the layout arm maps it)");
+                }
+            }
+        }
+        for p in ["align-self", "justify-self"] {
+            assert!(alignment_valid(p, "auto"), "{p}: auto");
+        }
+        let probe = ["bogus", "safe", "left", "right", "self-start", "safe left", "auto", "safe stretch", "safe space-between", "baseline first", "center start", "a b c"];
+        for p in ["align-content", "justify-content", "align-items", "justify-items", "align-self", "justify-self"] {
+            for w in jc.iter().chain(ac).chain(items).chain(probe.iter()) {
+                assert!(!alignment_valid(p, w) || alignment_words(w).is_some(), "{p}: {w} valid only through alignment_words");
+            }
+            assert!(!alignment_valid(p, "bogus"), "{p}: bogus refused");
         }
     }
 }

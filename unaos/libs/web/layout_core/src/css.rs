@@ -4856,3 +4856,19 @@ fn bg_shorthand_layer_props<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
         paint.bg_size_more = Some(sizes);
     }
 }
+
+// ---- AETHERCSSOMALIGNWORDSONE (LEDGER SR1102): the per-property css-align-3 grammar over alignment_words (named tail block) ----
+
+/// AETHERCSSOMALIGNWORDSONE (SR1102): is `value` (lowercase) a valid css-align-3 value of alignment longhand `prop`
+/// (align- / justify- content / items / self)? The multi-word forms are [`alignment_words`]' (THE grammar); this adds
+/// only the per-property word set (§4.1 / §5.1 / §6.1-6.3): a superset of every arm's words (the justify-content arm,
+/// [`apply_align_content`], [`self_alignment`]), so aether's CSSOM, which validates through it, never refuses a value
+/// the arms accept. The words an arm leaves out (left / right, self-start / self-end, ...) are AETHER-CSS-ALIGN-SPEC-WORDS.
+pub fn alignment_valid(prop: &str, value: &str) -> bool {
+    let (Some((w, _, _)), content, justify) = (alignment_words(value), prop.ends_with("-content"), prop.starts_with("justify")) else { return false };
+    matches!(w, "normal" | "center" | "start" | "end" | "flex-start" | "flex-end" | "stretch")
+        || (justify && matches!(w, "left" | "right"))
+        || (w == "baseline" && !(content && justify))
+        || (if content { matches!(w, "space-between" | "space-around" | "space-evenly") } else { matches!(w, "self-start" | "self-end") })
+        || (w == "auto" && prop.ends_with("-self"))
+}
