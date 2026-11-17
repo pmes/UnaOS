@@ -285,3 +285,74 @@ fn striaopacitynext_take_outgoing_hands_back() {
     assert_eq!((live, mix), (Some(a), None));
     println!("striaopacitynext: the mix run hands back to the live slot");
 }
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity points drive the mix per tick (named tail block) ----
+
+/// STRIAOPACITYKEYS: `striaopacity_stack(OPAQUE)` with the top clip's opacity points `pts` (source tick, percent).
+fn striaopacitykeys_stack(pts: &[(i64, u8)]) -> Timeline {
+    let mut tl = striaopacity_stack(timeline_core::OPAQUE);
+    let keys = pts.iter().fold(timeline_core::OpacityKeys::NONE, |k, &(t, p)| k.with(t, p).unwrap());
+    tl.tracks[1].clips[0] = tl.tracks[1].clips[0].with_opacity_keys(keys);
+    tl.validate().unwrap();
+    tl
+}
+
+/// A ramp 0 -> 90 over the top clip's ticks mixes at 10 % per tick; a ramp that reaches 100 stops mixing there; one
+/// point at 50 schedules exactly as SR868's static 50 %.
+#[test]
+fn striaopacitykeys_ramp_mixes_per_tick() {
+    use timeline_core::schedule::Frac;
+    let g = Gop { dur: 50 };
+    let steps = schedule(&striaopacitykeys_stack(&[(0, 0), (9, 90)]), 0..30, &g).unwrap();
+    for (t, s) in steps.iter().enumerate().take(20).skip(10) {
+        let m = s.vmix.expect("a ramp tick below opaque mixes");
+        assert_eq!(m.t, Frac { num: 10 * (t as i64 - 10), den: 100 }, "tick {t}");
+        assert_eq!(m.src, Some(SourceId(0)));
+    }
+    let steps = schedule(&striaopacitykeys_stack(&[(0, 50), (5, 100)]), 0..30, &g).unwrap();
+    for (t, s) in steps.iter().enumerate().take(20).skip(10) {
+        match t {
+            10..=14 => assert_eq!(s.vmix.map(|m| m.t), Some(Frac { num: 50 + 10 * (t as i64 - 10), den: 100 }), "tick {t}"),
+            _ => assert_eq!(s.vmix, None, "tick {t}: opaque, no mix"),
+        }
+    }
+    assert_eq!(
+        schedule(&striaopacitykeys_stack(&[(3, 50)]), 0..30, &g).unwrap(),
+        schedule(&striaopacity_stack(50), 0..30, &g).unwrap(),
+        "one point is a constant"
+    );
+    assert_eq!(striaopacitykeys_stack(&[(0, 0), (9, 90)]).tracks[1].clips[0].opacity_at(14), 40);
+    assert_eq!(striaopacitykeys_stack(&[(0, 0), (3, 10)]).tracks[1].clips[0].opacity_at(11), 3, "3.33 rounds to 3");
+    assert_eq!(striaopacitykeys_stack(&[(0, 0), (3, 10)]).tracks[1].clips[0].opacity_at(12), 7, "6.67 rounds to 7");
+    println!("striaopacitykeys: ramp weights per tick");
+}
+
+/// A split mid-ramp keeps the curve: both halves carry the points on their source ticks, the weights are unchanged.
+#[test]
+fn striaopacitykeys_split_keeps_the_curve() {
+    let g = Gop { dur: 50 };
+    let tl = striaopacitykeys_stack(&[(0, 0), (9, 90)]);
+    let cut = tl.split(1, 15).unwrap();
+    assert_eq!(cut.tracks[1].clips.len(), 2);
+    let w = |tl: &Timeline| schedule(tl, 0..30, &g).unwrap().iter().map(|s| s.vmix.map(|m| m.t)).collect::<Vec<_>>();
+    assert_eq!(w(&cut), w(&tl));
+}
+
+/// `validate` refuses points on an audio clip and a percent above opaque by name; a ninth point does not fit.
+#[test]
+fn striaopacitykeys_validate_refuses() {
+    use timeline_core::OpacityKeys;
+    let mut tl = striaopacity_stack(timeline_core::OPAQUE);
+    tl.tracks[1].clips[0] = tl.tracks[1].clips[0].with_opacity_keys(OpacityKeys::NONE.with(0, 101).unwrap());
+    assert_eq!(tl.validate(), Err(EditError::Opacity));
+    let mut tl = striaopacity_stack(timeline_core::OPAQUE);
+    tl.add_track(Kind::Audio);
+    tl.tracks[2].clips = vec![Clip::new(SourceId(0), 0, 10, 0).with_opacity_keys(OpacityKeys::NONE.with(0, 50).unwrap())];
+    assert_eq!(tl.validate(), Err(EditError::Opacity));
+    let full = (0..timeline_core::OPACITY_KEYS_MAX as i64).fold(OpacityKeys::NONE, |k, t| k.with(t, 50).unwrap());
+    assert_eq!(full.len(), timeline_core::OPACITY_KEYS_MAX);
+    assert_eq!(full.with(99, 50), None);
+    assert_eq!(full.with(3, 20).map(|k| k.len()), Some(timeline_core::OPACITY_KEYS_MAX), "a point at a held tick replaces");
+    assert_eq!(full.without(99), None);
+    assert_eq!(full.without(3).map(|k| k.iter().any(|(t, _)| t == 3)), Some(false));
+}

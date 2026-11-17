@@ -2676,7 +2676,7 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 
 /// STRIAOPACITYNEXT: `opacity` when step `s` mixes and its own clip is below `timeline_core::OPAQUE`, else `transition`.
 fn mix_what(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step) -> &'static str {
-    let pct = s.track.and_then(|ti| tl.clip_at(ti, s.out_t).map(|ci| tl.tracks[ti].clips[ci].opacity));
+    let pct = s.track.and_then(|ti| tl.clip_at(ti, s.out_t).map(|ci| tl.tracks[ti].clips[ci].opacity_at(s.out_t))); // STRIAOPACITYKEYS (SR9048): the percent at this tick (`Clip::opacity_at`)
     match pct {
         Some(p) if s.vmix.is_some() && p < timeline_core::OPAQUE => "opacity",
         _ => "transition",

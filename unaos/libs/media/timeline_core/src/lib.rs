@@ -101,6 +101,8 @@ pub struct Clip {
     pub fade_out: i64,
     /// STRIAOPACITY (SR868): the video clip's opacity, percent 0..=[`OPAQUE`] (opaque, the default); below it the track underneath shows through.
     pub opacity: u8,
+    /// STRIAOPACITYKEYS (SR9048): the opacity points on the clip's source ticks (none, the default: `opacity` holds).
+    pub opacity_keys: OpacityKeys,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -109,7 +111,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, opacity: OPAQUE }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, opacity: OPAQUE, opacity_keys: OpacityKeys::NONE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -380,6 +382,8 @@ pub enum EditError {
     Marks,
     /// STRIAOPACITY (SR868): an opacity above [`OPAQUE`] percent, or a non-opaque clip on an audio track.
     Opacity,
+    /// STRIAOPACITYKEYS (SR9048): no selected video clip under the playhead, a clip already at the most opacity points, or no point to clear there.
+    OpacityKey,
 }
 
 impl core::fmt::Display for EditError {
@@ -401,6 +405,7 @@ impl core::fmt::Display for EditError {
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
+            EditError::OpacityKey => "no opacity key here: a selected video clip under the playhead, at most 8 keys",
         })
     }
 }
@@ -1544,7 +1549,7 @@ pub const OPAQUE: u8 = 100;
 
 /// STRIAOPACITY: `validate`'s rule: an opacity is at most [`OPAQUE`], and only a video clip is ever below it.
 fn opacity_ok(kind: Kind, c: &Clip) -> Result<(), EditError> {
-    if c.opacity > OPAQUE || (c.opacity != OPAQUE && kind == Kind::Audio) {
+    if c.opacity > OPAQUE || (c.opacity != OPAQUE && kind == Kind::Audio) || !c.opacity_keys.valid(kind) {
         return Err(EditError::Opacity);
     }
     Ok(())
@@ -1564,6 +1569,170 @@ impl Timeline {
         let mut tl = self.clone();
         for &(track, idx) in picks {
             clip_mut(&mut tl, track, idx)?.opacity = pct;
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): animated opacity, the points and their one reader (named tail block) ----
+// A clip may carry up to [`OPACITY_KEYS_MAX`] opacity points (source tick, percent) on its SOURCE ticks, so split, trims,
+// moves and rolls keep the curve with the picture and no op edits them. [`Clip::opacity_at`] is the ONE reader: no
+// points, the static `opacity`; one point, its percent; before the first / after the last, held; between, linear
+// (rounded half up). `schedule::opacity_mix` reads it per tick; `* UNA ALPHAKEYS` in the EDL; the editor's
+// `opacity-key [<pct>]` / `opacity-unkey` words.
+
+/// STRIAOPACITYKEYS: the most opacity points one clip carries.
+pub const OPACITY_KEYS_MAX: usize = 8;
+
+/// STRIAOPACITYKEYS: a clip's opacity points, ascending source ticks (a fixed array: `Clip` stays `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpacityKeys {
+    n: u8,
+    tick: [i64; OPACITY_KEYS_MAX],
+    pct: [u8; OPACITY_KEYS_MAX],
+}
+
+impl OpacityKeys {
+    /// STRIAOPACITYKEYS: no points (every clip's default).
+    pub const NONE: OpacityKeys = OpacityKeys { n: 0, tick: [0; OPACITY_KEYS_MAX], pct: [0; OPACITY_KEYS_MAX] };
+    /// STRIAOPACITYKEYS: the number of points.
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+    /// STRIAOPACITYKEYS: no points.
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// STRIAOPACITYKEYS: the points, (source tick, percent), ascending.
+    pub fn iter(&self) -> impl Iterator<Item = (i64, u8)> + '_ {
+        (0..self.len()).map(move |i| (self.tick[i], self.pct[i]))
+    }
+    /// STRIAOPACITYKEYS: these points with `pct` at source tick `tick` (replacing a point there); `None` when full.
+    pub fn with(self, tick: i64, pct: u8) -> Option<OpacityKeys> {
+        let n = self.len();
+        let i = self.tick[..n].iter().position(|&k| k >= tick).unwrap_or(n);
+        let mut k = self;
+        if i < n && k.tick[i] == tick {
+            k.pct[i] = pct;
+            return Some(k);
+        }
+        if n == OPACITY_KEYS_MAX {
+            return None;
+        }
+        for j in (i..n).rev() {
+            k.tick[j + 1] = k.tick[j];
+            k.pct[j + 1] = k.pct[j];
+        }
+        k.tick[i] = tick;
+        k.pct[i] = pct;
+        k.n += 1;
+        Some(k)
+    }
+    /// STRIAOPACITYKEYS: these points without the one at source tick `tick`; `None` when there is none.
+    pub fn without(self, tick: i64) -> Option<OpacityKeys> {
+        let n = self.len();
+        let i = self.tick[..n].iter().position(|&k| k == tick)?;
+        let mut k = self;
+        for j in i..n - 1 {
+            k.tick[j] = k.tick[j + 1];
+            k.pct[j] = k.pct[j + 1];
+        }
+        k.tick[n - 1] = 0;
+        k.pct[n - 1] = 0;
+        k.n -= 1;
+        Some(k)
+    }
+    /// STRIAOPACITYKEYS: the percent at source tick `s` (held outside, linear between, rounded half up); `None` with no points.
+    pub fn at(&self, s: i64) -> Option<u8> {
+        let n = self.len();
+        if n == 0 {
+            return None;
+        }
+        if s <= self.tick[0] {
+            return Some(self.pct[0]);
+        }
+        if s >= self.tick[n - 1] {
+            return Some(self.pct[n - 1]);
+        }
+        let j = self.tick[..n].iter().position(|&k| k > s)?;
+        let (k0, k1, p0, p1) = (self.tick[j - 1], self.tick[j], self.pct[j - 1] as i64, self.pct[j] as i64);
+        let span = k1 - k0;
+        Some((p0 + ((p1 - p0) * (s - k0) * 2 + span).div_euclid(2 * span)) as u8)
+    }
+    /// STRIAOPACITYKEYS: `validate`'s rule: ticks >= 0 strictly ascending, each percent at most [`OPAQUE`], points on video only.
+    fn valid(&self, kind: Kind) -> bool {
+        let n = self.len();
+        if n == 0 {
+            return true;
+        }
+        kind == Kind::Video
+            && n <= OPACITY_KEYS_MAX
+            && self.tick[0] >= 0
+            && self.pct[..n].iter().all(|&p| p <= OPAQUE)
+            && self.tick[..n].windows(2).all(|w| w[0] < w[1])
+    }
+}
+
+impl Clip {
+    /// STRIAOPACITYKEYS: the source tick timeline tick `t` shows (the clock the opacity points live on).
+    pub fn key_tick(&self, t: i64) -> i64 {
+        self.src_in + (t - self.at)
+    }
+    /// STRIAOPACITYKEYS: THE opacity at timeline tick `t`: the points' value, else the static `opacity`.
+    pub fn opacity_at(&self, t: i64) -> u8 {
+        self.opacity_keys.at(self.key_tick(t)).unwrap_or(self.opacity)
+    }
+    /// STRIAOPACITYKEYS: the same clip with opacity points `keys`.
+    pub fn with_opacity_keys(self, keys: OpacityKeys) -> Clip {
+        Clip { opacity_keys: keys, ..self }
+    }
+}
+
+impl Timeline {
+    /// STRIAOPACITYKEYS: a point at timeline tick `t` on every clip in `picks` that covers `t`, at `pct` (or the clip's
+    /// own `opacity_at(t)`), as ONE edit. Refused by name: no pick covers `t`, or a clip is full
+    /// (`EditError::OpacityKey`); a percent above [`OPAQUE`] or an audio clip (`EditError::Opacity`).
+    pub fn set_opacity_key(&self, picks: &[(usize, usize)], t: i64, pct: Option<u8>) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let mut any = false;
+        for &(track, idx) in picks {
+            let c = clip_mut(&mut tl, track, idx)?;
+            if !c.covers(t) {
+                continue;
+            }
+            let p = pct.unwrap_or(c.opacity_at(t));
+            if p > OPAQUE {
+                return Err(EditError::Opacity);
+            }
+            let kt = c.key_tick(t);
+            c.opacity_keys = c.opacity_keys.with(kt, p).ok_or(EditError::OpacityKey)?;
+            any = true;
+        }
+        if !any {
+            return Err(EditError::OpacityKey);
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+    /// STRIAOPACITYKEYS: the point at timeline tick `t` removed from every clip in `picks` that covers `t` and has one
+    /// there, as ONE edit; refused by name (`EditError::OpacityKey`) when no such point exists.
+    pub fn clear_opacity_key(&self, picks: &[(usize, usize)], t: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let mut any = false;
+        for &(track, idx) in picks {
+            let c = clip_mut(&mut tl, track, idx)?;
+            if !c.covers(t) {
+                continue;
+            }
+            let kt = c.key_tick(t);
+            if let Some(k) = c.opacity_keys.without(kt) {
+                c.opacity_keys = k;
+                any = true;
+            }
+        }
+        if !any {
+            return Err(EditError::OpacityKey);
         }
         tl.validate()?;
         Ok(tl)

@@ -529,7 +529,7 @@ fn opacity_mix(
     m_next: &mut Option<(SourceId, i64)>,
 ) -> Result<Option<VideoMix>, ScheduleError> {
     let c = tl.tracks[ti].clips[ci];
-    if c.opacity == crate::OPAQUE {
+    if c.opacity_at(t) == crate::OPAQUE { // STRIAOPACITYKEYS (SR9048): the percent at this tick (`Clip::opacity_at`, lib.rs tail)
         return Ok(vmix);
     }
     if vmix.is_some() {
@@ -539,13 +539,13 @@ fn opacity_mix(
     if black_over(tl, t, lower.map(|l| l.0)).is_some_and(|(i, _)| i < ti) {
         return Err(ScheduleError::Opacity(c.src));
     }
-    let w = Frac { num: c.opacity as i64, den: 100 };
+    let w = Frac { num: c.opacity_at(t) as i64, den: 100 }; // STRIAOPACITYKEYS (SR9048): the weight follows the points
     let Some((li, lci)) = lower else {
         *m_next = None;
         return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
     };
     let lc = tl.tracks[li].clips[lci];
-    if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+    if lc.opacity_at(t) != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
         return Err(ScheduleError::Opacity(c.src));
     }
     let src_t = lc.src_in + (t - lc.at);

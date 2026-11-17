@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAOPACITY (SR868): `opacity <pct>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -737,5 +737,53 @@ impl EditorState {
             self.commit(tl);
         }
         Ok(())
+    }
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words through the one commit (named tail block) ----
+// `opacity-key [<pct>]` sets (or replaces) an opacity point at the playhead on every selected clip under it (bare: the
+// clip's own `opacity_at(playhead)`, pinning the curve there); `opacity-unkey` removes the point at the playhead. Each is
+// ONE commit through `Timeline::set_opacity_key` / `clear_opacity_key` (nothing commits when nothing changes). Refused by
+// name: no selection `EditError::NoClip`; no selected clip under the playhead, a full clip, or no point to clear
+// `EditError::OpacityKey`; a percent that is not 0..=100, an extra word, or an audio clip `EditError::Opacity`.
+impl EditorState {
+    /// STRIAOPACITYKEYS: an opacity point at the playhead on each selected clip under it, at `pct` (or its own value).
+    pub fn set_opacity_key(&mut self, pct: Option<u8>) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let tl = self.timeline.set_opacity_key(&self.set, self.playhead, pct)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+    /// STRIAOPACITYKEYS: the opacity point at the playhead removed from each selected clip under it.
+    pub fn clear_opacity_key(&mut self) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let tl = self.timeline.clear_opacity_key(&self.set, self.playhead)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// STRIAOPACITYKEYS: the `opacity-key` / `opacity-unkey` words of [`EditorState::verb`]; `None` for any other word.
+    fn opacity_key_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        match w.next() {
+            Some("opacity-key") => Some(match (w.next(), w.next()) {
+                (None, _) => self.set_opacity_key(None),
+                (Some(p), None) => match p.parse::<u8>().ok().filter(|&p| p <= crate::OPAQUE) {
+                    Some(p) => self.set_opacity_key(Some(p)),
+                    None => Err(EditError::Opacity),
+                },
+                _ => Err(EditError::Opacity),
+            }),
+            Some("opacity-unkey") => Some(match w.next() {
+                None => self.clear_opacity_key(),
+                Some(_) => Err(EditError::Opacity),
+            }),
+            _ => None,
+        }
     }
 }

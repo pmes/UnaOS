@@ -419,3 +419,34 @@ fn striaopacity_alpha_line_round_trips_and_refusals_are_named() {
     assert_eq!(edl::parse(&format!("{head}{a}* UNA ALPHA 50\n"), 25), Err(EdlError::Edit(EditError::Opacity)), "audio");
     assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHA 0\n"), 25).unwrap().tracks[0].clips[0].opacity, 0);
 }
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the `* UNA ALPHAKEYS` line (named tail block) ----
+
+/// A clip with opacity points writes ONE `* UNA ALPHAKEYS` line under its event (after its ALPHA line) and reads back
+/// equal; a timeline with no points writes what it wrote; each refusal is a named syntax error.
+#[test]
+fn striaopacitykeys_alphakeys_round_trip_and_refusals() {
+    let tl = cut();
+    let plain = edl::write(&tl, "CUT ONE").unwrap();
+    assert!(!plain.contains("ALPHAKEYS"), "no points, no line");
+    let tl = tl.set_opacity(&[(1, 0)], 50).unwrap().set_opacity_key(&[(1, 0)], 10, Some(0)).unwrap().set_opacity_key(&[(1, 0)], 19, Some(90)).unwrap();
+    let text = edl::write(&tl, "CUT ONE").unwrap();
+    let ev = text.lines().position(|l| l.contains(" V2 ")).unwrap();
+    assert_eq!(text.lines().nth(ev + 1), Some("* UNA ALPHA 50"));
+    assert_eq!(text.lines().nth(ev + 2), Some("* UNA ALPHAKEYS 0:0 9:90"), "source ticks, under its ALPHA line");
+    let back = edl::parse(&text, 30).unwrap();
+    assert_eq!(back, tl);
+    assert_eq!(edl::write(&back, "CUT ONE").unwrap(), text);
+    let head = "TITLE: X\nFCM: NON-DROP FRAME\n";
+    let v = "001  A        V     C        00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n";
+    let a = "001  A        A     C        00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n";
+    assert_eq!(edl::parse(&format!("{head}* UNA ALPHAKEYS 0:50\n"), 25), Err(EdlError::Syntax { line: 3 }), "no event above");
+    for bad in ["0:101", "0-50", "x:50", "5:50 5:60", "5:50 2:60", "-1:50", "0:1 1:1 2:1 3:1 4:1 5:1 6:1 7:1 8:1"] {
+        assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHAKEYS {bad}\n"), 25), Err(EdlError::Syntax { line: 4 }), "{bad:?}");
+    }
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA ALPHAKEYS 0:50\n* UNA ALPHAKEYS 1:50\n"), 25), Err(EdlError::Syntax { line: 5 }), "a second line");
+    assert_eq!(edl::parse(&format!("{head}{a}* UNA ALPHAKEYS 0:50\n"), 25), Err(EdlError::Edit(EditError::Opacity)), "audio");
+    let one = edl::parse(&format!("{head}{v}* UNA ALPHAKEYS 0:0 24:96\n"), 25).unwrap();
+    assert_eq!(one.tracks[0].clips[0].opacity_at(12), 48);
+    println!("striaopacitykeys: ALPHAKEYS round trip");
+}

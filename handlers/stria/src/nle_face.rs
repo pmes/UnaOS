@@ -237,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3141,5 +3141,35 @@ impl Face {
         if input {
             self.note = None;
         }
+    }
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words and their note (named tail block) ----
+// `opacity-key [<pct>]` / `opacity-unkey` (typed words) go through timeline_core's ONE verb dispatch (one commit each);
+// a success is the face note `opacity key: <pct> % at <tick>` (the first selected clip under the playhead, its value
+// there) or `opacity key cleared at <tick>`; a refusal reads `<word>: <EditError>` in `last_error`.
+
+impl Face {
+    /// STRIAOPACITYKEYS: an opacity point word through the one dispatch, its result on the note; `None` for any other word.
+    fn opacity_key_word(&mut self, v: &str) -> Option<bool> {
+        let word = v.split_ascii_whitespace().next()?;
+        if !matches!(word, "opacity-key" | "opacity-unkey") {
+            return None;
+        }
+        let ph = self.state.playhead;
+        match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
+            Ok(()) if word == "opacity-key" => {
+                let tl = &self.state.timeline;
+                let pct = self.state.set.iter().filter_map(|&(t, i)| tl.tracks.get(t)?.clips.get(i).copied()).find(|c| c.covers(ph)).map_or(timeline_core::OPAQUE, |c| c.opacity_at(ph));
+                self.last_error = None;
+                self.note = Some(format!("opacity key: {pct} % at {ph}"));
+            }
+            Ok(()) => {
+                self.last_error = None;
+                self.note = Some(format!("opacity key cleared at {ph}"));
+            }
+            Err(e) => self.last_error = Some(format!("{word}: {e}")),
+        }
+        Some(true)
     }
 }
