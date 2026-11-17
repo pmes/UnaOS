@@ -10363,4 +10363,69 @@ b</div>
         assert!(border_alpha_half_grey(edge), "the span's top edge is half-alpha grey: {edge:?}");
         assert_eq!(corners[0], edge, "armed: the inline frame's top-left corner composites once");
     }
+
+    // ---- AETHERFONTUNITSONEFN (LEDGER SR1142): ONE font_units for both re-resolutions (named tail block) ----
+
+    /// AETHERFONTUNITSONEFN (SR1142): a monospace 20px `width: 10ex` / `10ch` box on the font-relative road (#e, #c)
+    /// and the same declarations beside a `height: 1cqw` inside an inline-size container (#ke, #kc), so the
+    /// container-unit road re-applies them too.
+    fn font_units_tree() -> layout::LayoutTree {
+        laid_out(
+            r#"<html><body><div id=e class=m style="width:10ex"></div><div id=c class=m style="width:10ch"></div>
+            <div style="container-type:inline-size;width:400px"><div id=ke class=m style="width:10ex;height:1cqw"></div>
+            <div id=kc class=m style="width:10ch;height:1cqw"></div></div></body></html>"#,
+            "body{margin:0} .m{font-family:monospace;font-size:20px}",
+        )
+    }
+
+    /// The `layout_core::FontSel` of the test's monospace 400 normal 100% run.
+    fn font_units_mono_sel() -> layout_core::FontSel {
+        let family = crate::fonts::intern_family_list(crate::fonts::parse_family_list("monospace").expect("monospace parses"));
+        layout_core::FontSel { family, weight: 400, italic: false, stretch: 100 }
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ex` under a 20px font lays out at 10 x the face's x-height (whole-px rounded), the value
+    /// `font_units` gives (the first inline copy's, unchanged: armed-neutral).
+    #[test]
+    fn font_units_ex_width_face() {
+        let t = font_units_tree();
+        let u = layout_core::font_units(&crate::layout::HostFonts, font_units_mono_sel(), 20.0, 16.0);
+        let w = rect_by_id(&t, "e").unwrap().2;
+        println!("[font_units] face: fs 20 ex {} ch {} -> #e {}", u.2, u.3, w);
+        assert_eq!((u.0, u.1), (20.0, 16.0), "the tuple carries fs and root_fs through");
+        assert_eq!(w, (10.0 * u.2).round(), "#e: 10ex = 10 x {}, at layout's whole-px rounding", u.2);
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ch` under a 20px font lays out at 10 x the advance of "0".
+    #[test]
+    fn font_units_ch_width_face() {
+        let t = font_units_tree();
+        let u = layout_core::font_units(&crate::layout::HostFonts, font_units_mono_sel(), 20.0, 16.0);
+        let w = rect_by_id(&t, "c").unwrap().2;
+        assert_eq!(w, (10.0 * u.3).round(), "#c: 10ch = 10 x {}, at layout's whole-px rounding", u.3);
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): the same declarations re-resolved by the container-unit road (a `1cqw` sibling
+    /// declaration on the box) give the SAME px as the font-relative road. Armed-neutral: the two inline copies were
+    /// measured behaviourally identical at the cut, so the before value is the same.
+    #[test]
+    fn font_units_container_road_same_px() {
+        let t = font_units_tree();
+        let (e, c) = (rect_by_id(&t, "e").unwrap().2, rect_by_id(&t, "c").unwrap().2);
+        assert_eq!(rect_by_id(&t, "ke").unwrap().2, e, "#ke (container road) = #e (font-relative road)");
+        assert_eq!(rect_by_id(&t, "kc").unwrap().2, c, "#kc (container road) = #c (font-relative road)");
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): with no face (the Mac's empty database) ex and ch are both fs / 2 on both roads:
+    /// 10ex = 10ch = 100 at 20px. Armed against losing the has_face guard: `measure("0")` is 0 there.
+    #[test]
+    fn font_units_no_face_half_fs() {
+        let sel = layout_core::FontSel { family: 0, weight: 400, italic: false, stretch: 100 };
+        assert_eq!(layout_core::font_units(&HeaderBandNoFaces, sel, 20.0, 16.0), (20.0, 16.0, 10.0, 10.0));
+        let mut t = font_units_tree();
+        layout_core::remeasure(&mut t, &HeaderBandNoFaces);
+        for id in ["e", "c", "ke", "kc"] {
+            assert_eq!(rect_by_id(&t, id).unwrap().2, 100.0, "#{id}: 10 x 20 / 2 with no face");
+        }
+    }
 }
