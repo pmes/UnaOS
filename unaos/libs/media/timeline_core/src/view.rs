@@ -2218,7 +2218,7 @@ pub fn opacity_colour(c: [u8; 4], row: [u8; 4], pct: u8) -> [u8; 4] {
 // ---- STRIAGRADEFACE (LEDGER SR899): a graded clip's badge on its body (named tail block) ----
 // Every clip whose SR869 grade is not identity carries a small badge: three 2 x 6 px stripes (R, G, B) at the body's top
 // right, inside the end trim handle. A clip too narrow for it, or off the canvas, shows none; an identity grade paints no
-// pixel, so every golden is byte-identical. The kernel Player refuses a graded timeline at open (`grade-unsupported`).
+// pixel, so every golden is byte-identical. The kernel Player grades a graded timeline too (vplay.rs `edl_grade`, SR992).
 
 /// The badge's three stripes, left to right.
 pub const GRADE_BADGE: [[u8; 4]; 3] = [[0xff, 0x50, 0x50, 255], [0x50, 0xe0, 0x50, 255], [0x50, 0x90, 0xff, 255]];

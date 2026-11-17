@@ -1053,7 +1053,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
     if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.crop != timeline_core::Crop::NONE)) { return Err(("crop-unsupported", Some(String::from("the EDL crops a clip (* UNA CROP): the Player's frame road has no crop pass")))); } // NLE-CROP-KERNEL (SR867): a cropped clip refused by name, not shown uncropped (STRIACROP, LEDGER SR867)
-    if tl.tracks.iter().flat_map(|t| t.clips.iter()).any(|c| c.grade != timeline_core::Grade::IDENTITY) { return Err(("grade-unsupported", Some(String::from("a clip carries a colour grade (* UNA COLOR): the Player has no grade pass")))); } // NLE-GRADE-KERNEL (SR869): a graded clip shown ungraded is a wrong picture, so the Player refuses it by name
+    // NLE-GRADE-KERNEL BUILT by STRIAGRADENEXT (SR992): each step graded below, the outgoing side of a mix in edl_mix (edl_grade / edl_graded, file tail)
     if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.xform != timeline_core::Xform::NONE)) { return Err(("xform-unsupported", Some(String::from("the EDL places a clip (* UNA XFORM): the Player's frame road has no placement pass")))); } // NLE-XFORM-KERNEL (SR879): a placed clip refused by name, not shown full-frame (STRIAPOSITIONSCALE, LEDGER SR879)
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // NLE-TITLE-KERNEL (SR828): a titled source is refused by name, never scheduled onto a frame road with no title arm
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
@@ -1093,12 +1093,12 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
             }
             Some(id) => {
                 let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
-                coded(rep, s.out_t, ord, &px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) }
+                coded(rep, s.out_t, ord, &px); let px = edl_grade(tl.grade_at(s.track, s.out_t, false), px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) } // STRIAGRADENEXT (SR992): the clip's grade after the coded witness (file tail)
             }
         };
         match (s.vmix, refused) {
             (Some(_), Some(why)) => edl_refuse(rep, &why),
-            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, rep)?,
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, tl.grade_at(s.track, s.out_t, true), &mut frame, &mut mix, rep)?, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail)
             (None, _) => {}
         }
         if pts_ms < seek_ms {
@@ -1198,7 +1198,7 @@ fn edl_mix(
     reels: &Reels,
     tb: timeline_core::Timebase,
     out_t: i64,
-    m: timeline_core::schedule::VideoMix,
+    m: timeline_core::schedule::VideoMix, og: timeline_core::Grade, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail)
     frame: &mut Frame,
     mix: &mut Option<EdlRun>,
     rep: &mut EdlReport,
@@ -1215,7 +1215,7 @@ fn edl_mix(
                 }
             }
             match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
-                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(px.rgb()),
+                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => edl_graded(og, unpack(px.rgb())), // STRIAGRADENEXT (SR992): the outgoing frame graded, from-black stays black (file tail)
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
                     edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
@@ -2702,4 +2702,28 @@ fn edit_fit(view: &mut Option<(i64, i64)>, st: &mut timeline_core::editor::Edito
             Some(None)
         }
     }
+}
+
+// ---- STRIAGRADENEXT (LEDGER SR992): the Player's grade pass (named tail block) ----
+// NLE-GRADE-KERNEL: the EDL job grades each video step's own frame (`Timeline::grade_at(track, out_t, false)`) after the
+// coded witness, and `edl_mix` the outgoing source's frame (`grade_at(.., true)`) before the ONE mix, through timeline_core's
+// ONE per-pixel pass `Grade::apply` (Stria's render does the same: `handlers/stria/src/nle.rs` `reel_rgba`). The job's frame
+// is the source frame (the size policy is applied at present), so the bars stay black. A gap's black and a from-black
+// outgoing are not graded. An IDENTITY grade hands the frame back untouched and unconverted: an ungraded EDL plays and
+// hashes byte-identically.
+
+/// Straight RGBA through [`timeline_core::Grade::apply`]; IDENTITY: untouched.
+fn edl_graded(g: timeline_core::Grade, mut rgba: Vec<u8>) -> Vec<u8> {
+    if g != timeline_core::Grade::IDENTITY {
+        g.apply(&mut rgba);
+    }
+    rgba
+}
+
+/// A step's frame graded `g` (0RGB through [`unpack`] / [`pack`]); IDENTITY: `px` back as it came, not converted.
+fn edl_grade(g: timeline_core::Grade, px: Px) -> Px {
+    if g == timeline_core::Grade::IDENTITY {
+        return px;
+    }
+    pack(&edl_graded(g, unpack(px.rgb()))).into()
 }

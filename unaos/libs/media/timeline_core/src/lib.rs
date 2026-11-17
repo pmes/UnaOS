@@ -2359,7 +2359,7 @@ impl Timeline {
 // contrast about 128, then brightness as an offset of `255 b / 1000`, one clamp at the end. Stria's render calls it on the
 // RGBA a video step holds (`handlers/stria/src/nle.rs`, its own clip's and a transition's outgoing clip's); an IDENTITY
 // grade is no pass at all. Video clips only (`validate`: a graded audio clip is `EditError::Kind`). The kernel Player
-// refuses a graded timeline by name (`grade-unsupported`, NLE-GRADE-KERNEL).
+// grades it too (vplay.rs `edl_grade` / `edl_graded`, NLE-GRADE-KERNEL BUILT by STRIAGRADENEXT SR992).
 
 /// A clip's colour grade, each field in 1/1000 (`GRADE_MIN..=GRADE_MAX`; 0 = unchanged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

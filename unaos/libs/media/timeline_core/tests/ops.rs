@@ -2992,3 +2992,63 @@ fn striaxfademore_curve_word() {
     println!("striaxfademore: Linear -> linear, EqualPower -> equal");
 }
 
+
+// ---- STRIAGRADENEXT (LEDGER SR992): the grade over the selection set (named tail block) ----
+
+/// With more than one clip selected, `color b c s` grades every video member in ONE undo step (the same grade again
+/// pushes none), audio members are skipped, and a set with no video member is refused `Kind`.
+#[test]
+fn striagradenext_color_grades_the_set() {
+    use timeline_core::{Grade, editor::EditorState};
+    let (mut tl, a, _) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 60, 30));
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(a, 20, 30, 20)];
+    tl.validate().unwrap();
+    let mut st = EditorState::new(tl.clone());
+    st.select_many(&[(0, 0), (0, 1)], false);
+    assert_eq!(st.set.len(), 2);
+    assert_eq!(st.verb("color 100 0 0"), Some(Ok(())));
+    let g = Grade { brightness: 100, ..Grade::IDENTITY };
+    let v = |st: &EditorState, i: usize| st.timeline.tracks[0].clips[i].grade;
+    assert_eq!((v(&st, 0), v(&st, 1), v(&st, 2), st.undo_depth()), (g, g, Grade::IDENTITY, 1));
+    assert_eq!(st.verb("color 100 0 0"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1, "the same grade commits nothing");
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, tl);
+    st.select_many(&[(0, 0), (1, 0)], false);
+    assert_eq!(st.verb("color 0 200 0"), Some(Ok(())));
+    assert_eq!(v(&st, 0), Grade { contrast: 200, ..Grade::IDENTITY });
+    assert_eq!(st.timeline.tracks[1].clips[0].grade, Grade::IDENTITY, "the audio member is skipped");
+    assert_eq!(st.undo_depth(), 1);
+    st.select_many(&[(1, 0), (1, 1)], false);
+    let (held, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("color 1 0 0"), Some(Err(EditError::Kind)));
+    assert_eq!(st.verb("bright+"), Some(Err(EditError::Kind)));
+    assert_eq!((&st.timeline, st.undo_depth()), (&held, depth));
+}
+
+/// A step word over a set moves every video member by the primary's step (relative, ONE commit); a member pushed past
+/// the range refuses the whole edit and the state stays.
+#[test]
+fn striagradenext_step_moves_each_by_the_delta() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("color 300 0 0"), Some(Ok(())));
+    st.select_many(&[(0, 0), (0, 1)], false);
+    assert_eq!(st.selection, Some((0, 0)));
+    assert_eq!(st.verb("bright+"), Some(Ok(())));
+    let b = |st: &EditorState, i: usize| st.timeline.tracks[0].clips[i].grade.brightness;
+    assert_eq!((b(&st, 0), b(&st, 1), st.undo_depth()), (50, 350, 2));
+    assert_eq!(st.verb("sat-"), Some(Ok(())));
+    let s = |st: &EditorState, i: usize| st.timeline.tracks[0].clips[i].grade.saturation;
+    assert_eq!((s(&st, 0), s(&st, 1), st.undo_depth()), (-50, -50, 3));
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("color 1000 0 0"), Some(Ok(())));
+    st.select_many(&[(0, 0), (0, 1)], false);
+    let (held, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("bright+"), Some(Err(EditError::Grade)), "B would pass 1000: refused whole");
+    assert_eq!((&st.timeline, st.undo_depth()), (&held, depth));
+    assert_eq!(b(&st, 0), 50, "A did not move either");
+}
