@@ -870,6 +870,8 @@ pub const INHERIT_SMALL_CAPS: u32 = 8;
 pub const INHERIT_FONT_SIZE: u32 = 16;
 pub const INHERIT_LINE_HEIGHT: u32 = 32;
 pub const INHERIT_FAMILY: u32 = 64;
+/// AETHERCSSWIDECOLOR (SR823): `color` (inherited; its tag road is the `a` element's UA link blue). Not in INHERIT_FONT.
+pub const INHERIT_COLOR: u32 = 128;
 /// AETHERCSSWIDELONGHANDS (SR815): every font field `font: inherit` / `font: unset` reaches.
 pub const INHERIT_FONT: u32 = 127;
 
@@ -883,6 +885,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "font-size" => INHERIT_FONT_SIZE,
         "line-height" => INHERIT_LINE_HEIGHT,
         "font-family" => INHERIT_FAMILY,
+        "color" => INHERIT_COLOR,
         _ => 0,
     }
 }
@@ -899,6 +902,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.font_size.is_some() || self.font_size_rel.is_some(), INHERIT_FONT_SIZE)
             | on(self.line_height.is_some(), INHERIT_LINE_HEIGHT)
             | on(self.family.is_some(), INHERIT_FAMILY)
+            | on(self.color.is_some(), INHERIT_COLOR)
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
@@ -931,6 +935,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_FAMILY != 0 {
             self.family = None;
         }
+        if bits & INHERIT_COLOR != 0 { self.color = None; }
         self.inherit |= bits;
     }
 

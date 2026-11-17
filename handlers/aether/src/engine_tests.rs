@@ -5785,4 +5785,279 @@ mod tests {
         }
     }
 
+
+    // ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): a removed align=center lets the cell's narrow block go back to the start (named tail block) ----
+
+    /// AETHERCENTERRESTYLEITEMS (SR782): a `td align=center` centres its 200px block (-webkit-center, SR436); a script
+    /// that removes the attribute leaves the block at the cell's content start, as Chromium re-derives the placement on
+    /// the style recalc: neither the rule's align-self (SR686) nor the cell's align-items the rule wrote is kept.
+    #[test]
+    fn center_restyle_items_follow_removed_align() {
+        let html = r#"<!doctype html><html><body style="margin: 0"><table style="width: 600px; border-spacing: 0"><tr><td id="cell" align="center"><div id="d" style="width: 200px">ab</div></td></tr></table></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, id: &str, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (cl, cw, dl, dw) = (r(&mut engine, "cell", "left"), r(&mut engine, "cell", "width"), r(&mut engine, "d", "left"), r(&mut engine, "d", "width"));
+        assert!(dw > 0.0 && (dl + dw / 2.0 - (cl + cw / 2.0)).abs() <= 1.0, "td align=center centres #d (d {dl} + {dw}, cell {cl} + {cw})");
+        engine.js_engine.as_mut().unwrap().execute("document.getElementById('cell').removeAttribute('align');").expect("script must run clean");
+        engine.render_frame();
+        let (cl, dl) = (r(&mut engine, "cell", "left"), r(&mut engine, "d", "left"));
+        assert!((dl - (cl + 1.0)).abs() <= 1.0, "align removed: #d sits at the cell's content start (d {dl}, cell {cl})");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('cell')).textAlign").unwrap();
+        assert_ne!(ta, "-webkit-center", "align removed: the cell's computed text-align is no longer the align= value");
+    }
+
+    // ---- AETHERFILETYPECHANGE (LEDGER SR783): leaving type=file drops the selection (named tail block) ----
+
+    /// AETHERFILETYPECHANGE (SR783): file input `f` (multiple, two Files through SR706's DataTransfer helper), `fv`
+    /// (value="kept.txt", one File), text input `t` and a fresh multiple file input `fresh`; `input` / `change` on f, fv
+    /// and t count into `window.ev`.
+    fn file_type_change_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f" multiple></div>
+            <div><input type="file" id="fv" value="kept.txt"></div>
+            <div><input type="text" id="t"></div>
+            <div><input type="file" id="fresh" multiple></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("f").files = list(["a.txt", "b.txt"]);
+              document.getElementById("fv").files = list(["report.pdf"]);
+              window.ev = 0;
+              ["f", "fv", "t"].forEach(function (id) { ["input", "change"].forEach(function (k) { document.getElementById(id).addEventListener(k, function () { window.ev++; }); }); });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): `type = 'text'` on a file input holding a FileList drops the selection (Chromium
+    /// destroys FileInputType and its FileList): `files` reads null, `value` reads the value content attribute (HTML
+    /// §4.10.5 type change: "" with none, `kept.txt` on fv, never the fakepath), the FileList held before reads length
+    /// 0 with no index, and no `input` / `change` event fires, then or after a tick.
+    #[test]
+    fn file_type_change_leaving_clears() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"), fv = document.getElementById("fv"), k = f.files, n = k.length, fp = fv.value; f.type = "text"; fv.type = "text"; return [n, f.files === null, JSON.stringify(f.value), k.length, k[0] === undefined, fp, fv.value, fv.files === null, window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "2,true,\"\",0,true,C:\\fakepath\\report.pdf,kept.txt,true,0");
+        engine.tick();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("String(window.ev)").unwrap(), "0", "no event is queued by the type change");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a file input taken to text and back to file holds an empty FileList, `value` "",
+    /// no event fired, and its painted status is a fresh input's (SR715's probe), where two Files painted `2 files`.
+    #[test]
+    fn file_type_change_return_empty() {
+        let mut engine = file_type_change_page();
+        let before = file_value_clear_extent(&mut engine, "f");
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"); f.type = "text"; f.type = "file"; return [f.files.length, JSON.stringify(f.value), window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "0,\"\",0");
+        engine.tick(); engine.render_frame();
+        let (f, fresh) = (file_value_clear_extent(&mut engine, "f"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_ne!(before, fresh, "two Files painted `2 files` before the type change");
+        assert_eq!(f, fresh, "the returned input paints a fresh input's status");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a text input's `files` is null (HTML: null off the File Upload state); taken to
+    /// `file` it holds an empty FileList.
+    #[test]
+    fn file_type_change_text_to_file() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var t = document.getElementById("t"), was = t.files === null; t.type = "file"; return [was, t.files !== null, t.files.length].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "true,true,0");
+    }
+
+    // ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): one probe per line-height road: a number (under a px and an em font size), a
+    /// length, `normal`, a % and em (at 16px and 20px, the latter through `reresolve_font_relative`), and inheritance
+    /// (a number re-multiplies, a length is kept).
+    fn line_height_used_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:20px"><span id="num" style="line-height:1.5">Hello</span></div>
+            <div style="font-size:10px"><span id="numem" style="font-size:2em;line-height:1.5">Hello</span></div>
+            <div><span id="len" style="line-height:24px">Hello</span></div>
+            <div><span id="nrm" style="line-height:normal">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="line-height:150%">Hello</span></div>
+            <div style="font-size:16px"><span id="em16" style="line-height:1.5em">Hello</span></div>
+            <div><span id="em20" style="font-size:20px;line-height:1.5em">Hello</span></div>
+            <div style="font-size:10px;line-height:2"><span id="inum" style="font-size:20px">Hello</span></div>
+            <div style="font-size:10px;line-height:20px"><span id="ilen" style="font-size:30px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a number reads number x the USED font size: `1.5` under 20px reads 30px
+    /// (Chromium), and `font-size: 2em; line-height: 1.5` under 10px reads 30px (1.5 x the used 20px).
+    #[test]
+    fn line_height_used_cssom_number() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), "30px", "1.5 x 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "numem", "lineHeight"), "30px", "1.5 x the used 2em of 10px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a px line-height reads its px (it read `normal`: the stored length is negative).
+    #[test]
+    fn line_height_used_cssom_length() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), "24px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): `normal` stays the keyword (Chromium).
+    #[test]
+    fn line_height_used_cssom_normal() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a % and an em resolve against the element's own used font size: `150%` and
+    /// `1.5em` at 16px read 24px, `1.5em` with `font-size: 20px` reads 30px.
+    #[test]
+    fn line_height_used_cssom_percent_em() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "lineHeight"), "24px", "150% of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em16", "lineHeight"), "24px", "1.5em of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em20", "lineHeight"), "30px", "1.5em of the element's own 20px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): CSS 2.2 §10.8.1 inheritance: a number inherits as the number (a 20px child of
+    /// `line-height: 2` reads 40px), a length as the length (a 30px child of `line-height: 20px` reads 20px).
+    #[test]
+    fn line_height_used_cssom_inherit() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inum", "lineHeight"), "40px", "2 x the child's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ilen", "lineHeight"), "20px", "the parent's 20px kept");
+    }
+
+    // ---- AETHERCSSWIDECOLOR (LEDGER SR823): an explicit color: inherit beats an earlier rule and the a tag's link blue (named tail block) ----
+
+    /// AETHERCSSWIDECOLOR (SR823): one row per probe at 20px serif, the rules in a sheet. Under a red parent: a plain
+    /// link (the UA link blue), `a.c { color: blue }` and its `a.c.x { color: inherit }` twin, `a.u { color: unset }`,
+    /// `a.l { color: inherit } a.l.k { color: rgb(0, 160, 0) }` and a same-block `color: inherit; color: rgb(0, 160, 0)`
+    /// link. Under a black-background yellow-text row (the dark theme): the reset sheet's `a.r { color: inherit }` and a
+    /// plain link. Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn css_wide_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            a.c { color: blue }
+            a.c.x { color: inherit }
+            a.r { color: inherit }
+            a.u { color: unset }
+            a.l { color: inherit }
+            a.l.k { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><a id="aref" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ac" class="c" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ax" class="c x" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="au" class="u" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ak" class="l k" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ai" href="#" style="color:inherit;color:rgb(0, 160, 0)">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="ar" class="r" href="#">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="aref2" href="#">Hello</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the count of pixels in element `id`'s rect whose (r, g, b) passes `hue`.
+    fn css_wide_color_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 1).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn css_wide_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 < 90 && c.2 < 90
+    }
+
+    fn css_wide_blue(c: (u8, u8, u8)) -> bool {
+        c.2 > 150 && c.0 < 90 && c.1 < 90
+    }
+
+    fn css_wide_green(c: (u8, u8, u8)) -> bool {
+        c.1 > 110 && c.0 < 90 && c.2 < 90
+    }
+
+    fn css_wide_yellow(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 > 150 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `a.c.x { color: inherit }` after `a.c { color: blue }` under a red parent paints red
+    /// (no blue ink); the `a.c` twin and the plain link paint blue (armed); cssom reads the parent's rgb(255, 0, 0).
+    #[test]
+    fn css_wide_color_cross_rule_red() {
+        let mut e = css_wide_color_engine();
+        for id in ["aref", "ac"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 3, "#{id} paints blue (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red (armed)");
+        }
+        assert!(css_wide_color_ink(&mut e, "ax", css_wide_red) > 3, "a.c.x takes the red parent past the earlier rule");
+        assert_eq!(css_wide_color_ink(&mut e, "ax", css_wide_blue), 0, "a.c.x paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "aref", "color"), "rgb(0, 0, 238)", "the plain link reads the UA link blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the reset sheet's `a { color: inherit }` under a dark (black, yellow-text) row paints
+    /// the row's yellow, not the UA link blue; the plain link beside it stays blue (armed).
+    #[test]
+    fn css_wide_color_reset_link_dark() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "aref2", css_wide_blue) > 3, "the plain link on the dark row is blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "ar", css_wide_yellow) > 3, "the reset link paints the row's yellow");
+        assert_eq!(css_wide_color_ink(&mut e, "ar", css_wide_blue), 0, "the reset link paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ar", "color"), "rgb(255, 255, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `color: unset` is inherit for an inherited property (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_color_unset_is_inherit() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "au", css_wide_red) > 3, "a.u takes the red parent");
+        assert_eq!(css_wide_color_ink(&mut e, "au", css_wide_blue), 0, "a.u paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "color"), "rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): a later `color: rgb(0, 160, 0)` beats an earlier inherit, across rules (`a.l.k`) and
+    /// in one block (the inline style): green, neither red nor blue.
+    #[test]
+    fn css_wide_color_later_value_wins() {
+        let mut e = css_wide_color_engine();
+        for id in ["ak", "ai"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_green) > 3, "#{id} paints the later green");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
+    }
 }
