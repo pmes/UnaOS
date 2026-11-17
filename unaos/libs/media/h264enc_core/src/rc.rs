@@ -598,7 +598,7 @@ struct Pass2 {
     bits: Vec<u64>,
     n: usize,
     spent: i64,
-    total: i64,
+    total: i64, qpstep: u8, // H264ENCTWOPASSQPSTEPRUNTIME (SR769): Pass2Opts::qpstep, the runtime clamp's step
 }
 
 impl Rc {
@@ -613,7 +613,7 @@ impl Rc {
         let rb = (p.total - p.spent).clamp(rp / 2, 2 * rp).max(1);
         let share = (p.bits[p.n].max(1) as i128 * rb as i128 / rp as i128) as i64;
         let off = ((6 * (log2_q16(rp as u64) - log2_q16(rb as u64)) + (1 << 15)) >> 16).clamp(-PIC_STEP as i64, PIC_STEP as i64) as i32;
-        let mut qp = (p.qps[p.n] + off).clamp(self.floor, QP_MAX);
+        let mut qp = (p.qps[p.n] + off).clamp(self.floor, QP_MAX); qp = qpstep_clamp(qp, self.pass2_last(t), p.qpstep, (off < 0, off > 0 && p.n > 3)); // H264ENCTWOPASSQPSTEPRUNTIME (SR769): x264's lstep clamp before the bucket
         let room = (self.buf - self.full).max(self.r / 8);
         let m = self.types[t];
         while m.coded && qp < QP_MAX && m.predict(s, qp) > room as u128 {
@@ -1058,7 +1058,7 @@ impl Encoder {
         let total = (rate.bits_per_second as u128 * stats.len() as u128 * rate.fps_den as u128 / rate.fps_num as u128) as u64;
         let qps = pass2_qps(stats, total, rc.floor, opts);
         let bits = stats.iter().zip(&qps).map(|(p, &q)| p.complexity / step16(q)).collect();
-        rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64 });
+        rc.pass2 = Some(Pass2 { kinds: stats.iter().map(|p| p.kind).collect(), qps, bits, n: 0, spent: 0, total: total as i64, qpstep: opts.qpstep }); // H264ENCTWOPASSQPSTEPRUNTIME (SR769): the runtime clamp's step
         Ok(self)
     }
 }
@@ -1085,8 +1085,8 @@ pub fn intra_keep_q16(p: &PicStat) -> u128 {
 // qps) and the I pictures after it; an I only against the next I with no P between them nor after that next I (x264's
 // `last_accum_p_norm < 1` read as "no P": exact while every P carries no intra macroblock, SR751). A lasting complexity step plans
 // a ramp before it, as x264. Departures, named: x264's `tex_bits == 0` P rule is not ported (the records split no texture bits);
-// qpstep 0 = no limit (x264's 0 would hold every same-type picture equal). Owed: H264ENC-TWOPASS-QPSTEP-RUNTIME (`pass2_pick` held
-// within qpstep of the last CODED picture of its type, x264's rate_estimate_qscale lmin / lmax), H264ENC-TWOPASS-QPSTEP-CLI.
+// qpstep 0 = no limit (x264's 0 would hold every same-type picture equal). Owed: H264ENC-TWOPASS-QPSTEP-RUNTIME (BUILT by SR769, the
+// H264ENCTWOPASSQPSTEPRUNTIME tail block), H264ENC-TWOPASS-QPSTEP-CLI.
 
 /// x264's `--qpstep` default (`i_qp_step` 4): [`Pass2Opts::qpstep`]'s Default.
 pub const QP_STEP: u8 = 4;
@@ -1112,5 +1112,38 @@ pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
         }
         next_p = next.is_some_and(|j| kinds[j] == Pic::P);
         next = Some(i);
+    }
+}
+
+// ---- H264ENCTWOPASSQPSTEPRUNTIME (LEDGER SR769): x264's lstep clamp on the pass-2 runtime pick (named tail block) ----
+// A NAMED DEPARTURE: x264's 2-pass `rate_estimate_qscale` (ratecontrol.c) has no runtime neighbour clamp (its lmin / lmax there are
+// qp_min / qp_max; its 2-pass smoothness is init_pass2's get_diff_limited_q alone, our [`qpstep_limit`]). The clamp ported here is
+// x264's 1-PASS ABR rule: `lmin = last_qscale_for[type] / lstep; lmax = last_qscale_for[type] * lstep; if (overflow > 1.1 &&
+// i_frame > 3) lmax *= lstep; else if (overflow < 0.9) lmin /= lstep;` (asymmetric: "symmetric would prevent overflow control"),
+// then `vbv_pass1`, the bucket. `pass2_pick` runs it after the plan + `off` (x264's overflow term) and before its bucket raise,
+// which still wins: a bucket overflow is never traded for smoothness. last_qscale_for is `Rc.types[t].qp` (the final pick,
+// written by `update`); a P against the last coded P, an I only when the previous non-B was an I (x264's I after a P is its
+// I rule, our plan's), a B never (x264's B path returns before the clamp; the plan-time rule skips B too, the plan's B being
+// anchor + 2). Departures, named: our overflow is `off`'s sign (off >= 1 ~ overflow >= 1.06 against x264's 1.1, the rounding),
+// `p.n > 3` for `i_frame > 3`; x264's frame-0 seeding last_qscale_for[P] = I x ip_factor is not ported (the first P is unclamped).
+// qpstep 0 = no clamp (RAW byte-identical). Owed: H264ENC-TWOPASS-QPSTEP-ONE-RULE, H264ENC-TWOPASS-QPSTEP-FIRSTP.
+
+/// `qp` held within `qpstep` QP of `last` (H264ENCTWOPASSQPSTEPRUNTIME SR769, x264's ABR lmin / lmax), the low bound a further
+/// `qpstep` lower when `wide.0` (under budget), the high bound a further `qpstep` higher when `wide.1` (over budget); `last`
+/// None or `qpstep` 0 returns `qp` unchanged.
+pub fn qpstep_clamp(qp: i32, last: Option<i32>, qpstep: u8, wide: (bool, bool)) -> i32 {
+    let Some(l) = last.filter(|_| qpstep > 0) else { return qp };
+    let s = qpstep as i32;
+    qp.clamp(l - s - if wide.0 { s } else { 0 }, l + s + if wide.1 { s } else { 0 })
+}
+
+impl Rc {
+    /// Under a plan, the last coded QP the runtime clamp holds picture type `t` against (H264ENCTWOPASSQPSTEPRUNTIME SR769): a P's
+    /// last coded P; an I's last coded I only when the previous non-B picture of the plan was an I; a B none.
+    fn pass2_last(&self, t: usize) -> Option<i32> {
+        let p = self.pass2.as_ref()?;
+        let after_i = p.kinds[..p.n].iter().rev().find(|&&k| k != Pic::B) == Some(&Pic::Idr);
+        let m = self.types[t];
+        (m.coded && (t == 1 || (t == 0 && after_i))).then_some(m.qp)
     }
 }

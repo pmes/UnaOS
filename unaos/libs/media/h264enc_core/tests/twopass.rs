@@ -27,7 +27,7 @@
 //! the counts, a v1 text and a bad count refuse by name. Test f's tampered line keeps the v2 count token.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_limit, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_clamp, qpstep_limit, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -661,3 +661,104 @@ const T_DEFAULT_PRE: [[i32; 60]; 3] = [
     [24, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 24, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27],
     [18, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 18, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21],
 ];
+
+// ---- H264ENCTWOPASSQPSTEPRUNTIME (LEDGER SR769): x264's lstep clamp on the pass-2 runtime pick (named tail block) ----
+
+/// A 30-picture record that disagrees with scene(): an IDR, P pictures of `p` bits, a `k` x P at 12 and `k` x P from 22 on.
+fn rt_plan(p: u64, k: u64) -> Vec<PicStat> {
+    (0..N).map(|i| if i == 0 { pic(Pic::Idr, 30 * p) } else if i == 12 || i >= 22 { pic(Pic::P, k * p) } else { pic(Pic::P, p) }).collect()
+}
+
+/// Dense noise (an LCG per sample) for picture `t`: far costlier than scene().
+fn noise(t: usize) -> [Vec<u8>; 3] {
+    let mut s = (t as u32).wrapping_mul(2654435761) | 1;
+    let mut next = || {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        (s >> 24) as u8
+    };
+    let y = (0..W * H).map(|_| next()).collect();
+    let u = (0..W * H / 4).map(|_| next()).collect();
+    let v = (0..W * H / 4).map(|_| next()).collect();
+    [y, u, v]
+}
+
+/// (bits, SliceQPY) per picture of a two-pass encode at `kbps` planned from `plan` with `opts`, picture t from `src(t)`.
+fn rt_encode(kbps: u32, plan: &[PicStat], opts: &Pass2Opts, src: &dyn Fn(usize) -> [Vec<u8>; 3]) -> (Vec<u64>, Vec<i32>) {
+    let mut enc = Encoder::new(base(Some(RateControl::two_pass(kbps, (FPS, 1))))).unwrap().planned_with(plan, opts).unwrap();
+    let bits = (0..N).map(|t| au_bits(&enc.encode(&frame(&src(t))).unwrap())).collect();
+    (bits, enc.stats().iter().map(|p| p.qp).collect())
+}
+
+/// The largest same-type coded QP step between neighbouring P pictures of `q` (the plan's kinds).
+fn rt_step(q: &[i32]) -> i32 {
+    (2..q.len()).map(|i| (q[i] - q[i - 1]).abs()).max().unwrap_or(0)
+}
+
+#[test]
+fn u_qpstep_clamp_rules() {
+    // No last picture of the type, or qpstep 0: unchanged.
+    assert_eq!(qpstep_clamp(40, None, 4, (false, false)), 40);
+    assert_eq!(qpstep_clamp(40, Some(20), 0, (true, true)), 40);
+    // Within +-4 of the last coded: held at either bound, untouched inside.
+    assert_eq!(qpstep_clamp(40, Some(30), 4, (false, false)), 34);
+    assert_eq!(qpstep_clamp(20, Some(30), 4, (false, false)), 26);
+    assert_eq!(qpstep_clamp(32, Some(30), 4, (false, false)), 32);
+    // x264's asymmetric widening: over budget the high bound a further step up, under budget the low bound a further step down.
+    assert_eq!(qpstep_clamp(40, Some(30), 4, (false, true)), 38);
+    assert_eq!(qpstep_clamp(20, Some(30), 4, (false, true)), 26);
+    assert_eq!(qpstep_clamp(20, Some(30), 4, (true, false)), 22);
+    assert_eq!(qpstep_clamp(40, Some(30), 4, (true, false)), 34);
+}
+
+// (v) / (w) fixture, tuned and named: rt_plan(1000, 10) coded from scene() at 60 kbps (the measured premise: qpstep 0 steps 9 QP
+// between coded neighbouring P pictures; the pre-SR769 tree at qpstep 4 stepped 5, the plan held within 4 and the runtime `off`
+// adding the rest; 30 kbps and k = 30 step the same way, 13 / 6).
+const RT_KBPS: u32 = 60;
+
+#[test]
+fn v_runtime_qpstep_holds_the_coded_steps() {
+    let sharp = Pass2Opts { cplxblur: 0, qblur_q8: 0, ..Pass2Opts::default() };
+    let plan = rt_plan(1000, 10);
+    let (fb, free) = rt_encode(RT_KBPS, &plan, &Pass2Opts { qpstep: 0, ..sharp }, &scene);
+    let (hb, held) = rt_encode(RT_KBPS, &plan, &sharp, &scene);
+    let target = RT_KBPS as f64 * 1000.0 * N as f64 / FPS as f64;
+    let (f, h) = (fb.iter().sum::<u64>() as f64, hb.iter().sum::<u64>() as f64);
+    println!("twopassqpsteprt spike qpstep=0 step={} {:+.2}% {free:?}", rt_step(&free), (f / target - 1.0) * 100.0);
+    println!("twopassqpsteprt spike qpstep=4 step={} {:+.2}% {held:?}", rt_step(&held), (h / target - 1.0) * 100.0);
+    assert!(rt_step(&free) > 4, "the fixture steps more than 4 QP between coded P pictures without the clamps: {free:?}");
+    // X: within qpstep of the last coded P, a further qpstep where `off` says over / under budget (x264's asymmetric lstep).
+    assert!(rt_step(&held) <= 2 * 4, "every neighbouring coded P pair within 2 x qpstep: {held:?}");
+    assert!(rt_step(&held) < rt_step(&free), "the clamp narrows the coded steps: {held:?} vs {free:?}");
+}
+
+#[test]
+fn w_qpstep_zero_codes_the_pre_sr769_stream() {
+    let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, qpstep: 0, ..Pass2Opts::default() };
+    let (bits, qps) = rt_encode(RT_KBPS, &rt_plan(1000, 10), &raw, &scene);
+    assert_eq!(bits, W_PRE_BITS, "qpstep 0: the runtime clamp is off, the coded bytes are the pre-SR769 tree's");
+    assert_eq!(qps, W_PRE_QPS);
+}
+
+/// rt_encode(RT_KBPS, rt_plan(1000, 10), qpstep 0, scene) captured on the tree BEFORE SR769 (bits, SliceQPY per picture).
+const W_PRE_BITS: [u64; 30] = [15104, 1440, 952, 952, 1240, 1040, 1248, 1208, 1272, 1168, 1008, 1192, 368, 2200, 1128, 1192, 1120, 976, 1256, 1208, 1160, 1152, 552, 640, 760, 512, 1176, 1360, 1328, 1376]; // re-pinned at the SR769 fold: SR759 (P intra) moved the coded bytes;
+const W_PRE_QPS: [i32; 30] = [29, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 37, 28, 29, 29, 29, 29, 29, 29, 29, 30, 38, 37, 36, 35, 33, 32, 32, 32]; // re-pinned at the SR769 fold: SR759 (P intra) moved two QPs
+
+// (x) the bucket wins, measured and named: scene() then dense noise from picture 15 under the scene's own first pass (the plan
+// claims them flat). The bucket raise lifts the QP 29 -> 51 in one picture, past any clamp bound (2 x qpstep), at qpstep 4 as at
+// 0. Noise costs ~23 kbit a picture at QP 51 against 2 kbit at 60 kbps, so the replayed bucket overflows whatever the QP (the
+// first noise picture alone, coded at its pre-noise QP, is ~80 kbit > the 60 kbit bucket): printed, not asserted bounded.
+#[test]
+fn x_the_bucket_raise_wins_over_the_clamp() {
+    let plan = first_pass(RT_KBPS);
+    let src = |t: usize| if t < 15 { scene(t) } else { noise(t) };
+    let (fb, free) = rt_encode(RT_KBPS, &plan, &Pass2Opts { qpstep: 0, ..Pass2Opts::default() }, &src);
+    let (hb, held) = rt_encode(RT_KBPS, &plan, &Pass2Opts::default(), &src);
+    let (r, buf) = (RT_KBPS as i64 * 1000 / FPS as i64, RT_KBPS as i64 * 1000);
+    let mut full = buf / 2;
+    let full_max = hb.iter().map(|&b| { full = (full + b as i64 - r).max(0); full }).max().unwrap();
+    println!("twopassqpsteprt bucket step={} full_max={full_max} buf={buf} {held:?}", rt_step(&held));
+    assert!(rt_step(&held) > 2 * 4, "the bucket raise steps past any clamp bound: {held:?}");
+    assert!(held[16..].iter().all(|&q| q == QP_MAX), "the raise reaches QP_MAX under the clamp: {held:?}");
+    assert_eq!(held[16..], free[16..], "the clamp never holds the raise back");
+    assert_eq!(hb[16..], fb[16..]);
+}
