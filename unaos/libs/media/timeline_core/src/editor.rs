@@ -2904,7 +2904,7 @@ impl EditorState {
         let (n, _) = self.selection?;
         let m = self.timeline.track_neighbour(n, !up).ok()?;
         let (word, rel) = if up { ("track-up", "above") } else { ("track-down", "below") };
-        Some(alloc::format!("{word}: {} {rel} {}", self.timeline.track_name(m)?, self.timeline.track_name(n)?)))
+        Some(alloc::format!("{word}: {} {rel} {}", self.timeline.track_name(m)?, self.timeline.track_name(n)?))
     }
 }
 
