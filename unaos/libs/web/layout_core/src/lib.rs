@@ -296,12 +296,12 @@ pub struct Adv {
     pub size: f32,
     pub letter_spacing: f32,
     pub word_spacing: f32,
-    pub rtl: bool, pub small_caps: bool,
+    pub rtl: bool, pub small_caps: u8,
 }
 
 impl Adv {
     pub fn new(sel: FontSel, size: f32, letter_spacing: f32) -> Self {
-        Adv { sel, size, letter_spacing, word_spacing: 0.0, rtl: false, small_caps: false }
+        Adv { sel, size, letter_spacing, word_spacing: 0.0, rtl: false, small_caps: 0 }
     }
     pub fn with_word_spacing(mut self, ws: f32) -> Self {
         self.word_spacing = ws;
@@ -386,7 +386,7 @@ pub trait Fonts {
 impl Adv {
     /// AETHERFONTVARIANTSMALLCAPS (SR800): synthesize small capitals in this run (`paint::small_caps_synth`); the
     /// host's measurer splits the run by [`inline::small_caps_segments`].
-    pub fn with_small_caps(mut self, on: bool) -> Self {
+    pub fn with_small_caps(mut self, on: u8) -> Self {
         self.small_caps = on;
         self
     }

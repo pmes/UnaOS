@@ -1030,12 +1030,13 @@ pub const SMALL_CAPS_SCALE: f32 = 0.7;
 /// AETHERFONTVARIANTSMALLCAPS (SR800): `text` split as Chromium's SmallCapsIterator splits it (recalled: on
 /// `UCHAR_CHANGES_WHEN_UPPERCASED`): maximal byte ranges of characters whose uppercase mapping differs from the
 /// character (`true`: shaped uppercased at [`SMALL_CAPS_SCALE`]) and of the rest (`false`: shaped as is, full size).
-/// The uppercased text of a small segment can be longer (`ß` is `SS`).
-pub fn small_caps_segments(text: &str) -> Vec<(core::ops::Range<usize>, bool)> {
+/// The uppercased text of a small segment can be longer (`ß` is `SS`). AETHERFONTVARIANTCAPSALL (SR806): `all`
+/// (all-small-caps / all-petite-caps) puts the uppercase letters in the small segments too; non-letters stay full.
+pub fn small_caps_segments(text: &str, all: bool) -> Vec<(core::ops::Range<usize>, bool)> {
     let mut out: Vec<(core::ops::Range<usize>, bool)> = Vec::new();
     for (i, c) in text.char_indices() {
         let mut up = c.to_uppercase();
-        let small = !(up.next() == Some(c) && up.next().is_none());
+        let small = !(up.next() == Some(c) && up.next().is_none()) || (all && c.is_uppercase());
         let end = i + c.len_utf8();
         match out.last_mut() {
             Some((r, s)) if *s == small => r.end = end,
@@ -1045,11 +1046,11 @@ pub fn small_caps_segments(text: &str) -> Vec<(core::ops::Range<usize>, bool)> {
     out
 }
 
-/// AETHERFONTVARIANTSMALLCAPS (SR800): the computed `font-variant-caps` of box `id` (true = small-caps): the nearest
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the computed `font-variant-caps` of box `id` (a `paint::Caps`, SR806): the nearest
 /// specified `PaintStyle::small_caps` up the box tree, else normal. Aether's CSSOM reads it (the `font` shorthand's
 /// prefix sets it and is not expanded there).
-pub fn small_caps_used<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
-    inherited(tree, id, |p| p.small_caps).unwrap_or(false)
+pub fn small_caps_used<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> crate::paint::Caps {
+    inherited(tree, id, |p| p.small_caps).unwrap_or(crate::paint::Caps::Normal)
 }
 
 #[cfg(test)]
@@ -1058,28 +1059,86 @@ mod small_caps_tests {
 
     #[test]
     fn small_caps_segments_kat() {
-        assert_eq!(small_caps_segments("Hello World"), vec![(0..1, false), (1..5, true), (5..7, false), (7..11, true)]);
-        assert_eq!(small_caps_segments("ABC 123"), vec![(0..7, false)]);
-        assert_eq!(small_caps_segments(""), vec![]);
+        assert_eq!(small_caps_segments("Hello World", false), vec![(0..1, false), (1..5, true), (5..7, false), (7..11, true)]);
+        assert_eq!(small_caps_segments("ABC 123", false), vec![(0..7, false)]);
+        assert_eq!(small_caps_segments("", false), vec![]);
         let s = "\u{df}";
-        assert_eq!(small_caps_segments(s), vec![(0..2, true)]);
+        assert_eq!(small_caps_segments(s, false), vec![(0..2, true)]);
         assert_eq!(s.to_uppercase(), "SS", "the small segment grows when uppercased");
     }
 
     #[test]
     fn font_variant_caps_parse_kat() {
         use crate::css::parse_font_variant_caps as p;
-        assert_eq!(p("font-variant-caps", "small-caps"), Some(true));
-        assert_eq!(p("font-variant-caps", "normal"), Some(false));
-        assert_eq!(p("font-variant-caps", "initial"), Some(false));
-        assert_eq!(p("font-variant-caps", "all-small-caps"), None);
+        use crate::paint::Caps;
+        assert_eq!(p("font-variant-caps", "small-caps"), Some(Caps::SmallCaps));
+        assert_eq!(p("font-variant-caps", "normal"), Some(Caps::Normal));
+        assert_eq!(p("font-variant-caps", "initial"), Some(Caps::Normal));
+        assert_eq!(p("font-variant-caps", "all-small-caps"), Some(Caps::AllSmallCaps));
         assert_eq!(p("font-variant-caps", "inherit"), None);
         assert_eq!(p("font-variant-caps", "bogus"), None);
-        assert_eq!(p("font-variant", "small-caps"), Some(true));
-        assert_eq!(p("font-variant", "common-ligatures small-caps"), Some(true));
-        assert_eq!(p("font-variant", "normal"), Some(false));
-        assert_eq!(p("font-variant", "none"), Some(false));
-        assert_eq!(p("font-variant", "oldstyle-nums"), Some(false), "the shorthand resets its caps longhand");
-        assert_eq!(p("font-variant", "petite-caps"), None);
+        assert_eq!(p("font-variant", "small-caps"), Some(Caps::SmallCaps));
+        assert_eq!(p("font-variant", "common-ligatures small-caps"), Some(Caps::SmallCaps));
+        assert_eq!(p("font-variant", "normal"), Some(Caps::Normal));
+        assert_eq!(p("font-variant", "none"), Some(Caps::Normal));
+        assert_eq!(p("font-variant", "oldstyle-nums"), Some(Caps::Normal), "the shorthand resets its caps longhand");
+        assert_eq!(p("font-variant", "petite-caps"), Some(Caps::PetiteCaps));
+    }
+}
+
+// ---- AETHERFONTVARIANTCAPSALL (LEDGER SR806): the seven caps keywords, the derived mask and the all-* split (named tail block) ----
+
+#[cfg(test)]
+mod caps_all_tests {
+    use super::*;
+    use crate::paint::{small_caps_synth, Caps, CAPS_ALL, CAPS_NO_SYNTH, CAPS_SMALL};
+
+    /// AETHERFONTVARIANTCAPSALL (SR806): css-fonts-4 §6.6's seven longhand keywords, `font-variant`'s caps half.
+    #[test]
+    fn caps_parse_seven_kat() {
+        use crate::css::parse_font_variant_caps as p;
+        let all = [
+            ("normal", Caps::Normal), ("small-caps", Caps::SmallCaps), ("all-small-caps", Caps::AllSmallCaps),
+            ("petite-caps", Caps::PetiteCaps), ("all-petite-caps", Caps::AllPetiteCaps), ("unicase", Caps::Unicase),
+            ("titling-caps", Caps::TitlingCaps),
+        ];
+        for (k, c) in all {
+            assert_eq!(p("font-variant-caps", k), Some(c), "{k}");
+            assert_eq!(p("font-variant-caps", &k.to_ascii_uppercase()), Some(c), "{k} is ASCII case-insensitive");
+            assert_eq!(Caps::of(c.word()), Some(c), "{k}: word round-trips");
+        }
+        assert_eq!(p("font-variant", "all-small-caps"), Some(Caps::AllSmallCaps));
+        assert_eq!(p("font-variant", "common-ligatures petite-caps"), Some(Caps::PetiteCaps));
+        assert_eq!(p("font-variant", "normal"), Some(Caps::Normal));
+        assert_eq!(p("font-variant-caps", "bogus"), None);
+        assert_eq!(p("font-variant-caps", "inherit"), None);
+    }
+
+    /// AETHERFONTVARIANTCAPSALL (SR806): the mask derived from the stored value: petite as its small twin, the all-*
+    /// pair with `CAPS_ALL`, unicase / titling-caps nothing; `font-synthesis-small-caps: none` turns all four off (a
+    /// child's `normal` under an all-small-caps parent: the engine test `font_variant_caps_unicase_titling_plain`).
+    #[test]
+    fn caps_mask_kat() {
+        assert_eq!(Caps::SmallCaps.mask(), CAPS_SMALL);
+        assert_eq!(Caps::PetiteCaps.mask(), CAPS_SMALL);
+        assert_eq!(Caps::AllSmallCaps.mask(), CAPS_SMALL | CAPS_ALL);
+        assert_eq!(Caps::AllPetiteCaps.mask(), CAPS_SMALL | CAPS_ALL);
+        for c in [Caps::Normal, Caps::Unicase, Caps::TitlingCaps] {
+            assert_eq!(c.mask(), 0, "{c:?}");
+        }
+        for c in [Caps::SmallCaps, Caps::PetiteCaps, Caps::AllSmallCaps, Caps::AllPetiteCaps] {
+            assert_eq!(small_caps_synth(c.mask()), c.mask(), "{c:?} synthesizes");
+            assert_eq!(small_caps_synth(c.mask() | CAPS_NO_SYNTH), 0, "{c:?} under synthesis none");
+        }
+    }
+
+    /// AETHERFONTVARIANTCAPSALL (SR806): `all` joins the uppercase letters to the small segments; a space or a digit
+    /// stays full size, so it splits them (TRUE of the rule: Chromium's split on the lowercased text, recalled).
+    #[test]
+    fn small_caps_segments_all_kat() {
+        assert_eq!(small_caps_segments("Hello", true), vec![(0..5, true)]);
+        assert_eq!(small_caps_segments("Hello World", true), vec![(0..5, true), (5..6, false), (6..11, true)]);
+        assert_eq!(small_caps_segments("ABC 123", true), vec![(0..3, true), (3..7, false)]);
+        assert_eq!(small_caps_segments("Hello", false), vec![(0..1, false), (1..5, true)]);
     }
 }

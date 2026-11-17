@@ -2021,8 +2021,7 @@ fn font_variant_caps_computed(el: usize) -> String {
         Some(layout_core::inline::small_caps_used(&f.tree, *tid))
     });
     match used {
-        Some(true) => "small-caps".to_string(),
-        Some(false) => "normal".to_string(),
+        Some(c) => c.word().to_string(),
         None => cascaded_value(el, "font-variant-caps").unwrap_or_else(|| "normal".to_string()),
     }
 }

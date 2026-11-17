@@ -1431,7 +1431,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 let h = head.trim().to_ascii_lowercase();
                 if h == "italic" || h == "oblique" {
                     style.paint.italic = Some(true);
-                } else if h == "normal" || h == "small-caps" { if h == "small-caps" { style.paint.small_caps = Some(true); }
+                } else if h == "normal" || h == "small-caps" { if h == "small-caps" { style.paint.small_caps = Some(crate::paint::Caps::SmallCaps); }
                     // no effect here, but still part of the prefix
                 } else if let Some(p) = parse_font_stretch(&h).filter(|_| !h.ends_with('%')) {
                     style.paint.stretch = Some(p);
@@ -3544,9 +3544,9 @@ pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Op
 
 // ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): css-fonts-4 §6.6 font-variant-caps and font-variant's caps half (named tail block) ----
 
-/// AETHERFONTVARIANTSMALLCAPS (SR800): `font-variant-caps: normal | small-caps` and the caps half of the `font-variant`
-/// shorthand into `PaintStyle::small_caps` (inherited by the walkers' caps mask, `PaintStyle::caps`). The other caps
-/// keywords and the other font-variant longhands are parsed and dropped (owed: AETHER-FONT-VARIANT-CAPS-ALL / -OTHERS).
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `font-variant-caps` (the seven keywords, AETHERFONTVARIANTCAPSALL SR806) and the
+/// caps half of the `font-variant` shorthand into `PaintStyle::small_caps` (inherited by the walkers' caps mask,
+/// `PaintStyle::caps`). The other font-variant longhands are parsed and dropped (owed: AETHER-FONT-VARIANT-OTHERS).
 fn apply_font_variant_caps<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
     match parse_font_variant_caps(prop, value) {
         Some(on) => paint.small_caps = Some(on),
@@ -3558,31 +3558,25 @@ fn apply_font_variant_caps<H: Host>(prop: &str, value: &str, paint: &mut PaintSt
     }
 }
 
-/// AETHERFONTVARIANTSMALLCAPS (SR800): the caps value a `font-variant-caps` / `font-variant` declaration sets: Some(true)
-/// = small-caps, Some(false) = normal (`initial`; the shorthand's `normal` / `none` and any value without a caps keyword:
-/// the shorthand resets its caps longhand), None for a caps keyword not taken (all-small-caps, petite-caps,
-/// all-petite-caps, unicase, titling-caps), an invalid longhand value and `inherit` / `unset` (the property inherits).
-pub fn parse_font_variant_caps(prop: &str, value: &str) -> Option<bool> {
-    const NOT_TAKEN: [&str; 5] = ["all-small-caps", "petite-caps", "all-petite-caps", "unicase", "titling-caps"];
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the caps value a `font-variant-caps` / `font-variant` declaration sets
+/// (AETHERFONTVARIANTCAPSALL SR806: any of the seven keywords): `initial` is Normal; the shorthand's `normal` / `none` and
+/// any value without a caps keyword are Normal (the shorthand resets its caps longhand), its last caps keyword wins;
+/// None for an invalid longhand value and `inherit` / `unset` (the property inherits).
+pub fn parse_font_variant_caps(prop: &str, value: &str) -> Option<crate::paint::Caps> {
+    use crate::paint::Caps;
     let v = value.trim().to_ascii_lowercase();
     match v.as_str() {
-        "initial" => return Some(false),
+        "initial" => return Some(Caps::Normal),
         "inherit" | "unset" | "revert" | "revert-layer" | "" => return None,
         _ => {}
     }
     if prop == "font-variant-caps" {
-        return match v.as_str() {
-            "normal" => Some(false),
-            "small-caps" => Some(true),
-            _ => None,
-        };
+        return Caps::of(&v);
     }
-    let mut caps = Some(false);
+    let mut caps = Some(Caps::Normal);
     for k in v.split_whitespace() {
-        if k == "small-caps" {
-            caps = Some(true);
-        } else if NOT_TAKEN.contains(&k) {
-            return None;
+        if let Some(c) = Caps::of(k).filter(|c| *c != Caps::Normal) {
+            caps = Some(c);
         }
     }
     caps
