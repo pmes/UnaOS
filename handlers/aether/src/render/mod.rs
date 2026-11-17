@@ -21,7 +21,7 @@ struct Inherited {
     /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
     text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
-    underline: bool, deco_color: Option<(u8, u8, u8)>, deco_style: u8, deco_thick: Option<f32>,
+    underline: bool, deco_color: Option<(u8, u8, u8)>, deco_style: u8, deco_thick: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
     nowrap: bool,
     white_space: u8,
     word_break: u8,
@@ -486,7 +486,7 @@ fn root_inherited() -> Inherited {
         rtl: false, bidi_ovr: 0,
         text_shadow: None,
         line_height: 0.0, // natural
-        underline: false, deco_color: None, deco_style: 0, deco_thick: None,
+        underline: false, deco_color: None, deco_style: 0, deco_thick: None, ul_offset: None, ul_pos: 0,
         nowrap: false,
         white_space: 0,
         word_break: 0,
@@ -731,7 +731,7 @@ fn draw_decorations(
         }
     };
     if deco.underline {
-        for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline + m.underline_offset, t) { hline(a, b, y, h); }
+        for (a, b, y, h) in deco_rects(deco.style, x0, x1, underline_top(face, size, &deco, baseline, &m, t), t) { hline(a, b, y, h); }
     }
     if deco.line_through {
         for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline - m.line_through_offset, t) { hline(a, b, y, h); }
@@ -989,7 +989,7 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let deco = Deco { underline, line_through: false, color: None, style: 0, thickness: None };
+    let deco = Deco { underline, line_through: false, color: None, style: 0, thickness: None, ul_offset: None, ul_pos: 0 };
     draw_lines(
         text, origin_x, origin_y, max_width, adv, line_height_mult, color,
         &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
@@ -1171,7 +1171,7 @@ fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Deco {
     underline: bool,
-    line_through: bool, color: Option<(u8, u8, u8)>, style: u8, thickness: Option<f32>,
+    line_through: bool, color: Option<(u8, u8, u8)>, style: u8, thickness: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
 }
 
 /// Draws a run on the lines fonts::lines breaks it into — the same breaker
@@ -3462,7 +3462,7 @@ fn frame_walk(
                             inherited.line_height,
                             inherited.color,
                             &mode,
-                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, style: inherited.deco_style, thickness: inherited.deco_thick },
+                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, style: inherited.deco_style, thickness: inherited.deco_thick, ul_offset: inherited.ul_offset, ul_pos: inherited.ul_pos },
                             inherited.shadows(layout),
                             surface,
                             width,
@@ -3831,7 +3831,7 @@ fn frame_walk(
                             }
                             continue;
                         }
-                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, style: i.deco_style, thickness: i.deco_thick };
+                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, style: i.deco_style, thickness: i.deco_thick, ul_offset: i.ul_offset, ul_pos: i.ul_pos };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
                         // page once the staging buffer is composited.
@@ -4648,9 +4648,9 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// decoration paints through the descendant's text in the ancestor's `text-decoration-color`.
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
     if tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some() {
-        inherited.deco_color = None; inherited.deco_style = 0; inherited.deco_thick = None;
+        inherited.deco_color = None; inherited.deco_style = 0; inherited.deco_thick = None; inherited.ul_offset = None;
     }
-    if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(c) = spec.decoration_color {
+    if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(o) = spec.underline_offset { inherited.ul_offset = o; } if let Some(p) = spec.underline_position { inherited.ul_pos = p; } if let Some(c) = spec.decoration_color {
         inherited.deco_color = c;
     }
 }
@@ -4781,4 +4781,17 @@ fn wavy_path(x0: f32, x1: f32, y: f32, t: f32) -> Vec<(f32, f32, f32, f32)> {
         x += 1.0;
     }
     out
+}
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): the underline's top from text-underline-position / -offset (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the top row of the underline `draw_decorations` paints for `deco` at
+/// `baseline`, used thickness `t`. The base is `text-underline-position`: `under` (2) sits below the face's descent
+/// (`fonts::line_metrics`, whole px) by `t`, clear of g / j / p / y; auto and from-font (the face's post table is not
+/// consulted, as `fonts::decoration_metrics` documents: AETHER-CSS-TEXT-UNDERLINE-POSITION-FROM-FONT owed) are the auto
+/// gap `m.underline_offset`. `text-underline-offset` adds its length to that base (Blink's additive form, recalled:
+/// AETHER-CSS-TEXT-UNDERLINE-GEOMETRY-MEASURE owed); auto adds nothing.
+fn underline_top(face: &Font, size: f32, deco: &Deco, baseline: f32, m: &crate::fonts::DecoMetrics, t: f32) -> f32 {
+    let base = if deco.ul_pos == 2 { baseline + crate::fonts::line_metrics(face, size).1 + t } else { baseline + m.underline_offset };
+    base + deco.ul_offset.unwrap_or(0.0)
 }
