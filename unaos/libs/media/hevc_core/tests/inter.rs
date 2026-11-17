@@ -2213,3 +2213,115 @@ fn conceal_weighted_distance_log_error_table() {
     assert_eq!(log2_q16(65536), 0, "log2 1 = 0");
     assert_eq!(exp2_q16(0), 65536, "2^0 = 1");
 }
+
+// ---- HEVCCONCEALWEIGHTEDSLICES (LEDGER SR1067): each slice segment's pred_weight_table conceals its own blocks (named tail block) ----
+
+/// A one-entry luma pred_weight_table (luma_log2_weight_denom 6): delta_luma_weight `dw` (LumaWeightL0 64 + dw), offset `o`.
+fn slices_wp(dw: i32, o: i32) -> Option<(u32, Vec<Option<(i32, i32)>>)> {
+    Some((6, vec![Some((dw, o))]))
+}
+
+/// 8.5.3.3.4.3 at 8 bits for luma weight `w` (denom 6) and offset `o`: ((w v + 32) >> 6) + o (before the clip).
+fn slices_weighted(w: i32, o: i32) -> impl Fn(i32) -> i32 {
+    move |v| ((w * v + 32) >> 6) + o
+}
+
+/// `r` with luma rows 0-15 (CTBs 0-1, the first segment) through `top` and rows 16-31 (CTBs 2-3) through `bottom`, clipped to 8
+/// bits; chroma unchanged (the tables carry default chroma weights).
+fn slices_halves(r: &Img, top: impl Fn(i32) -> i32, bottom: impl Fn(i32) -> i32) -> Img {
+    let y = r.y.iter().enumerate().map(|(i, &v)| (if i / W < 16 { top(v as i32) } else { bottom(v as i32) }).clamp(0, 255) as u16).collect();
+    Img { y, cb: r.cb.clone(), cr: r.cr.clone() }
+}
+
+/// IDR0 (the gradient), the P2 slice data `p2` (references POC 0), P5 (skip-only, references the lost POC 4 and keeps POC 2
+/// unused; its table's one entry has the default weight: a copy), then `p6` when given. c - s = s - r = 2: the concealment
+/// ratio is 1, so the projected vector is P2's own and the weights stay unscaled (dpb.rs `scale_weight` num == den).
+fn slices_ratio_one(pi: &PpsInter, p2: Vec<u8>, p6: Option<Vec<u8>>) -> (Vec<Frame>, Vec<i32>, Vec<hevc_core::dpb::Concealed>) {
+    let mut s = headers(false, true, pi);
+    s.extend(idr(&gradient(), true));
+    s.extend(p2);
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(5, vec![(-1, true), (-3, false)]) }, skip_picture));
+    if let Some(p6) = p6 {
+        s.extend(p6);
+    }
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    (d.take_frames(), d.take_generated_refs(), d.take_concealed())
+}
+
+/// The PPS carries weighted_pred_flag. P2 is coded as TWO independent slice segments (the kit's `two_segments`), both moving by
+/// mv (32, 16) = (8, 4) samples from POC 0: the top (CTBs 0-1) with table A (LumaWeightL0 80 = 1.25, offset 8), the bottom
+/// (CTBs 2-3) with table B (48 = 0.75, offset -8). POC 4 is concealed from P2 at ratio 1; P5 is its copy. Each 8x8 block is
+/// weighted by the table of the slice that coded its source block (picture.rs `slice_weights`), so P5 equals P6, the decoder's
+/// own two-slice weighted MC of P2 with tables A / B, and the hand equation per half. Before SR1067 the bottom half took table A
+/// (the first segment's): ((80 v + 32) >> 6) + 8 on rows 16-31, refused below.
+#[test]
+fn conceal_weighted_slices_each_half_keeps_its_table() {
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    let p2 = |poc: u32, neg: Vec<(i32, bool)>| {
+        two_segments(&SliceCfg { weights: slices_wp(16, 8), ..p_slice(poc, neg.clone()) }, &SliceCfg { weights: slices_wp(-16, -8), ..p_slice(poc, neg) }, None, [32, 16])
+    };
+    let (f, generated, concealed) = slices_ratio_one(&pi, p2(2, vec![(-2, true)]), Some(p2(6, vec![(-4, true)])));
+    assert_eq!(generated, vec![4]);
+    assert_eq!(concealed, vec![hevc_core::dpb::Concealed { poc: 4, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 5, 6]);
+    let (a, b) = (slices_weighted(80, 8), slices_weighted(48, -8));
+    assert_frame(by_poc(&f, 2), &slices_halves(&shifted(&gradient(), 8, 4), &a, &b), "P2: the top segment weighted by A, the bottom by B");
+    let p2 = img_of(by_poc(&f, 2));
+    let p6 = img_of(by_poc(&f, 6));
+    assert_frame(by_poc(&f, 5), &p6, "the concealed copy equals the decoder's own two-slice weighted MC of P2 at (32, 16)");
+    assert_frame(by_poc(&f, 5), &slices_halves(&shifted(&p2, 8, 4), &a, &b), "the top half by table A, the bottom half by table B");
+    assert_ne!(img_of(by_poc(&f, 5)).y, slices_halves(&shifted(&p2, 8, 4), &a, &a).y, "not the first segment's table on the bottom half (pre-SR1067)");
+}
+
+/// Two segments carrying the SAME table (A) conceal byte for byte as P2 coded as one slice with that table (the SR741 road):
+/// one table per slice changes nothing when the slices agree.
+#[test]
+fn conceal_weighted_slices_identical_tables_match_one_slice() {
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    let cfg = SliceCfg { weights: slices_wp(16, 8), ..p_slice(2, vec![(-2, true)]) };
+    let (two, g2, c2) = slices_ratio_one(&pi, two_segments(&cfg, &cfg, None, [32, 16]), None);
+    let (one, g1, c1) = slices_ratio_one(&pi, picture(&cfg, |e| amvp_then_merge(e, [32, 16])), None);
+    assert_eq!((g2, c2), (g1, c1));
+    assert_eq!(two.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 5]);
+    assert_eq!(by_poc(&two, 2).planes, by_poc(&one, 2).planes, "P2 two segments == one slice");
+    assert_eq!(by_poc(&two, 5).planes, by_poc(&one, 5).planes, "the concealed copy: two segments == one slice");
+}
+
+/// The PPS enables dependent slice segments; P2's second segment is DEPENDENT (its header stops at slice_segment_address and
+/// carries no table: 7.3.6.1 copies the independent segment's), so it belongs to the first slice and every block of the
+/// concealed POC 4 is weighted by table A.
+#[test]
+fn conceal_weighted_slices_dependent_segment_inherits() {
+    let pi = PpsInter { weighted_pred: true, dependent_slices: true, ..Default::default() };
+    let cfg = SliceCfg { weights: slices_wp(16, 8), ..p_slice(2, vec![(-2, true)]) };
+    let (f, generated, concealed) = slices_ratio_one(&pi, two_segments(&cfg, &cfg, Some(true), [32, 16]), None);
+    assert_eq!(generated, vec![4]);
+    assert_eq!(concealed.iter().map(|c| (c.poc, c.src_poc, c.projected)).collect::<Vec<_>>(), vec![(4, 2, true)]);
+    let a = slices_weighted(80, 8);
+    assert_frame(by_poc(&f, 2), &slices_halves(&shifted(&gradient(), 8, 4), &a, &a), "P2: both segments weighted by A");
+    let p2 = img_of(by_poc(&f, 2));
+    assert_frame(by_poc(&f, 5), &slices_halves(&shifted(&p2, 8, 4), &a, &a), "the dependent segment's blocks conceal with its slice's table");
+}
+
+/// SR1056's distance scaling per table: P2's top segment carries the default weight (identity), its bottom (32, 10); P4
+/// (skip-only) references the lost POC 3, concealed from P2 at ratio (3 - 2) / (2 - 0) = 1/2 (mv' (16, 8) = (4, 2) samples):
+/// the top stays the copy (identity scales to identity) and the bottom takes (32, 10) scaled to SR1056's pinned (45, 5).
+#[test]
+fn conceal_weighted_slices_distance_scales_per_table() {
+    let mut s = headers(false, true, &PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(idr(&gradient(), true));
+    let neg = vec![(-2, true)];
+    s.extend(two_segments(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(2, neg.clone()) }, &SliceCfg { weights: slices_wp(-32, 10), ..p_slice(2, neg) }, None, [32, 16]));
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4]);
+    let p2 = img_of(by_poc(&f, 2));
+    assert_frame(by_poc(&f, 4), &slices_halves(&shifted(&p2, 4, 2), |v| v, slices_weighted(45, 5)), "top: identity; bottom: (32, 10) scaled by 1/2 to (45, 5)");
+    assert_ne!(img_of(by_poc(&f, 4)).y, slices_halves(&shifted(&p2, 4, 2), |v| v, slices_weighted(32, 10)).y, "not the bottom table unscaled");
+}

@@ -407,8 +407,8 @@ impl Dpb {
     /// top-left 4x4 motion. A block keeps the still copy when it is intra (pred 0), its list is long-term, or it is
     /// intra block copy (ref_poc == s); HEVCCONCEALBIDIR (SR721): each usable list projects (`project_lists`), two are averaged by
     /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
-    /// later picture's TMVP reads the projected vector. HEVCCONCEALWEIGHTED (SR741): a source coded with explicit weights (its kept
-    /// `Picture::weights`) weights each fetch by the source block's (w, o, log2WD) for that list and ref_idx. True when any block was projected.
+    /// later picture's TMVP reads the projected vector. HEVCCONCEALWEIGHTED (SR741): a source coded with explicit weights (its
+    /// slice's kept table, `Picture::slice_weights`, SR1067) weights each fetch by the source block's (w, o, log2WD) for that list and ref_idx. True when any block was projected.
     fn conceal_motion(&self, pic: &mut Picture, src: usize, only: Option<i32>) -> bool {
         let s = &self.pics[src].pic;
         if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
@@ -440,7 +440,7 @@ impl Dpb {
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().map(|(pw, high)| [0, 1].map(|l| scale_weight(crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high), if only.is_some() { (1, 1) } else { conceal_poc_pair(s.poc, m.ref_poc[l], pic.poc) }, bd, *high))), only.is_some(), &mut out);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.slice_weights(x as usize, y as usize).map(|(pw, high)| [0, 1].map(|l| scale_weight(crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high), if only.is_some() { (1, 1) } else { conceal_poc_pair(s.poc, m.ref_poc[l], pic.poc) }, bd, *high))), only.is_some(), &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
@@ -558,14 +558,13 @@ mod hevcconcealbidir_tests {
 }
 
 // ---- HEVCCONCEALWEIGHTED (LEDGER SR741): the source picture's explicit weights kept for concealment (named tail block) ----
-/// HEVCCONCEALWEIGHTED (SR741): keep the pred_weight_table of picture `pic`'s first independent slice segment that carries
-/// one (slice.rs parses it only under weighted_pred_flag for P / weighted_bipred_flag for B, the gate `predict_pu` reads),
-/// with the SPS's high_precision_offsets_enabled_flag, so `conceal_motion` weights a projection from `pic` as its own PUs
-/// were weighted. A later segment's table does not replace it (HEVC-CONCEAL-WEIGHTED-SLICES, owed).
+/// HEVCCONCEALWEIGHTED (SR741): keep the pred_weight_table of each independent slice segment of picture `pic` (slice.rs
+/// parses it only under weighted_pred_flag for P / weighted_bipred_flag for B, the gate `predict_pu` reads; None without
+/// one), with the SPS's high_precision_offsets_enabled_flag, so `conceal_motion` weights a projection from `pic` as its own
+/// PUs were weighted. HEVCCONCEALWEIGHTEDSLICES (SR1067): one entry per independent segment, pushed beside its `slices`
+/// entry (decoder.rs `decode_segment`), read per block by `Picture::slice_weights`; a dependent segment inherits its slice's.
 pub(crate) fn keep_weights(pic: &mut Picture, sh: &SliceHeader, sps: &Sps) {
-    if pic.weights.is_none() {
-        pic.weights = sh.pred_weights.clone().map(|w| (w, sps.range_ext.high_precision_offsets_enabled_flag));
-    }
+    pic.weights.push(sh.pred_weights.clone().map(|w| (w, sps.range_ext.high_precision_offsets_enabled_flag)));
 }
 
 // ---- HEVCCONCEALFORWARD (LEDGER SR754): a concealed picture refined from its first referencer's motion (named tail block) ----
