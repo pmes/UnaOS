@@ -1778,3 +1778,11 @@ exec-rmbp-aethercssomfontfamilyused|7b21faffe|cut107h
 exec-rmbp-nleclicompletionsuninstall|7b21faffe|cut107h
 exec-rmbp-h264enctwopassqpsteponerule|7b21faffe|cut107h
 exec-rmbp-hevcconcealmain10pin|7b21faffe|cut107h
+exec-rmbp-aethercsswiderevert|976d8ffbf|cut108h
+exec-rmbp-aethercssomfontsizeboxless|976d8ffbf|cut108h
+exec-rmbp-aethercssomborderimageexpand|976d8ffbf|cut108h
+exec-rmbp-aethercsswidecolorcontrolsdark|976d8ffbf|cut108h
+exec-rmbp-nlecliusageverbspin|976d8ffbf|cut108h
+exec-rmbp-nleclicompletionsverbflags|976d8ffbf|cut108h
+exec-rmbp-h264enchrdvbrkat|976d8ffbf|cut108h
+exec-rmbp-hevcconcealmain10highprecision|976d8ffbf|cut108h

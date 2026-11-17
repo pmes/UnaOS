@@ -1569,7 +1569,7 @@ pub fn canvas_background(layout: &LayoutTree) -> Option<(u8, u8, u8)> {
     };
     let bg = |id: Option<NodeId>| {
         let p = id.and_then(|i| layout.paint_map.get(&i))?;
-        let c = p.background?;
+        let c = layout_core::paint::bg_ink(p.background?, p.currentcolor, focusring::current_color(layout, id?));
         let a = p.bg_alpha.unwrap_or(1.0);
         if a <= 0.0 {
             return None;
@@ -2747,7 +2747,7 @@ fn frame_walk(
                     }
                     // css-color-4: a translucent background composites source-over.
                     let bga = spec.bg_alpha.unwrap_or(1.0).clamp(0.0, 1.0);
-                    let background = spec.background.filter(|_| bga > 0.0);
+                    let background = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inherited.color)).filter(|_| bga > 0.0);
                     if fancy && mask.is_none() && background.is_some() {
                         let mut blend_a = |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga);
                         boxpaint::paint(
@@ -2974,7 +2974,7 @@ fn frame_walk(
                 // Chromium's control theme paints a 1px #767676 frame at the
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
-                let mut border = spec.border.or(if is_control && !checkable && !image_input && !file_input {
+                let mut border = spec.border.map(|b| layout_core::paint::border_ink(b, spec.currentcolor, inherited.color)).or(if is_control && !checkable && !image_input && !file_input {
                     Some([Some((1.0, (118, 118, 118))); 4])
                 } else {
                     None
@@ -3708,7 +3708,7 @@ fn frame_walk(
                             continue;
                         }
                         let mut sides: [boxpaint::Side; 4] = [None; 4];
-                        if let Some(b) = spec.border {
+                        if let Some(b) = spec.border.map(|b| layout_core::paint::border_ink(b, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color))) {
                             let styles = spec.border_style.unwrap_or([0; 4]);
                             for i in 0..4 {
                                 let mut side = b[i];
@@ -3741,7 +3741,7 @@ fn frame_walk(
                             || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
                         let bga = spec.bg_alpha.unwrap_or(1.0);
                         let bda = spec.border_alpha.unwrap_or(1.0);
-                        let bg_rgb = spec.background;
+                        let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             // Background and border colours composite at their alpha.
                             let a = a * if Some(c) == bg_rgb { bga } else { bda };
@@ -3755,7 +3755,7 @@ fn frame_walk(
                             }
                         };
                         if rounded {
-                            boxpaint::paint(fx, fy, *w, *h, radius, sides, spec.background, width, height, &mut blend_at);
+                            boxpaint::paint(fx, fy, *w, *h, radius, sides, bg_rgb, width, height, &mut blend_at);
                         } else {
                             // Pixel-snapped rectangles, as Blink snaps box decorations.
                             let (x0, y0) = (fx.round(), fy.round());
@@ -3769,7 +3769,7 @@ fn frame_walk(
                                     }
                                 }
                             };
-                            if let Some(bg) = spec.background {
+                            if let Some(bg) = bg_rgb {
                                 fill(x0, y0, x1, y1, bg);
                             }
                             if let Some((bw, c, _)) = sides[0] {
