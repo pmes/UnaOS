@@ -373,3 +373,33 @@ fn cli_completions_scripts() {
     assert_eq!(lines[1], USAGE_FIRST);
     assert_eq!(lines[6], "       nle completions bash|zsh|fish");
 }
+
+// ---- STRIAEXPORTPRESETS (LEDGER SR871): `nle export --preset web|archive|proxy` through stria's ONE preset table (named tail block) ----
+#[test]
+fn cli_export_preset_proxy_is_its_knobs() {
+    let (dir, edl, srcs) = fixture("preset");
+    let (code, preset, err) = export(&edl, &srcs, &dir.join("preset"), &["--preset", "proxy"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, knobs, err) = export(&edl, &srcs, &dir.join("knobs"), &["--video", "h264", "--crf", "32", "--audio", "aac:64"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(preset, knobs, "the preset is its knobs, byte-exact");
+    assert!(preset.starts_with("{\"codec\":\"h264\",\"frames\":35,"), "{preset}");
+    assert_eq!(std::fs::read(dir.join("preset/movie.mp4")).unwrap(), std::fs::read(dir.join("knobs/movie.mp4")).unwrap(), "the same movie");
+    // The last flag written wins: a knob after the preset overrides it.
+    let (code, over, err) = export(&edl, &srcs, &dir.join("over"), &["--preset", "proxy", "--video", "png"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(over.starts_with("{\"codec\":\"png\","), "{over}");
+    assert!(usage_text().lines().nth(2).unwrap().contains(&format!("[--preset {}]", stria::nle_export::preset_words())), "the usage names the presets");
+    println!("cli_export_preset: {preset}");
+}
+
+#[test]
+fn cli_export_preset_refused_by_name() {
+    let (dir, edl, srcs) = fixture("preset-refused");
+    for (i, (extra, want)) in [(&["--preset", "gif"][..], "nle: --preset gif: one of web|archive|proxy"), (&["--preset"][..], "nle: --preset: a value is required")].iter().enumerate() {
+        let out = dir.join(format!("refused{i}"));
+        let (code, stdout, err) = export(&edl, &srcs, &out, extra);
+        assert_eq!((code, err.as_str(), stdout.as_str()), (1, format!("{want}\n").as_str(), ""), "{extra:?}");
+        assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
+    }
+}

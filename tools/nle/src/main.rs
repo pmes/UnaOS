@@ -43,7 +43,7 @@
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, H264Opts, I420Raw, VIDEO_NAMES, VideoEncoder, Y4m, export_as, export_png, Pass2Cli, pass2_cli_of, pass2_words, qblur_of, qcomp_of, qpstep_of, video_named_with};
+use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, H264Opts, I420Raw, VIDEO_NAMES, VideoEncoder, Y4m, export_as, export_png, Pass2Cli, pass2_cli_of, pass2_words, preset_named, preset_words, qblur_of, qcomp_of, qpstep_of, video_named_with};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
@@ -140,6 +140,7 @@ fn main() {
             "--qblur" => p2.qblur_q8 = Some({ let s = value(&mut it, "--qblur"); qblur_of(&s).unwrap_or_else(|| bad("--qblur", &s, "not a number within 0..=16")) }), // H264ENCTWOPASSQBLURCLI (SR766): x264's QP blur of the planned pass (Q8)
             "--qpstep" => p2.qpstep = Some({ let s = value(&mut it, "--qpstep"); qpstep_of(&s).unwrap_or_else(|| bad("--qpstep", &s, "not an integer within 0..=51")) }), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
             "--pass2" => p2 = pass2_cli_of(&value(&mut it, "--pass2")).unwrap_or_else(|e| die(format!("--pass2 {e}"))).over(p2), // H264ENCTWOPASSCLITABLE (SR790): any of the four plan knobs in one word, the last flag written winning; NLECLIPASS2VALUE (SR821): a missing value through `value`
+            "--preset" => { let s = value(&mut it, "--preset"); let p = preset_named(&s).unwrap_or_else(|| bad("--preset", &s, &format!("one of {}", preset_words()))); (video, audio, qp, crf, bitrate, scenecut, aq) = (p.video.into(), p.audio.into(), p.qp, p.crf, None, p.scenecut, p.aq); } // STRIAEXPORTPRESETS (SR871): THE preset table assigns the knobs below it; the last flag written wins
             "--src" => {
                 let v = value(&mut it, "--src");
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
@@ -393,7 +394,7 @@ fn help_asked(args: &[String]) -> bool {
 fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     let _ = writeln!(w, "       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
+    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png] [--preset {}]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"), preset_words()); // STRIAEXPORTPRESETS (SR871): the preset words
     let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     let _ = writeln!(w, "       nle completions bash|zsh|fish");
@@ -404,9 +405,9 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
 // ---- NLECLIDIDYOUMEAN (LEDGER SR816): the nearest arm / verb of an unknown word (named tail block) ----
 /// NLECLIDIDYOUMEAN (SR816): THE list of the option loop's arm words, in arm order (a tie names the first). SR799's
 /// `cli_usage_lists_every_flag` pins it equal to the arms its source scan finds, so a new arm without its word here reds.
-const FLAGS: [&str; 24] = [
+const FLAGS: [&str; 25] = [
     "--fps", "--out", "--video", "--audio", "--aac", "--png", "--qp", "--gop", "--bitrate", "--mkv", "--crf", "--scenecut",
-    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--src",
+    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--preset", "--src",
 ];
 
 /// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order (NLECLIPASS2VALUE SR821: `completions`).
