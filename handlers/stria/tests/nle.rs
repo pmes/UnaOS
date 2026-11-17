@@ -14383,3 +14383,21 @@ fn striadropframeface_goto_seeks_as_a_view_word() {
     assert_eq!((&face.state.timeline, face.state.undo_depth(), face.dirty()), (&before, 0, false));
     println!("striadropframeface: goto 00:00:01;00 -> 30 on 29.97; dropped and bare refused by name");
 }
+
+// ---- STRIAKCUTJUMP (LEDGER SR9091): the host KEYS rows match timeline_core's CUT_JUMP_KEYS (named tail block) ----
+// One key means one word on both faces: the kernel Player reads the arrow bytes of `timeline_core::editor::CUT_JUMP_KEYS`;
+// the host face's named keys (and AppKit's private-use arrows) must name the same words.
+
+#[test]
+fn striakcutjump_host_keys_match_the_shared_cut_jump_keys() {
+    for (&(b, name, word), appkit) in timeline_core::editor::CUT_JUMP_KEYS.iter().zip(["\u{f700}", "\u{f701}"]) {
+        for key in [name, appkit] {
+            let row = stria::nle_face::KEYS.iter().find(|k| k.0 == key);
+            assert_eq!(row.map(|k| k.1), Some(word), "host key {key:?} must name {word}");
+        }
+        assert!(stria::nle_face::VERBS.contains(&word), "{word} is a VERBS word");
+        assert_eq!(timeline_core::editor::jump_word(word).map(|j| j.0), Some(timeline_core::editor::Jump::Cut), "{word} is a cut jump");
+        assert_eq!(timeline_core::editor::jump_key(b), Some(word), "Player byte {b:#x} names {word}");
+    }
+    println!("striakcutjump: {} shared cut jump keys bound alike on both faces", timeline_core::editor::CUT_JUMP_KEYS.len());
+}

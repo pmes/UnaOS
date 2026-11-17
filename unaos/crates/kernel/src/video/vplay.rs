@@ -3718,7 +3718,7 @@ fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -
         return None;
     }
     let name = st.timeline.marker_at(to).map(|m| m.name.clone()).unwrap_or_default();
-    serial_println!("[nle] edit {} at={} to={} marker={}", verb, at, to, name);
+    if timeline_core::editor::jump_word(verb).map(|j| j.0) == Some(timeline_core::editor::Jump::Cut) { serial_println!("[nle] edit {} at={} to={} cut={}", verb, at, to, to); } else { serial_println!("[nle] edit {} at={} to={} marker={}", verb, at, to, name); } // STRIAKCUTJUMP (LEDGER SR9091): a cut jump names its edge (file tail)
     Some((st.timeline.tb.to_ns(to).max(0) as u64).div_ceil(1_000_000))
 }
 
@@ -4213,3 +4213,11 @@ fn stack_refuse(rep: &mut EdlReport, s: &timeline_core::schedule::Step) {
         serial_println!("[vplay] opacity: a stack of {} layers refused (two decoder slots); the top two show", n + 2);
     }
 }
+
+// ---- STRIAKCUTJUMP (LEDGER SR9091): Up / Down the Player's clip-edge jumps (named tail block) ----
+// The arrows are single bytes (una_abi `KEY_UP` / `KEY_DOWN`); player.rs `key_route` keeps Space and Left / Right for the
+// transport and hands Up / Down to `edit_post`, which posts a byte `edit_verb` names: `edit_verb` reads timeline_core's
+// `jump_key`, which names `cut-` / `cut+` from `CUT_JUMP_KEYS` (the host's Up / Down words), and `edit_key` routes them to
+// [`edit_jump`] (the ONE jump, the seek door, no save, no undo step). Wire: `[nle] edit <cut-|cut+> at=<tick> to=<tick>
+// cut=<tick>`, `[nle] edit <cut-|cut+> at=<tick> unchanged`. timeline_core does not link una_abi: the bytes are tied here.
+const _: () = assert!(timeline_core::editor::CUT_JUMP_KEYS[0].0 == una_abi::KEY_UP && timeline_core::editor::CUT_JUMP_KEYS[1].0 == una_abi::KEY_DOWN);
