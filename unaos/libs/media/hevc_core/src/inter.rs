@@ -705,5 +705,31 @@ mod hevcconcealweightedbimixed_tests {
             }
         }
     }
+
+    /// HEVCCONCEALWEIGHTEDCHROMA (SR776): the chroma arm of `explicit_weight_of` is 7-56 — ChromaOffset = Clip3(-half,
+    /// half - 1, half + delta_chroma_offset - ((half * ChromaWeight) >> ChromaLog2WeightDenom)), half = 128 (or
+    /// 1 << (BitDepthC - 1) with high_precision), shifted by BitDepthC - 8 (0 with high_precision); log2WD = 7 + shift1.
+    /// Hand-computed: Cb (96, delta -12), Cr (160, delta 2) at ref_idx 0; the clip pair (128, +-300) at ref_idx 1.
+    #[test]
+    fn chroma_offset_rule_7_56() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 7,
+            l0: WeightList { luma: vec![(64, 0), (64, 0)], chroma: vec![[(96, -12), (160, 2)], [(128, 300), (128, -300)]] },
+            l1: WeightList::default(),
+        };
+        // (bd, high, ref_idx, Cb (w, o, log2WD), Cr (w, o, log2WD))
+        let cases = [
+            (8u32, false, 0i8, (96, 20, 13u32), (160, -30, 13u32)),
+            (8, false, 1, (128, 127, 13), (128, -128, 13)),
+            (10, false, 0, (96, 80, 11), (160, -120, 11)),
+            (8, true, 0, (96, 20, 13), (160, -30, 13)),
+            (10, true, 0, (96, 116, 11), (160, -126, 11)),
+        ];
+        for (bd, high, r, cb, cr) in cases {
+            assert_eq!(explicit_weight_of(Some(&pw), 1, 0, r, bd, high), cb, "Cb bd {bd} high {high} ref_idx {r}");
+            assert_eq!(explicit_weight_of(Some(&pw), 2, 0, r, bd, high), cr, "Cr bd {bd} high {high} ref_idx {r}");
+        }
+    }
 }
 
