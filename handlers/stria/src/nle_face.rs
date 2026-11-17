@@ -2955,9 +2955,10 @@ pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
 
 /// The running job's [`export_line`]: its `done` / `total` reading (as [`Face::export_progress`] reads it) and SR796's
 /// [`eta_words`] over its `started`. A free fn over the job, so [`Face::export_tick`] calls it under its live `&mut` borrow.
+/// A stall past [`STALL_AFTER`] trades the eta word for [`stall_words`] (`export: 3 / 35 stalled 7 s`, NLE5DEXPORTMESSAGEETASTALLWORD SR817).
 fn job_line(j: &ExportJob) -> String {
     let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
-    export_line(d, t, job_eta(j, d, t).map(eta_words_of))
+    export_line(d, t, stall_words(j.rate_at.0.elapsed(), j.rate_ema).or_else(|| job_eta(j, d, t).map(eta_words_of)))
 }
 
 // ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
@@ -3006,19 +3007,19 @@ fn eta_sample(j: &mut ExportJob, now: std::time::Instant) {
 }
 
 /// The remaining time of `remaining` frames at `rate` frames per second. `None` for a rate that is not positive and finite,
-/// or a time a `Duration` cannot hold.
-pub fn eta_of_rate(remaining: u64, rate: f64) -> Option<Duration> {
+/// or a time a `Duration` cannot hold; plus `since_last` (the time since the last sampled move) beyond one frame interval `1 / rate`, never negative, so a stalled export's eta grows (NLE5DEXPORTMESSAGEETASTALL SR811).
+pub fn eta_of_rate(remaining: u64, rate: f64, since_last: Duration) -> Option<Duration> {
     if !(rate > 0.0 && rate.is_finite()) {
         return None;
     }
-    Duration::try_from_secs_f64(remaining as f64 / rate).ok()
+    Duration::try_from_secs_f64(remaining as f64 / rate + (since_last.as_secs_f64() - 1.0 / rate).max(0.0)).ok()
 }
 
 /// THE eta of a running job at the reading `(d, t)`: [`eta_of_rate`] over the EMA once it has a rate, else SR796's mean
 /// ([`eta_of`] over `started`), so a job sampled fewer than two moves (every paused fixture) reads the mean unchanged.
 fn job_eta(j: &ExportJob, d: u64, t: u64) -> Option<Duration> {
     if j.rate_ema > 0.0 {
-        eta_of_rate(t.saturating_sub(d), j.rate_ema)
+        eta_of_rate(t.saturating_sub(d), j.rate_ema, j.rate_at.0.elapsed())
     } else {
         eta_of(d, t, j.started.elapsed())
     }
@@ -3035,6 +3036,32 @@ pub fn eta_words_of(d: Duration) -> String {
     } else {
         format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
     }
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWORD (LEDGER SR817): a stalled export's line names the stall (named tail block) ----
+// SR811 grows a stalled export's eta, but the line still read like progress (`export: 3 / 35 ~19 s` climbing). THE STALL
+// RULE: `job_line` passes `stall_words(rate_at.0.elapsed(), rate_ema)` in place of the eta word when the time since the last
+// sampled move exceeds max(STALL_AFTER, STALL_FRAMES / rate) for a positive finite EMA rate (a slow-but-moving export is not
+// called stalled), else a flat STALL_AFTER (the mean road, before the EMA has a rate: `rate_at.0` is `started` until the first
+// sampled move, so a first frame that never comes still names its stall). The seconds read SR796's one grammar
+// (`eta_words_of`, half up through `eta_secs`) without the tilde. `export_line`, `job_eta`, `Face::export_eta` and stria-view's
+// `"eta_secs"` are unchanged; the word returns to the eta at the next move. Owed: NLE5D-EXPORT-MESSAGE-ETA-STALL-WITNESS (the
+// stall seconds on stria-view's export JSON), NLE5D-EXPORT-MESSAGE-ETA-STALL-FINALIZE (done == total: name the finalise, not a
+// stall), NLE5D-EXPORT-MESSAGE-ETA-KERNEL, NLE5D-EXPORT-MESSAGE-ETA-TOTAL, NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The least time since the last sampled move that reads as a stall.
+pub const STALL_AFTER: Duration = Duration::from_secs(5);
+
+/// The frame intervals at the EMA rate that must also pass before a moving-but-slow export reads as stalled.
+pub const STALL_FRAMES: f64 = 10.0;
+
+/// A running export's stall as a person reads it: `stalled 7 s` (`stalled 4:10` past a minute, [`eta_words_of`]'s grammar
+/// without the tilde) when `since_last` (the time since the last sampled move) is strictly over max([`STALL_AFTER`],
+/// [`STALL_FRAMES`] / `rate`), or over a flat [`STALL_AFTER`] while `rate` is not positive and finite; else `None`.
+pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
+    let after = STALL_AFTER.as_secs_f64();
+    let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
+    (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
 }
 
 // ---- STRIATITLECLIP (LEDGER SR828): the `title` word — a title card at the playhead (named tail block) ----
