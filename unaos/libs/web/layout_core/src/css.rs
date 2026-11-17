@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    match prop {
+    if font_css_wide(prop, value, &mut style.paint) { return; } match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -1391,7 +1391,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.stretch = Some(p);
             }
         }
-        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => apply_font_synthesis(prop, value, &mut style.paint),
+        "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => apply_font_synthesis(prop, value, &mut style.paint), "font-variant" | "font-variant-caps" => apply_font_variant_caps(prop, value, &mut style.paint),
         // css-text-3 §7.1
         "word-spacing" => {
             if value == "normal" {
@@ -1422,16 +1422,16 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
                 )
             {
-                return;
+                return apply_font_wide(value, style, cx);
             }
-            let mut rest = value;
+            let mut rest = value; let font_prior = reset_font_prefix(&mut style.paint);
             // Leading style / variant / weight / stretch keywords.
             loop {
                 let Some((head, tail)) = rest.split_once(char::is_whitespace) else { break };
                 let h = head.trim().to_ascii_lowercase();
                 if h == "italic" || h == "oblique" {
                     style.paint.italic = Some(true);
-                } else if h == "normal" || h == "small-caps" {
+                } else if h == "normal" || h == "small-caps" { if h == "small-caps" { style.paint.small_caps = Some(true); }
                     // no effect here, but still part of the prefix
                 } else if let Some(p) = parse_font_stretch(&h).filter(|_| !h.ends_with('%')) {
                     style.paint.stretch = Some(p);
@@ -1449,9 +1449,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             let family = rest[size_part.len()..].trim();
             let (size, line) = split_top_level_slash(size_part);
             match parse_font_size(size, cx) {
-                Some(px) => style.paint.font_size = Some(px),
+                Some(px) => { style.paint.font_size = Some(px); reset_font_shorthand_rest(size, style, cx) }
                 None => {
-                    H::record_css(&format!("font-shorthand:{}", clip(value)));
+                    restore_font_prefix(&mut style.paint, font_prior); H::record_css(&format!("font-shorthand:{}", clip(value)));
                     return;
                 }
             }
@@ -2593,9 +2593,9 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps,
+        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -3540,4 +3540,125 @@ pub fn parse_font_synthesis(prop: &str, value: &str) -> Option<(Option<bool>, Op
         },
     };
     Some((w, s, c))
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): css-fonts-4 §6.6 font-variant-caps and font-variant's caps half (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `font-variant-caps: normal | small-caps` and the caps half of the `font-variant`
+/// shorthand into `PaintStyle::small_caps` (inherited by the walkers' caps mask, `PaintStyle::caps`). The other caps
+/// keywords and the other font-variant longhands are parsed and dropped (owed: AETHER-FONT-VARIANT-CAPS-ALL / -OTHERS).
+fn apply_font_variant_caps<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) {
+    match parse_font_variant_caps(prop, value) {
+        Some(on) => paint.small_caps = Some(on),
+        None => {
+            if !is_neutral_keyword(value) {
+                H::record_css(&format!("{prop}-value:{}", clip(value)));
+            }
+        }
+    }
+}
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the caps value a `font-variant-caps` / `font-variant` declaration sets: Some(true)
+/// = small-caps, Some(false) = normal (`initial`; the shorthand's `normal` / `none` and any value without a caps keyword:
+/// the shorthand resets its caps longhand), None for a caps keyword not taken (all-small-caps, petite-caps,
+/// all-petite-caps, unicase, titling-caps), an invalid longhand value and `inherit` / `unset` (the property inherits).
+pub fn parse_font_variant_caps(prop: &str, value: &str) -> Option<bool> {
+    const NOT_TAKEN: [&str; 5] = ["all-small-caps", "petite-caps", "all-petite-caps", "unicase", "titling-caps"];
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "initial" => return Some(false),
+        "inherit" | "unset" | "revert" | "revert-layer" | "" => return None,
+        _ => {}
+    }
+    if prop == "font-variant-caps" {
+        return match v.as_str() {
+            "normal" => Some(false),
+            "small-caps" => Some(true),
+            _ => None,
+        };
+    }
+    let mut caps = Some(false);
+    for k in v.split_whitespace() {
+        if k == "small-caps" {
+            caps = Some(true);
+        } else if NOT_TAKEN.contains(&k) {
+            return None;
+        }
+    }
+    caps
+}
+
+// ---- AETHERFONTSHORTHANDRESET (LEDGER SR805): css-fonts-4 §4.3 the font shorthand resets its omitted longhands (named tail block) ----
+
+/// AETHERFONTSHORTHANDRESET (SR805): the four longhands the `font` prefix loop writes (font-style, font-weight,
+/// font-stretch, font-variant-caps), as they stood before a `font` declaration.
+type FontPrefix = (Option<bool>, Option<FontWeight>, Option<u16>, Option<bool>);
+
+/// AETHERFONTSHORTHANDRESET (SR805): `font` is a reset-all shorthand (css-fonts-4 §4.3): before its prefix applies,
+/// the prefix longhands take their INITIAL values (Some, never None: None inherits): font-style normal, font-weight
+/// 400, font-stretch 100%, font-variant-caps normal. Returns what they were, for [`restore_font_prefix`] when the
+/// declaration turns out invalid. font-synthesis is not in the reset set and is not touched.
+fn reset_font_prefix<H: Host>(paint: &mut PaintStyle<H>) -> FontPrefix {
+    let prior = (paint.italic, paint.weight, paint.stretch, paint.small_caps);
+    paint.italic = Some(false);
+    paint.weight = Some(FontWeight::Abs(400));
+    paint.stretch = Some(100);
+    paint.small_caps = Some(false);
+    prior
+}
+
+/// AETHERFONTSHORTHANDRESET (SR805): an invalid `font` declaration (its size does not parse) is dropped whole: the
+/// prefix longhands go back to what they were before it (neither the reset nor the prefix leaks).
+fn restore_font_prefix<H: Host>(paint: &mut PaintStyle<H>, prior: FontPrefix) {
+    (paint.italic, paint.weight, paint.stretch, paint.small_caps) = prior;
+}
+
+/// AETHERFONTSHORTHANDRESET (SR805): once the size parsed, the shorthand's font-size goes through the `font-size` arm
+/// (its relative mark, so an earlier `font-size: 2em` does not survive) and line-height resets to `normal` through
+/// the `line-height` arm (its `font_rel` entry, so the font-relative replay does not bring an earlier line-height
+/// back); the arm's own `/line-height` applies after this and wins.
+fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    apply_declaration("font-size", size, style, cx);
+    apply_declaration("line-height", "normal", style, cx);
+}
+
+// ---- AETHERFONTSHORTHANDINHERIT (LEDGER SR810): css-cascade-4 §7.3 the CSS-wide keywords on font reach its longhands (named tail block) ----
+
+/// AETHERFONTSHORTHANDINHERIT (SR810): a CSS-wide keyword on the `font` shorthand applies to each longhand it resets
+/// (css-cascade-4 §7.3). `inherit` / `unset` (every font longhand is inherited, so unset == inherit) take the
+/// longhands' own inherit road, None: font-style / -weight / -stretch / -variant-caps through [`restore_font_prefix`],
+/// line-height through the `line-height` arm (its `font_rel` entry, so the font-relative replay cannot bring an earlier
+/// line-height back) then None, font-family None; the size takes the parent-relative road `smaller` / `larger` use
+/// (font_size None, font_size_rel (0, 1.0)), because a None size is the tag's code default (13.333 px on a control),
+/// not the parent's. `initial` is SR805's reset ([`reset_font_prefix`], [`reset_font_shorthand_rest`] at `medium`)
+/// plus the standard family. `revert` (no UA cascade layer is modelled) and the system fonts are dropped as before.
+/// AETHERCSSWIDELONGHANDS (SR815): inherit / unset write the seven explicit inherit bits (`PaintStyle::set_inherit`).
+fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    match kw {
+        "inherit" | "unset" => {
+            apply_declaration("line-height", "inherit", style, cx);
+            style.paint.set_inherit(crate::paint::INHERIT_FONT);
+        }
+        "initial" => {
+            reset_font_prefix(&mut style.paint);
+            reset_font_shorthand_rest("medium", style, cx);
+            style.paint.family = Some(crate::STANDARD);
+        }
+        _ => {} // revert and the six system fonts: dropped (AETHER-CSS-WIDE-REVERT, AETHER-FONT-SHORTHAND-SYSTEM owed)
+    }
+}
+
+// ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): the font longhands' inherit / unset write the explicit inherit bit (named tail block) ----
+
+/// AETHERCSSWIDELONGHANDS (SR815): css-cascade-4 §7.3.1 / §7.3.3: `inherit`, and `unset` on these inherited properties,
+/// on one of the seven font longhands writes its explicit inherit bit (`PaintStyle::set_inherit`: the field's earlier
+/// value goes) and ends the declaration: every arm's own inherit road was a no-op (None), which a later rule's Some or
+/// the tag default overrode. Runs after the `font_rel` push, so line-height's replay entry stays `inherit`.
+fn font_css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool {
+    let bit = crate::paint::inherit_bit(prop);
+    if bit == 0 || !(value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset")) {
+        return false;
+    }
+    paint.set_inherit(bit);
+    true
 }

@@ -1356,13 +1356,13 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let paint = tid.and_then(|t| tree.paint_map.get(&t)).cloned().unwrap_or_default();
             let spec = tid.and_then(|t| last.get(&t)).cloned();
             let mut me = parent.clone();
-            me.font_size = paint.font_size.unwrap_or_else(|| crate::layout::default_font_size(tag, parent.font_size));
+            me.font_size = paint.font_size.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_FONT_SIZE, parent.font_size, |fs| crate::layout::default_font_size(tag, fs)));
             me.weight = paint
                 .weight
                 .map(|w| w.resolve(parent.weight))
-                .unwrap_or_else(|| crate::layout::default_weight(tag, parent.weight));
-            me.italic = paint.italic.unwrap_or_else(|| crate::layout::default_italic(tag, parent.italic));
-            me.family = paint.family.unwrap_or_else(|| crate::layout::default_family(tag, parent.family));
+                .unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WEIGHT, parent.weight, |w| crate::layout::default_weight(tag, w)));
+            me.italic = paint.italic.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_ITALIC, parent.italic, |i| crate::layout::default_italic(tag, i)));
+            me.family = paint.family.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_FAMILY, parent.family, |f| crate::layout::default_family(tag, f)));
             if let Some(lh) = paint.line_height {
                 me.line_height = lh;
             }
@@ -1466,7 +1466,7 @@ fn property_supported(prop: &str) -> bool {
             | "border-top" | "border-right" | "border-bottom" | "border-left"
             | "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width"
             | "text-decoration" | "text-decoration-line" | "text-transform" | "white-space" | "box-sizing"
-            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps"
+            | "font-family" | "font-style" | "font-stretch" | "letter-spacing" | "word-spacing" | "direction" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" | "font-variant" | "font-variant-caps"
             | "text-shadow"
             | "flex" | "flex-grow" | "flex-shrink" | "flex-basis" | "flex-wrap" | "flex-flow"
             | "gap" | "row-gap" | "column-gap"
