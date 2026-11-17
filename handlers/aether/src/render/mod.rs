@@ -2014,7 +2014,6 @@ pub(crate) fn placed_origin(
     let mut current_x = abs_x + layout_box.location.x;
     let mut current_y = abs_y + layout_box.location.y;
     let paint = layout.paint_map.get(&node_id);
-    let (vw, vh) = (width as f32, height as f32);
     let (w, h) = (layout_box.size.width, layout_box.size.height);
     match paint.and_then(|p| p.position_kind) {
         Some(3) => {
@@ -2041,25 +2040,25 @@ pub(crate) fn placed_origin(
                 ),
                 None => (f32::MIN, f32::MIN, f32::MAX, f32::MAX),
             };
-            let (nx, ny) = (current_x, current_y);
+            let (nx, ny, (pl, pt, pr, pb, cb_r, cb_b)) = (current_x, current_y, sticky_scrollport(layout, node_id, abs_x, abs_y, width, height, sx, sy, cb_r, cb_b));
             if let Some(t) = ins[0] {
-                let target = sy as f32 + t;
+                let target = pt + t;
                 if ny < target {
                     current_y = target.min(cb_b - h).max(ny);
                 }
             } else if let Some(b) = ins[2] {
-                let target = sy as f32 + vh - b - h;
+                let target = pb - b - h;
                 if ny > target {
                     current_y = target.max(cb_t).min(ny);
                 }
             }
             if let Some(l) = ins[3] {
-                let target = sx as f32 + l;
+                let target = pl + l;
                 if nx < target {
                     current_x = target.min(cb_r - w).max(nx);
                 }
             } else if let Some(r) = ins[1] {
-                let target = sx as f32 + vw - r - w;
+                let target = pr - r - w;
                 if nx > target {
                     current_x = target.max(cb_l).min(nx);
                 }
@@ -4955,4 +4954,69 @@ fn text_lines_ink(
         let run = (origin_x - m, top.min(by - 3.0 * size) - 4.0, origin_x + line.width + m, (top + line_height).max(by + 2.0 * size) + 4.0);
         ink_union(r, text_shadows_ink(run, &line.text, adv, origin_x, by, shadows))
     })
+}
+
+// ---- AETHERSTICKYNESTEDSCROLLER (LEDGER SR1152): a sticky box holds against its nearest scrollport (named tail block) ----
+
+/// AETHERSTICKYNESTEDSCROLLER (SR1152): the scrollport a `position: sticky` box holds against (css-position-3 §3.4: its
+/// NEAREST scroll container's padding box, else the viewport), as (left, top, right, bottom) in `placed_origin`'s own
+/// space, followed by the containing block's right / bottom edge (`cb_r`, `cb_b`, passed in from the arm).
+///
+/// The ancestors are walked from the parent `P`: a `position: fixed` ancestor or the root ends the walk at the viewport
+/// (`(sx, sy, sx + vw, sy + vh)`, today's terms, so a page with no inner scroller places every box as before); the root
+/// element and a body whose overflow propagates to the viewport (css-overflow-3 §3.3: the root is not a scroll container)
+/// are skipped, since layout_core keeps their overflow on the box. The first `is_scroll_container` ancestor is `S`. The
+/// walk passed `abs = origin(P) + content_shift(P)` and `box_origin(child) = box_origin(parent) + content_shift(parent) +
+/// location`, so `origin(S) = abs - content_shift(P) - (box_origin(P) - box_origin(S))` in the walk's space (outer sticky
+/// holds and fixed origins cancel in the difference). The box's flow place already carries `-scroll(S)`, so the arm's
+/// targets need no scroll term. When `P` is `S` the containing block is the scroller's scrollable overflow minus its padding
+/// (Chromium / WebKit), not its client box moved by the scroll, so a direct-child header stays stuck through the scroll.
+/// The walk is the taffy parent chain (an absolutely positioned box between `S` and the sticky box is not re-parented).
+#[allow(clippy::too_many_arguments)]
+fn sticky_scrollport(
+    layout: &LayoutTree,
+    node_id: NodeId,
+    abs_x: f32,
+    abs_y: f32,
+    width: u32,
+    height: u32,
+    sx: i32,
+    sy: i32,
+    cb_r: f32,
+    cb_b: f32,
+) -> (f32, f32, f32, f32, f32, f32) {
+    use layout_core::scroll::{box_origin, client_rect, content_shift, is_scroll_container, scroll_size};
+    let (vx, vy) = (sx as f32, sy as f32);
+    let viewport = (vx, vy, vx + width as f32, vy + height as f32, cb_r, cb_b);
+    let Some(p) = layout.taffy.parent(node_id) else { return viewport };
+    let tag_is = |id: NodeId, t: &str| layout.node_map.get(&id).and_then(layout_core::DomNode::tag).is_some_and(|g| g.eq_ignore_ascii_case(t));
+    let mut cur = Some(p);
+    let mut scroller = None;
+    while let Some(a) = cur {
+        if layout.paint_map.get(&a).and_then(|q| q.position_kind) == Some(3) {
+            break;
+        }
+        let up = layout.taffy.parent(a);
+        let propagates = tag_is(a, "html") || (tag_is(a, "body") && !up.is_some_and(|h| tag_is(h, "html") && is_scroll_container(layout, h)));
+        if !propagates && is_scroll_container(layout, a) {
+            scroller = Some(a);
+            break;
+        }
+        cur = up;
+    }
+    let Some(s) = scroller else { return viewport };
+    let (Some(bp), Some(bs)) = (box_origin(layout, p, (vx, vy)), box_origin(layout, s, (vx, vy))) else { return viewport };
+    let (shx, shy) = content_shift(layout, p);
+    let (ox, oy) = (abs_x - shx - (bp.0 - bs.0), abs_y - shy - (bp.1 - bs.1));
+    let (cx, cy, cw, ch) = client_rect(layout, s);
+    let (pl, pt) = (ox + cx, oy + cy);
+    let (mut r, mut b) = (cb_r, cb_b);
+    if p == s {
+        if let Ok(sl) = layout.taffy.layout(s) {
+            let (sw, sh) = scroll_size(layout, s);
+            r = r.max(abs_x + sl.border.left + sw - sl.padding.right);
+            b = b.max(abs_y + sl.border.top + sh - sl.padding.bottom);
+        }
+    }
+    (pl, pt, pl + cw, pt + ch, r, b)
 }
