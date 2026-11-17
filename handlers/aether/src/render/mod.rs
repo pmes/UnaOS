@@ -249,7 +249,7 @@ fn box_inputs(layout: &LayoutTree, id: NodeId) -> Option<String> {
         return None;
     }
     let p = layout.paint_map.get(&id);
-    if p.is_some_and(|p| p.bg_image.is_some()) {
+    if p.is_some_and(|p| p.has_bg_url()) {
         return None;
     }
     let text = n.filter(|n| layout_core::DomNode::is_text(*n)).map(layout_core::DomNode::text);
@@ -2773,7 +2773,7 @@ fn frame_walk(
                         }
                     }
 
-                    if let Some(Some(g)) = spec.bg_gradient.as_ref() {
+                    for layer in spec.bg_layers_bottom_up() { if let Some(g) = layer.gradient() {
                         let radii = boxpaint::used_radii(spec.radius.unwrap_or([0.0; 4]), bw, bh);
                         let (gx, gy) = (box_sx, box_sy);
                         let cover = move |fx: f32, fy: f32| (0.5 - boxpaint::sdf(fx, fy, gx, gy, gx + bw, gy + bh, radii)).clamp(0.0, 1.0);
@@ -2793,7 +2793,7 @@ fn frame_walk(
                     // honouring background-size / -position / -repeat (the
                     // sprite-sheet idiom is exactly a positioned no-repeat
                     // layer of an intrinsically-sized sheet).
-                    if let Some(img) = spec.bg_image.as_deref().and_then(crate::images::get) {
+                    if let Some(img) = layer.url().and_then(crate::images::get) {
                         let g = resolve_bg_geometry(
                             spec.bg_size.as_deref(),
                             spec.bg_position.as_deref(),
@@ -2820,7 +2820,7 @@ fn frame_walk(
                                 }
                             }
                         }
-                    }
+                    } }
 
                     // Inset box shadows (§7.1.3): over the background, under the
                     // border and content, inside the padding box.
