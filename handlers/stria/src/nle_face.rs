@@ -266,7 +266,7 @@ impl Face {
             },
         };
         if let Err(e) = r {
-            self.last_error = Some(format!("{v}: {e}"));
+            self.last_error = Some(match self.state.xfade_refusal(v, e) { Some(s) => format!("{v}: {s}"), None => format!("{v}: {e}") }); // STRIAXFADECURVE (SR904): an `xfade` refusal's audio wording (timeline_core editor.rs tail)
         }
         true
     }

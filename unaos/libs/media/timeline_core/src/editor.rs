@@ -1280,8 +1280,8 @@ impl EditorState {
 pub const XFADE_DEFAULT_S_DIV: u32 = 2;
 
 impl EditorState {
-    /// Put (`dur`: `Some(n)`) or toggle (`None`) the explicit equal-power audio crossfade on the selected clip's head cut.
-    pub fn toggle_audio_xfade(&mut self, dur: Option<i64>) -> Result<(), EditError> {
+    /// Put (`dur`: `Some(n)`) or toggle (`None`) the explicit audio crossfade on the selected clip's head cut; `curve` `None`: equal-power and the toggle, `Some(c)`: put `c`, never take off (STRIAXFADECURVE SR904).
+    pub fn toggle_audio_xfade(&mut self, dur: Option<i64>, curve: Option<crate::Curve>) -> Result<(), EditError> {
         let (track, ci) = self.selection.ok_or(EditError::NoClip)?;
         let tl = &self.timeline;
         let t = tl.tracks.get(track).ok_or(EditError::NoTrack)?;
@@ -1291,13 +1291,13 @@ impl EditorState {
         }
         let o = *t.clips.iter().find(|c| c.end() == i.at).ok_or(EditError::Transition)?;
         let next = match dur {
-            Some(n) => tl.add_audio_xfade(track, i.at, n, crate::Curve::EqualPower)?,
-            None if tl.audio_xfades.iter().any(|x| x.track == track && x.at == i.at) => tl.remove_audio_xfade(track, i.at)?,
+            Some(n) => tl.add_audio_xfade(track, i.at, n, curve.unwrap_or(crate::Curve::EqualPower))?,
+            None if curve.is_none() && tl.audio_xfades.iter().any(|x| x.track == track && x.at == i.at) => tl.remove_audio_xfade(track, i.at)?,
             None => {
                 let handle = tl.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
                 let half = (tl.fps().unwrap_or(25) / XFADE_DEFAULT_S_DIV) as i64;
                 let n = tl.crossfade_at(track, ci).map_or(half.min(i.len()).min(handle), |x| x.dur).max(1);
-                tl.add_audio_xfade(track, i.at, n, crate::Curve::EqualPower)?
+                tl.add_audio_xfade(track, i.at, n, curve.unwrap_or(crate::Curve::EqualPower))?
             }
         };
         self.commit(next);
@@ -1308,12 +1308,12 @@ impl EditorState {
         let mut w = v.split_ascii_whitespace();
         w.next().filter(|&w| w == "xfade")?;
         Some(match (w.next(), w.next()) {
-            (None, _) => self.toggle_audio_xfade(None),
+            (None, _) => self.toggle_audio_xfade(None, None),
             (Some(n), None) => match n.parse::<i64>() {
-                Ok(n) => self.toggle_audio_xfade(Some(n)),
-                Err(_) => Err(EditError::Transition),
+                Ok(n) => self.toggle_audio_xfade(Some(n), None),
+                Err(_) => self.xfade_curve_word(None, n, None),
             },
-            _ => Err(EditError::Transition),
+            (Some(n), Some(c)) => self.xfade_curve_word(Some(n), c, w.next()),
         })
     }
 }
@@ -2734,5 +2734,54 @@ mod striainsertmarks_tests {
         }
         assert_eq!(s.undo_depth(), 0);
         assert_eq!(EditError::NoMarks.to_string(), "no in / out marks set");
+    }
+}
+
+// ---- STRIAXFADECURVE (LEDGER SR904): the crossfade curve words and the audio refusal text (named tail block) ----
+// SR860's `xfade` put only the equal-power curve and its refusals read `EditError`'s video-transition text. `xfade
+// linear|equal` and `xfade <n> linear|equal` ride the same `toggle_audio_xfade` (its `curve` parameter): a curve word
+// puts that curve, keeping an existing record's length (else the parent's default length), and never takes one off.
+// `xfade_refusal` words an `xfade` refusal from the UNCHANGED state (a refusal commits nothing); the host face's one
+// error line reads it first, no new `EditError` variant.
+impl EditorState {
+    /// `xfade [<n>] <curve>`: `n` the optional tick count word, `c` the curve word, `extra` a third word (refused).
+    fn xfade_curve_word(&mut self, n: Option<&str>, c: &str, extra: Option<&str>) -> Result<(), EditError> {
+        if extra.is_some() {
+            return Err(EditError::Transition);
+        }
+        let curve = match c {
+            "linear" => crate::Curve::Linear,
+            "equal" => crate::Curve::EqualPower,
+            _ => return Err(EditError::Transition),
+        };
+        let dur = match n {
+            Some(n) => Some(n.parse::<i64>().map_err(|_| EditError::Transition)?),
+            None => None,
+        };
+        self.toggle_audio_xfade(dur, Some(curve))
+    }
+    /// The honest text of a refused `xfade` word `v` (`e` its error), read against the state the refusal left alone;
+    /// `None` when `v` is not an `xfade` word or `e` has no audio wording (the caller shows `e`'s own text).
+    pub fn xfade_refusal(&self, v: &str, e: EditError) -> Option<&'static str> {
+        if v.split_ascii_whitespace().next() != Some("xfade") {
+            return None;
+        }
+        match e {
+            EditError::NoClip if self.selection.is_none() => Some("no clip selected (select the incoming audio clip)"),
+            EditError::Transition => {
+                let (track, ci) = self.selection?;
+                let t = self.timeline.tracks.get(track)?;
+                let i = t.clips.get(ci)?;
+                Some(if t.kind != crate::Kind::Audio {
+                    "the selected clip is not on an audio track"
+                } else if !t.clips.iter().any(|c| c.end() == i.at) {
+                    "no clip ends where the selected clip starts"
+                } else {
+                    "usage: xfade [<ticks>] [linear|equal], ticks at least 1"
+                })
+            }
+            EditError::Handle => Some("the crossfade is longer than the incoming clip or the outgoing clip's handle"),
+            _ => None,
+        }
     }
 }
