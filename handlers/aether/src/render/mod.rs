@@ -1331,7 +1331,7 @@ fn paint_marker(
         };
         match style {
             1 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
-            2 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [Some((1.0, color, 0)); 4], None, width, height, &mut blend_at),
+            2 => boxpaint::paint(x, y, d, d, [d / 2.0; 4], [Some((1.0, color, 0, 1.0)); 4], None, width, height, &mut blend_at),
             _ => boxpaint::paint(x, y, d, d, [0.0; 4], [None; 4], Some(color), width, height, &mut blend_at),
         }
         return;
@@ -1362,7 +1362,7 @@ fn paint_checkable(
     let blue = (0, 117, 255);
     let grey = (118, 118, 118);
     let r = if radio { [w.min(h) / 2.0; 4] } else { [2.0; 4] };
-    let frame = |c| [Some((1.0, c, 0u8)); 4];
+    let frame = |c| [Some((1.0, c, 0u8, 1.0)); 4];
     if radio {
         if checked {
             boxpaint::paint(x, y, w, h, r, frame(blue), Some((255, 255, 255)), width, height, &mut blend_at);
@@ -3258,12 +3258,10 @@ fn frame_walk(
                         let styles = spec.border_style.unwrap_or([0; 4]);
                         let mut bs: [boxpaint::Side; 4] = [None; 4];
                         for i in 0..4 {
-                            bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
+                            bs[i] = (if focused_field { sides } else { undropped.unwrap_or(sides) })[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i], if focused_field { 1.0 } else { layout_core::css::border_side_alpha_ink(&spec, i, inherited.color_alpha) }));
                         }
-                        let bda = border_a; let ghost = undropped.and_then(|u| diagonal_ghost(&mut bs, u, styles)); // SR1147: the ghost lives only in this SIDES-ONLY call (background None below)
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
-                            let a = a * bda;
-                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) || Some(c) == ghost {
+                            if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
                                 return;
                             }
                             if a >= 0.999 {
@@ -3274,7 +3272,7 @@ fn frame_walk(
                         };
                         boxpaint::paint(
                             box_sx, box_sy, bw, bh, spec.radius.unwrap_or([0.0; 4]),
-                            bs, None, width, height, &mut blend_at, // SR1147: background None: the ghost RGB is contained to this sides-only call
+                            bs, None, width, height, &mut blend_at, // SR1151: each side's alpha is in boxpaint's coverage (alpha 0: its diagonal half, unpainted)
                         );
                     } else if let Some(sides) = border {
                         // Same rule as the background/image spans: x_start..end_x
@@ -3723,7 +3721,7 @@ fn frame_walk(
                                         side = Some((w, c));
                                     }
                                 }
-                                sides[i] = side.filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
+                                sides[i] = side.filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i], layout_core::css::border_side_alpha_ink(spec, i, inh.get(node).map_or(1.0, |i| i.color_alpha))));
                             }
                         }
                         // box-decoration-break: slice — the inline-start edge
@@ -3744,9 +3742,9 @@ fn frame_walk(
                             radius[2] = 0.0;
                         }
                         let rounded = radius.iter().any(|&r| r != 0.0)
-                            || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0)) || sides_differ(spec, sides.map(|s| s.map(|(w, c, _)| (w, c))), inh.get(node).map_or(1.0, |i| i.color_alpha));
+                            || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0)) || sides_differ(spec, sides.map(|s| s.map(|(w, c, _, _)| (w, c))), inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bga = layout_core::css::bg_alpha_ink(spec, inh.get(node).map_or(1.0, |i| i.color_alpha));
-                        let bda = layout_core::css::border_visible(spec, &mut sides, inh.get(node).map_or(1.0, |i| i.color_alpha));
+                        let all = sides; let bda = layout_core::css::border_visible(spec, &mut sides, inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             // `a` is the final alpha: the callers pass the background's bga or the frame's bda.
@@ -3760,7 +3758,7 @@ fn frame_walk(
                             }
                         };
                         if rounded {
-                            boxpaint::paint(fx, fy, *w, *h, radius, [None; 4], bg_rgb, width, height, &mut |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga)); boxpaint::paint(fx, fy, *w, *h, radius, sides, None, width, height, &mut |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bda));
+                            boxpaint::paint(fx, fy, *w, *h, radius, [None; 4], bg_rgb, width, height, &mut |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga)); boxpaint::paint(fx, fy, *w, *h, radius, all, None, width, height, &mut blend_at);
                         } else {
                             // Pixel-snapped rectangles, as Blink snaps box decorations.
                             let (x0, y0) = (fx.round(), fy.round());
@@ -3777,16 +3775,16 @@ fn frame_walk(
                             if let Some(bg) = bg_rgb {
                                 fill(x0, y0, x1, y1, bg, bga);
                             }
-                            if let Some((bw, c, _)) = sides[0] {
+                            if let Some((bw, c, _, _)) = sides[0] {
                                 fill(x0 + lw, y0, x1 - rw, y0 + bw.round().max(1.0), c, bda);
                             }
-                            if let Some((bw, c, _)) = sides[2] {
+                            if let Some((bw, c, _, _)) = sides[2] {
                                 fill(x0 + lw, y1 - bw.round().max(1.0), x1 - rw, y1, c, bda);
                             }
-                            if let Some((bw, c, _)) = sides[3] {
+                            if let Some((bw, c, _, _)) = sides[3] {
                                 fill(x0, y0, x0 + bw.round().max(1.0), y1, c, bda);
                             }
-                            if let Some((bw, c, _)) = sides[1] {
+                            if let Some((bw, c, _, _)) = sides[1] {
                                 fill(x1 - bw.round().max(1.0), y0, x1, y1, c, bda);
                             }
                         }
@@ -4877,28 +4875,6 @@ fn sides_differ(spec: &crate::layout::PaintStyle, sides: [Option<(f32, (u8, u8, 
         (w > 0.0).then_some(if a > 0.0 { Some((c, a)) } else { None })
     };
     (0..4).any(|i| matches!((key(i), key((i + 1) % 4)), (Some(p), Some(q)) if p != q))
-}
-
-/// AETHERCSSBORDERCORNERDIAGONAL (SR1147): the block road's fancy border pass hands boxpaint each alpha-0 side that
-/// `border_visible` dropped back as a GHOST side (its real width, an RGB no visible side uses) so the visible
-/// neighbour owns only its diagonal half (the CSS triangle); the caller's closure skips the ghost RGB. A colour
-/// sentinel, contained: it exists only in the SIDES-ONLY boxpaint call (background None), never where a background
-/// paints (owed AETHER-BOXPAINT-SIDE-VISIBLE: boxpaint takes a per-side visibility). Some(ghost) iff a side was filled.
-fn diagonal_ghost(bs: &mut [boxpaint::Side; 4], undropped: [Option<(f32, (u8, u8, u8))>; 4], styles: [u8; 4]) -> Option<(u8, u8, u8)> {
-    let ghost = {
-        let used = |c: (u8, u8, u8)| bs.iter().any(|s| s.is_some_and(|s| s.1 == c));
-        [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12), (13, 14, 15)].into_iter().find(|&c| !used(c))?
-    };
-    let mut any = false;
-    for i in 0..4 {
-        if bs[i].is_none() {
-            if let Some((w, _)) = undropped[i].filter(|(w, _)| *w > 0.0) {
-                bs[i] = Some((w, ghost, styles[i]));
-                any = true;
-            }
-        }
-    }
-    any.then_some(ghost)
 }
 
 // ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration line composites at its colour's alpha (named tail block) ----
