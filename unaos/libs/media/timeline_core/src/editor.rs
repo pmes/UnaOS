@@ -660,3 +660,19 @@ impl EditorState {
         })
     }
 }
+
+// ---- STRIAAUTOSAVE (LEDGER SR883): a whole timeline restored through the one commit (named tail block) ----
+// The host face's `recover` word applies the document's autosave (`<stem>.autosave.edl`, parsed by `edl::parse`) as ONE
+// edit: the current timeline goes on the undo stack, so `undo` returns to the document as opened.
+
+impl EditorState {
+    /// Replace the timeline with `tl` through [`EditorState::commit`] (one undo step); false, and nothing pushed, when
+    /// `tl` is the current timeline.
+    pub fn restore(&mut self, tl: Timeline) -> bool {
+        if tl == self.timeline {
+            return false;
+        }
+        self.commit(tl);
+        true
+    }
+}
