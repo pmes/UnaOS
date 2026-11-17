@@ -1224,7 +1224,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "inherit" | "initial" | "unset" => {}
             other => H::record_css(&format!("justify-content-value:{}", other)),
         },
-        "background-color" => {
+        "background-color" => { bg_currentcolor::<H>(&mut style.paint, value);
             if value.eq_ignore_ascii_case("transparent") {
                 style.paint.bg_alpha = Some(0.0);
             } else if !is_neutral_keyword(value) {
@@ -1242,7 +1242,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
         }
-        "background" if value.to_ascii_lowercase().contains("-gradient(") => {
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
             let lower = value.to_ascii_lowercase();
@@ -1279,16 +1279,16 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
-            None => {
+            None => { bg_image_clear::<H>(&mut style.paint, value);
                 if !is_neutral_keyword(value) {
                     H::record_css(&format!("background-image-value:{}", clip(value)));
                 }
             }
         },
-        "background" => {
+        "background" => { bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
-            if let Some(u) = extract_css_url(value) {
+            bg_shorthand_none::<H>(&mut style.paint, value); if let Some(u) = extract_css_url(value) {
                 style.paint.bg_image = Some(u);
             }
             // Components outside url(...) — the url may itself hold slashes
@@ -1592,7 +1592,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                sides[side] = Some((width, color));
+                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v);
                 style.paint.border = Some(sides);
             }
         }
@@ -1836,7 +1836,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                style.paint.border = Some([Some((width, color)); 4]);
+                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v);
             } else {
                 H::record_css(&format!("border-value:{}", clip(value)));
             }
@@ -1870,7 +1870,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some([None; 4]);
                 return;
             }
-            if let Some(c) = parse_color_str::<H>(value) {
+            if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
                 style.paint.border_alpha = Some(color_alpha::<H>(value));
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
@@ -1881,7 +1881,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "border-width" => {
-            if let Some(w) = parse_px(value, cx) {
+            if let Some(w) = parse_px(value, cx) { width_cc(&mut style.paint);
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
                     let c = side.map(|(_, c)| c).unwrap_or((128, 128, 128));
@@ -2595,7 +2595,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         deco_clone, text_combine, scroll_margin, container_scroll,
         outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -2603,7 +2603,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
             list.push((p.clone(), v.clone()));
         }
     }
-    clone!(pct_math, bg_gradient, shadows);
+    merge_bg_image_none(dst, src); clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
@@ -3672,22 +3672,41 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
 /// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is
 /// rewritten for the six sizes only (no tag road: SR1028); elsewhere the UA value is the tag road, which no Some
 /// reaches, so it stays dropped (AETHER-CSS-WIDE-REVERT-NONINHERITED owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
+/// AETHERCSSWIDENONINHERITEDREST (SR848): opacity / transform / flex-grow / flex-shrink through the same anim call; position static, float / clear none, overflow visible, z-index and the insets auto, flex-direction row, flex-wrap nowrap, flex-flow `row nowrap`, flex-basis auto, flex `0 1 auto`, align-items / justify-content normal, gap / row-gap 0px, background-repeat / -position / -size repeat / `0% 0%` / auto; not column-gap (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL), align-content (AETHER-CSS-ALIGN-CONTENT-FIELD) or the background shorthand's image layers (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE).
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background` and `background-image` rewrite to `none`, which the arms now write as an explicit no-image (`bg_image_clear`, `bg_shorthand_none`), so `background: initial` resets the image, the colour and the repeat / position / size layers.
 fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
     if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset") || (value.eq_ignore_ascii_case("revert") && matches!(prop, "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height"))) { // SR1028: no tag road for the sizes, so revert == initial
         return value;
     }
     match prop {
         "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top"
+        | "opacity" | "transform" | "flex-grow" | "flex-shrink"
         | "padding-right" | "padding-bottom" | "padding-left" | "background-color" => {
             crate::anim::initial_value(prop).unwrap_or(value)
         }
-        "background" => "transparent",
+        "background" | "background-image" => "none",
         "display" => "inline",
         "color" if value.eq_ignore_ascii_case("initial") => "black", // SR1021: css-color-4 CanvasText (light scheme); unset stays inherit (css_wide)
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         "border-width" => "3px",
+        // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
+        "position" => "static",
+        "float" | "clear" => "none",
+        "overflow" | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" => "visible",
+        "z-index" => "auto",
+        "top" | "right" | "bottom" | "left" | "inset" => "auto",
+        "flex-direction" => "row",
+        "flex-wrap" => "nowrap",
+        "flex-flow" => "row nowrap",
+        "flex-basis" => "auto",
+        "flex" => "0 1 auto",
+        "align-items" | "justify-content" => "normal",
+        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px",
+        "background-repeat" => "repeat",
+        "background-position" => "0% 0%",
+        "background-size" => "auto",
         _ => value,
     }
 }
@@ -3753,5 +3772,107 @@ fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &
         }
         "revert-layer" => {}
         _ => H::record_css(&format!("all-value:{}", clip(value))),
+    }
+}
+
+// ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor marker writes (named tail block) ----
+
+/// The background arms' marker (css-color-4 §6.2): a top-level `currentcolor` token writes the carrier and sets
+/// [`crate::paint::CC_BG`] (paint resolves it to the element's ink); a concrete colour clears the bit (the arm's body
+/// then writes that colour as before); anything else (transparent, none, an image alone) leaves it.
+fn bg_currentcolor<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let parts = split_top_level(value);
+    if parts.iter().any(|p| p.eq_ignore_ascii_case("currentcolor")) {
+        paint.background = Some((0, 0, 0));
+        paint.bg_alpha = Some(1.0);
+        paint.currentcolor |= crate::paint::CC_BG;
+    } else if parts.iter().any(|p| parse_color_str::<H>(p).is_some()) || H::parse_color_alpha(value).is_some() {
+        paint.currentcolor &= !crate::paint::CC_BG;
+    }
+}
+
+/// The `border` / side shorthands' marker: css-backgrounds-3 §3.1 `border-color`'s initial value is currentcolor, so
+/// a shorthand whose colour is omitted or `currentcolor` sets the `mask` side bits (the arm's grey is the carrier);
+/// a concrete colour clears them.
+fn border_cc<H: Host>(paint: &mut PaintStyle<H>, mask: u8, v: &str) {
+    let parts = split_top_level(v);
+    let mut rest = parts.iter().filter(|p| {
+        border_style_code(p).is_none()
+            && !p.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+            && !matches!(p.to_ascii_lowercase().as_str(), "thin" | "medium" | "thick")
+    });
+    let first = rest.next();
+    if first.is_none() || first.into_iter().chain(rest).any(|p| p.eq_ignore_ascii_case("currentcolor")) {
+        paint.currentcolor |= mask;
+    } else {
+        paint.currentcolor &= !mask;
+    }
+}
+
+/// `border-color`'s colour: a parsed colour clears the side bits; `currentcolor` sets them and answers the grey
+/// carrier, so the arm builds the sides as it does for a colour; anything else None.
+fn border_color_of<H: Host>(paint: &mut PaintStyle<H>, value: &str) -> Option<(u8, u8, u8)> {
+    if let Some(c) = parse_color_str::<H>(value) {
+        paint.currentcolor &= !crate::paint::CC_SIDES;
+        Some(c)
+    } else if value.trim().eq_ignore_ascii_case("currentcolor") {
+        paint.currentcolor |= crate::paint::CC_SIDES;
+        Some((128, 128, 128))
+    } else {
+        None
+    }
+}
+
+/// `border-width`'s marker: each side the arm creates at the grey (no border yet, or that side absent) takes the
+/// initial border colour, currentcolor.
+fn width_cc<H: Host>(paint: &mut PaintStyle<H>) {
+    for i in 0..4 {
+        if paint.border.map_or(true, |b| b[i].is_none()) {
+            paint.currentcolor |= 1 << i;
+        }
+    }
+}
+
+// ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): css-backgrounds-3 §3.3: `background-image: none` is a value (no image
+/// layer), but `PaintStyle::bg_image`'s None means "unspecified", so `merge_paint` (Somes only) kept an earlier rule's
+/// url. The arm's `none` (and `initial` / `unset`, rewritten to `none` by `noninherited_initial`) clears both image
+/// roads of this block (`bg_image` None, `bg_gradient` Some(None): background-image is ONE property) and sets
+/// `bg_image_none`, which `merge_bg_image_none` turns into the same clear on the cascade's accumulated style.
+fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    if value.trim().eq_ignore_ascii_case("none") {
+        paint.bg_image = None;
+        paint.bg_gradient = Some(None);
+        paint.bg_image_none = true;
+    }
+}
+
+/// The `background` shorthand's empty spellings (`none`, `transparent`, `none transparent`, and `initial` / `unset`
+/// through `noninherited_initial`'s `none`): css-backgrounds-3 §3.10 resets every omitted longhand to its initial
+/// value, so the image goes (`bg_image_clear`), the colour is transparent, and repeat / position / size take SR848's
+/// initials (repeat / `0% 0%` / auto, stored as their arms store them; not through `apply_declaration`, which would
+/// enter background-color / -position in `animatable`). Any other shorthand keeps its omitted layers
+/// (AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+fn bg_shorthand_none<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let parts = split_top_level(value);
+    if parts.is_empty() || !parts.iter().all(|p| p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("transparent")) {
+        return;
+    }
+    bg_image_clear(paint, "none");
+    paint.bg_alpha = Some(0.0);
+    paint.bg_repeat = parse_repeat("repeat");
+    paint.bg_position = Some("0% 0%".to_string());
+    paint.bg_size = Some("auto".to_string());
+}
+
+/// `merge_paint`'s half for the bit, BEFORE the image / gradient clones: a later block that declared none clears the
+/// accumulated image and gradient and carries the bit (a chained merge clears again); that block's own later url or
+/// gradient (`none; url(b)`) is then copied by the clones, so the later value wins either way.
+fn merge_bg_image_none<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    if src.bg_image_none {
+        dst.bg_image = None;
+        dst.bg_gradient = Some(None);
+        dst.bg_image_none = true;
     }
 }
