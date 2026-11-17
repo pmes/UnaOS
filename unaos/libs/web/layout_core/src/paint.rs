@@ -65,7 +65,7 @@ pub struct PaintStyle<H: Host> {
     /// text-align: 0 = left/start, 1 = center, 2 = right/end. INHERITED —
     /// remeasure walks it down the box tree and turns it into the flex
     /// alignment of each descendant's own formatting context.
-    pub text_align: Option<u8>,
+    pub text_align: Option<u8>, pub text_align_last: Option<u8>, // AETHERTEXTALIGNLAST (SR1062): css-text-3 §7.2, the text-align codes, 255 auto; INHERITED
     /// object-fit (replaced content: `<video>` frames and posters, see `media::object_fit_rect`):
     /// 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down. None = the element's default
     /// (contain for video).
@@ -311,7 +311,7 @@ impl<H: Host> Default for PaintStyle<H> {
             mask_size: None,
             mask_position: None,
             mask_repeat: None,
-            text_align: None,
+            text_align: None, text_align_last: None,
             object_fit: None,
             object_position: None,
             flex_container: None,

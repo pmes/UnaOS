@@ -1852,7 +1852,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
         root_fs: f32,
         fonts: &F,
     ) {
-        let mut size = inherited.clone();
+        let mut size = inherited.clone(); if let Some(l) = tree.paint_map.get(&node_id).and_then(|p| p.text_align_last) { size.text_align_last = (l != 255).then_some(l); } // AETHERTEXTALIGNLAST (SR1062): 255 auto -> None
         if let Some(ta) = tree.paint_map.get(&node_id).and_then(|p| p.text_align) {
             // AETHERCENTERLAYOUT (SR421): the inline formatter sees -webkit-center / -webkit-right as center / right.
             size.text_align = match ta { 5 => 1, 6 => 2, 7 => 4, a => a };
@@ -2813,7 +2813,7 @@ pub(crate) struct TextRun {
     pub(crate) stretch: u16,
     pub(crate) text_transform: u8,
     /// Inherited text-align: 0 start, 1 center, 2 end.
-    pub(crate) text_align: u8,
+    pub(crate) text_align: u8, pub(crate) text_align_last: Option<u8>, // AETHERTEXTALIGNLAST (SR1062): None = auto
     /// The font-size still derives from the initial `medium` keyword (no
     /// absolute size up the chain): only then does switching to monospace
     /// scale it by 13/16 (Blink's fixed-pitch default).

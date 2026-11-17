@@ -8958,4 +8958,24 @@ b</div>
         let s = edges("start");
         assert!(s[0] < 99.5, "the start twin is ragged: {s:?}");
     }
+
+    // ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last (named tail block) ----
+
+    /// AETHERTEXTALIGNLAST (SR1062): getComputedStyle reads text-align-last back: `center` on the element, `center`
+    /// inherited by a child that does not declare it, `justify` on a justify element.
+    #[test]
+    fn text_align_last_reads_back() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <p id="c" style="text-align: justify; text-align-last: center">a b</p>
+            <div style="text-align-last: center"><p id="i">a b</p></div>
+            <p id="j" style="text-align-last: justify">a b</p>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "c", "textAlignLast"), "center", "text-align-last: center reads back");
+        assert_eq!(font_shorthand_cs(&mut e, "i", "textAlignLast"), "center", "text-align-last is inherited");
+        assert_eq!(font_shorthand_cs(&mut e, "j", "textAlignLast"), "justify", "justify reads back");
+    }
 }
