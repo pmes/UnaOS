@@ -781,6 +781,71 @@ fn text_decoration_style_thickness_merge() {
     merge_paint(&mut dst.paint, &styled(&[("text-decoration-style", "double")]).paint);
     assert_eq!(dst.paint.decoration_style, Some(1), "a later longhand wins");
 }
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset / -position arms (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the offset longhand: a length in px (negative and 0 accepted; em at the parse
+/// context's font), a percentage of 1em; auto / initial / unset are `Some(None)`; a bare non-zero number, an invalid
+/// word and `inherit` (not inherited, no bit) write nothing.
+#[test]
+fn text_underline_offset_longhand() {
+    assert_eq!(styled(&[("text-underline-offset", "3px")]).paint.underline_offset, Some(Some(3.0)));
+    assert_eq!(styled(&[("text-underline-offset", "-2px")]).paint.underline_offset, Some(Some(-2.0)));
+    assert_eq!(styled(&[("text-underline-offset", "0")]).paint.underline_offset, Some(Some(0.0)));
+    let em = ParseCx::default().font.0 * 0.2;
+    for v in ["0.2em", "20%"] {
+        let o = styled(&[("text-underline-offset", v)]).paint.underline_offset.flatten().expect("parses");
+        assert!((o - em).abs() < 1e-3, "{v} = {o}, want {em}");
+    }
+    for v in ["auto", "initial", "unset"] {
+        assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, Some(None), "{v}");
+    }
+    for v in ["3", "bogus", "inherit"] {
+        assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, None, "{v}");
+    }
+    let s = styled(&[("text-underline-offset", "5px"), ("text-underline-offset", "initial")]);
+    assert_eq!(s.paint.underline_offset, Some(None), "initial resets an earlier length to auto");
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the position longhand: auto / initial 0, from-font 1, under 2; left / right keep
+/// the horizontal part (bare = auto); invalid combinations write nothing; inherit / unset write the inherit bit and clear
+/// an earlier value, and a later value beats the bit.
+#[test]
+fn text_underline_position_longhand() {
+    use layout_core::paint::INHERIT_UNDERLINE_POSITION;
+    for (v, want) in [("auto", 0), ("initial", 0), ("from-font", 1), ("under", 2), ("under left", 2), ("right under", 2), ("from-font right", 1), ("left", 0), ("right", 0)] {
+        assert_eq!(styled(&[("text-underline-position", v)]).paint.underline_position, Some(want), "{v}");
+    }
+    for v in ["bogus", "under from-font", "left right", "under under"] {
+        assert_eq!(styled(&[("text-underline-position", v)]).paint.underline_position, None, "{v}");
+    }
+    for v in ["inherit", "unset"] {
+        let s = styled(&[("text-underline-position", "under"), ("text-underline-position", v)]);
+        assert_eq!(s.paint.underline_position, None, "{v} clears the earlier under");
+        assert!(s.paint.inherits(INHERIT_UNDERLINE_POSITION), "{v} writes the inherit bit");
+    }
+    let s = styled(&[("text-underline-position", "inherit"), ("text-underline-position", "under")]);
+    assert_eq!(s.paint.underline_position, Some(2));
+    assert!(!s.paint.inherits(INHERIT_UNDERLINE_POSITION), "a later value beats the bit");
+    assert!(!styled(&[("text-underline-position", "under")]).paint.inherits(INHERIT_UNDERLINE_POSITION), "armed");
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): merge_paint carries both later-wins; the `text-decoration` shorthand (which does
+/// not include them) leaves both; a later `inherit` on the position clears it through the bit.
+#[test]
+fn text_underline_merge() {
+    let mut dst = styled(&[("text-underline-offset", "4px"), ("text-underline-position", "under")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!((dst.paint.underline_offset, dst.paint.underline_position), (Some(Some(4.0)), Some(2)), "a rule without them keeps them");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline wavy")]).paint);
+    assert_eq!((dst.paint.underline_offset, dst.paint.underline_position), (Some(Some(4.0)), Some(2)), "the shorthand leaves them");
+    merge_paint(&mut dst.paint, &styled(&[("text-underline-offset", "auto")]).paint);
+    assert_eq!(dst.paint.underline_offset, Some(None), "a later auto wins");
+    merge_paint(&mut dst.paint, &styled(&[("text-underline-position", "inherit")]).paint);
+    assert_eq!(dst.paint.underline_position, None, "a later inherit clears it");
+    assert!(dst.paint.inherits(layout_core::paint::INHERIT_UNDERLINE_POSITION));
+}
+
 // ---- AETHERFONTSYNTHESISPOSITION (LEDGER SR1080): css-fonts-4 §6.4 font-synthesis-position, the fourth half (named tail block) ----
 
 fn synth4(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<bool>, Option<bool>, Option<bool>) {
