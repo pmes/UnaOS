@@ -237,3 +237,88 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIAUNDOHISTORY (LEDGER SR876): op names on the undo entries (named tail block) ----
+
+/// Each verb names the undo step it commits; undo / redo move the name with the snapshot (`redo` is not a step); a refused
+/// or foreign word adds nothing; a commit outside any verb (a drag's `Drag::finish` road, `move_selected`) is unnamed; a
+/// commit after an undo drops the redo names with the redo stack; an outer armed word wins over the verb it calls.
+#[test]
+fn striaundohistory_verbs_name_their_steps() {
+    use timeline_core::editor::{EditorState, HISTORY_N};
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl);
+    assert_eq!(st.history_line(HISTORY_N), "history: nothing to undo");
+    st.select(0, 1).unwrap();
+    st.seek(15);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    assert_eq!(st.verb("]"), Some(Ok(())));
+    assert_eq!(st.verb("mark in"), Some(Ok(())));
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("]")), (1, Some("split"))]);
+    assert_eq!(st.history_line(HISTORY_N), "history: 3 mark in | 2 ] | 1 split");
+    let sel = st.selection;
+    st.deselect();
+    assert_eq!(st.verb("split"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.verb("play"), None);
+    assert_eq!(st.history(HISTORY_N).len(), 3);
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.history(HISTORY_N), vec![(2, Some("]")), (1, Some("split"))]);
+    assert_eq!(st.verb("redo"), Some(Ok(())));
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("]")), (1, Some("split"))]);
+    st.select(0, 0).unwrap();
+    st.move_selected(0, 100).unwrap();
+    assert_eq!(st.history(2), vec![(4, None), (3, Some("mark in"))]);
+    assert_eq!(st.history_line(2), "history: 4 (unnamed) | 3 mark in");
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.redo_depth(), 2);
+    assert_eq!(st.verb("mark out"), Some(Ok(())));
+    assert_eq!(st.redo_depth(), 0);
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark out")), (2, Some("]")), (1, Some("split"))]);
+    let armed = st.arm_word("outer");
+    assert!(armed);
+    assert!(!st.arm_word("inner"), "a word is armed: the outer one wins");
+    assert_eq!(st.verb("mark clear"), Some(Ok(())));
+    st.disarm_word(armed);
+    assert_eq!(st.history(1), vec![(4, Some("outer"))]);
+    println!("striaundohistory: {} (selection before the refusal {sel:?})", st.history_line(HISTORY_N));
+}
+
+/// Bounded: 300 verb commits keep UNDO_MAX snapshots and their names in lockstep (the cap drops the oldest name with the
+/// oldest snapshot); a full undo and redo round brings every name back; the line lists `HISTORY_N`; a long word is clipped
+/// to `WORD_MAX` bytes on a char boundary.
+#[test]
+fn striaundohistory_bounded() {
+    use timeline_core::editor::{EditorState, HISTORY_N, UNDO_MAX, WORD_MAX};
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl);
+    st.select(0, 1).unwrap();
+    for i in 0..12 {
+        assert_eq!(st.verb(if i % 2 == 0 { "nudge+" } else { "nudge-" }), Some(Ok(())));
+    }
+    assert_eq!(st.history(HISTORY_N).len(), 10);
+    assert_eq!(st.history(99).len(), 12);
+    assert_eq!(st.history_line(HISTORY_N).matches(" | ").count(), 9);
+    for i in 12..300 {
+        assert_eq!(st.verb(if i % 2 == 0 { "nudge+" } else { "nudge-" }), Some(Ok(())));
+    }
+    assert_eq!(st.undo_depth(), UNDO_MAX);
+    let want: Vec<(usize, Option<&str>)> = (0..HISTORY_N).map(|k| (UNDO_MAX - k, Some(if k % 2 == 0 { "nudge-" } else { "nudge+" }))).collect();
+    assert_eq!(st.history(HISTORY_N), want);
+    let all: Vec<(usize, Option<String>)> = st.history(UNDO_MAX).into_iter().map(|(i, w)| (i, w.map(String::from))).collect();
+    assert_eq!(all.len(), UNDO_MAX);
+    assert!(all.iter().all(|(_, w)| w.is_some()), "every kept snapshot is named");
+    while st.undo() {}
+    assert_eq!((st.undo_depth(), st.redo_depth()), (0, UNDO_MAX));
+    while st.redo() {}
+    let back: Vec<(usize, Option<String>)> = st.history(UNDO_MAX).into_iter().map(|(i, w)| (i, w.map(String::from))).collect();
+    assert_eq!(back, all);
+    let long = format!("a{}", "\u{e9}".repeat(20));
+    let armed = st.arm_word(&long);
+    assert_eq!(st.verb("nudge+"), Some(Ok(())));
+    st.disarm_word(armed);
+    let top = st.history(1)[0].1.unwrap().to_string();
+    assert!(top.len() <= WORD_MAX && long.starts_with(&top));
+    assert_eq!(top.len(), 23, "24 falls inside a two-byte char: clipped to 23");
+    assert_eq!(st.undo_depth(), UNDO_MAX);
+}

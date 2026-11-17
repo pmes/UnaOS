@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "history", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAUNDOHISTORY (SR876): history (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -234,7 +234,7 @@ impl Face {
         }
     }
     /// A transport verb ([`VERBS`]); false for any other word.
-    pub fn verb(&mut self, v: &str) -> bool {
+    fn verb_unnamed(&mut self, v: &str) -> bool {
         if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
@@ -3060,4 +3060,24 @@ pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
     let after = STALL_AFTER.as_secs_f64();
     let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
     (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
+}
+
+// ---- STRIAUNDOHISTORY (LEDGER SR876): the face's `history` word and its verbs named on the undo steps (named tail block) ----
+// The public [`Face::verb`] arms its word on the editor state (`EditorState::arm_word`) around the face's dispatch
+// (`verb_unnamed`), so every undo step a face word commits carries that word, the face's own roads too (a selected
+// transition's `delete` / `[` / `]`, the `in` / `out` marks); the outer word wins over the editor word it calls (`slip+`, not
+// `slip 1`). `history` is view-only: the last `HISTORY_N` undo entries, newest first, as ONE line on the message row
+// (`last_error`, THE message: `serve` logs it, stria-view lists it under `errors`); it commits nothing and dirties nothing.
+impl Face {
+    /// A transport verb ([`VERBS`]); false for any other word.
+    pub fn verb(&mut self, v: &str) -> bool {
+        if v == "history" {
+            self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N));
+            return true;
+        }
+        let armed = self.state.arm_word(v);
+        let r = self.verb_unnamed(v);
+        self.state.disarm_word(armed);
+        r
+    }
 }
