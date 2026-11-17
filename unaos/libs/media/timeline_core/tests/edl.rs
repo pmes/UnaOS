@@ -74,7 +74,7 @@ FCM: NON-DROP FRAME
 #[test]
 fn refusals_are_named() {
     let ev = |s: &str| format!("TITLE: X\nFCM: NON-DROP FRAME\n{s}\n");
-    assert_eq!(edl::parse("TITLE: X\nFCM: DROP FRAME\n", 30), Err(EdlError::DropFrame { line: 2 }));
+    assert_eq!(edl::parse("TITLE: X\nFCM: DROP FRAME\n* UNA FPS 25\n", 30), Err(EdlError::DropFrame { line: 2 })); // STRIATCTHREE (SR9030): drop-frame off 30 / 60 (a bare DROP FRAME reads: file tail)
     assert_eq!(edl::parse("FCM: 24P\n", 24), Err(EdlError::Fcm { line: 1 }));
     assert_eq!(
         edl::parse(&ev("001  A        V     C        00:00:00;00 00:00:01;00 00:00:00;00 00:00:01;00"), 30),
@@ -563,4 +563,68 @@ fn striakmarkers_the_players_key_words_mark_save_and_paint_the_band() {
     assert_eq!(st.verb("unmark"), Some(Err(EditError::Marker)), "nothing to remove");
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT, "unmark writes the EDL back byte for byte");
     println!("striakmarkers: mark -> M1 @5 saved, painted on the ruler ({inside} px); unmark -> CUT byte for byte");
+}
+
+// ---- STRIATCTHREE (LEDGER SR9030): drop-frame documents (named tail block) ----
+
+/// A 30000/1001 timeline writes `FCM: DROP FRAME`, `* UNA FPS 30` and `;` labels (a clip past the first minute), and reads
+/// back equal.
+#[test]
+fn striatcthree_drop_frame_round_trips() {
+    let mut tl = Timeline::new(30);
+    tl.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+    let a = tl.add_source("A", 4000);
+    let v = tl.add_track(Kind::Video);
+    tl.tracks[v].clips.push(Clip::new(a, 100, 2000, 0));
+    let text = edl::write(&tl, "DF").expect("an NTSC 30 timeline writes");
+    assert!(text.contains("\nFCM: DROP FRAME\n* UNA FPS 30\n"), "{text}");
+    assert!(text.contains("* UNA SOURCE A 00:02:13;14\n"), "{text}");
+    assert!(text.contains("A        V     C        00:00:03;10 00:01:06;22 00:00:00;00 00:01:03;12\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25), Ok(tl));
+    println!("striatcthree: 30000/1001 writes and reads back drop-frame");
+}
+
+/// A foreign drop-frame EDL (no `* UNA FPS`) reads at 29.97: `00:01:00;02` is tick 1800, the base 30000/1001; a bare
+/// `FCM: DROP FRAME` reads an empty 30000/1001 timeline (tests/edl.rs `refusals_are_named` held the old refusal).
+#[test]
+fn striatcthree_foreign_drop_frame_reads() {
+    let ntsc = timeline_core::Timebase { num: 1001, den: 30000 };
+    let text = "TITLE: F\nFCM: DROP FRAME\n\n001  A        V     C        00:00:00;00 00:01:00;02 00:00:00;00 00:01:00;02\n";
+    let tl = edl::parse(text, 25).expect("drop-frame reads");
+    assert_eq!(tl.tb, ntsc);
+    let c = tl.tracks[0].clips[0];
+    assert_eq!((c.src_in, c.src_out, c.at, c.end()), (0, 1800, 0, 1800));
+    assert_eq!(edl::parse("TITLE: X\nFCM: DROP FRAME\n", 30).map(|t| (t.tb, t.tracks.len())), Ok((ntsc, 0)));
+    let tl60 = edl::parse("FCM: DROP FRAME\n* UNA FPS 60\n001  A        V     C        00:00:00;00 00:01:00;04 00:00:00;00 00:01:00;04\n", 25).expect("59.94 reads");
+    assert_eq!((tl60.tb, tl60.tracks[0].clips[0].src_out), (timeline_core::Timebase { num: 1001, den: 60000 }, 3600));
+}
+
+/// Still refused, each by name: a skipped label (`;00` at minute 1), drop-frame at a nominal but 30 / 60, `;` in a non-drop file.
+#[test]
+fn striatcthree_drop_refusals() {
+    let ev = "001  A        V     C        00:00:00;00 00:01:00;00 00:00:00;00 00:01:00;00";
+    assert_eq!(edl::parse(&format!("TITLE: X\nFCM: DROP FRAME\n\n{ev}\n"), 30), Err(EdlError::Timecode { line: 4 }));
+    assert_eq!(edl::parse("FCM: DROP FRAME\n* UNA FPS 24\n", 30), Err(EdlError::DropFrame { line: 1 }));
+    assert_eq!(edl::parse(&format!("FCM: NON-DROP FRAME\n{ev}\n"), 30), Err(EdlError::DropFrame { line: 2 }));
+    let mut tl = Timeline::new(24);
+    tl.tb = timeline_core::Timebase { num: 1001, den: 24000 };
+    assert_eq!(edl::write(&tl, "X"), Err(EdlError::Fps), "23.976 has no drop-frame (NLE-TC-NTSC24-EDL owed)");
+}
+
+/// `drop_tick` inverts `drop_number` at 30 and 60 (and `timecode_drop` is built on it); other nominals are the identity.
+#[test]
+fn striatcthree_drop_number_inverse() {
+    use timeline_core::edl::{drop_number, drop_tick, timecode_drop};
+    for nom in [30u32, 60] {
+        let mut prev = -1;
+        for t in 0..40_000i64 {
+            let n = drop_number(t, nom);
+            assert!(n > prev, "strictly increasing at {t}");
+            assert_eq!(drop_tick(n, nom), Some(t), "nominal {nom} tick {t}");
+            prev = n;
+        }
+    }
+    assert_eq!((drop_tick(1800, 30), drop_tick(1801, 30), drop_tick(18000, 30)), (None, None, Some(17982)));
+    assert_eq!((drop_number(7, 25), drop_tick(7, 25), drop_number(-3, 30)), (7, Some(7), 0));
+    assert_eq!(timecode_drop(1800, 30), "00:01:00;02");
 }

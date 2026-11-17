@@ -25,7 +25,7 @@
 //! `* UNA GAIN <centi-dB>` (the clip's audio gain; absent = 0) and `* UNA FADE <in> <out>` (fade lengths as
 //! `HH:MM:SS:FF`; absent = none). One with no event above it (or under a `BL` event) is a syntax error.
 //!
-//! Refused, each by name: `FCM: DROP FRAME` or a `;` timecode (drop-frame), any other FCM, a transition other than
+//! Refused, each by name: `FCM: DROP FRAME` off nominal 30 / 60 or a `;` timecode in a non-drop file (drop-frame; STRIATCTHREE SR9030 reads the rest at the file tail), any other FCM, a transition other than
 //! `C`, `D` or a `W<nnn>` that [`WipeDir::from_code`] names (or one not shaped as below), an unknown channel, a record span unequal to its source span,
 //! a malformed timecode, and any line that is none of the above. Tracks come back canonical: V1..Vn, then A1..An.
 //!
@@ -75,7 +75,7 @@ use crate::{Clip, Ease, EditError, Kind, SizePolicy, Timeline, Transition, Trans
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdlError {
-    /// Drop-frame timecode (`FCM: DROP FRAME` or a `;` separator): only non-drop frame is read.
+    /// Drop-frame timecode off nominal 30 / 60, or a `;` separator in a non-drop file (STRIATCTHREE SR9030 reads the rest).
     DropFrame { line: usize },
     /// An FCM other than `NON-DROP FRAME`.
     Fcm { line: usize },
@@ -101,7 +101,7 @@ pub enum EdlError {
 impl core::fmt::Display for EdlError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            EdlError::DropFrame { line } => write!(f, "line {line}: drop-frame timecode is not supported (non-drop frame only)"),
+            EdlError::DropFrame { line } => write!(f, "line {line}: drop-frame timecode is read only at 30 or 60 fps under FCM: DROP FRAME"),
             EdlError::Fcm { line } => write!(f, "line {line}: unknown FCM (only NON-DROP FRAME)"),
             EdlError::Transition { line } => write!(f, "line {line}: transition is not a cut, a dissolve or a known SMPTE W<nnn> wipe event"),
             EdlError::Channel { line } => write!(f, "line {line}: unknown channel"),
@@ -160,7 +160,7 @@ fn reel_ok(r: &str) -> bool {
 /// Read a CMX 3600 EDL. `fps_if_absent` is the frame rate when no `* UNA FPS` comment names one.
 pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     // Pass 1: the frame rate (it governs every timecode, wherever the comment sits).
-    let mut fps = fps_if_absent;
+    let dropped = drop_read(text, fps_if_absent)?; let text = dropped.as_ref().map_or(text, |d| d.0.as_str()); let mut fps = dropped.as_ref().map_or(fps_if_absent, |d| d.1); // STRIATCTHREE (SR9030): a drop-frame text is read as its non-drop twin at its nominal (file tail)
     for l in text.lines() {
         if let Some(r) = l.trim().strip_prefix("* UNA FPS ") {
             fps = r.trim().parse().map_err(|_| EdlError::Fps)?;
@@ -341,7 +341,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     }
     track_flags(text, &mut tl)?; // STRIATRACKMUTESOLO (SR837): the `* UNA MUTE` / `* UNA SOLO` lines, once the tracks exist (file tail)
     track_gains(text, &mut tl)?; // STRIATRACKGAIN (SR864): the `* UNA TGAIN` lines, once the tracks exist (file tail)
-    tl.validate().map_err(EdlError::Edit)?;
+    if dropped.is_some() { tl.tb = ntsc_tb(fps); } tl.validate().map_err(EdlError::Edit)?; // STRIATCTHREE (SR9030): the drop-frame document's NTSC base (file tail)
     Ok(tl)
 }
 
@@ -386,7 +386,7 @@ fn transition_lines(tl: &Timeline, ti: usize, c: &Clip, num: usize, ch: &str, fp
 /// Write `tl` as a CMX 3600 EDL: the header, the FPS and SOURCE comments, then one event per clip in record order
 /// (ties: track order), numbered from 001.
 pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
-    let fps = tl.fps().ok_or(EdlError::Fps)?;
+    let fps = tl.fps().or(drop_nominal(tl.tb)).ok_or(EdlError::Fps)?; // STRIATCTHREE (SR9030): an NTSC 30 / 60 base writes at its nominal (file tail)
     tl.validate().map_err(EdlError::Edit)?;
     let mut s = String::new();
     s.push_str(&format!("TITLE: {title}\nFCM: NON-DROP FRAME\n* UNA FPS {fps}\n"));
@@ -452,7 +452,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         }
         s.push_str(&grade_line(c)); s.push_str(&pan_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail); STRIAPAN (SR861): `* UNA PAN` (file tail)
     }
-    Ok(s)
+    Ok(drop_write(s, tl)) // STRIATCTHREE (SR9030): an NTSC 30 / 60 timeline's labels become drop-frame (file tail)
 }
 
 /// NLE4: apply a `* UNA GAIN <cdb>` or `* UNA FADE <in> <out>` line to the event above it (`None`: no event).
@@ -1427,14 +1427,138 @@ pub fn timecode_drop(t: i64, nominal: u32) -> String {
     if nominal != 30 && nominal != 60 {
         return timecode(t, nominal);
     }
-    let (t, nom) = (t.max(0), nominal as i64);
-    let drop = nom / 15;
-    let (per10, per1) = (nom * 600 - 9 * drop, nom * 60 - drop);
-    let (d, m) = (t / per10, t % per10);
-    let n = t + 9 * drop * d + if m >= drop { drop * ((m - drop) / per1) } else { 0 };
+    let n = drop_number(t, nominal); // STRIATCTHREE (SR9030): the one renumbering (file tail)
     let mut s = timecode(n, nominal);
     if let Some(i) = s.rfind(':') {
         s.replace_range(i..i + 1, ";");
     }
     s
+}
+
+// ---- STRIATCTHREE (LEDGER SR9030): drop-frame documents (named tail block) ----
+// A `FCM: DROP FRAME` EDL is translated at the text edge around the unchanged parser and writer. Read: every 11-char
+// `HH:MM:SS[:;]FF` token is taken as a drop-frame label and rewritten as the non-drop label of the same tick at the nominal
+// rate (`* UNA FPS`, else 30: CMX drop-frame is 29.97), the FCM line as `NON-DROP FRAME`, the line count kept; the parser
+// runs at the nominal and the timeline's base becomes `1001/(nominal*1000)`. Write: a 30000/1001 or 60000/1001 timeline
+// writes at its nominal and every label is relabelled through `timecode_drop`, the FCM line `DROP FRAME`. `drop_number`
+// is SR964's renumbering (moved, one rule) and `drop_tick` its inverse. Other nominals keep `DropFrame`; a skipped label is
+// `Timecode`. Owed: NLE-TC-NTSC24-EDL (24000/1001 has no drop-frame and no time-base line), NLE-TC-NTSC-NEW.
+
+/// STRIATCTHREE (SR9030): `k` for an NTSC base `1001/(k*1000)`, else `None`.
+pub fn ntsc_nominal(tb: crate::Timebase) -> Option<u32> {
+    let k = tb.den / 1000;
+    if tb.num != 1001 || tb.den % 1000 != 0 || k == 0 || k > u32::MAX as u64 { None } else { Some(k as u32) }
+}
+
+/// STRIATCTHREE (SR9030): the nominal of a drop-frame base (30000/1001 or 60000/1001), else `None`.
+fn drop_nominal(tb: crate::Timebase) -> Option<u32> {
+    ntsc_nominal(tb).filter(|k| *k == 30 || *k == 60)
+}
+
+/// STRIATCTHREE (SR9030): the NTSC base at nominal `k`.
+fn ntsc_tb(k: u32) -> crate::Timebase {
+    crate::Timebase { num: 1001, den: k as u64 * 1000 }
+}
+
+/// STRIATCTHREE (SR9030): the drop-frame label's frame number (non-drop count at `nominal`) for tick `t` (SMPTE: `nominal / 15`
+/// numbers skipped each minute but every tenth); any nominal but 30 / 60 is `t`. SR964's renumbering, moved here.
+pub fn drop_number(t: i64, nominal: u32) -> i64 {
+    let t = t.max(0);
+    if nominal != 30 && nominal != 60 {
+        return t;
+    }
+    let nom = nominal as i64;
+    let drop = nom / 15;
+    let (per10, per1) = (nom * 600 - 9 * drop, nom * 60 - drop);
+    let (d, m) = (t / per10, t % per10);
+    t + 9 * drop * d + if m >= drop { drop * ((m - drop) / per1) } else { 0 }
+}
+
+/// STRIATCTHREE (SR9030): the tick a drop-frame label's frame number `n` names ([`drop_number`]'s inverse); `None` for a
+/// skipped label (`;00` / `;01` at 30 off a tenth minute) or a negative `n`. Any nominal but 30 / 60 is `n`.
+pub fn drop_tick(n: i64, nominal: u32) -> Option<i64> {
+    if n < 0 {
+        return None;
+    }
+    if nominal != 30 && nominal != 60 {
+        return Some(n);
+    }
+    let nom = nominal as i64;
+    let drop = nom / 15;
+    let (mins, f) = (n / (nom * 60), n % (nom * 60));
+    if mins % 10 != 0 && f < drop {
+        return None;
+    }
+    Some(n - drop * (mins - mins / 10))
+}
+
+/// STRIATCTHREE (SR9030): the one token walker: every line but `TITLE:` split on ' ' (runs kept), each 11-char
+/// `HH:MM:SS[:;]FF` token through `f` (its 1-based line), the `FCM:` line through `fcm`; the line count is kept.
+fn relabel(text: &str, fcm: &str, mut f: impl FnMut(&str, usize) -> Result<String, EdlError>) -> Result<String, EdlError> {
+    let shaped = |w: &str| {
+        let b = w.as_bytes();
+        b.len() == 11 && b[2] == b':' && b[5] == b':' && (b[8] == b':' || b[8] == b';') && [0, 1, 3, 4, 6, 7, 9, 10].iter().all(|&i| b[i].is_ascii_digit())
+    };
+    let mut out = String::with_capacity(text.len());
+    for (i, l) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let l = l.strip_suffix('\r').unwrap_or(l);
+        let t = l.trim();
+        if t.starts_with("FCM:") {
+            out.push_str(fcm);
+            continue;
+        }
+        if t.starts_with("TITLE:") {
+            out.push_str(l);
+            continue;
+        }
+        let mut words: Vec<String> = Vec::new();
+        for w in l.split(' ') {
+            words.push(if shaped(w) { f(w, i + 1)? } else { String::from(w) });
+        }
+        out.push_str(&words.join(" "));
+    }
+    Ok(out)
+}
+
+/// STRIATCTHREE (SR9030): a `FCM: DROP FRAME` text as its non-drop twin and the nominal it is read at (`* UNA FPS`, else 30);
+/// `None` for any other text. A nominal but 30 / 60 is `DropFrame` (the FCM line); a skipped or malformed label is `Timecode`.
+fn drop_read(text: &str, _fps_if_absent: u32) -> Result<Option<(String, u32)>, EdlError> {
+    let Some(fl) = text.lines().position(|l| l.trim().strip_prefix("FCM:").map(str::trim) == Some("DROP FRAME")) else { return Ok(None) };
+    let mut nominal = 30u32;
+    for l in text.lines() {
+        if let Some(r) = l.trim().strip_prefix("* UNA FPS ") {
+            nominal = r.trim().parse().map_err(|_| EdlError::Fps)?;
+        }
+    }
+    if nominal != 30 && nominal != 60 {
+        return Err(EdlError::DropFrame { line: fl + 1 });
+    }
+    let nom = nominal as i64;
+    relabel(text, "FCM: NON-DROP FRAME", |w, line| {
+        let b = w.as_bytes();
+        let num = |i: usize| ((b[i] - b'0') * 10 + (b[i + 1] - b'0')) as i64;
+        let (hh, mm, ss, ff) = (num(0), num(3), num(6), num(9));
+        if mm >= 60 || ss >= 60 || ff >= nom {
+            return Err(EdlError::Timecode { line });
+        }
+        let t = drop_tick(((hh * 60 + mm) * 60 + ss) * nom + ff, nominal).ok_or(EdlError::Timecode { line })?;
+        Ok(timecode(t, nominal))
+    })
+    .map(|s| Some((s, nominal)))
+}
+
+/// STRIATCTHREE (SR9030): `write`'s text for `tl`: unchanged for a `1/n` base; for a drop-frame base every label (a tick at the
+/// nominal) relabelled through [`timecode_drop`] and the FCM line `FCM: DROP FRAME`.
+fn drop_write(s: String, tl: &Timeline) -> String {
+    let Some(nominal) = drop_nominal(tl.tb).filter(|_| tl.fps().is_none()) else { return s };
+    let nom = nominal as i64;
+    relabel(&s, "FCM: DROP FRAME", |w, _| {
+        let b = w.as_bytes();
+        let num = |i: usize| ((b[i] - b'0') * 10 + (b[i + 1] - b'0')) as i64;
+        Ok(timecode_drop(((num(0) * 60 + num(3)) * 60 + num(6)) * nom + num(9), nominal))
+    })
+    .unwrap_or(s)
 }
