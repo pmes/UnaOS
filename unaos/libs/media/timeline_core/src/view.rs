@@ -332,6 +332,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -1222,6 +1223,8 @@ pub struct Peaks {
 pub trait PeakSource {
     fn peaks(&self, src: crate::SourceId) -> Option<&Peaks>;
     fn gain_q16(&self, cdb: i32) -> i64;
+    /// STRIATHUMBNAILS (SR839): the head still of `src` at source tick `src_tick` ([`head_still`]-sized; none: no head).
+    fn thumb(&self, _src: crate::SourceId, _src_tick: i64) -> Option<&Still> { None }
 }
 
 /// THE ONE reduction: `interleaved` (`channels` per frame at `rate` Hz) to `ceil(frames * per_sec / rate)` buckets, bucket
@@ -1772,5 +1775,179 @@ mod striatrackmutesolo_tests {
         let mut off = st.clone();
         off.timeline = off.timeline.set_track_flags(0, false, false).unwrap();
         assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "no flag: the unflagged paint, byte for byte");
+    }
+}
+
+// ---- STRIATHUMBNAILS (LEDGER SR839): a video clip's head frame (named tail block) ----
+// A video clip's body shows its HEAD: the frame at `src_in`, scaled to the body's height in the frame's own aspect
+// ([`head_still`], [`SizePolicy::Fill`](crate::SizePolicy::Fill) through THE scaler `Canvas::blit_policy`), blitted at the
+// body's left edge by [`paint_head`] from [`paint_in`]'s clip-body arm through SR827's optional [`PeakSource`] hook (its
+// `thumb` method, default `None`). The box is `min(still width, body width)` wide, so a clip narrower than the still shows the
+// still's centre columns and no pixel leaves the body; the colour bar continues to the right; the labels paint over it. A head
+// whose body starts left of the canvas paints nothing. No hook or no still: the body exactly as before (every golden and the
+// kernel view band byte-identical). The stills are the face's (Stria's `nle_face::Thumbs`, decoded through `preview`).
+// Owed: NLE-THUMBNAILS-FILMSTRIP, NLE-THUMBNAILS-TAIL, NLE-THUMBNAILS-BACKGROUND, NLE-THUMBNAILS-KERNEL.
+
+/// The head still's height: the clip body's ([`paint_in`] fills `y0 + 2 .. y1 - 2` of a [`ROW_H`] row).
+pub const HEAD_H: u32 = ROW_H - 4;
+/// The widest head still (a 32:9 frame at [`HEAD_H`]).
+pub const HEAD_MAX_W: u32 = 128;
+
+/// A `w` x `h` frame's head size: `(round(w * HEAD_H / h)` clamped to `1..=HEAD_MAX_W`, `HEAD_H)`; `None` for an empty frame.
+pub fn head_size(w: u32, h: u32) -> Option<(u32, u32)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let tw = ((w as u64 * HEAD_H as u64 + h as u64 / 2) / h as u64).clamp(1, HEAD_MAX_W as u64) as u32;
+    Some((tw, HEAD_H))
+}
+
+/// `full` scaled to its [`head_size`] by [`Canvas::blit_policy`] with `Fill` (the frame's own aspect, no bars); `None` for
+/// an empty frame.
+pub fn head_still(full: &Still) -> Option<Still> {
+    let (tw, th) = head_size(full.width, full.height)?;
+    let mut c = Canvas::new(tw, th, Order::Rgba);
+    c.blit_policy(full, 0, 0, tw, th, crate::SizePolicy::Fill);
+    Some(Still { width: tw, height: th, rgba: c.px })
+}
+
+/// THE ONE head painter: `src`'s still for `(clip.src, clip.src_in)` into `body` (`x0, y0, x1, y1`, the clip body rect
+/// [`paint_in`] filled) at its left edge, `min(still width, body width)` x body height, by `Fill` (1:1 at full width, the
+/// still's centre columns when narrower). No still, a body starting left of the canvas, or an empty body: nothing.
+pub fn paint_head(c: &mut Canvas, body: (i64, i64, i64, i64), clip: &crate::Clip, src: &dyn PeakSource) {
+    let Some(s) = src.thumb(clip.src, clip.src_in) else { return };
+    let (x0, y0, x1, y1) = body;
+    let bw = (s.width as i64).min(x1 - x0);
+    let bh = y1 - y0;
+    if x0 < 0 || y0 < 0 || bw <= 0 || bh <= 0 || x0 >= c.w as i64 {
+        return;
+    }
+    c.blit_policy(s, x0 as u32, y0 as u32, bw as u32, bh as u32, crate::SizePolicy::Fill);
+}
+
+#[cfg(test)]
+mod head_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// A test hook: one head still for every key, and optionally one peak table (the waveform's ramp).
+    struct Hook(Option<Still>, Option<Peaks>);
+    impl PeakSource for Hook {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            self.1.as_ref()
+        }
+        fn gain_q16(&self, cdb: i32) -> i64 {
+            if cdb == 0 { 65536 } else { libm::round(libm::pow(10.0, cdb as f64 / 2000.0) * 65536.0) as i64 }
+        }
+        fn thumb(&self, _src: SourceId, _src_tick: i64) -> Option<&Still> {
+            self.0.as_ref()
+        }
+    }
+
+    /// A 48 x 36 still whose every pixel is distinct from its neighbours and from the clip colours.
+    fn pattern() -> Still {
+        let (w, h) = (48u32, 36u32);
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 5) as u8, (y * 7) as u8, 0x11, 255]);
+            }
+        }
+        Still { width: w, height: h, rgba }
+    }
+
+    fn one_clip(kind: Kind, clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn head_size_and_still() {
+        assert_eq!(head_size(64, 48), Some((48, 36)));
+        assert_eq!(head_size(1920, 1080), Some((64, 36)));
+        assert_eq!(head_size(0, 48), None);
+        assert_eq!(head_size(64, 0), None);
+        assert_eq!(head_size(10_000, 10), Some((HEAD_MAX_W, HEAD_H)));
+        let s = head_still(&pattern()).expect("a head");
+        assert_eq!((s.width, s.height, s.rgba.len()), (48, 36, 48 * 36 * 4));
+        assert_eq!(s, pattern(), "a still already head-sized scales 1:1");
+    }
+
+    #[test]
+    fn head_box_shows_the_still_and_the_bar_continues() {
+        let still = pattern();
+        let hook = Hook(Some(still.clone()), None);
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 2));
+        let l = Layout::of(320, 160, &st);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (bx, by) = (l.x_of(2) + 1, l.row_y(0) + 2);
+        let mut matched = 0;
+        for y in 0..36 {
+            for x in 0..48 {
+                let i = ((y * 48 + x) * 4) as usize;
+                assert_eq!(px(&buf, l.w, bx + x, by + y), [still.rgba[i], still.rgba[i + 1], still.rgba[i + 2], still.rgba[i + 3]], "head pixel {x},{y}");
+                matched += 1;
+            }
+        }
+        let bar = clip_colour(0, Kind::Video);
+        for y in by..by + 36 {
+            assert_eq!(px(&buf, l.w, bx + 48, y), bar, "the colour bar continues right of the box");
+        }
+        let bgra = paint_in(&st, l, Order::Bgra, None, None, Some(&hook));
+        assert!(buf.chunks(4).zip(bgra.chunks(4)).all(|(a, b)| a == [b[2], b[1], b[0], b[3]]), "the BGRA paint is the same picture");
+        std::println!("striathumbnails: head box 48x36 matched={matched} fnv={:016x}", fnv1a(&buf));
+    }
+
+    #[test]
+    fn head_none_and_audio_unchanged() {
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&Hook(None, None))), none, "no still: the body as before");
+        // the audio body under a hook holding BOTH a still and SR827's ramp table is SR827's golden: no head on audio
+        let ramp = Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() };
+        let a = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
+        let la = Layout::of(320, 160, &a);
+        let wave = paint_in(&a, la, Order::Rgba, None, None, Some(&Hook(Some(pattern()), Some(ramp))));
+        assert_eq!(alloc::format!("{:016x}", fnv1a(&wave)), "923f68ef86d1a44d", "the audio body equals the STRIAWAVEFORM golden");
+    }
+
+    #[test]
+    fn head_narrow_clip_stays_inside_its_body() {
+        let hook = Hook(Some(pattern()), None);
+        // a 3-tick clip at zoom 8: a 22 px body, narrower than the 48 px still
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 3, 4));
+        let l = Layout::of(320, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (x0, x1) = (l.x_of(4) + 1, l.x_of(7) - 1);
+        let (y0, y1) = (l.row_y(0) + 2, l.row_y(0) + ROW_H as i64 - 2);
+        let mut inside = 0;
+        for y in 0..l.h as i64 {
+            for x in 0..l.w as i64 {
+                let (a, b) = (px(&buf, l.w, x, y), px(&none, l.w, x, y));
+                if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                    inside += (a != b) as usize;
+                } else {
+                    assert_eq!(a, b, "a head pixel at {x},{y} outside the body");
+                }
+            }
+        }
+        assert_eq!(inside as i64, (x1 - x0) * (y1 - y0), "the whole narrow body is the head");
+        // the body shows the still's centre columns (Fill's centred crop)
+        let still = pattern();
+        let c0 = ((48 - (x1 - x0)) / 2) as usize;
+        let i = c0 * 4;
+        assert_eq!(px(&buf, l.w, x0, y0), [still.rgba[i], still.rgba[i + 1], still.rgba[i + 2], still.rgba[i + 3]], "the centre crop");
+        std::println!("striathumbnails: narrow body {}x{} px all head, none outside", x1 - x0, y1 - y0);
     }
 }
