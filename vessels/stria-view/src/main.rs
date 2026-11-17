@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("snap", "Snap"), // STRIASNAPTOGGLE (SR892): the drag snap default on / off (THE `snap` word)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,31 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIASNAPTOGGLE (LEDGER SR892): the `snap` transport button — the drag snap default on / off (named tail block) ----
+#[cfg(test)]
+mod striasnaptoggle_tests {
+    use super::*;
+
+    /// STRIASNAPTOGGLE M3: the transport row's second-to-last button is `snap` (before `help`), firing the face's `snap`
+    /// word; driving it (the `--do` road the click takes) turns the snap default off and names it on the message line
+    /// (the witness's errors list), a second press turns it back on.
+    #[test]
+    fn striasnaptoggle_button_before_help_drives_the_word() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let TetraNode::Button { id, label, action } = &row[row.len() - 2] else { panic!("not a button") };
+        assert_eq!((id.as_str(), label.as_str()), ("snap", "Snap"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "snap"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(f.snap_on());
+        assert_eq!(drive(&mut f, text), vec!["snap: off".to_string()]);
+        assert!(!f.snap_on());
+        assert_eq!(drive(&mut f, text), vec!["snap: on".to_string()]);
+        assert!(f.snap_on());
+        println!("striasnaptoggle witness: button {id} {label:?} -> snap: off, again -> snap: on");
     }
 }

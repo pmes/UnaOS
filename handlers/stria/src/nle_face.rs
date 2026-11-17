@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "snap", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    snap_off: bool, // STRIASNAPTOGGLE (SR892): the drag snap default is off (the `snap` word flips it; Alt at the press inverts it) (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, snap_off: false }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -425,7 +426,7 @@ impl Face {
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
-        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0);
+        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, (mods & bandy::MOD_ALT != 0) != self.snap_off);
         self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick);
@@ -2386,7 +2387,7 @@ impl Face {
     /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
     fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
         let l = self.layout();
-        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0)?;
+        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, (mods & bandy::MOD_ALT != 0) != self.snap_off)?;
         self.drag = Some(d);
         Some(true)
     }
@@ -3032,5 +3033,26 @@ pub fn eta_words_of(d: Duration) -> String {
         format!("~{}:{:02}", s / 60, s % 60)
     } else {
         format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+}
+
+// ---- STRIASNAPTOGGLE (LEDGER SR892): the drag snap default on / off (named tail block) ----
+// SR836's snap (timeline_core view's `snap_targets` / `snap_to`) is switched per press by the `nosnap` bool of
+// `Drag::begin_with` / `Drag::begin_transition_edge`; the face holds the default and passes `(Alt held) != snap_off`,
+// so Alt inverts whichever default stands. The `snap` word is a view word: no commit, no undo step, not dirty; the
+// message row names the new state.
+impl Face {
+    /// The `snap` word: flip the drag snap default and name it on the message row (`snap: on` / `snap: off`).
+    fn snap_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "snap" {
+            return None;
+        }
+        self.snap_off = !self.snap_off;
+        self.last_error = Some(format!("snap: {}", if self.snap_off { "off" } else { "on" }));
+        Some(true)
+    }
+    /// A plain press snaps (the default; Alt at the press inverts it).
+    pub fn snap_on(&self) -> bool {
+        !self.snap_off
     }
 }
