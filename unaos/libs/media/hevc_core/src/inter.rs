@@ -223,12 +223,13 @@ pub fn merge_motion(pic: &Picture, geo: &Geometry, ctx: &InterCtx, sh: &SliceHea
     let second_hor = matches!(b.part, Part::P2NxN | Part::P2NxnU | Part::P2NxnD) && b.idx == 1;
     // 8.5.3.2.3 spatial candidates.
     let a1 = if second_vert { None } else { get(b.x - 1, b.y + b.h - 1) };
-    let mut b1 = if second_hor { None } else { get(b.x + b.w - 1, b.y - 1) };
+    let nb1 = if second_hor { None } else { get(b.x + b.w - 1, b.y - 1) };
+    let mut b1 = nb1; // HEVCWPTOSHIBALUMA (SR1082) 8.5.3.2.3: B0 prunes against the B1 NEIGHBOUR (availableB1), not the pruned candidate
     if b1.is_some() && b1 == a1 {
         b1 = None;
     }
     let mut bb0 = get(b.x + b.w, b.y - 1);
-    if bb0.is_some() && bb0 == b1 {
+    if bb0.is_some() && bb0 == nb1 {
         bb0 = None;
     }
     let mut a0 = get(b.x - 1, b.y + b.h);

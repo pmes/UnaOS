@@ -64,18 +64,18 @@ fn md5(data: &[u8]) -> String {
     crypto_core::md5::md5(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Decode vector `name` and check it; `None` when it was not available (SKIP).
-fn run(name: &str) -> Option<String> {
-    let v = fetch(name)?;
-    let (frames, checks) = decode_all(&v.stream).unwrap_or_else(|e| panic!("{name}: {e}"));
-    check_vector(name, &v, frames, checks)
+/// Decode vector `name` and check it; `Verdict::Skip` when it was not available.
+fn run(name: &str) -> Verdict {
+    let Some(v) = fetch(name) else { return Verdict::Skip };
+    let (frames, checks) = match decode_all(&v.stream) { Ok(d) => d, Err(e) => return Verdict::Decode(e.to_string()) };
+    check_vector(&v, frames, checks)
 }
 
 /// HEVCREXT (SR334): `run`'s check of one decoded vector — the hash SEI verdicts, then the md5 of the output YUV.
-fn check_vector(name: &str, v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, HashCheck)>) -> Option<String> {
-    assert!(!frames.is_empty(), "{name}: no frames decoded");
-    let bad: Vec<_> = checks.iter().filter(|(_, c)| matches!(c, HashCheck::Mismatch(_))).collect();
-    assert!(bad.is_empty(), "{name}: decoded picture hash SEI mismatch at (POC, cIdx) {bad:?}");
+fn check_vector(v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, HashCheck)>) -> Verdict {
+    if frames.is_empty() { return Verdict::Decode("no frames decoded".into()) }
+    let bad: Vec<_> = checks.iter().filter(|(_, c)| matches!(c, HashCheck::Mismatch(_))).copied().collect();
+    if !bad.is_empty() { return Verdict::HashMismatch(bad) }
     let ok = checks.iter().filter(|(_, c)| *c == HashCheck::Match).count();
     let md5_unchecked = checks.len() - ok;
     let out: Vec<Vec<u8>> = frames.iter().map(yuv_bytes).collect();
@@ -89,19 +89,16 @@ fn check_vector(name: &str, v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, Ha
                 r != Some(f.as_slice())
             })
         });
-        panic!("{name}: decoded YUV md5 {got}, want {} ({} frames; first differing frame against the zip's yuv: {at:?})", v.md5, frames.len());
+        return Verdict::Md5(got, v.md5.clone(), frames.len(), at);
     }
-    Some(format!("{} frames md5 ok, hash SEI: {ok} CRC/checksum ok, {md5_unchecked} MD5 unchecked", frames.len()))
+    Verdict::Ok(format!("{} frames md5 ok, hash SEI: {ok} CRC/checksum ok, {md5_unchecked} MD5 unchecked", frames.len()))
 }
 
 macro_rules! vectors {
     ($($t:ident = $n:expr),* $(,)?) => {$(
         #[test]
         fn $t() {
-            match run($n) {
-                Some(s) => eprintln!("{}: {s}", $n),
-                None => eprintln!("SKIP {}", $n),
-            }
+            report($n, run($n))
         }
     )*};
 }
@@ -134,20 +131,26 @@ vectors!(
 #[test]
 fn rext_vectors_decode_or_are_refused_by_name() {
     let names = LIST.lines().filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("hevc/rext/")?.strip_suffix(".zip"));
+    let mut rows = Vec::new();
     for name in names {
-        let Some(v) = fetch(&format!("rext/{name}")) else {
-            eprintln!("SKIP hevc/rext/{name}");
-            continue;
-        };
-        match decode_all(&v.stream) {
-            Err(Error::Unsupported(msg)) if msg.contains("HEVCREXT") => eprintln!("{name}: refused by name ({msg})"),
-            Err(e) => panic!("{name}: {e}"),
-            Ok((frames, checks)) => match check_vector(name, &v, frames, checks) {
-                Some(s) => eprintln!("{name}: {s}"),
-                None => eprintln!("SKIP {name}"),
+        let Some(verdict) = row_verdict(|| Some(match fetch(&format!("rext/{name}")) {
+            None => Verdict::Skip,
+            Some(v) => match decode_all(&v.stream) {
+                Err(Error::Unsupported(msg)) if msg.contains("HEVCREXT") => {
+                    eprintln!("{name}: refused by name ({msg})");
+                    return None;
+                }
+                Err(e) => Verdict::Decode(e.to_string()),
+                Ok((frames, checks)) => check_vector(&v, frames, checks),
             },
+        })) else { continue };
+        match &verdict {
+            Verdict::Skip => eprintln!("SKIP hevc/rext/{name}"),
+            v => eprintln!("{name}: {v}"),
         }
+        rows.push((name.to_string(), verdict));
     }
+    if let Some(m) = red_rows("rext", &rows) { panic!("{m}") }
 }
 
 fn plane(w: usize, h: usize, data: &[u16]) -> Plane {
@@ -191,7 +194,7 @@ fn sei_parse_kat() {
     md5.push(0x80);
     let want: [[u8; 16]; 3] = core::array::from_fn(|c| core::array::from_fn(|i| (c * 16 + i) as u8));
     assert_eq!(sei::picture_hash(&md5), Ok(Some(PictureHash::Md5(want))));
-    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0));
+    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0b111)); // SR1090: cIdx mask
     assert_eq!(sei::picture_hash(&[5, 1, 0, 0x80]), Ok(None));
     assert_eq!(sei::picture_hash(&[132, 7, 1, 0x12]), Err(Error::Truncated));
 }
@@ -222,7 +225,7 @@ fn md5_kat() {
 
 /// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 per component through crypto_core, against the hex of an
 /// independent MD5 (Python's hashlib over the same pictureData bytes): a 2x2 / 1x1 / 1x1 picture at 8 bits matches, a
-/// changed Cr is Mismatch(2); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
+/// changed Cr is Mismatch(0b100); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
 #[test]
 fn sei_md5_kat() {
     let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -234,9 +237,174 @@ fn sei_md5_kat() {
     let want = PictureHash::Md5(["08d6c05a21512a79a1dfeb9d2a8f262f", "8bb6c17838643f9691cc6a4de6c51709", "06eca1b437c7904cc3ce6546c8110110"].map(digest));
     assert_eq!(sei::check(&pic, 8, 8, &want), HashCheck::Match);
     let cr_off = [pic[0].clone(), pic[1].clone(), plane(1, 1, &[7])];
-    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(2));
+    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(0b100)); // SR1090: cIdx mask
     assert_eq!(hex(sei::plane_md5(&plane(2, 2, &[0x3FF, 0, 1, 2]), 10)), "c0e517ad64daf3a79e06d779d07d8b26");
     let mono = [pic[0].clone(), plane(0, 0, &[]), plane(0, 0, &[])];
     let one = PictureHash::Md5([digest("08d6c05a21512a79a1dfeb9d2a8f262f"), [0; 16], [0; 16]]);
     assert_eq!(sei::check(&mono, 8, 8, &one), HashCheck::Match);
+}
+
+// ---- HEVCREXTLOOPALLROWS (LEDGER SR1094): one verdict per vector; the loops list every red row (named tail block) ----
+
+/// HEVCREXTLOOPALLROWS (SR1094): `check_vector` / `run`'s verdict for one vector. Its Display is the old panic text
+/// without the `{name}: ` prefix, which the caller adds (`report`, `red_rows`).
+enum Verdict {
+    Ok(String),
+    Skip,
+    HashMismatch(Vec<(i32, HashCheck)>),
+    /// got, want, frames decoded, the first frame differing from the zip's yuv (None: the zip carries no yuv).
+    Md5(String, String, usize, Option<Option<usize>>),
+    Decode(String),
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Verdict::Ok(s) | Verdict::Decode(s) => f.write_str(s),
+            Verdict::Skip => f.write_str("SKIP"),
+            Verdict::HashMismatch(bad) => write!(f, "decoded picture hash SEI mismatch at (POC, planes) {bad:?}"),
+            Verdict::Md5(got, want, n, at) => {
+                write!(f, "decoded YUV md5 {got}, want {want} ({n} frames; first differing frame against the zip's yuv: {at:?})")
+            }
+        }
+    }
+}
+
+/// The per-vector test's arm: Ok and Skip print, anything else panics with `{name}: {verdict}` (the old texts).
+fn report(name: &str, v: Verdict) {
+    match v {
+        Verdict::Ok(s) => eprintln!("{name}: {s}"),
+        Verdict::Skip => eprintln!("SKIP {name}"),
+        v => panic!("{name}: {v}"),
+    }
+}
+
+/// Every red row (not Ok, not Skip) of a loop as ONE message, `None` when there is none.
+fn red_rows(kind: &str, rows: &[(String, Verdict)]) -> Option<String> {
+    let red: Vec<String> = rows.iter().filter(|(_, v)| !matches!(v, Verdict::Ok(_) | Verdict::Skip)).map(|(n, v)| format!("{n}: {v}")).collect();
+    (!red.is_empty()).then(|| format!("{} {kind} rows red: [{}]", red.len(), red.join(", ")))
+}
+
+/// A 2x2 8-bit 4:2:0 frame with luma `y` and chroma 5 / 6 (`yuv_bytes` is y ++ [5] ++ [6]).
+fn frame8(y: [u8; 4]) -> Frame {
+    Frame {
+        width: 2,
+        height: 2,
+        planes: [y.to_vec(), vec![5], vec![6]],
+        poc: 0,
+        tag: 0,
+        full_range: false,
+        bit_depth: 8,
+        planes16: None,
+        chroma: h264_core::ChromaFormat::Yuv420,
+        bit_depth_c: 8,
+    }
+}
+
+fn vector(md5: &str, yuv: Option<Vec<u8>>) -> Vector {
+    Vector { stream: Vec::new(), md5: md5.into(), yuv }
+}
+
+#[test]
+fn verdict_hash_mismatch_prints_the_old_panic_text() {
+    let v = Verdict::HashMismatch(vec![(2, HashCheck::Mismatch(0b001)), (3, HashCheck::Mismatch(0b011))]);
+    assert_eq!(format!("WP: {v}"), "WP: decoded picture hash SEI mismatch at (POC, planes) [(2, Mismatch(Y)), (3, Mismatch(Y+Cb))]");
+}
+
+#[test]
+fn verdict_md5_names_the_frame_count_and_first_differing_frame() {
+    // md5_kat pins 6ac1e56b.. for frame8([1, 2, 3, 4]).
+    let ok = check_vector(&vector("6ac1e56bc78f031059be7be854522c4c", None), vec![frame8([1, 2, 3, 4])], vec![]);
+    assert!(matches!(&ok, Verdict::Ok(s) if s == "1 frames md5 ok, hash SEI: 0 CRC/checksum ok, 0 MD5 unchecked"));
+    let want = "0".repeat(32);
+    let zip_yuv = [yuv_bytes(&frame8([1, 2, 3, 4])), yuv_bytes(&frame8([9, 9, 9, 9]))].concat();
+    let red = check_vector(&vector(&want, Some(zip_yuv)), vec![frame8([1, 2, 3, 4]), frame8([1, 2, 3, 4])], vec![]);
+    let Verdict::Md5(got, w, n, at) = &red else { panic!("expected Md5, got {red}") };
+    assert_eq!((w.as_str(), *n, *at), (want.as_str(), 2, Some(Some(1))));
+    let old = format!("decoded YUV md5 {got}, want {} ({} frames; first differing frame against the zip's yuv: {at:?})", want, 2);
+    assert_eq!(red.to_string(), old);
+    assert!(red.to_string().ends_with("(2 frames; first differing frame against the zip's yuv: Some(Some(1)))"));
+}
+
+#[test]
+fn verdict_loop_names_every_red_row() {
+    let good = "6ac1e56bc78f031059be7be854522c4c";
+    let rows = vec![
+        ("r1".to_string(), check_vector(&vector(&"0".repeat(32), None), vec![frame8([1, 2, 3, 4])], vec![])),
+        ("r2".to_string(), check_vector(&vector(good, None), vec![frame8([1, 2, 3, 4])], vec![(0, HashCheck::Match)])),
+        ("r3".to_string(), check_vector(&vector(good, None), vec![frame8([1, 2, 3, 4])], vec![(0, HashCheck::Mismatch(0b100))])),
+        ("r4".to_string(), Verdict::Skip),
+    ];
+    let m = red_rows("rext", &rows).expect("two red rows");
+    assert!(m.starts_with("2 rext rows red: [r1: decoded YUV md5 "), "{m}");
+    assert!(m.contains("want 00000000000000000000000000000000 (1 frames; first differing frame against the zip's yuv: None)"), "{m}");
+    assert!(m.ends_with(", r3: decoded picture hash SEI mismatch at (POC, planes) [(0, Mismatch(Cr))]]"), "{m}");
+    assert!(!m.contains("r2") && !m.contains("r4"), "{m}");
+    assert_eq!(red_rows("rext", &rows[1..2]), None);
+}
+
+#[test]
+fn verdict_per_vector_panic_text_is_verbatim() {
+    let text = |v: Verdict| {
+        let p = std::panic::catch_unwind(|| report("X", v)).expect_err("a red verdict panics");
+        p.downcast::<String>().map(|s| *s).unwrap_or_default()
+    };
+    assert_eq!(text(Verdict::Decode(Error::Truncated.to_string())), "X: hevc: truncated");
+    assert_eq!(text(Verdict::HashMismatch(vec![(1, HashCheck::Mismatch(0b110))])), "X: decoded picture hash SEI mismatch at (POC, planes) [(1, Mismatch(Cb+Cr))]");
+    report("X", Verdict::Skip);
+    report("X", Verdict::Ok("1 frames md5 ok".into()));
+}
+
+// ---- HEVCREXTLOOPCATCHPANIC (LEDGER SR1099): one rext row under catch_unwind; a panic is the row's Decode verdict (named tail block) ----
+
+/// HEVCREXTLOOPCATCHPANIC (SR1099): run one loop row under ONE catch_unwind; a panic (fetch's "not in the zip", a decoder
+/// bug) becomes the row's `Decode("panic: {msg}")`, so the loop goes on to the next row. `None` is a row refused by name.
+fn row_verdict(row: impl FnOnce() -> Option<Verdict>) -> Option<Verdict> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(row)).unwrap_or_else(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+        Some(Verdict::Decode(format!("panic: {}", msg.as_deref().unwrap_or("<non-string payload>"))))
+    })
+}
+
+/// The text of a row's verdict (`Verdict` has no Debug): `None` for a refused row.
+fn caught(row: impl FnOnce() -> Option<Verdict>) -> Option<String> {
+    row_verdict(row).map(|v| match v {
+        Verdict::Decode(s) => format!("Decode({s})"),
+        v => v.to_string(),
+    })
+}
+
+#[test]
+fn verdict_catch_panic_str_payload_is_a_decode_verdict() {
+    assert_eq!(caught(|| std::panic::panic_any("boom")), Some("Decode(panic: boom)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_string_payload_is_a_decode_verdict() {
+    let (rel, bitstream) = ("hevc/rext/R.zip", "r.bit");
+    let got = caught(|| panic!("{rel}: {bitstream} is not in the zip"));
+    assert_eq!(got, Some("Decode(panic: hevc/rext/R.zip: r.bit is not in the zip)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_non_string_payload_falls_back() {
+    assert_eq!(caught(|| std::panic::panic_any(7u32)), Some("Decode(panic: <non-string payload>)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_passes_a_returned_verdict_through() {
+    let ok = row_verdict(|| Some(Verdict::Ok("1 frames md5 ok".into())));
+    assert!(matches!(&ok, Some(Verdict::Ok(s)) if s == "1 frames md5 ok"));
+    assert!(row_verdict(|| None).is_none(), "a row refused by name stays None");
+}
+
+#[test]
+fn verdict_catch_panic_red_rows_names_the_panicking_row() {
+    let ok = || row_verdict(|| Some(Verdict::Ok("ok".into()))).expect("Ok row");
+    let rows = vec![
+        ("r1".to_string(), ok()),
+        ("r2".to_string(), row_verdict(|| panic!("{}: r2.bit is not in the zip", "hevc/rext/r2.zip")).expect("panic row")),
+        ("r3".to_string(), ok()),
+    ];
+    assert_eq!(red_rows("rext", &rows), Some("1 rext rows red: [r2: panic: hevc/rext/r2.zip: r2.bit is not in the zip]".into()));
 }

@@ -417,7 +417,7 @@ fn sao_edge_offset_kat() {
 
 /// HEVCCONF (SR321): the decoded picture hash SEI (a suffix SEI after the picture's slice) is checked against the
 /// decoded, filtered, uncropped picture: the flat-128 64x48 picture with its true CRCs is a Match, with a checksum one
-/// off in luma a Mismatch(0). The hash functions themselves have KATs in tests/conformance.rs.
+/// off in luma a Mismatch(0b001). The hash functions themselves have KATs in tests/conformance.rs.
 #[test]
 fn picture_hash_sei_checks_the_decoded_picture() {
     use hevc_core::picture::Plane;
@@ -444,12 +444,12 @@ fn picture_hash_sei_checks_the_decoded_picture() {
     for (c, p) in flat.iter().enumerate() {
         sum.extend((plane_checksum(p, 8) + u32::from(c == 0)).to_be_bytes());
     }
-    assert_eq!(checks(sum), [(0, HashCheck::Mismatch(0))]);
+    assert_eq!(checks(sum), [(0, HashCheck::Mismatch(0b001))]); // SR1090: cIdx mask
 }
 
 /// HEVCLEVELLINE (SR368, HEVCSEI-MD5): the flat-128 64x48 picture's MD5 SEI (hash_type 0, payloadSize 49) through
 /// `Decoder::take_hash_checks`, against the hex of an independent MD5 (Python's hashlib: 3072 and 768 bytes of 0x80):
-/// a Match, and a Cb digest one byte off a Mismatch(1).
+/// a Match, and a Cb digest one byte off a Mismatch(0b010).
 #[test]
 fn picture_md5_sei_checks_the_decoded_picture() {
     use hevc_core::sei::HashCheck;
@@ -471,7 +471,7 @@ fn picture_md5_sei_checks_the_decoded_picture() {
         d.take_hash_checks()
     };
     assert_eq!(checks(0), [(0, HashCheck::Match)]);
-    assert_eq!(checks(1), [(0, HashCheck::Mismatch(1))]);
+    assert_eq!(checks(1), [(0, HashCheck::Mismatch(0b010))]); // SR1090: cIdx mask
 }
 
 // ---- HEVCINTERCIP (LEDGER SR688): constrained intra prediction and generated reference pictures (named tail block) ----
