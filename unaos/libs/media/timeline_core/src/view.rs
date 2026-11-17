@@ -726,8 +726,8 @@ impl Drag {
         match self.kind {
             DragKind::TrimOut if self.roll => st.roll_selected(self.delta), // STRIAROLLMORE (SR954): the roll tool's drag is ONE roll of the cut at the clip's out edge
             DragKind::TrimIn | DragKind::TrimOut if self.ripple => st.ripple_trim(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta),
-            DragKind::TrimIn => st.trim(Edge::In, self.delta),
-            DragKind::TrimOut => st.trim(Edge::Out, self.delta),
+            DragKind::TrimIn => st.trim_by_ticks(Edge::In, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
+            DragKind::TrimOut => st.trim_by_ticks(Edge::Out, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::Slip => st.slip_selected(self.delta),
             DragKind::Slide => st.slide_selected(self.delta),
             DragKind::Move if st.set.len() > 1 => st.move_set_track(self.to_track as isize - self.track as isize, self.delta), // STRIAMULTISELECTMORE (SR950)

@@ -1485,14 +1485,14 @@ impl Timeline {
     pub fn slide(&self, track: usize, idx: usize, delta: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let c = *clip_mut(&mut tl, track, idx)?;
-        if slide_follows_rated(&tl.tracks[track], idx) { return Err(EditError::Rate); } let (cut_in, cut_out) = (c.at, c.end()); // STRIACLIPSPEED (SR829): a rated butted neighbour cannot follow tick for tick (file tail)
+        if slide_follows_rated(&tl.tracks[track], idx, delta) { return Err(EditError::Rate); } let (cut_in, cut_out) = (c.at, c.end()); // STRIACLIPSPEED (SR829): a rated butted neighbour cannot follow tick for tick (file tail); STRIACLIPSPEEDMORE (SR951): only one that cannot land exactly
         let tr = &mut tl.tracks[track];
         if let Some(p) = idx.checked_sub(1).and_then(|i| tr.clips.get_mut(i)).filter(|p| p.end() == cut_in) {
-            p.src_out = p.src_out.saturating_add(delta);
+            p.src_out = follow_src(*p, cut_in, p.src_out, delta); // STRIACLIPSPEEDMORE (SR951): through src_at at a rate (1x: src_out + delta) (file tail)
         }
         if let Some(n) = tr.clips.get_mut(idx + 1).filter(|n| n.at == cut_out) {
             n.at = n.at.saturating_add(delta);
-            n.src_in = n.src_in.saturating_add(delta);
+            n.src_in = follow_src(Clip { at: cut_out, ..*n }, cut_out, n.src_in, delta); // STRIACLIPSPEEDMORE (SR951): the pre-move clip through src_at (1x: src_in + delta) (file tail)
         }
         tr.clips[idx].at = cut_in.saturating_add(delta);
         for x in tr.transitions.iter_mut().filter(|x| x.at == cut_in || x.at == cut_out) {
@@ -1716,12 +1716,13 @@ fn cut_clean(t: &Track, at: i64) -> bool {
     })
 }
 
-/// STRIACLIPSPEED: clip `idx` of `t` has a butted neighbour that `slide` would make follow and that neighbour is rated.
-fn slide_follows_rated(t: &Track, idx: usize) -> bool {
+/// STRIACLIPSPEED: clip `idx` of `t` has a butted neighbour that `slide` would make follow and that neighbour is rated;
+/// STRIACLIPSPEEDMORE (SR951): and, followed by `delta` through `follow_src`, that neighbour does not land exactly.
+fn slide_follows_rated(t: &Track, idx: usize, delta: i64) -> bool {
     let Some(c) = t.clips.get(idx) else { return false };
     let rated = |o: &Clip| o.rate_q16 != 0x1_0000;
-    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && rated(p))
-        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && rated(n))
+    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && rated(p) && Clip { src_out: follow_src(*p, c.at, p.src_out, delta), ..*p }.end() != c.at.saturating_add(delta))
+        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && rated(n) && Clip { src_in: follow_src(*n, n.at, n.src_in, delta), at: n.at.saturating_add(delta), ..*n }.end() != n.end())
 }
 
 impl Timeline {
@@ -1828,7 +1829,7 @@ mod striaclipspeed_tests {
         assert_eq!(tl2(0x1_0000).set_rate(0, 0, 0), Err(EditError::Rate));
         let mut b = tl2(0x2_0000);
         b.tracks[0].clips[1].at = 5;
-        assert_eq!(b.slide(0, 1, 1), Err(EditError::Rate), "a rated butted neighbour cannot follow");
+        assert_eq!(b.slide(0, 1, 1).map(|s| s.tracks[0].clips.clone()), Ok(alloc::vec![Clip::new(SourceId(0), 0, 12, 0).at_rate(0x2_0000), Clip::new(SourceId(0), 20, 30, 6)]), "a 2x butted neighbour follows through src_at"); // STRIACLIPSPEEDMORE (SR951): was Err(EditError::Rate)
         assert!(tl2(0x1_0000).slide(0, 1, -1).is_ok());
         std::println!("striaclipspeed: trim_in at 2x keeps end 5; set_rate 2x == built 2x; 0.5x into a neighbour -> {}", EditError::Overlap);
     }
@@ -3259,5 +3260,131 @@ impl Timeline {
         tl.retarget_transitions(self)?;
         tl.validate()?;
         Ok(tl)
+    }
+}
+
+// ---- STRIACLIPSPEEDMORE (LEDGER SR951): a rated clip edits like a 1x clip — slide follows through src_at, the rippling speed change (named tail block) ----
+// `slide` makes its butted neighbours follow through ONE `follow_src`: at 1x the old `saturating_add` (so every 1x slide is
+// unchanged), at a rate the source point THE `Clip::src_at` of the PRE-move clip gives at the moved edge; the parent's
+// `slide_follows_rated` now refuses (`Rate`) only a rated neighbour that cannot land exactly there (a 0.5x hold's half
+// frame). `ripple_set_rate` is the existing ripple body (`ripple_trim`) on the re-rated clip: later clips, transitions and
+// explicit audio crossfades of its track at or past its old end shift by the length change (NLE-SPEED-RIPPLE), where
+// `set_rate` refuses `Overlap`. The drag's timeline delta is converted in `EditorState::trim_by_ticks` (editor.rs tail).
+
+/// STRIACLIPSPEEDMORE: the source edge `old` of `c` (the PRE-move clip) when its timeline edge at `edge` moves by `delta`:
+/// 1x `old + delta` (saturating, the old slide), any other rate `c.src_at(edge + delta)`.
+fn follow_src(c: Clip, edge: i64, old: i64, delta: i64) -> i64 {
+    if c.rate_q16 == 0x1_0000 { old.saturating_add(delta) } else { c.src_at(edge.saturating_add(delta)) }
+}
+
+impl Timeline {
+    /// STRIACLIPSPEEDMORE: set clip `idx`'s speed to `rate_q16` (Q16.16) keeping its `at`; every other clip, transition and
+    /// explicit audio crossfade of `track` at or past its old end shifts by the length change (`ripple_trim`, the one ripple
+    /// body). Refused by name: `NoTrack` / `NoClip`; rate 0 `Rate` (`validate`).
+    pub fn ripple_set_rate(&self, track: usize, idx: usize, rate_q16: u32) -> Result<Timeline, EditError> {
+        let c = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        self.ripple_trim(track, idx, c.at_rate(rate_q16))
+    }
+}
+
+#[cfg(test)]
+mod striaclipspeedmore_tests {
+    extern crate std;
+    use super::*;
+    use crate::editor::{Edge, EditorState};
+    use crate::view::{Drag, DragKind, Layout};
+
+    /// V1 on source A (50): `clips` laid as given.
+    fn tl(clips: Vec<Clip>) -> Timeline {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = clips;
+        tl
+    }
+
+    fn a(src_in: i64, src_out: i64, at: i64) -> Clip {
+        Clip::new(SourceId(0), src_in, src_out, at)
+    }
+
+    #[test]
+    fn striaclipspeedmore_slide_rated_neighbours_follow_through_src_at() {
+        // P 2x 0..10 @0 (end 5) | M 1x 20..30 @5 (end 15) | N 2x 30..40 @15 (end 20).
+        let base = tl(alloc::vec![a(0, 10, 0).at_rate(0x2_0000), a(20, 30, 5), a(30, 40, 15).at_rate(0x2_0000)]);
+        let r = base.slide(0, 1, 1).unwrap();
+        assert_eq!(r.tracks[0].clips, alloc::vec![a(0, 12, 0).at_rate(0x2_0000), a(20, 30, 6), a(32, 40, 16).at_rate(0x2_0000)]);
+        let l = base.slide(0, 1, -1).unwrap();
+        assert_eq!(l.tracks[0].clips, alloc::vec![a(0, 8, 0).at_rate(0x2_0000), a(20, 30, 4), a(28, 40, 14).at_rate(0x2_0000)]);
+        let (p, n) = (base.tracks[0].clips[0], base.tracks[0].clips[2]);
+        for t in 0..4 {
+            assert_eq!(r.tracks[0].clips[0].src_at(t), p.src_at(t), "P tick {t}");
+        }
+        for t in 16..20 {
+            assert_eq!(r.tracks[0].clips[2].src_at(t), n.src_at(t), "N tick {t}");
+        }
+        let slow = tl(alloc::vec![a(0, 10, 0).at_rate(0x8000), a(20, 30, 20)]);
+        assert_eq!(slow.slide(0, 1, 1), Err(EditError::Rate), "a 0.5x neighbour cannot end on a held half frame");
+        assert_eq!(slow.slide(0, 1, 2).map(|s| s.tracks[0].clips.clone()), Ok(alloc::vec![a(0, 11, 0).at_rate(0x8000), a(20, 30, 22)]));
+        let one = tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]);
+        assert_eq!(one.slide(0, 1, -1).map(|s| s.tracks[0].clips.clone()), Ok(alloc::vec![a(0, 9, 0), a(20, 30, 9)]), "1x unchanged");
+        std::println!("striaclipspeedmore: slide +1 over 2x neighbours lands at 6 / 16; a 0.5x neighbour +1 -> {}", EditError::Rate);
+    }
+
+    #[test]
+    fn striaclipspeedmore_ripple_set_rate_shifts_the_rest_of_the_track() {
+        let base = tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]).add_transition(0, 10, TransitionKind::Dissolve, 2).unwrap();
+        assert!(base.set_rate(0, 0, 0x8000).is_err(), "set_rate does not ripple: refused");
+        let r = base.ripple_set_rate(0, 0, 0x8000).unwrap();
+        assert_eq!(r.tracks[0].clips, alloc::vec![a(0, 10, 0).at_rate(0x8000), a(20, 30, 20)]);
+        assert_eq!(r.tracks[0].transitions[0].at, 20, "the cut's transition moves with it");
+        let f = base.ripple_set_rate(0, 0, 0x2_0000).unwrap();
+        assert_eq!((f.tracks[0].clips[1].at, f.tracks[0].transitions[0].at), (5, 5));
+        assert_eq!(base.ripple_set_rate(0, 0, 0), Err(EditError::Rate));
+        assert_eq!(base.ripple_set_rate(5, 0, 0x2_0000), Err(EditError::NoTrack));
+        assert_eq!(base.ripple_set_rate(0, 9, 0x2_0000), Err(EditError::NoClip));
+        std::println!("striaclipspeedmore: ripple 0.5x moves the next clip and its dissolve 10 -> 20; plain set_rate refuses");
+    }
+
+    #[test]
+    fn striaclipspeedmore_drag_trim_lands_under_the_pointer_and_rspeed_is_one_step() {
+        let two = tl(alloc::vec![a(0, 10, 0).at_rate(0x2_0000), a(20, 30, 10)]);
+        let mut st = EditorState::new(two.clone());
+        st.select(0, 0).unwrap();
+        assert_eq!(st.trim_by_ticks(Edge::Out, -2), Ok(()));
+        let c = st.selected().unwrap();
+        assert_eq!((c.src_out, c.end()), (6, 3), "the out edge lands 2 ticks earlier at 2x");
+        let mut s1 = EditorState::new(tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]));
+        let mut s2 = s1.clone();
+        s1.select(0, 0).unwrap();
+        s2.select(0, 0).unwrap();
+        assert_eq!((s1.trim_by_ticks(Edge::In, 3), s2.trim(Edge::In, 3)), (Ok(()), Ok(())));
+        assert_eq!(s1.timeline, s2.timeline, "1x: ticks are source ticks");
+        let mut st = EditorState::new(two.clone());
+        st.select(0, 0).unwrap();
+        let d = Drag {
+            kind: DragKind::TrimOut,
+            track: 0,
+            idx: 0,
+            origin_tick: 5,
+            layout: Layout::of(320, 56, &st),
+            delta: -2,
+            to_track: 0,
+            origin: (0.0, 0.0),
+            at: (0.0, 0.0),
+            snap: false,
+            additive: false,
+            guide: None,
+        };
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.selected().unwrap().end(), 3, "the drag's edge is where the pointer left it");
+        let mut st = EditorState::new(tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]));
+        st.select(0, 0).unwrap();
+        let want = st.timeline.ripple_set_rate(0, 0, 0x8000).unwrap();
+        assert_eq!(st.verb("rspeed 0.5"), Some(Ok(())));
+        assert_eq!((&st.timeline, st.undo_depth()), (&want, 1));
+        assert_eq!(st.verb("rspeed 0"), Some(Err(EditError::Rate)));
+        assert_eq!(st.undo_depth(), 1, "a refusal pushes nothing");
+        assert_eq!(st.verb("rspeed x"), None);
+        std::println!("striaclipspeedmore: 2x drag -2 ticks ends at 3; rspeed 0.5 one undo step; rspeed 0 -> {}", EditError::Rate);
     }
 }
