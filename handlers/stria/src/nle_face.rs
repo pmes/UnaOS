@@ -2957,19 +2957,19 @@ fn eta_sample(j: &mut ExportJob, now: std::time::Instant) {
 }
 
 /// The remaining time of `remaining` frames at `rate` frames per second. `None` for a rate that is not positive and finite,
-/// or a time a `Duration` cannot hold.
-pub fn eta_of_rate(remaining: u64, rate: f64) -> Option<Duration> {
+/// or a time a `Duration` cannot hold; plus `since_last` (the time since the last sampled move) beyond one frame interval `1 / rate`, never negative, so a stalled export's eta grows (NLE5DEXPORTMESSAGEETASTALL SR811).
+pub fn eta_of_rate(remaining: u64, rate: f64, since_last: Duration) -> Option<Duration> {
     if !(rate > 0.0 && rate.is_finite()) {
         return None;
     }
-    Duration::try_from_secs_f64(remaining as f64 / rate).ok()
+    Duration::try_from_secs_f64(remaining as f64 / rate + (since_last.as_secs_f64() - 1.0 / rate).max(0.0)).ok()
 }
 
 /// THE eta of a running job at the reading `(d, t)`: [`eta_of_rate`] over the EMA once it has a rate, else SR796's mean
 /// ([`eta_of`] over `started`), so a job sampled fewer than two moves (every paused fixture) reads the mean unchanged.
 fn job_eta(j: &ExportJob, d: u64, t: u64) -> Option<Duration> {
     if j.rate_ema > 0.0 {
-        eta_of_rate(t.saturating_sub(d), j.rate_ema)
+        eta_of_rate(t.saturating_sub(d), j.rate_ema, j.rate_at.0.elapsed())
     } else {
         eta_of(d, t, j.started.elapsed())
     }

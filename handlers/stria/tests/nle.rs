@@ -3196,11 +3196,11 @@ fn nle5dexportmessageetaband_tick_repaints_when_the_eta_word_moves() {
 fn nle5dexportmessageetasmooth_eta_of_rate_kat() {
     use stria::nle_face::eta_of_rate;
     use std::time::Duration;
-    let e = eta_of_rate(32, 10.0).expect("32 frames at 10 fps");
+    let e = eta_of_rate(32, 10.0, Duration::ZERO).expect("32 frames at 10 fps");
     assert_eq!(e.as_millis(), 3200, "{e:?}: 32 / 10 = 3.2 s");
-    assert_eq!(eta_of_rate(0, 10.0), Some(Duration::ZERO), "nothing left: no time left");
+    assert_eq!(eta_of_rate(0, 10.0, Duration::ZERO), Some(Duration::ZERO), "nothing left: no time left");
     for r in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert_eq!(eta_of_rate(32, r), None, "rate {r}: no estimate");
+        assert_eq!(eta_of_rate(32, r, Duration::ZERO), None, "rate {r}: no estimate");
     }
     println!("nle5dexportmessageetasmooth: eta_of_rate 32 @ 10 fps = {e:?}; rate 0 / negative / NaN / inf -> None");
 }
@@ -3252,11 +3252,70 @@ fn nle5dexportmessageetasmooth_scripted_slow_start() {
     assert_eq!(st.1, (now, 302));
     let same = ema_sample(st.0, st.1, 302, now + ms(100));
     assert_eq!(same, st, "a tick with done fixed changes nothing: the paused job keeps its rate");
-    let smooth = eta_of_rate(total - done, st.0).expect("an EMA eta");
+    let smooth = eta_of_rate(total - done, st.0, Duration::ZERO).expect("an EMA eta");
     let elapsed = now - started;
     let mean = elapsed * (total - done) as u32 / done as u32;
     assert!(smooth < mean, "{smooth:?} >= {mean:?}: after the fast run the EMA eta sits under the mean's");
     assert!(st.0 > 50.0 && st.0 < 100.0, "{}: between the mean and the true 100 fps", st.0);
     assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
     println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALL (LEDGER SR811): a stalled export's eta grows by the overdue time (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetastall_eta_of_rate_kat() {
+    use stria::nle_face::eta_of_rate;
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    let near = |d: Option<Duration>, want: Duration| d.is_some_and(|d| d.abs_diff(want) < ms(1));
+    assert_eq!(eta_of_rate(32, 10.0, Duration::ZERO).map(|d| d.as_millis()), Some(3200), "no stall: 32 / 10 = 3.2 s");
+    assert_eq!(eta_of_rate(32, 10.0, ms(50)).map(|d| d.as_millis()), Some(3200), "50 ms is under one 100 ms frame: no overdue");
+    let late = eta_of_rate(32, 10.0, ms(2100));
+    assert!(near(late, ms(5200)), "{late:?}: 3.2 s + (2.1 s - 0.1 s) overdue");
+    let left0 = eta_of_rate(0, 10.0, ms(5000));
+    assert!(near(left0, ms(4900)), "{left0:?}: nothing left but stalled 5 s: the overdue alone (the export is not done)");
+    for r in [0.0, f64::NAN] {
+        assert_eq!(eta_of_rate(32, r, ms(5000)), None, "rate {r}: no estimate, stalled or not");
+    }
+    let base = eta_of_rate(32, 10.0, Duration::ZERO).unwrap();
+    let (a, b, c) = (eta_of_rate(32, 10.0, ms(3000)).unwrap(), eta_of_rate(32, 10.0, ms(4000)).unwrap(), eta_of_rate(32, 10.0, ms(5000)).unwrap());
+    assert!(base <= a && a < b && b < c, "{base:?} {a:?} {b:?} {c:?}: the eta grows with the stall and never drops under the unstalled one");
+    println!("nle5dexportmessageetastall: 32 @ 10 fps: 0 / 50 ms -> 3.2 s, 2.1 s -> {late:?}; 0 left stalled 5 s -> {left0:?}");
+}
+
+#[test]
+fn nle5dexportmessageetastall_scripted_stall() {
+    use stria::nle_face::{ema_sample, eta_of_rate, eta_words_of};
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    // SR808's slow-start script by hand: a 2 s warm-up, the second move seeds 1 fps, then 30 x (100 ms, +10 frames).
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let started = t0 - Duration::from_secs(2);
+    let total = 1000u64;
+    let mut st = (0.0, (started, 0u64));
+    st = ema_sample(st.0, st.1, 1, t0);
+    st = ema_sample(st.0, st.1, 2, t0 + ms(1000));
+    let mut now = t0 + ms(1000);
+    let mut done = 2;
+    for _ in 0..30 {
+        now += ms(100);
+        done += 10;
+        st = ema_sample(st.0, st.1, done, now);
+    }
+    assert!(st.0 > 50.0 && st.0 < 100.0, "{}: SR808's EMA after the fast run", st.0);
+    // The stall: 5 s with done fixed leaves the rate and the last move alone.
+    let at = now + Duration::from_secs(5);
+    let stalled = ema_sample(st.0, st.1, done, at);
+    assert_eq!(stalled, st, "a stall changes neither the rate nor the last move");
+    let since = at - stalled.1.0;
+    assert_eq!(since, Duration::from_secs(5));
+    let fresh = eta_of_rate(total - done, st.0, Duration::ZERO).expect("the EMA eta");
+    let late = eta_of_rate(total - done, st.0, since).expect("the stalled eta");
+    // The arc's "- 0.1 s" assumed 10 fps; the frame interval is 1 / rate at the script's EMA (50..100 fps).
+    let want = fresh.as_secs_f64() + 5.0 - 1.0 / st.0;
+    assert!((late.as_secs_f64() - want).abs() < 1e-3, "{late:?} vs {want}: the EMA eta + 5 s - 1 / rate ({:.4} s, one frame at the EMA rate)", 1.0 / st.0);
+    assert_ne!(eta_words_of(late), eta_words_of(fresh), "the stalled word moved");
+    assert!(late > fresh, "{late:?} <= {fresh:?}");
+    println!("nle5dexportmessageetastall: EMA {:.2} fps: eta {fresh:?} -> {late:?} after a 5 s stall ({} -> {})", st.0, eta_words_of(fresh), eta_words_of(late));
 }
