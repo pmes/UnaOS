@@ -133,17 +133,17 @@ fn rext_vectors_decode_or_are_refused_by_name() {
     let names = LIST.lines().filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("hevc/rext/")?.strip_suffix(".zip"));
     let mut rows = Vec::new();
     for name in names {
-        let verdict = match fetch(&format!("rext/{name}")) {
+        let Some(verdict) = row_verdict(|| Some(match fetch(&format!("rext/{name}")) {
             None => Verdict::Skip,
             Some(v) => match decode_all(&v.stream) {
                 Err(Error::Unsupported(msg)) if msg.contains("HEVCREXT") => {
                     eprintln!("{name}: refused by name ({msg})");
-                    continue;
+                    return None;
                 }
                 Err(e) => Verdict::Decode(e.to_string()),
                 Ok((frames, checks)) => check_vector(&v, frames, checks),
             },
-        };
+        })) else { continue };
         match &verdict {
             Verdict::Skip => eprintln!("SKIP hevc/rext/{name}"),
             v => eprintln!("{name}: {v}"),
@@ -353,4 +353,58 @@ fn verdict_per_vector_panic_text_is_verbatim() {
     assert_eq!(text(Verdict::HashMismatch(vec![(1, HashCheck::Mismatch(0b110))])), "X: decoded picture hash SEI mismatch at (POC, planes) [(1, Mismatch(Cb+Cr))]");
     report("X", Verdict::Skip);
     report("X", Verdict::Ok("1 frames md5 ok".into()));
+}
+
+// ---- HEVCREXTLOOPCATCHPANIC (LEDGER SR1099): one rext row under catch_unwind; a panic is the row's Decode verdict (named tail block) ----
+
+/// HEVCREXTLOOPCATCHPANIC (SR1099): run one loop row under ONE catch_unwind; a panic (fetch's "not in the zip", a decoder
+/// bug) becomes the row's `Decode("panic: {msg}")`, so the loop goes on to the next row. `None` is a row refused by name.
+fn row_verdict(row: impl FnOnce() -> Option<Verdict>) -> Option<Verdict> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(row)).unwrap_or_else(|p| {
+        let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+        Some(Verdict::Decode(format!("panic: {}", msg.as_deref().unwrap_or("<non-string payload>"))))
+    })
+}
+
+/// The text of a row's verdict (`Verdict` has no Debug): `None` for a refused row.
+fn caught(row: impl FnOnce() -> Option<Verdict>) -> Option<String> {
+    row_verdict(row).map(|v| match v {
+        Verdict::Decode(s) => format!("Decode({s})"),
+        v => v.to_string(),
+    })
+}
+
+#[test]
+fn verdict_catch_panic_str_payload_is_a_decode_verdict() {
+    assert_eq!(caught(|| std::panic::panic_any("boom")), Some("Decode(panic: boom)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_string_payload_is_a_decode_verdict() {
+    let (rel, bitstream) = ("hevc/rext/R.zip", "r.bit");
+    let got = caught(|| panic!("{rel}: {bitstream} is not in the zip"));
+    assert_eq!(got, Some("Decode(panic: hevc/rext/R.zip: r.bit is not in the zip)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_non_string_payload_falls_back() {
+    assert_eq!(caught(|| std::panic::panic_any(7u32)), Some("Decode(panic: <non-string payload>)".into()));
+}
+
+#[test]
+fn verdict_catch_panic_passes_a_returned_verdict_through() {
+    let ok = row_verdict(|| Some(Verdict::Ok("1 frames md5 ok".into())));
+    assert!(matches!(&ok, Some(Verdict::Ok(s)) if s == "1 frames md5 ok"));
+    assert!(row_verdict(|| None).is_none(), "a row refused by name stays None");
+}
+
+#[test]
+fn verdict_catch_panic_red_rows_names_the_panicking_row() {
+    let ok = || row_verdict(|| Some(Verdict::Ok("ok".into()))).expect("Ok row");
+    let rows = vec![
+        ("r1".to_string(), ok()),
+        ("r2".to_string(), row_verdict(|| panic!("{}: r2.bit is not in the zip", "hevc/rext/r2.zip")).expect("panic row")),
+        ("r3".to_string(), ok()),
+    ];
+    assert_eq!(red_rows("rext", &rows), Some("1 rext rows red: [r2: panic: hevc/rext/r2.zip: r2.bit is not in the zip]".into()));
 }
