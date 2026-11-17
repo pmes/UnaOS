@@ -1673,15 +1673,7 @@ fn reresolve_font_relative<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>,
             (fs * 0.5, fs * 0.5)
         };
         let cx = ParseCx { viewport, font: (fs, root_fs, ex, ch), container: (None, None) };
-        let mut spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx); spec.paint.position_kind = tree.paint_map.get(&id).and_then(|p| p.position_kind); // SR1130: the kind (sticky's inset guard in fold_into) rides the re-applied spec
-        if let Ok(st) = tree.taffy.style(id) {
-            let mut st = st.clone();
-            spec.fold_into(&mut st);
-            let _ = tree.taffy.set_style(id, st);
-        }
-        if let Some(p) = tree.paint_map.get_mut(&id) {
-            css::merge_paint(p, &spec.paint);
-        }
+        refold(tree, id, css::reapply_declarations(&decls, &cx)); // SR1130 / SR1136: the one refold tail, seeded with the paint fields fold_into reads
     }
     true
 }
@@ -2747,15 +2739,7 @@ fn reresolve_container_units<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H
             None => ParseCx::default().font,
         };
         let cx = ParseCx { viewport, font, container: (qw, qh) };
-        let spec: SpecifiedStyle<H> = css::reapply_declarations(&decls, &cx);
-        if let Ok(st) = tree.taffy.style(id) {
-            let mut st = st.clone();
-            spec.fold_into(&mut st);
-            let _ = tree.taffy.set_style(id, st);
-        }
-        if let Some(p) = tree.paint_map.get_mut(&id) {
-            css::merge_paint(p, &spec.paint);
-        }
+        refold(tree, id, css::reapply_declarations(&decls, &cx)); // SR1136: the one refold tail, seeded with the paint fields fold_into reads
     }
     true
 }
@@ -4043,4 +4027,26 @@ fn table_align_hint<H: Host>(align: &str, tag: &str, style: &mut Style, paint: &
     };
     apply_inline_style::<H>(decl, style, paint, cx);
     true
+}
+
+// ---- AETHERCSSCONTAINERUNITSREAPPLYKIND (LEDGER SR1136): ONE refold tail for both re-resolutions (named tail block) ----
+
+/// AETHERCSSCONTAINERUNITSREAPPLYKIND (SR1136): the tail both re-resolutions (font-relative, container units) share:
+/// the re-applied length declarations' FRESH spec folded into taffy and merged into the paint. The fresh spec never
+/// carries the non-length paint fields `fold_into` branches on, so it is seeded from the node's paint where None (a
+/// re-applied declaration still wins): the position kind (sticky's inset guard, SR1130), and overflow +
+/// scrollbar-gutter only where the second fold is idempotent — a both-edges start gutter is added to the re-applied
+/// padding-left, so without one the first fold's gutter stays in the node and re-adding it would double it.
+/// `merge_paint` copies the seeded values back unchanged (the paint map's own). Container type / contain-size are
+/// not seeded: the re-resolution keeps a re-applied min-height on a size container (owed AETHER-CSS-CONTAIN-SIZE-MIN-HEIGHT).
+fn refold<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, mut spec: SpecifiedStyle<H>) {
+    if let Some(p) = tree.paint_map.get(&id) {
+        spec.paint.position_kind = spec.paint.position_kind.or(p.position_kind);
+        if p.scrollbar_gutter != Some(2) || spec.padding[3].is_some() {
+            spec.paint.overflow = spec.paint.overflow.or(p.overflow);
+            spec.paint.scrollbar_gutter = spec.paint.scrollbar_gutter.or(p.scrollbar_gutter);
+        }
+    }
+    if let Ok(st) = tree.taffy.style(id) { let mut st = st.clone(); spec.fold_into(&mut st); let _ = tree.taffy.set_style(id, st); }
+    if let Some(p) = tree.paint_map.get_mut(&id) { css::merge_paint(p, &spec.paint); }
 }
