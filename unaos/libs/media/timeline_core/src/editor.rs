@@ -669,7 +669,7 @@ impl EditorState {
 impl EditorState {
     /// The selected clip's pan set to `pan_cq8` (one commit; the same pan again commits nothing).
     pub fn set_selected_pan(&mut self, pan_cq8: i8) -> Result<(), EditError> {
-        if self.set.len() > 1 { return self.pan_whole_set(pan_cq8); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAPANMORE (SR959): a set of more than one pans its audio clips (file tail)
+        if self.set.len() > 1 { return self.pan_whole_set(pan_cq8); } if let Some(r) = self.pankey_write(pan_cq8) { return r; } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAPANAUTOWRITE (SR9084): a keyed clip's pan writes the point at the playhead (file tail); STRIAPANMORE (SR959): a set of more than one pans its audio clips (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.pan_cq8 == pan_cq8 {
             return Ok(());
@@ -708,7 +708,7 @@ impl EditorState {
             "pan+" => 1,
             _ => return None,
         };
-        let cur = self.selected().map_or(0, |c| c.pan_cq8) as i32;
+        let cur = self.selected().map_or(0, |c| c.pan_at(self.playhead)) as i32; // STRIAPANAUTOWRITE (SR9084): step from the pan shown at the playhead
         let m = cur * 8;
         let k = ((m + m.signum() * 63) / 127 + d).clamp(-8, 8);
         let n = k * 127;
@@ -796,4 +796,21 @@ fn pankey_words(v: &str) -> Option<Option<Option<i8>>> {
         return Some(Some(None));
     }
     rest.starts_with(' ').then(|| pan_words(&alloc::format!("pan{rest}")))?.map(|p| Some(Some(p)))
+}
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): a keyed clip's pan words write the point at the playhead (named tail block) ----
+// On a selected clip WITH pan points every pan word (`pan <x>`, `pan` / `pan-` / `pan+`, the grip drag and its preview, all
+// of which end in [`EditorState::set_selected_pan`]) writes the point at the playhead's source tick through SR9050's
+// [`EditorState::pan_key_at_playhead`] (its one `commit`; off the clip `EditError::NoClip`, full `EditError::PanKey`). The
+// pan shown there unchanged commits nothing. A clip without points keeps SR861's static pan road.
+impl EditorState {
+    /// A pan on a KEYED selected clip: the point at the playhead set to `pan_cq8`; `None` when the selected clip has no
+    /// points (the static pan, as before).
+    fn pankey_write(&mut self, pan_cq8: i8) -> Option<Result<(), EditError>> {
+        let c = self.selected().filter(|c| c.pan_keys.n > 0)?;
+        if c.covers(self.playhead) && c.pan_at(self.playhead) == pan_cq8 {
+            return Some(Ok(()));
+        }
+        Some(self.pan_key_at_playhead(Some(Some(pan_cq8))))
+    }
 }

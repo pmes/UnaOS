@@ -3112,8 +3112,8 @@ impl Face {
             return None;
         }
         let Some(r) = self.state.verb(v) else { return Some(false) };
-        if r.is_ok() { self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8))); return Some(true); } self.note = None; self.last_error = Some(match r { // STRIAPANNEXT (SR994): the reading is the note, a refusal last_error (file tail)
-            Ok(()) => pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)),
+        if r.is_ok() { self.note = Some(self.pan_reading()); return Some(true); } self.note = None; self.last_error = Some(match r { // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail); STRIAPANNEXT (SR994): the reading is the note, a refusal last_error (file tail)
+            Ok(()) => self.pan_reading(), // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail)
             Err(e) => format!("pan: {e}"),
         });
         Some(true)
@@ -3152,7 +3152,20 @@ impl Face {
     /// A pan drag ([`DragKind::Pan`], timeline_core's grip) that committed: the note reads the primary's pan ([`pan_line`]).
     fn pan_drag_note(&mut self, kind: DragKind, r: &Result<(), EditError>) {
         if kind == DragKind::Pan && r.is_ok() {
-            self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)));
+            self.note = Some(self.pan_reading()); // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail)
         }
+    }
+}
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): the pan reading at the playhead (named tail block) ----
+// The pan words' and the pan drag's note read the pan the selected clip SHOWS at the playhead (`Clip::pan_at`: its curve
+// when keyed, else its static pan) through SR897's [`pan_line`], with ` keys <n>` after it on a keyed clip.
+impl Face {
+    /// The message row's pan reading of the selected clip at the playhead (`pan: centre` with nothing selected).
+    fn pan_reading(&self) -> String {
+        let Some(c) = self.state.selected() else { return pan_line(0) };
+        let n = c.pan_keys.n;
+        let line = pan_line(c.pan_at(self.state.playhead));
+        if n > 0 { format!("{line} keys {n}") } else { line }
     }
 }

@@ -348,7 +348,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
         c.frame(x0, y0, x1, y1, SELECT);
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
-        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
+        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE); pan_curve(&mut c, &l, st, row, clip); // STRIAPANAUTOWRITE (SR9084): the selected keyed audio clip's pan curve, nothing unkeyed (file tail)
     }
     paint_transitions(&mut c, l, st);
     // The playhead, through the ruler and the tracks.
@@ -1197,7 +1197,7 @@ mod slipdrag_tests {
 // `pan_cq8 != 0`, so a centred clip paints exactly as before (every golden unchanged). The kernel Player paints it through
 // this same painter: it shows the document's pan, though the kernel plays pan centred (NLE-PAN-KERNEL).
 fn pan_tick(c: &mut Canvas, kind: Kind, clip: &crate::Clip, x0: i64, x1: i64, y0: i64) {
-    if !matches!(kind, Kind::Audio) || clip.pan_cq8 == 0 {
+    if !matches!(kind, Kind::Audio) || clip.pan_cq8 == 0 || clip.pan_keys.n > 0 { // STRIAPANAUTOWRITE (SR9084): a keyed clip's pan is its curve, not the static tick
         return;
     }
     let half = pan_half(x0, x1); // STRIAPANNEXT (SR994): the one tick geometry, shared with the pan grip (file tail)
@@ -1241,7 +1241,7 @@ impl Drag {
     /// STRIAPANNEXT (SR994): the grip's clip pan at the press and its swing (px; at least 1); `None` when the clip is gone.
     fn pan_origin(&self, st: &EditorState) -> Option<(i64, i64)> {
         let c = st.timeline.tracks.get(self.track)?.clips.get(self.idx)?;
-        Some((c.pan_cq8 as i64, pan_half(self.layout.x_of(c.at), self.layout.x_of(c.end())).max(1)))
+        Some((c.pan_at(st.playhead) as i64, pan_half(self.layout.x_of(c.at), self.layout.x_of(c.end())).max(1))) // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead
     }
     /// STRIAPANNEXT (SR994): a pan drag's pointer: `delta` = the pan the x travel reaches (rounded, clamped) - the pan at the
     /// press; no snap, no guide, no track change.
@@ -1257,5 +1257,44 @@ impl Drag {
     fn finish_pan(&self, st: &mut EditorState) -> Result<(), EditError> {
         let (p0, _) = self.pan_origin(st).ok_or(EditError::NoClip)?;
         st.set_selected_pan((p0 + self.delta).clamp(-127, 127) as i8)
+    }
+}
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): the pan curve on the selected keyed audio clip (named tail block) ----
+// On the SELECTED clip of an AUDIO track that carries pan points ([`crate::Clip::pan_keys`]): per canvas column strictly
+// between the trim handles a 1 x 2 px mark in [`PAN_INK`] at the pan [`crate::Clip::pan_at`] reads at that column's tick (hard
+// left up, centre the row's middle, hard right down, over `ROW_H / 2 - 6` px), and each point inside the clip a 5 px plus in
+// the same ink. Nothing on an unkeyed clip, so every golden stays byte-identical. Its ink (green) and plus marks stay
+// distinct from the gain envelope's orange square marks (siblings SR9047 / SR9082 share the body). The kernel Player paints
+// it through this same painter (it plays the pan centred: NLE-PAN-AUTO-KERNEL).
+
+/// STRIAPANAUTOWRITE (SR9084): the pan curve's ink.
+pub const PAN_INK: [u8; 4] = [0x50, 0xe0, 0x90, 255];
+
+/// STRIAPANAUTOWRITE (SR9084): the y of pan `p` on track row `row` (hard left at the top of the swing).
+pub fn pan_curve_y(l: &Layout, row: usize, p: i8) -> i64 {
+    let mid = l.row_y(row) + ROW_H as i64 / 2;
+    mid + (p as i64).clamp(-127, 127) * (ROW_H as i64 / 2 - 6) / 127
+}
+
+/// STRIAPANAUTOWRITE (SR9084): the selected clip's pan curve and point marks (see the block comment).
+fn pan_curve(c: &mut Canvas, l: &Layout, st: &EditorState, row: usize, clip: crate::Clip) {
+    if clip.pan_keys.n == 0 || !st.timeline.tracks.get(row).is_some_and(|tr| matches!(tr.kind, Kind::Audio)) {
+        return;
+    }
+    let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+    let (a, b) = ((x0 + HANDLE_W).max(0), (x1 - HANDLE_W).min(c.w as i64));
+    for x in a..b {
+        let y = pan_curve_y(l, row, clip.pan_at(l.tick_at(x as f64)));
+        c.rect(x, y, x + 1, y + 2, PAN_INK);
+    }
+    for &(s, p) in clip.pan_keys.points() {
+        let t = clip.at + (s - clip.src_in);
+        if !clip.covers(t) {
+            continue;
+        }
+        let (x, y) = (l.x_of(t), pan_curve_y(l, row, p));
+        c.rect(x - 2, y, x + 3, y + 1, PAN_INK);
+        c.rect(x, y - 2, x + 1, y + 3, PAN_INK);
     }
 }

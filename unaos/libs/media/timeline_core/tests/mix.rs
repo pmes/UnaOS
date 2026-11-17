@@ -705,3 +705,103 @@ fn striapanautomation_edl_round_trip_and_refusals() {
         assert_eq!(edl::parse(&t, 25).map(|_| ()), Err(edl::EdlError::Syntax { line: at + 1 }), "{bad}");
     }
 }
+
+// ---- STRIAPANAUTOWRITE (LEDGER SR9084): a keyed clip's pan words / drag write the point, the curve, the under split (named tail block) ----
+use timeline_core::view::{PAN_INK, pan_curve_y};
+
+/// A1 / A2 of `two_tracks` with A2's clip keyed hard left at its source tick 0 and hard right at 8 (timeline ticks 5 / 13).
+fn keyed() -> Timeline {
+    two_tracks().set_pan_key(1, 0, 0, -127).unwrap().set_pan_key(1, 0, 8, 127).unwrap()
+}
+
+/// On a keyed clip every pan word writes the point at the playhead's source tick (one undo step each), stepping from the pan
+/// shown there; the shown pan unchanged commits nothing; the static pan is untouched; off the clip `NoClip`; an unkeyed clip
+/// keeps the static road.
+#[test]
+fn striapanautowrite_pan_words_write_the_point_at_the_playhead() {
+    let mut st = EditorState::new(keyed());
+    st.select(1, 0).unwrap();
+    st.seek(9);
+    let pts = |st: &EditorState| st.timeline.tracks[1].clips[0].pan_keys.points().to_vec();
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_at(9), 0);
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("pan"), Some(Ok(())));
+    assert_eq!((pts(&st).len(), st.undo_depth()), (2, d0), "shown centre already: no commit");
+    assert_eq!(st.verb("pan 0.5"), Some(Ok(())));
+    assert_eq!((pts(&st), st.undo_depth()), (vec![(0i64, -127i8), (4, 64), (8, 127)], d0 + 1));
+    assert_eq!(st.verb("pan+"), Some(Ok(())));
+    assert_eq!((pts(&st)[1], st.undo_depth()), ((4i64, 79i8), d0 + 2), "the step starts from the shown pan");
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, 0, "the static pan is untouched");
+    assert!(st.undo());
+    assert_eq!(pts(&st)[1], (4, 64));
+    st.seek(2);
+    assert_eq!(st.verb("pan 0.5"), Some(Err(EditError::NoClip)), "the playhead is off the keyed clip");
+    st.select(0, 0).unwrap();
+    st.seek(3);
+    assert_eq!(st.verb("pan 0.5"), Some(Ok(())));
+    assert_eq!((st.timeline.tracks[0].clips[0].pan_cq8, st.timeline.tracks[0].clips[0].pan_keys.n), (64, 0), "unkeyed: the static pan");
+    println!("striapanautowrite words: {:?}", pts(&st));
+}
+
+/// The grip drag on a keyed clip starts at the pan shown at the playhead, previews the point and commits it once.
+#[test]
+fn striapanautowrite_pan_drag_writes_the_point() {
+    use timeline_core::view::{Drag, DragKind, Layout, pan_half};
+    let mut st = EditorState::new(keyed());
+    st.select(1, 0).unwrap();
+    st.seek(9);
+    let l = Layout::of(320, 160, &st);
+    let (x0, x1, y0) = (l.x_of(5), l.x_of(15), l.row_y(1));
+    let half = pan_half(x0, x1).max(1) as f64;
+    let (x, y) = ((x0 + x1) as f64 / 2.0, y0 as f64 + 2.0);
+    let d0 = st.undo_depth();
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    assert_eq!(d.kind, DragKind::Pan);
+    d.update(&st, x + half / 2.0, y);
+    assert_eq!(d.delta, 64, "from the shown pan 0");
+    let shown = d.shown(&st).expect("a preview");
+    assert_eq!(shown.timeline.tracks[1].clips[0].pan_at(9), 64, "the preview writes the point");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    let c = st.timeline.tracks[1].clips[0];
+    assert_eq!((c.pan_keys.points().to_vec(), c.pan_cq8, st.undo_depth()), (vec![(0i64, -127i8), (4, 64), (8, 127)], 0, d0 + 1));
+}
+
+/// A linear crossfade out of a keyed clip: the under layer's runs break wherever the outgoing clip's pan changes and carry
+/// its curve at both edges; without points the crossfade is one run as before.
+#[test]
+fn striapanautowrite_under_layer_splits_at_its_pan() {
+    let plain = audio_runs(&audio_only(Curve::Linear), 0..60, &Gop).unwrap();
+    assert_eq!(plain.iter().map(|r| (r.out_t, r.len)).collect::<Vec<_>>(), vec![(0, 20), (20, 8), (28, 32)]);
+    let tl = audio_only(Curve::Linear).set_pan_key(0, 0, 30, -127).unwrap().set_pan_key(0, 0, 38, 127).unwrap();
+    let o = tl.tracks[0].clips[0];
+    let runs = audio_runs(&tl, 0..60, &Gop).unwrap();
+    for r in runs.iter().filter(|r| (20..28).contains(&r.out_t)) {
+        assert_eq!(r.len, 1, "run at {}", r.out_t);
+        let u = r.layers[0];
+        assert_eq!((u.src, u.pan_cq8, u.pan_to), (SourceId(0), o.pan_at(r.out_t), o.pan_at(r.out_t + 1)), "run at {}", r.out_t);
+    }
+    assert_eq!(runs.iter().filter(|r| (20..28).contains(&r.out_t)).count(), 8);
+    assert_eq!(runs.first().map(|r| (r.out_t, r.len)), Some((0, 20)), "the held pan before the crossfade is one run");
+    println!("striapanautowrite under: {} runs (unkeyed {})", runs.len(), plain.len());
+}
+
+/// The pan curve paints only on the SELECTED keyed audio clip: a keyed clip unselected paints exactly as unkeyed; selected,
+/// the curve's ink sits at the shown pan's y and a point's plus mark at its tick.
+#[test]
+fn striapanautowrite_curve_paints_on_the_selected_keyed_clip() {
+    let (w, h) = (320u32, 160u32);
+    assert_eq!(view::paint(&EditorState::new(keyed()), w, h, Order::Rgba, None, None), view::paint(&EditorState::new(two_tracks()), w, h, Order::Rgba, None, None), "unselected: nothing new");
+    let mut plain = EditorState::new(two_tracks());
+    plain.select(1, 0).unwrap();
+    let mut st = EditorState::new(keyed());
+    st.select(1, 0).unwrap();
+    let (a, px) = (view::paint(&plain, w, h, Order::Rgba, None, None), view::paint(&st, w, h, Order::Rgba, None, None));
+    assert_ne!(a, px);
+    let l = view::Layout::of(w, h, &st);
+    let at = |x: i64, y: i64| &px[((y as usize) * w as usize + x as usize) * 4..][..4];
+    let (x, y) = (l.x_of(9) + 3, pan_curve_y(&l, 1, 0));
+    assert_eq!((at(x, y), at(x, y + 1)), (&PAN_INK[..], &PAN_INK[..]), "the curve at tick 9 (pan 0)");
+    let (xp, yp) = (l.x_of(13), pan_curve_y(&l, 1, 127));
+    assert_eq!((at(xp, yp + 2), at(xp + 2, yp)), (&PAN_INK[..], &PAN_INK[..]), "the plus at the hard-right point");
+    assert!(pan_curve_y(&l, 1, -127) < pan_curve_y(&l, 1, 127), "hard left up");
+}
