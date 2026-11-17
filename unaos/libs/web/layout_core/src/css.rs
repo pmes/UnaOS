@@ -3672,12 +3672,14 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
 /// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is not
 /// rewritten (author-origin revert rolls back to the UA origin, which Aether keeps on the tag road:
 /// AETHER-CSS-WIDE-REVERT-UA owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
+/// AETHERCSSWIDENONINHERITEDREST (SR848): opacity / transform / flex-grow / flex-shrink through the same anim call; position static, float / clear none, overflow visible, z-index and the insets auto, flex-direction row, flex-wrap nowrap, flex-flow `row nowrap`, flex-basis auto, flex `0 1 auto`, align-items / justify-content normal, gap / row-gap 0px, background-repeat / -position / -size repeat / `0% 0%` / auto; not column-gap (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL), align-content (AETHER-CSS-ALIGN-CONTENT-FIELD) or the background shorthand's image layers (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE).
 fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
     if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset")) {
         return value;
     }
     match prop {
         "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top"
+        | "opacity" | "transform" | "flex-grow" | "flex-shrink"
         | "padding-right" | "padding-bottom" | "padding-left" | "background-color" => {
             crate::anim::initial_value(prop).unwrap_or(value)
         }
@@ -3687,6 +3689,22 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         "border-width" => "3px",
+        // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
+        "position" => "static",
+        "float" | "clear" => "none",
+        "overflow" | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" => "visible",
+        "z-index" => "auto",
+        "top" | "right" | "bottom" | "left" | "inset" => "auto",
+        "flex-direction" => "row",
+        "flex-wrap" => "nowrap",
+        "flex-flow" => "row nowrap",
+        "flex-basis" => "auto",
+        "flex" => "0 1 auto",
+        "align-items" | "justify-content" => "normal",
+        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px",
+        "background-repeat" => "repeat",
+        "background-position" => "0% 0%",
+        "background-size" => "auto",
         _ => value,
     }
 }

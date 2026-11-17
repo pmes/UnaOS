@@ -5999,4 +5999,152 @@ mod tests {
         }
     }
 
+    // ---- AETHERCSSWIDENONINHERITEDREST (LEDGER SR848): initial / unset on the rest of the non-inherited arms beat an earlier rule (named tail block) ----
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): one armed / reset pair per row at 400 px wide, each `.r` twin resetting
+    /// what its class's rule set: position absolute (initial), float left (unset), opacity 0.5 on red (initial), a
+    /// 100px translate (initial), overflow hidden on a 10px box with a 40px red child (initial), a column flexbox
+    /// (initial), and a relative box 30px down (top: initial).
+    fn css_wide_rest_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div, section { margin: 0 0 12px }
+            .pa { position: absolute; top: 0; left: 200px; width: 50px; height: 30px }
+            .pa.r { position: initial }
+            .fl { float: left; width: 50px; height: 40px }
+            .fl.r { float: unset }
+            .op { opacity: 0.5; background-color: rgb(255, 0, 0); height: 20px }
+            .op.r { opacity: initial }
+            .tr { transform: translateX(100px); width: 50px; height: 20px; background-color: rgb(255, 0, 0) }
+            .tr.r { transform: initial }
+            .ov { overflow: hidden; height: 10px; margin-bottom: 50px }
+            .ov.r { overflow: initial }
+            .fd { display: flex; flex-direction: column }
+            .fd.r { flex-direction: initial }
+            .tp { position: relative; top: 30px }
+            .tp.r { top: initial }
+            </style></head><body style="margin:0;font:20px serif">
+            <section id="pasec"><div id="pa" class="pa"></div><div id="pas">B</div></section>
+            <section id="parsec"><div id="par" class="pa r"></div><div id="pars">B</div></section>
+            <section><div id="fl" class="fl"></div><span id="fls">Hi</span></section>
+            <section style="clear:both"><div id="flr" class="fl r"></div><span id="flrs">Hi</span></section>
+            <div id="op" class="op"></div>
+            <div id="opr" class="op r"></div>
+            <div id="tr" class="tr"></div>
+            <div id="trr" class="tr r"></div>
+            <div id="ov" class="ov"><div style="height:40px;background-color:rgb(255,0,0)"></div></div>
+            <div id="ovr" class="ov r"><div style="height:40px;background-color:rgb(255,0,0)"></div></div>
+            <div class="fd"><span id="fd1">A</span><span id="fd2">B</span></div>
+            <div class="fd r"><span id="fdr1">A</span><span id="fdr2">B</span></div>
+            <section><div id="tps">A</div><div id="tp" class="tp">B</div></section>
+            <section><div id="tprs">A</div><div id="tpr" class="tp r">B</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 1000));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): the red pixels in a surface rect (clamped).
+    fn css_wide_rest_red(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let mut n = 0;
+        for y in y0.min(sh)..y1.min(sh) {
+            for x in x0.min(sw)..x1.min(sw) {
+                if css_wide_red(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `position: initial` after `absolute` lays the box in flow: its sibling
+    /// sits below it; the absolute twin (inset, so not tree.rs's static-position fallback) takes no space, so its
+    /// sibling is at the section's top (armed).
+    #[test]
+    fn css_wide_rest_position_in_flow() {
+        let mut e = css_wide_rest_engine();
+        let (_, st, ..) = imgalt_rect(&mut e, "pasec");
+        let (_, sbt, ..) = imgalt_rect(&mut e, "pas");
+        assert!((sbt - st).abs() <= 1.0, "the absolute box takes no space (armed): {sbt} vs {st}");
+        let (_, rt, ..) = imgalt_rect(&mut e, "par");
+        let (_, rbt, ..) = imgalt_rect(&mut e, "pars");
+        assert!(rbt >= rt + 29.0, "position: initial is static: the sibling below the 30px box: {rbt} vs {rt}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `float: unset` after `left`: the text no longer wraps beside the 50px box
+    /// but sits below it (the floated twin's text starts right of it, armed).
+    #[test]
+    fn css_wide_rest_float_unset() {
+        let mut e = css_wide_rest_engine();
+        let (sl, ..) = imgalt_rect(&mut e, "fls");
+        assert!(sl >= 49.0, "the float's text beside it (armed): {sl}");
+        let (_, ft, ..) = imgalt_rect(&mut e, "flr");
+        let (rl, rt, ..) = imgalt_rect(&mut e, "flrs");
+        assert!(rl < 5.0, "float: unset: the text at the line start: {rl}");
+        assert!(rt >= ft + 39.0, "float: unset: the text below the 40px box: {rt} vs {ft}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `opacity: initial` after 0.5 paints full red (the 0.5 twin is pink, armed).
+    #[test]
+    fn css_wide_rest_opacity_full_ink() {
+        let mut e = css_wide_rest_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "op", css_wide_red), 0, "opacity 0.5 red is pink (armed)");
+        assert!(css_wide_color_ink(&mut e, "opr", css_wide_red) > 100, "opacity: initial paints full red");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `transform: initial` after `translateX(100px)` paints the 50px box at its
+    /// untransformed x (red at 0..50, none at 100..150; the translated twin the reverse, armed).
+    #[test]
+    fn css_wide_rest_transform_untransformed() {
+        let mut e = css_wide_rest_engine();
+        let (_, t, _, h) = imgalt_rect(&mut e, "tr");
+        let (y0, y1) = (t.ceil() as usize + 2, (t + h).floor() as usize - 2);
+        assert!(css_wide_rest_red(&e, 102, 148, y0, y1) > 100, "the translated box at 100 (armed)");
+        assert_eq!(css_wide_rest_red(&e, 2, 48, y0, y1), 0, "nothing at 0 (armed)");
+        let (_, t, _, h) = imgalt_rect(&mut e, "trr");
+        let (y0, y1) = (t.ceil() as usize + 2, (t + h).floor() as usize - 2);
+        assert!(css_wide_rest_red(&e, 2, 48, y0, y1) > 100, "transform: initial: the box at 0");
+        assert_eq!(css_wide_rest_red(&e, 102, 148, y0, y1), 0, "transform: initial: nothing at 100");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `overflow: initial` after `hidden`: the 40px red child paints below its
+    /// 10px parent (the hidden twin clips it, armed).
+    #[test]
+    fn css_wide_rest_overflow_paints() {
+        let mut e = css_wide_rest_engine();
+        let (_, t, ..) = imgalt_rect(&mut e, "ov");
+        let t = t.ceil() as usize;
+        assert_eq!(css_wide_rest_red(&e, 0, 400, t + 14, t + 36), 0, "overflow: hidden clips the child (armed)");
+        let (_, t, ..) = imgalt_rect(&mut e, "ovr");
+        let t = t.ceil() as usize;
+        assert!(css_wide_rest_red(&e, 0, 400, t + 14, t + 36) > 1000, "overflow: initial: the child paints below");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `flex-direction: initial` after `column` puts the items in a row (the
+    /// column twin stacks them, armed).
+    #[test]
+    fn css_wide_rest_flex_direction_row() {
+        let mut e = css_wide_rest_engine();
+        let (_, t1, ..) = imgalt_rect(&mut e, "fd1");
+        let (_, t2, ..) = imgalt_rect(&mut e, "fd2");
+        assert!(t2 >= t1 + 10.0, "the column twin stacks (armed): {t2} vs {t1}");
+        let (l1, t1, w1, _) = imgalt_rect(&mut e, "fdr1");
+        let (l2, t2, ..) = imgalt_rect(&mut e, "fdr2");
+        assert!((t2 - t1).abs() <= 2.0, "flex-direction: initial: one row: {t2} vs {t1}");
+        assert!(l2 >= l1 + w1 - 1.0, "flex-direction: initial: the second item right of the first: {l2} vs {l1} + {w1}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `top: initial` on a relative box is auto: no offset (the twin is 30px
+    /// further down from its sibling, armed).
+    #[test]
+    fn css_wide_rest_top_no_offset() {
+        let mut e = css_wide_rest_engine();
+        let (_, s, ..) = imgalt_rect(&mut e, "tps");
+        let (_, b, ..) = imgalt_rect(&mut e, "tp");
+        let (_, rs, ..) = imgalt_rect(&mut e, "tprs");
+        let (_, rb, ..) = imgalt_rect(&mut e, "tpr");
+        assert!(((b - s) - (rb - rs) - 30.0).abs() <= 1.0, "top: initial drops the 30px offset: {} vs {}", b - s, rb - rs);
+    }
 }
