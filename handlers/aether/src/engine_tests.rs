@@ -8443,4 +8443,157 @@ mod tests {
         assert!(text_decoration_ink(&mut e, "pn", text_decoration_black) > 40, "#pn paints black");
         assert_eq!(text_decoration_ink(&mut e, "pn", css_wide_red), 0, "#pn paints no red");
     }
+
+    // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending border colour paints only where a side exists (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): one 40x20 box per row, rows 12px apart, under a green parent: `#ca`
+    /// `border-color: red` alone; `#cb` `border: 2px solid blue; border-color: red`; `#cc` the sheet's `.p { border: 2px
+    /// solid blue } .p.q { border-top-color: red }`; `#cd` `.p.r { border-color: red }` over `.p`; `#ce` `border-color: red;
+    /// border-width: 2px`; `#cf` a button with `border-color: red`; `#cg` a plain button (control).
+    fn border_color_stored_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .p { border: 2px solid blue }
+            .p.q { border-top-color: red }
+            .p.r { border-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="ca" style="width:40px;height:20px;border-color:red"></div>
+            <div id="cb" style="width:40px;height:20px;border:2px solid blue;border-color:red"></div>
+            <div id="cc" class="p q" style="width:40px;height:20px"></div>
+            <div id="cd" class="p r" style="width:40px;height:20px"></div>
+            <div id="ce" style="width:40px;height:20px;border-color:red;border-width:2px"></div>
+            <div><button id="cf" style="width:60px;height:24px;border-color:red"></button></div>
+            <div><button id="cg" style="width:60px;height:24px"></button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): `border-color: red` alone paints no red (style none, as Chromium; before SR1058
+    /// a 1px red frame); armed: `#cb` paints red and `#ce` (`border-width` creates the sides from the pending red) too.
+    /// SR1069 (flipped in place): `#ce` declares no style, so it paints nothing (Chromium; `border-width` stores only).
+    #[test]
+    fn border_color_stored_alone_paints_nothing() {
+        let mut e = border_color_stored_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "ca", css_wide_red), 0, "#ca paints no red");
+        assert!(css_wide_color_ink(&mut e, "cb", css_wide_red) > 40, "armed: #cb paints a red frame");
+        assert_eq!(css_wide_color_ink(&mut e, "ce", css_wide_red), 0, "SR1069: #ce has no style, no red (was a 2px red frame)");
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): the merge road: a later rule's `border-top-color` reaches the earlier rule's top
+    /// (before: dropped, the top stayed blue), the other edges stay blue; a later `border-color` recolours all four.
+    #[test]
+    fn border_color_stored_merge_paints() {
+        let mut e = border_color_stored_engine();
+        let edges = border_side_color_edges(&mut e, "cc");
+        assert!(css_wide_red(edges[0]), "#cc: the top is red: {:?}", edges[0]);
+        for (i, c) in edges.iter().enumerate().skip(1) {
+            assert!(css_wide_blue(*c), "#cc: side {i} stays blue: {c:?}");
+        }
+        for (i, c) in border_side_color_edges(&mut e, "cd").iter().enumerate() {
+            assert!(css_wide_red(*c), "#cd: side {i} is red: {c:?}");
+        }
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): a control's theme frame takes the pending colour (`pending_frame`): `#cf`
+    /// paints red; armed: the plain `#cg` paints none.
+    #[test]
+    fn border_color_stored_button_frame() {
+        let mut e = border_color_stored_engine();
+        assert!(css_wide_color_ink(&mut e, "cf", css_wide_red) > 20, "#cf: a red frame");
+        assert_eq!(css_wide_color_ink(&mut e, "cg", css_wide_red), 0, "armed: #cg paints no red");
+    }
+
+    // ---- AETHERCSSBORDERSIDESTYLEWIDTH (LEDGER SR1069): a style alone paints a medium frame; a width alone paints nothing (named tail block) ----
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): under a green body colour, `#sa` a 40x20 box with `border-style: solid`
+    /// alone, `#sb` the armed twin with `border-width: 3px` alone, and `#pp` an open `dialog` popover (displayed by the UA
+    /// sheet's `:not(dialog[open])`) whose border is the UA `[popover] { border: solid }`.
+    fn border_side_style_width_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="sa" style="width:40px;height:20px;border-style:solid"></div>
+            <div id="sb" style="width:40px;height:20px;border-width:3px"></div>
+            <dialog popover open id="pp" style="width:40px;height:20px;padding:0"></dialog>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `#sa` (style alone) is a 46x26 border box with a 3px frame in the ink colour
+    /// (rows 0-2 at mid-x green, row 3 not; before SR1069 no frame and 40x20); armed: `#sb` (width alone) is 40x20 and
+    /// paints no green (before SR1069 a 3px frame).
+    #[test]
+    fn border_side_style_width_paints_medium() {
+        let mut e = border_side_style_width_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "sa");
+        assert_eq!((w, h), (46.0, 26.0), "#sa: the 3px sides size the box");
+        let x = (l + w / 2.0) as usize;
+        for dy in 0..3 {
+            let c = imgalt_px(&mut e, x, t as usize + dy);
+            assert!(css_wide_green(c), "#sa: row {dy} is the ink: {c:?}");
+        }
+        let c = imgalt_px(&mut e, x, t as usize + 3);
+        assert!(!css_wide_green(c), "#sa: row 3 is inside the frame: {c:?}");
+        let (_, _, w, h) = imgalt_rect(&mut e, "sb");
+        assert_eq!((w, h), (40.0, 20.0), "#sb: a width alone makes no border box");
+        assert_eq!(css_wide_color_ink(&mut e, "sb", css_wide_green), 0, "#sb: paints nothing");
+    }
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the UA `[popover] { border: solid }` is Chromium's medium 3px (the shorthand
+    /// without a width part; before SR1069 1px): the 40x20 popover's border box is 46x26.
+    #[test]
+    fn border_side_style_width_popover_medium() {
+        let mut e = border_side_style_width_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "pp");
+        assert_eq!((w, h), (46.0, 26.0), "#pp: the popover's medium border");
+    }
+
+    // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): 40x20 boxes in green ink, rows 12px apart: `#tn` `border: thin solid`, `#tk`
+    /// `border: thick solid`, `#tz` `border-width: 1px 0; border-style: solid`.
+    fn border_thin_thick_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="tn" style="width:40px;height:20px;border:thin solid"></div>
+            <div id="tk" style="width:40px;height:20px;border:thick solid"></div>
+            <div id="tz" style="width:40px;height:20px;border-width:1px 0;border-style:solid"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERTHINTHICK (SR1075): `#tn` is a 42x22 border box whose row 0 (mid-x) is the ink and row 1 not; `#tk`
+    /// is 50x30 with rows 0-4 inked and row 5 not (before SR1075 both were medium 3px, 46x26); `#tz` is 40x22 (top / bottom
+    /// 1px, left / right 0; before SR1075 the two-value declaration was dropped). getComputedStyle reads 1px / 5px.
+    #[test]
+    fn border_thin_thick_paints() {
+        let mut e = border_thin_thick_engine();
+        for (id, bw, size) in [("tn", 1usize, (42.0, 22.0)), ("tk", 5, (50.0, 30.0))] {
+            let (l, t, w, h) = imgalt_rect(&mut e, id);
+            assert_eq!((w, h), size, "#{id}: the border box");
+            let x = (l + w / 2.0) as usize;
+            for dy in 0..bw {
+                let c = imgalt_px(&mut e, x, t as usize + dy);
+                assert!(css_wide_green(c), "#{id}: row {dy} is the ink: {c:?}");
+            }
+            let c = imgalt_px(&mut e, x, t as usize + bw);
+            assert!(!css_wide_green(c), "#{id}: row {bw} is inside the frame: {c:?}");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderTopWidth"), format!("{bw}px"), "#{id}: getComputedStyle");
+        }
+        let (_, _, w, h) = imgalt_rect(&mut e, "tz");
+        assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
+    }
 }
