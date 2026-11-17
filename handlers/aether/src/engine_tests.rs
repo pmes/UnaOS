@@ -6497,4 +6497,49 @@ mod tests {
         let mut e = css_wide_controls_engine();
         assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
     }
+
+    // ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): font: caption / icon / menu / message-box / small-caption / status-bar (named tail block) ----
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): under a 30px serif parent: a `font: menu` div with a child span, a
+    /// `font: italic bold 20px serif; font: status-bar` span, a plain button (the control-font reference) and a plain span
+    /// (the armed parent reference).
+    fn system_font_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font:30px serif"><span id="par">Hello</span></div>
+            <div style="font:30px serif"><div id="sys" style="font:menu">Hello <span id="kid">World</span></div></div>
+            <div style="font:30px serif"><span id="sb" style="font:italic bold 20px serif;font:status-bar">Hello</span></div>
+            <div style="font:30px serif"><button id="pbtn">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): `font: menu` reads the plain button's used size (CONTROL_FONT_PX, 13.333px)
+    /// and its child span inherits it, not the 30px parent (armed: the parent reference reads 30px).
+    #[test]
+    fn system_font_used_size() {
+        let mut e = system_font_engine();
+        let control = font_shorthand_cs(&mut e, "pbtn", "fontSize");
+        assert!(control.starts_with("13.333"), "the control size: {control}");
+        assert_eq!(font_shorthand_cs(&mut e, "par", "fontSize"), "30px", "armed: the parent is 30px");
+        assert_eq!(font_shorthand_cs(&mut e, "sys", "fontSize"), control, "font: menu is the control size");
+        assert_eq!(font_shorthand_cs(&mut e, "kid", "fontSize"), control, "the child inherits the control size, not 30px");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontSize"), control, "font: status-bar is the same font");
+    }
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): the system font resets weight and style (the initial road) and takes the
+    /// control family: the family word Aether reports for a plain button.
+    #[test]
+    fn system_font_weight_style_family() {
+        let mut e = system_font_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontWeight"), "400", "bold reset");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontStyle"), "normal", "italic reset");
+        let family = font_shorthand_cs(&mut e, "pbtn", "fontFamily");
+        assert_eq!(font_shorthand_cs(&mut e, "sys", "fontFamily"), family, "the control family");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontFamily"), family, "the control family");
+        assert_ne!(font_shorthand_cs(&mut e, "par", "fontFamily"), family, "armed: the parent is serif");
+    }
 }

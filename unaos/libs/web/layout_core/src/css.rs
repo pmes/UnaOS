@@ -3625,7 +3625,7 @@ fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>,
 /// line-height back) then None, font-family None; the size takes the parent-relative road `smaller` / `larger` use
 /// (font_size None, font_size_rel (0, 1.0)), because a None size is the tag's code default (13.333 px on a control),
 /// not the parent's. `initial` is SR805's reset ([`reset_font_prefix`], [`reset_font_shorthand_rest`] at `medium`)
-/// plus the standard family. `revert` (no UA cascade layer is modelled) and the system fonts are dropped as before.
+/// plus the standard family. `revert` (no UA cascade layer is modelled) is dropped as before; the six system fonts are SR1022's.
 /// AETHERCSSWIDELONGHANDS (SR815): inherit / unset write the seven explicit inherit bits (`PaintStyle::set_inherit`).
 fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     match kw {
@@ -3638,7 +3638,8 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
             reset_font_shorthand_rest("medium", style, cx);
             style.paint.family = Some(crate::STANDARD);
         }
-        _ => {} // revert and the six system fonts: dropped (AETHER-CSS-WIDE-REVERT, AETHER-FONT-SHORTHAND-SYSTEM owed)
+        w if SYSTEM_FONTS.contains(&w) => { apply_font_wide("initial", style, cx); apply_declaration("font-size", &format!("{}px", crate::CONTROL_FONT_PX), style, cx); style.paint.family = Some(H::control_family()); } // SR1022
+        _ => {} // revert: dropped (AETHER-CSS-WIDE-REVERT owed)
     }
 }
 
@@ -3690,3 +3691,10 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         _ => value,
     }
 }
+
+// ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): css-fonts-4 §4.3.1 the six system-font keywords of `font` (named tail block) ----
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): the `font` shorthand's system-font keywords. Chromium resolves all six to the same
+/// UI font (13.333px, normal weight and style); [`apply_font_wide`] gives them the `initial` road, then the control
+/// family (`Host::control_family`, the UA control font) at [`crate::CONTROL_FONT_PX`] through the `font-size` arm.
+const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
