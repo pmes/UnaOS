@@ -1904,7 +1904,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let st = &mut e.st;
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
-        let at = st.playhead; if timeline_core::editor::jump_word(verb).is_some() { return edit_jump(st, verb, at); } // STRIAKMARKERJUMP (LEDGER SR9064): a jump key neither reselects nor saves (file tail)
+        let at = st.playhead; if timeline_core::editor::seek_word(verb) { return edit_jump(st, verb, at); } // STRIAKMARKERJUMP (LEDGER SR9064): a jump key neither reselects nor saves (file tail); STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End too, timeline_core `seek_word` (file tail)
         if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
@@ -2683,7 +2683,7 @@ fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -
         return None;
     }
     let name = st.timeline.marker_at(to).map(|m| m.name.clone()).unwrap_or_default();
-    if timeline_core::editor::jump_word(verb).map(|j| j.0) == Some(timeline_core::editor::Jump::Cut) { serial_println!("[nle] edit {} at={} to={} cut={}", verb, at, to, to); } else { serial_println!("[nle] edit {} at={} to={} marker={}", verb, at, to, name); } // STRIAKCUTJUMP (LEDGER SR9091): a cut jump names its edge (file tail)
+    match timeline_core::editor::jump_word(verb).map(|j| j.0) { Some(timeline_core::editor::Jump::Cut) => serial_println!("[nle] edit {} at={} to={} cut={}", verb, at, to, to), Some(timeline_core::editor::Jump::Marker) => serial_println!("[nle] edit {} at={} to={} marker={}", verb, at, to, name), None => serial_println!("[nle] edit {} at={} to={}", verb, at, to) } // STRIAKCUTJUMP (LEDGER SR9091): a cut jump names its edge (file tail); STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End name none (file tail)
     Some((st.timeline.tb.to_ns(to).max(0) as u64).div_ceil(1_000_000))
 }
 
@@ -2694,3 +2694,11 @@ fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -
 // [`edit_jump`] (the ONE jump, the seek door, no save, no undo step). Wire: `[nle] edit <cut-|cut+> at=<tick> to=<tick>
 // cut=<tick>`, `[nle] edit <cut-|cut+> at=<tick> unchanged`. timeline_core does not link una_abi: the bytes are tied here.
 const _: () = assert!(timeline_core::editor::CUT_JUMP_KEYS[0].0 == una_abi::KEY_UP && timeline_core::editor::CUT_JUMP_KEYS[1].0 == una_abi::KEY_DOWN);
+
+// ---- STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End the Player's timeline start / end jumps (named tail block) ----
+// timeline_core `END_JUMP_KEYS` names the bytes 0x91 / 0x92 `home` / `end` (the host's Home / End words, `EditorState::verb`'s
+// existing view words); [`edit_verb`] reads them through `jump_key`, and [`edit_key`] sends every `seek_word` (the jumps
+// and Home / End) to [`edit_jump`]: the seek door, no save, no undo step. Wire: `[nle] edit <home|end> at=<tick> to=<tick>`,
+// `[nle] edit <home|end> at=<tick> unchanged`. The keyboard presses NO byte for Home / End yet (owed
+// NLE-JUMP-ENDS-KERNEL-BYTES: una-abi `KEY_HOME` 0x91 / `KEY_END` 0x92 and the xhci HID rows 0x4A / 0x4D), so no const
+// assert ties them here until those exist.

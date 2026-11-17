@@ -4038,3 +4038,29 @@ fn striakcutjump_host_keys_match_the_shared_cut_jump_keys() {
     }
     println!("striakcutjump: {} shared cut jump keys bound alike on both faces", timeline_core::editor::CUT_JUMP_KEYS.len());
 }
+
+// ---- STRIAKCUTJUMPMORE (LEDGER SR9108): the host KEYS rows match timeline_core's END_JUMP_KEYS (named tail block) ----
+// One key means one word on both faces: the kernel Player reads the bytes of `timeline_core::editor::END_JUMP_KEYS`; the
+// host face's named keys (and AppKit's private-use Home / End) must name the same words, and move the playhead only.
+
+#[test]
+fn striakcutjumpmore_host_keys_match_the_shared_end_jump_keys() {
+    for (&(b, name, word), appkit) in timeline_core::editor::END_JUMP_KEYS.iter().zip(["\u{f729}", "\u{f72b}"]) {
+        for key in [name, appkit] {
+            let row = stria::nle_face::KEYS.iter().find(|k| k.0 == key);
+            assert_eq!(row.map(|k| k.1), Some(word), "host key {key:?} must name {word}");
+        }
+        assert!(timeline_core::editor::seek_word(word), "{word} moves the playhead only");
+        assert_eq!(timeline_core::editor::jump_key(b), Some(word), "Player byte {b:#x} names {word}");
+    }
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(5);
+    assert!(face.on(&bandy::SMessage::BrowserKey("End".into())));
+    assert_eq!(face.state.playhead, face.state.timeline.end());
+    assert!(face.on(&bandy::SMessage::BrowserKey("Home".into())));
+    assert_eq!(face.state.playhead, 0);
+    assert_eq!(face.state.timeline, tl0);
+    assert!(!face.dirty(), "Home / End do not dirty the document");
+    println!("striakcutjumpmore: {} shared end jump keys bound alike on both faces", timeline_core::editor::END_JUMP_KEYS.len());
+}
