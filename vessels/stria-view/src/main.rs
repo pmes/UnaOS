@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "pan"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -856,5 +856,18 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- STRIAPAN (LEDGER SR861): the `pan:<x>` token (named tail block) ----
+    /// `--do at:12:1,pan:-0.5` selects the audio clip and pans it through the face's `pan <x>` word (timeline_core's verb).
+    #[test]
+    fn striapan_do_token_pans_the_selected_clip() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:1,pan:-0.5");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.selection, Some((1, 1)));
+        assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, -64);
+        println!("striapan witness: pan:-0.5 -> pan_cq8 {}", face.state.timeline.tracks[1].clips[1].pan_cq8);
     }
 }

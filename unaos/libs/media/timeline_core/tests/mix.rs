@@ -320,3 +320,111 @@ fn nlexfadepower_a_bl_transition_fades_its_audio_from_and_to_silence() {
         assert_eq!(&edl::parse(&text, 25).unwrap(), tl);
     }
 }
+
+// ---- STRIAPAN (LEDGER SR861): per-clip pan — the law, the layers, the edit road, the EDL line (named tail block) ----
+use timeline_core::editor::EditorState;
+use timeline_core::schedule::pan_q16;
+
+/// THE law: hard left, centre (-3.01 dB each side), hard right, and the power kept at every pan.
+#[test]
+fn striapan_law_hard_left_centre_hard_right() {
+    assert_eq!(pan_q16(-128), [ENV_ONE, 0]);
+    assert_eq!(pan_q16(-127), [ENV_ONE, 0]);
+    assert_eq!(pan_q16(0), [46341, 46341]);
+    assert_eq!(pan_q16(127), [0, ENV_ONE]);
+    let db = 20.0 * (46341.0f64 / 65536.0).log10();
+    assert!((db + 3.0103).abs() < 0.001, "centre {db} dB");
+    for p in -128i32..=127 {
+        let [l, r] = pan_q16(p as i8).map(|w| w as u64);
+        let sum = (l * l + r * r) as f64 / 65536.0;
+        assert!((sum - 65536.0).abs() <= 4.0, "pan {p}: {l}^2 + {r}^2 = {sum} x 65536");
+        if p > -127 {
+            assert!(r >= pan_q16((p - 1) as i8)[1] as u64, "pan {p}: the right weight rises");
+        }
+    }
+    println!("striapan law: -128 {:?} 0 {:?} 127 {:?} (centre {db:.4} dB)", pan_q16(-128), pan_q16(0), pan_q16(127));
+}
+
+/// `audio_runs` copies each clip's pan onto its layer, the crossfade's under layer the outgoing clip's.
+#[test]
+fn striapan_layers_carry_the_clip_pan() {
+    let tl = two_tracks().set_pan(0, 0, -64).unwrap().set_pan(1, 0, 100).unwrap();
+    let runs = audio_runs(&tl, 0..20, &Gop).unwrap();
+    for r in &runs {
+        for l in &r.layers {
+            assert_eq!(l.pan_cq8, if l.track == 0 { -64 } else { 100 });
+        }
+    }
+    assert_eq!(audio_runs(&two_tracks(), 0..20, &Gop).unwrap().iter().flat_map(|r| r.layers.iter()).filter(|l| l.pan_cq8 != 0).count(), 0);
+    // pan does not break runs: the same runs as the centred timeline
+    let shape = |tl: &Timeline| audio_runs(tl, 0..20, &Gop).unwrap().iter().map(|r| (r.out_t, r.len, r.layers.len())).collect::<Vec<_>>();
+    assert_eq!(shape(&tl), shape(&two_tracks()));
+    let x = audio_only(Curve::Linear).set_pan(0, 0, -127).unwrap().set_pan(0, 1, 127).unwrap();
+    let runs = audio_runs(&x, 0..60, &Gop).unwrap();
+    assert_eq!((runs[1].layers[0].src, runs[1].layers[0].pan_cq8), (SourceId(0), -127), "the under layer: the outgoing's pan");
+    assert_eq!((runs[1].layers[1].src, runs[1].layers[1].pan_cq8), (SourceId(1), 127));
+}
+
+/// `set_pan` sets one clip; only the clip's address is refused; a split keeps the pan on both halves.
+#[test]
+fn striapan_set_pan_and_split() {
+    let tl = two_tracks();
+    let p = tl.set_pan(0, 0, -128).unwrap();
+    assert_eq!(p.tracks[0].clips[0].pan_cq8, -128);
+    assert_eq!(p.tracks[1].clips[0].pan_cq8, 0);
+    assert_eq!(tl.set_pan(0, 3, 1).map(|_| ()), Err(EditError::NoClip));
+    assert_eq!(tl.set_pan(9, 0, 1).map(|_| ()), Err(EditError::NoTrack));
+    let s = tl.set_pan(0, 0, 40).unwrap().split(0, 4).unwrap();
+    assert_eq!((s.tracks[0].clips[0].pan_cq8, s.tracks[0].clips[1].pan_cq8), (40, 40));
+    assert_eq!(Clip::new(SourceId(0), 0, 1, 0).pan_cq8, 0);
+}
+
+/// The `pan <x>` word: one commit, one undo step, the same pan commits nothing, NoClip with nothing selected, a malformed
+/// word is not the verb.
+#[test]
+fn striapan_verb_one_undo_step_and_refusals() {
+    let mut st = EditorState::new(two_tracks());
+    assert_eq!(st.verb("pan 0.5"), Some(Err(EditError::NoClip)));
+    st.select(1, 0).unwrap();
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("pan -0.5"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -64); // round(-63.5) away from zero
+    assert_eq!(st.undo_depth(), d0 + 1);
+    assert_eq!(st.verb("pan -0.5"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1, "the same pan commits nothing");
+    assert_eq!(st.verb("pan 1"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, 127);
+    assert_eq!(st.verb("pan -1"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127);
+    assert_eq!(st.verb("pan 0"), Some(Ok(())));
+    assert_eq!(st.timeline, two_tracks());
+    assert!(st.undo());
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127, "one undo step per pan");
+    for bad in ["pan", "pan 2", "pan -1.01", "pan x", "pan 0.5 0.5", "pan NaN", "pan inf", "pans 0.5"] {
+        assert_eq!(st.verb(bad), None, "{bad}");
+    }
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_cq8, -127);
+}
+
+/// The EDL: `* UNA PAN <cq8>` under a panned event only, read back exactly; refused as `Syntax` with no event above or a
+/// value that is not one i8.
+#[test]
+fn striapan_edl_round_trip_and_refusals() {
+    assert!(!edl::write(&two_tracks(), "MIX").unwrap().contains("UNA PAN"));
+    let tl = two_tracks().set_gain(1, 0, -602).unwrap().set_fades(1, 0, 0, 3).unwrap().set_pan(1, 0, -64).unwrap().set_pan(0, 0, 127).unwrap();
+    let text = edl::write(&tl, "MIX").unwrap();
+    assert!(text.contains("00:00:00:20\n* UNA PAN 127\n002"), "{text}");
+    assert!(text.contains("* UNA GAIN -602\n* UNA FADE 00:00:00:00 00:00:00:03\n* UNA PAN -64\n"), "{text}");
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!((back.tracks[0].clips[0].pan_cq8, back.tracks[1].clips[0].pan_cq8), (127, -64));
+    assert_eq!(edl::write(&back, "MIX").unwrap(), text);
+    let min = edl::write(&two_tracks().set_pan(0, 0, -128).unwrap(), "MIX").unwrap();
+    assert_eq!(edl::parse(&min, 25).unwrap().tracks[0].clips[0].pan_cq8, -128);
+    for (bad, with) in [("* UNA PAN 128", true), ("* UNA PAN x", true), ("* UNA PAN 1 2", true), ("* UNA PAN 5", false)] {
+        let mut lines: Vec<&str> = text.lines().collect();
+        let at = if with { lines.iter().position(|l| l.starts_with("001")).unwrap() + 1 } else { lines.iter().position(|l| l.starts_with("001")).unwrap() };
+        lines.insert(at, bad);
+        let t = lines.join("\n");
+        assert_eq!(edl::parse(&t, 25).map(|_| ()), Err(edl::EdlError::Syntax { line: at + 1 }), "{bad}");
+    }
+}

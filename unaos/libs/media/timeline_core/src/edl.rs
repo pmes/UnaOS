@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+            pan_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") { // STRIAPAN (SR861): the `* UNA PAN` line (file tail)
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             if l.starts_with("* UNA XFADE") {
@@ -444,7 +444,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(xfade_line(tl, *ti, c.at)); // NLEXFADEPOWER (SR678)
+        s.push_str(&pan_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); // NLEXFADEPOWER (SR678); STRIAPAN (SR861): `* UNA PAN` (file tail)
     }
     Ok(s)
 }
@@ -624,4 +624,21 @@ fn mark_line(tl: &Timeline) -> String {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
+}
+
+// ---- STRIAPAN (LEDGER SR861): the `* UNA PAN` line (named tail block) ----
+// `* UNA PAN <cq8>` is the event's [`Clip::pan_cq8`] (an integer -128..=127; absent = 0, so a centred clip writes no line),
+// written after `* UNA GAIN` / `* UNA FADE` and read like them onto the event line just above it.
+
+/// STRIAPAN: a `* UNA PAN <cq8>` line applied to the event above it; any other line is not this one (`Ok`). No event
+/// above, or a value that is not one i8: `Syntax`.
+fn pan_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA PAN ") else { return Ok(()) };
+    clip.ok_or(EdlError::Syntax { line })?.pan_cq8 = r.trim().parse().map_err(|_| EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAPAN: the `* UNA PAN` line of clip `c` (empty when centred).
+fn pan_line(c: &Clip) -> String {
+    if c.pan_cq8 != 0 { format!("* UNA PAN {}\n", c.pan_cq8) } else { String::new() }
 }

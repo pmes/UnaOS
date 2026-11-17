@@ -99,6 +99,7 @@ pub struct Clip {
     pub fade_in: i64,
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
+    pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan, -128..=127 (0 = centre; -127 / -128 hard left, 127 hard right; schedule::pan_q16 is the law)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -107,7 +108,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, pan_cq8: 0 }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -1525,6 +1526,21 @@ impl Timeline {
         }
         let mut tl = self.clone();
         tl.marks = m;
+        Ok(tl)
+    }
+}
+
+// ---- STRIAPAN (LEDGER SR861): per-clip pan (named tail block) ----
+// A clip carries [`Clip::pan_cq8`] (0 = centre, the default every constructor gives); `set_pan` is `set_gain`'s shape, the
+// editor's `pan <x>` word commits it, the EDL writes it as `* UNA PAN <cq8>`, and `schedule::audio_runs` copies it onto
+// each [`schedule::Layer`]. The ONE law is [`schedule::pan_q16`]; Stria's render applies it (the kernel Player plays it
+// centred: NLE-PAN-KERNEL).
+impl Timeline {
+    /// STRIAPAN: set a clip's pan (`pan_cq8`, -128..=127; every i8 is a pan, so only the clip's address is refused).
+    pub fn set_pan(&self, track: usize, idx: usize, pan_cq8: i8) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.pan_cq8 = pan_cq8;
+        tl.validate()?;
         Ok(tl)
     }
 }
