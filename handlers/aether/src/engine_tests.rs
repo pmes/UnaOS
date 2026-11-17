@@ -6344,7 +6344,7 @@ mod tests {
             ("display", "block"), ("position", "static"), ("color", "rgb(0, 0, 0)"), ("backgroundColor", "rgba(0, 0, 0, 0)"),
             ("fontSize", "16px"), ("fontWeight", "400"), ("fontStyle", "normal"), ("lineHeight", "normal"), ("textAlign", "start"),
             ("textDecorationLine", "none"), ("visibility", "visible"), ("borderTopWidth", "0px"), ("borderTopStyle", "none"),
-            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"),
+            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"), ("direction", "ltr"),
         ] {
             assert_eq!(cssom_inherited_rest_cs(&mut e, "plain", p), want, "#plain: computed {p}");
         }
@@ -6558,5 +6558,60 @@ mod tests {
         }
         assert!(red > 40, "the outline paints the element's red ({red} px)");
         assert_eq!(blue, 0, "no blue");
+    }
+
+    // ---- AETHERCSSOMDIRECTIONCOLUMN (LEDGER SR1000): getComputedStyle direction reads the render's rtl as the 21st report column (named tail block) ----
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): a `dir=rtl` div and its children (a plain p, an inline `direction: ltr`, an
+    /// earlier `p.e { direction: ltr }` beaten by `p.e.i { direction: inherit }`, a `dir=ltr` child), an inline
+    /// `direction: rtl` div and its child, and a plain div.
+    fn cssom_direction_column_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            p.e { direction: ltr }
+            p.e.i { direction: inherit }
+            </style></head><body style="margin:0;font:16px serif">
+            <div id="r" dir="rtl"><p id="rc">a</p><p id="rl" style="direction:ltr">a</p><p id="re" class="e">a</p><p id="ri" class="e i">a</p><p id="rd" dir="ltr">a</p></div>
+            <div id="c" style="direction:rtl"><p id="cc">a</p></div>
+            <div id="plain">a</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): `getComputedStyle(el).direction` for element `id`.
+    fn cssom_direction_column_cs(e: &mut crate::AetherEngine, id: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).direction")).unwrap()
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): the `dir` attribute maps onto direction and inherits (was ltr everywhere); an
+    /// author `direction: ltr` and a `dir=ltr` child read ltr; SR831's `direction: inherit` beats the earlier ltr rule.
+    #[test]
+    fn cssom_direction_column_dir_attr() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("r", "rtl"), ("rc", "rtl"), ("rl", "ltr"), ("re", "ltr"), ("ri", "rtl"), ("rd", "ltr"), ("plain", "ltr")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): an author `direction: rtl` reads rtl and its child inherits it.
+    #[test]
+    fn cssom_direction_column_css() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("c", "rtl"), ("cc", "rtl")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): direction is the 21st column, appended at the END, so the twenty positions
+    /// the a11y tree indexes (display 0, visibility 12) and the style oracle's fixture prefix do not move.
+    #[test]
+    fn cssom_direction_column_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 21);
+        assert_eq!(crate::css::REPORT_PROPS[20], "direction");
+        assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
 }
