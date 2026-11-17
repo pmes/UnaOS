@@ -3312,12 +3312,12 @@ fn frame_walk(
                         // common declaration on the web (every Tailwind/reset
                         // preflight opens with it); rounding it up to a hairline
                         // outlines every box on the page.
-                        let px = |w: f32| if w > 0.0 { w.max(1.0) } else { 0.0 };
+                        let px = |w: f32| if w > 0.0 { w.max(1.0) } else { 0.0 }; let (lw, rw) = (sides[3].map_or(0.0, |(w, _)| px(w)), sides[1].map_or(0.0, |(w, _)| px(w)));
                         if let Some((w, c)) = sides[0].filter(|(w, _)| *w > 0.0) {
-                            stroke(bx0, by0, bx1, by0 + px(w), c);
+                            stroke(bx0 + lw, by0, bx1 - rw, by0 + px(w), c);
                         }
                         if let Some((w, c)) = sides[2].filter(|(w, _)| *w > 0.0) {
-                            stroke(bx0, by1 - px(w), bx1, by1, c);
+                            stroke(bx0 + lw, by1 - px(w), bx1 - rw, by1, c);
                         }
                         if let Some((w, c)) = sides[3].filter(|(w, _)| *w > 0.0) {
                             stroke(bx0, by0, bx0 + px(w), by1, c);
@@ -3765,7 +3765,7 @@ fn frame_walk(
                         } else {
                             // Pixel-snapped rectangles, as Blink snaps box decorations.
                             let (x0, y0) = (fx.round(), fy.round());
-                            let (x1, y1) = ((fx + w).round(), (fy + h).round());
+                            let (x1, y1) = ((fx + w).round(), (fy + h).round()); let (lw, rw) = (sides[3].map_or(0.0, |s| s.0.round().max(1.0)), sides[1].map_or(0.0, |s| s.0.round().max(1.0)));
                             let mut fill = |ax: f32, ay: f32, bx: f32, by: f32, c: (u8, u8, u8)| {
                                 let (ax, ay) = (ax.max(0.0) as u32, ay.max(0.0) as u32);
                                 let (bx, by) = ((bx.max(0.0) as u32).min(width), (by.max(0.0) as u32).min(height));
@@ -3779,10 +3779,10 @@ fn frame_walk(
                                 fill(x0, y0, x1, y1, bg);
                             }
                             if let Some((bw, c, _)) = sides[0] {
-                                fill(x0, y0, x1, y0 + bw.round().max(1.0), c);
+                                fill(x0 + lw, y0, x1 - rw, y0 + bw.round().max(1.0), c);
                             }
                             if let Some((bw, c, _)) = sides[2] {
-                                fill(x0, y1 - bw.round().max(1.0), x1, y1, c);
+                                fill(x0 + lw, y1 - bw.round().max(1.0), x1 - rw, y1, c);
                             }
                             if let Some((bw, c, _)) = sides[3] {
                                 fill(x0, y0, x0 + bw.round().max(1.0), y1, c);
