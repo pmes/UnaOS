@@ -5794,3 +5794,61 @@ mod striagainenvcurve_tests {
         assert_eq!(st.verb("env-curves"), None);
     }
 }
+
+// ---- STRIAKINSERTALL (LEDGER SR9090): the laid line both faces show (named tail block) ----
+// After a laying word (`lays`, SR9062) the selected clip is the laid one: [`EditorState::laid_line`] is its one line,
+// `<word>: <reel> <length> at <record in>` (timecode at the timeline's rate, frames for a non-integer time base). The host
+// face shows it on its message row (stria nle_face.rs SR924 `laid_verb`); the kernel Player paints it in its band's ruler
+// row through the band's label hook (vplay.rs `band_note_paint`). Neither face keeps a copy of the format.
+
+impl EditorState {
+    /// The selected (laid) clip as `<w>: <reel> <length> at <record in>`; `None` with no clip selected.
+    pub fn laid_line(&self, w: &str) -> Option<alloc::string::String> {
+        let c = self.selected()?;
+        let fps = self.timeline.fps();
+        let tc = |t: i64| fps.map_or_else(|| alloc::format!("{t}"), |f| edl::timecode(t, f));
+        let name = self.timeline.source(c.src).map_or_else(|| alloc::format!("{}", c.src.0), |x| x.reel.clone());
+        Some(alloc::format!("{w}: {name} {} at {}", tc(c.len()), tc(c.at)))
+    }
+}
+
+#[cfg(test)]
+mod striakinsertall_tests {
+    use super::*;
+    use crate::{Kind, Timebase};
+
+    /// SR852's cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and A1.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// No selection: no line. B selected, the playhead at 15, `insert` lays B 0..10 at 15: the host's SR924 string.
+    #[test]
+    fn striakinsertall_laid_line_names_the_laid_clip() {
+        let mut st = state();
+        assert_eq!(st.laid_line("insert"), None);
+        st.select(0, 1).unwrap();
+        st.seek(15);
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        assert_eq!(st.laid_line("insert").as_deref(), Some("insert: B 00:00:00:10 at 00:00:00:15"));
+    }
+
+    /// A non-integer time base (1001/30000) names the length and the record in as frames.
+    #[test]
+    fn striakinsertall_laid_line_frames_off_integer_rate() {
+        let mut st = state();
+        st.timeline.tb = Timebase { num: 1001, den: 30000 };
+        st.select(0, 1).unwrap();
+        st.seek(15);
+        assert_eq!(st.verb("overwrite"), Some(Ok(())));
+        assert_eq!(st.laid_line("overwrite").as_deref(), Some("overwrite: B 10 at 15"));
+    }
+}

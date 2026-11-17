@@ -6308,21 +6308,13 @@ impl Face {
             return None;
         }
         match self.state.verb(v)? {
-            Ok(()) => self.laid = self.laid_line(w),
+            Ok(()) => self.laid = self.state.laid_line(w), // STRIAKINSERTALL (SR9090): timeline_core's ONE laid line (the kernel Player paints it too)
             Err(e) => {
                 self.laid = None;
                 self.last_error = Some(format!("{v}: {e}"));
             }
         }
         Some(true)
-    }
-    /// The selected (laid) clip as `<word>: <reel> <length> at <record in>`; `None` with no clip selected.
-    fn laid_line(&self, w: &str) -> Option<String> {
-        let c = self.state.selected()?;
-        let fps = self.state.timeline.fps();
-        let tc = |t: i64| fps.map_or_else(|| t.to_string(), |f| timeline_core::edl::timecode(t, f));
-        let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
-        Some(format!("{w}: {name} {} at {}", tc(c.len()), tc(c.at)))
     }
     /// The laid line stands until the next taken input: a word, a click, a press, or a key the face binds (GTK's
     /// `BrowserKey` twin of a text key is not one).
