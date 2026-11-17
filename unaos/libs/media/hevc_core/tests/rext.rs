@@ -259,17 +259,7 @@ fn e_chroma_deblocking_follows_the_chroma_sample_grid() {
 
 /// 8.5.3.3.3.2 for one chroma sample of a w x h plane (eighth-sample chroma mv).
 fn hand_chroma(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -> i32 {
-    let s = |x: i32, y: i32| r[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize] as i32;
-    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
-    let (xi, yi) = (x + (mv[0] >> 3), y + (mv[1] >> 3));
-    let hz = |yy: i32| (0..4).map(|i| CHROMA_FILTER[xf][i] * s(xi + i as i32 - 1, yy)).sum::<i32>();
-    if yf == 0 {
-        if xf == 0 { s(xi, yi) << 6 } else { hz(yi) }
-    } else if xf == 0 {
-        (0..4).map(|i| CHROMA_FILTER[yf][i] * s(xi, yi + i as i32 - 1)).sum()
-    } else {
-        (0..4).map(|n| CHROMA_FILTER[yf][n] * hz(yi + n as i32 - 1)).sum::<i32>() >> 6
-    }
+    hand_chroma_wh(r, w, h, x, y, mv)
 }
 
 #[test]
@@ -961,7 +951,7 @@ fn x_decoder_profile_tier_level() {
 /// SR758: one residual-free P picture NAL over the four 16x16 CTBs (initType 1): with `mvd`, CTB 0 a 2Nx2N AMVP unit (no
 /// neighbours, no TMVP: mvp 0, so mv = mvd) and CTBs 1..3 skip coding units merging it (tests/inter.rs `amvp_then_merge`,
 /// (f) above); without, four skip coding units (tests/inter.rs `skip_picture`). No chroma syntax: the format enters through
-/// the SPS and the IDR's pcm sample counts only (HEVC-TESTKIT-PBODY owes one shared copy in tests/common).
+/// the SPS and the IDR's pcm sample counts only (HEVC-TESTKIT-PBODY-SHARED owes one shared copy in tests/common).
 fn conceal_p(cfg: &SliceCfg, mvd: Option<[i32; 2]>) -> Vec<u8> {
     let mut e = CabacEnc::new(slice_header(cfg), 1, 26);
     match mvd {
@@ -1006,22 +996,8 @@ fn conceal_p(cfg: &SliceCfg, mvd: Option<[i32; 2]>) -> Vec<u8> {
 /// is 8.5.3.3.3.2 at mvC on every sample (a 4:4:4 8x8 block is a full 64), not the 4:2:0 arm's (3, 1).
 fn conceal_subpel_case(idc: u32) {
     let (sw, sh) = sub(idc);
-    let cfg = SpsCfg { width: 32, height: 32, log2_ctb: 4, log2_max_tb: 4, chroma_format_idc: idc, pcm: Some((8, 8, 3, 4, true)), ..Default::default() };
-    let mut s = vps(false);
-    s.extend(nal(33, &sps_rbsp_ext(&cfg, &InterSps { max_dec_pic_buffering_minus1: 4, ..Default::default() })));
-    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, &PpsInter::default())));
+    let mut s = head_fmt(idc, &InterSps { max_dec_pic_buffering_minus1: 4, ..Default::default() }, &PpsInter::default());
     let (w, h) = (32 / sw, 32 / sh);
-    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
-    for k in 0..4 {
-        let (bx, by) = (k % 2, k / 2);
-        let ctb = |seed: usize, cw: usize, chh: usize| (0..cw * chh).map(|i| pat(bx * cw + i % cw, by * chh + i / cw, seed, 8)).collect::<Vec<u16>>();
-        let (cw, chh) = (16 / sw, 16 / sh);
-        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, chh), &ctb(170, cw, chh), (sw, sh));
-        if k < 3 {
-            e.terminate(0);
-        }
-    }
-    s.extend(nal(19, &e.finish().out));
     let p = |poc: u32, neg: Vec<(i32, bool)>| SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: poc, neg, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
     s.extend(conceal_p(&p(2, vec![(-2, true)]), Some([6, 2])));
     s.extend(conceal_p(&p(4, vec![(-1, true), (-2, false)]), None));
