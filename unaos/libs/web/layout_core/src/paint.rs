@@ -155,7 +155,7 @@ pub struct PaintStyle<H: Host> {
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
     /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>,
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<bool>,
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -313,7 +313,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None,
+            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None,
             word_spacing: None,
             rtl: None,
             text_shadows: None,
@@ -766,4 +766,33 @@ impl<H: Host> PaintStyle<H> {
         };
         bit(self.synth_style, NO_SYNTH_STYLE, bit(self.synth_weight, NO_SYNTH_WEIGHT, inherited))
     }
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): the inherited caps mask beside the synthesis mask (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the inherited caps mask's bits — `CAPS_SMALL` = css-fonts-4 §6.6
+/// `font-variant-caps: small-caps` (`PaintStyle::small_caps`), `CAPS_NO_SYNTH` = `font-synthesis-small-caps: none`
+/// (SR772's `synth_small_caps`). Its own field, not a third `no_synth` bit: `no_synth` keys the face caches
+/// (`FontSel`), and small caps is a split of the text road, never a different face.
+pub const CAPS_SMALL: u8 = 1;
+pub const CAPS_NO_SYNTH: u8 = 2;
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): the caps mask this box carries given its parent's `inherited` one, as
+    /// [`PaintStyle::no_synth`] does: a declared value sets or clears its bit, an undeclared one keeps the parent's
+    /// (both properties inherit).
+    pub fn caps(&self, inherited: u8) -> u8 {
+        let bit = |v: Option<bool>, b: u8, m: u8| match v {
+            Some(true) => m | b,
+            Some(false) => m & !b,
+            None => m,
+        };
+        bit(self.synth_small_caps.map(|auto| !auto), CAPS_NO_SYNTH, bit(self.small_caps, CAPS_SMALL, inherited))
+    }
+}
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): small capitals are synthesized when the run is `small-caps` and the synthesis
+/// is not `none` (Chromium likewise draws the lowercase as is under `font-synthesis-small-caps: none`).
+pub fn small_caps_synth(caps: u8) -> bool {
+    caps == CAPS_SMALL
 }
