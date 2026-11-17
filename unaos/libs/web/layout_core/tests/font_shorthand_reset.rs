@@ -23,7 +23,7 @@ fn font_resets_each_omitted_longhand() {
     let s = styled(&[("font-weight", "bold"), ("font", "16px serif")]);
     assert_eq!(s.paint.weight, Some(FontWeight::Abs(400)), "font-weight resets to 400");
     let s = styled(&[("font-variant", "small-caps"), ("font", "16px serif")]);
-    assert_eq!(s.paint.small_caps, Some(false), "font-variant-caps resets to normal");
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal), "font-variant-caps resets to normal");
     let s = styled(&[("font-stretch", "condensed"), ("font", "16px serif")]);
     assert_eq!(s.paint.stretch, Some(100), "font-stretch resets to 100%");
     let s = styled(&[("line-height", "3"), ("font", "16px serif")]);
@@ -38,7 +38,7 @@ fn font_prefix_and_slash_set_their_own() {
     assert_eq!(s.paint.italic, Some(true));
     assert_eq!(s.paint.weight, Some(FontWeight::Abs(700)));
     assert_eq!(s.paint.stretch, Some(75));
-    assert_eq!(s.paint.small_caps, Some(true));
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::SmallCaps));
     assert_eq!(s.paint.line_height, Some(2.0), "the shorthand's own /line-height applies after the reset");
 }
 

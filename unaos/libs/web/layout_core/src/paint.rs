@@ -155,7 +155,7 @@ pub struct PaintStyle<H: Host> {
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
     /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<bool>,
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>,
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -787,12 +787,71 @@ impl<H: Host> PaintStyle<H> {
             Some(false) => m & !b,
             None => m,
         };
-        bit(self.synth_small_caps.map(|auto| !auto), CAPS_NO_SYNTH, bit(self.small_caps, CAPS_SMALL, inherited))
+        bit(self.synth_small_caps.map(|auto| !auto), CAPS_NO_SYNTH, self.small_caps.map_or(inherited, |c| inherited & !(CAPS_SMALL | CAPS_ALL) | c.mask()))
     }
 }
 
 /// AETHERFONTVARIANTSMALLCAPS (SR800): small capitals are synthesized when the run is `small-caps` and the synthesis
-/// is not `none` (Chromium likewise draws the lowercase as is under `font-synthesis-small-caps: none`).
-pub fn small_caps_synth(caps: u8) -> bool {
-    caps == CAPS_SMALL
+/// is not `none` (Chromium likewise draws the lowercase as is under `font-synthesis-small-caps: none`); SR806: the bits, 0 off.
+pub fn small_caps_synth(caps: u8) -> u8 {
+    if caps & CAPS_NO_SYNTH != 0 { 0 } else { caps & (CAPS_SMALL | CAPS_ALL) }
+}
+
+// ---- AETHERFONTVARIANTCAPSALL (LEDGER SR806): the seven font-variant-caps values, the mask derived (named tail block) ----
+
+/// AETHERFONTVARIANTCAPSALL (SR806): the caps-mask bit of `all-small-caps` / `all-petite-caps`: the uppercase letters are
+/// synthesized small too (`inline::small_caps_segments`'s `all`). Set only beside `CAPS_SMALL`.
+pub const CAPS_ALL: u8 = 4;
+
+/// AETHERFONTVARIANTCAPSALL (SR806): css-fonts-4 §6.6 `font-variant-caps`, the value `PaintStyle::small_caps` stores.
+/// The face has no GSUB feature selection, so as Chromium does without `smcp` / `pcap` (recalled): small-caps and
+/// petite-caps synthesize the lowercase, the all-* pair every letter, unicase and titling-caps render normal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caps {
+    Normal,
+    SmallCaps,
+    AllSmallCaps,
+    PetiteCaps,
+    AllPetiteCaps,
+    Unicase,
+    TitlingCaps,
+}
+
+impl Caps {
+    /// AETHERFONTVARIANTCAPSALL (SR806): the keyword's value (ASCII lowercase expected), None for any other word.
+    pub fn of(k: &str) -> Option<Caps> {
+        Some(match k {
+            "normal" => Caps::Normal,
+            "small-caps" => Caps::SmallCaps,
+            "all-small-caps" => Caps::AllSmallCaps,
+            "petite-caps" => Caps::PetiteCaps,
+            "all-petite-caps" => Caps::AllPetiteCaps,
+            "unicase" => Caps::Unicase,
+            "titling-caps" => Caps::TitlingCaps,
+            _ => return None,
+        })
+    }
+
+    /// AETHERFONTVARIANTCAPSALL (SR806): the computed keyword (getComputedStyle's `fontVariantCaps`).
+    pub fn word(self) -> &'static str {
+        match self {
+            Caps::Normal => "normal",
+            Caps::SmallCaps => "small-caps",
+            Caps::AllSmallCaps => "all-small-caps",
+            Caps::PetiteCaps => "petite-caps",
+            Caps::AllPetiteCaps => "all-petite-caps",
+            Caps::Unicase => "unicase",
+            Caps::TitlingCaps => "titling-caps",
+        }
+    }
+
+    /// AETHERFONTVARIANTCAPSALL (SR806): the caps-mask bits this value sets (`PaintStyle::caps` clears both first):
+    /// petite as its small twin, unicase / titling-caps none (no synthesis).
+    pub fn mask(self) -> u8 {
+        match self {
+            Caps::SmallCaps | Caps::PetiteCaps => CAPS_SMALL,
+            Caps::AllSmallCaps | Caps::AllPetiteCaps => CAPS_SMALL | CAPS_ALL,
+            Caps::Normal | Caps::Unicase | Caps::TitlingCaps => 0,
+        }
+    }
 }
