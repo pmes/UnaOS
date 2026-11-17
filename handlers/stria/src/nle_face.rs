@@ -3159,7 +3159,7 @@ impl Thumbs {
                 let _ = self.thumb_for(tl, sources, c.src, c.src_in);
                 done += 1;
             }
-        }
+        } self.fill_strip(tl, sources, l, t0, done); // STRIATHUMBNAILSMORE (SR949): every head wanted is decoded: the wide bodies' filmstrip and tail on the same budget (file tail)
     }
     /// The head of `src` at `src_in`: cached, else decoded once (see the block's RULES).
     fn thumb_for(&mut self, tl: &Timeline, sources: &Sources, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
@@ -3227,5 +3227,57 @@ mod thumb_tests {
         assert!(t.get(timeline_core::SourceId(0), 0).is_none(), "the first key went");
         assert!(t.get(timeline_core::SourceId(0), 1).is_some() && t.get(timeline_core::SourceId(0), THUMB_CACHE as i64).is_some());
         println!("striathumbnails: cache {} entries after {} inserts, oldest dropped", t.map.len(), THUMB_CACHE + 1);
+    }
+}
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail stills (named tail block) ----
+// timeline_core view.rs `head_tiles` is THE tile rule (the painter `paint_strip` reads it too): a body two heads wide shows
+// its head, a filmstrip still every head width and its tail (`src_out - 1`). `Thumbs::fill_strip` decodes those tiles' keys
+// into the SAME map through the SAME `thumb_for` (one `preview`, `head_still`), continuing `fill`'s count and clock, so the
+// THUMBS_PER_PAINT / THUMB_BUDGET_MS rule spans both and `pending` keeps `serve`'s clock filling. ORDER: `fill` calls it only
+// once every visible head is decoded (heads first). A body starting left of the canvas (the head pass skips it) whose visible
+// part is at least THUMB_MIN_W px decodes its head key first, since the head still's width sets the tiles. Tiles left of the
+// canvas or right of it ask nothing (paint_head paints neither). Owed: NLE-THUMBNAILS-STRIP-CACHE (more visible tiles than
+// THUMB_CACHE re-decode every paint), NLE-THUMBNAILS-RATE (STRIACLIPSPEED SR829's `src_at` in `head_tiles`).
+
+impl Thumbs {
+    /// STRIATHUMBNAILSMORE (SR949): the visible tiles beyond each head, decoded within the paint's bounds (the block's rules).
+    fn fill_strip(&mut self, tl: &Timeline, sources: &Sources, l: Layout, t0: std::time::Instant, mut done: u32) {
+        let spent = |done: u32| done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS));
+        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
+            let y = l.row_y(row);
+            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
+                continue;
+            }
+            for c in &tr.clips {
+                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+                if x1 <= 0 || x0 >= l.w as i64 || x1.min(l.w as i64) - x0.max(0) < THUMB_MIN_W {
+                    continue;
+                }
+                if !self.map.contains_key(&(c.src, c.src_in)) {
+                    if x0 >= 0 {
+                        continue; // the head pass's rule left it (a body under THUMB_MIN_W): no strip either
+                    }
+                    if spent(done) {
+                        self.pending = true;
+                        return;
+                    }
+                    let _ = self.thumb_for(tl, sources, c.src, c.src_in);
+                    done += 1;
+                }
+                let Some(sw) = self.get(c.src, c.src_in).map(|s| s.width as i64) else { continue };
+                for (x, _, tick) in view::head_tiles(x0, x1, sw, l.zoom, c).into_iter().skip(1) {
+                    if x < 0 || x >= l.w as i64 || self.map.contains_key(&(c.src, tick)) {
+                        continue;
+                    }
+                    if spent(done) {
+                        self.pending = true;
+                        return;
+                    }
+                    let _ = self.thumb_for(tl, sources, c.src, tick);
+                    done += 1;
+                }
+            }
+        }
     }
 }
