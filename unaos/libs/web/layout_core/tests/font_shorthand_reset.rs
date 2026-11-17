@@ -122,7 +122,7 @@ fn font_wide(kw: &str) -> SpecifiedStyle<TH> {
 
 /// AETHERFONTSHORTHANDINHERIT (SR810): the fields `font` resets, for a field-by-field comparison.
 #[allow(clippy::type_complexity)]
-fn font_fields(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<FontWeight>, Option<u16>, Option<bool>, Option<f32>, Option<f32>, Option<(u8, f32)>, Option<u16>) {
+fn font_fields(s: &SpecifiedStyle<TH>) -> (Option<bool>, Option<FontWeight>, Option<u16>, Option<layout_core::paint::Caps>, Option<f32>, Option<f32>, Option<(u8, f32)>, Option<u16>) {
     let p = &s.paint;
     (p.italic, p.weight, p.stretch, p.small_caps, p.line_height, p.font_size, p.font_size_rel, p.family)
 }
@@ -151,7 +151,7 @@ fn font_initial_takes_the_initials() {
     assert_eq!(s.paint.italic, Some(false));
     assert_eq!(s.paint.weight, Some(FontWeight::Abs(400)));
     assert_eq!(s.paint.stretch, Some(100));
-    assert_eq!(s.paint.small_caps, Some(false));
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal));
     assert_eq!(s.paint.line_height, Some(0.0), "line-height normal");
     assert_eq!(s.paint.font_size, Some(16.0), "medium");
     assert_eq!(s.paint.font_size_rel, Some((2, 0.0)), "absolute");
