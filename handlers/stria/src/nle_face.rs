@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "speed", "title", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIACLIPSPEED (SR829): speed (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -243,6 +243,8 @@ impl Face {
                 Ok(())
             }
             "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
+            v if speed_word(v).is_some() => speed_verb(&mut self.state, v), // STRIACLIPSPEED (SR829): `speed` cycles 1x / 2x / 4x, `speed <q>` sets it (file tail)
+            v if title_text(v).is_some() => add_title(&mut self.state, title_text(v).unwrap_or("Title")), // STRIATITLECLIP (SR828): `title [<text...>]` lays a 5 s title card at the playhead (file tail)
             v if slipslide_word(v).is_some() => slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)
@@ -3096,4 +3098,56 @@ impl Face {
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
     }
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): the `title` word — a title card at the playhead (named tail block) ----
+/// STRIATITLECLIP (LEDGER SR828): a face's title card lasts this many seconds.
+pub const TITLE_SECS: u64 = 5;
+
+/// STRIATITLECLIP: the text of a `title [<text...>]` word (`None`: not one): the words after `title`, trimmed; bare
+/// `title` (the Title button) is "Title".
+pub fn title_text(v: &str) -> Option<&str> {
+    if v == "title" {
+        return Some("Title");
+    }
+    let t = v.strip_prefix("title ")?.trim();
+    Some(if t.is_empty() { "Title" } else { t })
+}
+
+/// STRIATITLECLIP: `text` as a [`TITLE_SECS`] title source inserted at the playhead on the first video track through
+/// timeline_core's ONE editor commit (`EditorState::add_title`, `Timeline::place` Insert).
+pub fn add_title(st: &mut EditorState, text: &str) -> Result<(), EditError> {
+    let tb = st.timeline.tb;
+    let dur = (TITLE_SECS * tb.den / tb.num.max(1)) as i64;
+    st.add_title(text, dur)
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): the `speed` word — the selected clip's rate through the one commit (named tail block) ----
+/// STRIACLIPSPEED (LEDGER SR829): what bare `speed` (the Speed button) steps the selected clip through: 1x -> 2x -> 4x -> 1x
+/// (a rate not in the table goes to 1x). It only ever shrinks the clip and then gives back its own length, so the button
+/// never needs room the clip did not have.
+pub const SPEED_CYCLE: [u32; 3] = [0x1_0000, 0x2_0000, 0x4_0000];
+
+/// STRIACLIPSPEED: the rate a `speed` word asks for: `Some(None)` bare `speed` (the cycle), `Some(Some(q))` `speed <q>` (`q` a
+/// decimal read by timeline_core's `speed_q16`: `speed 2`, `speed 0.5`, `speed 1.5`); `None`: not this word.
+pub fn speed_word(v: &str) -> Option<Option<u32>> {
+    if v == "speed" {
+        return Some(None);
+    }
+    timeline_core::speed_q16(v.strip_prefix("speed ")?.trim(), 1).map(Some)
+}
+
+/// STRIACLIPSPEED: the `speed` word on the selected clip through `EditorState::set_speed` (ONE commit; undo restores); a
+/// refusal (`NoClip`, `Rate` for `speed 0`, `Overlap`) comes back by name for the message line.
+pub fn speed_verb(st: &mut EditorState, v: &str) -> Result<(), EditError> {
+    let q = match speed_word(v) {
+        Some(Some(q)) => q,
+        Some(None) => {
+            let now = st.selected().ok_or(EditError::NoClip)?.rate_q16;
+            let i = SPEED_CYCLE.iter().position(|&r| r == now).map_or(0, |i| (i + 1) % SPEED_CYCLE.len());
+            SPEED_CYCLE[i]
+        }
+        None => return Err(EditError::NoClip),
+    };
+    st.set_speed(q)
 }

@@ -207,7 +207,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
-            mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+            title_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
@@ -221,7 +221,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             }
             continue;
         }
-        let w: Vec<&str> = l.split_whitespace().collect();
+        if l.starts_with("M2 ") { m2_comment(text, i, l, fps, line, cur.and_then(|k| events.get_mut(k)).map(|e| &mut e.3))?; continue; } let w: Vec<&str> = l.split_whitespace().collect(); // STRIACLIPSPEED (SR829): the CMX M2 speed line under its event (file tail)
         xq = None; // NLEXFADEPOWER: an XFADE line belongs to the event line just above it
         if w.is_empty() || !w[0].bytes().all(|b| b.is_ascii_digit()) {
             return Err(EdlError::Syntax { line });
@@ -233,7 +233,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         }
         let (kind, num) = channel(w[2]).ok_or(EdlError::Channel { line })?;
         let tc: Vec<i64> = w[n_words - 4..n_words].iter().map(|s| parse_tc(s, fps, line)).collect::<Result<_, _>>()?;
-        if tc[3] - tc[2] != tc[1] - tc[0] {
+        if tc[3] - tc[2] != tc[1] - tc[0] && !m2_next(text, i) { // STRIACLIPSPEED (SR829): a rated event's spans differ; its M2 line checks them (file tail)
             return Err(EdlError::Duration { line });
         }
         let clip = Clip::new(crate::SourceId(0), tc[0], tc[1], tc[2]);
@@ -396,6 +396,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if src.size_policy != SizePolicy::Letterbox {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
+        s.push_str(&title_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail)
     }
     s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
@@ -437,7 +438,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.at, fps),
             timecode(c.end(), fps)
         ));
-        s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
+        s.push_str(&m2_line(reel, c, fps)); s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
         if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
@@ -623,5 +624,253 @@ fn mark_line(tl: &Timeline) -> String {
     match tl.marks {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
+    }
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): the `* UNA TITLE` line (named tail block) ----
+// `* UNA TITLE <reel> "<text>"` is a generated title source's text ([`crate::Source::title`]), written right after that
+// reel's `* UNA SOURCE` (and SIZE) line and only for a titled source, so an EDL with no title writes as before. The text is
+// quoted: `\` -> `\\`, `"` -> `\"`, LF -> `\n`, CR -> `\r`. A TITLE line naming a reel no SOURCE line above it declared, a
+// second TITLE for one reel, or a malformed quote (an unknown escape, no closing quote, words after it) is a syntax error.
+
+/// STRIATITLECLIP: a `* UNA TITLE` line applied to its (already declared) source; any other line is left alone.
+fn title_comment(l: &str, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA TITLE ") else { return Ok(()) };
+    let (reel, q) = r.split_once(' ').ok_or(EdlError::Syntax { line })?;
+    let text = unquote(q).ok_or(EdlError::Syntax { line })?;
+    let src = tl.sources.iter_mut().find(|s| s.reel == reel).filter(|s| s.title.is_none()).ok_or(EdlError::Syntax { line })?;
+    src.title = Some(text);
+    Ok(())
+}
+
+/// STRIATITLECLIP: a source's `* UNA TITLE` line (empty for a media reel).
+fn title_line(src: &crate::Source) -> String {
+    match &src.title {
+        Some(t) => format!("* UNA TITLE {} {}\n", src.reel, quote(t)),
+        None => String::new(),
+    }
+}
+
+/// STRIATITLECLIP: `text` in double quotes, `\`, `"`, LF and CR escaped (the one inverse of [`unquote`]).
+fn quote(text: &str) -> String {
+    let mut q = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => q.push_str("\\\\"),
+            '"' => q.push_str("\\\""),
+            '\n' => q.push_str("\\n"),
+            '\r' => q.push_str("\\r"),
+            c => q.push(c),
+        }
+    }
+    q.push('"');
+    q
+}
+
+/// STRIATITLECLIP: the text of a [`quote`]d string that is the whole of `q`; `None` for anything else.
+fn unquote(q: &str) -> Option<String> {
+    let mut it = q.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    loop {
+        match it.next()? {
+            '"' => return it.next().is_none().then_some(out),
+            '\\' => out.push(match it.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                'r' => '\r',
+                _ => return None,
+            }),
+            c => out.push(c),
+        }
+    }
+}
+
+#[cfg(test)]
+mod striatitleclip_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    fn titled(text: &str) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        tl.sources[1].title = Some(String::from(text));
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, 20, 10)];
+        tl
+    }
+
+    #[test]
+    fn striatitleclip_title_round_trips_with_quote_and_backslash() {
+        let text = "He said \"hi\" \\ back\\slash";
+        let tl = titled(text);
+        let s = write(&tl, "TITLES").unwrap();
+        assert!(s.contains("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"He said \\\"hi\\\" \\\\ back\\\\slash\"\n"), "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back, tl);
+        assert_eq!(back.sources[1].title.as_deref(), Some(text));
+        assert_eq!(write(&back, "TITLES").unwrap(), s, "write(parse(write)) byte-identical");
+    }
+
+    #[test]
+    fn striatitleclip_quote_pair_and_malformed() {
+        for t in ["", "plain", "a\"b", "c\\d", "line\nbreak\rcr", "  spaced  ", "\u{00e9}t\u{00e9}"] {
+            assert_eq!(unquote(&quote(t)).as_deref(), Some(t), "{t:?}");
+        }
+        for bad in ["", "plain", "\"open", "\"x\" tail", "\"bad\\q\"", "\"end\\\"", "x\"y\""] {
+            assert_eq!(unquote(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn striatitleclip_bad_title_lines_are_syntax() {
+        let good = write(&titled("Hello"), "T").unwrap();
+        let unknown = good.replace("* UNA TITLE T1", "* UNA TITLE T9");
+        assert!(matches!(parse(&unknown, 25), Err(EdlError::Syntax { .. })), "unknown reel");
+        let twice = good.replace("* UNA TITLE T1 \"Hello\"\n", "* UNA TITLE T1 \"Hello\"\n* UNA TITLE T1 \"Again\"\n");
+        assert!(matches!(parse(&twice, 25), Err(EdlError::Syntax { .. })), "second title");
+        let bad = good.replace("\"Hello\"", "\"Hello");
+        assert!(matches!(parse(&bad, 25), Err(EdlError::Syntax { .. })), "bad quote");
+        let first = good.replace("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"Hello\"\n", "* UNA TITLE T1 \"Hello\"\n* UNA SOURCE T1 00:00:05:00\n");
+        assert!(matches!(parse(&first, 25), Err(EdlError::Syntax { .. })), "title before its source");
+    }
+
+    #[test]
+    fn striatitleclip_no_title_writes_no_title_line() {
+        let mut tl = titled("x");
+        tl.sources[1].title = None;
+        let s = write(&tl, "T").unwrap();
+        assert!(!s.contains("UNA TITLE"), "{s}");
+        assert_eq!(parse(&s, 25).unwrap().sources[1].title, None);
+    }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): the CMX 3600 `M2` motion-memory line (named tail block) ----
+// A clip at a rate other than 1x writes ONE line directly under its event line: `M2   <reel> <speed> <source in>`, the
+// speed being fps x rate written EXACTLY (`{:03}` integer part, then every decimal digit the 2^-16 fraction needs, at least
+// one: `050.0` is 2x at 25 fps, `037.5` 1.5x, `012.5` 0.5x), so `write(parse(write))` stays byte-identical; a 1x clip writes
+// none, so every 1x EDL writes as before. The event line keeps source in / out = the source and record in / out = the
+// timeline (`at`, `end()`), so a rated event's spans differ: that is accepted only when an M2 line follows it directly, and
+// the M2 line checks `len()` at its rate against the record span (`Duration`, at the event's line). Refused by name: an M2
+// line not directly under an event that made a clip (none, a `BL`, a transition's zero-length outgoing line), another reel,
+// a source in other than the event's, or an unreadable speed (`Syntax`); a `-` or zero speed (`Edit(Rate)`: no reverse, no
+// dwell). A hand-written speed is read exactly and rounded once to Q16.16 (`crate::speed_q16`).
+
+/// STRIACLIPSPEED: line `i + 1` of `text` (0-based) is an M2 line.
+fn m2_next(text: &str, i: usize) -> bool {
+    text.lines().nth(i + 1).is_some_and(|n| n.trim().starts_with("M2 "))
+}
+
+/// STRIACLIPSPEED: apply the M2 line `l` (0-based line `i` of `text`, 1-based `line`) to the clip of the event line directly
+/// above it (`clip`: `None` when that event made no clip).
+fn m2_comment(text: &str, i: usize, l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let prev = i.checked_sub(1).and_then(|k| text.lines().nth(k)).map(str::trim).ok_or(EdlError::Syntax { line })?;
+    let e: Vec<&str> = prev.split_whitespace().collect();
+    if e.len() < 8 || !e[0].bytes().all(|b| b.is_ascii_digit()) {
+        return Err(EdlError::Syntax { line });
+    }
+    let w: Vec<&str> = l.split_whitespace().collect();
+    if w.len() != 4 || w[0] != "M2" || w[1] != e[1] || parse_tc(w[3], fps, line)? != c.src_in {
+        return Err(EdlError::Syntax { line });
+    }
+    if w[2].starts_with('-') {
+        return Err(EdlError::Edit(EditError::Rate));
+    }
+    let q = crate::speed_q16(w[2], fps).ok_or(EdlError::Syntax { line })?;
+    if q == 0 {
+        return Err(EdlError::Edit(EditError::Rate));
+    }
+    let n = e.len();
+    let span = parse_tc(e[n - 1], fps, line - 1)? - parse_tc(e[n - 2], fps, line - 1)?;
+    c.rate_q16 = q;
+    if c.len() != span {
+        return Err(EdlError::Duration { line: line - 1 });
+    }
+    Ok(())
+}
+
+/// STRIACLIPSPEED: clip `c`'s M2 line (empty at 1x).
+fn m2_line(reel: &str, c: &Clip, fps: u32) -> String {
+    if c.rate_q16 == 0x1_0000 {
+        return String::new();
+    }
+    format!("M2   {:<8} {} {}\n", reel, m2_speed(c.rate_q16, fps), timecode(c.src_in, fps))
+}
+
+/// STRIACLIPSPEED: `rate_q16 * fps / 0x1_0000` as an exact decimal: `{:03}` integer part, every needed decimal digit (>= 1).
+fn m2_speed(rate_q16: u32, fps: u32) -> String {
+    let v = rate_q16 as u64 * fps as u64;
+    let mut s = format!("{:03}.", v >> 16);
+    let mut r = v & 0xFFFF;
+    loop {
+        r *= 10;
+        s.push((b'0' + (r >> 16) as u8) as char);
+        r &= 0xFFFF;
+        if r == 0 {
+            break;
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod striaclipspeed_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    /// V1 A[13,23)@0 at `rate`, A[30,40)@25; A1 A[13,23)@0 at `rate`.
+    fn rated(rate: u32) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0).at_rate(rate), Clip::new(a, 30, 40, 25)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 13, 23, 0).at_rate(rate)];
+        tl
+    }
+
+    #[test]
+    fn striaclipspeed_m2_round_trip() {
+        let tl = rated(0x2_0000);
+        let s = write(&tl, "SPEED").unwrap();
+        assert!(s.contains("001  A        V     C        00:00:00:13 00:00:00:23 00:00:00:00 00:00:00:05\nM2   A        050.0 00:00:00:13\n"), "{s}");
+        assert_eq!(s.matches("M2 ").count(), 2, "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back, tl);
+        assert_eq!(write(&back, "SPEED").unwrap(), s, "write(parse(write)) byte-identical");
+        for (q, word) in [(0x1_8000, "037.5"), (0x8000, "012.5"), (0x1_5555, "033.3332061767578125")] {
+            let t = rated(q);
+            let s = write(&t, "SPEED").unwrap();
+            assert!(s.contains(&format!("M2   A        {word} 00:00:00:13\n")), "{s}");
+            assert_eq!(parse(&s, 25).unwrap(), t, "{word}");
+        }
+        assert!(!write(&rated(0x1_0000), "SPEED").unwrap().contains("M2"), "a 1x EDL writes no M2");
+        std::println!("striaclipspeed: M2 050.0 / 037.5 / 012.5 round trip byte-identical; 1x writes none");
+    }
+
+    #[test]
+    fn striaclipspeed_m2_refusals_by_name() {
+        let s = write(&rated(0x2_0000), "SPEED").unwrap();
+        let m2 = "M2   A        050.0 00:00:00:13\n";
+        let lost = s.replacen(m2, "", 1);
+        assert!(matches!(parse(&lost, 25), Err(EdlError::Duration { .. })), "spans differ with no M2");
+        let stray = s.replacen("* UNA SOURCE A 00:00:02:00\n", &format!("* UNA SOURCE A 00:00:02:00\n{m2}"), 1);
+        assert!(matches!(parse(&stray, 25), Err(EdlError::Syntax { .. })), "an M2 under no event");
+        let reel = s.replacen(m2, "M2   B        050.0 00:00:00:13\n", 1);
+        assert!(matches!(parse(&reel, 25), Err(EdlError::Syntax { .. })), "another reel");
+        let tc = s.replacen(m2, "M2   A        050.0 00:00:00:14\n", 1);
+        assert!(matches!(parse(&tc, 25), Err(EdlError::Syntax { .. })), "another source in");
+        let slow = s.replacen(m2, "M2   A        025.0 00:00:00:13\n", 1);
+        assert!(matches!(parse(&slow, 25), Err(EdlError::Duration { .. })), "a speed that does not fit the record span");
+        for bad in ["-050.0", "000.0"] {
+            let t = s.replacen(m2, &format!("M2   A        {bad} 00:00:00:13\n"), 1);
+            assert!(matches!(parse(&t, 25), Err(EdlError::Edit(EditError::Rate))), "{bad}");
+        }
+        let junk = s.replacen(m2, "M2   A        fast 00:00:00:13\n", 1);
+        assert!(matches!(parse(&junk, 25), Err(EdlError::Syntax { .. })), "unreadable speed");
+        std::println!("striaclipspeed: M2 refusals: stray/reel/tc/junk Syntax, wrong speed Duration, -/0 Rate");
     }
 }

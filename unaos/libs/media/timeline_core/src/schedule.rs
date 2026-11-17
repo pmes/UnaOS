@@ -137,10 +137,10 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                 (Some((ti, x)), _) => black_step(tl, idx, ti, &x, t, &mut v_next, &mut m_next)?,
                 (None, Some((ti, ci))) => {
                     let c = tl.tracks[ti].clips[ci];
-                    let src_t = c.src_in + (t - c.at);
+                    let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?;
                     let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, v_next)?;
-                    v_next = Some((c.src, src_t + 1));
+                    v_next = Some((c.src, c.src_at(t + 1))); // STRIACLIPSPEED (SR829): a rated clip continues its run (1x: src_t + 1)
                     Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
                 }
                 (None, None) => {
@@ -265,9 +265,9 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                         None => xnext[ti] = None,
                     }
                     env = tail_env(tl, ti, ci, t, end, env); // NLEXFADEPOWER: a fade to silence past the clip's end
-                    let src_t = c.src_in + (t - c.at);
+                    let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
-                    next[ti] = Some((c.src, src_t + (end - t)));
+                    next[ti] = Some((c.src, c.src_at(end))); // STRIACLIPSPEED (SR829): where the run's source ends at the clip's rate (1x: src_t + (end - t))
                     layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: c.gain_cdb, env });
                 }
                 None => (next[ti], xnext[ti]) = (None, None),
@@ -290,7 +290,7 @@ fn seek_for(
     if next == Some((src, src_t)) {
         return Ok(None);
     }
-    idx.keyframe_ns(src, kind, tl.tb.to_ns(src_t)).map(Some).ok_or(ScheduleError::NoKeyframe(src))
+    if kind == Kind::Video && tl.source(src).is_some_and(|s| s.title.is_some()) { return Ok(Some(tl.tb.to_ns(src_t))); } idx.keyframe_ns(src, kind, tl.tb.to_ns(src_t)).map(Some).ok_or(ScheduleError::NoKeyframe(src)) // STRIATITLECLIP (SR828): a title on a video track is generated: every frame is its own key, no SourceIndex asked
 }
 
 /// NLE4: clip `c`'s fade envelope at timeline tick (edge) `t`, Q16: rising over `at..at + fade_in`, falling over

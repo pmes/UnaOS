@@ -1038,7 +1038,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
-    let mut reels = Reels { tb: tl.tb, reels: Vec::new() };
+    if let Some(c) = tl.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| c.rate_q16 != 0x1_0000) { return Err(("rate-unsupported", Some(alloc::format!("a clip at rate {:#x} (the Player's EDL mode plays every clip at 1x)", c.rate_q16)))); } let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // NLE-SPEED-KERNEL (SR829): a rated clip is refused by name, never played at 1x
     for s in &tl.sources {
         let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
             return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV)", s.reel, dir, s.reel))));
@@ -1052,7 +1052,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         );
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
-    let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?;
+    if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // NLE-TITLE-KERNEL (SR828): a titled source is refused by name, never scheduled onto a frame road with no title arm
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
     rep.steps = steps.len();

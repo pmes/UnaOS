@@ -35,7 +35,7 @@
 //!   model for the host face (`stria::nle_face`) and the on-UnaOS face (the kernel Player's EDL mode).
 //! * Edit lists (EDITMAP, LEDGER SR223): an MP4 `elst` IS a timeline over one source; [`Timeline::lay_edit_list`] lays
 //!   a stream's segments on a track (each media segment a clip, an empty edit a gap, a repeat two clips over one source
-//!   range) and refuses a rate other than 1 by name ([`EditError::Rate`]).
+//!   range) and refuses a rate <= 0 by name ([`EditError::Rate`]); a positive rate lays the clip at that `rate_q16` (STRIACLIPSPEED SR829).
 //! * [`vmix`] (NLE6MIX, rmbp-ledger B899): the ONE video transition mix ([`vmix::mix_step`]) and outgoing-run rule
 //!   ([`vmix::take_outgoing`]) Stria's render and the kernel Player's EDL mode both call.
 //! * [`view`] (NLE6KEYS, rmbp-ledger B961): the editor's ONE track view — the geometry ([`view::Layout`]) and the painter
@@ -84,6 +84,8 @@ pub struct Source {
     pub duration: i64,
     /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
     pub size_policy: SizePolicy,
+    /// STRIATITLECLIP (SR828): a generated title card's one line of text (`None`: a media reel); `edl` keeps it as `* UNA TITLE`.
+    pub title: Option<String>,
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -99,6 +101,8 @@ pub struct Clip {
     pub fade_in: i64,
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
+    /// STRIACLIPSPEED (SR829): the clip's speed, Q16.16 (`0x1_0000` = 1x, the MP4 `elst` media_rate encoding); [`Clip::len`] / [`Clip::src_at`].
+    pub rate_q16: u32,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -107,7 +111,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000 }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -119,7 +123,7 @@ impl Clip {
     }
     /// Ticks on the timeline.
     pub fn len(&self) -> i64 {
-        self.src_out - self.src_in
+        rated_len(self.src_out - self.src_in, self.rate_q16) // STRIACLIPSPEED (SR829): ceil(source span / rate) (file tail)
     }
     pub fn is_empty(&self) -> bool {
         self.len() <= 0
@@ -369,8 +373,8 @@ pub enum EditError {
     Fade,
     /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
     Gain,
-    /// EDITMAP (SR223): an edit-list segment at a rate other than 1 (slow / fast motion, or a rate-0 dwell hold): the
-    /// model has no speed op.
+    /// EDITMAP (SR223): an edit-list segment at a rate <= 0 (a rate-0 dwell hold, or reverse); STRIACLIPSPEED (SR829): a clip
+    /// at rate 0, an M2 speed <= 0, or an op that would cut a rated clip off its frame grid.
     Rate,
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
@@ -393,7 +397,7 @@ impl core::fmt::Display for EditError {
             EditError::Handle => "transition is longer than a clip's handle",
             EditError::Fade => "fades longer than the clip",
             EditError::Gain => "gain out of range",
-            EditError::Rate => "edit list rate is not 1 (no speed op)",
+            EditError::Rate => "rate is not a positive speed (a dwell or reverse)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
         })
@@ -422,7 +426,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None });
         id
     }
     /// Add an empty track (builder); returns its index.
@@ -459,7 +463,7 @@ impl Timeline {
                 if c.at < 0 || c.src_in < 0 {
                     return Err(EditError::Negative);
                 }
-                if c.src_in >= c.src_out {
+                if c.rate_q16 == 0 { return Err(EditError::Rate); } if c.src_in >= c.src_out { // STRIACLIPSPEED (SR829): rate 0 refused by name
                     return Err(EditError::Empty);
                 }
                 if c.src_out > s.duration {
@@ -601,12 +605,12 @@ impl Timeline {
         let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
         match mode {
             Mode::Insert => {
-                split_at(t, clip.at);
+                if !cut_clean(t, clip.at) { return Err(EditError::Rate); } split_at(t, clip.at); // STRIACLIPSPEED (SR829): a rated clip cuts on its frame grid (file tail)
                 for c in t.clips.iter_mut().filter(|c| c.at >= clip.at) {
                     c.at += clip.len();
                 }
             }
-            Mode::Overwrite => carve(t, clip.at, clip.end()),
+            Mode::Overwrite => { if !cut_clean(t, clip.at) || !cut_clean(t, clip.end()) { return Err(EditError::Rate); } carve(t, clip.at, clip.end()) } // STRIACLIPSPEED (SR829)
         }
         t.clips.push(clip);
         sort(t);
@@ -621,7 +625,7 @@ impl Timeline {
         if !tr.clips.iter().any(|c| c.at < t && t < c.end()) {
             return Err(EditError::NoClip);
         }
-        split_at(tr, t);
+        if !cut_clean(tr, t) { return Err(EditError::Rate); } split_at(tr, t); // STRIACLIPSPEED (SR829): off the frame grid refused by name
         tl.validate()?;
         Ok(tl)
     }
@@ -630,7 +634,7 @@ impl Timeline {
     pub fn trim_in(&self, track: usize, idx: usize, src_in: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let c = clip_mut(&mut tl, track, idx)?;
-        c.at += src_in - c.src_in;
+        c.at = c.end() - Clip { src_in, ..*c }.len(); // STRIACLIPSPEED (SR829): the out edge stays at any rate (1x: at += src_in - old src_in)
         c.src_in = src_in;
         tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
         Ok(tl)
@@ -715,8 +719,8 @@ impl Timeline {
     /// tick 0, vplay's rule), so a segment's `media_pts` maps to source tick `from_ns(media.to_ns(media_pts) - origin_ns)`.
     /// An empty edit is a gap (the later segments' `start_ns` already count it); a media segment is a clip at
     /// `from_ns(start_ns)` lasting to `from_ns(start_ns + duration_ns)` (duration 0 = the rest of the source; a segment
-    /// rounding to no tick is skipped; a `src_out` one tick past the source, rounding, is clamped to it); a rate other
-    /// than 1 (`0x1_0000`) is [`EditError::Rate`]. An empty list is the identity: the whole source at tick 0.
+    /// rounding to no tick is skipped; a `src_out` one tick past the source, rounding, is clamped to it); a rate <= 0 is
+    /// [`EditError::Rate`], a positive rate a clip at that `rate_q16` covering `(end - at) * rate` source ticks (STRIACLIPSPEED SR829). An empty list is the identity: the whole source at tick 0.
     pub fn lay_edit_list(&self, track: usize, src: SourceId, edits: &[demux_core::EditSegment], media: Timebase, origin_ns: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let dur = tl.source(src).ok_or(EditError::NoSource)?.duration;
@@ -727,7 +731,7 @@ impl Timeline {
         }
         for e in edits {
             let Some(pts) = e.media_pts else { continue };
-            if e.rate != 0x1_0000 {
+            if e.rate <= 0 { // STRIACLIPSPEED (SR829): a positive rate lays a rated clip; a dwell or reverse stays refused
                 return Err(EditError::Rate);
             }
             let at = tb.from_ns(e.start_ns);
@@ -736,13 +740,13 @@ impl Timeline {
                 dur
             } else {
                 let end = tb.from_ns(e.start_ns.saturating_add(i64::try_from(e.duration_ns).unwrap_or(i64::MAX)));
-                src_in + (end - at)
+                src_in + scale_q16(end - at, e.rate as u32) // STRIACLIPSPEED (SR829): the timeline span at the segment's rate (1x: end - at)
             };
             if src_out == dur + 1 {
                 src_out = dur;
             }
             if src_out > src_in {
-                t.clips.push(Clip::new(src, src_in, src_out, at));
+                t.clips.push(Clip::new(src, src_in, src_out, at).at_rate(e.rate as u32)); // STRIACLIPSPEED (SR829)
             }
         }
         sort(t);
@@ -835,7 +839,7 @@ fn sort(t: &mut Track) {
 fn split_at(t: &mut Track, at: i64) {
     if let Some(i) = t.clips.iter().position(|c| c.at < at && at < c.end()) {
         let c = t.clips[i];
-        let cut = c.src_in + (at - c.at);
+        let cut = c.src_at(at); // STRIACLIPSPEED (SR829): the source tick tick `at` shows (1x: src_in + (at - c.at))
         let head = &mut t.clips[i];
         head.src_out = cut;
         head.fade_in = c.fade_in.min(head.len());
@@ -1454,7 +1458,7 @@ impl Timeline {
     pub fn slide(&self, track: usize, idx: usize, delta: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let c = *clip_mut(&mut tl, track, idx)?;
-        let (cut_in, cut_out) = (c.at, c.end());
+        if slide_follows_rated(&tl.tracks[track], idx) { return Err(EditError::Rate); } let (cut_in, cut_out) = (c.at, c.end()); // STRIACLIPSPEED (SR829): a rated butted neighbour cannot follow tick for tick (file tail)
         let tr = &mut tl.tracks[track];
         if let Some(p) = idx.checked_sub(1).and_then(|i| tr.clips.get_mut(i)).filter(|p| p.end() == cut_in) {
             p.src_out = p.src_out.saturating_add(delta);
@@ -1526,5 +1530,188 @@ impl Timeline {
         let mut tl = self.clone();
         tl.marks = m;
         Ok(tl)
+    }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): per-clip speed — rate_q16, the one length road, src_at, set_rate (named tail block) ----
+// A clip at `rate_q16` (Q16.16, `0x1_0000` = 1x: the MP4 `elst` media_rate encoding, so `lay_edit_list` lays a rated segment
+// as one) shows source ticks `src_in..src_out` over `len() = ceil((src_out - src_in) * 0x1_0000 / rate)` timeline ticks. The
+// rounding is CEILING, so every covered tick's source tick is below `src_out` and the last source frame is always shown.
+// Timeline tick `t` shows source tick `src_at(t) = src_in + floor((t - at) * rate / 0x1_0000)`. At 1x both are the old
+// identity, so a 1x timeline is unchanged everywhere. A rate-0 clip (refused `Rate` by `validate`) measures as 1x. A
+// transition's outgoing handle plays at 1x past `src_out` (NLE-SPEED-HANDLE owed). The ops that cut a rated clip (`split`,
+// `place` Insert / Overwrite) cut it only ON ITS FRAME GRID (both halves keep every tick and frame: `cut_clean`), else
+// `Rate` by name. `slide` refuses a rated butted neighbour (`Rate`: it cannot follow tick for tick). `set_rate` is
+// `trim_out`'s shape: `at` and the source window stay, the out edge moves, nothing ripples. `validate` stays the one gate.
+
+/// STRIACLIPSPEED: the rate a length is measured at (0, refused by `validate`, measures as 1x).
+fn eff_rate(rate_q16: u32) -> u32 {
+    if rate_q16 == 0 { 0x1_0000 } else { rate_q16 }
+}
+
+/// STRIACLIPSPEED: `n` scaled by a Q16.16 rate, floored (i128: no overflow at any tick count).
+fn scale_q16(n: i64, rate_q16: u32) -> i64 {
+    ((n as i128 * rate_q16 as i128) >> 16) as i64
+}
+
+/// STRIACLIPSPEED: the timeline length of a source span `n` at `rate_q16`: `ceil(n * 0x1_0000 / rate)` (exactly `n` at 1x; a
+/// non-positive span is returned as it is, so `is_empty` reads it as before).
+fn rated_len(n: i64, rate_q16: u32) -> i64 {
+    let r = eff_rate(rate_q16);
+    if r == 0x1_0000 || n <= 0 {
+        return n;
+    }
+    (((n as u128) << 16).div_ceil(r as u128)) as i64
+}
+
+impl Clip {
+    /// STRIACLIPSPEED: the source tick timeline tick `t` shows: `src_in + floor((t - at) * rate / 0x1_0000)` (1x:
+    /// `src_in + (t - at)`). The schedule's video and audio steps, `split` and the editor's mark-in / mark-out read it.
+    pub fn src_at(&self, t: i64) -> i64 {
+        self.src_in + scale_q16(t - self.at, eff_rate(self.rate_q16))
+    }
+    /// STRIACLIPSPEED: the same clip at speed `rate_q16` (Q16.16).
+    pub fn at_rate(self, rate_q16: u32) -> Clip {
+        Clip { rate_q16, ..self }
+    }
+}
+
+/// STRIACLIPSPEED: whether cutting track `t` at tick `at` keeps a rated clip spanning it whole: the head `src_in..src_at(at)`
+/// ends at `at` and the tail from `at` ends where the clip ended (always true at 1x and for any integer rate >= 1).
+fn cut_clean(t: &Track, at: i64) -> bool {
+    t.clips.iter().filter(|c| c.at < at && at < c.end() && c.rate_q16 != 0x1_0000).all(|c| {
+        let cut = c.src_at(at);
+        Clip { src_out: cut, ..*c }.end() == at && Clip { src_in: cut, at, ..*c }.end() == c.end()
+    })
+}
+
+/// STRIACLIPSPEED: clip `idx` of `t` has a butted neighbour that `slide` would make follow and that neighbour is rated.
+fn slide_follows_rated(t: &Track, idx: usize) -> bool {
+    let Some(c) = t.clips.get(idx) else { return false };
+    let rated = |o: &Clip| o.rate_q16 != 0x1_0000;
+    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && rated(p))
+        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && rated(n))
+}
+
+impl Timeline {
+    /// STRIACLIPSPEED: set clip `idx`'s speed to `rate_q16` (Q16.16): its `at` and source window stay, its out edge moves
+    /// (`trim_out`'s shape: a transition on the moving cut is refused `Transition`, never dropped; one on its head cut is
+    /// fitted); no ripple, so a slower clip running into the next is `Overlap`; rate 0 is `Rate`.
+    pub fn set_rate(&self, track: usize, idx: usize, rate_q16: u32) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.rate_q16 = rate_q16;
+        tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
+        Ok(tl)
+    }
+}
+
+/// STRIACLIPSPEED: THE decimal speed reader (the EDL's M2 field with `per` = its fps, the face's `speed <q>` with `per` = 1):
+/// `<digits>[.<digits>]` read exactly and rounded once to Q16.16 (`round(value * 0x1_0000 / per)`); `None` for any other text
+/// (a sign, an exponent, more than 9 integer or 18 decimal digits) or a value past `u32`. A zero comes back as `Some(0)`.
+pub fn speed_q16(s: &str, per: u32) -> Option<u32> {
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if (int.is_empty() && frac.is_empty()) || per == 0 || int.len() > 9 || frac.len() > 18 {
+        return None;
+    }
+    if !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let num = int.bytes().chain(frac.bytes()).fold(0u128, |n, b| n * 10 + (b - b'0') as u128);
+    let den = 10u128.pow(frac.len() as u32) * per as u128;
+    u32::try_from((num * 0x1_0000 + den / 2) / den).ok()
+}
+
+#[cfg(test)]
+mod striaclipspeed_tests {
+    extern crate std;
+    use super::*;
+
+    fn src_ats(c: &Clip) -> Vec<i64> {
+        (c.at..c.end()).map(|t| c.src_at(t)).collect()
+    }
+
+    /// V1: A[0,10)@0 at `rate`, then A[20,30)@10.
+    fn tl2(rate: u32) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0).at_rate(rate), Clip::new(a, 20, 30, 10)];
+        tl
+    }
+
+    #[test]
+    fn striaclipspeed_len_and_src_at_kats() {
+        let c = Clip::new(SourceId(0), 0, 10, 0);
+        assert_eq!((c.rate_q16, c.len(), src_ats(&c)), (0x1_0000, 10, (0..10).collect::<Vec<_>>()));
+        let d = c.at_rate(0x2_0000);
+        assert_eq!((d.len(), src_ats(&d)), (5, alloc::vec![0, 2, 4, 6, 8]));
+        let h = c.at_rate(0x8000);
+        assert_eq!((h.len(), src_ats(&h)), (20, (0..20).map(|k| k / 2).collect::<Vec<_>>()));
+        let f = c.at_rate(0x1_8000);
+        assert_eq!((f.len(), src_ats(&f)), (7, alloc::vec![0, 1, 3, 4, 6, 7, 9]));
+        let m = Clip::new(SourceId(0), 13, 23, 5).at_rate(0x2_0000);
+        assert_eq!((m.end(), m.src_at(5), m.src_at(9)), (10, 13, 21));
+        assert_eq!(c.at_rate(0).len(), 10, "rate 0 measures as 1x");
+        std::println!("striaclipspeed: over 10 source ticks: 1x len 10, 2x len 5 (0,2,4,6,8), 0.5x len 20, 1.5x len 7 (0,1,3,4,6,7,9)");
+    }
+
+    #[test]
+    fn striaclipspeed_validate_and_the_following_clip() {
+        let tl = tl2(0x2_0000);
+        assert_eq!(tl.validate(), Ok(()));
+        assert_eq!((tl.tracks[0].clips[0].end(), tl.tracks[0].clips[1].at, tl.end()), (5, 10, 20));
+        assert_eq!(tl2(0).validate(), Err(EditError::Rate));
+        assert_eq!(tl2(0x8000).validate(), Err(EditError::Overlap), "0.5x over 10 is 20 ticks: into the clip at 10");
+        assert_eq!(alloc::format!("{}", EditError::Rate), "rate is not a positive speed (a dwell or reverse)");
+        std::println!("striaclipspeed: 2x over 10 occupies 0..5, next clip stays at 10; rate 0 -> {}", EditError::Rate);
+    }
+
+    #[test]
+    fn striaclipspeed_split_and_insert_cut_on_the_frame_grid() {
+        let tl = tl2(0x2_0000);
+        let s = tl.split(0, 2).unwrap();
+        let a = SourceId(0);
+        assert_eq!(&s.tracks[0].clips[..2], &[Clip::new(a, 0, 4, 0).at_rate(0x2_0000), Clip::new(a, 4, 10, 2).at_rate(0x2_0000)]);
+        for t in 0..5 {
+            let i = s.clip_at(0, t).unwrap();
+            assert_eq!(s.tracks[0].clips[i].src_at(t), tl.tracks[0].clips[0].src_at(t), "tick {t}");
+        }
+        let mut slow = Timeline::new(25);
+        let a = slow.add_source("A", 50);
+        slow.add_track(Kind::Video);
+        slow.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0).at_rate(0x8000)];
+        assert!(slow.split(0, 4).is_ok(), "a 0.5x clip cuts on a frame boundary");
+        assert_eq!(slow.split(0, 3), Err(EditError::Rate), "mid-hold");
+        assert_eq!(slow.place(0, Clip::new(a, 0, 2, 3), Mode::Insert), Err(EditError::Rate));
+        assert_eq!(slow.place(0, Clip::new(a, 0, 2, 3), Mode::Overwrite), Err(EditError::Rate));
+        std::println!("striaclipspeed: 2x split at 2 keeps frames 0,2 | 4,6,8; 0.5x split at 3 -> {}", EditError::Rate);
+    }
+
+    #[test]
+    fn striaclipspeed_trim_in_slide_and_set_rate() {
+        let tl = tl2(0x2_0000);
+        let c = tl.trim_in(0, 0, 4).unwrap().tracks[0].clips[0];
+        assert_eq!((c.src_in, c.at, c.end()), (4, 2, 5), "trim_in keeps the out edge at 2x");
+        assert_eq!(tl2(0x1_0000).set_rate(0, 0, 0x2_0000), Ok(tl2(0x2_0000)));
+        assert_eq!(tl2(0x1_0000).set_rate(0, 0, 0x8000), Err(EditError::Overlap));
+        assert_eq!(tl2(0x1_0000).set_rate(0, 0, 0), Err(EditError::Rate));
+        let mut b = tl2(0x2_0000);
+        b.tracks[0].clips[1].at = 5;
+        assert_eq!(b.slide(0, 1, 1), Err(EditError::Rate), "a rated butted neighbour cannot follow");
+        assert!(tl2(0x1_0000).slide(0, 1, -1).is_ok());
+        std::println!("striaclipspeed: trim_in at 2x keeps end 5; set_rate 2x == built 2x; 0.5x into a neighbour -> {}", EditError::Overlap);
+    }
+
+    #[test]
+    fn striaclipspeed_speed_q16_reads_decimals_exactly() {
+        assert_eq!(speed_q16("2", 1), Some(0x2_0000));
+        assert_eq!(speed_q16("0.5", 1), Some(0x8000));
+        assert_eq!(speed_q16("1.5", 1), Some(0x1_8000));
+        assert_eq!(speed_q16("037.5", 25), Some(0x1_8000));
+        assert_eq!(speed_q16("050.0", 25), Some(0x2_0000));
+        assert_eq!(speed_q16("0", 1), Some(0));
+        for bad in ["", ".", "x", "-2", "1.2.3", "1e3", "+1"] {
+            assert_eq!(speed_q16(bad, 1), None, "{bad}");
+        }
     }
 }

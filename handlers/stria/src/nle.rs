@@ -194,12 +194,12 @@ pub struct Sources {
     applied: Vec<(SourceId, usize)>,
     /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
-    stand_in: std::sync::Mutex<Vec<SourceId>>,
+    stand_in: std::sync::Mutex<Vec<SourceId>>, titles: TitleCache, // STRIATITLECLIP (SR828): the title stills, keyed (text, w, h) (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), titles: Default::default() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -489,7 +489,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
         let Some(src) = s.src.or(s.vmix.and_then(|m| m.src)) else { continue }; // NLE3cBLACK: a to-black step sizes by its outgoing
-        let m = sources.get(src)?;
+        if titled(tl, src) { continue; } let m = sources.get(src)?; // STRIATITLECLIP (SR828): a title sizes no frame (file tail)
         match s.kind {
             Kind::Video if r.width == 0 => {
                 if let Some(i) = m.video {
@@ -506,7 +506,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             _ => {}
         }
     }
-    if r.width == 0 && steps.iter().any(|s| s.kind == Kind::Video) {
+    title_size(tl, sources, &steps, &mut r); if r.width == 0 && steps.iter().any(|s| s.kind == Kind::Video) { // STRIATITLECLIP (SR828): a title-only range's size (file tail)
         return Err(RenderError::NoSize);
     }
     if sources.audio_rate > 0 {
@@ -622,7 +622,7 @@ fn mix_run(
             *seeks += 1;
         }
         let start = samples(tl.tb.to_ns(l.src_t), rate);
-        let pcm = slot.as_mut().expect("opened above").take_at(start, n, rate)?;
+        let pcm = take_rated(tl, run, li, slot.as_mut().expect("opened above"), start, n, rate)?; // STRIACLIPSPEED (SR829): a rated clip's layer through the same Sinc at the effective rate (file tail)
         mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
         if let Some(t) = taps.as_mut() {
             mix_into(&mut t[l.track], &pcm, l, n, ch.max(1) as usize); // NLE4C: the same terms, the master acc untouched
@@ -680,7 +680,7 @@ fn vid_frame(
     tol: i64,
     r: &mut RenderReport,
 ) -> Result<Frame, RenderError> {
-    let target = tl.tb.to_ns(src_t);
+    if let Some(f) = title_frame(tl, sources, run, src, src_t, r) { return Ok(f); } let target = tl.tb.to_ns(src_t); // STRIATITLECLIP (SR828): a title's frame is its cached still (file tail)
     if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) {
         let key = match seek {
             Some(k) => k,
@@ -987,4 +987,116 @@ impl Sources {
         let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): the title card's frames (named tail block) ----
+/// STRIATITLECLIP (LEDGER SR828): a generated title source (`timeline_core::Source::title`) has no bytes: its frame is ONE
+/// still, white text on opaque black, one line, centred, drawn by text_host's `Line::paint` (the face's label road) at the
+/// render's frame size and cached on [`Sources`]. The frame size stays render's rule (the first scheduled media video step's
+/// reel; a titled step sizes nothing); a range whose video steps size nothing but hold a title takes the first untitled
+/// source in `tl.sources` with a video stream, else [`TITLE_SIZE`]. The schedule keys a title itself (every frame is a key).
+pub const TITLE_SIZE: (u32, u32) = (1280, 720);
+/// STRIATITLECLIP: the stills a [`Sources`] keeps, oldest dropped past this many.
+const TITLE_CACHE_MAX: usize = 8;
+/// STRIATITLECLIP: the title ink (straight alpha).
+const TITLE_INK: [u8; 4] = [255, 255, 255, 255];
+
+/// STRIATITLECLIP: the still cache, `(text, w, h, still)`; locked for one find or one push, never across a raster.
+type TitleCache = std::sync::Mutex<Vec<(String, u32, u32, Arc<timeline_core::view::Still>)>>;
+
+/// STRIATITLECLIP: source `src` of `tl` is a title.
+fn titled(tl: &Timeline, src: SourceId) -> bool {
+    tl.source(src).is_some_and(|s| s.title.is_some())
+}
+
+/// STRIATITLECLIP: when nothing sized the frame and a video step (or its outgoing) is a title, the size rule above.
+fn title_size(tl: &Timeline, sources: &Sources, steps: &[timeline_core::schedule::Step], r: &mut RenderReport) {
+    let has_title = steps.iter().filter(|s| s.kind == Kind::Video).flat_map(|s| [s.src, s.vmix.and_then(|m| m.src)]).flatten().any(|src| titled(tl, src));
+    if r.width != 0 || !has_title {
+        return;
+    }
+    let reel = tl.sources.iter().filter(|s| s.title.is_none()).find_map(|s| {
+        let m = sources.get(s.id).ok()?;
+        let t = &m.demux.tracks()[m.video?];
+        (t.width > 0 && t.height > 0).then_some((t.width, t.height))
+    });
+    (r.width, r.height) = reel.unwrap_or(TITLE_SIZE);
+}
+
+/// STRIATITLECLIP: the frame of title source `src` at source tick `src_t` (`None`: not a title): the cached still at the
+/// render's size as an RGBA `Frame`. The live decode run is dropped (parked), so the next media step opens by its seek.
+fn title_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64, r: &RenderReport) -> Option<Frame> {
+    let text = tl.source(src)?.title.as_deref()?;
+    *run = None;
+    let still = sources.title_still_cached(text, r.width, r.height);
+    Some(Frame { width: still.width, height: still.height, pts_ns: tl.tb.to_ns(src_t), pixels: gneiss_pal::dsp::video::Pixels::Rgba(still.rgba.clone()) })
+}
+
+/// STRIATITLECLIP: `text` as a `w` x `h` RGBA still: opaque black, white ink, one line through text_host at `h / 10` px (8 at
+/// least), shrunk once to 90% of the width when wider, centred on its line box.
+pub fn title_still(text: &str, w: u32, h: u32) -> timeline_core::view::Still {
+    use text_host::line::{PixelOrder, TextStyle};
+    let mut rgba = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
+    let mut style = TextStyle::new(&["sans"], (h as f32 / 10.0).max(8.0));
+    let mut line = style.shape(text);
+    let room = w as f32 * 0.9;
+    if line.width > room {
+        style.size = (style.size * room / line.width).max(1.0);
+        line = style.shape(text);
+    }
+    let x = ((w as f32 - line.width) / 2.0).round();
+    let baseline = ((h as f32 + line.ascent - line.descent) / 2.0).round();
+    line.paint(&mut rgba, w, h, w as usize * 4, PixelOrder::Rgba, x, baseline, TITLE_INK, (0, w as i32));
+    timeline_core::view::Still { width: w, height: h, rgba }
+}
+
+impl Sources {
+    /// STRIATITLECLIP: [`title_still`] once per `(text, w, h)`; a second ask returns the same `Arc`.
+    pub fn title_still_cached(&self, text: &str, w: u32, h: u32) -> Arc<timeline_core::view::Still> {
+        let hit = self.titles.lock().ok().and_then(|c| c.iter().find(|e| e.0 == text && e.1 == w && e.2 == h).map(|e| e.3.clone()));
+        if let Some(s) = hit {
+            return s;
+        }
+        let s = Arc::new(title_still(text, w, h));
+        if let Ok(mut c) = self.titles.lock() {
+            if c.len() >= TITLE_CACHE_MAX {
+                c.remove(0);
+            }
+            c.push((String::from(text), w, h, s.clone()));
+        }
+        s
+    }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): audio at a clip's speed — the same resampler at the effective rate (named tail block) ----
+// THE rule: a layer of a clip at `rate_q16` is resampled by that rate through NLE4B's ONE converter (`Aud::take_at`,
+// audio_core's `resample::Sinc`): the run's `n` output samples are asked at the EFFECTIVE output rate
+// `eff = round(out_rate * 0x1_0000 / rate_q16)` Hz, so they cover `rate` times the 1x source span (pitch follows speed, as a
+// tape does; going faster is anti-aliased by the sinc's cutoff; `eff` equal to the source's rate is the plain sample copy).
+// The run's start is the layer's exact `src_t` at `eff`, so the < 1 Hz rounding of `eff` never accumulates past a run. A
+// crossfade's UNDER layer and a fade-to-silence tail play their 1x handle (the transition handle rule). The video needs no
+// arm: the schedule names `src_at(t)` and `Vid::show` decodes and drops forward (rate > 1) or holds the last frame (rate < 1).
+// A pitch-preserving stretch is owed (NLE-SPEED-PITCH-PRESERVE).
+
+/// STRIACLIPSPEED: the speed layer `li` of `run` plays at: 1x for an under layer or one no clip of its source covers at the
+/// run's first tick (a handle past the clip's end), else that clip's `rate_q16`.
+fn layer_rate(tl: &Timeline, run: &AudioRun, li: usize) -> u32 {
+    let Some(l) = run.layers.get(li) else { return 0x1_0000 };
+    if run.under(li) {
+        return 0x1_0000;
+    }
+    tl.clip_at(l.track, run.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or(0x1_0000, |c| c.rate_q16)
+}
+
+/// STRIACLIPSPEED: layer `li`'s `n` output samples at `rate`: exactly `take_at(start, n, rate)` at 1x, else `take_at` at the
+/// effective rate from the layer's `src_t`.
+#[allow(clippy::too_many_arguments)]
+fn take_rated(tl: &Timeline, run: &AudioRun, li: usize, a: &mut Aud, start: i64, n: i64, rate: u32) -> Result<Vec<f32>, RenderError> {
+    let q = layer_rate(tl, run, li);
+    if q == 0x1_0000 || q == 0 {
+        return a.take_at(start, n, rate);
+    }
+    let eff = ((rate as u64 * 0x1_0000 + q as u64 / 2) / q as u64).clamp(1, u32::MAX as u64) as u32;
+    let l = &run.layers[li];
+    a.take_at(samples(tl.tb.to_ns(l.src_t), eff), n, eff)
 }

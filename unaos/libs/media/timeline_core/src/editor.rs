@@ -343,11 +343,11 @@ impl EditorState {
             "}" => self.trim(Edge::Out, 1),
             "lift" => self.lift_selected(),
             "mark-in" => match self.selected() {
-                Some(c) => self.trim(Edge::In, ph - c.at),
+                Some(c) => self.trim(Edge::In, c.src_at(ph) - c.src_in), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - at)
                 None => Err(EditError::NoClip),
             },
             "mark-out" => match self.selected() {
-                Some(c) => self.trim(Edge::Out, ph - c.end()),
+                Some(c) => self.trim(Edge::Out, c.src_at(ph) - c.src_out), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - end)
                 None => Err(EditError::NoClip),
             },
             "home" => {
@@ -658,5 +658,38 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): a title card laid at the playhead as ONE commit (named tail block) ----
+impl EditorState {
+    /// A new generated title source (reel the first free `T<n>`, its text `text`, `dur` ticks) inserted at the playhead on
+    /// the first video track through `Timeline::place` (`Mode::Insert`): ONE commit, so undo removes the source and the clip;
+    /// the new clip is selected. Refused by name: no video track `EditError::NoTrack`; `dur < 1` `EditError::Empty`.
+    pub fn add_title(&mut self, text: &str, dur: i64) -> Result<(), EditError> {
+        let track = self.timeline.tracks.iter().position(|t| t.kind == crate::Kind::Video).ok_or(EditError::NoTrack)?;
+        let reel = (1u32..).map(|n| alloc::format!("T{n}")).find(|r| self.timeline.source_by_reel(r).is_none()).expect("a free T<n> reel");
+        let mut tl = self.timeline.clone();
+        let id = tl.add_source(&reel, dur.max(0));
+        if let Some(s) = tl.sources.last_mut() {
+            s.title = Some(alloc::string::String::from(text));
+        }
+        let at = self.playhead;
+        let tl = tl.place(track, crate::Clip::new(id, 0, dur, at), crate::Mode::Insert)?;
+        self.commit(tl);
+        let _ = self.select_at(track, at);
+        Ok(())
+    }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): the selected clip's speed as ONE commit (named tail block) ----
+impl EditorState {
+    /// The selected clip at speed `rate_q16` (Q16.16) through `Timeline::set_rate`: ONE commit, so undo restores the whole
+    /// pre-op timeline; a refusal (`Rate`, `Overlap`, `Transition`, `NoClip`) leaves the state.
+    pub fn set_speed(&mut self, rate_q16: u32) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_rate(track, idx, rate_q16)?;
+        self.commit(tl);
+        Ok(())
     }
 }

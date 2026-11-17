@@ -596,7 +596,7 @@ fn editmap_the_editor_plays_the_whole_edit_list() {
 
 #[test]
 fn editmap_a_rate_edit_is_refused_and_an_edl_is_not_media() {
-    assert!(matches!(Sources::from_media("AX", &editmap_file(0x2_0000), 25), Err(stria::nle::RenderError::Edit(EditError::Rate))));
+    let (two, _) = Sources::from_media("AX", &editmap_file(0x2_0000), 25).unwrap().unwrap(); let fast = vec![Clip::new(SourceId(0), 25, 45, 0).at_rate(0x2_0000), Clip::new(SourceId(0), 5, 25, 10).at_rate(0x2_0000)]; assert_eq!((&two.tracks[0].clips, &two.tracks[1].clips), (&fast, &fast)); // STRIACLIPSPEED (SR829): a 2x edit list now LAYS 2x clips (was EditError::Rate)
     let edl_text = edl::write(&timeline(), "EDITMAP").unwrap();
     assert!(Sources::from_media("AX", edl_text.as_bytes(), 25).unwrap().is_none());
     // A file without an edit list is the whole source.
@@ -3647,4 +3647,288 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     assert_eq!(face.export_stall(), None, "no job: no stall");
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
+}
+
+// ---- STRIATITLECLIP (LEDGER SR828): a title card is a generated source — its still, its render, the face's word (named tail block) ----
+
+/// The frames a render hands out, at their own size.
+#[derive(Default)]
+struct StriaTitleFrames(Vec<(i64, u32, u32, Vec<u8>)>);
+
+impl RenderSink for StriaTitleFrames {
+    fn frame(&mut self, out_t: i64, w: u32, h: u32, rgba: &[u8]) {
+        self.0.push((out_t, w, h, rgba.to_vec()));
+    }
+    fn pcm(&mut self, _out_t: i64, _rate: u32, _ch: u16, _s: &[f32]) {}
+}
+
+/// No `sans` face on this machine: the glyph checks cannot run (said loudly, text_host's own skip rule).
+fn striatitleclip_no_font() -> bool {
+    let none = text_host::line::TextStyle::new(&["sans"], 16.0).primary().is_none();
+    if none {
+        println!("SKIP: striatitleclip: no `sans` face installed, the title's glyph checks did not run");
+    }
+    none
+}
+
+/// A 25 fps timeline: optional synth reel A (64x48, 50 ticks) at A[0,10)@0, then title T1 `text` (`dur` ticks) at 10 (or at
+/// 0 without A), all on V1.
+fn striatitleclip_timeline(with_a: bool, text: &str, dur: i64) -> (Timeline, Sources) {
+    let mut tl = Timeline::new(25);
+    let a = with_a.then(|| tl.add_source("A", 50));
+    let t = tl.add_source("T1", dur);
+    tl.sources[t.0 as usize].title = Some(text.to_string());
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = match a {
+        Some(a) => vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, dur, 10)],
+        None => vec![Clip::new(t, 0, dur, 0)],
+    };
+    tl.validate().unwrap();
+    let mut src = Sources::new(&tl);
+    if let Some(a) = a {
+        src.add(a, synth_source(0, 50, 25)).unwrap();
+    }
+    (tl, src)
+}
+
+#[test]
+fn striatitleclip_still_is_white_text_centred_on_black() {
+    if striatitleclip_no_font() {
+        return;
+    }
+    let s = stria::nle::title_still("Hello", 320, 160);
+    assert_eq!((s.width, s.height, s.rgba.len()), (320, 160, 320 * 160 * 4));
+    let px = |x: usize, y: usize| &s.rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+    assert_eq!(px(0, 0), &[0, 0, 0, 255], "corner black");
+    assert_eq!(px(319, 159), &[0, 0, 0, 255], "corner black");
+    let lit = (0..320).filter(|&x| px(x, 80)[0] > 128).count();
+    assert!(lit > 0, "the centre row carries ink");
+    assert!(s.rgba.chunks(4).all(|p| p[3] == 255), "opaque");
+    assert!(s.rgba.chunks(4).all(|p| p[0] == p[1] && p[1] == p[2]), "white on black only");
+    println!("striatitleclip: Hello at 320x160: {lit} lit px on the centre row");
+}
+
+#[test]
+fn striatitleclip_title_only_renders_at_title_size_from_the_cache() {
+    let (tl, src) = striatitleclip_timeline(false, "Hello", 2);
+    let mut a = StriaTitleFrames::default();
+    let r = render(&tl, 0..2, &src, &mut a).unwrap();
+    assert_eq!(r.frames, 2);
+    let (w, h) = stria::nle::TITLE_SIZE;
+    assert_eq!((w, h), (1280, 720));
+    let still = stria::nle::title_still("Hello", w, h);
+    for (i, f) in a.0.iter().enumerate() {
+        assert_eq!((f.0, f.1, f.2), (i as i64, w, h));
+        assert!(f.3 == still.rgba, "frame {i} is the still");
+    }
+    let mut b = StriaTitleFrames::default();
+    render(&tl, 0..2, &src, &mut b).unwrap();
+    assert!(a.0 == b.0, "the same text renders the same bytes");
+    let (x, y) = (src.title_still_cached("Hello", w, h), src.title_still_cached("Hello", w, h));
+    assert!(std::sync::Arc::ptr_eq(&x, &y), "the second ask is the cached still");
+    assert!(!std::sync::Arc::ptr_eq(&x, &src.title_still_cached("Hello", 64, 48)), "another size is another still");
+    println!("striatitleclip: title-only render {} frames at {w}x{h}, cached", r.frames);
+}
+
+#[test]
+fn striatitleclip_title_beside_a_reel_takes_its_size() {
+    let (tl, src) = striatitleclip_timeline(true, "Hello", 20);
+    let mut f = StriaTitleFrames::default();
+    render(&tl, 8..14, &src, &mut f).unwrap();
+    assert_eq!(f.0.len(), 6);
+    assert!(f.0.iter().all(|x| (x.1, x.2) == (64, 48)), "every frame at reel A's 64x48");
+    let still = stria::nle::title_still("Hello", 64, 48);
+    assert!(f.0[2..].iter().all(|x| x.3 == still.rgba), "ticks 10.. show the title");
+    let mut only = StriaTitleFrames::default();
+    render(&tl, 12..13, &src, &mut only).unwrap();
+    assert_eq!((only.0[0].1, only.0[0].2), (64, 48), "a range holding only the title still sizes by reel A");
+    println!("striatitleclip: title beside reel A renders at 64x48");
+}
+
+#[test]
+fn striatitleclip_dissolve_onto_a_title_mixes() {
+    let (tl, src) = striatitleclip_timeline(true, "Hello", 20);
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut f = StriaTitleFrames::default();
+    render(&tl, 10..15, &src, &mut f).unwrap();
+    assert_eq!(f.0.len(), 5);
+    let mid = &f.0[2].3;
+    let title = &f.0[4].3;
+    let mut alone = tl.clone();
+    alone.tracks[0].transitions.clear();
+    alone.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 20, 0)];
+    let mut a = StriaTitleFrames::default();
+    render(&alone, 12..13, &src, &mut a).unwrap();
+    assert!(mid != title, "the mid frame is not the title alone");
+    assert!(*mid != a.0[0].3, "the mid frame is not reel A alone");
+    println!("striatitleclip: dissolve A -> T1 at 10 for 4: mid frame differs from both ends");
+}
+
+#[test]
+fn striatitleclip_face_title_word_adds_a_title_at_the_playhead() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    assert!(VERBS.contains(&"title"));
+    assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(12);
+    assert!(face.verb("title Hello"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let t1 = face.state.timeline.source_by_reel("T1").expect("T1").clone();
+    assert_eq!((t1.duration, t1.title.as_deref()), (125, Some("Hello")));
+    let at = face.state.timeline.clip_at(0, 12).expect("a clip at the playhead");
+    let c = face.state.timeline.tracks[0].clips[at];
+    assert_eq!((c.src, c.at, c.src_in, c.src_out), (t1.id, 12, 0, 125));
+    assert_eq!(face.state.selection, Some((0, at)));
+    assert!(face.verb("title"));
+    assert_eq!(face.state.timeline.source_by_reel("T2").and_then(|s| s.title.clone()).as_deref(), Some("Title"));
+    assert!(face.state.undo());
+    assert!(face.state.timeline.source_by_reel("T2").is_none(), "undo removes the source");
+    assert!(face.state.timeline.source_by_reel("T1").is_some());
+    let text = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(text.contains("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"Hello\"\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the document reopens with its title");
+    println!("striatitleclip: `title Hello` -> T1 125 ticks at 12; bare `title` -> T2 \"Title\"; undo drops T2");
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): per-clip speed through the schedule and the render (named tail block) ----
+
+/// V1 = A[0,20)@0 at `rate` over the NLE1 reel A (utp1 counters 0..49): the counter each output tick shows, the schedule's
+/// video seeks, the render report.
+fn striaclipspeed_video(rate: u32, ticks: i64) -> (Vec<Option<u32>>, usize, stria::nle::RenderReport) {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0).at_rate(rate)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let seeks = schedule(&tl, 0..ticks, &src).unwrap().iter().filter(|s| s.seek.is_some()).count();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..ticks, &src, &mut sink).unwrap();
+    (sink.frames.iter().map(|f| TestPattern::read_counter(&f.1, 64, 48)).collect(), seeks, r)
+}
+
+#[test]
+fn striaclipspeed_a_2x_clip_shows_every_other_frame_and_a_half_speed_clip_holds() {
+    let (fast, seeks, r) = striaclipspeed_video(0x2_0000, 10);
+    assert_eq!(fast, (0..10).map(|k| Some(2 * k)).collect::<Vec<_>>());
+    assert_eq!((seeks, r.seeks, r.frames), (1, 1, 10), "one run, decoded and dropped forward");
+    let (slow, seeks, r) = striaclipspeed_video(0x8000, 40);
+    assert_eq!(slow, (0..40).map(|k| Some(k / 2)).collect::<Vec<_>>());
+    assert_eq!((seeks, r.seeks), (1, 1), "one run, each frame held twice");
+    println!("striaclipspeed: 2x over 20 -> 10 ticks, frames 0,2,..,18, seeks=1 runup={}; 0.5x -> 40 ticks, each frame twice, seeks=1", r.runup_frames);
+}
+
+/// The zero crossings (sign changes, 0 counted positive) of `pcm` past its first and last `skip` samples.
+fn striaclipspeed_crossings(pcm: &[f32], skip: usize) -> usize {
+    let body = &pcm[skip..pcm.len() - skip];
+    body.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count()
+}
+
+/// A1 = T[0,25 * rate)@0 at `rate` over a 2 s mono 1 kHz tone (PCM16 at SYNTH_RATE): 25 output ticks of its render.
+fn striaclipspeed_tone(rate: u32) -> Vec<f32> {
+    let n = 2 * SYNTH_RATE as usize;
+    let tone: Vec<i16> = (0..n).map(|i| (16_000.0 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / SYNTH_RATE as f64 + 0.3).sin()) as i16).collect();
+    let file = build::mp4(&[build::pcm16_track(2, SYNTH_RATE, 1, &tone, 960)], &build::Mp4Options::default());
+    let mut tl = Timeline::new(25);
+    let t = tl.add_source("T", 50);
+    let a = tl.add_track(Kind::Audio);
+    let span = (25 * rate as i64) >> 16;
+    tl.tracks[a].clips = vec![Clip::new(t, 0, span, 0).at_rate(rate)];
+    let mut src = Sources::new(&tl);
+    src.add(t, file).unwrap();
+    let mut sink = Pcm::default();
+    render(&tl, 0..25, &src, &mut sink).unwrap();
+    assert_eq!((sink.rate, sink.pcm.len()), (SYNTH_RATE, 25 * PER));
+    sink.pcm
+}
+
+#[test]
+fn striaclipspeed_a_1khz_tone_at_2x_renders_at_2khz() {
+    let (one, two) = (striaclipspeed_tone(0x1_0000), striaclipspeed_tone(0x2_0000));
+    let (z1, z2) = (striaclipspeed_crossings(&one, 480), striaclipspeed_crossings(&two, 480));
+    assert!((1900..2000).contains(&z1), "1x: {z1} crossings of a 1 kHz tone over 0.98 s");
+    assert!((z2 as i64 - 2 * z1 as i64).abs() <= 2, "1x {z1} crossings, 2x {z2}");
+    println!("striaclipspeed: tone 1x z={z1} 2x z={z2} (pitch follows speed through the one Sinc)");
+}
+
+#[test]
+fn striaclipspeed_face_speed_word_halves_the_drawn_width_and_undo_restores() {
+    assert_eq!(VERBS.iter().position(|v| *v == "speed").map(|i| VERBS[i + 1]), Some("title"), "speed sits right before title");
+    assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("speed"));
+    assert_eq!(face.last_error.take(), Some(format!("speed: {}", EditError::NoClip)), "nothing selected");
+    face.state.select(0, 0).unwrap();
+    let width = |f: &Face| {
+        let (l, c) = (f.layout(), f.state.selected().unwrap());
+        l.x_of(c.end()) - l.x_of(c.at)
+    };
+    let w1 = width(&face);
+    assert!(face.verb("speed 2"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let c = face.state.selected().unwrap();
+    assert_eq!((c.rate_q16, c.at, c.len()), (0x2_0000, 0, 5));
+    assert_eq!(width(&face) * 2, w1, "half the drawn width");
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "undo restores");
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        assert!(face.verb("speed"));
+        seen.push(face.state.selected().unwrap().rate_q16);
+    }
+    assert_eq!(seen, vec![0x2_0000, 0x4_0000, 0x1_0000], "bare speed cycles 1x -> 2x -> 4x -> 1x");
+    assert!(face.verb("speed 0"));
+    assert_eq!(face.last_error.take(), Some(format!("speed 0: {}", EditError::Rate)));
+    assert!(face.verb("speed 0.5"));
+    assert_eq!(face.last_error.take(), Some(format!("speed 0.5: {}", EditError::Overlap)), "0.5x runs into B at 10");
+    assert!(!face.verb("speed fast"), "an unreadable speed is not a face word");
+    println!("striaclipspeed: `speed 2` -> width {w1} -> {}; undo restores; cycle {seen:x?}", w1 / 2);
+}
+
+/// The seat's pin: on the NLE1 synth fixture (every clip 1x) the schedule's video steps and audio runs are exactly the
+/// pre-arc identity: each source tick is `src_in + (t - at)` and each seek falls where the old `src_t + 1` / `src_t + len`
+/// continuity says (the kernel Player plays exactly this).
+#[test]
+fn striaclipspeed_a_1x_timeline_schedules_as_before() {
+    let tl = timeline();
+    let src = sources(&tl);
+    assert!(tl.tracks.iter().flat_map(|t| t.clips.iter()).all(|c| c.rate_q16 == 0x1_0000));
+    let steps = schedule(&tl, 0..35, &src).unwrap();
+    let mut v_next: Option<(SourceId, i64)> = None;
+    let mut vseeks = 0;
+    for s in steps.iter().filter(|s| s.kind == Kind::Video) {
+        match (s.track, s.src) {
+            (Some(ti), Some(id)) => {
+                let c = tl.tracks[ti].clips[tl.clip_at(ti, s.out_t).unwrap()];
+                let want = c.src_in + (s.out_t - c.at);
+                assert_eq!(s.src_t, want, "video tick {}", s.out_t);
+                assert_eq!(s.seek.is_some(), v_next != Some((id, want)), "video seek at {}", s.out_t);
+                vseeks += s.seek.is_some() as usize;
+                v_next = Some((id, want + 1));
+            }
+            _ => v_next = None,
+        }
+    }
+    let runs = timeline_core::schedule::audio_runs(&tl, 0..35, &src).unwrap();
+    let mut next: Vec<Option<(SourceId, i64)>> = vec![None; tl.tracks.len()];
+    let mut aseeks = 0;
+    for r in &runs {
+        for (ti, n) in next.iter_mut().enumerate() {
+            if !r.layers.iter().any(|l| l.track == ti) {
+                *n = None;
+            }
+        }
+        for l in &r.layers {
+            let c = tl.tracks[l.track].clips[tl.clip_at(l.track, r.out_t).unwrap()];
+            let want = c.src_in + (r.out_t - c.at);
+            assert_eq!(l.src_t, want, "audio run at {}", r.out_t);
+            assert_eq!(l.seek.is_some(), next[l.track] != Some((l.src, want)), "audio seek at {}", r.out_t);
+            aseeks += l.seek.is_some() as usize;
+            next[l.track] = Some((l.src, want + r.len));
+        }
+    }
+    assert_eq!((vseeks, aseeks), (3, 3));
+    println!("striaclipspeed: 1x fixture schedule = the old identity: {} steps, {} runs, seeks v={vseeks} a={aseeks}", steps.len(), runs.len());
 }
