@@ -890,6 +890,7 @@ pub enum MarkerWord<'a> {
     Mark(Option<&'a str>),
     /// `unmark`.
     Unmark,
+    UnmarkAll, // STRIAMARKERRENAME (SR895): `unmark all` removes every marker in ONE commit (file tail)
 }
 
 /// STRIAMARKERS (SR835): `unmark`, `mark`, `mark <name>` (the rest trimmed); `None` for any other word, SR723's export
@@ -897,7 +898,7 @@ pub enum MarkerWord<'a> {
 pub fn marker_word(v: &str) -> Option<MarkerWord<'_>> {
     let v = v.trim();
     match v {
-        "unmark" => return Some(MarkerWord::Unmark),
+        "unmark" => return Some(MarkerWord::Unmark), "unmark all" => return Some(MarkerWord::UnmarkAll), // STRIAMARKERRENAME (SR895): exactly `unmark all` after the trim (file tail)
         "mark" => return Some(MarkerWord::Mark(None)),
         _ => {}
     }
@@ -926,8 +927,8 @@ impl EditorState {
     /// The marker words of [`EditorState::verb`]; `None` for any other word.
     fn marker_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         Some(match marker_word(v)? {
-            MarkerWord::Mark(name) => self.mark(name),
-            MarkerWord::Unmark => self.unmark(),
+            MarkerWord::Mark(Some(n)) if self.timeline.marker_at(self.playhead).is_some() => self.rename_marker(n), MarkerWord::Mark(name) => self.mark(name), // STRIAMARKERRENAME (SR895): a named mark on a taken tick renames that marker (file tail)
+            MarkerWord::Unmark => self.unmark(), MarkerWord::UnmarkAll => self.unmark_all(), // STRIAMARKERRENAME (SR895): (file tail)
         })
     }
 }
@@ -1916,5 +1917,27 @@ impl EditorState {
         let base = self.selected().ok_or(EditError::NoClip)?.opacity;
         let pct = (base as i16 + d).clamp(0, crate::OPAQUE as i16) as u8;
         self.set_opacity(pct)
+    }
+}
+
+// ---- STRIAMARKERRENAME (LEDGER SR895): rename the playhead's marker / remove every marker through the one commit (named tail block) ----
+// `mark <name>` on a tick that already holds a marker RENAMES it (SR835 refused it); bare `mark` there is still refused (a
+// default `M<n>` would erase a chosen name). `unmark all` removes every marker. Each is ONE `commit` (one undo step; the
+// document dirty; `edl::write` keeps the new name in its `* UNA MARKER` line). Refused by name, no commit:
+// `EditError::Marker` for a rename to the name it already carries (or no marker there) and for `unmark all` with none.
+
+impl EditorState {
+    /// The marker at the playhead renamed `name`: ONE commit. Refused: no marker there, or it is already `name`
+    /// (`EditError::Marker`).
+    pub fn rename_marker(&mut self, name: &str) -> Result<(), EditError> {
+        let tl = self.timeline.rename_marker(self.playhead, name).ok_or(EditError::Marker)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// Every marker removed: ONE commit. Refused: no marker (`EditError::Marker`).
+    pub fn unmark_all(&mut self) -> Result<(), EditError> {
+        let tl = self.timeline.unmark_all().ok_or(EditError::Marker)?;
+        self.commit(tl);
+        Ok(())
     }
 }

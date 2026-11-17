@@ -3500,14 +3500,17 @@ impl Face {
         let word = timeline_core::editor::marker_word(v)?;
         let ph = self.state.playhead;
         let tc = self.state.timeline.fps().map_or_else(|| ph.to_string(), |f| timeline_core::edl::timecode(ph, f));
-        let before = self.state.timeline.marker_at(ph).map(|m| m.name.clone());
+        let before = self.state.timeline.marker_at(ph).map(|m| m.name.clone()); let count = self.state.timeline.markers.len(); // STRIAMARKERRENAME (SR895): the count `unmark all` reports
         let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
         let now = self.state.timeline.marker_at(ph).map(|m| m.name.clone());
         self.last_error = Some(match (word, r, before) {
+            (timeline_core::editor::MarkerWord::Mark(Some(_)), Ok(()), Some(b)) => format!("renamed {b} to {} at {tc}", now.clone().unwrap_or_default()), // STRIAMARKERRENAME (SR895)
             (timeline_core::editor::MarkerWord::Mark(_), Ok(()), _) => format!("marked {} at {tc}", now.unwrap_or_default()),
             (timeline_core::editor::MarkerWord::Unmark, Ok(()), b) => format!("unmarked {} at {tc}", b.unwrap_or_default()),
             (timeline_core::editor::MarkerWord::Mark(_), Err(EditError::Marker), Some(b)) => format!("mark: {b} is already at {tc}"),
             (timeline_core::editor::MarkerWord::Unmark, Err(EditError::Marker), None) => format!("unmark: no marker at {tc}"),
+            (timeline_core::editor::MarkerWord::UnmarkAll, Ok(()), _) => format!("unmarked {count} markers"), // STRIAMARKERRENAME (SR895)
+            (timeline_core::editor::MarkerWord::UnmarkAll, Err(EditError::Marker), _) => "unmark all: no markers".to_string(), // STRIAMARKERRENAME (SR895)
             (_, Err(e), _) => format!("{}: {e}", v.trim()),
         });
         Some(true)
