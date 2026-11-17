@@ -4965,7 +4965,7 @@ pub const JUMP_KEYS: [(u8, &str); 2] = [(b';', "marker-"), (b'\'', "marker+")];
 
 /// STRIAKMARKERJUMP (SR9064): the jump word a key byte names ([`JUMP_KEYS`]); `None` for any other byte.
 pub fn jump_key(b: u8) -> Option<&'static str> {
-    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| cut_jump_key(b)) // STRIAKCUTJUMP (LEDGER SR9091): Up / Down the cut jumps (file tail)
+    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| cut_jump_key(b)).or_else(|| end_jump_key(b)) // STRIAKCUTJUMP (LEDGER SR9091): Up / Down the cut jumps (file tail)
 }
 
 #[cfg(test)]
@@ -5435,7 +5435,7 @@ impl EditorState {
         }
         let now = match self.selected_title_style() { Ok(s) => s, Err(e) => return Some(Err(e)) };
         Some(title_step(now, v).ok_or(EditError::Style).and_then(|s| self.title_style(s)))
-    }
+    }; STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End (file tail)
 }
 
 #[cfg(test)]
@@ -6084,5 +6084,72 @@ impl EditorState {
         tl.validate()?;
         self.commit(tl);
         Ok(())
+    }
+}
+
+// ---- STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End both faces bind (named tail block) ----
+// One key means one word on both faces: Home / End are `verb`'s existing view words `home` / `end` (`seek` to 0 / to
+// `timeline.end()`, no commit). The host face binds the named keys (`Home` / `End`, AppKit U+F729 / U+F72B) through its KEYS
+// slice, which a test (stria tests/nle.rs) ties to this table. The kernel Player reads the bytes through [`jump_key`] and
+// routes every [`seek_word`] through its seek door (no save, no undo step). The bytes are PROPOSED: una_abi has no Home / End
+// byte yet and the HID table presses none (owed NLE-JUMP-ENDS-KERNEL-BYTES), so the Player sees them once that lands.
+
+/// STRIAKCUTJUMPMORE (SR9108): the Player byte proposed for Home (the next free chord-range byte after una_abi `KEY_PGDN`).
+pub const KEY_HOME_BYTE: u8 = 0x91;
+/// STRIAKCUTJUMPMORE (SR9108): the Player byte proposed for End.
+pub const KEY_END_BYTE: u8 = 0x92;
+
+/// STRIAKCUTJUMPMORE (SR9108): `(Player byte, host key name, word)` of the timeline start / end jumps.
+pub const END_JUMP_KEYS: [(u8, &str, &str); 2] = [(KEY_HOME_BYTE, "Home", "home"), (KEY_END_BYTE, "End", "end")];
+
+/// STRIAKCUTJUMPMORE (SR9108): the start / end word a Player byte names ([`END_JUMP_KEYS`]); `None` for any other byte.
+pub fn end_jump_key(b: u8) -> Option<&'static str> {
+    END_JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.2)
+}
+
+/// STRIAKCUTJUMPMORE (SR9108): a word that only moves the playhead (a [`jump_word`] or an [`END_JUMP_KEYS`] word): no save,
+/// no undo step, no reselect. THE predicate the kernel Player's seek door reads.
+pub fn seek_word(v: &str) -> bool {
+    jump_word(v).is_some() || END_JUMP_KEYS.iter().any(|k| k.2 == v.trim())
+}
+
+#[cfg(test)]
+mod striakcutjumpmore_tests {
+    use super::*;
+    use crate::Kind;
+
+    #[test]
+    fn striakcutjumpmore_bytes_name_home_and_end() {
+        assert_eq!(jump_key(KEY_HOME_BYTE), Some("home"));
+        assert_eq!(jump_key(KEY_END_BYTE), Some("end"));
+        assert_eq!(end_jump_key(0x1F), None);
+        assert_eq!(end_jump_key(0x90), None);
+        assert_eq!(jump_key(0x1F), Some("cut-"), "the cut jumps keep their bytes");
+        for w in ["home", "end", " end ", "cut-", "cut+", "marker-", "marker+"] {
+            assert!(seek_word(w), "{w}");
+        }
+        for w in ["split", "mark", "unmark", "zoom+", "delete", ""] {
+            assert!(!seek_word(w), "{w}");
+        }
+    }
+
+    #[test]
+    fn striakcutjumpmore_home_end_move_the_playhead_only() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 30, 10)];
+        let mut st = EditorState::new(tl);
+        let tl0 = st.timeline.clone();
+        let (home, end) = (jump_key(KEY_HOME_BYTE).unwrap(), jump_key(KEY_END_BYTE).unwrap());
+        st.seek(12);
+        assert_eq!(st.verb(end), Some(Ok(())));
+        assert_eq!(st.playhead, st.timeline.end());
+        assert_eq!(st.verb(home), Some(Ok(())));
+        assert_eq!(st.playhead, 0);
+        assert_eq!(st.verb(home), Some(Ok(())));
+        assert_eq!(st.playhead, 0);
+        assert_eq!(st.timeline, tl0);
+        assert!(!st.undo(), "Home / End are not an undo step");
     }
 }
