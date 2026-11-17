@@ -195,13 +195,14 @@ pub struct Face {
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
+    entry: Option<String>, // STRIAGOTOMORE (SR9097): the open entry line's text (`None`: closed, the default) (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, tc: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, tc: None, entry: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -209,7 +210,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.entry_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -236,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.goto_verb(v) { return r; } if let Some(r) = self.tc_amount_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -388,6 +389,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
+    ("Ctrl+g", "enter goto"), // STRIAGOTOMORE (SR9097): Ctrl / Cmd+g opens the entry line holding `goto `, Ctrl / Cmd+Return opens it empty (file tail)
+    ("Meta+g", "enter goto"),
+    ("Ctrl+Return", "enter"),
+    ("Meta+Return", "enter"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -496,7 +501,7 @@ impl Face {
             return false;
         }
         let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
-        if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
+        if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } if let Some(r) = self.entry_open(act) { return r; } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
         if VERBS.contains(&act) || slipslide_word(act).is_some() { // NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
@@ -2362,7 +2367,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.entry_line().or_else(|| self.last_error.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line()) // STRIAGOTOMORE (SR9097): the open entry line wins the row (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2605,6 +2610,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("tc", "playhead readout: off / timecode / frames / seconds"), // STRIATCSET (SR908)
+    ("enter goto", "go to a typed timecode (Return: go, Escape: cancel)"), // STRIAGOTOMORE (SR9097)
+    ("enter", "type a face word (Return: do it, Escape: cancel)"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3346,7 +3353,7 @@ impl Face {
         }
         let args: Vec<&str> = words.collect();
         match args.as_slice() {
-            [a] => match timeline_core::edl::tc_entry(a, &self.state.timeline) {
+            [a] => match goto_target(a, self.state.playhead, &self.state.timeline) { // STRIAGOTOMORE (SR9097): `goto +<tc>` / `goto -<tc>` from the playhead (file tail)
                 Ok(t) => self.state.seek(t),
                 Err(m) => self.last_error = Some(format!("goto: {m}")),
             },
@@ -3368,5 +3375,113 @@ mod striadropframeface_tests {
         assert_eq!(mark_arg("in"), ("in", None));
         assert_eq!(mark_arg("kind W007"), ("kind W007", None));
         assert_eq!(mark_arg("tc frames"), ("tc frames", None));
+    }
+}
+
+// ---- STRIAGOTOMORE (LEDGER SR9097): relative `goto`, timecode amounts and the face's entry line (named tail block) ----
+// `goto +<tc>` / `goto -<tc>` seek from the playhead (`goto_target`, through `timeline_core::edl::tc_delta`, the signed form
+// of THE typed reader `tc_entry`; the seek clamps as every seek does). `slip` / `slide <tc>` and `rtrim in|out <tc>` read a
+// signed timecode through the same `tc_delta` and are rewritten to editor.rs's integer words, then go through `Face::verb` again
+// (THE dispatch, ONE commit); an integer or a text with no `:` / `;` keeps the old road. The entry line: a KEYS action `enter
+// <text>` opens it holding `<text> ` (`Ctrl+g` / `Meta+g`: `goto `), `enter` opens it empty (`Ctrl+Return` / `Meta+Return`);
+// while open it takes `BrowserText` (appended), `BackSpace`, `Return` / `KP_Enter` (closes, fires the trimmed line through
+// `Face::verb`; a word the face does not take is `last_error`) and `Escape` (closes); every other key is taken and ignored.
+// It shows on the message row (`message_text`) as `<text>_`, labels on only, so every labels-off golden is byte-identical.
+// Owed: NLE-TC-ENTRY-FADE / -MARKER / -NUDGE, NLE-TC-ENTRY-SRCRATE, NLE-TC-ENTRY-KERNEL, NLE-TC-ENTRY-CURSOR, NLE-TC-ENTRY-APPKIT-CHORD.
+
+/// STRIAGOTOMORE (SR9097): the tick `goto <a>` names: a signed `a` is relative to the playhead `ph`, else absolute.
+fn goto_target(a: &str, ph: i64, tl: &Timeline) -> Result<i64, String> {
+    if a.starts_with(['+', '-']) {
+        timeline_core::edl::tc_delta(a, tl).map(|d| ph.saturating_add(d))
+    } else {
+        timeline_core::edl::tc_entry(a, tl)
+    }
+}
+
+impl Face {
+    /// `slip` / `slide <tc>` and `rtrim in|out <tc>`: the signed timecode as ticks, then the integer word through
+    /// [`Face::verb`]; a refusal is `last_error`. `None` for any other word, or an amount that is an integer or no timecode.
+    fn tc_amount_verb(&mut self, v: &str) -> Option<bool> {
+        let w: Vec<&str> = v.split_whitespace().collect();
+        let (word, x) = match w.as_slice() {
+            [h @ ("slip" | "slide"), x] => (String::from(*h), *x),
+            ["rtrim", e @ ("in" | "out"), x] => (format!("rtrim {e}"), *x),
+            _ => return None,
+        };
+        if x.parse::<i64>().is_ok() || !x.contains([':', ';']) {
+            return None;
+        }
+        match timeline_core::edl::tc_delta(x, &self.state.timeline) {
+            Ok(d) => Some(self.verb(&format!("{word} {d}"))),
+            Err(m) => {
+                self.last_error = Some(format!("{}: {m}", w[0]));
+                Some(true)
+            }
+        }
+    }
+    /// A KEYS action `enter <text>` opens the entry line holding `<text> `; `enter` opens it empty. `None` for any other action.
+    fn entry_open(&mut self, act: &str) -> Option<bool> {
+        let text = if act == "enter" { String::new() } else { format!("{} ", act.strip_prefix("enter ")?) };
+        self.entry = Some(text);
+        Some(true)
+    }
+    /// While the entry line is open: the typed text, BackSpace, Return (fire), Escape (close); any other key is taken and
+    /// ignored (`Some(false)`). `None` with the line closed, and for every message that is not a key.
+    fn entry_input(&mut self, msg: &SMessage) -> Option<bool> {
+        self.entry.as_ref()?;
+        match msg {
+            SMessage::BrowserText(t) => {
+                if let Some(e) = self.entry.as_mut() {
+                    e.extend(t.chars().filter(|c| !c.is_control()));
+                }
+                Some(true)
+            }
+            SMessage::BrowserKey(k) => match k.as_str() {
+                "Return" | "KP_Enter" => {
+                    let owned = self.entry.take().unwrap_or_default();
+                    let line = owned.trim();
+                    if !line.is_empty() && !self.verb(line) {
+                        self.last_error = Some(format!("{line}: not a face word"));
+                    }
+                    Some(true)
+                }
+                "BackSpace" => {
+                    if let Some(e) = self.entry.as_mut() {
+                        e.pop();
+                    }
+                    Some(true)
+                }
+                "Escape" => {
+                    self.entry = None;
+                    Some(true)
+                }
+                _ => Some(false),
+            },
+            _ => None,
+        }
+    }
+    /// The open entry line as the message row shows it (`<text>_`); `None` while closed.
+    fn entry_line(&self) -> Option<String> {
+        self.entry.as_ref().map(|e| format!("{e}_"))
+    }
+    /// The open entry line's text; `None` while closed.
+    pub fn entry(&self) -> Option<&str> {
+        self.entry.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod striagotomore_tests {
+    use super::*;
+
+    /// `goto_target`: a signed entry is relative to the playhead (clamping is the seek's), a bare one absolute.
+    #[test]
+    fn striagotomore_goto_target_signs() {
+        let tl = Timeline::new(25);
+        assert_eq!(goto_target("+00:00:01:00", 12, &tl), Ok(37));
+        assert_eq!(goto_target("-5", 12, &tl), Ok(7));
+        assert_eq!(goto_target("00:00:01:00", 12, &tl), Ok(25));
+        assert_eq!(goto_target("-20", 12, &tl), Ok(-8), "the seek clamps, not the reader");
+        assert!(goto_target("+", 12, &tl).is_err());
     }
 }
