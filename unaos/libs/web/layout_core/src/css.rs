@@ -1224,7 +1224,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "inherit" | "initial" | "unset" => {}
             other => H::record_css(&format!("justify-content-value:{}", other)),
         },
-        "background-color" => {
+        "background-color" => { bg_currentcolor::<H>(&mut style.paint, value);
             if value.eq_ignore_ascii_case("transparent") {
                 style.paint.bg_alpha = Some(0.0);
             } else if !is_neutral_keyword(value) {
@@ -1242,7 +1242,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
         }
-        "background" if value.to_ascii_lowercase().contains("-gradient(") => {
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
             style.paint.bg_gradient = H::parse_gradient(value).map(Some);
             let lower = value.to_ascii_lowercase();
@@ -1285,7 +1285,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         },
-        "background" => {
+        "background" => { bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
             if let Some(u) = extract_css_url(value) {
@@ -1592,7 +1592,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                sides[side] = Some((width, color));
+                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v);
                 style.paint.border = Some(sides);
             }
         }
@@ -1836,7 +1836,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                style.paint.border = Some([Some((width, color)); 4]);
+                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v);
             } else {
                 H::record_css(&format!("border-value:{}", clip(value)));
             }
@@ -1870,7 +1870,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some([None; 4]);
                 return;
             }
-            if let Some(c) = parse_color_str::<H>(value) {
+            if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
                 style.paint.border_alpha = Some(color_alpha::<H>(value));
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
@@ -1881,7 +1881,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "border-width" => {
-            if let Some(w) = parse_px(value, cx) {
+            if let Some(w) = parse_px(value, cx) { width_cc(&mut style.paint);
                 let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
                 for side in sides.iter_mut() {
                     let c = side.map(|(_, c)| c).unwrap_or((128, 128, 128));
@@ -2595,7 +2595,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         deco_clone, text_combine, scroll_margin, container_scroll,
         outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -3688,5 +3688,63 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         "border-width" => "3px",
         _ => value,
+    }
+}
+
+// ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor marker writes (named tail block) ----
+
+/// The background arms' marker (css-color-4 §6.2): a top-level `currentcolor` token writes the carrier and sets
+/// [`crate::paint::CC_BG`] (paint resolves it to the element's ink); a concrete colour clears the bit (the arm's body
+/// then writes that colour as before); anything else (transparent, none, an image alone) leaves it.
+fn bg_currentcolor<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let parts = split_top_level(value);
+    if parts.iter().any(|p| p.eq_ignore_ascii_case("currentcolor")) {
+        paint.background = Some((0, 0, 0));
+        paint.bg_alpha = Some(1.0);
+        paint.currentcolor |= crate::paint::CC_BG;
+    } else if parts.iter().any(|p| parse_color_str::<H>(p).is_some()) || H::parse_color_alpha(value).is_some() {
+        paint.currentcolor &= !crate::paint::CC_BG;
+    }
+}
+
+/// The `border` / side shorthands' marker: css-backgrounds-3 §3.1 `border-color`'s initial value is currentcolor, so
+/// a shorthand whose colour is omitted or `currentcolor` sets the `mask` side bits (the arm's grey is the carrier);
+/// a concrete colour clears them.
+fn border_cc<H: Host>(paint: &mut PaintStyle<H>, mask: u8, v: &str) {
+    let parts = split_top_level(v);
+    let mut rest = parts.iter().filter(|p| {
+        border_style_code(p).is_none()
+            && !p.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+            && !matches!(p.to_ascii_lowercase().as_str(), "thin" | "medium" | "thick")
+    });
+    let first = rest.next();
+    if first.is_none() || first.into_iter().chain(rest).any(|p| p.eq_ignore_ascii_case("currentcolor")) {
+        paint.currentcolor |= mask;
+    } else {
+        paint.currentcolor &= !mask;
+    }
+}
+
+/// `border-color`'s colour: a parsed colour clears the side bits; `currentcolor` sets them and answers the grey
+/// carrier, so the arm builds the sides as it does for a colour; anything else None.
+fn border_color_of<H: Host>(paint: &mut PaintStyle<H>, value: &str) -> Option<(u8, u8, u8)> {
+    if let Some(c) = parse_color_str::<H>(value) {
+        paint.currentcolor &= !crate::paint::CC_SIDES;
+        Some(c)
+    } else if value.trim().eq_ignore_ascii_case("currentcolor") {
+        paint.currentcolor |= crate::paint::CC_SIDES;
+        Some((128, 128, 128))
+    } else {
+        None
+    }
+}
+
+/// `border-width`'s marker: each side the arm creates at the grey (no border yet, or that side absent) takes the
+/// initial border colour, currentcolor.
+fn width_cc<H: Host>(paint: &mut PaintStyle<H>) {
+    for i in 0..4 {
+        if paint.border.map_or(true, |b| b[i].is_none()) {
+            paint.currentcolor |= 1 << i;
+        }
     }
 }
