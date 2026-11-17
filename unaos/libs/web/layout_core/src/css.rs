@@ -1242,7 +1242,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
             bg_image_layers::<H>(&mut style.paint, value);
         }
-        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
             bg_image_layers::<H>(&mut style.paint, value);
             let lower = value.to_ascii_lowercase();
@@ -1285,7 +1285,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
         },
-        "background" => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
             bg_shorthand_none::<H>(&mut style.paint, value); if extract_css_url(value).is_some() {
@@ -3795,17 +3795,13 @@ fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
 /// value, so the image goes (`bg_image_clear`), the colour is transparent, and repeat / position / size take SR848's
 /// initials (repeat / `0% 0%` / auto, stored as their arms store them; not through `apply_declaration`, which would
 /// enter background-color / -position in `animatable`). Any other shorthand keeps its omitted layers
-/// (AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+/// (no longer: SR1061 resets every shorthand through `bg_shorthand_reset` at both arm heads; this guard calls it too).
 fn bg_shorthand_none<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
     let parts = split_top_level(value);
     if parts.is_empty() || !parts.iter().all(|p| p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("transparent")) {
         return;
     }
-    bg_image_clear(paint, "none");
-    paint.bg_alpha = Some(0.0);
-    paint.bg_repeat = parse_repeat("repeat");
-    paint.bg_position = Some("0% 0%".to_string());
-    paint.bg_size = Some("auto".to_string());
+    bg_shorthand_reset(paint, "none");
 }
 
 /// `merge_paint`'s half for the bit, BEFORE the image / gradient clones: a later block that declared none clears the
@@ -4137,4 +4133,23 @@ fn merge_bg_layers<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         dst.bg_image = None;
         dst.bg_gradient = Some(None);
     }
+}
+
+// ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): css-backgrounds-3 §3.10: both `background` arms call this at their head,
+/// BEFORE `bg_currentcolor` (which re-sets CC_BG and the opaque alpha for a currentcolor token), so every longhand the
+/// value omits takes its initial as an explicit Some that `merge_paint` copies over an earlier rule: no image
+/// (`bg_image_clear`, SR1052's empty `bg_more`), transparent, repeat / `0% 0%` / auto; the arm's scans then write the
+/// parts present. `inherit` / `revert` / `revert-layer` are left as they were (dropped: owed).
+fn bg_shorthand_reset<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "revert" | "revert-layer") {
+        return;
+    }
+    bg_image_clear(paint, "none");
+    paint.bg_alpha = Some(0.0);
+    paint.currentcolor &= !crate::paint::CC_BG;
+    paint.bg_repeat = parse_repeat("repeat");
+    paint.bg_position = Some("0% 0%".to_string());
+    paint.bg_size = Some("auto".to_string());
 }
