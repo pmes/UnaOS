@@ -10177,3 +10177,44 @@ fn striaopacitymore_keys_step_the_selection_and_help_names_them() {
     }
     println!("striaopacitymore: key 8 -> opacity: 90 %, key 9 -> opacity: 100 %, help rows 8 / 9");
 }
+
+// ---- STRIAPANMORE (LEDGER SR959): the Alt pan keys and the pan on the whole selection set (named tail block) ----
+
+/// Alt+Right / Alt+0 / Alt+Left (named keys) step / centre the selected audio clip through SR897's face words and read the
+/// pan on the message row; the text form is not taken; the help names the keys; a set takes the pan on its audio clips
+/// only, in one undo step; a set with no audio clip is refused `NoClip`.
+#[test]
+fn striapanmore_alt_keys_pan_and_read() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let key = |f: &mut Face, k: &str| f.on(&bandy::SMessage::BrowserKey(k.into()));
+    face.state.select(1, 1).unwrap();
+    assert!(key(&mut face, "Alt+Right") && key(&mut face, "Alt+Right"));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (32, Some("pan: R 25")));
+    assert!(key(&mut face, "Alt+0"));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (0, Some("pan: centre")));
+    assert!(key(&mut face, "Alt+Left"));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (-16, Some("pan: L 13")));
+    assert!(!face.on(&bandy::SMessage::BrowserText("Alt+Left".into())), "a named key is read from BrowserKey only");
+    let rows = help_rows();
+    for (k, w) in [("Alt+Left", "pan-"), ("Alt+0", "pan"), ("Alt+Right", "pan+")] {
+        assert!(KEYS.contains(&(k, w)), "{k}");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(row.1 != w, "{w}: a phrase, not the word");
+    }
+    face.state.select(0, 1).unwrap();
+    face.state.select_add(1, 0).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    let d0 = face.state.undo_depth();
+    assert!(key(&mut face, "Alt+Right"));
+    let p = |f: &Face, t: usize, i: usize| f.state.timeline.tracks[t].clips[i].pan_cq8;
+    assert_eq!((p(&face, 1, 0), p(&face, 1, 2), p(&face, 0, 1), face.state.undo_depth()), (16, 16, 0, d0 + 1), "audio clips only, one step");
+    assert_eq!(face.last_error.take().as_deref(), Some("pan: R 13"));
+    face.state.select(0, 0).unwrap();
+    face.state.select_add(0, 1).unwrap();
+    assert!(face.verb("pan+"));
+    assert_eq!(face.last_error.take(), Some(format!("pan: {}", EditError::NoClip)), "no audio clip in the set");
+    assert_eq!(face.state.undo_depth(), d0 + 1);
+    println!("striapanmore: Alt keys -> R 25 / centre / L 13; set of two audio + one video -> 16, 16, 0");
+}

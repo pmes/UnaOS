@@ -697,7 +697,7 @@ pub const GAIN_STEP_CDB: i32 = 100;
 impl EditorState {
     /// The selected clip's gain set to `cdb` centi-dB (`Timeline::set_gain`, ONE commit; the same gain commits nothing).
     pub fn set_selected_gain(&mut self, cdb: i32) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if self.set.len() > 1 { return self.pan_whole_set(pan_cq8); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAPANMORE (SR959): a set of more than one pans its audio clips (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.gain_cdb == cdb {
             return Ok(());
@@ -3078,6 +3078,38 @@ impl EditorState {
             tl = tl.set_opacity(&[(track, idx)], pct)?;
         }
         if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+}
+
+// ---- STRIAPANMORE (LEDGER SR959): the pan on the whole selection set (named tail block) ----
+// A set of more than one clip (`EditorState::set`: shift-press, marquee) takes the pan on every clip of it on an AUDIO track,
+// through SR861's `Timeline::set_pan` and ONE `commit` (one undo step; nothing commits when every such clip already holds
+// the pan). A clip on a video track is left alone; a set with no audio clip is refused `EditError::NoClip` (no pan-kind
+// error exists: SR861's single-clip road does not refuse a video clip). SR897's `pan-` / `pan+` step from the primary's
+// pan and the whole set takes that value; `set_selected_pan` stays THE one road every pan word takes.
+impl EditorState {
+    /// Every audio clip of the set panned to `pan_cq8` (one commit); `NoClip` when the set holds no audio clip.
+    fn pan_whole_set(&mut self, pan_cq8: i8) -> Result<(), EditError> {
+        let mut tl = self.timeline.clone();
+        let (mut audio, mut changed) = (false, false);
+        for &(t, i) in &self.set {
+            let tr = self.timeline.tracks.get(t).ok_or(EditError::NoTrack)?;
+            if !matches!(tr.kind, crate::Kind::Audio) {
+                continue;
+            }
+            audio = true;
+            if tr.clips.get(i).ok_or(EditError::NoClip)?.pan_cq8 != pan_cq8 {
+                tl = tl.set_pan(t, i, pan_cq8)?;
+                changed = true;
+            }
+        }
+        if !audio {
+            return Err(EditError::NoClip);
+        }
+        if changed {
             self.commit(tl);
         }
         Ok(())
