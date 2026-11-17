@@ -2246,7 +2246,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::GainEnv => "gain-env", // STRIAGAINENVDRAG (SR9082): the arm only; the Player never begins one (edit_press calls begin_with)
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::GainEnv => "gain-env", // STRIAGAINENVDRAG (SR9082) / STRIAKGAINENV (SR9111): begun by edit_begin (Drag::begin_grab)
     }
 }
 
@@ -2260,7 +2260,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
+        let d = match edit_begin(&mut e.st, l, x as f64, (y - y0) as f64) { Ok(d) => d, Err(picked) => return picked }; // STRIAKGAINENV (SR9111): timeline_core's ONE press order, then begin_with (file tail)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
@@ -2664,4 +2664,33 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKGAINENV (LEDGER SR9111): the Player's press takes timeline_core's ONE press order (named tail block) ----
+// handlers.md §5 NLE5b's NLE-GAIN-ENV-DRAG-KERNEL. [`edit_press`] called only `Drag::begin_with`, so the Player's band never
+// began a transition edge drag or the selected audio clip's envelope drag the host face begins. [`edit_begin`] asks the host's
+// ordered list first (`view::Drag::begin_grab`: the transition edge, the widget pick, the envelope), then `begin_with`; the
+// release is the generic [`edit_drag_end`] (`Drag::finish`: `set_transition_dur` / `set_selected_gain_env`, the save), the band's
+// `Drag::shown` the preview. A press on a widget's middle selects that transition (no drag; the band repaints) and a press off
+// every widget clears the selection, as the host's. Wire: `[nle] press transition track=<n> idx=<n> selected` | `refused (<why>)`;
+// the drags print the existing `[nle] drag press <gain-env|transition-in|transition-out>` and `[nle] drag <kind> from= to=` lines.
+
+/// STRIAKGAINENV (SR9111): the press's begin on the Player's editor state: `Ok(drag)`; `Err(true)`: a transition picked (the
+/// press is taken, no drag); `Err(false)`: nothing under the press.
+fn edit_begin(st: &mut timeline_core::editor::EditorState, l: timeline_core::view::Layout, x: f64, y: f64) -> Result<timeline_core::view::Drag, bool> {
+    use timeline_core::view::{Drag, Grab};
+    let nosnap = false;
+    match Drag::begin_grab(st, l, x, y, false, nosnap, false) {
+        Some(Grab::Drag(d)) => Ok(d),
+        Some(Grab::Pick(r)) => {
+            BAND_DIRTY.store(true, Ordering::Release);
+            let (t, i) = l.transition_at(&st.timeline, x, y).unwrap_or((0, 0));
+            match r {
+                Ok(()) => serial_println!("[nle] press transition track={} idx={} selected", t, i),
+                Err(why) => serial_println!("[nle] press transition track={} idx={} refused ({})", t, i, why),
+            }
+            Err(true)
+        }
+        None => Drag::begin_with(st, l, x, y, false, nosnap, false).ok_or(false),
+    }
 }
