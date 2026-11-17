@@ -392,3 +392,66 @@ fn h_vbr_scene_change_stays_in_bucket() {
     assert_eq!((fillers, bp.len()), (0, 2));
     assert!(margin >= 0);
 }
+
+// ---- H264ENCHRDVBRUNDERFLOW (LEDGER SR1050): the VBR row-QP room term at the knife edge (named tail block) ----
+// A VBR picture whose bits pass the max bucket's room at its start (bmax - fmax: the CPB `hrd_au` signals is the bucket's mirror)
+// underflows the CPB. The knife edge: the stream's first IDR has no fitted model, so `Rc::picture` codes it at start_qp (cfg.qp 16
+// here) whatever the target, and only `row_qp` can move it. While the target cap is idle its size does not depend on the max, so
+// the run at max 2000 (room x 15/16 far above it: the term cannot fire) IS the old code's IDR at the knife max: the armed contrast
+// is measured at runtime. rc.rs `Rc::room_step` (SR1050) raises the rows' QP until the projected picture fits the room.
+
+/// [`busy`]'s first picture frozen for 6 frames at VBR mean 64 / max `max` kbit/s, gop 12, cfg.qp 16, deblocking on (so
+/// `Encoder::mb_qps` holds the coded QPs): the access units and the IDR's QP per macroblock row (the row's largest).
+fn knife(max: u32) -> (Vec<Access>, Vec<u8>) {
+    let cfg = Config { width: W as u32, height: H as u32, qp: 16, gop: 12, deblock: true, hrd: true, rate: Some(RateControl::vbr(64, max, (FPS, 1))), ..Default::default() };
+    let mut enc = Encoder::new(cfg).unwrap();
+    let p = busy(0);
+    let (mut aus, mut rows) = (Vec::new(), Vec::new());
+    for t in 0..6 {
+        aus.push(enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap());
+        if t == 0 {
+            rows = enc.mb_qps().chunks(W / 16).map(|r| *r.iter().max().unwrap()).collect();
+        }
+    }
+    (aus, rows)
+}
+
+/// The idle run (max 2000) and the knife run (max = 15/16 of the idle IDR's bits): (idle IDR bits, idle rows, knife units, knife rows).
+fn knife_pair() -> (i128, Vec<u8>, Vec<Access>, Vec<u8>) {
+    let (idle, idle_rows) = knife(2000);
+    let x = bits(&idle[0]);
+    let (aus, rows) = knife((x * 15 / 16 / 1000) as u32);
+    (x, idle_rows, aus, rows)
+}
+
+#[test]
+fn i_vbr_knife_edge_does_not_underflow() {
+    let (x, idle_rows, aus, rows) = knife_pair();
+    let v = sps_of(&aus[0].nals[0]);
+    let cpb = v.nal_hrd.expect("nal_hrd_parameters").cpb_size as i128;
+    let y = bits(&aus[0]);
+    println!("hrd vbr knife edge: idle idr {x} bits rows {idle_rows:?}, cpb {cpb} (old margin {}), knife idr {y} bits rows {rows:?}", cpb - x);
+    println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
+    assert!(cpb < x, "the knife CPB ({cpb}) holds the old code's IDR ({x}): not a knife edge");
+    let (fillers, margin, peak) = replay(&aus, &v);
+    println!("  arrival margin min {margin} bits, cpb peak {peak} / {cpb} bits");
+    assert_eq!(fillers, 0, "VBR pads nothing");
+    assert!(margin >= 0);
+    assert!(y <= cpb && y < x, "the knife IDR ({y}) shrank below the CPB ({cpb}) and the old IDR ({x})");
+    // Measured (SR1050 EXCEPTION runs): at the old rc.rs the knife run's IDR was 111928 bits and `replay` panicked (CPB underflow,
+    // old margin 104000 - 111936 = -7936); with the room term the IDR is 93800 bits and the smallest margin 5698.
+    assert_eq!((x, cpb, y, margin), (111_936, 104_000, 93_800, 5_698), "idle IDR, knife CPB, knife IDR, arrival margin");
+}
+
+#[test]
+fn j_vbr_row_qp_steps_are_bounded() {
+    let (_, idle_rows, _, rows) = knife_pair();
+    let term: Vec<i32> = rows.iter().zip(&idle_rows).map(|(&k, &i)| k as i32 - i as i32).collect();
+    println!("hrd vbr knife row term {term:?} (idle rows {idle_rows:?}, knife rows {rows:?})");
+    assert_eq!(term[0], 0, "row 0 never reaches rc_row");
+    assert!(term.iter().all(|d| (0..=6).contains(d)), "the room term is bounded at +6");
+    assert!(term.windows(2).all(|w| w[0] <= w[1]), "the room term never falls within the picture");
+    assert!(term.iter().any(|&d| d > 0), "the room term never fired at the knife edge");
+    // Measured (SR1050): idle rows [16, 19 x 5] (row_qp's +3), knife rows [16, 22, 24, 25, 25, 25]; at the old rc.rs the term was all 0.
+    assert_eq!(term, [0, 3, 5, 6, 6, 6], "the room term per macroblock row");
+}
