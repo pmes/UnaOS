@@ -7615,3 +7615,132 @@ mod striakgainenv_tests {
         std::println!("striakgainenv: plain -> GainEnv, Shift / slip / off the line -> None");
     }
 }
+
+// ---- STRIASOURCEGHOST (LEDGER SR9115): the source frame following a source drag (named tail block) ----
+// SR9081 owed NLE-SOURCE-DRAG-GHOST. While a `DragKind::Source` drag's pointer is over the tracks, a THUMB_W x THUMB_H box
+// above the pointer shows the loaded source's frame through the one blit road (`Canvas::rect`, `blit_fit`, `frame`, as
+// the transition thumbnail does). The face passes the still its preview band rendered this paint (during a source drag
+// that is the source's frame: `Drag::shown` carries the source). Any other state paints nothing. The drop tick's line is
+// `paint_drag`'s guide (the Source arm of `snap_delta` sets it): nothing is added for it here.
+
+/// The gap (px) between the ghost box's foot and the pointer.
+pub const GHOST_GAP: i64 = 4;
+
+/// The ghost box's top-left `(x0, y0)` ([`THUMB_W`] x [`THUMB_H`]): centred on the pointer's x, its foot [`GHOST_GAP`]
+/// above the pointer, kept on the canvas.
+pub fn ghost_box(l: &Layout, at: (f64, f64)) -> (i64, i64) {
+    let x0 = (at.0 as i64 - THUMB_W / 2).min(l.w as i64 - THUMB_W).max(0);
+    let y0 = (at.1 as i64 - GHOST_GAP - THUMB_H).min(l.h as i64 - THUMB_H).max(0);
+    (x0, y0)
+}
+
+/// The source drag's ghost over the painted canvas: `px` untouched unless `drag` is a [`DragKind::Source`] drag whose
+/// pointer is over the tracks (`ruler_y..h`); then the box at [`ghost_box`] filled [`FIELD`], `still` fitted inside it
+/// (none, e.g. an audio-only source: the empty box) and outlined in [`GUIDE`].
+pub fn paint_source_ghost(px: Vec<u8>, l: Layout, order: Order, drag: Option<&Drag>, still: Option<&Still>) -> Vec<u8> {
+    let Some(d) = drag else { return px };
+    if d.kind != DragKind::Source || d.at.1 < l.ruler_y as f64 || d.at.1 >= l.h as f64 {
+        return px;
+    }
+    let (x0, y0) = ghost_box(&l, d.at);
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    c.rect(x0, y0, x0 + THUMB_W, y0 + THUMB_H, FIELD);
+    if let Some(s) = still {
+        c.blit_fit(s, x0 as u32 + 1, y0 as u32 + 1, THUMB_W as u32 - 2, THUMB_H as u32 - 2);
+    }
+    c.frame(x0, y0, x0 + THUMB_W, y0 + THUMB_H, GUIDE);
+    c.px
+}
+
+#[cfg(test)]
+mod striasourceghost_tests {
+    use super::*;
+    use crate::{Clip, SourceId, Timeline};
+
+    /// A 0..20 at 0 on V1 and A1; B (50 ticks) loaded for video and audio.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 40);
+        tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.load_source(SourceId(1), &[Kind::Video, Kind::Audio]).unwrap();
+        st
+    }
+
+    /// A 4x4 still of one colour.
+    fn still(c: [u8; 4]) -> Still {
+        Still { width: 4, height: 4, rgba: c.repeat(16) }
+    }
+
+    fn at(px: &[u8], l: &Layout, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * l.w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    }
+
+    const RED: [u8; 4] = [0xff, 0, 0, 255];
+
+    /// No drag, a scrub drag, and a source drag whose pointer is still over the preview band paint nothing.
+    #[test]
+    fn striasourceghost_paints_nothing_by_default() {
+        let mut st = state();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let s = still(RED);
+        assert_eq!(paint_source_ghost(px.clone(), l, Order::Rgba, None, Some(&s)), px);
+        let d = Drag::begin_source(&st, l, 10.0, 5.0, false, true).unwrap();
+        assert!((d.at.1 as u32) < l.ruler_y);
+        assert_eq!(paint_source_ghost(px.clone(), l, Order::Rgba, Some(&d), Some(&s)), px, "over the band");
+        let (x, y) = l.point(0, 5);
+        st.source = None;
+        if let Some(mut d) = Drag::begin_with(&mut st, l, x, l.ruler_y as f64 + 1.0, false, false, false) {
+            d.update(&st, x + 10.0, y);
+            assert_ne!(d.kind, DragKind::Source);
+            assert_eq!(paint_source_ghost(px.clone(), l, Order::Rgba, Some(&d), Some(&s)), px, "another kind");
+        }
+    }
+
+    /// A source drag over V1: the box above the pointer, outlined in GUIDE, the still inside it.
+    #[test]
+    fn striasourceghost_paints_the_still_above_the_pointer() {
+        let st = state();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let mut d = Drag::begin_source(&st, l, 10.0, 5.0, false, true).unwrap();
+        let (x, y) = l.point(0, 15);
+        d.update(&st, x, y);
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let got = paint_source_ghost(px.clone(), l, Order::Rgba, Some(&d), Some(&still(RED)));
+        let (x0, y0) = ghost_box(&l, (x, y));
+        assert_eq!((x0, y0 + THUMB_H + GHOST_GAP), ((x as i64 - THUMB_W / 2).max(0), (y as i64).max(THUMB_H + GHOST_GAP)));
+        assert_eq!(at(&got, &l, x0, y0), GUIDE);
+        assert_eq!(at(&got, &l, x0 + THUMB_W - 1, y0 + THUMB_H - 1), GUIDE);
+        assert_eq!(at(&got, &l, x0 + THUMB_W / 2, y0 + THUMB_H / 2), RED);
+        assert_ne!(got, px);
+    }
+
+    /// The box stays on the canvas at the right and top edges.
+    #[test]
+    fn striasourceghost_box_clamps_onto_the_canvas() {
+        let st = state();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        assert_eq!(ghost_box(&l, (399.0, 2.0)), (400 - THUMB_W, 0));
+        assert_eq!(ghost_box(&l, (0.0, 199.0)), (0, 199 - GHOST_GAP - THUMB_H));
+    }
+
+    /// No still (an audio-only source): the FIELD box and its GUIDE outline only.
+    #[test]
+    fn striasourceghost_no_still_is_the_empty_box() {
+        let st = state();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let mut d = Drag::begin_source(&st, l, 10.0, 5.0, false, true).unwrap();
+        let (x, y) = l.point(0, 15);
+        d.update(&st, x, y);
+        let got = paint_source_ghost(paint_in(&st, l, Order::Rgba, None, None), l, Order::Rgba, Some(&d), None);
+        let (x0, y0) = ghost_box(&l, (x, y));
+        assert_eq!(at(&got, &l, x0, y0), GUIDE);
+        assert_eq!(at(&got, &l, x0 + THUMB_W / 2, y0 + THUMB_H / 2), FIELD);
+    }
+}
