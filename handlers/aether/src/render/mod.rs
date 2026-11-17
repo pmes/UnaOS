@@ -3749,8 +3749,7 @@ fn frame_walk(
                         let bda = layout_core::css::border_visible(spec, &mut sides, inh.get(node).map_or(1.0, |i| i.color_alpha));
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
-                            // Background and border colours composite at their alpha.
-                            let a = a * if Some(c) == bg_rgb { bga } else { bda };
+                            // `a` is the final alpha: the callers pass the background's bga or the frame's bda.
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, child_clip) {
                                 return;
                             }
@@ -3761,34 +3760,34 @@ fn frame_walk(
                             }
                         };
                         if rounded {
-                            boxpaint::paint(fx, fy, *w, *h, radius, sides, bg_rgb, width, height, &mut blend_at);
+                            boxpaint::paint(fx, fy, *w, *h, radius, [None; 4], bg_rgb, width, height, &mut |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bga)); boxpaint::paint(fx, fy, *w, *h, radius, sides, None, width, height, &mut |x: u32, y: u32, c: (u8, u8, u8), a: f32| blend_at(x, y, c, a * bda));
                         } else {
                             // Pixel-snapped rectangles, as Blink snaps box decorations.
                             let (x0, y0) = (fx.round(), fy.round());
                             let (x1, y1) = ((fx + w).round(), (fy + h).round()); let (lw, rw) = (sides[3].map_or(0.0, |s| s.0.round().max(1.0)), sides[1].map_or(0.0, |s| s.0.round().max(1.0)));
-                            let mut fill = |ax: f32, ay: f32, bx: f32, by: f32, c: (u8, u8, u8)| {
+                            let mut fill = |ax: f32, ay: f32, bx: f32, by: f32, c: (u8, u8, u8), a: f32| {
                                 let (ax, ay) = (ax.max(0.0) as u32, ay.max(0.0) as u32);
                                 let (bx, by) = ((bx.max(0.0) as u32).min(width), (by.max(0.0) as u32).min(height));
                                 for yy in ay..by {
                                     for xx in ax..bx {
-                                        blend_at(xx, yy, c, 1.0);
+                                        blend_at(xx, yy, c, a);
                                     }
                                 }
                             };
                             if let Some(bg) = bg_rgb {
-                                fill(x0, y0, x1, y1, bg);
+                                fill(x0, y0, x1, y1, bg, bga);
                             }
                             if let Some((bw, c, _)) = sides[0] {
-                                fill(x0 + lw, y0, x1 - rw, y0 + bw.round().max(1.0), c);
+                                fill(x0 + lw, y0, x1 - rw, y0 + bw.round().max(1.0), c, bda);
                             }
                             if let Some((bw, c, _)) = sides[2] {
-                                fill(x0 + lw, y1 - bw.round().max(1.0), x1 - rw, y1, c);
+                                fill(x0 + lw, y1 - bw.round().max(1.0), x1 - rw, y1, c, bda);
                             }
                             if let Some((bw, c, _)) = sides[3] {
-                                fill(x0, y0, x0 + bw.round().max(1.0), y1, c);
+                                fill(x0, y0, x0 + bw.round().max(1.0), y1, c, bda);
                             }
                             if let Some((bw, c, _)) = sides[1] {
-                                fill(x1 - bw.round().max(1.0), y0, x1, y1, c);
+                                fill(x1 - bw.round().max(1.0), y0, x1, y1, c, bda);
                             }
                         }
                     }

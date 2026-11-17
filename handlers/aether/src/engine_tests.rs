@@ -10265,4 +10265,82 @@ b</div>
         assert!(border_alpha_half_grey(edge), "the span's top edge is half-alpha grey: {edge:?}");
         assert_eq!(corners[0], edge, "armed: the inline frame's top-left corner composites once");
     }
+
+    // ---- AETHERCSSINLINEBORDERALPHABYCOLOUR (LEDGER SR1146): the inline road's fills carry their alpha, not a colour comparison (named tail block) ----
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): on white, three inline spans (`padding: 0 12px`, white text) and
+    /// their block-road twins (40x20 divs, 48x28 with the frame), under a 12px top padding (the first span's frame
+    /// rises above its line, so it would start above the viewport): `#sa` / `#da` `background: rgba(255, 0, 0, 0.2);
+    /// border: 4px solid red`, `#sb` / `#db` the same background under `4px solid rgba(255, 0, 0, 0.5)`, `#sc` / `#dc`
+    /// `background: red; border: 4px solid rgba(0, 0, 255, 0.5)`.
+    fn inline_border_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; padding: 12px 0 0; background: #fff }
+            div { width: 40px; height: 20px; margin: 0 0 12px }
+            p { margin: 0 0 12px; padding: 0 8px; font: 16px sans-serif }
+            span { padding: 0 12px; color: #fff }
+            .a { background: rgba(255, 0, 0, 0.2); border: 4px solid red }
+            .b { background: rgba(255, 0, 0, 0.2); border: 4px solid rgba(255, 0, 0, 0.5) }
+            .c { background: red; border: 4px solid rgba(0, 0, 255, 0.5) }
+            </style></head><body>
+            <p><span id="sa" class="a">x</span></p>
+            <p><span id="sb" class="b">x</span></p>
+            <p><span id="sc" class="c">x</span></p>
+            <div id="da" class="a"></div>
+            <div id="db" class="b"></div>
+            <div id="dc" class="c"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// (top-border pixel, interior pixel) of `id`, both 7px in from the left edge: inside the left padding of a span
+    /// (clear of the text), on the top side (past the 4px left side) and at the vertical middle.
+    fn inline_border_alpha_px(e: &mut crate::AetherEngine, id: &str) -> ((u8, u8, u8), (u8, u8, u8)) {
+        let (l, t, _, h) = imgalt_rect(e, id);
+        let (x, t, h) = (l.round() as usize + 7, t.round() as usize, h.round() as usize);
+        (imgalt_px(e, x, t + 1), imgalt_px(e, x, t + h / 2))
+    }
+
+    fn inline_border_alpha_near(c: (u8, u8, u8), want: (u8, u8, u8)) -> bool {
+        [(c.0, want.0), (c.1, want.1), (c.2, want.2)].iter().all(|&(a, b)| a.abs_diff(b) <= 2)
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): an opaque red frame over a 0.2 red background paints opaque red on
+    /// the span, as on the div. Before SR1146 the inline road gave every pixel whose RGB equalled the background's the
+    /// background's alpha: the border composited at 0.2 over the fill (~(255, 163, 163)).
+    #[test]
+    fn inline_border_alpha_opaque_frame_over_translucent_fill() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sa");
+        assert_eq!(border, (255, 0, 0), "armed: the span's opaque red frame paints at its own alpha 1.0");
+        assert!(inline_border_alpha_near(interior, (255, 204, 204)), "the 0.2 fill: {interior:?}");
+        assert_eq!(inline_border_alpha_px(&mut e, "da"), (border, interior), "the block road paints the same pixels");
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): a 0.5 red frame over a 0.2 red background composites at 0.5 over
+    /// the fill (~(255, 101, 101)), on the span as on the div. Before SR1146 the span's frame took the fill's 0.2
+    /// (~(255, 163, 163)).
+    #[test]
+    fn inline_border_alpha_translucent_same_rgb() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sb");
+        assert!(inline_border_alpha_near(border, (255, 101, 101)), "armed: the frame composites at 0.5: {border:?}");
+        assert!(inline_border_alpha_near(interior, (255, 204, 204)), "the 0.2 fill: {interior:?}");
+        assert_eq!(inline_border_alpha_px(&mut e, "db"), (border, interior), "the block road paints the same pixels");
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): a 0.5 blue frame over an opaque red background (different RGBs: never
+    /// aliased) is unchanged: ~(127, 0, 128) on the frame, red inside, on the span as on the div.
+    #[test]
+    fn inline_border_alpha_distinct_colours_unchanged() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sc");
+        assert!(inline_border_alpha_near(border, (127, 0, 128)), "the blue 0.5 frame over red: {border:?}");
+        assert_eq!(interior, (255, 0, 0), "the opaque red fill");
+        assert_eq!(inline_border_alpha_px(&mut e, "dc"), (border, interior), "the block road paints the same pixels");
+    }
 }
