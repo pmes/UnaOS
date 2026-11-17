@@ -2690,7 +2690,7 @@ impl AetherEngine {
                 continue; // not painted by the last frame
             }
             let sticky = self.layout_tree.as_ref().and_then(|l| l.paint_map.get(&id)).and_then(|p| p.position_kind) == Some(4);
-            let g = (r.0, r.1 - idy, r.2, r.3 - idy);
+            let g = (r.0, r.1 - idy, r.2, r.3 - idy); if let Some(exact) = self.layout_tree.as_ref().zip(self.last_snap.as_ref().filter(|s| sticky && s.0 == self.layout_epoch)).and_then(|(l, s)| render::sticky_blit_damage(l, &s.1, id, g, self.width, self.height, self.scroll_x as i32, old_sy, self.scroll_y as i32)) { rects.extend(exact); continue; } // AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): the sticky holder's placed origin at both scrolls
             if sticky || (g.1 < r.3 && r.1 < g.3) {
                 rects.push((r.0, r.1.min(g.1), r.2, r.3.max(g.3)));
             } else {

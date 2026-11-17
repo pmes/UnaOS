@@ -5020,3 +5020,51 @@ fn sticky_scrollport(
     }
     (pl, pt, pl + cw, pt + ch, r, b)
 }
+
+// ---- AETHERSCROLLDAMAGEUNSTUCKEXACT (LEDGER SR1162): a sticky holder damages only what the scroll blit got wrong (named tail block) ----
+
+/// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): the damage a blitted scroll from `old_sy` to `new_sy` owes the sticky holder
+/// `id`, whose last-frame subtree ink the blit moved to `ghost`. The index recorded the walk origin the painter handed
+/// the box (`BoxSnap::abs`); `placed_origin` (the painter's own fn, its sticky arm and `sticky_scrollport` included)
+/// places the box from it at both scrolls. The blit moved the box with the flow, so its new screen place is the ghost
+/// moved by the change of its placed origin: none (unstuck at both: zero hold, or held at the same page place) owes no
+/// damage; else the ghost and the ghost moved by it, one hull when they meet. None — the caller keeps SR1139's hull —
+/// when `snap` is not the frame at (`sx`, `old_sy`) and this size (a horizontal scroll included), the box was not on
+/// it, or a fixed / sticky ancestor moves its walk origin with the scroll (owed AETHER-STICKY-OUTER-HOLD).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sticky_blit_damage(
+    layout: &LayoutTree,
+    snap: &FrameSnap,
+    id: NodeId,
+    ghost: Ink,
+    width: u32,
+    height: u32,
+    sx: i32,
+    old_sy: i32,
+    new_sy: i32,
+) -> Option<Vec<Ink>> {
+    if snap.scroll != (sx, old_sy) || snap.size != (width, height) {
+        return None;
+    }
+    let b = snap.boxes.get(&id)?;
+    let lb = b.layout.as_ref()?;
+    let mut up = layout.taffy.parent(id);
+    while let Some(a) = up {
+        if matches!(layout.paint_map.get(&a).and_then(|p| p.position_kind), Some(3 | 4)) {
+            return None;
+        }
+        up = layout.taffy.parent(a);
+    }
+    let old = placed_origin(layout, id, b.abs.0, b.abs.1, lb, width, height, sx, old_sy);
+    let new = placed_origin(layout, id, b.abs.0, b.abs.1, lb, width, height, sx, new_sy);
+    let (dx, dy) = (new.0 - old.0, new.1 - old.1);
+    if dx == 0.0 && dy == 0.0 {
+        return Some(Vec::new());
+    }
+    let moved = (ghost.0 + dx, ghost.1 + dy, ghost.2 + dx, ghost.3 + dy);
+    if moved.0 < ghost.2 && ghost.0 < moved.2 && moved.1 < ghost.3 && ghost.1 < moved.3 {
+        Some(vec![ink_union(ghost, moved)])
+    } else {
+        Some(vec![ghost, moved])
+    }
+}

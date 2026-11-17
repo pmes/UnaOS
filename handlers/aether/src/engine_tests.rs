@@ -9791,7 +9791,7 @@ b</div>
     }
 
     /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a page with no fixed or sticky box keeps the blit: a 50px scroll damages
-    /// only the exposed 50px strip (unchanged); the sticky fixture's 50px scroll damages the whole viewport.
+    /// only the exposed 50px strip (unchanged); the sticky fixture's 50px scroll damages the strip and each stuck box (SR1162).
     #[test]
     fn sticky_scroll_blit_plain_page_damage_is_strip() {
         let html = r#"<!doctype html><html><body style="margin:0"><div style="height:2000px"></div></body></html>"#;
@@ -9803,7 +9803,7 @@ b</div>
         assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "plain page: the exposed strip only");
         let mut s = sticky_em_inset_engine();
         s.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
-        assert_eq!(s.damage_rects, vec![(0, 0, 400, 300)], "sticky page: the whole viewport");
+        assert_eq!(s.damage_rects, vec![(0, 250, 400, 50), (0, 14, 400, 24), (0, 0, 400, 12), (0, 14, 400, 24)], "sticky page: the strip and each stuck box exact (SR1162)");
     }
 
     /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a `position: fixed` box (top 10px, 20px tall) stays at rows 10..29 under
@@ -9844,15 +9844,15 @@ b</div>
         <div style="height:2000px"></div>"#;
 
     /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): one unstuck 300x20 sticky box (`top: 30px`, flow y 120): a 50px scroll
-    /// keeps the blit and damages the strip plus ONE hull of its ink (y 118..142, x -2..302) and that ink moved up 50
-    /// (y 68..92), clipped: (0, 68, 302, 74) — not the viewport (armed: SR1135 damaged the viewport).
+    /// keeps the blit and damages the strip alone — the box is unstuck at both scrolls, so the blit moved it right
+    /// (SR1162; SR1139 took the hull (0, 68, 302, 74)) — not the viewport (armed: SR1135 damaged the viewport).
     #[test]
     fn sticky_scroll_damage_rects_one_sticky() {
         let mut e = damage_rects_engine(
             r#"<div style="height:120px"></div><div style="position:sticky;top:30px;width:300px;height:20px;background-color:rgb(0, 128, 0)"></div><div style="height:2000px"></div>"#,
         );
         e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
-        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 68, 302, 74)], "the strip and the sticky box's hull (armed)");
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "the strip alone: the unstuck box moved with the blit (SR1162)");
     }
 
     /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a fixed 100x20 header at the top: a +50 scroll damages the strip and the
@@ -11530,5 +11530,131 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginLeft"), "auto", "margin: 0 auto: margin-left");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
+    }
+
+    // ---- AETHERSCROLLDAMAGEUNSTUCKEXACT (LEDGER SR1162): a sticky holder damages only what the scroll blit got wrong (named tail block) ----
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): a 400x600 page of `body` (margin 0): a 100px lead, then ten 800px sections,
+    /// each opening with a 40px `position: sticky; top: 0` header (`hdr` appended to its style, `child` inside it) over
+    /// seven coloured 100px rows (header i's flow y is 100 + 800 i; it sticks from scroll 100 + 800 i until its section's
+    /// bottom pushes it). The paint index is armed by one first frame (`perf::scoped()`, the host default).
+    fn unstuck_exact_body(hdr: &str, child: &str) -> String {
+        let mut body = String::from(r#"<div style="height:100px;background-color:rgb(240, 240, 240)"></div>"#);
+        for i in 0..10 {
+            body.push_str(&format!(
+                r#"<section style="height:800px;background-color:rgb({}, {}, 200)"><div style="position:sticky;top:0;height:40px;background-color:rgb({}, 60, {});{hdr}">{child}</div>"#,
+                (i * 53) % 256, (i * 29) % 256, (i * 71) % 256, 255 - (i * 23) % 256
+            ));
+            for k in 0..7 {
+                body.push_str(&format!(r#"<div style="height:100px;background-color:rgb({}, {}, {})"></div>"#, (i * 31 + k * 17) % 256, (k * 47) % 256, (i * 13 + k * 89) % 256));
+            }
+            body.push_str("</section>");
+        }
+        body
+    }
+
+    fn unstuck_exact_engine(body: &str) -> crate::AetherEngine {
+        let html = format!(r#"<!doctype html><html><body style="margin:0">{body}</body></html>"#);
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): `e` scrolled by `dy` to `at` and repainted from its blit and damage equals
+    /// a control engine scrolled to `at` and repainted whole, byte for byte.
+    fn unstuck_exact_matches_full(e: &mut crate::AetherEngine, body: &str, at: f64) {
+        e.render_frame();
+        let mut c = unstuck_exact_engine(body);
+        c.handle_event(crate::api::events::Event::Scroll(0.0, at));
+        c.damage_rects.push((0, 0, 400, 600));
+        c.render_frame();
+        assert_eq!(e.scroll_y, at, "scrolled to {at}");
+        assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): 0 -> 10, no header stuck at either scroll: the damage is the exposed strip
+    /// alone (armed: SR1139 added header 0's hull (0, 88, 400, 54)), and the frame equals a full repaint.
+    #[test]
+    fn scroll_damage_unstuck_exact_none_stuck() {
+        let body = unstuck_exact_body("", "");
+        let mut e = unstuck_exact_engine(&body);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert_eq!(e.damage_rects, vec![(0, 590, 400, 10)], "the strip alone: every unstuck header moved with the blit (armed)");
+        unstuck_exact_matches_full(&mut e, &body, 10.0);
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): 895 -> 905, header 2 (flow y 900) sticks: the damage is the strip and ONE
+    /// hull of header 2's ghost (screen -7..37) and its new place (-2..42), clipped (0, 0, 400, 42); header 1 (held at its
+    /// section's bottom, page y 860 at both scrolls) adds nothing (armed: SR1139's hull of header 2 reached row 47).
+    #[test]
+    fn scroll_damage_unstuck_exact_becomes_stuck() {
+        let body = unstuck_exact_body("", "");
+        let mut e = unstuck_exact_engine(&body);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 895.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert_eq!(e.damage_rects, vec![(0, 590, 400, 10), (0, 0, 400, 42)], "the strip and header 2's ghost and new place (armed)");
+        unstuck_exact_matches_full(&mut e, &body, 905.0);
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): 910 -> 920, header 2 stuck at both ends: its rect (-2..42) and the strip
+    /// the blit dragged it to (-12..32): (0, 0, 400, 42), today's cost for that one box; the frame equals a full repaint.
+    #[test]
+    fn scroll_damage_unstuck_exact_stuck_both() {
+        let body = unstuck_exact_body("", "");
+        let mut e = unstuck_exact_engine(&body);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 910.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert_eq!(e.damage_rects, vec![(0, 590, 400, 10), (0, 0, 400, 42)], "the strip and header 2's rect with its dragged ghost");
+        unstuck_exact_matches_full(&mut e, &body, 920.0);
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): a translucent stuck header with a 70px child overflowing it: 910 -> 920
+    /// damages down to the child's ink (row 72), and the frame equals a full repaint (SR1139's pins hold).
+    #[test]
+    fn scroll_damage_unstuck_exact_translucent_overflow() {
+        let body = unstuck_exact_body(
+            "background-color:rgba(0, 0, 255, 0.5)",
+            r#"<div style="width:50px;height:70px;background-color:rgb(255, 0, 255)"></div>"#,
+        );
+        let mut e = unstuck_exact_engine(&body);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 910.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert!(!e.damage_rects.contains(&(0, 0, 400, 600)), "the blit is kept");
+        assert!(e.damage_rects.iter().any(|r| r.1 == 0 && r.1 + r.3 >= 72), "the damage holds the overflowing child ({:?})", e.damage_rects);
+        unstuck_exact_matches_full(&mut e, &body, 920.0);
+    }
+
+    /// AETHERSCROLLDAMAGEUNSTUCKEXACT (SR1162): SR1152's panel (`#h` sticky inside a 200px `overflow: auto` panel), the
+    /// panel scrolled 300 so `#h` holds at its top, then a +10 PAGE scroll with the pointer below the panel: the panel and
+    /// its stuck header moved with the blit (the scrollport does not depend on the viewport scroll), so the damage is the
+    /// strip alone; against a control scrolled the same way and repainted whole only the panel's scrollbar column differs.
+    #[test]
+    fn scroll_damage_unstuck_exact_nested_scroller() {
+        let page = |e: &mut crate::AetherEngine| {
+            sticky_nested_scroller_wheel(e, 300.0);
+            e.handle_event(crate::api::events::Event::MouseMove(10.0, 280.0));
+        };
+        let mut e = sticky_nested_scroller_panel();
+        page(&mut e);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        assert_eq!(e.damage_rects, vec![(0, 290, 400, 10)], "the strip alone: the stuck header rode the panel");
+        e.render_frame();
+        let mut c = sticky_nested_scroller_panel();
+        page(&mut c);
+        c.handle_event(crate::api::events::Event::Scroll(0.0, 10.0));
+        c.damage_rects.push((0, 0, 400, 300));
+        c.render_frame();
+        assert_eq!(e.scroll_y, 10.0, "the page scrolled");
+        // Owed AETHER-SCROLL-BLIT-NESTED-SCROLLER-PIXELS (trunk's, measured with SR1162's line disabled: the same pixels):
+        // the blitted frame differs from the full repaint ONLY in the panel's scrollbar column (thumb vs track rows).
+        let (a, b) = (e.surface(), c.surface());
+        let diff: Vec<(usize, usize)> = (0..300usize).flat_map(|y| (0..400usize).map(move |x| (x, y))).filter(|&(x, y)| { let i = (y * 400 + x) * 4; a[i..i + 3] != b[i..i + 3] }).collect();
+        let bb = diff.iter().fold((usize::MAX, usize::MAX, 0, 0), |m, &(x, y)| (m.0.min(x), m.1.min(y), m.2.max(x), m.3.max(y)));
+        assert_eq!((diff.len(), bb), (456, (392, 97, 397, 191)), "the mismatch is the panel's scrollbar column alone (owed AETHER-SCROLL-BLIT-NESTED-SCROLLER-PIXELS)");
     }
 }
