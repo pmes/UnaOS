@@ -39,7 +39,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 19. STRIALOUDNESSREADOUT — integrated loudness (ITU-R BS.1770 K-weighting + gating) for the export range on the message row (`loudness` verb); ONE pure fn in audio_core or timeline_core (name which).
 
 ## C. Video (nle.rs render + export)
-20. STRIACROP — per-clip crop (l / t / r / b in 1/1000 of the frame) applied in the render step before the size policy; verb `crop`; EDL `* UNA CROP`.
+20. [SR867 started] STRIACROP — per-clip crop (l / t / r / b in 1/1000 of the frame) applied in the render step before the size policy; verb `crop`; EDL `* UNA CROP`.
 21. [SR879 started] STRIAPOSITIONSCALE — per-clip position / scale (picture-in-picture): the render blits the scaled source into the frame at (x, y); verbs `pip` / `scale`; EDL `* UNA XFORM`.
 22. STRIAOPACITY — per-clip opacity for an upper video track over a lower one (measure `schedule`'s track priority and `vmix` first); EDL `* UNA ALPHA`.
 23. STRIACOLORLIFT — per-clip brightness / contrast / saturation (three i16 in 1/1000) as ONE per-pixel pass in the render step (RGBA); verb `color <b> <c> <s>`; EDL `* UNA COLOR`.

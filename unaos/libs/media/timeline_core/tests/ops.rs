@@ -237,3 +237,130 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIACROP (LEDGER SR867): the per-clip crop: geometry, the crop pass, the op, the word and the EDL line (named tail block) ----
+mod striacrop {
+    use super::base;
+    use timeline_core::edl::{self, EdlError};
+    use timeline_core::editor::EditorState;
+    use timeline_core::{Clip, Crop, EditError, SizePolicy, TransitionKind, crop_frame};
+
+    const C: Crop = Crop { l: 250, t: 0, r: 250, b: 0 };
+
+    #[test]
+    fn striacrop_rect_and_validity() {
+        let r = Crop { l: 100, t: 200, r: 300, b: 400 }.rect(1000, 500);
+        assert_eq!((r.x, r.y, r.w, r.h), (100, 100, 600, 200));
+        let r = Crop::NONE.rect(7, 3);
+        assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 7, 3));
+        let r = Crop { l: 999, t: 0, r: 0, b: 999 }.rect(4, 2);
+        assert_eq!((r.x, r.y, r.w, r.h), (3, 0, 1, 1), "at least one sample, inside the frame");
+        assert!(Crop { l: 499, t: 0, r: 500, b: 999 }.ok());
+        assert!(!Crop { l: 500, t: 0, r: 500, b: 0 }.ok());
+        assert!(!Crop { l: 0, t: 1000, r: 0, b: 0 }.ok());
+        assert_eq!(Crop::default(), Crop::NONE);
+        assert_eq!(Clip::new(timeline_core::SourceId(0), 0, 1, 0).crop, Crop::NONE);
+    }
+
+    #[test]
+    fn striacrop_crop_frame_by_policy() {
+        let px: Vec<u32> = (0..8).collect(); // 4 x 2: 0 1 2 3 / 4 5 6 7
+        let l = Crop { l: 500, t: 0, r: 0, b: 0 };
+        assert_eq!(crop_frame(&px, 4, 2, l, SizePolicy::Stretch, 99), vec![2, 2, 3, 3, 6, 6, 7, 7]);
+        assert_eq!(crop_frame(&px, 4, 2, l, SizePolicy::Letterbox, 99), vec![99, 2, 3, 99, 99, 6, 7, 99]);
+        assert_eq!(crop_frame(&px, 4, 2, l, SizePolicy::Adopt, 99), vec![99, 2, 3, 99, 99, 6, 7, 99], "Adopt places as Letterbox");
+        assert_eq!(crop_frame(&px, 4, 2, l, SizePolicy::Fill, 99), vec![2, 2, 3, 3, 2, 2, 3, 3]);
+        assert_eq!(crop_frame(&px, 4, 2, Crop::NONE, SizePolicy::Letterbox, 99), px, "no crop: the frame");
+        assert_eq!(crop_frame(&px, 4, 2, Crop { l: 0, t: 500, r: 0, b: 0 }, SizePolicy::Stretch, 99), vec![4, 5, 6, 7, 4, 5, 6, 7]);
+        assert_eq!(crop_frame(&px[..5], 4, 2, l, SizePolicy::Stretch, 99), px[..5].to_vec(), "a short frame comes back as it was");
+    }
+
+    #[test]
+    fn striacrop_set_crop_and_refusals() {
+        let (tl, _, _) = base();
+        let t2 = tl.set_crop(0, 1, C).unwrap();
+        assert_eq!(t2.tracks[0].clips[1].crop, C);
+        assert_eq!(t2.tracks[0].clips[0].crop, Crop::NONE);
+        assert_eq!(tl.tracks[0].clips[1].crop, Crop::NONE, "pure");
+        assert_eq!(tl.set_crop(0, 1, Crop { l: 500, t: 0, r: 500, b: 0 }), Err(EditError::Crop));
+        assert_eq!(tl.set_crop(0, 9, C), Err(EditError::NoClip));
+        assert_eq!(tl.set_crop(9, 0, C), Err(EditError::NoTrack));
+        assert_eq!(tl.set_crop(1, 0, C), Err(EditError::Kind));
+        assert_eq!(EditError::Crop.to_string(), "crop is l t r b in 1/1000 with l + r and t + b under 1000");
+        let s = t2.split(0, 15).unwrap();
+        assert_eq!((s.tracks[0].clips[1].crop, s.tracks[0].clips[2].crop), (C, C), "both halves keep the crop");
+        let m = t2.move_clip(0, 1, 0, 40).unwrap();
+        assert_eq!(m.tracks[0].clips[1].crop, C);
+    }
+
+    #[test]
+    fn striacrop_crop_at_incoming_and_outgoing() {
+        let (tl, _, _) = base();
+        let tl = tl.set_crop(0, 0, C).unwrap().add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        assert_eq!(tl.crop_at(0, 5, false), C);
+        assert_eq!(tl.crop_at(0, 11, false), Crop::NONE, "the incoming B");
+        assert_eq!(tl.crop_at(0, 11, true), C, "the transition's outgoing A");
+        assert_eq!(tl.crop_at(0, 14, true), Crop::NONE, "past the transition");
+        assert_eq!(tl.crop_at(7, 5, false), Crop::NONE);
+    }
+
+    #[test]
+    fn striacrop_verb_one_undo_step() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("crop 250 0 250 0"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("crop 250 0 250 0"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.crop)), (1, Some(C)));
+        assert_eq!(st.verb("crop 250 0 250 0"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same crop commits nothing");
+        for bad in ["crop", "crop 1 2 3", "crop 1 2 3 4 5", "crop a 0 0 0", "crop -1 0 0 0", "crop 600 0 400 0"] {
+            assert_eq!(st.verb(bad), Some(Err(EditError::Crop)), "{bad}");
+        }
+        assert_eq!(st.undo_depth(), 1);
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl);
+        assert!(st.redo());
+        assert_eq!(st.selected().map(|c| c.crop), Some(C));
+        assert_eq!(st.verb("crop 0 0 0 0"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.crop)), (2, Some(Crop::NONE)));
+        assert_eq!(st.verb("cropx"), None, "not a crop word");
+    }
+
+    #[test]
+    fn striacrop_edl_round_trip() {
+        let (tl, _, _) = base();
+        let plain = edl::write(&tl, "T").unwrap();
+        assert!(!plain.contains("UNA CROP"));
+        let t2 = tl.set_crop(0, 1, Crop { l: 1, t: 2, r: 3, b: 4 }).unwrap();
+        let text = edl::write(&t2, "T").unwrap();
+        assert!(text.contains("\n* UNA CROP 1 2 3 4\n"), "{text}");
+        assert_eq!(text.replace("* UNA CROP 1 2 3 4\n", ""), plain, "the one added line");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back.tracks[0].clips[1].crop, Crop { l: 1, t: 2, r: 3, b: 4 });
+        assert_eq!(edl::write(&back, "T").unwrap(), text);
+        assert_eq!(edl::parse(&plain, 25).unwrap().tracks[0].clips[1].crop, Crop::NONE);
+    }
+
+    #[test]
+    fn striacrop_edl_refusals() {
+        const V: &str = "001  A        V     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        const A: &str = "002  A        A     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        const BL: &str = "001  BL       V     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        let h = "FCM: NON-DROP FRAME\n";
+        let ok = format!("{h}{V}* UNA CROP 10 20 30 40\n");
+        assert_eq!(edl::parse(&ok, 25).unwrap().tracks[0].clips[0].crop, Crop { l: 10, t: 20, r: 30, b: 40 });
+        for (text, line) in [
+            (format!("{h}* UNA CROP 1 2 3 4\n{V}"), 2),
+            (format!("{h}{V}{A}* UNA CROP 1 2 3 4\n"), 4),
+            (format!("{h}{BL}* UNA CROP 1 2 3 4\n"), 3),
+            (format!("{h}{V}* UNA CROP 1 2 3\n"), 3),
+            (format!("{h}{V}* UNA CROP 1 2 3 x\n"), 3),
+            (format!("{h}{V}* UNA CROP 600 0 400 0\n"), 3),
+            (format!("{h}{V}* UNA CROP 0 0 0 0\n"), 3),
+            (format!("{h}{V}* UNA CROP 1 2 3 4\n* UNA CROP 1 2 3 4\n"), 4),
+        ] {
+            assert_eq!(edl::parse(&text, 25).map(|_| ()), Err(EdlError::Syntax { line }), "{text}");
+        }
+    }
+}

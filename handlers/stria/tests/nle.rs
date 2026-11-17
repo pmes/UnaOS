@@ -3648,3 +3648,54 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIACROP (LEDGER SR867): the render's crop pass (named tail block) ----
+
+/// STRIACROP (SR867): the preview (THE frame road: `render` of one tick) of a cropped clip is timeline_core's ONE
+/// `crop_frame` of the uncropped frame, placed by the reel's policy (Letterbox: FIELD bars at the left edge); a clip with no
+/// crop renders the same bytes as before the crop existed; `undo` restores those bytes exactly.
+#[test]
+fn striacrop_render_crops_the_frame() {
+    use stria::nle_face::preview;
+    let (tl, src) = synth_fixture();
+    let plain = preview(&tl, &src, 12).unwrap().expect("a frame at tick 12");
+    let none = tl.set_crop(0, 1, timeline_core::Crop::NONE).unwrap();
+    assert_eq!(none, tl, "Crop::NONE is no edit");
+    let crop = timeline_core::Crop { l: 250, t: 0, r: 250, b: 0 };
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("crop 250 0 250 0"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.undo_depth(), 1);
+    let (_, src) = synth_fixture();
+    let cut = preview(&face.state.timeline, &src, 12).unwrap().expect("a cropped frame");
+    assert_eq!((cut.width, cut.height), (plain.width, plain.height));
+    let (w, h) = (plain.width as usize, plain.height as usize);
+    let want = timeline_core::crop_frame(plain.rgba.as_chunks::<4>().0, w, h, crop, SizePolicy::Letterbox, timeline_core::view::FIELD).into_flattened();
+    assert_eq!(cut.rgba, want, "the one crop pass over the frame the step held");
+    assert_ne!(cut.rgba, plain.rgba);
+    assert_eq!(&cut.rgba[..4], &timeline_core::view::FIELD, "the letterbox bar at the left edge");
+    let other = preview(&face.state.timeline, &src, 3).unwrap().expect("tick 3: clip 0, no crop");
+    let (_, src2) = synth_fixture();
+    assert_eq!(other.rgba, preview(&tl, &src2, 3).unwrap().unwrap().rgba, "an uncropped clip: the same bytes");
+    assert!(face.verb("undo"));
+    let back = preview(&face.state.timeline, &src2, 12).unwrap().unwrap();
+    assert_eq!(back.rgba, plain.rgba, "undo restores the exact bytes");
+    println!("striacrop: tick 12 {w}x{h} cropped 250/0/250/0 -> letterboxed, undo restores");
+}
+
+/// STRIACROP (SR867): a crop keeping no picture is refused by name on the face's message row, no undo step.
+#[test]
+fn striacrop_face_refusal_on_the_message_row() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("crop 100 0 100 0"));
+    assert_eq!(face.last_error.take(), Some(format!("crop 100 0 100 0: {}", EditError::NoClip)));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("crop 900 0 200 0"));
+    assert_eq!(face.last_error.take(), Some(format!("crop 900 0 200 0: {}", EditError::Crop)));
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("crop 100 0 100 0"));
+    assert_eq!(face.last_error.take(), Some(format!("crop 100 0 100 0: {}", EditError::Kind)));
+    assert_eq!(face.state.undo_depth(), 0);
+}
