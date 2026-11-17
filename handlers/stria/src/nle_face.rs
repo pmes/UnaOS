@@ -51,7 +51,7 @@ pub use timeline_core::editor::{Edge, EditorState, UNDO_MAX, ZOOM_DEFAULT, ZOOM_
 
 /// NLE6KEYS (rmbp-ledger B961): the geometry ([`Layout`], [`Hit`], [`Role`]) and the painter are timeline_core's
 /// (`timeline_core::view`), the ONE view the kernel Player's EDL band paints too; re-exported so every `nle_face::` path stands.
-pub use timeline_core::view::{Drag, DragKind, HANDLE_W, Hit, Layout, MARQUEE_MIN, ROW_H, RULER_H, Role, SNAP_PX, Still, THUMB_H, THUMB_W, TRANS_H, TRANS_MIN_W, fnv1a, snap_targets, snap_to, transition_mid}; // NLE6FACEDRAG (rmbp-ledger B975): the drag model moved to timeline_core::view, both faces call it
+pub use timeline_core::view::{Drag, DragKind, DragShown, HANDLE_W, Hit, Layout, MARQUEE_MIN, ROW_H, RULER_H, Role, SNAP_PX, Still, THUMB_H, THUMB_W, TRANS_H, TRANS_MIN_W, fnv1a, snap_targets, snap_to, transition_mid}; // NLE6FACEDRAG (rmbp-ledger B975): the drag model moved to timeline_core::view, both faces call it
 use timeline_core::view::{self, Canvas, FIELD, Order, TRANS};
 #[cfg(test)]
 use timeline_core::view::{GUIDE, HANDLE, PLAYHEAD, ROW, SELECT, TRANS_FILL, clip_colour};
@@ -169,6 +169,7 @@ pub struct Face {
     /// The shuttle rate in frames per clock tick (J/K/L; 1 for play).
     pub rate: i64,
     drag: Option<Drag>,
+    drag_shown: DragShown, // STRIAPERFDRAGSHOWN (SR936): the drag preview, replayed only when the drag or its state changes
     pointer: Option<(f64, f64)>,
     /// The surface sends `BrowserButton` (its release then stands for `BrowserClick`).
     buttons: bool,
@@ -200,7 +201,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -1588,8 +1589,8 @@ impl Face {
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
-        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
-        let st = shown.as_ref().unwrap_or(&self.state);
+        let shown = self.drag_shown.get(self.drag.as_ref(), &self.state); // STRIAPERFDRAGSHOWN (SR936): the drag preview replayed only when the drag or the state it reads changes (timeline_core view.rs tail)
+        let st = shown.as_deref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
@@ -3095,5 +3096,18 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+// ---- STRIAPERFDRAGSHOWN (LEDGER SR936): the drag preview kept across paints (named tail block) ----
+
+impl Face {
+    /// STRIAPERFDRAGSHOWN (SR936): how many times a paint replayed the live drag ([`Drag::shown`] through timeline_core's
+    /// [`DragShown`]); paints between two pointer moves reuse the one replay.
+    pub fn drag_replays(&self) -> u64 {
+        self.drag_shown.replays
+    }
+    /// STRIAPERFDRAGSHOWN (SR936): forget the kept drag preview, so the next paint replays it (the byte-identity witness).
+    pub fn drag_shown_reset(&mut self) {
+        self.drag_shown.clear();
     }
 }

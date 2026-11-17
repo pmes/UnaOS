@@ -3648,3 +3648,63 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIAPERFDRAGSHOWN (LEDGER SR936): the drag preview kept across paints (named tail block) ----
+
+/// Rule: a live drag replays its preview (`Drag::shown`) once per pointer position: three paints after one move are one
+/// replay, a second move is the second, and after the release a paint replays nothing.
+#[test]
+fn striaperfdragshown_paints_replay_once_until_the_pointer_moves() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    assert_eq!(face.drag_replays(), 0, "no paint yet");
+    for _ in 0..3 {
+        let _ = face.paint();
+    }
+    assert_eq!(face.drag_replays(), 1, "three paints, one replay");
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 48.0, y, 0));
+    let _ = face.paint();
+    assert_eq!(face.drag_replays(), 2, "the pointer moved");
+    face.on(&nle3eslipdrag_btn(false, x + 48.0, y, bandy::MOD_CONTROL));
+    assert!(face.dragging().is_none());
+    let _ = face.paint();
+    assert_eq!(face.drag_replays(), 2, "no drag, no replay");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striaperfdragshown: 3 paints after one move = 1 replay, 2 moves = 2");
+}
+
+/// Rule: the kept preview paints the same bytes as a fresh replay: a miss, a hit, and a paint after the reset agree.
+#[test]
+fn striaperfdragshown_cached_paint_is_byte_identical() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_CONTROL));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 0));
+    assert!(face.dragging().and_then(|d| d.shown(&face.state)).is_some(), "the slip previews");
+    let p1 = face.paint();
+    let p2 = face.paint();
+    face.drag_shown_reset();
+    let p3 = face.paint();
+    assert_eq!(face.drag_replays(), 2, "the miss and the replay after the reset");
+    assert!(p1 == p2, "the hit paints the miss's bytes");
+    assert!(p2 == p3, "the hit paints a fresh replay's bytes");
+    println!("striaperfdragshown: {} bytes, miss == hit == fresh", p1.len());
+}
+
+/// Rule: a split face's repaint (Preview then Tracks) pays ONE replay of the live drag, not one per Surface.
+#[test]
+fn striaperfdragshown_split_pays_one_replay_per_repaint() {
+    let (tl, src) = synth_fixture();
+    let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1);
+    f.state.select(0, 1).unwrap();
+    f.on(&bandy::SMessage::BrowserButton { down: true, x: 81.0, y: 36.0, mods: 0, surface: 1 });
+    f.on(&bandy::SMessage::BrowserMouseMove(105.0, 36.0, 1));
+    assert!(f.dragging().is_some(), "the press on the tracks Surface began a drag");
+    assert_eq!(f.frames().len(), 2);
+    assert_eq!(f.drag_replays(), 1, "two Surfaces, one replay");
+    let _ = f.frames();
+    assert_eq!(f.drag_replays(), 1, "a repaint with the pointer still: none");
+    println!("striaperfdragshown: split repaint x2 = 1 replay");
+}
