@@ -3089,3 +3089,37 @@ mod striafreezelen_tests {
         assert_eq!(st.undo_depth(), 0, "a refusal pushes no undo step");
     }
 }
+
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): close-gaps on every track, all-or-nothing (named tail block) ----
+// `close_gaps_all` chains SR857's ONE `close_gaps` (with SR909's black rule) over every track in a value built aside: the
+// first track that refuses refuses the whole word, named by its index. A derived audio crossfade pairs by tick and source
+// with a video transition on ANOTHER track, so tracks closed independently can lose a pairing that `validate` does not
+// see (a wrong sound): an audio track ending with fewer derived crossfades than it had is refused by name (`Transition`).
+// Each step validates its half-closed value (a coincidental mid-chain pairing can refuse: owed NLE-GAPS-ALL-ORDER).
+impl Timeline {
+    /// STRIAGAPSALLTRACKS: close every gap on every track (each the leading one included). Refused: `(track, why)` for the
+    /// first track `close_gaps` refuses, or an audio track that would lose a crossfade paired with a video transition.
+    pub fn close_gaps_all(&self) -> Result<Timeline, (usize, EditError)> {
+        let mut tl = self.clone();
+        for t in 0..tl.tracks.len() {
+            tl = tl.close_gaps(t).map_err(|e| (t, e))?;
+        }
+        for t in 0..tl.tracks.len() {
+            if tl.paired_xfades(t) < self.paired_xfades(t) {
+                return Err((t, EditError::Transition));
+            }
+        }
+        Ok(tl)
+    }
+
+    /// STRIAGAPSALLTRACKS: how many gaps [`Timeline::close_gaps_all`] would close (every track's [`Timeline::gap_count`]).
+    pub fn gap_count_all(&self) -> usize {
+        (0..self.tracks.len()).map(|t| self.gap_count(t)).sum()
+    }
+
+    /// The derived (video-paired) audio crossfades on `track`'s cuts ([`Timeline::audio_crossfade`]); 0 on a video track.
+    fn paired_xfades(&self, track: usize) -> usize {
+        let n = self.tracks.get(track).map_or(0, |t| t.clips.len());
+        (0..n).filter(|&ci| self.audio_crossfade(track, ci).is_some()).count()
+    }
+}

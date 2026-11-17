@@ -2379,3 +2379,76 @@ fn strialinkautofuzz_link_av_word() {
     assert!(st.undo());
     assert_eq!(st.timeline, tl, "one undo step parts both pairs");
 }
+
+// ---- STRIAGAPSALLTRACKS (LEDGER SR929): close-gaps on every track, all-or-nothing (named tail block) ----
+
+/// SR857's base: V1 A@5|B@15|A@30 with a dissolve at 15, A1 A@0|B@20|A@30 with an explicit xfade at 30. Closing every track is
+/// the per-track close chained; every gap goes; A1's cut at 10 now pairs with V1's moved dissolve (a GAINED derived crossfade,
+/// its handle fits) and the explicit xfade moves with its own track to 20.
+#[test]
+fn striagapsalltracks_closes_every_track() {
+    let (tl, _, _) = striagapclose_base();
+    let c = tl.close_gaps_all().unwrap();
+    assert_eq!(c, tl.close_gaps(0).unwrap().close_gaps(1).unwrap());
+    assert_eq!((c.gap_count(0), c.gap_count(1), c.gap_count_all(), tl.gap_count_all()), (0, 0, 0, tl.gap_count(0) + tl.gap_count(1)));
+    assert_eq!(c.audio_crossfade(1, 1).map(|x| (x.at, x.dur)), Some((10, 3)));
+    assert_eq!(c.audio_xfades[0].at, 20);
+    assert_eq!(c.validate(), Ok(()));
+    assert_eq!(c.close_gaps_all().unwrap(), c);
+}
+
+/// A track that refuses refuses the whole word, named by its index: A1's B closing onto A[90,100) pairs with V1's dissolve at
+/// 10, and A's handle is 0 (`Handle`).
+#[test]
+fn striagapsalltracks_refuses_the_whole_word_by_track() {
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    k.tracks[1].clips = vec![Clip::new(a, 90, 100, 0), Clip::new(b, 0, 10, 15)];
+    let k = k.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(k.close_gaps_all(), Err((1, EditError::Handle)));
+}
+
+/// A derived crossfade LOST by closing tracks differently is refused by name: V1 A@5|B@15 dissolve at 15 pairs with A1's cut
+/// at 15 (A[0,15)@0|B@15, no gap); V1's close moves the dissolve to 10 and A1's cut stays at 15 (`Transition`, track 1).
+#[test]
+fn striagapsalltracks_refuses_a_lost_pairing() {
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 5), Clip::new(b, 0, 10, 15)];
+    k.tracks[1].clips = vec![Clip::new(a, 0, 15, 0), Clip::new(b, 0, 10, 15)];
+    let k = k.add_transition(0, 15, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert!(k.audio_crossfade(1, 1).is_some());
+    assert!(k.close_gaps(0).is_ok());
+    assert_eq!(k.close_gaps_all(), Err((1, EditError::Transition)));
+}
+
+/// `close-gaps all` through THE verb dispatch: no selection needed, one commit, a second is an equal value (nothing), undo
+/// restores; a refusal commits nothing; a third word is not this verb.
+#[test]
+fn striagapsalltracks_editor_one_undo_step() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = striagapclose_base();
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("close-gaps all"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.close_gaps_all().unwrap(), 1));
+    assert_eq!(st.verb("close-gaps all"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1);
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    assert_eq!(st.verb("close-gaps all x"), None);
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    k.tracks[1].clips = vec![Clip::new(a, 90, 100, 0), Clip::new(b, 0, 10, 15)];
+    let k = k.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let mut st = EditorState::new(k.clone());
+    assert_eq!(st.verb("close-gaps all"), Some(Err(EditError::Handle)));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (k, 0));
+}
