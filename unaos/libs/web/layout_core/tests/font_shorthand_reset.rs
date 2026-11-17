@@ -137,7 +137,7 @@ fn font_inherit_clears_the_block() {
     assert_eq!(s.paint.line_height, None, "line-height inherits");
     assert_eq!(s.paint.family, None, "font-family inherits");
     assert_eq!(s.paint.font_size, None, "no absolute size survives");
-    assert_eq!(s.paint.font_size_rel, Some((0, 1.0)), "the size is 1 x the parent's (a control's default does not apply)");
+    assert_eq!(s.paint.font_size_rel, None, "no relative mark: the size bit (SR815) takes the parent's, not a control's default"); assert_eq!(s.paint.inherit, layout_core::paint::INHERIT_FONT, "SR815: the seven explicit inherit bits");
 }
 
 #[test]
@@ -174,4 +174,101 @@ fn font_inherit_replay_keeps_line_height_inherited() {
     let spec: SpecifiedStyle<TH> = reapply_declarations(&list, &cx);
     merge_paint(&mut s.paint, &spec.paint);
     assert_eq!(s.paint.line_height, None, "the font-relative replay does not bring line-height 1.5em back");
+}
+
+// ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): the explicit inherit bit per font field (named tail block) ----
+
+use layout_core::paint::{INHERIT_FAMILY, INHERIT_FONT, INHERIT_FONT_SIZE, INHERIT_ITALIC, INHERIT_LINE_HEIGHT, INHERIT_SMALL_CAPS, INHERIT_STRETCH, INHERIT_WEIGHT};
+
+/// AETHERCSSWIDELONGHANDS (SR815): each font longhand with the bit its explicit inherit sets.
+const LONGHAND_BITS: [(&str, &str, u32); 7] = [
+    ("font-style", "italic", INHERIT_ITALIC),
+    ("font-weight", "bold", INHERIT_WEIGHT),
+    ("font-stretch", "condensed", INHERIT_STRETCH),
+    ("font-variant-caps", "small-caps", INHERIT_SMALL_CAPS),
+    ("font-size", "20px", INHERIT_FONT_SIZE),
+    ("line-height", "3", INHERIT_LINE_HEIGHT),
+    ("font-family", "serif", INHERIT_FAMILY),
+];
+
+/// AETHERCSSWIDELONGHANDS (SR815): a longhand's `inherit` / `unset` (any case) clears its earlier value and sets its
+/// bit; a later value in the same block beats the bit; `font-variant: inherit` sets the caps bit.
+#[test]
+fn css_wide_longhand_sets_its_bit() {
+    for (prop, value, bit) in LONGHAND_BITS {
+        for kw in ["inherit", "unset", "INHERIT"] {
+            let s = styled(&[(prop, value), (prop, kw)]);
+            assert_eq!(s.paint.inherit, bit, "{prop}: {kw} sets its bit");
+            assert_eq!(s.paint.valued() & bit, 0, "{prop}: {kw} clears the earlier value");
+            assert!(s.paint.inherits(bit), "{prop}: {kw} inherits");
+        }
+        let s = styled(&[(prop, "inherit"), (prop, value)]);
+        assert!(!s.paint.inherits(bit), "{prop}: a later value beats the bit");
+        assert_ne!(s.paint.valued() & bit, 0, "{prop}: the later value stands");
+    }
+    let s = styled(&[("font-variant", "small-caps"), ("font-variant", "inherit")]);
+    assert!(s.paint.inherits(INHERIT_SMALL_CAPS) && s.paint.small_caps.is_none(), "font-variant: inherit reaches its caps half");
+    let s = styled(&[("color", "inherit")]);
+    assert_eq!(s.paint.inherit, 0, "color is not a font field (AETHER-CSS-WIDE-COLOR owed)");
+}
+
+/// AETHERCSSWIDELONGHANDS (SR815): across rules, a later rule's explicit inherit clears the earlier rule's value (the
+/// cascade's "later declaration wins"), for each of the seven fields.
+#[test]
+fn merge_paint_inherit_beats_earlier_rule() {
+    for (prop, value, bit) in LONGHAND_BITS {
+        let mut dst = styled(&[(prop, value)]);
+        assert_ne!(dst.paint.valued() & bit, 0, "{prop}: the earlier rule's value (armed)");
+        let later = styled(&[(prop, "inherit")]);
+        merge_paint(&mut dst.paint, &later.paint);
+        assert!(dst.paint.inherits(bit), "{prop}: the later inherit wins");
+        assert_eq!(dst.paint.valued() & bit, 0, "{prop}: the earlier value is gone");
+    }
+}
+
+/// AETHERCSSWIDELONGHANDS (SR815): a later rule's value clears the earlier rule's bit; a later rule that says nothing
+/// about the field keeps it; a rule carrying inherit then a value (same block) does not carry the bit.
+#[test]
+fn merge_paint_later_value_clears_bit() {
+    let mut dst = styled(&[("font-style", "inherit"), ("font-size", "inherit")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "red")]).paint);
+    assert_eq!(dst.paint.inherit, INHERIT_ITALIC | INHERIT_FONT_SIZE, "an unrelated later rule keeps the bits");
+    merge_paint(&mut dst.paint, &styled(&[("font-style", "normal")]).paint);
+    assert_eq!(dst.paint.italic, Some(false));
+    assert_eq!(dst.paint.inherit, INHERIT_FONT_SIZE, "the later value cleared the style bit only");
+    merge_paint(&mut dst.paint, &styled(&[("font-size", "inherit"), ("font-size", "2em")]).paint);
+    assert_eq!(dst.paint.inherit, 0, "inherit then a value in one block: the value wins across the merge");
+    assert_eq!(dst.paint.font_size_rel, Some((0, 2.0)));
+}
+
+/// AETHERCSSWIDELONGHANDS (SR815): `font: inherit` / `font: unset` set the seven bits and beat an earlier rule's
+/// longhands; `font: initial` writes values (SR805), no bits.
+#[test]
+fn font_inherit_sets_seven_bits() {
+    for kw in ["inherit", "unset"] {
+        let mut dst = styled(&FONT_ALL);
+        merge_paint(&mut dst.paint, &styled(&[("font", kw)]).paint);
+        assert_eq!(dst.paint.inherit, INHERIT_FONT, "font: {kw}");
+        for (_, _, bit) in LONGHAND_BITS {
+            assert!(dst.paint.inherits(bit), "font: {kw} inherits bit {bit}");
+        }
+    }
+    let s = font_wide("initial");
+    assert_eq!(s.paint.valued(), INHERIT_FONT, "font: initial writes every field");
+    assert!(!(0..7).any(|b| s.paint.inherits(1 << b)), "font: initial inherits nothing");
+}
+
+/// AETHERCSSWIDELONGHANDS (SR815): the font-relative replay keeps line-height's explicit inherit across a merge onto
+/// an earlier rule's line-height (the replayed entry is `inherit`).
+#[test]
+fn font_inherit_replay_keeps_bit() {
+    let mut s = styled(&[("line-height", "1.5em"), ("padding", "1em")]);
+    merge_paint(&mut s.paint, &styled(&[("font", "inherit")]).paint);
+    let list = s.paint.font_rel.clone().expect("length declarations kept");
+    assert!(list.iter().any(|(p, v)| p == "line-height" && v == "inherit"), "the later entry replaced the earlier: {list:?}");
+    let cx = ParseCx::default();
+    let spec: SpecifiedStyle<TH> = reapply_declarations(&list, &cx);
+    merge_paint(&mut s.paint, &spec.paint);
+    assert!(s.paint.inherits(INHERIT_LINE_HEIGHT), "the replay keeps line-height inherited");
+    assert_eq!(s.paint.line_height, None);
 }
