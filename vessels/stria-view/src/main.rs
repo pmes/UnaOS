@@ -544,6 +544,7 @@ fn transport() -> TetraNode {
         button("paste-insert", "Paste Insert"), button("paste-over", "Paste Over"), // STRIAPASTEINSERT (SR896): the clipboard laid at the playhead rippling the track / carving what is there
         button("snap", "Snap"), // STRIASNAPTOGGLE (SR892): the drag snap default on / off (THE `snap` word)
         button("bright-", "Bright -"), button("bright+", "Bright +"), button("contrast-", "Contrast -"), button("contrast+", "Contrast +"), button("sat-", "Sat -"), button("sat+", "Sat +"), // STRIAGRADEFACE (SR899): step the selected clip's grade (timeline_core's words)
+        button("normalize", "Normalize"), // STRIANORMALIZE (SR878): the selected audio clip's gain to its exact peak at -1 dBFS
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }

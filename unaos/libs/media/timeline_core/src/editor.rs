@@ -757,7 +757,7 @@ impl EditorState {
 
 /// A gain word in dB (`-3`, `2.5`) as centi-dB, rounded half away from zero; `None` for a word that is not a finite
 /// number. The cast saturates, so an absurd value is refused by `validate`'s `EditError::Gain`.
-fn cdb_of(s: &str) -> Option<i32> {
+pub fn cdb_of(s: &str) -> Option<i32> {
     let db = s.parse::<f64>().ok().filter(|x| x.is_finite())?;
     let v = db * 100.0;
     Some((if v < 0.0 { v - 0.5 } else { v + 0.5 }) as i32)
