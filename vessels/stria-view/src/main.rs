@@ -194,7 +194,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo" | "target"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo" | "target" | "pan-key"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
         [w @ ("insert" | "overwrite" | "insert-all"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
@@ -582,6 +582,7 @@ fn transport() -> TetraNode {
         button("ripple-all", "Ripple All"), // STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (a Shift-drag on a clip edge ripples every track)
         button("rspeed", "Ripple Speed"), // STRIACLIPSPEEDTHREE (SR9031): the selected clip 1x -> 2x -> 4x -> 1x with the rest of its track following (THE `rspeed` verb)
         button("headers", "Hdr"), button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
+        button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -3343,5 +3344,29 @@ mod striasourceviewer_tests {
         assert!(drive(&mut plain, "source:B,src-next").is_empty());
         assert_eq!(source_json(&plain), r#","source":{"reel":"B","at":1,"in":null,"out":null}"#);
         println!("striasourceviewer witness: --split --bin --do binload:1,src-next,src-in,src-next,src-next,src-out,ruler:15,insert -> B 1..3 at 15 on V1 + A1, undo 1");
+    }
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the pan point words on the witness (named tail block) ----
+#[cfg(test)]
+mod striapanautomation_tests {
+    use super::*;
+
+    /// `at:12:1,pan-key:-0.5` sets a pan point on the selected audio clip at the playhead (-64, no error line); `pan-unkey`
+    /// clears it; each is one undo step.
+    #[test]
+    fn striapanautomation_do_tokens_set_and_clear_a_point() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let lines = drive(&mut face, "at:12:1,pan-key:-0.5");
+        assert!(lines.is_empty(), "{lines:?}");
+        let c = face.state.selected().expect("a clip is selected");
+        assert_eq!((c.pan_keys.n, c.pan_at(12)), (1, -64));
+        let depth = face.state.undo_depth();
+        let lines = drive(&mut face, "pan-unkey");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(face.state.selected().map(|c| c.pan_keys.n), Some(0));
+        assert_eq!(face.state.undo_depth(), depth + 1);
+        println!("striapanautomation witness: pan-key -0.5 then pan-unkey");
     }
 }

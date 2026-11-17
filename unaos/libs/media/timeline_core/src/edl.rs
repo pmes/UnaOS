@@ -210,7 +210,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; group_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; pan_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") { // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail) // STRIAPAN (SR861): the `* UNA PAN` line (file tail)
+            xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; group_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; pan_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; pankeys_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") { // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail) // STRIAPAN (SR861): the `* UNA PAN` line (file tail)
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             marker_comment(l, fps, line, &mut tl)?; marker_style_comment(l, fps, line, &mut tl)?; alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; grade_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; alpha_keys_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") { // STRIACOLORLIFT (SR869): `* UNA COLOR` (file tail) // STRIAMARKERJUMPKEYSNEXT (SR984): `* UNA MCOLOUR` / `* UNA MRANGE` (file tail)
@@ -447,7 +447,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(&grade_line(c)); s.push_str(&pan_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&alpha_keys_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail); STRIAPAN (SR861): `* UNA PAN` (file tail); STRIAOPACITYKEYS (SR9048): `* UNA ALPHAKEYS` (file tail)
+        s.push_str(&grade_line(c)); s.push_str(&pan_line(c)); s.push_str(&pankeys_line(c, fps)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&alpha_keys_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail); STRIAPAN (SR861): `* UNA PAN` (file tail); STRIAOPACITYKEYS (SR9048): `* UNA ALPHAKEYS` (file tail)
     }
     Ok(drop_write(s, tl)) // STRIATCTHREE (SR9030): an NTSC 30 / 60 timeline's labels become drop-frame (file tail)
 }
@@ -1726,4 +1726,41 @@ fn alpha_keys_line(c: &Clip) -> String {
     }
     let pairs: Vec<String> = c.opacity_keys.iter().map(|(t, p)| format!("{t}:{p}")).collect();
     format!("* UNA ALPHAKEYS {}\n", pairs.join(" "))
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the `* UNA PANKEYS` line (named tail block) ----
+// `* UNA PANKEYS <tc>=<cq8> ...` is the event's [`crate::PanKeys`]: every point, its SOURCE tick as timecode and its pan
+// as an integer, in tick order; written only when the clip has points (after `* UNA PAN`), read onto the event line just
+// above it. `* UNA PAN ` (with its space) never matches this line.
+
+/// STRIAPANAUTOMATION: a `* UNA PANKEYS` line applied to the event above it; any other line is not this one (`Ok`). No
+/// event above, an empty list, a token not `<tc>=<i8>`, ticks not strictly rising, or more than [`crate::PAN_KEYS_MAX`]
+/// points: `Syntax` (a bad timecode is its own `Timecode` / `DropFrame`).
+fn pankeys_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA PANKEYS ") else { return Ok(()) };
+    let clip = clip.ok_or(EdlError::Syntax { line })?;
+    let mut k = crate::PanKeys::EMPTY;
+    for w in r.split_whitespace() {
+        let (tc, p) = w.split_once('=').ok_or(EdlError::Syntax { line })?;
+        let s = parse_tc(tc, fps, line)?;
+        let p: i8 = p.parse().map_err(|_| EdlError::Syntax { line })?;
+        if k.points().last().is_some_and(|q| q.0 >= s) {
+            return Err(EdlError::Syntax { line });
+        }
+        k = k.with(s, p).ok_or(EdlError::Syntax { line })?;
+    }
+    if k.n == 0 {
+        return Err(EdlError::Syntax { line });
+    }
+    clip.pan_keys = k;
+    Ok(())
+}
+
+/// STRIAPANAUTOMATION: the `* UNA PANKEYS` line of clip `c` (empty when it has no points).
+fn pankeys_line(c: &Clip, fps: u32) -> String {
+    if c.pan_keys.n == 0 {
+        return String::new();
+    }
+    let w: Vec<String> = c.pan_keys.points().iter().map(|&(s, p)| format!("{}={}", timecode(s, fps), p)).collect();
+    format!("* UNA PANKEYS {}\n", w.join(" "))
 }

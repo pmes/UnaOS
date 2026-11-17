@@ -195,6 +195,7 @@ pub struct Layer {
     /// The clip's gain plus its track's ([`Timeline::heard_cdb`], STRIATRACKGAIN SR864), centi-dB.
     pub gain_cdb: i32,
     pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan (Stria's mix_into and the kernel Player's snd apply [`pan_mix_q16`], STRIAKPAN SR9015)
+    pub pan_to: i8, // STRIAPANAUTOMATION (LEDGER SR9050): the pan at the run's END edge (`pan_cq8` is the pan at its first tick; equal without pan points)
     /// The fade envelope (Q16, [`ENV_ONE`] = full) at the run's first tick and at its end edge; linear between.
     pub env: [u32; 2],
 }
@@ -248,9 +249,9 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
     let mut out = Vec::new();
     let mut t = range.start;
     while t < range.end {
-        let here = key(t);
+        let here = key(t); let phere = pan_piece(tl, &tracks, t); // STRIAPANAUTOMATION (SR9050): an automated clip's pan splits runs too (file tail)
         let mut end = t + 1;
-        while end < range.end && key(end) == here {
+        while end < range.end && key(end) == here && pan_piece(tl, &tracks, end) == phere {
             end += 1;
         }
         let mut layers = Vec::new();
@@ -276,7 +277,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                     let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, c.src_at(end))); // STRIACLIPSPEED (SR829): where the run's source ends at the clip's rate (1x: src_t + (end - t))
-                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), pan_cq8: c.pan_cq8, env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), pan_cq8: c.pan_at(t), pan_to: c.pan_at(end), env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
                 }
                 None => (next[ti], xnext[ti]) = (None, None),
             }
@@ -383,7 +384,7 @@ fn under_layer(
     *xnext = Some((o.src, o.src_at(end))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + (end - t))
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_cq8, env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_at(t), pan_to: o.pan_at(end), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
@@ -645,4 +646,21 @@ pub fn rated_hz(rate: u32, q: u32) -> u32 {
 /// that of the last clip of `src` there ending at or before `t`; 1x when none does.
 pub fn handle_rate(tl: &Timeline, track: usize, src: SourceId, t: i64) -> u32 {
     tl.tracks.get(track).and_then(|tr| tr.clips.iter().rev().find(|c| c.src == src && c.end() <= t)).map_or(0x1_0000, |c| c.rate_q16)
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the run split at an automated clip's pan (named tail block) ----
+
+/// STRIAPANAUTOMATION: per audio track (`tracks`), the pan at tick `t` of the clip there when it carries pan points, else
+/// `None`. `audio_runs` breaks a run where this changes (beside its fade key), so between two edges an automated pan is
+/// linear and each [`Layer`] carries its true value at both edges; with no points anywhere every entry is `None` and the
+/// runs are exactly the unautomated ones. A crossfade's under layer reads its own curve at its edges without a split of
+/// its own (NLE-PAN-AUTO-UNDER).
+fn pan_piece(tl: &Timeline, tracks: &[usize], t: i64) -> Vec<Option<i8>> {
+    tracks
+        .iter()
+        .map(|&ti| {
+            let c = tl.clip_at(ti, t).map(|ci| &tl.tracks[ti].clips[ci])?;
+            (c.pan_keys.n > 0).then(|| c.pan_at(t))
+        })
+        .collect()
 }
