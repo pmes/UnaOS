@@ -367,3 +367,70 @@ fn striaaudiocrossfade_paint_shows_the_bracket() {
     assert_eq!(paint_in(&st, l, Order::Rgba, None, None), before);
     println!("striaaudiocrossfade: bracket {x0}..{x1} x {y0}..{y1}, {moved} px moved");
 }
+
+// ---- STRIAXFADECURVE (LEDGER SR904): the crossfade curve words and the audio refusal text (named tail block) ----
+
+/// `xfade linear` puts a LINEAR record of the default length (12 ticks), the EDL carries no `* UNA XFADE EQUAL` and parses
+/// back linear; `xfade equal` keeps the length and swaps the curve; `xfade 6 linear` replaces; bare `xfade` still takes it
+/// off; each change one undo step.
+#[test]
+fn striaxfadecurve_curve_words_one_undo_step_each() {
+    use timeline_core::{AudioXfade, Curve, edl};
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade linear"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::Linear }]);
+    let text = edl::write(&st.timeline, "XC").unwrap();
+    assert!(!text.contains("* UNA XFADE EQUAL"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().audio_xfades, st.timeline.audio_xfades);
+    assert_eq!(st.verb("xfade equal"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::EqualPower }]);
+    assert_eq!(st.verb("xfade 6 linear"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 6, curve: Curve::Linear }]);
+    assert_eq!(st.verb("xfade linear"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades[0].dur, 6);
+    assert_eq!(st.undo_depth(), 4);
+    assert_eq!(st.verb("xfade"), Some(Ok(())));
+    assert!(st.timeline.audio_xfades.is_empty());
+    assert!(st.undo());
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 6, curve: Curve::Linear }]);
+    println!("striaxfadecurve: linear 12 -> equal 12 -> linear 6 -> linear keeps 6 -> bare off; undo -> linear 6");
+}
+
+/// Each curve-word refusal by name; nothing committed.
+#[test]
+fn striaxfadecurve_curve_refusals_by_name() {
+    let mut st = striaaudiocrossfade_state();
+    let tl0 = st.timeline.clone();
+    st.select(1, 1).unwrap();
+    for (v, want) in [
+        ("xfade sine", EditError::Transition),
+        ("xfade 6 linear x", EditError::Transition),
+        ("xfade x linear", EditError::Transition),
+        ("xfade 0 linear", EditError::Transition),
+        ("xfade 99 equal", EditError::Handle),
+    ] {
+        assert_eq!(st.verb(v), Some(Err(want)), "{v}");
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0), "{v}");
+    }
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("xfade linear"), Some(Err(EditError::Transition)));
+    println!("striaxfadecurve: sine / third word / bad count / 0 -> Transition; 99 -> Handle; video clip -> Transition");
+}
+
+/// `xfade_refusal` words each audio refusal from the unchanged state; a non-xfade word or an unworded error is `None`.
+#[test]
+fn striaxfadecurve_refusal_text() {
+    let mut st = striaaudiocrossfade_state();
+    assert_eq!(st.xfade_refusal("xfade", EditError::NoClip), Some("no clip selected (select the incoming audio clip)"));
+    st.select(0, 0).unwrap();
+    assert_eq!(st.xfade_refusal("xfade", EditError::Transition), Some("the selected clip is not on an audio track"));
+    st.select(1, 2).unwrap();
+    assert_eq!(st.xfade_refusal("xfade linear", EditError::Transition), Some("no clip ends where the selected clip starts"));
+    st.select(1, 1).unwrap();
+    assert_eq!(st.xfade_refusal("xfade sine", EditError::Transition), Some("usage: xfade [<ticks>] [linear|equal], ticks at least 1"));
+    assert_eq!(st.xfade_refusal("xfade 99", EditError::Handle), Some("the crossfade is longer than the incoming clip or the outgoing clip's handle"));
+    assert_eq!(st.xfade_refusal("kind", EditError::Transition), None);
+    assert_eq!(st.xfade_refusal("xfade", EditError::NoSource), None);
+    println!("striaxfadecurve: five audio wordings; kind / NoSource -> None");
+}

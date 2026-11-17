@@ -3676,10 +3676,43 @@ fn striaaudiocrossfade_face_refusal_on_the_message_line() {
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
     assert!(face.verb("xfade"));
-    assert_eq!(face.last_error.take(), Some(format!("xfade: {}", EditError::NoClip)));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: no clip selected (select the incoming audio clip)")); // STRIAXFADECURVE (SR904): the audio wording
     face.state.select(0, 1).unwrap();
     assert!(face.verb("xfade"));
-    assert_eq!(face.last_error.take(), Some(format!("xfade: {}", EditError::Transition)));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade: the selected clip is not on an audio track")); // STRIAXFADECURVE (SR904): the audio wording
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
-    println!("striaaudiocrossfade: no selection -> xfade: {}; video clip -> xfade: {}", EditError::NoClip, EditError::Transition);
+    println!("striaaudiocrossfade: no selection and a video clip each refused on the message line in the audio wording"); // STRIAXFADECURVE (SR904)
+}
+
+// ---- STRIAXFADECURVE (LEDGER SR904): the face's crossfade curve words and the audio refusal text (named tail block) ----
+
+/// `xfade linear` on the selected audio clip puts a LINEAR record of the default length through ONE commit, `xfade equal`
+/// swaps the curve keeping the length, `xfade 6 linear` replaces it; refusals read the audio wording and move nothing.
+#[test]
+fn striaxfadecurve_face_curve_word_and_refusal_text() {
+    use timeline_core::Curve;
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(1, 1).unwrap();
+    assert!(face.verb("xfade linear"));
+    assert_eq!(face.last_error, None);
+    assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::Linear).unwrap());
+    assert!(face.verb("xfade equal"));
+    assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 10, Curve::EqualPower).unwrap());
+    assert!(face.verb("xfade 6 linear"));
+    assert_eq!(face.state.timeline, tl.add_audio_xfade(1, 10, 6, Curve::Linear).unwrap());
+    assert_eq!(face.state.undo_depth(), 3);
+    let (before, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    for (v, want) in [
+        ("xfade sine", "xfade sine: usage: xfade [<ticks>] [linear|equal], ticks at least 1"),
+        ("xfade 99 equal", "xfade 99 equal: the crossfade is longer than the incoming clip or the outgoing clip's handle"),
+    ] {
+        assert!(face.verb(v));
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{v}");
+    }
+    face.state.select(1, 2).unwrap();
+    assert!(face.verb("xfade linear"));
+    assert_eq!(face.last_error.take().as_deref(), Some("xfade linear: no clip ends where the selected clip starts"));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&before, depth));
+    println!("striaxfadecurve: linear 10 -> equal 10 -> linear 6 (3 undo steps); sine / 99 / no butting clip refused in words");
 }
