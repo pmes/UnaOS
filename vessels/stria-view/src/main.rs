@@ -198,7 +198,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo" | "target" | "pan-key" | "opacity-key"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYKEYSFACE (SR9085): `opacity-key:40`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo" | "target" | "pan-key" | "opacity-key" | "seqrate"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYKEYSFACE (SR9085): `opacity-key:40`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); STRIASEQFACE (SR9088): `seqrate:12`, `seqrate:25/2`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
         [w @ ("insert" | "overwrite" | "insert-all"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
@@ -545,7 +545,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), button("loudness", "LUFS"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         TetraNode::TextField { id: nle_face::HELP_FIELD.into(), placeholder: "find a key".into(), action: quartzite::tetra::TextAction::ConsoleInput, secret: false }, button("speed", "Speed"), // STRIACLIPSPEED (SR829): the selected clip 1x -> 2x -> 4x -> 1x (THE `speed` verb)
         button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
-        button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
+        button("title", "Title"), button("seqrate", "Rate"), // STRIASEQFACE (SR9088): the selected sequence reel's next rate (THE `seqrate` word); STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("roll-", "Roll -"), button("roll+", "Roll +"), button("roll-tool", "Roll tool"), // STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge; STRIAROLLMORE (SR954): the roll tool on / off
@@ -3634,5 +3634,26 @@ mod striawavecachepref_tests {
         assert!(!peak_cache_from(None));
         assert!(!peak_cache_from(Some(PrefValue::Str("true".into()))));
         println!("striawavecachepref: pref true -> on; false / unset / string -> off");
+    }
+}
+
+// ---- STRIASEQFACE (LEDGER SR9088): the witness's `seqrate:<rate>` token (named tail block) ----
+#[cfg(test)]
+mod striaseqface_tests {
+    use super::*;
+
+    /// `seqrate:<rate>` is the face's `seqrate <rate>` word, bare `seqrate` the Rate button's; over the synthetic (movie)
+    /// fixture with nothing selected the word is taken and refused by name, the timeline unchanged.
+    #[test]
+    fn striaseqface_token_carries_the_rate() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        for (tok, want) in [("seqrate:12", "seqrate 12"), ("seqrate:25/2", "seqrate 25/2"), ("seqrate", "seqrate")] {
+            let m = token(&face, tok).expect(tok);
+            assert!(matches!(m.as_slice(), [SMessage::Input { target, text }] if target == SURFACE && text == want), "{tok}");
+        }
+        let mut face = face;
+        assert_eq!(drive(&mut face, "seqrate:12"), vec![format!("seqrate: {}", timeline_core::EditError::NoClip)]);
+        assert_eq!(face.state.timeline, tl);
     }
 }
