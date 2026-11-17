@@ -1959,7 +1959,7 @@ pub fn edit_live(path: &str) -> bool {
 
 /// The editor verb a key byte names ([`EDIT_KEYS`]).
 pub fn edit_verb(b: u8) -> Option<&'static str> {
-    if let Some(v) = jump_key(b) { return Some(v); } EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
+    if let Some(v) = jump_key(b) { return Some(v); } EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| help_verb(b)) // STRIAHELPTHREE (LEDGER SR9043): `?` admits the help, no EDIT_KEYS row (file tail)
 }
 
 /// The output tick shown at `ms` (the inverse of the job's `out_ms`).
@@ -1971,7 +1971,7 @@ fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
 /// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
 /// unchanged, or no EDL open at `path`.
 pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
-    let verb = edit_verb(b)?; if verb == "roll-tool" { return edit_roll_tool(path); } // STRIAKROLL (LEDGER SR9003): the roll tool is face state, not an editor word (file tail) HIST_ARMED.store(false, Ordering::Release);
+    let verb = edit_verb(b)?; if verb == "roll-tool" { return edit_roll_tool(path); } // STRIAKROLL (LEDGER SR9003): the roll tool is face state, not an editor word (file tail) HIST_ARMED.store(false, Ordering::Release); if help_key(verb) { return None; } // STRIAHELPTHREE (LEDGER SR9043): the help's toggle, and a key that only hides it (file tail)
     let (at, tl, clips, undo, back) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
@@ -2016,7 +2016,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HELP_SHOWN.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2043,7 +2043,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let th = thumbs_band(&live, l); let px = pack(&view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref())); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail)
+    let th = thumbs_band(&live, l); let px = pack(&help_over(view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref()), l)); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail) // STRIAHELPTHREE (LEDGER SR9043): the keys help over the band, nothing while hidden (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -3352,4 +3352,148 @@ fn thumb_decode(reels: &Reels, tl: &timeline_core::Timeline, src: timeline_core:
 /// STRIAKTHUMBS (SR9019): the Player closed: its stills go.
 fn thumbs_close() {
     *THUMBS.lock() = None;
+}
+
+// ---- STRIAHELPTHREE (LEDGER SR9043): the kernel face's keys help, painted from EDIT_KEYS (named tail block) ----
+// handlers.md §5 NLE5b's NLE5D-KEYS-HELP-KERNEL. `?` ([`HELP_KEY`], the host `KEYS` key for the same word) is admitted by the
+// ONE lookup ([`edit_verb`]) without an EDIT_KEYS row and taken on the ONE key road ([`edit_key`]) before the editor state:
+// it toggles [`HELP_SHOWN`]; while the help shows any other editing key only hides it and is NOT applied (the host's SR744
+// rule). Space and the arrows are player.rs `key_route`'s transport, taken before `edit_post`, and keep acting. THE band
+// paint ([`view_band`]) lays [`help_over`] on the band's canvas: hidden, the pixels go back untouched (every band byte as
+// before); shown, the band (`ruler_y..h`) filled `view::BG` and [`help_rows`] (EDIT_KEYS grouped by verb in table order,
+// keys joined ` / `, the verb word as its phrase: the host's rule for an action with no phrase) in columns through THE
+// kernel text hook ([`ViewLabels`], which also measures), the host's pad and gaps, the last line `...` when rows remain (the
+// kernel seam draws bytes). A toggle marks [`BAND_DIRTY`]: no job restart, no save, no undo step.
+// Wire: `[nle] edit help shown=1 rows=<n> cols=<n> at=<tick>`, `[nle] edit help shown=0`, `[nle] edit <verb> not applied
+// (help hidden)`. Owed: NLE5D-KEYS-HELP-KERNEL-PHRASES, NLE5D-KEYS-HELP-KERNEL-WITNESS, NLE5D-KEYS-HELP-KERNEL-TRANSPORT.
+
+/// The Player's keys help shows over the view band.
+static HELP_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// The Player's key for the help (the host `KEYS` row `("?", "help")`).
+const HELP_KEY: u8 = b'?';
+/// The help's inset from the band's top and left (px; the host's).
+const HELP_PAD: usize = 4;
+/// The gap between a row's keys and its verb (px; the host's).
+const HELP_KEY_GAP: usize = 12;
+/// The gap between two columns (px; the host's).
+const HELP_COL_GAP: usize = 16;
+/// One help line: the `Face::Body` cell's height (px).
+const HELP_PITCH: usize = 16;
+
+/// The help's word for a key byte ([`HELP_KEY`] -> `help`), asked by [`edit_verb`] after EDIT_KEYS.
+fn help_verb(b: u8) -> Option<&'static str> {
+    (b == HELP_KEY).then_some("help")
+}
+
+/// [`edit_key`]'s first step: `help` toggles the help; while it shows, any other editing key only hides it. `true`: the key
+/// is taken here and goes no further (no verb, no save); the band is marked for the pass's repaint.
+fn help_key(verb: &str) -> bool {
+    if verb == "help" {
+        let shown = !HELP_SHOWN.load(Ordering::Acquire);
+        HELP_SHOWN.store(shown, Ordering::Release);
+        BAND_DIRTY.store(true, Ordering::Release);
+        if shown {
+            let rows = help_rows();
+            let cols = BAND.try_lock().and_then(|b| b.as_ref().map(|n| n.2)).map_or(0, |l| help_cols(&rows, l).2.len());
+            let at = EDIT.try_lock().and_then(|g| g.as_ref().map(|e| e.st.playhead)).unwrap_or(0);
+            serial_println!("[nle] edit help shown=1 rows={} cols={} at={}", rows.len(), cols, at);
+        } else {
+            serial_println!("[nle] edit help shown=0");
+        }
+        return true;
+    }
+    if HELP_SHOWN.swap(false, Ordering::AcqRel) {
+        BAND_DIRTY.store(true, Ordering::Release);
+        serial_println!("[nle] edit {} not applied (help hidden)", verb);
+        return true;
+    }
+    false
+}
+
+/// The help's rows, one per verb in EDIT_KEYS order, then the help's own: `(its keys joined " / ", the verb)`; 0x7F shows
+/// `Delete`, 0x08 `Backspace`, every other byte itself.
+pub fn help_rows() -> Vec<(String, &'static str)> {
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    for (b, verb) in EDIT_KEYS.iter().copied().chain(core::iter::once((HELP_KEY, "help"))) {
+        let i = match rows.iter().position(|r| r.1 == verb) {
+            Some(i) => i,
+            None => {
+                rows.push((String::new(), verb));
+                rows.len() - 1
+            }
+        };
+        let k = &mut rows[i].0;
+        if !k.is_empty() {
+            k.push_str(" / ");
+        }
+        match b {
+            0x7F => k.push_str("Delete"),
+            0x08 => k.push_str("Backspace"),
+            b => k.push(b as char),
+        }
+    }
+    rows
+}
+
+/// A string's width in THE kernel text seam (`text::draw_with`'s pen x, nothing drawn).
+fn help_w(s: &str) -> usize {
+    super::text::draw_with(s.as_bytes(), false, super::text::Face::Body, 0, 0, 1 << 20, 0, &mut |_: isize, _: isize, _: u8| {})
+}
+
+/// The help's columns over the band `l`: `(the first line's top, lines per column, [(first row, keys width, verb width)],
+/// rows left over)`; as many columns as the width holds, at least one.
+fn help_cols(rows: &[(String, &'static str)], l: timeline_core::view::Layout) -> (usize, usize, Vec<(usize, usize, usize)>, bool) {
+    let top = l.ruler_y as usize + HELP_PAD;
+    let per = (l.h as usize).saturating_sub(top) / HELP_PITCH;
+    let mut cols: Vec<(usize, usize, usize)> = Vec::new();
+    if per == 0 {
+        return (top, 0, cols, false);
+    }
+    let (mut x, mut start) = (HELP_PAD, 0usize);
+    while start < rows.len() {
+        let chunk = &rows[start..(start + per).min(rows.len())];
+        let kw = chunk.iter().map(|r| help_w(&r.0)).max().unwrap_or(0);
+        let pw = chunk.iter().map(|r| help_w(r.1)).max().unwrap_or(0);
+        if !cols.is_empty() && x + kw + HELP_KEY_GAP + pw > l.w as usize {
+            break;
+        }
+        cols.push((start, kw, pw));
+        x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
+        start += per;
+    }
+    (top, per, cols, start < rows.len())
+}
+
+/// The help over the band's painted canvas `px` (layout `l`): untouched while hidden or with no line's room; shown, the
+/// band filled `view::BG` and [`help_rows`] in [`help_cols`] through [`ViewLabels`].
+fn help_over(px: Vec<u8>, l: timeline_core::view::Layout) -> Vec<u8> {
+    use timeline_core::view;
+    if !HELP_SHOWN.load(Ordering::Acquire) || l.ruler_y >= l.h {
+        return px;
+    }
+    let rows = help_rows();
+    let (top, per, cols, cut) = help_cols(&rows, l);
+    if per == 0 {
+        return px;
+    }
+    let mut c = view::Canvas { w: l.w, h: l.h, order: view::Order::Rgba, px };
+    c.rect(0, l.ruler_y as i64, l.w as i64, l.h as i64, view::BG);
+    let mut lab = ViewLabels(0);
+    let mut x = HELP_PAD;
+    for (ci, &(first, kw, pw)) in cols.iter().enumerate() {
+        let end = (first + per).min(rows.len());
+        let clip = (x as i32, (x + kw + HELP_KEY_GAP + pw).min(l.w as usize) as i32);
+        for (n, (keys, verb)) in rows[first..end].iter().enumerate() {
+            let baseline = (top + n * HELP_PITCH) as f32 + LABEL_RISE;
+            if cut && ci + 1 == cols.len() && first + n + 1 == end {
+                view::Text::text(&mut lab, &mut c, "...", x as f32, baseline, clip);
+            } else {
+                view::Text::text(&mut lab, &mut c, keys, x as f32, baseline, clip);
+                view::Text::text(&mut lab, &mut c, verb, (x + kw + HELP_KEY_GAP) as f32, baseline, clip);
+            }
+        }
+        x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
+    }
+    c.px
 }
