@@ -196,13 +196,15 @@ pub struct Face {
     help: bool,
     proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, proxy_queue: Vec<(timeline_core::SourceId, String)>, proxy_hold: Option<u64>, // STRIAPROXYOFF (SR915): the `proxy all` queue and the job's hold seam (file tail); STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub note: Option<String>, // STRIAPANNEXT (SR994): a success line, read by message_text after last_error, cleared by the next taken input (file tail)
+    watched: Vec<(String, String)>, // STRIAPROXYTHREE (SR9026): each reel's file stamp as last opened (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new(), proxy_queue: Vec::new(), proxy_hold: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new(), proxy_queue: Vec::new(), proxy_hold: None, note: None, watched: Vec::new() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -210,7 +212,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); self.watch_sources(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2363,7 +2365,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3146,7 +3148,7 @@ pub fn proxy_fresh(src: &std::path::Path) -> bool {
 impl Face {
     /// Each reel's source file (reel name, path), the files `proxy` renders from and writes beside.
     pub fn with_reel_paths(mut self, paths: Vec<(String, std::path::PathBuf)>) -> Face {
-        self.reel_paths = paths; self.proxy_auto(); // STRIAPROXYOFF (SR915): a fresh proxy beside a reel attaches at open (file tail)
+        self.reel_paths = paths; self.proxy_auto(); self.watch_arm(); // STRIAPROXYOFF (SR915): a fresh proxy beside a reel attaches at open (file tail)
         self
     }
     /// True while a proxy job's result has not been reported.
@@ -3466,5 +3468,104 @@ impl Face {
             parts.push(format!("{reel}: {off}{}", self.purge_files(src)));
         }
         self.last_error = Some(format!("proxy: purge all: {}", parts.join("; ")));
+    }
+}
+
+// ---- STRIAPROXYTHREE (LEDGER SR9026): a reel changed on disk reloads, its proxy follows; the face note (named tail block) ----
+// `Face::note` (SR994's shape) holds a success line: `message_text` reads it after `last_error`; `clear_note` clears it on the
+// next acting input. WATCH: at each acting input (`Face::on`, after `takes`) every reel path's SR882 `proxy_stamp` is compared
+// with the stamp recorded at open (`watch_arm`, from `with_reel_paths`; a file already off the opened bytes' length records ""
+// so the first acting input reloads it). A changed reel reopens through the ONE reopen, `Sources::add` (its old media stays on
+// a refusal), only while no export / proxy job holds the shared `Arc<Sources>` (else the note says it waits and the next acting
+// input retries); a proxy it carried is detached (`Sources::clear_proxy`: it is the old content's) and queued on SR915's
+// `proxy_queue`, so SR882's one `proxy_start` rebuilds it. The timeline is untouched (Source.duration is the document's): no
+// undo step, the document clean. Owed: NLE-PROXY-WATCH-LENGTH, NLE-PROXY-WATCH-IDLE, NLE-PROXY-WATCH-WORKER.
+
+/// STRIAPROXYTHREE (LEDGER SR9026): an acting input (SR994's set): an `Input`, a `BrowserClick`, a button press,
+/// `BrowserSelectAll`, a named `BrowserKey` or a one-character `BrowserText` (a pointer move, a release, a resize are not).
+fn acting(msg: &SMessage) -> bool {
+    match msg {
+        SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+        SMessage::BrowserKey(k) => k.chars().count() > 1,
+        SMessage::BrowserText(t) => t.chars().count() == 1,
+        _ => false,
+    }
+}
+
+impl Face {
+    /// Clear the note on a taken acting input ([`Face::on`], after the `takes` check).
+    fn clear_note(&mut self, msg: &SMessage) {
+        if acting(msg) {
+            self.note = None;
+        }
+    }
+    /// Record each reel file's stamp as opened; a file whose length is not the opened bytes' records "" (reloads at once).
+    fn watch_arm(&mut self) {
+        let mut watched = Vec::new();
+        for (reel, path) in &self.reel_paths {
+            let src = self.state.timeline.source_by_reel(reel).map(|s| s.id);
+            let same = src.is_some_and(|s| std::fs::metadata(path).map(|m| m.len()).ok() == self.sources.byte_len(s));
+            watched.push((reel.clone(), if same { proxy_stamp(path).unwrap_or_default() } else { String::new() }));
+        }
+        self.watched = watched;
+    }
+    /// On an acting input: reload every reel whose file stamp moved since it was recorded. The note reads
+    /// `watch: A: reloaded <n> bytes[, proxy rebuilds]; ..` (or `watch: A: changed on disk; reloads after the running job`);
+    /// a refusal is `watch: A: <why>` on `last_error`; a queued rebuild runs SR915's `proxy_next`.
+    fn watch_sources(&mut self, msg: &SMessage) {
+        if !acting(msg) || self.reel_paths.is_empty() {
+            return;
+        }
+        let mut changed = Vec::new();
+        for (reel, path) in &self.reel_paths {
+            let Some(now) = proxy_stamp(path) else { continue };
+            let Some(src) = self.state.timeline.source_by_reel(reel).map(|s| s.id) else { continue };
+            if self.watched.iter().find(|(r, _)| r == reel).map(|(_, s)| s.as_str()) != Some(now.as_str()) {
+                changed.push((src, reel.clone(), path.clone(), now));
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        let Some(sources) = Arc::get_mut(&mut self.sources) else {
+            let reels: Vec<String> = changed.into_iter().map(|(_, r, _, _)| r).collect();
+            self.note = Some(format!("watch: {}: changed on disk; reloads after the running job", reels.join(", ")));
+            return;
+        };
+        let (mut parts, mut refused, mut queue) = (Vec::new(), Vec::new(), Vec::new());
+        for (src, reel, path, now) in changed {
+            let r = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display())).and_then(|b| {
+                let n = b.len();
+                sources.add(src, b).map(|()| n).map_err(|e| e.to_string())
+            });
+            match r {
+                Ok(n) => {
+                    let follow = sources.clear_proxy(src);
+                    if follow {
+                        queue.push((src, reel.clone()));
+                    }
+                    parts.push(format!("{reel}: reloaded {n} bytes{}", if follow { ", proxy rebuilds" } else { "" }));
+                }
+                Err(e) => refused.push(format!("watch: {reel}: {e}")),
+            }
+            self.watched.retain(|(r, _)| *r != reel);
+            self.watched.push((reel, now));
+        }
+        self.trans_still = None;
+        self.meters.reset();
+        if !parts.is_empty() {
+            self.note = Some(format!("watch: {}", parts.join("; ")));
+        }
+        if !refused.is_empty() {
+            let line = refused.join("; ");
+            self.last_error = Some(match self.last_error.take() {
+                Some(l) => format!("{l}; {line}"),
+                None => line,
+            });
+        }
+        if !queue.is_empty() {
+            self.proxy_queue.extend(queue);
+            self.proxy_next();
+        }
     }
 }

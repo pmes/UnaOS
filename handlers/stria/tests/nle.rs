@@ -4060,3 +4060,89 @@ fn striaproxymore_proxy_leaves_the_audio_original() {
     assert!(after.pcm == before.pcm, "the audio stays the original's");
     println!("striaproxymore audio: {} samples unchanged under a proxy", after.pcm.len());
 }
+
+// ---- STRIAPROXYTHREE (LEDGER SR9026): a reel changed on disk reloads at the next acting input, its proxy follows (named tail block) ----
+
+/// The `help` button's message (an acting input that edits nothing).
+fn striaproxythree_input(text: &str) -> bandy::SMessage {
+    bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: text.into() }
+}
+
+/// A proxied reel rewritten on disk reloads at the next acting input: the note names it, its stale proxy is detached and
+/// rebuilt on SR915's queue, the preview shows the new file; the timeline and the document are untouched.
+#[test]
+fn striaproxythree_changed_reel_reloads_and_the_proxy_follows() {
+    use stria::nle_face::{preview, proxy_fresh, proxy_paths};
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("three-reload");
+    let a = tl.sources[0].id;
+    let xa = proxy_paths(&pa).0;
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy() && face.has_proxy(a));
+    face.last_error = None;
+    assert!(face.on(&striaproxythree_input("zoom+")));
+    assert_eq!(face.note, None, "nothing changed on disk: no note");
+    let new = synth_source(5000, 50, 25);
+    std::fs::write(&pa, &new).unwrap();
+    face.on(&striaproxythree_input("zoom-"));
+    assert_eq!(face.note, Some(format!("watch: A: reloaded {} bytes, proxy rebuilds", new.len())));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: building (stale) -> {}", xa.display())));
+    assert!(face.proxying() && !face.has_proxy(a), "the old proxy is detached while the new one builds");
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: 50 frames -> {}", xa.display())));
+    assert!(face.has_proxy(a) && proxy_fresh(&pa));
+    assert!(face.verb("proxy off"));
+    face.last_error = None;
+    face.state.seek(3);
+    let _ = face.paint();
+    let mut alt = Sources::new(&tl);
+    alt.add(a, new.clone()).unwrap();
+    alt.add(tl.sources[1].id, synth_source(1000, 50, 25)).unwrap();
+    let want = preview(&tl, &alt, 3).unwrap().expect("the rewritten reel's frame at 3");
+    assert!(face.still().is_some_and(|s| s.rgba == want.rgba), "the preview reads the reloaded file");
+    face.on(&striaproxythree_input("zoom+"));
+    assert_eq!(face.note, None, "the next acting input clears the note and reloads nothing");
+    assert!(face.last_error.is_none());
+    assert_eq!(face.state.timeline.sources, tl.sources, "the document's sources are untouched");
+    assert!(!face.dirty(), "a reload leaves the document clean");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxythree reload: A reloaded {} bytes, proxy rebuilt, preview = the new file", new.len());
+}
+
+/// A reel changed while a job holds the sources waits (the note; the next acting input retries); bytes that do not open are
+/// refused by name with the old media kept; a pointer move stats nothing; a face without paths watches nothing.
+#[test]
+fn striaproxythree_busy_waits_unreadable_and_pointer() {
+    let (dir, _, pb, mut face, _) = striaproxyoff_face("three-busy");
+    face.hold_proxy_at(Some(3));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.proxying());
+    face.last_error = None;
+    let new = synth_source(7000, 50, 25);
+    std::fs::write(&pb, &new).unwrap();
+    face.on(&striaproxythree_input("zoom+"));
+    assert_eq!(face.note.as_deref(), Some("watch: B: changed on disk; reloads after the running job"));
+    assert!(face.cancel_proxy() && face.wait_proxy());
+    face.last_error = None;
+    face.on(&striaproxythree_input("zoom-"));
+    assert_eq!(face.note, Some(format!("watch: B: reloaded {} bytes", new.len())));
+    assert!(face.last_error.is_none(), "B carried no proxy: nothing rebuilds");
+    std::fs::write(&pb, b"not media").unwrap();
+    face.on(&bandy::SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    assert!(face.last_error.is_none(), "a pointer move stats nothing");
+    face.on(&striaproxythree_input("zoom+"));
+    let line = face.last_error.take().unwrap_or_default();
+    assert!(line.starts_with("watch: B: "), "{line}");
+    assert_eq!(face.note, None);
+    face.state.seek(12);
+    let _ = face.paint();
+    assert!(face.still().is_some(), "the old media stays after a refused reload");
+    face.on(&striaproxythree_input("zoom-"));
+    assert!(face.last_error.is_none(), "a refused stamp is recorded: no repeat");
+    assert!(!face.dirty());
+    let (t2, s2) = synth_fixture();
+    let mut bare = Face::new(EditorState::new(t2), s2, (320, 160), PixelOrder::Rgba, false);
+    bare.on(&striaproxythree_input("zoom+"));
+    assert!(bare.note.is_none() && bare.last_error.is_none(), "no paths: nothing watched");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxythree busy: waited, reloaded, refused \"{line}\"");
+}
