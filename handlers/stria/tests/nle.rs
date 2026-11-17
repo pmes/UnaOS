@@ -4016,3 +4016,90 @@ fn striawaveformstereo_scan_keeps_both_channels() {
     assert_eq!(m.lod.last().map(|top| top.len()), Some(1));
     println!("striawaveformstereo: stereo scan buckets={} chans={} L max={lmax} lod levels={}", p.buckets.len(), p.chans.len(), p.lod.len());
 }
+
+// ---- STRIAWAVEMULTI (LEDGER SR9071): the peak table cached beside the media (named tail block) ----
+
+/// STRIAWAVEMULTI (SR9071): a stereo PCM16 mp4 of `secs` seconds (L a sawtooth, R silence).
+fn striawavemulti_stereo(secs: usize) -> Vec<u8> {
+    let frames = secs * SYNTH_RATE as usize;
+    let pcm: Vec<i16> = (0..frames).flat_map(|f| [((f % 480) as i32 * 60 - 14_400) as i16, 0i16]).collect();
+    let track = gneiss_pal::dsp::demux::build::pcm16_track(2, SYNTH_RATE, 2, &pcm, 960);
+    gneiss_pal::dsp::demux::build::mp4(&[track], &gneiss_pal::dsp::demux::build::Mp4Options::default())
+}
+
+/// STRIAWAVEMULTI (SR9071): the media file's stamp as `Sources` reads it (byte length, mtime ns since the epoch).
+fn striawavemulti_stamp(path: &std::path::Path) -> (u64, u64) {
+    let md = std::fs::metadata(path).unwrap();
+    (md.len(), md.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64)
+}
+
+/// STRIAWAVEMULTI (SR9071): the cache file codec round-trips a stereo table (each lane's pyramid rebuilt) and refuses a
+/// size / mtime / per_sec mismatch, a wrong magic, a truncated file and trailing bytes.
+#[test]
+fn striawavemulti_cache_file_round_trip() {
+    use stria::nle::{peak_file_bytes, peak_file_parse};
+    use timeline_core::view::{PEAKS_PER_SEC, Peaks};
+    let lane = |b: Vec<u8>| Peaks { per_sec: PEAKS_PER_SEC, buckets: b, chans: Vec::new(), lod: Vec::new() };
+    let l: Vec<u8> = (0..300u32).map(|i| (i * 37 % 256) as u8).collect();
+    let r: Vec<u8> = (0..300u32).map(|i| (i * 11 % 200) as u8).collect();
+    let both: Vec<u8> = l.iter().zip(&r).map(|(a, b)| *a.max(b)).collect();
+    let mut p = Peaks { chans: vec![lane(l), lane(r)], ..lane(both) };
+    p.finish();
+    let bytes = peak_file_bytes(&p, 1234, 5678);
+    let back = peak_file_parse(&bytes, 1234, 5678, PEAKS_PER_SEC).expect("the same stamp reads back");
+    assert_eq!(back, p, "buckets, lanes and every pyramid equal");
+    assert!(peak_file_parse(&bytes, 1235, 5678, PEAKS_PER_SEC).is_none(), "another size");
+    assert!(peak_file_parse(&bytes, 1234, 5679, PEAKS_PER_SEC).is_none(), "another mtime");
+    assert!(peak_file_parse(&bytes, 1234, 5678, 50).is_none(), "another resolution");
+    assert!(peak_file_parse(&bytes[..bytes.len() - 1], 1234, 5678, PEAKS_PER_SEC).is_none(), "truncated");
+    let mut more = bytes.clone();
+    more.push(0);
+    assert!(peak_file_parse(&more, 1234, 5678, PEAKS_PER_SEC).is_none(), "trailing bytes");
+    let mut bad = bytes.clone();
+    bad[0] ^= 0xff;
+    assert!(peak_file_parse(&bad, 1234, 5678, PEAKS_PER_SEC).is_none(), "wrong magic");
+    let mut mono = lane(vec![7; 10]);
+    mono.finish();
+    assert_eq!(peak_file_parse(&peak_file_bytes(&mono, 1, 2), 1, 2, PEAKS_PER_SEC), Some(mono), "a mono table: no lanes");
+    println!("striawavemulti: cache file {} bytes for 300 buckets x 2 lanes", bytes.len());
+}
+
+/// STRIAWAVEMULTI (SR9071): with the media's path noted, the first scan writes `<media>.una-peaks`, a second scan reads it
+/// (a marker table written under the same stamp comes back: no decode), and a changed media (another length) rescans;
+/// a source with no path noted writes no file.
+#[test]
+fn striawavemulti_scan_reads_the_cache() {
+    use stria::nle::{peak_file_bytes, scan_peaks};
+    use timeline_core::view::{PEAKS_PER_SEC, Peaks};
+    let dir = fresh_dir("striawavemulti", "cache");
+    let media = dir.join("st.mp4");
+    let cache = dir.join("st.mp4.una-peaks");
+    let bytes = striawavemulti_stereo(2);
+    std::fs::write(&media, &bytes).unwrap();
+    let mut tl = Timeline::new(25);
+    let st = tl.add_source("ST", 50);
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(st, 0, 50, 0)];
+    let mut plain = Sources::new(&tl);
+    plain.add(st, bytes.clone()).unwrap();
+    let first = scan_peaks(&plain, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    assert!(!cache.exists(), "no path noted: no cache file");
+    let mut src = Sources::new(&tl);
+    src.add(st, bytes.clone()).unwrap();
+    src.note_path(st, &media);
+    let one = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    assert_eq!(one, first, "the cached road scans the same table");
+    assert!(cache.exists(), "the first scan writes the cache beside the media");
+    let (size, mtime) = striawavemulti_stamp(&media);
+    let marker = Peaks { per_sec: PEAKS_PER_SEC, buckets: vec![42; 7], chans: Vec::new(), lod: Vec::new() };
+    std::fs::write(&cache, peak_file_bytes(&marker, size, mtime)).unwrap();
+    let two = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    assert_eq!(two.buckets, vec![42; 7], "a matching stamp answers from the file");
+    let mut f = std::fs::OpenOptions::new().append(true).open(&media).unwrap();
+    std::io::Write::write_all(&mut f, &[0]).unwrap();
+    drop(f);
+    let three = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    assert_eq!(three, first, "a changed media rescans");
+    assert_eq!(three.chans.len(), 2);
+    println!("striawavemulti: cache {} buckets={} lanes={}", cache.display(), three.buckets.len(), three.chans.len());
+}
