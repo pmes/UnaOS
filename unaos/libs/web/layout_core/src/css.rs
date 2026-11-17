@@ -75,7 +75,7 @@ pub struct SpecifiedStyle<H: Host> {
     pub inset_right: Option<LengthPercentageAuto>,
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
-    pub align_items: Option<taffy::style::AlignItems>,
+    pub align_items: Option<taffy::style::AlignItems>, pub align_content: Option<taffy::style::AlignContent>, // AETHERCSSALIGNCONTENTFIELD (SR1016): align-content's own field, folded by fold_into on a flex container
     pub align_self: Option<taffy::style::AlignSelf>,
     pub box_sizing: Option<taffy::style::BoxSizing>,
     /// `display: flex` (Some(true)) versus any other display (Some(false)).
@@ -304,7 +304,7 @@ impl<H: Host> SpecifiedStyle<H> {
                 node_style.flex_direction = FlexDirection::Row;
             }
             node_style.flex_wrap = self.flex_wrap.unwrap_or(taffy::style::FlexWrap::NoWrap);
-            node_style.align_items = self.align_items.unwrap_or(taffy::style::AlignItems::NORMAL);
+            node_style.align_items = self.align_items.unwrap_or(taffy::style::AlignItems::NORMAL); node_style.align_content = self.align_content.unwrap_or(taffy::style::AlignContent::NORMAL);
         } else if let Some(w) = self.flex_wrap {
             node_style.flex_wrap = w;
         }
@@ -551,9 +551,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
             if prop == "column-gap" {
                 if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
-                    style.paint.col_gap = Some(px);
+                    style.paint.col_gap = Some(Some(px));
                 } else if value == "normal" {
-                    style.paint.col_gap = None;
+                    style.paint.col_gap = Some(None);
                 }
             }
             apply_column_gap(value, style, cx);
@@ -1279,7 +1279,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "background-image" => match extract_css_url(value) {
             Some(u) => style.paint.bg_image = Some(u),
-            None => {
+            None => { bg_image_clear::<H>(&mut style.paint, value);
                 if !is_neutral_keyword(value) {
                     H::record_css(&format!("background-image-value:{}", clip(value)));
                 }
@@ -1288,7 +1288,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background" => { bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
-            if let Some(u) = extract_css_url(value) {
+            bg_shorthand_none::<H>(&mut style.paint, value); if let Some(u) = extract_css_url(value) {
                 style.paint.bg_image = Some(u);
             }
             // Components outside url(...) — the url may itself hold slashes
@@ -1463,7 +1463,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-items" | "align-content" => match value {
+        "align-content" => apply_align_content(value, style), "align-items" => match value {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -2604,7 +2604,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
             list.push((p.clone(), v.clone()));
         }
     }
-    clone!(pct_math, bg_gradient, shadows);
+    merge_bg_image_none(dst, src); clone!(pct_math, bg_gradient, shadows);
     clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
@@ -2734,7 +2734,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
         if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
     }
     take!(display, flex_direction, width, height, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_content, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint);
@@ -3673,21 +3673,40 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
 /// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is not
 /// rewritten (author-origin revert rolls back to the UA origin, which Aether keeps on the tag road:
 /// AETHER-CSS-WIDE-REVERT-UA owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
+/// AETHERCSSWIDENONINHERITEDREST (SR848): opacity / transform / flex-grow / flex-shrink through the same anim call; position static, float / clear none, overflow visible, z-index and the insets auto, flex-direction row, flex-wrap nowrap, flex-flow `row nowrap`, flex-basis auto, flex `0 1 auto`, align-items / justify-content normal, gap / row-gap 0px, background-repeat / -position / -size repeat / `0% 0%` / auto; not column-gap (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL), align-content (AETHER-CSS-ALIGN-CONTENT-FIELD) or the background shorthand's image layers (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE).
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background` and `background-image` rewrite to `none`, which the arms now write as an explicit no-image (`bg_image_clear`, `bg_shorthand_none`), so `background: initial` resets the image, the colour and the repeat / position / size layers.
 fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
     if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset")) {
         return value;
     }
     match prop {
         "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top"
+        | "opacity" | "transform" | "flex-grow" | "flex-shrink"
         | "padding-right" | "padding-bottom" | "padding-left" | "background-color" => {
             crate::anim::initial_value(prop).unwrap_or(value)
         }
-        "background" => "transparent",
+        "background" | "background-image" => "none",
         "display" => "inline",
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         "border-width" => "3px",
+        // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
+        "position" => "static",
+        "float" | "clear" => "none",
+        "overflow" | "overflow-x" | "overflow-y" | "overflow-inline" | "overflow-block" => "visible",
+        "z-index" => "auto",
+        "top" | "right" | "bottom" | "left" | "inset" => "auto",
+        "flex-direction" => "row",
+        "flex-wrap" => "nowrap",
+        "flex-flow" => "row nowrap",
+        "flex-basis" => "auto",
+        "flex" => "0 1 auto",
+        "align-items" | "justify-content" | "align-content" => "normal",
+        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px", "column-gap" | "grid-column-gap" => "normal",
+        "background-repeat" => "repeat",
+        "background-position" => "0% 0%",
+        "background-size" => "auto",
         _ => value,
     }
 }
@@ -3748,6 +3767,76 @@ fn width_cc<H: Host>(paint: &mut PaintStyle<H>) {
             paint.currentcolor |= 1 << i;
         }
     }
+}
+
+// ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+/// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): css-backgrounds-3 §3.3: `background-image: none` is a value (no image
+/// layer), but `PaintStyle::bg_image`'s None means "unspecified", so `merge_paint` (Somes only) kept an earlier rule's
+/// url. The arm's `none` (and `initial` / `unset`, rewritten to `none` by `noninherited_initial`) clears both image
+/// roads of this block (`bg_image` None, `bg_gradient` Some(None): background-image is ONE property) and sets
+/// `bg_image_none`, which `merge_bg_image_none` turns into the same clear on the cascade's accumulated style.
+fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    if value.trim().eq_ignore_ascii_case("none") {
+        paint.bg_image = None;
+        paint.bg_gradient = Some(None);
+        paint.bg_image_none = true;
+    }
+}
+
+/// The `background` shorthand's empty spellings (`none`, `transparent`, `none transparent`, and `initial` / `unset`
+/// through `noninherited_initial`'s `none`): css-backgrounds-3 §3.10 resets every omitted longhand to its initial
+/// value, so the image goes (`bg_image_clear`), the colour is transparent, and repeat / position / size take SR848's
+/// initials (repeat / `0% 0%` / auto, stored as their arms store them; not through `apply_declaration`, which would
+/// enter background-color / -position in `animatable`). Any other shorthand keeps its omitted layers
+/// (AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+fn bg_shorthand_none<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let parts = split_top_level(value);
+    if parts.is_empty() || !parts.iter().all(|p| p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("transparent")) {
+        return;
+    }
+    bg_image_clear(paint, "none");
+    paint.bg_alpha = Some(0.0);
+    paint.bg_repeat = parse_repeat("repeat");
+    paint.bg_position = Some("0% 0%".to_string());
+    paint.bg_size = Some("auto".to_string());
+}
+
+/// `merge_paint`'s half for the bit, BEFORE the image / gradient clones: a later block that declared none clears the
+/// accumulated image and gradient and carries the bit (a chained merge clears again); that block's own later url or
+/// gradient (`none; url(b)`) is then copied by the clones, so the later value wins either way.
+fn merge_bg_image_none<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    if src.bg_image_none {
+        dst.bg_image = None;
+        dst.bg_gradient = Some(None);
+        dst.bg_image_none = true;
+    }
+}
+
+// ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content writes its own field; column-gap an explicit normal (named tail block) ----
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): css-align-3 §5.4 / css-flexbox-1 §8.4 `align-content` writes
+/// `SpecifiedStyle::align_content`, taffy's own `Style::align_content`, folded on a real flex container by `fold_into`
+/// (normal = taffy's NORMAL, stretch for flex; a single-line container shows no effect). The arm it shared with
+/// `align-items` wrote `align_items` (`align-content: center` centred the items, `space-between` was refused).
+/// `initial` / `unset` arrive here as `normal` through `noninherited_initial`; `inherit` stays neutral
+/// (AETHER-CSS-WIDE-NONINHERITED-INHERIT). The multicol gutter's explicit `normal` is `PaintStyle::col_gap`'s Some(None).
+fn apply_align_content<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
+    use taffy::style::AlignContent as A;
+    style.align_content = Some(match value {
+        "normal" => A::NORMAL,
+        "flex-start" => A::FLEX_START,
+        "start" => A::START,
+        "flex-end" => A::FLEX_END,
+        "end" => A::END,
+        "center" => A::CENTER,
+        "stretch" => A::STRETCH,
+        "space-between" => A::SPACE_BETWEEN,
+        "space-around" => A::SPACE_AROUND,
+        "space-evenly" => A::SPACE_EVENLY,
+        "inherit" | "initial" | "unset" => return,
+        other => return H::record_css(&format!("align-content-value:{}", other)),
+    });
 }
 
 // ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the `color-scheme` property parsed into PaintStyle::color_scheme (named tail block) ----
