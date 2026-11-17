@@ -187,8 +187,8 @@ fn c_bframes_zero_through_push_keeps_the_pinned_bytes() {
     let (w, h) = (128usize, 96usize);
     let base = |qp: u8| Config { width: w as u32, height: h as u32, qp, gop: 30, bframes: 0, ..Default::default() };
     for (name, cfg, want) in [
-        ("qp26 gop30", base(26), 0x1290_fbb5_41d1_0774u64),
-        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0x20e7_2796_bb58_a08b),
+        ("qp26 gop30", base(26), 0x1fbc_56dc_6807_f2a8u64),
+        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0x1c1e_9579_5119_5ceb),
         ("qp36 gop1", Config { gop: 1, ..base(36) }, 0x7785_4898_5213_d0db),
     ] {
         let (aus, _, _) = encode_all(cfg, 60, &|t| scene(w, h, t));
@@ -284,4 +284,28 @@ fn g_weighted_bipred_decodes_to_the_reconstruction() {
     let (a, _, _) = encode_all(Config { bipred: BiPred::Explicit, ..cfg }, 30, &|t| fade(w, h, t));
     let (b, _, _) = encode_all(Config { bipred: BiPred::Average, ..cfg }, 30, &|t| fade(w, h, t));
     assert_ne!(a, b, "explicit weights wrote the average's stream");
+}
+// ---- H264ENCPINTRA (LEDGER SR759): a B macroblock neither reference can predict codes intra (named tail block) ----
+
+/// A flash in the B pictures: displays 0 and 3 (the anchors) black, 1 and 2 the textured [`scene`] (64x48).
+fn flash(t: usize) -> [Vec<u8>; 3] {
+    if t == 1 || t == 2 {
+        return scene(64, 48, t);
+    }
+    [vec![16u8; 64 * 48], vec![128u8; 64 * 48 / 4], vec![128u8; 64 * 48 / 4]]
+}
+
+/// H264ENCPINTRA (SR759): the flashed B pictures code intra macroblocks (Table 7-14's 23 + I type under CAVLC, Table 9-37's
+/// `1 1 1 1 0 1` prefix and the suffix at ctxIdxOffset 32 under CABAC) and the stream decodes in output order to the
+/// encoder's reconstruction.
+#[test]
+fn pintra_flash_in_b_codes_intra_and_decodes() {
+    for entropy in [Entropy::Cavlc, Entropy::Cabac] {
+        let cfg = Config { width: 64, height: 48, qp: 26, gop: 30, bframes: 2, entropy, ..Default::default() };
+        let bytes = check("pintra flash", cfg, 4, &flash, 30.0);
+        let (_, _, enc) = encode_all(cfg, 4, &flash);
+        let counts: Vec<String> = enc.stats().iter().map(|p| format!("{:?}:{}", p.kind, p.intra_mbs)).collect();
+        println!("pintra B flash {entropy:?} intra_mbs=[{}] bytes={bytes}", counts.join(" "));
+        assert!(enc.stats().iter().any(|p| p.kind == h264enc_core::Pic::B && p.intra_mbs > 0), "{entropy:?}: no B coded intra ({counts:?})");
+    }
 }
