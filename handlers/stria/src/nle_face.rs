@@ -577,12 +577,12 @@ impl Face {
         }
         let r = match act {
             "shuttle+" => {
-                self.rate = if self.playing && self.rate > 0 { (self.rate * 2).min(SHUTTLE_MAX) } else { 1 };
+                self.rate = timeline_core::editor::shuttle_rate("shuttle+", self.playing, self.rate, SHUTTLE_MAX); // STRIAKSHUTTLE (SR9061): the ONE ladder both faces call (timeline_core editor.rs tail)
                 self.playing = true; self.sync_audio(); // NLEPLAYAUDIO (SR676)
                 Ok(())
             }
             "shuttle-" => {
-                self.rate = if self.playing && self.rate < 0 { (self.rate * 2).max(-SHUTTLE_MAX) } else { -1 };
+                self.rate = timeline_core::editor::shuttle_rate("shuttle-", self.playing, self.rate, SHUTTLE_MAX); // STRIAKSHUTTLE (SR9061): the ONE ladder both faces call (timeline_core editor.rs tail)
                 self.playing = true; self.sync_audio(); // NLEPLAYAUDIO (SR676)
                 Ok(())
             }

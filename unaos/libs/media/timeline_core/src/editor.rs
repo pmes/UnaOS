@@ -5241,3 +5241,69 @@ impl EditorState {
         Some(r)
     }
 }
+
+// ---- STRIAKSHUTTLE (LEDGER SR9061): the J / K / L shuttle ladder both faces call (named tail block) ----
+// The host face's rule, lifted from `stria::nle_face::Face::key` so the kernel Player's keys take the SAME ladder: the
+// face passes its own ceiling (the host 8, the Player 4). Transport only: no timeline change, no undo step.
+
+/// The shuttle rate after `word` (frames per clock tick, negative = backward): `shuttle+` doubles a forward play up to
+/// `max`, else (paused, or playing backward) gives 1; `shuttle-` is its mirror down to `-max`, else -1; `stop` and any other
+/// word give 1. The caller then plays (`shuttle+` / `shuttle-`) or pauses (`stop`).
+pub fn shuttle_rate(word: &str, playing: bool, rate: i64, max: i64) -> i64 {
+    match word {
+        "shuttle+" => if playing && rate > 0 { rate.saturating_mul(2).min(max) } else { 1 },
+        "shuttle-" => if playing && rate < 0 { rate.saturating_mul(2).max(-max) } else { -1 },
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod striakshuttle_tests {
+    use super::shuttle_rate;
+
+    /// STRIAKSHUTTLE M3: the Player's ceiling: L from 1x doubles to 2x, 4x and holds at 4x.
+    #[test]
+    fn striakshuttle_ladder_kernel_ceiling() {
+        let mut r = 1;
+        let mut seen = alloc::vec::Vec::new();
+        for _ in 0..4 {
+            r = shuttle_rate("shuttle+", true, r, 4);
+            seen.push(r);
+        }
+        assert_eq!(seen, [2, 4, 4, 4]);
+    }
+
+    /// STRIAKSHUTTLE M3: the host's ceiling (SHUTTLE_MAX 8): 2, 4, 8, held at 8; the mirror goes to -8.
+    #[test]
+    fn striakshuttle_ladder_host_ceiling() {
+        let (mut f, mut b) = (1, -1);
+        for _ in 0..4 {
+            f = shuttle_rate("shuttle+", true, f, 8);
+            b = shuttle_rate("shuttle-", true, b, 8);
+        }
+        assert_eq!((f, b), (8, -8));
+    }
+
+    /// STRIAKSHUTTLE M3: from a paused face either word starts at 1x its way, whatever the rate held.
+    #[test]
+    fn striakshuttle_from_paused_is_one() {
+        assert_eq!(shuttle_rate("shuttle+", false, 4, 8), 1);
+        assert_eq!(shuttle_rate("shuttle-", false, -4, 8), -1);
+        assert_eq!(shuttle_rate("shuttle+", false, 1, 4), 1);
+    }
+
+    /// STRIAKSHUTTLE M3: a direction change restarts at 1x the other way.
+    #[test]
+    fn striakshuttle_direction_change() {
+        assert_eq!(shuttle_rate("shuttle-", true, 4, 8), -1);
+        assert_eq!(shuttle_rate("shuttle+", true, -8, 8), 1);
+    }
+
+    /// STRIAKSHUTTLE M3: `stop` (K) is 1x from any rate.
+    #[test]
+    fn striakshuttle_stop_is_one() {
+        for r in [-8, -1, 1, 2, 4, 8] {
+            assert_eq!(shuttle_rate("stop", true, r, 8), 1);
+        }
+    }
+}
