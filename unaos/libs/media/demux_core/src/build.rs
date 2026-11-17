@@ -374,8 +374,8 @@ pub struct Mp4Extras {
     pub colour: Vec<(u32, crate::colour::Colour)>,
     /// H264ENCHRDMP4 (SR720): per track id, the `btrt` (bufferSizeDB, maxBitrate, avgBitrate) its sample entry carries, the last child.
     pub btrt: Vec<(u32, (u32, u32, u32))>,
-    /// STRIACHAPTERSMP4 (SR9076): chapters as (start in ns from the movie's start, title): a Nero `moov/udta/chpl` (MP4 only; Matroska writes none).
-    pub chapters: Vec<(i64, alloc::string::String)>,
+    /// STRIACHAPTERSMP4 (SR9076): chapters as (start in ns from the movie's start, title): a Nero `moov/udta/chpl`; STRIACHAPTERSMKV (SR9096): the Matroska one-shot writes them as Chapters.
+    pub chapters: Vec<(i64, alloc::string::String, Option<i64>)>, // STRIACHAPTERSMKV (SR9096): a ranged marker's end (ns) too, Matroska's ChapterTimeEnd (chpl has none); the Matroska one-shot writes them as Chapters (file tail)
 }
 
 fn track_duration(t: &MediaTrack) -> u64 {
@@ -2043,7 +2043,7 @@ pub fn mux(tracks: &[MediaTrack], c: Container, x: &Mp4Extras) -> Result<Vec<u8>
         return Ok(mp4_with(tracks, &Mp4Options::default(), x));
     }
     mkv_refuses_extras(x)?;
-    let mut st = MkvStream::begin(Vec::new()).map_err(never)?;
+    let mut st = MkvStream::begin(Vec::new()).map_err(never)?; st.chapters(&x.chapters).map_err(never)?; // STRIACHAPTERSMKV (SR9096): the Chapters before the first Cluster (file tail)
     let ids = tracks.iter().map(|t| st.track(t.spec.clone())).collect::<Result<Vec<usize>, _>>()?;
     for (i, k) in decode_order(tracks) {
         st.push(ids[i], tracks[i].samples[k].clone()).map_err(never)?;
@@ -2298,7 +2298,7 @@ mod synth_reel_kats {
 // at a char boundary). At most 255 chapters (the first 255). No chapter: no `udta` at all (every pinned file keeps its bytes).
 
 /// STRIACHAPTERSMP4 (SR9076): `udta` holding one `chpl` of `ch` ((start ns, title)), or nothing when `ch` is empty.
-fn udta_chpl(ch: &[(i64, alloc::string::String)]) -> Vec<u8> {
+fn udta_chpl(ch: &[(i64, alloc::string::String, Option<i64>)]) -> Vec<u8> {
     if ch.is_empty() {
         return Vec::new();
     }
@@ -2306,7 +2306,7 @@ fn udta_chpl(ch: &[(i64, alloc::string::String)]) -> Vec<u8> {
     let mut b = Vec::new();
     b.u32b(0);
     b.push(take.len() as u8);
-    for (ns, title) in take {
+    for (ns, title, _) in take {
         b.u64b((*ns).max(0) as u64 / 100);
         let mut n = title.len().min(255);
         while !title.is_char_boundary(n) {
@@ -2331,7 +2331,7 @@ mod chpl_kats {
         let plain = synth_reel(1000, 30, 25, &Mp4Extras::default());
         assert!(!plain.windows(4).any(|w| w == b"udta"));
         let long: String = core::iter::repeat('x').take(300).collect();
-        let x = Mp4Extras { chapters: vec![(80_000_000, String::from("Act 1")), (400_000_000, long)], ..Default::default() };
+        let x = Mp4Extras { chapters: vec![(80_000_000, String::from("Act 1"), None), (400_000_000, long, Some(500_000_000))], ..Default::default() };
         let file = synth_reel(1000, 30, 25, &x);
         let mut want = vec![0u8, 0, 0, 0, 2];
         want.extend_from_slice(&800_000u64.to_be_bytes());
@@ -2353,5 +2353,106 @@ mod chpl_kats {
             let rows = |d: &crate::Demuxer| d.track_samples(i).map(|s| d.sample_data(s).to_vec()).collect::<Vec<_>>();
             assert_eq!(rows(&a), rows(&b), "track {i} samples unchanged");
         }
+    }
+}
+
+// ---- STRIACHAPTERSMKV (LEDGER SR9096): Matroska Chapters from the export's chapter list (named tail block) ----
+// The one-shot Matroska ([`mux`]) writes the same list the MP4's `chpl` carries as ONE Chapters (0x1043A770) / EditionEntry
+// (0x45B9), after the Tracks' room and before the first Cluster (a reader walking the Segment's head finds it without a
+// Seek; the SeekHead keeps its two entries, so every pinned file keeps its bytes). Per chapter a ChapterAtom (0xB6):
+// ChapterUID (0x73C4) = its index + 1, ChapterTimeStart (0x91) in ns (unscaled), ChapterTimeEnd (0x92) for a ranged
+// marker, ChapterDisplay (0x80) { ChapString (0x85) the whole title, ChapLanguage (0x437C) "eng" }. No chapter: nothing.
+// The streamed export ([`MuxStream`], the kernel's) writes none (NLE-CHAPTERS-STREAM owed).
+
+impl<S: Sink> MkvStream<S> {
+    /// STRIACHAPTERSMKV (SR9096): write `ch` ((start ns, title, end ns)) as the file's Chapters at the end of what is
+    /// written. Call it BEFORE the first [`MkvStream::push`]: with a Cluster open, or no chapter, it writes nothing.
+    pub fn chapters(&mut self, ch: &[(i64, alloc::string::String, Option<i64>)]) -> Result<(), S::Error> {
+        if ch.is_empty() || self.cluster.is_some() {
+            return Ok(());
+        }
+        let c = mkv_chapters(ch);
+        self.sink.write_at(self.end, &c)?;
+        self.end += c.len() as u64;
+        Ok(())
+    }
+}
+
+/// STRIACHAPTERSMKV (SR9096): the Chapters element of `ch` (see the block comment).
+fn mkv_chapters(ch: &[(i64, alloc::string::String, Option<i64>)]) -> Vec<u8> {
+    let mut ed = Vec::new();
+    for (i, (ns, title, end)) in ch.iter().enumerate() {
+        let mut a = cat(&[&el_uint(0x73C4, i as u64 + 1), &el_uint(0x91, (*ns).max(0) as u64)]);
+        if let Some(e) = end {
+            a.extend_from_slice(&el_uint(0x92, (*e).max(0) as u64));
+        }
+        a.extend_from_slice(&el(0x80, &cat(&[&el(0x85, title.as_bytes()), &el(0x437C, b"eng")])));
+        ed.extend_from_slice(&el(0xB6, &a));
+    }
+    el(0x1043_A770, &el(0x45B9, &ed))
+}
+
+#[cfg(test)]
+mod chapters_mkv_kats {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+
+    fn pcm() -> MediaTrack {
+        let pcm: Vec<i16> = (0..48_000 * 2 / 5).map(|i| (i % 3000) as i16 - 1500).collect();
+        pcm16_track(1, 48_000, 2, &pcm, 1024)
+    }
+
+    /// STRIACHAPTERSMKV M3: two chapters (the second ranged) = the exact Chapters element, after the Tracks and before
+    /// the first Cluster; no chapter = the bytes of the default extras; the samples are unchanged; `mkv::chapters` and
+    /// `facts::chapters_of` read the starts and titles back.
+    #[test]
+    fn striachaptersmkv_mkv_chapters_bytes() {
+        let t = [pcm()];
+        let plain = mux(&t, Container::Mkv, &Mp4Extras::default()).unwrap();
+        assert!(!plain.windows(4).any(|w| w == [0x10, 0x43, 0xA7, 0x70]), "no Chapters without chapters");
+        let ch = vec![(80_000_000i64, String::from("Act 1"), None), (400_000_000, String::from("End"), Some(800_000_000))];
+        let file = mux(&t, Container::Mkv, &Mp4Extras { chapters: ch.clone(), ..Default::default() }).unwrap();
+        let atom = |uid: u8, start: &[u8], end: &[u8], title: &[u8]| {
+            let mut a = vec![0x73, 0xC4, 0x81, uid, 0x91, 0x80 | start.len() as u8];
+            a.extend_from_slice(start);
+            a.extend_from_slice(end);
+            let disp = [&[0x85, 0x80 | title.len() as u8][..], title, &[0x43, 0x7C, 0x83][..], &b"eng"[..]].concat();
+            a.extend_from_slice(&[0x80, 0x80 | disp.len() as u8]);
+            a.extend_from_slice(&disp);
+            [&[0xB6, 0x80 | a.len() as u8][..], &a[..]].concat()
+        };
+        let ed = [atom(1, &[0x04, 0xC4, 0xB4, 0x00], &[], b"Act 1"), atom(2, &[0x17, 0xD7, 0x84, 0x00], &[0x92, 0x84, 0x2F, 0xAF, 0x08, 0x00], b"End")].concat();
+        let edition = [&[0x45, 0xB9, 0x80 | ed.len() as u8][..], &ed[..]].concat();
+        let want = [&[0x10, 0x43, 0xA7, 0x70, 0x80 | edition.len() as u8][..], &edition[..]].concat();
+        assert_eq!(mkv_chapters(&ch), want);
+        let at = file.windows(want.len()).position(|w| w == want.as_slice()).expect("Chapters written");
+        let cluster = file.windows(4).position(|w| w == [0x1F, 0x43, 0xB6, 0x75]).unwrap();
+        let tracks = file.windows(4).position(|w| w == [0x16, 0x54, 0xAE, 0x6B]).unwrap();
+        assert!(tracks < at && at + want.len() <= cluster, "after the Tracks, before the first Cluster");
+        assert_eq!(file.len(), plain.len() + want.len());
+        assert_eq!(mux(&t, Container::Mkv, &Mp4Extras { chapters: Vec::new(), ..Default::default() }).unwrap(), plain);
+        let (a, b) = (crate::Demuxer::open(plain).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
+        let rows = |d: &crate::Demuxer| d.track_samples(0).map(|s| d.sample_data(s).to_vec()).collect::<Vec<_>>();
+        assert_eq!(rows(&a), rows(&b), "samples unchanged");
+        let back = vec![(80_000_000i64, String::from("Act 1")), (400_000_000, String::from("End"))];
+        assert_eq!(crate::mkv::chapters(&file), back);
+        assert_eq!(crate::facts::chapters_of(&file), back);
+    }
+
+    /// STRIACHAPTERSMKV M3: SR9076's `chpl` reads back (100 ns starts, the 255-byte cut title); a file without one, and
+    /// bytes that are no container, give none.
+    #[test]
+    fn striachaptersmkv_chapters_read_back() {
+        let long: String = core::iter::repeat('x').take(300).collect();
+        let x = Mp4Extras { chapters: vec![(80_000_050, String::from("Act 1"), None), (400_000_000, long, None)], ..Default::default() };
+        let file = synth_reel(1000, 30, 25, &x);
+        let cut: String = core::iter::repeat('x').take(255).collect();
+        let back = vec![(80_000_000i64, String::from("Act 1")), (400_000_000, cut)];
+        assert_eq!(crate::mp4::chapters(&file), back);
+        assert_eq!(crate::facts::chapters_of(&file), back);
+        assert!(crate::mp4::chapters(&synth_reel(1000, 30, 25, &Mp4Extras::default())).is_empty());
+        assert!(crate::facts::chapters_of(b"not a container at all").is_empty());
+        assert!(crate::mkv::chapters(&mux(&[pcm()], Container::Mkv, &Mp4Extras::default()).unwrap()).is_empty());
     }
 }

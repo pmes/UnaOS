@@ -15125,3 +15125,37 @@ fn striawavecachepref_readonly_dir_falls_back() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     println!("striawavecachepref: read-only dir root={root} alt={} buckets={}", alt.display(), first.buckets.len());
 }
+
+// ---- STRIACHAPTERSMKV (LEDGER SR9096): a Matroska export carries Chapters; a re-imported export shows its markers (named tail block) ----
+
+/// SR9076's fixture (markers 5 / 12 / 20, the last ranged to the range end; range 10..30) exported as Matroska and as MP4:
+/// the `.mkv` carries a Chapters element with the ranged marker's ChapterTimeEnd; each file opened through
+/// `Sources::from_media` (the one import door) shows the two in-range chapters as point markers at ticks 2 and 10.
+#[test]
+fn striachaptersmkv_export_reimports_markers() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as};
+    let (tl, src) = synth_fixture();
+    let tl = tl.mark(5, "Intro").unwrap().mark(12, "Act 1").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap();
+    for (c, ext) in [(Container::Mkv, "mkv"), (Container::Mp4, "mp4")] {
+        let dir = nlefaceexport_dir(&format!("striachaptersmkv-{ext}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        export_as(&tl, 10..30, &src, &dir, Box::new(PngSequence), AudioOut::Mp4, c).unwrap();
+        let file = std::fs::read(dir.join(format!("audio.{ext}"))).unwrap();
+        if ext == "mkv" {
+            assert!(file.windows(4).any(|w| w == [0x10, 0x43, 0xA7, 0x70]), "the Matroska Chapters element");
+            assert!(file.windows(6).any(|w| w == [0x92, 0x84, 0x2F, 0xAF, 0x08, 0x00]), "End's ChapterTimeEnd at 800 ms");
+        }
+        let (back, _) = Sources::from_media("RE", &file, 25).unwrap().expect("the export opens as media");
+        let marks: Vec<(i64, &str)> = back.markers.iter().map(|m| (m.at, m.name.as_str())).collect();
+        assert_eq!(marks, vec![(2, "Act 1"), (10, "End")], "{ext}: the chapters as markers");
+        println!("striachaptersmkv: audio.{ext} {} bytes re-imports markers {marks:?}", file.len());
+    }
+    let none = nlefaceexport_dir("striachaptersmkv-none");
+    std::fs::create_dir_all(&none).unwrap();
+    let mut bare = tl.clone();
+    bare.markers.clear();
+    export_as(&bare, 10..30, &src, &none, Box::new(PngSequence), AudioOut::Mp4, Container::Mkv).unwrap();
+    let file = std::fs::read(none.join("audio.mkv")).unwrap();
+    assert!(!file.windows(4).any(|w| w == [0x10, 0x43, 0xA7, 0x70]), "no markers, no Chapters");
+    assert!(Sources::from_media("RE", &file, 25).unwrap().unwrap().0.markers.is_empty());
+}
