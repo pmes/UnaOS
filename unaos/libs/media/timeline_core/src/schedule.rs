@@ -533,10 +533,10 @@ fn opacity_mix(
     m_next: &mut Option<(SourceId, i64)>,
 ) -> Result<Option<VideoMix>, ScheduleError> {
     let c = tl.tracks[ti].clips[ci];
-    if c.opacity == crate::OPAQUE && c.xform == crate::Xform::NONE { // STRIAPOSITIONSCALE (SR879): a placed clip is the two-layer case too
+    if c.opacity == crate::OPAQUE && !c.placed() { // STRIAPOSITIONSCALE (SR879): a placed clip is the two-layer case too
         return Ok(vmix);
     }
-    if vmix.is_some() && c.xform != crate::Xform::NONE { return Err(ScheduleError::Xform(c.src)); } if vmix.is_some() { // STRIAPOSITIONSCALE (SR879): a placed clip over a transition, named
+    if vmix.is_some() && c.placed() { return Err(ScheduleError::Xform(c.src)); } if vmix.is_some() { // STRIAPOSITIONSCALE (SR879): a placed clip over a transition, named
         return Err(ScheduleError::Opacity(c.src));
     }
     let lower = below(tl, ti, t);
@@ -549,7 +549,7 @@ fn opacity_mix(
         return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
     };
     let lc = tl.tracks[li].clips[lci];
-    if lc.xform != crate::Xform::NONE { return Err(ScheduleError::Xform(c.src)); } if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+    if lc.placed() { return Err(ScheduleError::Xform(c.src)); } if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
         return Err(ScheduleError::Opacity(c.src));
     }
     let src_t = lc.src_in + (t - lc.at);

@@ -199,7 +199,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
@@ -3252,5 +3252,28 @@ mod striaxformthree_tests {
         assert_eq!(face.last_error, None);
         assert_eq!(face.state.undo_depth(), 5);
         assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform::PIP));
+    }
+}
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): the witness's placement key tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformkeys_tests {
+    use super::*;
+
+    /// STRIAXFORMKEYS (SR9049): `pip:key` / `pip:unkey` are timeline_core's key words on the selected clip at the
+    /// playhead, one undo step each, no error; `pip:unkey` with no point there is refused by name and commits nothing.
+    #[test]
+    fn striaxformkeys_witness_key_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        face.state.playhead = 12;
+        let errors = drive(&mut face, "pip:tl,pip:key");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((face.state.undo_depth(), face.state.selected().map(|c| c.xkeys.len())), (2, Some(1)));
+        assert!(drive(&mut face, "pip:unkey").is_empty());
+        assert_eq!(face.state.selected().map(|c| c.xkeys.len()), Some(0));
+        assert_eq!(drive(&mut face, "pip:unkey"), vec![format!("pip unkey: {}", timeline_core::EditError::XKey)]);
+        assert_eq!(face.state.undo_depth(), 3);
     }
 }

@@ -943,7 +943,7 @@ impl EditorState {
 impl EditorState {
     /// Roll the cut at the selected clip's out edge by `d` ticks (`Timeline::roll`).
     pub fn roll_selected(&mut self, d: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if let Some(r) = self.xkey_set(xf) { return r; } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAXFORMKEYS (SR9049): a keyed clip's placement word edits the point at the playhead (file tail)
         let tl = self.timeline.roll(track, idx, d)?;
         self.commit(tl);
         Ok(())
@@ -2435,7 +2435,7 @@ impl EditorState {
         if word != "pip" && word != "scale" {
             return None;
         }
-        let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+        let Some(cur) = self.selected().map(|c| c.xform_at(self.playhead)) else { return Some(Err(EditError::NoClip)) };
         let n: Vec<Option<u16>> = args.iter().map(|x| x.parse().ok()).collect();
         let xf = match (word, args, n.as_slice()) {
             ("pip", [], _) => crate::Xform::PIP,
@@ -3085,7 +3085,7 @@ impl EditorState {
         let xf = match w.as_slice() {
             ["pip", c] => crate::Xform::corner(c)?,
             [step @ ("scale-" | "scale+")] => {
-                let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+                let Some(cur) = self.selected().map(|c| c.xform_at(self.playhead)) else { return Some(Err(EditError::NoClip)) };
                 match cur.fit_step(if *step == "scale+" { d } else { -d }) { // STRIAXFORMMORE (SR975): a step at an edge clamps (file tail)
                     Some(xf) => xf,
                     None => return Some(Err(EditError::Xform)),
@@ -3516,7 +3516,7 @@ impl EditorState {
 impl EditorState {
     /// The nudge words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xform_nudge_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let n = crate::Xform::NUDGE_STEP as i32;
+        if let Some(r) = self.xkey_verb(v) { return Some(r); } let n = crate::Xform::NUDGE_STEP as i32; // STRIAXFORMKEYS (SR9049): `pip key|unkey`, `pip unkey all` (file tail)
         let (dx, dy) = match v.split_ascii_whitespace().collect::<Vec<&str>>().as_slice() {
             ["pip", "left"] => (-n, 0),
             ["pip", "right"] => (n, 0),
@@ -3524,7 +3524,7 @@ impl EditorState {
             ["pip", "down"] => (0, n),
             _ => return None,
         };
-        let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+        let Some(cur) = self.selected().map(|c| c.xform_at(self.playhead)) else { return Some(Err(EditError::NoClip)) };
         Some(match cur.nudged(dx, dy) {
             Some(xf) => self.set_xform(xf),
             None => self.set_xform(cur).and(Err(EditError::Xform)),
@@ -4518,5 +4518,65 @@ mod striamarkerranges_tests {
         assert_eq!(marker_style_word("marker marks"), None);
         assert_eq!(jump_word("marker marks"), None);
         assert_eq!(mark_words("marker marks"), None);
+    }
+}
+
+// ---- STRIAXFORMKEYS (LEDGER SR9049): the placement keyframe words through the one commit (named tail block) ----
+// `pip key` adds (or replaces) a point at the playhead holding the placement shown there; `pip unkey` removes the point
+// at the playhead; `pip unkey all` clears every point. On a keyed clip every placement word (SR879 / SR938 / SR975) edits
+// the point at the playhead through [`EditorState::set_xform`]'s fold ([`EditorState::xkey_set`]); the placement shown
+// there unchanged commits nothing. Each ONE `commit` (undo-able). Refused: no clip selected `EditError::NoClip`; an audio
+// clip `EditError::Kind`; the playhead off the selected clip, a ninth point, no point to remove `EditError::XKey`.
+impl EditorState {
+    /// The selected clip with the points `keys` (one commit; the same points again commit nothing).
+    pub fn set_xkeys(&mut self, keys: crate::XKeys) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_xkeys(track, idx, keys)?;
+        if tl == self.timeline {
+            return Ok(());
+        }
+        self.commit(tl);
+        Ok(())
+    }
+    /// A placement on a KEYED selected clip: the point at the playhead set to `xf`; `None` when the selected clip has no
+    /// points (SR879's static placement, as before).
+    fn xkey_set(&mut self, xf: crate::Xform) -> Option<Result<(), EditError>> {
+        let c = self.selected().filter(|c| !c.xkeys.is_empty())?;
+        if !c.covers(self.playhead) {
+            return Some(Err(EditError::XKey));
+        }
+        if !xf.ok() {
+            return Some(Err(EditError::Xform));
+        }
+        if c.xform_at(self.playhead) == xf {
+            return Some(Ok(()));
+        }
+        Some(match c.xkeys.with(c.src_tick(self.playhead), xf) {
+            Some(k) => self.set_xkeys(k),
+            None => Err(EditError::XKey),
+        })
+    }
+    /// The key words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn xkey_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if !matches!(w.as_slice(), ["pip", "key"] | ["pip", "unkey"] | ["pip", "unkey", "all"]) {
+            return None;
+        }
+        let Some(c) = self.selected() else { return Some(Err(EditError::NoClip)) };
+        if self.selection.is_some_and(|(t, _)| self.timeline.tracks.get(t).is_some_and(|tr| tr.kind != crate::Kind::Video)) {
+            return Some(Err(EditError::Kind));
+        }
+        let ph = self.playhead;
+        let keys = match w.as_slice() {
+            ["pip", "unkey", "all"] if !c.xkeys.is_empty() => Some(crate::XKeys::NONE),
+            ["pip", "unkey", "all"] => None,
+            _ if !c.covers(ph) => None,
+            ["pip", "key"] => c.xkeys.with(c.src_tick(ph), c.xform_at(ph)),
+            _ => c.xkeys.without(c.src_tick(ph)),
+        };
+        Some(match keys {
+            Some(k) => self.set_xkeys(k),
+            None => Err(EditError::XKey),
+        })
     }
 }
