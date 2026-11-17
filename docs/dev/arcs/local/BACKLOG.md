@@ -62,7 +62,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 36. STRIAEXPORTAACBITRATE — `--audio aac:KBPS` on the face's export verb (the CLI has it: measure the face's export_usage word list).
 37. STRIAIMPORTIMAGESEQUENCE — `open` of a `frame_%04d.png` pattern as a video source (a PNG-sequence demux arm in Sources; `lux::decode_png` EXISTS).
 38. STRIAIMPORTWAV — a `.wav` as an audio source (measure whether demux_core has a WAV demux; if not, ONE 44-byte header reader + PCM frames).
-39. STRIASOURCEINFO — `info` shows the selected source's `summary_parts` (media.rs :1292 EXISTS) on the message row for 5 s; stria-view `"info"`.
+39. [SR875 started] STRIASOURCEINFO — `info` shows the selected source's `summary_parts` (media.rs :1292 EXISTS) on the message row for 5 s; stria-view `"info"`.
 
 ## F. Cross-cutting
 40. STRIAPERFPAINTBUDGET — a per-paint time readout (ms) on stria-view (`"paint_ms"`) and a pin: a 60-clip timeline paints under 8 ms at 1920x1200 (measure first; name the hot spot if it fails).
