@@ -164,7 +164,7 @@ pub struct PaintStyle<H: Host> {
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
-    pub rtl: Option<bool>,
+    pub rtl: Option<bool>, pub unicode_bidi: Option<u8>,
     /// text-shadow (css-text-decor-3 §4): none = Some(empty).
     pub text_shadows: Option<Vec<H::Shadow>>,
     /// AETHERGEN (SR71): the author-styled `::marker` of a list item (`generated::generate`).
@@ -326,7 +326,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_rel: None,
             stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None, inherit: 0,
             word_spacing: None,
-            rtl: None,
+            rtl: None, unicode_bidi: None,
             text_shadows: None,
             marker: None,
             clear: None,
@@ -1002,7 +1002,7 @@ pub fn line_height_length_px(mult: f32) -> f32 {
 }
 
 /// AETHERLINEHEIGHTZERO (SR843): the arm's write for an author value: a RAW zero (`0`, `0px`, `0%`) is
-/// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (a negative keeps today's clamp to 0.0).
+/// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (SR1017: the arm refuses a negative before this call).
 pub fn line_height_zero_or(raw: f32, encoded: f32) -> f32 {
     if raw == 0.0 { LINE_HEIGHT_ZERO } else { encoded }
 }

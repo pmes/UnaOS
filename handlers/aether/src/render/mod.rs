@@ -17,7 +17,7 @@ struct Inherited {
     no_synth: u8, caps: u8,
     word_spacing: f32,
     /// direction: rtl
-    rtl: bool,
+    rtl: bool, bidi_ovr: u8,
     /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
     text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
@@ -53,7 +53,7 @@ impl Inherited {
     }
     /// The measurer/shaper of this text: face stack, size, spacing, direction.
     fn advancer(&self) -> Advancer {
-        Advancer::new(self.sel(), self.font_size, self.letter_spacing).with_word_spacing(self.word_spacing).with_dir(self.rtl).with_small_caps(layout_core::paint::small_caps_synth(self.caps))
+        Advancer::new(self.sel(), self.font_size, self.letter_spacing).with_word_spacing(self.word_spacing).with_dir(self.rtl).with_small_caps(layout_core::paint::small_caps_synth(self.caps)).with_bidi_override(self.bidi_ovr)
     }
     fn shadows<'a>(&self, layout: &'a LayoutTree) -> &'a [effects::Shadow] {
         self.text_shadow
@@ -483,7 +483,7 @@ fn root_inherited() -> Inherited {
         stretch: 100,
         no_synth: 0, caps: 0,
         word_spacing: 0.0,
-        rtl: false,
+        rtl: false, bidi_ovr: 0,
         text_shadow: None,
         line_height: 0.0, // natural
         underline: false, deco_color: None,
@@ -1023,7 +1023,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(ws) = spec.word_spacing {
         inherited.word_spacing = ws;
     }
-    inherited.rtl = spec.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_DIRECTION, inherited.rtl, |r| crate::layout::default_rtl(dom_node, r)));
+    inherited.rtl = spec.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_DIRECTION, inherited.rtl, |r| crate::layout::default_rtl(dom_node, r))); inherited.bidi_ovr = bidi_override_of(inherited.bidi_ovr, inherited.rtl, unicode_bidi_of(tag, spec, dom_node));
     inherited.family = spec
         .family
         .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FAMILY, inherited.family, |f| crate::layout::default_family(tag, f)));
@@ -4652,6 +4652,40 @@ fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintSty
     }
     if let Some(c) = spec.decoration_color {
         inherited.deco_color = c;
+    }
+}
+
+// ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): the unicode-bidi tag road and the paint-time override (named tail block) ----
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): the `unicode-bidi` code an element takes (`layout_core::css::unicode_bidi_code`'s codes):
+/// its own declared value, else Blink's UA defaults: html.css `bdo { unicode-bidi: isolate-override }` (4), `bdi, output
+/// { unicode-bidi: isolate }` (2), and the `dir` presentation attribute on any other element (HTMLElement::
+/// CollectStyleForPresentationAttribute: isolate, `dir=auto` on pre / textarea plaintext 5); else normal (0). Not
+/// inherited. ONE fn for the painter (`inherit_element`) and `css::computed_report`.
+pub(crate) fn unicode_bidi_of(tag: &str, spec: &crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef) -> u8 {
+    if let Some(u) = spec.unicode_bidi {
+        return u;
+    }
+    match tag {
+        "bdo" => 4,
+        "bdi" | "output" => 2,
+        _ => match layout_core::DomNode::attr(dom_node, "dir").map(|d| d.trim().to_ascii_lowercase()) {
+            Some(d) if d == "auto" && matches!(tag, "pre" | "textarea") => 5,
+            Some(_) => 2,
+            None => 0,
+        },
+    }
+}
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): the override in effect inside an element (0 none, 1 LRO, 2 RLO; the shaper's
+/// `Advancer::with_bidi_override`): bidi-override / isolate-override (3 / 4) override in the element's own direction;
+/// embed / isolate / plaintext (1 / 2 / 5) open a new embedding whose override status is neutral (UAX #9 X2-X5); normal
+/// (0) keeps the parent's.
+fn bidi_override_of(parent: u8, rtl: bool, ub: u8) -> u8 {
+    match ub {
+        3 | 4 => if rtl { 2 } else { 1 },
+        1 | 2 | 5 => 0,
+        _ => parent,
     }
 }
 

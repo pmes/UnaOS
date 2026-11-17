@@ -51,3 +51,58 @@ fn vertical_lines_boxes_and_logical_mapping() {
     assert_eq!(writing::to_physical(writing::SIDEWAYS_LR, 0, 3, 40, 100, &none), (3, 99));
     assert_eq!(writing::logical_sides(writing::VERTICAL_RL, false), ("top", "bottom", "right", "left"));
 }
+
+// ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): css-writing-modes-4 §2.2 the unicode-bidi arm (named tail block) ----
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): `unicode-bidi` declared in order on one rule, its `PaintStyle::unicode_bidi` code.
+fn unicode_bidi_after(decls: &[&str]) -> Option<u8> {
+    let cx = layout_core::css::ParseCx::new(600.0, 400.0);
+    let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+    for v in decls {
+        layout_core::css::apply_declaration("unicode-bidi", v, &mut s, &cx);
+    }
+    s.paint.unicode_bidi
+}
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): the six keywords, ASCII-case-insensitive, and nothing written without a declaration.
+#[test]
+fn unicode_bidi_keywords() {
+    assert_eq!(unicode_bidi_after(&[]), None, "undeclared: the tag road decides");
+    for (v, want) in [
+        ("normal", 0), ("embed", 1), ("isolate", 2), ("bidi-override", 3), ("isolate-override", 4), ("plaintext", 5),
+        ("BIDI-OVERRIDE", 3), ("Isolate-Override", 4), (" plaintext ", 5),
+    ] {
+        assert_eq!(unicode_bidi_after(&[v]), Some(want), "unicode-bidi: {v:?}");
+        assert_eq!(layout_core::css::unicode_bidi_code(v), Some(want), "unicode_bidi_code({v:?})");
+    }
+}
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): not inherited, so `initial` / `unset` are normal and beat an earlier bidi-override;
+/// `inherit` (owed to the non-inherited inherit road), `revert` and garbage keep the earlier value.
+#[test]
+fn unicode_bidi_initial_unset_and_invalid() {
+    assert_eq!(unicode_bidi_after(&["bidi-override", "initial"]), Some(0));
+    assert_eq!(unicode_bidi_after(&["bidi-override", "UNSET"]), Some(0));
+    assert_eq!(unicode_bidi_after(&["isolate", "inherit"]), Some(2));
+    assert_eq!(unicode_bidi_after(&["isolate", "revert"]), Some(2));
+    assert_eq!(unicode_bidi_after(&["embed", "sideways"]), Some(1));
+    assert_eq!(unicode_bidi_after(&["garbage"]), None);
+}
+
+/// AETHERCSSOMUNICODEBIDI (SR1008): `merge_paint` carries the field: a later rule's value wins, an undeclared one keeps it.
+#[test]
+fn unicode_bidi_merges() {
+    let cx = layout_core::css::ParseCx::new(600.0, 400.0);
+    let mut a = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("unicode-bidi", "isolate-override", &mut a, &cx);
+    let mut b = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("direction", "rtl", &mut b, &cx);
+    let mut dst = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::merge_paint(&mut dst.paint, &a.paint);
+    layout_core::css::merge_paint(&mut dst.paint, &b.paint);
+    assert_eq!(dst.paint.unicode_bidi, Some(4), "an undeclared later rule keeps it");
+    let mut c = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("unicode-bidi", "normal", &mut c, &cx);
+    layout_core::css::merge_paint(&mut dst.paint, &c.paint);
+    assert_eq!(dst.paint.unicode_bidi, Some(0), "a later normal wins");
+}
