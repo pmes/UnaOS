@@ -1280,10 +1280,10 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 22; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 25; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
-    "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi",
+    "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1433,6 +1433,9 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 st.as_ref().map(|s| lp(s.padding.top)).unwrap_or_else(|| px(0.0)),
                 st.as_ref().map(|s| lpa_s(s.margin.top)).unwrap_or_else(|| px(0.0)),
                 flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(), unicode_bidi_word(crate::render::unicode_bidi_of(tag, &paint, &any.node_at(id))).to_string(),
+                white_space_longhands(me.white_space).0.to_string(),
+                white_space_longhands(me.white_space).1.to_string(),
+                rgb(paint.decoration_color.flatten().unwrap_or(me.color)),
             ];
             out.insert(id, values);
             inh.insert(id, me);
@@ -1826,5 +1829,20 @@ fn unicode_bidi_word(c: u8) -> &'static str {
         4 => "isolate-override",
         5 => "plaintext",
         _ => "normal",
+    }
+}
+
+// ---- AETHERCSSOMCOLUMNSREST (LEDGER SR1036): white-space's two css-text-4 longhands from the one code (named tail block) ----
+
+/// AETHERCSSOMCOLUMNSREST (SR1036): a `PaintStyle::white_space` code (the codes [`white_space_word`] reads) as its
+/// css-text-4 §4 longhand pair `(white-space-collapse, text-wrap-mode)`, as Chromium's getComputedStyle reports them.
+fn white_space_longhands(c: u8) -> (&'static str, &'static str) {
+    match c {
+        1 => ("collapse", "nowrap"),
+        2 => ("preserve", "nowrap"),
+        3 => ("preserve", "wrap"),
+        4 => ("preserve-breaks", "wrap"),
+        5 => ("break-spaces", "wrap"),
+        _ => ("collapse", "wrap"),
     }
 }
