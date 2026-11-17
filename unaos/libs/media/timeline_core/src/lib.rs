@@ -1528,3 +1528,31 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIACOPYPASTE (LEDGER SR854): paste through place (named tail block) ----
+// The editor's `paste` lays its clipboard through THE placement road, `Timeline::place` in `Mode::Overwrite`, item by item
+// on the running value. A paste never overwrites: an item whose `[at, end)` meets a clip already on its track is refused
+// `EditError::Overlap` BEFORE `place` (whose carve of the empty hole is then a no-op), so the hole is always empty.
+
+impl Timeline {
+    /// Lay `items` (`(track, the kind it was copied from, clip at its landing tick)`) as ONE edit. Refused by name, the
+    /// whole paste together: none `EditError::NoClip`; a missing track `NoTrack`; a track of the other kind `Kind`; an
+    /// item meeting a clip already on its track `Overlap`; anything `place` itself refuses.
+    pub fn paste(&self, items: &[(usize, Kind, Clip)]) -> Result<Timeline, EditError> {
+        if items.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let mut tl = self.clone();
+        for &(track, kind, clip) in items {
+            let t = tl.tracks.get(track).ok_or(EditError::NoTrack)?;
+            if t.kind != kind {
+                return Err(EditError::Kind);
+            }
+            if t.clips.iter().any(|c| c.at < clip.end() && clip.at < c.end()) {
+                return Err(EditError::Overlap);
+            }
+            tl = tl.place(track, clip, Mode::Overwrite)?;
+        }
+        Ok(tl)
+    }
+}

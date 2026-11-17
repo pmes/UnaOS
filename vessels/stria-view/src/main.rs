@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,32 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIACOPYPASTE (LEDGER SR854): the copy / cut / paste buttons and `--do` words (named tail block) ----
+
+#[cfg(test)]
+mod striacopypaste_tests {
+    use super::*;
+
+    /// `--do at:12:0,copy,ruler:35,paste`: B copied off V1, laid at the ruler's tick on V1 (the selected track), one undo
+    /// step; the three buttons sit before the help button.
+    #[test]
+    fn striacopypaste_witness_copy_paste_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,copy,ruler:35,paste");
+        assert!(errors.is_empty(), "{errors:?}");
+        let v1 = &face.state.timeline.tracks[0].clips;
+        assert_eq!(v1.last().map(|c| (c.src_in, c.src_out, c.at)), Some((0, 10, 35)));
+        assert_eq!(face.state.timeline.tracks[1], tl0.tracks[1]);
+        assert_eq!((face.state.undo_depth(), face.last_error.clone()), (1, None));
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        let words: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
+        assert_eq!(words[words.len() - 4..], ["copy", "cut", "paste", "help"]);
+        println!("striacopypaste witness: V1 {:?}", v1.last());
     }
 }
