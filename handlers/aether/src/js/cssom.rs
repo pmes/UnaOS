@@ -1109,12 +1109,12 @@ fn initial_value(p: &str) -> &'static str {
         "justify-content" | "align-content" | "align-items" | "align-self" | "justify-items" | "justify-self" => "normal",
         "direction" => "ltr", "unicode-bidi" => "normal",
         "pointer-events" => "auto",
-        "letter-spacing" | "word-spacing" => "normal",
-        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
-        "min-width" | "min-height" => "0px",
-        "margin-right" | "margin-bottom" | "margin-left" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
-        "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
-        "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
+        "letter-spacing" | "word-spacing" | "row-gap" | "column-gap" => "normal",
+        "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
+        "min-width" | "min-height" | "border-top-left-radius" | "border-top-right-radius" | "border-bottom-right-radius" | "border-bottom-left-radius" => "0px",
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         _ => "",
     }
 }
@@ -1205,7 +1205,7 @@ fn cascaded_value(el: usize, prop: &str) -> Option<String> {
     let parent = || with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0)).filter(|p| with_doc(|d| d.element(NodeId(*p)).is_some()));
     let inherits = css_core::container::inherited_property(prop);
     let from_parent = || parent().map(|p| computed_value(p, prop)).filter(|v| !v.is_empty());
-    let initial = || Some(initial_value(prop).to_string()).filter(|v| !v.is_empty());
+    let initial = || Some(initial_of(prop)).filter(|v| !v.is_empty());
     match declared.as_deref() {
         Some("inherit") => from_parent(),
         Some("initial") => initial(),
@@ -2974,4 +2974,117 @@ fn offset_held_first(f: &Flushed, el: usize) -> Option<(f32, f32, f32, f32)> {
     let (x, y, w, h) = f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())?;
     let (x, y) = sticky_held_at(f, NodeId(el), x, y, page(|p| p.scroll));
     Some((x, y, w, h))
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLEINITIAL (LEDGER SR1086): a shorthand's initial derived from its longhands' initials (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLEINITIAL (SR1086): a [`SHORTHANDS`] row's initial value, DERIVED: a [`Block`] of the row's
+/// longhands each at its own [`initial_value`], serialized by [`serialize_shorthand`] — so a shorthand's initial and
+/// its longhands' rows cannot disagree. None for a name that is not a row, for a row with a longhand that has no
+/// initial row (its value is the report's or has no static form), and for a row whose grammar does not serialize at
+/// initial (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS).
+fn shorthand_initial(sh: &str) -> Option<String> {
+    let mut b = Block::default();
+    for name in longhands(sh)? {
+        let value = initial_value(&name);
+        if value.is_empty() {
+            return None;
+        }
+        b.decls.push(Decl { name, value: value.to_string(), important: false });
+    }
+    serialize_shorthand(&b, sh).map(|x| x.0)
+}
+
+/// The initial value of `prop` as getComputedStyle serializes it: a shorthand's derived through
+/// [`shorthand_initial`], else the longhand's [`initial_value`] row ("" for a property with neither).
+fn initial_of(prop: &str) -> String {
+    shorthand_initial(prop).unwrap_or_else(|| initial_value(prop).to_string())
+}
+
+#[cfg(test)]
+mod shorthand_table_initial_tests {
+    use super::*;
+
+    /// The rows whose longhands have no static initial row (colours resolve currentcolor per element; border-image-*
+    /// and most background-* have no `initial_value` row), so they read "" (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS).
+    const NOT_DERIVED: [&str; 9] =
+        ["border", "border-image", "border-color", "border-top", "border-right", "border-bottom", "border-left", "outline", "background"];
+
+    #[test]
+    fn shorthand_table_initial_rows_derive() {
+        for (sh, _) in SHORTHANDS {
+            let got = shorthand_initial(sh);
+            if NOT_DERIVED.contains(sh) {
+                assert_eq!(got, None, "{sh}: a named non-deriving row");
+            } else {
+                assert!(got.as_deref().is_some_and(|v| !v.is_empty()), "{sh}: derives a non-empty initial, got {got:?}");
+            }
+        }
+        for sh in NOT_DERIVED {
+            assert!(SHORTHANDS.iter().any(|(s, _)| *s == sh), "{sh} is a SHORTHANDS row");
+        }
+    }
+
+    /// The ONE shorthand row initial_value keeps: `computed_value`'s fallback still reads `initial_value` (no derived
+    /// value is invented there), so `overflow` keeps its `visible` read-back until AETHER-CSSOM-SHORTHAND-COMPUTED lands.
+    const KEPT_ROW: &str = "overflow";
+
+    #[test]
+    fn shorthand_table_initial_no_shorthand_in_initial_value() {
+        for (sh, _) in SHORTHANDS {
+            if *sh == KEPT_ROW {
+                assert_eq!(initial_value(sh), shorthand_initial(sh).unwrap(), "{sh}: the kept row equals the derived initial");
+                continue;
+            }
+            assert_eq!(initial_value(sh), "", "{sh}: no hand-written shorthand row in initial_value");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_initial_byte_identity() {
+        // The two literals initial_value carried before SR1086.
+        assert_eq!(initial_of("font-synthesis"), "weight style small-caps");
+        assert_eq!(initial_of("overflow"), "visible");
+    }
+
+    #[test]
+    fn shorthand_table_initial_pins() {
+        for (prop, want) in [
+            ("gap", "normal"),
+            ("margin", "0px"),
+            ("padding", "0px"),
+            ("overflow", "visible"),
+            ("border-radius", "0px"),
+            ("inset", "auto"),
+            ("flex", "0 1 auto"),
+            ("border-width", "0px"),
+            ("border-style", "none"),
+            ("opacity", "1"),
+            ("overflow-x", "visible"),
+            ("bogus", ""),
+        ] {
+            assert_eq!(initial_of(prop), want, "{prop}: initial");
+        }
+    }
+
+    /// getComputedStyle through `cascaded_value`'s `initial` closure: a declared CSS-wide `initial` on a shorthand reads
+    /// the derived initial. An undeclared shorthand stays "" at `computed_value`'s fallback (no value is invented for a
+    /// shorthand Aether does not compute; owed AETHER-CSSOM-SHORTHAND-COMPUTED).
+    #[test]
+    fn shorthand_table_initial_computed_gap() {
+        let html = r#"<!doctype html><html><body><div id="a"></div><div id="g" style="gap: initial"></div><div id="r" style="border-radius: initial"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (id, prop, want) in [("g", "gap", "normal"), ("r", "border-radius", "0px"), ("a", "gap", "")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{prop}')"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed {prop}");
+        }
+    }
 }
