@@ -2090,7 +2090,7 @@ pub struct ExportJob {
     /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), passes: u8, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2133,7 +2133,7 @@ impl Face {
     }
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
     /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `audio` (the verb's word, default `AudioOut::Wav`, NLE5DEXPORTAUDIOOPTIONS SR722) into `Container::Mp4` (`nle export`'s defaults).
-    /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
+    /// `pause_at`: the job holds after frame k (k = 0: before the first, NLEFACEEXPORTJSONZERO SR1110) until cancelled ([`Face::export_paused_at`]).
     fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut, plan: ExportPlan) -> Result<(), String> {
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
@@ -2142,13 +2142,12 @@ impl Face {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
         self.range_check(&range)?; std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let span = range.clone().unwrap_or(0..self.state.timeline.end()); let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(crate::nle_export::export_total(&self.state.timeline, &span))), Arc::new(AtomicBool::new(false))); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the range resolved once, the total seeded before the spawn
+        let passes = 1 + (plan.two_pass && fmt == "h264") as u64; let span = range.clone().unwrap_or(0..self.state.timeline.end()); let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(crate::nle_export::export_total(&self.state.timeline, &span) * passes)), Arc::new(AtomicBool::new(false))); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the range resolved once, the total seeded before the spawn
         let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
         let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), span);
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
-                let video = face_video(&fmt, &tl, span.clone(), &sources, &path, plan)?; // H264ENCTWOPASSQCOMPFACE (SR1076): the one table with the plan's options, pass 1 first under two-pass
                 let mut progress = |n: u64, of: u64| -> Result<(), ExportError> {
                     d.store(n, Relaxed);
                     t.store(of, Relaxed);
@@ -2162,10 +2161,10 @@ impl Face {
                     }
                     Ok(())
                 };
-                export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
+                progress(0, t.load(Relaxed))?; let video = face_video(&fmt, &tl, span.clone(), &sources, &path, plan, &mut progress)?; export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut |n, of| progress(n + (passes - 1) * of, passes * of)) // H264ENCTWOPASSFACEPROGRESS (SR1093): pass 1 inside the one closure; pass 2 reads frames + n of 2 x frames; NLEFACEEXPORTJSONZERO (SR1110): reading 0 once before the first frame (the k = 0 hold)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0), passes: passes as u8 });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2956,7 +2955,7 @@ pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
 /// A stall past [`STALL_AFTER`] trades the eta word for [`stall_words`] (`export: 3 / 35 stalled 7 s`, NLE5DEXPORTMESSAGEETASTALLWORD SR817).
 fn job_line(j: &ExportJob) -> String {
     let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
-    export_line(d, t, finishing_words(d, t).or_else(|| stall_words(j.rate_at.0.elapsed(), j.rate_ema)).or_else(|| job_eta(j, d, t).map(eta_words_of)))
+    export_line_passes(d, t, j.passes, finishing_words(d, t).or_else(|| stall_words(j.rate_at.0.elapsed(), j.rate_ema)).or_else(|| job_eta(j, d, t).map(eta_words_of)))
 }
 
 // ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
@@ -3172,12 +3171,14 @@ fn plan_check(plan: &ExportPlan, fmt: &str) -> Result<(), String> {
 /// The export thread's encoder: the ONE table ([`video_named_with`]) with the plan's options; under `two-pass` the lib's first pass
 /// ([`pass1_stats`], `<dir>/pass1/` at the table's GOP) runs first and its records plan this pass. A first-pass refusal is the
 /// export's (`ExportError::Io`).
-fn face_video(fmt: &str, tl: &Timeline, span: std::ops::Range<i64>, sources: &Sources, dir: &std::path::Path, plan: ExportPlan) -> Result<Box<dyn VideoEncoder>, ExportError> {
+fn face_video(fmt: &str, tl: &Timeline, span: std::ops::Range<i64>, sources: &Sources, dir: &std::path::Path, plan: ExportPlan, progress: &mut dyn FnMut(u64, u64) -> Result<(), ExportError>) -> Result<Box<dyn VideoEncoder>, ExportError> {
     let ExportPlan { mut opts, two_pass } = plan;
     if two_pass && fmt == "h264" {
         let (num, den) = (tl.tb.num.max(1) as u32, tl.tb.den.max(1) as u32);
         let gop = opts.gop.unwrap_or((den / num).max(1));
-        let stats = pass1_stats(tl, span, sources, dir, opts.qp, gop, opts.bitrate.unwrap_or_default(), opts.scenecut, opts.aq, Container::Mp4).map_err(|e| ExportError::Io(std::io::Error::other(e)))?;
+        let mut held = None; // H264ENCTWOPASSFACEPROGRESS (SR1093): the closure's own refusal (the face's cancel), handed back unchanged
+        let stats = pass1_stats(tl, span, sources, dir, opts.qp, gop, opts.bitrate.unwrap_or_default(), opts.scenecut, opts.aq, Container::Mp4, &mut |n, of| progress(n, 2 * of).map_err(|e| { let s = e.to_string(); held = Some(e); ExportError::Io(std::io::Error::other(s)) }));
+        let stats = stats.map_err(|e| held.take().unwrap_or_else(|| ExportError::Io(std::io::Error::other(e))))?;
         opts.two_pass_stats = Some(stats);
     }
     Ok(video_named_with(fmt, tl.tb, opts).expect("a VIDEO_NAMES word"))
@@ -3214,5 +3215,61 @@ fn rate_needs_h264(o: &H264Opts, fmt: &str) -> Result<(), String> {
     match set.iter().find(|(_, on)| *on) {
         Some((w, _)) if fmt != "h264" => Err(format!("{w} needs h264")),
         _ => Ok(()),
+    }
+}
+
+// ---- H264ENCTWOPASSFACEPROGRESS (LEDGER SR1093): the hold seam with a plan (named tail block) ----
+// SR1076's two-pass export ran its first pass before the job's progress closure existed: the band read 0 and Esc was unread
+// for half the export. The first pass now reads the same closure (`nle_export::pass1_stats` through `export_as_with`'s
+// `Ticked`), total = 2 x frames under two-pass (pass 1 n, pass 2 frames + n). Owed: NLE-FACE-EXPORT-PASS-WORD (the band has
+// no text slot; the message row's `export_line` is the natural one).
+
+impl Face {
+    /// [`Face::export_paused_at`] with the export's plan: the job holds after reading `k` (the combined counter: under two-pass
+    /// `k <= frames` is a first-pass frame) until it is cancelled.
+    pub fn export_paused_plan(&mut self, dir: &std::path::Path, fmt: &str, k: u64, plan: ExportPlan) -> Result<(), String> {
+        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav, plan)
+    }
+}
+
+// ---- NLEFACEEXPORTPASSWORD (LEDGER SR1095): the pass word on the export message row (named tail block) ----
+// SR1093 made a two-pass export's reading monotone over passes x frames, so the row read `export: 40 / 70` with no word of
+// the pass. `ExportJob.passes` (set once in `start_export`) reaches `job_line` through `export_line_passes`, which composes ON
+// `export_line` (its text and pins unchanged): the band, `export_progress` and the cancel line keep the combined reading.
+// Owed: NLE-FACE-EXPORT-PASS-JSON (stria-view's `"export"` object gains the pass).
+
+/// [`export_line`] with the pass: under `passes > 1` the per-pass numbers and the pass word, the finishing / stall / eta word
+/// after it (`export: 15 / 35 (pass 2/2) ~12 s`); pass k = ceil(done / frames), so the last pass-1 frame reads `35 / 35 (pass 1/2)`.
+/// One pass (or no frames) is [`export_line`] byte for byte.
+pub fn export_line_passes(done: u64, total: u64, passes: u8, eta: Option<String>) -> String {
+    let n = u64::from(passes);
+    if n <= 1 || total == 0 {
+        return export_line(done, total, eta);
+    }
+    let f = total / n; let (k, _) = pass_of(done, total, passes); let pass = format!("(pass {k}/{n})");
+    export_line(done - (k - 1) * f, f, Some(eta.map_or(pass.clone(), |e| format!("{pass} {e}"))))
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the pass on the witness's export object (named tail block) ----
+// SR1095 gave the message row the pass word; the witness JSON (stria-view's `export_json`) still carried the combined reading
+// only. ONE rule for the pass, `pass_of` (lifted from `export_line_passes`, which reads it), and ONE accessor over it,
+// `Face::export_pass`, so the row and the JSON cannot disagree. Owed: NLE-FACE-EXPORT-JSON-SCHEMA (the export object's fields
+// listed once for the bench).
+
+/// The pass `(k, n)` a combined reading `done` of `total` (= n x frames) is in: k = ceil(done / frames), clamped to 1..=n, so
+/// the last pass-1 frame is pass 1 and the reading 0 is pass 1. The rule [`export_line_passes`] and [`Face::export_pass`] share.
+pub fn pass_of(done: u64, total: u64, passes: u8) -> (u64, u64) {
+    let n = u64::from(passes).max(1);
+    let f = total / n;
+    ((done.saturating_sub(1) / f.max(1) + 1).min(n), n)
+}
+
+impl Face {
+    /// The running export's pass `(k, n)` ([`pass_of`] over the job's combined reading), `Some` only while a job with more
+    /// than one pass runs (the witness's `"pass"` / `"passes"` fields).
+    pub fn export_pass(&self) -> Option<(u8, u8)> {
+        let j = self.export.as_ref().filter(|j| j.passes > 1)?;
+        let (k, n) = pass_of(j.done.load(Relaxed), j.total.load(Relaxed), j.passes);
+        Some((k as u8, n as u8))
     }
 }
