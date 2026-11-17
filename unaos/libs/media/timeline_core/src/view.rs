@@ -1397,3 +1397,52 @@ mod striamultiselectmore_tests {
         assert_eq!(st.set, alloc::vec![(0, 0), (0, 1)]);
     }
 }
+
+// ---- STRIAKMULTISEL (LEDGER SR9020): the shift marquee the kernel Player now reaches (named tail block) ----
+// The Player's press passes Shift into `Drag::begin_with` (vplay.rs `edit_press`), so a shift-press on an empty track
+// spot is an ADDITIVE marquee (`finish` -> `EditorState::select_many(.., additive)`), the host face's rule.
+#[cfg(test)]
+mod striakmultisel_tests {
+    use super::*;
+    use crate::Clip;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10; A1: A 0..20 at 0; V2 (row 2) empty; the set both V1 clips, primary V1's B; the
+    /// tracks band of a 320x136 canvas (three rows).
+    fn state() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 136, &st);
+        (st, l)
+    }
+
+    #[test]
+    fn striakmultisel_shift_marquee_adds_to_the_set() {
+        let (mut st, l) = state();
+        let (x, y) = l.point(2, 5);
+        let (x1, y1) = l.point(1, 15);
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert_eq!((d.kind, d.additive, d.toggle), (DragKind::Marquee, true, false));
+        assert_eq!(st.set, alloc::vec![(0, 0), (0, 1)], "the press selects nothing");
+        d.update(&st, x1, y1);
+        assert!(d.moved());
+        assert!(!d.release_still(&mut st), "a marquee never toggles");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.set, alloc::vec![(0, 0), (0, 1), (1, 0)], "the audio clip joins the set");
+        assert_eq!((st.selection, st.undo_depth()), (Some((0, 1)), 0), "the primary is kept; a selection commits nothing");
+        let (mut st, l) = state();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        assert!(!d.additive);
+        d.update(&st, x1, y1);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((st.selection, st.set.clone()), (Some((1, 0)), alloc::vec![(1, 0)]), "a plain marquee replaces the set");
+    }
+}
