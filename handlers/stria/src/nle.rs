@@ -725,7 +725,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r, proxy)?;
-            cropped(tl, s.track, s.out_t, true, graded(tl.grade_at(s.track, s.out_t, true), reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0, w, h, reel_fit(tl, src, false))) // STRIACOLORLIFT (SR869): the outgoing clip's grade (file tail); NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            cropped(tl, s.track, s.out_t, true, graded(tl.grade_at(s.track, s.out_t, true), reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0), w, h, reel_fit(tl, src, false)) // STRIACOLORLIFT (SR869): the outgoing clip's grade (file tail); NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),

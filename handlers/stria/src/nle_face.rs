@@ -2568,7 +2568,7 @@ pub const SLIP_STEP: i64 = 10;
 fn slipslide_word(v: &str) -> Option<String> {
     let (word, rest) = match v.strip_prefix("slip") {
         Some(r) => ("slip", r),
-        None => match v.strip_prefix("slide") { Some(r) => ("slide", r), None => ("nudge", r), None => ("roll", v.strip_prefix("nudgeroll")?) }, // STRIANUDGE (SR855): and `nudge±[10]` -> `nudge <d>` // STRIAROLLKEYS (SR893): the roll words ride the same rewrite onto SR851's `roll <d>`
+        None => match v.strip_prefix("slide") { Some(r) => ("slide", r), None => match v.strip_prefix("nudge") { Some(r) => ("nudge", r), None => ("roll", v.strip_prefix("roll")?) } }, // STRIANUDGE (SR855): and `nudge±[10]` -> `nudge <d>`; STRIAROLLKEYS (SR893): the roll words ride the same rewrite onto SR851's `roll <d>`
     };
     let (sign, count) = match rest.as_bytes().first().copied()? {
         b'-' => (-1i64, &rest[1..]),
@@ -2724,7 +2724,7 @@ impl Face {
         if per == 0 {
             return px;
         }
-        let rows = self.help_rows_shownhelp_rows_with(&self.keymap);
+        let rows = self.help_rows_shown();
         // The columns: (first row, keys width, phrase width), as many as the width holds, at least one.
         let mut cols: Vec<(usize, f32, f32)> = Vec::new();
         let (mut x, mut start) = (HELP_PAD, 0usize);
@@ -3201,7 +3201,7 @@ impl Face {
             let tc = self.state.timeline.fps().map_or_else(|| ph.to_string(), |f| timeline_core::edl::timecode(ph, f));
             frame_path(self.doc_path.as_deref(), &tc)
         } else {
-            self.cancel_loudnessframeno file (no document path)();
+            self.last_error = Some("frame: no file (no document path)".into());
             self.frame_saved = None;
             return Some(true);
         };
@@ -4014,7 +4014,7 @@ impl Face {
             return None;
         }
         if self.loudness.is_some() {
-            self.last_error = Some("loudness: busy".into());
+            self.cancel_loudness();
             return Some(true);
         }
         let range = self.export_range();
@@ -4496,9 +4496,11 @@ mod striajkltransport_tests {
 // NLE5D-KEYS-HELP-SEARCH-LIVE (type to filter while shown), NLE5D-KEYS-HELP-SEARCH-BUTTON (a query field on the bar).
 
 /// STRIAHELPSEARCH (SR874): [`help_rows`] whose keys or phrase contain `q` (ASCII case-insensitive).
-pub fn help_matching(q: &str) -> Vec<(String, &'static str)> {
+pub fn help_matching(q: &str) -> Vec<(String, &'static str)> { help_matching_in(help_rows(), q) }
+/// The fold of SR874 / SR941 with SR886: the same filter over any row list (the face's key overlay rows).
+pub fn help_matching_in(rows: Vec<(String, &'static str)>, q: &str) -> Vec<(String, &'static str)> {
     let q = q.to_ascii_lowercase();
-    help_rows().into_iter().filter(|(k, p)| k.to_ascii_lowercase().contains(&q) || p.to_ascii_lowercase().contains(&q)).collect()
+    rows.into_iter().filter(|(k, p)| k.to_ascii_lowercase().contains(&q) || p.to_ascii_lowercase().contains(&q)).collect()
 }
 
 impl Face {
@@ -4528,8 +4530,8 @@ impl Face {
     /// The rows the help shows: [`help_matching`] the query, or [`help_rows`] verbatim without one.
     pub fn help_rows_shown(&self) -> Vec<(String, &'static str)> {
         match &self.help_query {
-            Some(q) => help_matching(q),
-            None => help_rows(),
+            Some(q) => help_matching_in(help_rows_with(&self.keymap), q),
+            None => help_rows_with(&self.keymap),
         }
     }
 }
@@ -4629,6 +4631,7 @@ pub struct ExportRequest {
     fmt: String,
     range: Option<std::ops::Range<i64>>,
     audio: AudioOut,
+    opts: H264Opts, // STRIAEXPORTPRESETS (SR871) at the fold: a queued request carries its preset's H.264 options
     timeline: Timeline, // STRIAEXPORTQUEUESKIP (SR914): the timeline as it stood when queued, swapped in around start_export (file tail)
 }
 
@@ -4636,15 +4639,15 @@ impl Face {
     /// The verb's start: with no job running, [`Face::start_export`] as before; with one running, the request is checked
     /// at once (the format word and [`Face::range_check`], refused by the same words) and queued, the message line
     /// `export: queued (<n> waiting)`.
-    fn export_or_queue(&mut self, dir: &std::path::Path, fmt: &str, range: Option<std::ops::Range<i64>>, audio: AudioOut) -> Result<(), String> {
+    fn export_or_queue(&mut self, dir: &std::path::Path, fmt: &str, range: Option<std::ops::Range<i64>>, audio: AudioOut, opts: H264Opts) -> Result<(), String> {
         if self.export.is_none() {
-            return self.start_export(dir, fmt, None, range, audio);
+            return self.start_export(dir, fmt, None, range, audio, opts);
         }
         if !VIDEO_NAMES.contains(&fmt) {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
         self.range_check(&range)?;
-        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio, timeline: self.state.timeline.clone() }); // STRIAEXPORTQUEUESKIP (SR914): the queued snapshot
+        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio, opts, timeline: self.state.timeline.clone() }); // STRIAEXPORTQUEUESKIP (SR914): the queued snapshot
         self.last_error = Some(format!("export: queued ({} waiting)", self.export_queue.len()));
         Ok(())
     }
@@ -5503,7 +5506,7 @@ impl Face {
         let handle = std::thread::Builder::new()
             .name("nle-proxy".into())
             .spawn(move || -> Result<u64, String> {
-                let video: Box<dyn crate::nle_export::VideoEncoder> = Box::new(crate::nle_export::HalfSize(video_named("h264", tl.tb).expect("h264 is a VIDEO_NAMES word")));
+                let video: Box<dyn crate::nle_export::VideoEncoder> = Box::new(crate::nle_export::HalfSize(crate::nle_export::video_named("h264", tl.tb).expect("h264 is a VIDEO_NAMES word")));
                 let mut progress = |k: u64, of: u64| -> Result<(), ExportError> {
                     d.store(k, Relaxed);
                     tt.store(of, Relaxed);
@@ -5547,7 +5550,7 @@ impl Face {
             Some(Ok(Err(e))) => Err(if j.cancel.load(Relaxed) { format!("cancelled at {}/{} frames", j.done.load(Relaxed), j.total.load(Relaxed)) } else { e }), // STRIAPROXYOFF (SR915): Esc's stop by name
             _ => Err("the proxy thread panicked".to_string()),
         };
-        self.last_error = Some(format!("proxy: {}: {}", j.reel, r.unwrap_or_else(|e| e)));
+        self.last_error = Some(format!("proxy: {}: {}", j.reel, r.unwrap_or_else(|e| e))); self.proxy_next(); // STRIAPROXYOFF (SR915): `proxy all` chains the next reel (file tail)
     }
 }
 
@@ -6035,7 +6038,7 @@ impl Face {
     /// timeline is back in place before this returns, whatever the outcome.
     fn start_request(&mut self, r: &mut ExportRequest) -> Result<(), String> {
         std::mem::swap(&mut self.state.timeline, &mut r.timeline);
-        let res = self.start_export(&r.dir, &r.fmt, None, r.range.clone(), r.audio);
+        let res = self.start_export(&r.dir, &r.fmt, None, r.range.clone(), r.audio, r.opts.clone());
         std::mem::swap(&mut self.state.timeline, &mut r.timeline);
         res
     }
@@ -6160,7 +6163,7 @@ impl Face {
             Ok(()) => self.last_error = self.state.track_move_line(up),
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
-        Some(true) self.proxy_next(); // STRIAPROXYOFF (SR915): `proxy all` chains the next reel (file tail)
+        Some(true)
     }
 }
 
