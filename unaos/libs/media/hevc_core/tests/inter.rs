@@ -13,7 +13,7 @@
 mod common;
 
 use common::*;
-use hevc_core::tables::{CHROMA_FILTER, LUMA_FILTER};
+use hevc_core::tables::LUMA_FILTER;
 use hevc_core::{Decoder, Frame};
 
 const W: usize = 32;
@@ -219,17 +219,7 @@ fn hand_luma(r: &[u8], x: i32, y: i32, mv: [i32; 2]) -> i32 {
 
 /// 8.5.3.3.3.2 for one chroma sample (eighth-sample mv).
 fn hand_chroma(r: &[u8], x: i32, y: i32, mv: [i32; 2]) -> i32 {
-    let s = |x: i32, y: i32| r[(y.clamp(0, 15) * 16 + x.clamp(0, 15)) as usize] as i32;
-    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
-    let (xi, yi) = (x + (mv[0] >> 3), y + (mv[1] >> 3));
-    let h = |yy: i32| (0..4).map(|i| CHROMA_FILTER[xf][i] * s(xi + i as i32 - 1, yy)).sum::<i32>();
-    if yf == 0 {
-        if xf == 0 { s(xi, yi) << 6 } else { h(yi) }
-    } else if xf == 0 {
-        (0..4).map(|i| CHROMA_FILTER[yf][i] * s(xi, yi + i as i32 - 1)).sum()
-    } else {
-        (0..4).map(|n| CHROMA_FILTER[yf][n] * h(yi + n as i32 - 1)).sum::<i32>() >> 6
-    }
+    hand_chroma_wh(&r.iter().map(|&v| v as u16).collect::<Vec<u16>>(), 16, 16, x, y, mv)
 }
 
 /// Uni-prediction with default weights (8.5.3.3.4.2: (predSamples + 32) >> 6, clipped).
@@ -1369,32 +1359,6 @@ fn conceal_forward_bi_inverse_chroma_joins_both_lists() {
 }
 
 // ---- HEVCCONCEALWEIGHTEDCHROMA422 (LEDGER SR798): explicit chroma weights through the 4:2:2 concealment (named tail block) ----
-
-/// SR798: VPS, SPS ([`sps_cfg`] at chroma_format_idc `idc`, inter SPS `x`), PPS (`pi`, deblocking off) and IDR0: four 16x16
-/// pcm CTBs through the kit's `pcm_cu_fmt` over the non-linear pattern (x * 37 + y * 29 + seed) % 256 (seeds 0 / 90 / 170,
-/// SR758's: a linear ramp's filtered fractions round alike, so a wrong (SubWidthC, SubHeightC) arm could hide).
-fn head_fmt(idc: u32, x: &InterSps, pi: &PpsInter) -> Vec<u8> {
-    let (sw, sh) = match idc {
-        1 => (2usize, 2usize),
-        2 => (2, 1),
-        _ => (1, 1),
-    };
-    let mut s = vps(false);
-    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { chroma_format_idc: idc, ..sps_cfg() }, x)));
-    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
-    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
-    for k in 0..4 {
-        let (bx, by) = (k % 2, k / 2);
-        let ctb = |seed: usize, w: usize, h: usize| (0..w * h).map(|i| (((bx * w + i % w) * 37 + (by * h + i / w) * 29 + seed) % 256) as u16).collect::<Vec<u16>>();
-        let (cw, ch) = (16 / sw, 16 / sh);
-        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, ch), &ctb(170, cw, ch), (sw, sh));
-        if k < 3 {
-            e.terminate(0);
-        }
-    }
-    s.extend(nal(19, &e.finish().out));
-    s
-}
 
 /// SR798: every sample of the w x h plane `r` of component `c` fetched at `mv` (luma quarter-sample through [`hand_luma`],
 /// chroma eighth-sample through the kit's `hand_chroma_wh`), its 14-bit intermediate mapped by `f`, clipped to 8 bits.
