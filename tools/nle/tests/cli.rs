@@ -114,9 +114,9 @@ fn cli_no_verb_prints_usage() {
         assert_eq!(code, 2, "{road:?}: usage exits 2");
         assert_eq!(out, "", "{road:?}: nothing on stdout");
         let lines: Vec<&str> = err.lines().collect();
-        assert_eq!(lines.len(), 5, "{road:?}: five usage lines: {err}");
+        assert_eq!(lines.len(), 6, "{road:?}: six usage lines: {err}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
         assert_eq!(lines[0], USAGE_FIRST, "{road:?}");
-        for (l, head) in lines[1..].iter().zip(["       nle render ", "       nle export ", "       nle --make-src ", "       nle size "]) {
+        for (l, head) in lines[1..].iter().zip(["       nle render ", "       nle export ", "       nle --make-src ", "       nle size ", "       nle completions "]) {
             assert!(l.starts_with(head), "{road:?}: {l:?} starts {head:?}");
         }
     }
@@ -130,7 +130,7 @@ fn cli_export_refuses_by_name() {
     // Refused BY NAME: `nle: <msg>` on stderr, exit 1 (NLECLIREFUSALSBYNAME SR801: every refusal; the table words from stria's).
     let video_want = format!("nle: --video bogus: one of {}", VIDEO_NAMES.join("|"));
     let audio_want = format!("nle: --audio bogus: one of {}|aac:KBPS", AUDIO_NAMES.join("|"));
-    let named: [(&[&str], &str); 22] = [
+    let named: [(&[&str], &str); 24] = [
         (&["--qblur", "17"], "nle: --qblur 17: not a number within 0..=16"),
         (&["--qblur", "x"], "nle: --qblur x: not a number within 0..=16"),
         (&["--qcomp", "2"], "nle: --qcomp 2: not a fraction within 0..=1"),
@@ -153,6 +153,8 @@ fn cli_export_refuses_by_name() {
         (&["--out"], "nle: --out: a value is required"),
         (&["--qpstep"], "nle: --qpstep: a value is required"), // NLECLIREFUSALSREST (SR814): SR773's arm through `value`
         (&["--qpstep", "x"], "nle: --qpstep x: not an integer within 0..=51"),
+        (&["--pass2"], "nle: --pass2: a value is required"), // NLECLIPASS2VALUE (SR821): SR790's arm through `value`
+        (&["--pass2", "qpstep=52"], "nle: --pass2 qpstep 52: not an integer within 0..=51"), // NLECLIPASS2VALUE (SR821): pass2_cli_of's own text by name
     ];
     for (i, (extra, want)) in named.iter().enumerate() {
         let out = dir.join(format!("named{i}"));
@@ -225,6 +227,7 @@ fn cli_usage_lists_every_flag() {
     for a in &scanned {
         assert!(has_word(&usage, a), "{a}: an arm with no word in the usage");
     }
+    let flags: Vec<&str> = src.split_once("const FLAGS: ").and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default(); let (mut f, mut sc) = (flags.clone(), scanned.clone()); f.sort(); sc.sort(); assert_eq!(f, sc, "NLECLIDIDYOUMEAN (SR816): main.rs FLAGS is the option loop's arms"); // NLECLIDIDYOUMEAN (SR816): the did-you-mean list cannot drift from the arms
     for w in ["--make-src", "nle schedule", "nle render", "nle export", "nle size"] {
         assert!(usage.contains(w), "{w} in the usage");
     }
@@ -243,7 +246,7 @@ fn cli_help_exits_zero_on_stdout() {
         let (code, out, err) = nle(road);
         assert_eq!(code, 0, "{road:?}: a person asked for it, exit 0");
         assert_eq!(err, "", "{road:?}: nothing on stderr");
-        assert_eq!(out.lines().count(), 5, "{road:?}: five usage lines: {out}");
+        assert_eq!(out.lines().count(), 6, "{road:?}: six usage lines: {out}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
         assert_eq!(out.lines().next(), Some(USAGE_FIRST), "{road:?}");
         assert_eq!(out, usage, "{road:?}: stdout carries the same usage `nle` prints on stderr");
     }
@@ -277,4 +280,96 @@ fn cli_positional_refusals() {
         let (code, out, err) = nle(&args);
         assert_eq!((code, err.as_str(), out.as_str()), (1, format!("{want}\n").as_str(), ""), "{verb}");
     }
+}
+
+// ---- NLECLIDIDYOUMEAN (LEDGER SR816): an unknown flag or verb names the nearest within 2 (named tail block) ----
+#[test]
+fn cli_unknown_word_did_you_mean() {
+    let (dir, edl, srcs) = fixture("didyoumean");
+    let near: [(&[&str], &str); 3] = [
+        (&["--qbulr", "2"], "nle: --qbulr: unknown flag; did you mean --qblur?"),
+        (&["--qp5"], "nle: --qp5: unknown flag; did you mean --qp?"),
+        (&["--zzzzzz"], "nle: --zzzzzz: unknown flag (nle export --help lists them)"), // none within 2: SR801's text unchanged
+    ];
+    for (i, (extra, want)) in near.iter().enumerate() {
+        let out = dir.join(format!("near{i}"));
+        let (code, stdout, err) = export(&edl, &srcs, &out, extra);
+        assert_eq!((code, err.as_str(), stdout.as_str()), (1, format!("{want}\n").as_str(), ""), "{extra:?}");
+        assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
+    }
+    // An unknown verb near one: the hint, then the usage, exit 2 — before the EDL is read.
+    let out = dir.join("verb");
+    let o = s(&out);
+    let mut full: Vec<&str> = vec!["exprot", edl.as_str()];
+    full.extend(srcs.iter().map(String::as_str));
+    full.extend(["--out", o.as_str()]);
+    let roads: [&[&str]; 2] = [&["exprot"], &full];
+    for road in roads {
+        let (code, stdout, err) = nle(road);
+        assert_eq!((code, stdout.as_str()), (2, ""), "{road:?}");
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 7, "{road:?}: the hint and six usage lines: {err}"); // NLECLIPASS2VALUE (SR821): + `nle completions`
+        assert_eq!(lines[0], "nle: exprot: unknown verb; did you mean export?", "{road:?}");
+        assert_eq!(lines[1], USAGE_FIRST, "{road:?}");
+        assert!(!out.exists(), "{road:?}: nothing written");
+    }
+}
+
+// ---- NLECLIPASS2VALUE (LEDGER SR821): `nle completions bash|zsh|fish` from main.rs FLAGS / VERBS (named tail block) ----
+/// The words of main.rs `const <name>: [...]` (FLAGS / VERBS), read from the source as SR816's FLAGS pin reads them.
+fn const_words(name: &str) -> Vec<&'static str> {
+    let src: &'static str = include_str!("../src/main.rs");
+    src.split_once(&format!("const {name}: ")).and_then(|(_, r)| r.split_once("];")).map(|(b, _)| b.split('"').skip(1).step_by(2).collect()).unwrap_or_default()
+}
+
+#[test]
+fn cli_completions_scripts() {
+    let (flags, verbs) = (const_words("FLAGS"), const_words("VERBS"));
+    assert!(!flags.is_empty() && !verbs.is_empty(), "FLAGS / VERBS read from main.rs");
+    assert!(verbs.contains(&"completions"), "the verb is in VERBS: {verbs:?}");
+    let words: Vec<&str> = verbs.iter().chain(flags.iter()).copied().collect();
+    let script = |shell: &str| {
+        let (code, out, err) = nle(&["completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+        out
+    };
+    // bash: ONE `complete` line naming every word.
+    let bash = script("bash");
+    assert_eq!(bash.lines().count(), 1, "{bash}");
+    assert!(bash.starts_with("complete ") && bash.ends_with(" nle\n"), "{bash}");
+    // zsh: `#compdef nle` first, every word in the script.
+    let zsh = script("zsh");
+    assert_eq!(zsh.lines().next(), Some("#compdef nle"), "{zsh}");
+    for (shell, text) in [("bash", &bash), ("zsh", &zsh)] {
+        for w in &words {
+            assert!(has_word(text, w), "{shell}: {w} in {text}");
+        }
+    }
+    // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
+    let fish = script("fish");
+    assert_eq!(fish.lines().count(), words.len(), "{fish}");
+    for w in &words {
+        let line = match w.strip_prefix("--") {
+            Some(l) => format!("complete -c nle -l {l}"),
+            None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
+        };
+        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
+    }
+    // Refusals by SR801's grammar, exit 1, nothing on stdout.
+    let refused: [(&[&str], &str); 2] = [
+        (&["completions", "tcsh"], "nle: completions tcsh: one of bash|zsh|fish\n"),
+        (&["completions"], "nle: completions: a value is required\n"),
+    ];
+    for (args, want) in refused {
+        let (code, out, err) = nle(args);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, want, ""), "{args:?}");
+    }
+    // A misspelt verb: SR816's hint names it, then the usage, exit 2.
+    let (code, out, err) = nle(&["completoins", "bash"]);
+    assert_eq!((code, out.as_str()), (2, ""));
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 7, "the hint and six usage lines: {err}");
+    assert_eq!(lines[0], "nle: completoins: unknown verb; did you mean completions?");
+    assert_eq!(lines[1], USAGE_FIRST);
+    assert_eq!(lines[6], "       nle completions bash|zsh|fish");
 }

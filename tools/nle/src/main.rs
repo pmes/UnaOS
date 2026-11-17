@@ -10,6 +10,7 @@
 //! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
+//! nle completions bash|zsh|fish
 //! ```
 //!
 //! `size` (NLESIZEPOLICYUI, LEDGER SR402) sets a reel's size policy through the editor's ONE verb dispatch
@@ -106,7 +107,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); print!("{}", completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish"))); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -137,7 +138,7 @@ fn main() {
             "--cplxblur" => p2.cplxblur = Some(num(&mut it, "--cplxblur")), // H264ENCTWOPASSQCOMPCLI (SR753): x264's complexity blur of the planned pass
             "--qblur" => p2.qblur_q8 = Some({ let s = value(&mut it, "--qblur"); qblur_of(&s).unwrap_or_else(|| bad("--qblur", &s, "not a number within 0..=16")) }), // H264ENCTWOPASSQBLURCLI (SR766): x264's QP blur of the planned pass (Q8)
             "--qpstep" => p2.qpstep = Some({ let s = value(&mut it, "--qpstep"); qpstep_of(&s).unwrap_or_else(|| bad("--qpstep", &s, "not an integer within 0..=51")) }), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
-            "--pass2" => p2 = it.next().map(|s| pass2_cli_of(s).unwrap_or_else(|e| die(format!("--pass2 {e}")))).unwrap_or_else(|| usage()).over(p2), // H264ENCTWOPASSCLITABLE (SR790): any of the four plan knobs in one word, the last flag written winning
+            "--pass2" => p2 = pass2_cli_of(&value(&mut it, "--pass2")).unwrap_or_else(|e| die(format!("--pass2 {e}"))).over(p2), // H264ENCTWOPASSCLITABLE (SR790): any of the four plan knobs in one word, the last flag written winning; NLECLIPASS2VALUE (SR821): a missing value through `value`
             "--src" => {
                 let v = value(&mut it, "--src");
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
@@ -394,6 +395,7 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
     let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
+    let _ = writeln!(w, "       nle completions bash|zsh|fish");
     let _ = w.flush();
     std::process::exit(code)
 }
@@ -406,8 +408,8 @@ const FLAGS: [&str; 24] = [
     "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--src",
 ];
 
-/// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order.
-const VERBS: [&str; 7] = ["schedule", "render", "export", "size", "--make-src", "help", "--help"];
+/// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order (NLECLIPASS2VALUE SR821: `completions`).
+const VERBS: [&str; 8] = ["schedule", "render", "export", "size", "--make-src", "completions", "help", "--help"];
 
 /// NLECLIDIDYOUMEAN (SR816): the farthest a word may be from a candidate and still be named (git's autocorrect suggests
 /// within a bound too; ours is plain distance, ONE candidate).
@@ -471,4 +473,31 @@ fn verb_hint(args: &[String]) {
         eprintln!("nle: {w}: unknown verb; did you mean {v}?");
         usage()
     }
+}
+
+// ---- NLECLIPASS2VALUE (LEDGER SR821): the shell completion scripts from FLAGS / VERBS (named tail block) ----
+/// NLECLIPASS2VALUE (SR821): `nle completions <shell>`'s script, its words [`VERBS`] then [`FLAGS`] (a new arm's word is in
+/// every script with no second list); `None` for a shell other than bash / zsh / fish. The grammar is each shell's own
+/// (recalled): bash `complete -o default -W` (filenames when no word matches), zsh `#compdef` + `_arguments` (`*` = the
+/// option may repeat, `--src` does), fish `complete -c nle` (`-a` a verb at the first word, `-l` a `--name` word).
+fn completions(shell: &str) -> Option<String> {
+    let words = || VERBS.iter().chain(FLAGS.iter()).copied();
+    Some(match shell {
+        "bash" => format!("complete -o default -W \"{}\" nle\n", words().collect::<Vec<_>>().join(" ")),
+        "zsh" => {
+            let mut s = format!("#compdef nle\n_arguments '1:verb:({})'", VERBS.join(" "));
+            for f in FLAGS {
+                s.push_str(&format!(" '*{f}'"));
+            }
+            s.push_str(" '*:file:_files'\n");
+            s
+        }
+        "fish" => words()
+            .map(|w| match w.strip_prefix("--") {
+                Some(l) => format!("complete -c nle -l {l}\n"),
+                None => format!("complete -c nle -n __fish_use_subcommand -a {w}\n"),
+            })
+            .collect(),
+        _ => return None,
+    })
 }
