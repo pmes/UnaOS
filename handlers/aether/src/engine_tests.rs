@@ -10967,6 +10967,253 @@ b</div>
         assert!(color_alpha_ink(&mut e, "pc").0 < 30, "the child's glyphs are opaque black");
     }
 
+    // ---- AETHERPAINTINDEXTEXTSHADOW (LEDGER SR1150): a text shadow's ink is the mask rect its painter allocates, not unbounded (named tail block) ----
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): a fixed 200x30 header (top-left, grey) holding the text "Header" with `shadow`
+    /// as its `text-shadow` and `extra` in its style, on a 2000px page.
+    fn text_shadow_holder_body(shadow: &str, extra: &str) -> String {
+        format!(
+            r#"<div style="position:fixed;top:0;left:0;width:200px;height:30px;background-color:rgb(200, 200, 200);font-size:16px;color:rgb(0, 0, 0);text-shadow:{shadow};{extra}">Header</div>
+        <div style="height:2000px"></div>"#
+        )
+    }
+
+    const TEXT_SHADOW_HOLDER: &str = "2px 2px 4px red";
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the holder's subtree ink is finite, and every pixel of the full repaint that
+    /// differs from the page background lies inside it (the header, its text and every shadow pixel).
+    fn text_shadow_ink_holds_painted(e: &crate::AetherEngine) -> usize {
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(holders.len(), 1, "one holder: the header");
+        let (ink, _) = crate::render::subtree_ink(&holders);
+        let ink = ink.expect("a text shadow leaves the ink finite (armed: unbounded before SR1150)");
+        let s = e.surface();
+        let px = |x: usize, y: usize| { let i = (y * 400 + x) * 4; (s[i], s[i + 1], s[i + 2]) };
+        let bg = px(399, 299);
+        let mut painted = 0;
+        for y in 0..300usize {
+            for x in 0..400usize {
+                if px(x, y) != bg {
+                    painted += 1;
+                    assert!(
+                        (x as f32) + 1.0 > ink.0 && (x as f32) < ink.2 && (y as f32) + 1.0 > ink.1 && (y as f32) < ink.3,
+                        "pixel ({x}, {y}) lies outside the ink {ink:?}"
+                    );
+                }
+            }
+        }
+        painted
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the blurred red shadow: the ink is finite and holds every painted pixel; the
+    /// header painted and some pixel inside it carries the shadow's red over the grey (the surface is BGRA: red at +2).
+    #[test]
+    fn paint_index_text_shadow_ink_finite_contains_painted() {
+        let e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, ""));
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+        let s = e.surface();
+        let reddish = (0..30usize).any(|y| (0..200usize).any(|x| { let i = (y * 400 + x) * 4; s[i + 2] > s[i + 1].saturating_add(20) }));
+        assert!(reddish, "the red text shadow shows in the header");
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): blur 0 and two layers (one up-left, one down-right): the ink is the union of
+    /// both layers' rects and holds every painted pixel.
+    #[test]
+    fn paint_index_text_shadow_blur_zero_two_layers() {
+        let e = damage_rects_engine(&text_shadow_holder_body("3px 3px 0 red, -4px -2px 0 blue", ""));
+        assert!(text_shadow_ink_holds_painted(&e) >= 200 * 30, "the header painted");
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): a +50 scroll keeps the blit: the damage is the 50-row strip and then rects
+    /// inside the header's ink clipped to the viewport — not the viewport (armed: the text shadow made the ink unbounded).
+    #[test]
+    fn paint_index_text_shadow_scroll_damage_is_strip_plus_header() {
+        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, ""));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        let ink = crate::render::subtree_ink(&holders).0.expect("finite ink");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "the viewport is not the damage (armed)");
+        assert_eq!(e.damage_rects.first(), Some(&(0, 250, 400, 50)), "the strip first");
+        assert!(e.damage_rects.len() >= 2, "the header is damaged too: {:?}", e.damage_rects);
+        for &(x, y, w, h) in &e.damage_rects[1..] {
+            assert!(
+                x as f32 >= ink.0.floor().max(0.0) && y as f32 >= ink.1.floor().max(0.0) && (x + w) as f32 <= ink.2.ceil() && (y + h) as f32 <= ink.3.ceil(),
+                "damage ({x}, {y}, {w}, {h}) lies inside the header ink {ink:?}"
+            );
+        }
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): THE pin: +50, +50, -30 with the shadowed header over coloured rows: after each
+    /// blitted frame the whole surface equals a control engine scrolled there and repainted whole (the shadow intact).
+    #[test]
+    fn paint_index_text_shadow_pixels_match_full_repaint() {
+        let mut body = text_shadow_holder_body(TEXT_SHADOW_HOLDER, "");
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERPAINTINDEXTEXTSHADOW (SR1150): the same header under `filter: blur(2px)`: the filter group stays unbounded,
+    /// so the scroll damages the viewport (AETHER-PAINT-INDEX-FILTER-EXTENT owed).
+    #[test]
+    fn paint_index_text_shadow_filter_falls_back() {
+        let mut e = damage_rects_engine(&text_shadow_holder_body(TEXT_SHADOW_HOLDER, "filter:blur(2px)"));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
+    }
+
+    // ---- AETHERBOXPAINTSIDEALPHA (LEDGER SR1151): boxpaint's Side carries its alpha, the ring blend multiplies by the owner's (named tail block) ----
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): one engine, white page, each box absolutely placed (20x20 content, 10px sides):
+    /// `#mx` red 0.5 top / bottom and blue left / right at (0,0); `#ma` red 0.5 top / bottom and opaque red left / right
+    /// at (100,0); `#bg` an rgb(1, 2, 3) background (SR1147's first ghost candidate) under a red / blue frame at (200,0);
+    /// an unchecked checkbox at (300,0); a `<p>` at y 200 holding `#it`, an inline CSS triangle (transparent 10px sides,
+    /// red top) around one white glyph.
+    fn boxpaint_side_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            .a { position: absolute; top: 0; width: 20px; height: 20px; margin: 0 }
+            p { position: absolute; left: 0; top: 200px; margin: 0; padding: 0 8px; font: 16px sans-serif }
+            </style></head><body>
+            <div id="mx" class="a" style="left:0;border:10px solid;border-color:rgba(255, 0, 0, 0.5) blue"></div>
+            <div id="ma" class="a" style="left:100px;border:10px solid;border-color:rgba(255, 0, 0, 0.5) red"></div>
+            <div id="bg" class="a" style="left:200px;border:10px solid;border-color:red blue;background:rgb(1, 2, 3)"></div>
+            <input id="cb" type="checkbox" style="position:absolute;left:300px;top:0;margin:0">
+            <p><span id="it" style="border:10px solid transparent;border-top-color:red;color:#fff">x</span></p>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): `border-color: rgba(255, 0, 0, 0.5) blue` strokes each side at its own alpha: the
+    /// top edge composites red at 0.5 over white (~(255, 127, 127)), the left edge is opaque blue. Before SR1151 the frame
+    /// stroked at the max of its side alphas (1.0): the top read opaque red (AETHER-CSS-BORDER-SIDE-ALPHA-MIXED).
+    #[test]
+    fn boxpaint_side_alpha_mixed_colour() {
+        let e = boxpaint_side_alpha_engine();
+        let top = imgalt_px(&e, 20, 2);
+        assert!(inline_border_alpha_near(top, (255, 127, 127)), "armed: #mx top side at its own 0.5: {top:?}");
+        assert_eq!(imgalt_px(&e, 2, 20), (0, 0, 255), "#mx left side opaque blue");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the same RGB at two alphas (`rgba(255, 0, 0, 0.5) red`) differs by alpha alone
+    /// (sides_differ takes it to boxpaint): the top at 0.5, the left opaque red (before SR1151 both opaque).
+    #[test]
+    fn boxpaint_side_alpha_mixed_alpha_same_rgb() {
+        let e = boxpaint_side_alpha_engine();
+        let top = imgalt_px(&e, 120, 2);
+        assert!(inline_border_alpha_near(top, (255, 127, 127)), "armed: #ma top side at its own 0.5: {top:?}");
+        assert_eq!(imgalt_px(&e, 102, 20), (255, 0, 0), "#ma left side opaque red");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the inline road's CSS triangle: the transparent left / right sides own their
+    /// diagonal halves and paint nothing, so the top-centre is red and the left- and right-middle stay the white page.
+    /// Before SR1151 the inline road handed boxpaint only the visible top side and it owned a whole band
+    /// (AETHER-CSS-INLINE-BORDER-TRANSPARENT-SIDE). One white glyph inside: an EMPTY inline's box fragment is not
+    /// established (AETHER-INLINE-EMPTY-BOX-FRAG).
+    #[test]
+    fn boxpaint_side_alpha_inline_triangle() {
+        let mut e = boxpaint_side_alpha_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "it");
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        assert!(css_wide_red(imgalt_px(&e, l + w / 2, t + 2)), "#it top-centre is red: {:?}", imgalt_px(&e, l + w / 2, t + 2));
+        assert_eq!(imgalt_px(&e, l + 2, t + h / 2), (255, 255, 255), "armed: #it left-middle is the transparent left side's");
+        assert_eq!(imgalt_px(&e, l + w - 3, t + h / 2), (255, 255, 255), "armed: #it right-middle is the transparent right side's");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): no colour sentinel exists any more: an rgb(1, 2, 3) background under a two-colour
+    /// frame paints its interior, with the red top and the blue left over it.
+    #[test]
+    fn boxpaint_side_alpha_background_123() {
+        let e = boxpaint_side_alpha_engine();
+        assert_eq!(imgalt_px(&e, 220, 20), (1, 2, 3), "#bg interior is its rgb(1, 2, 3) background");
+        assert_eq!(imgalt_px(&e, 220, 2), (255, 0, 0), "#bg top side red");
+        assert_eq!(imgalt_px(&e, 202, 20), (0, 0, 255), "#bg left side blue");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the control glyphs pass alpha 1.0 (one token each): an unchecked checkbox keeps
+    /// its #767676 frame on its top row and its white centre.
+    #[test]
+    fn boxpaint_side_alpha_checkbox_frame() {
+        let mut e = boxpaint_side_alpha_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "cb");
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        let grey = |c: (u8, u8, u8)| c.0 == c.1 && c.1 == c.2 && (100..=140).contains(&c.0);
+        let rows: Vec<(u8, u8, u8)> = (t.saturating_sub(1)..=t + 1).map(|y| imgalt_px(&e, l + w / 2, y)).collect();
+        assert!(rows.iter().any(|&c| grey(c)), "#cb top row carries the grey frame: {rows:?}");
+        assert_eq!(imgalt_px(&e, l + w / 2, t + h / 2), (255, 255, 255), "#cb centre is white");
+    }
+
+    // ---- AETHERCSSOMWHITESPACELONGHANDSACCESSOR (LEDGER SR1109): the camelCase accessors for white-space's longhands (named tail block) ----
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): one div per case at 400 px wide.
+    fn cssom_white_space_longhands_accessor_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div id="c">a b</div><div id="m">a b</div><div id="t">a b</div><div id="d">a b</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `whiteSpaceCollapse` writes the declaration (getPropertyValue
+    /// and cssText read it) and getComputedStyle reads `preserve` (without the accessor: '' / '' / `collapse`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_collapse() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('c').style; s.whiteSpaceCollapse = 'preserve'; [s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse'), s.cssText].join('|')");
+        assert_eq!(got, "preserve|preserve|white-space-collapse: preserve;");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "c", "whiteSpaceCollapse"), "preserve", "computed white-space-collapse");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrapMode = 'nowrap'` reaches the declaration and the
+    /// computed column (without the accessor: `wrap`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_wrap_mode() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('m').style; s.textWrapMode = 'nowrap'; [s.textWrapMode, s.getPropertyValue('text-wrap-mode')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "m", "textWrapMode"), "nowrap", "computed text-wrap-mode");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrap = 'nowrap'` is stored as text-wrap (no SHORTHANDS row:
+    /// owed) and SR1044's layout_core arm makes the computed text-wrap-mode `nowrap`.
+    #[test]
+    fn cssom_white_space_longhands_accessor_text_wrap() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('t').style; s.textWrap = 'nowrap'; [s.textWrap, s.getPropertyValue('text-wrap')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "t", "textWrapMode"), "nowrap", "computed text-wrap-mode under text-wrap");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): the same loop installs the dashed accessor.
+    #[test]
+    fn cssom_white_space_longhands_accessor_dashed() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('d').style; s['white-space-collapse'] = 'preserve-breaks'; [s['white-space-collapse'], s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse')].join('|')");
+        assert_eq!(got, "preserve-breaks|preserve-breaks|preserve-breaks");
+    }
+
     // ---- AETHERSTICKYNESTEDSCROLLER (LEDGER SR1152): a sticky box holds against its nearest scrollport (named tail block) ----
 
     /// AETHERSTICKYNESTEDSCROLLER (SR1152): 400x300 with `body` (margin 0) holding `pre`, then a 200px `overflow: auto`
