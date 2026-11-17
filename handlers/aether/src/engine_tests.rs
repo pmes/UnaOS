@@ -8602,4 +8602,91 @@ b</div>
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color");
     }
 
+
+    // ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color paints the focused text control's caret (named tail block) ----
+
+    /// AETHERCSSCARETCOLOR (SR1040): `body` holds one `autofocus` control `#f` (the `focused_field_paints_caret_and_ring`
+    /// shape: margin 10px, empty value); the engine after its first frame, with the caret in its visible phase.
+    fn caret_color_engine(body: &str) -> crate::AetherEngine {
+        let html = format!(r#"<html><body style="margin:0">{body}</body></html>"#);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 120));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): the columns of `#f`'s mid-height row inside its 2px edges whose pixel passes `hue`.
+    fn caret_color_cols(e: &crate::AetherEngine, hue: fn((u8, u8, u8)) -> bool) -> Vec<u32> {
+        let f = dom_by_id(e, "f");
+        let (x, y, w, h) = e.box_of(&f).unwrap();
+        let mid = (y + h / 2.0) as u32;
+        ((x as u32 + 2)..((x + w) as u32 - 2)).filter(|&cx| hue(imgalt_px(e, cx as usize, mid as usize))).collect()
+    }
+
+    fn caret_color_dark(c: (u8, u8, u8)) -> bool {
+        c.0 < 60
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): `caret-color: red` paints the caret one red column (the field text stays FieldText);
+    /// armed: the plain field's caret is one dark column and no red.
+    #[test]
+    fn caret_color_red_paints_red() {
+        let e = caret_color_engine(r#"<input id="f" autofocus style="margin:10px;caret-color:red" value="">"#);
+        assert_eq!(caret_color_cols(&e, css_wide_red).len(), 1, "one red caret column");
+        assert!(caret_color_cols(&e, caret_color_dark).is_empty(), "no dark caret");
+        let plain = caret_color_engine(r#"<input id="f" autofocus style="margin:10px" value="">"#);
+        assert_eq!(caret_color_cols(&plain, caret_color_dark).len(), 1, "armed: the plain caret is the ink");
+        assert!(caret_color_cols(&plain, css_wide_red).is_empty(), "armed: the plain caret is not red");
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): caret-color is inherited: an input under `caret-color: red` paints a red caret, and
+    /// so does one that says `caret-color: inherit`.
+    #[test]
+    fn caret_color_inherits_to_input() {
+        let e = caret_color_engine(r#"<div style="caret-color:red"><input id="f" autofocus style="margin:10px" value=""></div>"#);
+        assert_eq!(caret_color_cols(&e, css_wide_red).len(), 1, "the parent's red caret");
+        let e = caret_color_engine(r#"<div style="caret-color:red"><input id="f" autofocus style="margin:10px;caret-color:inherit" value=""></div>"#);
+        assert_eq!(caret_color_cols(&e, css_wide_red).len(), 1, "caret-color: inherit takes the parent's red");
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): `caret-color: auto` is the control's currentcolor: under `color: blue` (and a parent's
+    /// red caret-color it resets) the caret is blue.
+    #[test]
+    fn caret_color_auto_is_currentcolor() {
+        let e = caret_color_engine(r#"<div style="caret-color:red"><input id="f" autofocus style="margin:10px;color:blue;caret-color:auto" value=""></div>"#);
+        assert_eq!(caret_color_cols(&e, css_wide_blue).len(), 1, "one blue caret column");
+        assert!(caret_color_cols(&e, css_wide_red).is_empty(), "auto drops the parent's red");
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): `caret-color: transparent` (the hide-the-caret idiom) paints no caret.
+    #[test]
+    fn caret_color_transparent_hides_caret() {
+        let e = caret_color_engine(r#"<input id="f" autofocus style="margin:10px;caret-color:transparent" value="">"#);
+        assert!(caret_color_cols(&e, caret_color_dark).is_empty(), "no dark caret");
+        assert!(caret_color_cols(&e, css_wide_red).is_empty(), "no red");
+    }
+
+    /// AETHERCSSCARETCOLOR (SR1040): a focused textarea's caret reads caret-color too: red pixels inside its 2px edges;
+    /// armed: a plain textarea paints none.
+    #[test]
+    fn caret_color_textarea() {
+        let red_px = |e: &crate::AetherEngine| {
+            let f = dom_by_id(e, "f");
+            let (x, y, w, h) = e.box_of(&f).unwrap();
+            let mut n = 0;
+            for py in (y as u32 + 2)..((y + h) as u32 - 2) {
+                for px in (x as u32 + 2)..((x + w) as u32 - 2) {
+                    if css_wide_red(imgalt_px(e, px as usize, py as usize)) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let e = caret_color_engine(r#"<textarea id="f" autofocus style="margin:10px;caret-color:red"></textarea>"#);
+        assert!(red_px(&e) >= 8, "a red caret in the textarea");
+        let plain = caret_color_engine(r#"<textarea id="f" autofocus style="margin:10px"></textarea>"#);
+        assert_eq!(red_px(&plain), 0, "armed: the plain textarea caret is not red");
+    }
 }

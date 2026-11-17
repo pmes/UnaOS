@@ -1198,3 +1198,43 @@ fn white_space_longhands_write_inherit_clears_halves() {
     let s = styled(&[("white-space", "inherit"), ("text-wrap-mode", "nowrap")]);
     assert_eq!(ws_over(&s, 3), 2, "the parent's preserve with the later nowrap: pre");
 }
+
+// ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color parses into the RGBA marker and inherits through its bit (named tail block) ----
+
+/// AETHERCSSCARETCOLOR (SR1040): `caret-color` (css-ui-4 §4.1, `auto | <color>`): a colour is `Some(Some(rgba))`,
+/// `transparent` alpha 0, `auto` / `initial` / `currentcolor` `Some(None)`; `invert` and junk are dropped.
+#[test]
+fn caret_color_parses() {
+    let cc = |v: &str| styled(&[("caret-color", v)]).paint.caret_color;
+    assert_eq!(cc("red"), Some(Some((255, 0, 0, 255))), "red");
+    assert_eq!(cc("RED"), Some(Some((255, 0, 0, 255))), "case-insensitive");
+    assert_eq!(cc("rgb(0, 160, 0)"), Some(Some((0, 160, 0, 255))), "rgb()");
+    assert_eq!(cc("transparent"), Some(Some((0, 0, 0, 0))), "transparent: alpha 0, no caret");
+    for v in ["auto", "AUTO", "initial", "currentcolor"] {
+        assert_eq!(cc(v), Some(None), "{v} is the control's currentcolor");
+    }
+    for v in ["invert", "bogus", ""] {
+        assert_eq!(cc(v), None, "{v:?} is dropped");
+    }
+}
+
+/// AETHERCSSCARETCOLOR (SR1040): caret-color is inherited: `inherit` and `unset` after a red rule write
+/// `INHERIT_CARET_COLOR` and drop the red; `initial` after red is `auto`; a later red clears the bit.
+#[test]
+fn caret_color_css_wide() {
+    use layout_core::paint::INHERIT_CARET_COLOR;
+    let red: &[(&str, &str)] = &[("caret-color", "red")];
+    let s = cascade(&[red]);
+    assert_eq!(s.paint.caret_color, Some(Some((255, 0, 0, 255))), "red (armed)");
+    assert!(!s.paint.inherits(INHERIT_CARET_COLOR), "a value is no inherit (armed)");
+    for kw in ["inherit", "unset"] {
+        let s = cascade(&[red, &[("caret-color", kw)]]);
+        assert_eq!(s.paint.caret_color, None, "caret-color: {kw} after red drops the red");
+        assert!(s.paint.inherits(INHERIT_CARET_COLOR), "caret-color: {kw} writes the inherit bit");
+    }
+    let s = cascade(&[red, &[("caret-color", "initial")]]);
+    assert_eq!(s.paint.caret_color, Some(None), "caret-color: initial after red is auto");
+    let s = cascade(&[&[("caret-color", "inherit")], red]);
+    assert_eq!(s.paint.caret_color, Some(Some((255, 0, 0, 255))), "a later red wins");
+    assert!(!s.paint.inherits(INHERIT_CARET_COLOR), "a later red clears the bit");
+}
