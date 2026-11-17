@@ -1765,7 +1765,7 @@ struct PlayAudio {
     pushed: u64,
     run_base: u64,
     run_pushed: u64,
-    rate: u32,
+    rate: u32, stretch: Option<gneiss_pal::dsp::audio::stretch::Wsola>, // STRIAJKLTRANSPORT (SR873): the forward 2x / 4x shuttle's ONE stretch (file tail)
 }
 
 impl PlayAudio {
@@ -1797,7 +1797,7 @@ struct PlaySink<'a> {
     meters: &'a mut MixMeters,
     out: Option<&'a mut Box<dyn crate::media::AudioOut>>,
     still: Option<Still>,
-    pushed: u64,
+    pushed: u64, stretch: Option<&'a mut gneiss_pal::dsp::audio::stretch::Wsola>, // STRIAJKLTRANSPORT (SR873): the shuttle's stretch, None at 1x (file tail)
 }
 
 impl RenderSink for PlaySink<'_> {
@@ -1807,7 +1807,7 @@ impl RenderSink for PlaySink<'_> {
     fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
         RenderSink::pcm(&mut *self.meters, out_t, rate, channels, interleaved);
         if let Some(o) = self.out.as_mut() {
-            let took = o.push(&crate::media::to_stereo(interleaved, channels as usize));
+            let took = o.push(&shuttle_pcm(self.stretch.as_deref_mut(), crate::media::to_stereo(interleaved, channels as usize))); // STRIAJKLTRANSPORT (SR873): stretched at 2x / 4x (file tail)
             self.pushed += (took / 2) as u64;
         }
     }
@@ -1836,9 +1836,9 @@ impl Face {
         PlayStats { renders: self.play.renders, pushed: self.play.pushed, live: self.play.live }
     }
     /// The device follows the transport: released while playing at rate 1; otherwise paused and its ring flushed (a
-    /// shuttle and reverse play are silent: NLE-SHUTTLE-AUDIO owed). A run's end logs what the device consumed, once.
+    /// forward 2x / 4x shuttle is heard through ONE WSOLA stretch, STRIAJKLTRANSPORT SR873; 8x and reverse are silent: NLE-SHUTTLE-8X-AUDIO / NLE-SHUTTLE-REVERSE owed). A run's end logs what the device consumed, once.
     fn sync_audio(&mut self) {
-        let want = self.playing && self.rate == 1;
+        let want = self.playing && (1..=SHUTTLE_HEARD).contains(&self.rate); self.shuttle_stretch(); // STRIAJKLTRANSPORT (SR873): 1x, 2x and 4x are heard (file tail)
         if want == self.play.live {
             return;
         }
@@ -1882,13 +1882,13 @@ impl Face {
             return true;
         }
         if self.play.next != Some(ph) {
-            self.meters.reset();
+            self.meters.reset(); if let Some(w) = self.play.stretch.as_mut() { w.reset(); } // STRIAJKLTRANSPORT (SR873): the stretch restarts with the ring
             if let Some(o) = self.play.out.as_mut() {
                 o.flush();
             }
         }
-        let out = if self.play.live && self.rate == 1 { self.play.out.as_mut() } else { None };
-        let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0 };
+        let out = if self.play.live { self.play.out.as_mut() } else { None }; // STRIAJKLTRANSPORT (SR873): live is 1x / 2x / 4x forward
+        let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0, stretch: self.play.stretch.as_mut() }; // STRIAJKLTRANSPORT (SR873)
         let r = render(&self.state.timeline, ph..end, &self.sources, &mut sink);
         let (still, pushed) = (sink.still, sink.pushed);
         self.play.renders += 1;
@@ -2012,7 +2012,7 @@ mod playaudio_tests {
         assert_eq!(f.meters().levels().len(), 2);
     }
 
-    /// NLEPLAYAUDIO M3: the device starts paused, play releases it, stop pauses it then flushes; a shuttle past rate 1 is
+    /// NLEPLAYAUDIO M3: the device starts paused, play releases it, stop pauses it then flushes; a 2x shuttle stays released and its tick is stretched (STRIAJKLTRANSPORT SR873); it was
     /// silent (paused, flushed, nothing pushed on its tick); a face with no device plays and pushes nothing.
     #[test]
     fn nleplayaudio_pause_flushes() {
@@ -2031,8 +2031,8 @@ mod playaudio_tests {
         f.on(&SMessage::BrowserText("l".into()));
         assert_eq!((f.playing, f.rate), (true, 2));
         assert!(f.tick());
-        assert_eq!(*log.lock().unwrap(), vec![Ev::Paused(false), Ev::Paused(true), Ev::Flush], "the shuttle's tick pushes nothing");
-        assert_eq!((f.state.playhead, f.played().renders, f.played().pushed), (1, 2, 1920));
+        assert_eq!(log.lock().unwrap().iter().filter(|e| !matches!(e, Ev::Push(_))).cloned().collect::<Vec<_>>(), vec![Ev::Paused(false)], "STRIAJKLTRANSPORT (SR873): the 2x shuttle stays released, nothing paused or flushed");
+        assert_eq!((f.state.playhead, f.played().renders, f.played().pushed), (1, 2, 1920 + 1440)); // STRIAJKLTRANSPORT (SR873): the 2x tick pushes its stretch (3840 frames in, one 960-frame WSOLA window held: (3840 - 960) / 2)
 
         let (tl, src) = synth_fixture();
         let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
@@ -3060,4 +3060,191 @@ pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
     let after = STALL_AFTER.as_secs_f64();
     let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
     (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
+}
+
+// ---- STRIAJKLTRANSPORT (LEDGER SR873): the forward shuttle heard at 2x / 4x through audio_core's WSOLA (named tail block) ----
+
+/// STRIAJKLTRANSPORT (SR873): the fastest forward shuttle the device hears: audio_core's `stretch::MAX_RATE` (4.0), the
+/// ceiling of the WSOLA stretch the media Player's `set_rate` uses. 8x plays silent, as before (NLE-SHUTTLE-8X-AUDIO owed).
+const SHUTTLE_HEARD: i64 = gneiss_pal::dsp::audio::stretch::MAX_RATE as i64;
+
+impl Face {
+    /// STRIAJKLTRANSPORT (SR873): a forward shuttle at 2x / 4x with a device keeps ONE `Wsola` at the shuttle rate (pitch
+    /// kept; a rate change takes effect at its next hop); 1x, 8x, reverse and stop drop it, so the 1x path is unchanged.
+    fn shuttle_stretch(&mut self) {
+        if self.playing && self.play.out.is_some() && (2..=SHUTTLE_HEARD).contains(&self.rate) {
+            let (hz, r) = (self.play.rate, self.rate as f64);
+            self.play.stretch.get_or_insert_with(|| gneiss_pal::dsp::audio::stretch::Wsola::new(hz, 2)).set_rate(r);
+        } else {
+            self.play.stretch = None;
+        }
+    }
+}
+
+/// STRIAJKLTRANSPORT (SR873): a played tick's stereo on its way to the device: unchanged with no stretch (1x), else pushed
+/// through the shuttle's `Wsola` and what it yields so far (a 2x tick's two frames of audio come out as about one).
+fn shuttle_pcm(w: Option<&mut gneiss_pal::dsp::audio::stretch::Wsola>, stereo: Vec<f32>) -> Vec<f32> {
+    let Some(w) = w else { return stereo };
+    w.push(&stereo);
+    let mut out = Vec::new();
+    w.pull(&mut out);
+    out
+}
+
+#[cfg(test)]
+mod striajkltransport_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::SYNTH_RATE;
+    use std::sync::{Arc, Mutex};
+
+    /// The device's calls: (frames pushed, paused, flushes).
+    #[derive(Default)]
+    struct Dev {
+        pushed: Vec<usize>,
+        paused: Vec<bool>,
+        flushes: usize,
+    }
+    struct Out(Arc<Mutex<Dev>>);
+    impl AudioOut for Out {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            self.0.lock().unwrap().pushed.push(stereo.len() / 2);
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.0.lock().unwrap().pushed.iter().sum::<usize>() as u64
+        }
+        fn flush(&mut self) {
+            self.0.lock().unwrap().flushes += 1;
+        }
+        fn set_paused(&mut self, p: bool) {
+            self.0.lock().unwrap().paused.push(p);
+        }
+    }
+
+    fn face() -> (Face, Arc<Mutex<Dev>>) {
+        let (tl, src) = synth_fixture();
+        let dev = Arc::new(Mutex::new(Dev::default()));
+        (Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(Out(dev.clone())), SYNTH_RATE), dev)
+    }
+
+    fn key(f: &mut Face, k: &str) {
+        assert!(f.on(&SMessage::BrowserText(k.into())));
+    }
+
+    /// STRIAJKLTRANSPORT M3: L doubles 1, 2, 4, 8 and holds at 8; J mirrors it; L while reversing and J while going forward
+    /// start over at 1x; K stops at rate 1; a 4x tick steps 4 frames; the end clamps and stops.
+    #[test]
+    fn striajkltransport_ladder() {
+        let (mut f, _) = face();
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            key(&mut f, "l");
+            seen.push(f.rate);
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 8]);
+        key(&mut f, "j");
+        assert_eq!((f.playing, f.rate), (true, -1), "J while going forward starts reverse at 1x");
+        seen.clear();
+        for _ in 0..4 {
+            key(&mut f, "j");
+            seen.push(f.rate);
+        }
+        assert_eq!(seen, vec![-2, -4, -8, -8]);
+        key(&mut f, "l");
+        assert_eq!((f.playing, f.rate), (true, 1), "L while reversing starts forward at 1x");
+        key(&mut f, "k");
+        assert_eq!((f.playing, f.rate), (false, 1));
+
+        f.state.seek(10);
+        key(&mut f, "l");
+        key(&mut f, "l");
+        key(&mut f, "l");
+        assert_eq!(f.rate, 4);
+        assert!(f.tick() && f.tick());
+        assert_eq!(f.state.playhead, 14, "the first tick is shown at its own playhead, the next steps 4");
+        let end = f.state.timeline.end();
+        f.state.seek(end - 2);
+        while f.tick() {}
+        assert_eq!((f.playing, f.state.playhead), (false, end), "the end clamps and stops");
+    }
+
+    /// STRIAJKLTRANSPORT M3: 2x and 4x stay released (no pause, no flush on the step up) and keep the device in real time
+    /// (N ticks push N x 1920 frames within one WSOLA frame); 8x pauses and flushes and pushes nothing; back at 1x every
+    /// tick pushes exactly 1920 again (the stretch dropped).
+    #[test]
+    fn striajkltransport_audio_follows() {
+        let per = (SYNTH_RATE / 25) as usize;
+        let wsola_n = (SYNTH_RATE as usize / 50) & !1;
+        for (keys, rate) in [(2, 2), (3, 4)] {
+            let (mut f, dev) = face();
+            key(&mut f, "l");
+            assert!(f.tick());
+            let base = { let d = dev.lock().unwrap(); (d.pushed.iter().sum::<usize>(), d.paused.clone(), d.flushes) };
+            assert_eq!(base.0, per);
+            for _ in 1..keys {
+                key(&mut f, "l");
+            }
+            assert_eq!(f.rate, rate);
+            assert!(f.played().live, "{rate}x is released");
+            let n = 6;
+            for _ in 0..n {
+                assert!(f.tick());
+            }
+            let d = dev.lock().unwrap();
+            assert_eq!((d.paused.clone(), d.flushes), (base.1.clone(), base.2), "{rate}x: no pause, no flush");
+            let got = d.pushed.iter().sum::<usize>() - base.0;
+            assert!(got + 2 * wsola_n >= n * per && got <= n * per + wsola_n, "{rate}x: {got} frames for {n} ticks");
+        }
+
+        let (mut f, dev) = face();
+        for _ in 0..4 {
+            key(&mut f, "l");
+        }
+        assert_eq!(f.rate, 8);
+        assert!(!f.played().live, "8x is silent, as before");
+        assert_eq!(dev.lock().unwrap().paused.last(), Some(&true));
+        let before = dev.lock().unwrap().pushed.iter().sum::<usize>();
+        assert!(f.tick() && f.tick());
+        assert_eq!(dev.lock().unwrap().pushed.iter().sum::<usize>(), before, "8x pushes nothing");
+        assert!(f.play.stretch.is_none());
+
+        let (mut f, dev) = face();
+        key(&mut f, "l");
+        key(&mut f, "l");
+        assert!(f.tick() && f.tick());
+        assert!(f.play.stretch.is_some());
+        key(&mut f, "k");
+        assert!(f.play.stretch.is_none());
+        key(&mut f, "l");
+        dev.lock().unwrap().pushed.clear();
+        assert!(f.tick() && f.tick() && f.tick());
+        assert_eq!(dev.lock().unwrap().pushed, vec![per; 3], "1x after a shuttle is today's path");
+    }
+
+    /// STRIAJKLTRANSPORT M3: reverse is silent: J pauses and flushes the device and its ticks push nothing; a face with no
+    /// device never builds a stretch.
+    #[test]
+    fn striajkltransport_reverse_silent() {
+        let (mut f, dev) = face();
+        f.state.seek(20);
+        key(&mut f, "l");
+        assert!(f.tick());
+        let flushes = dev.lock().unwrap().flushes;
+        key(&mut f, "j");
+        assert_eq!((f.playing, f.rate, f.played().live), (true, -1, false));
+        let (pushed, last, fl) = { let d = dev.lock().unwrap(); (d.pushed.iter().sum::<usize>(), d.paused.last().copied(), d.flushes) };
+        assert_eq!((last, fl), (Some(true), flushes + 1));
+        key(&mut f, "j");
+        assert!(f.tick() && f.tick());
+        assert_eq!(dev.lock().unwrap().pushed.iter().sum::<usize>(), pushed, "reverse pushes nothing");
+        assert!(f.play.stretch.is_none());
+
+        let (tl, src) = synth_fixture();
+        let mut mute = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        key(&mut mute, "l");
+        key(&mut mute, "l");
+        assert!(mute.tick());
+        assert!(mute.play.stretch.is_none());
+    }
 }
