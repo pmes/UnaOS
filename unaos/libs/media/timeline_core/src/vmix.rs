@@ -83,7 +83,7 @@ pub fn mix_step(kind: TransitionKind, t: Frac, out: &mut [u8], b: &[u8], w: u32,
 /// take. Returns whether `live` moved.
 pub fn take_outgoing<R>(s: &Step, live: &mut Option<R>, mix: &mut Option<R>, src_of: impl Fn(&R) -> SourceId) -> bool {
     let Some(m) = s.vmix else {
-        *mix = None;
+        hand_back(s, live, mix, &src_of); *mix = None; // STRIAOPACITYNEXT (SR993): a lower run the overlay positioned goes back to the live slot (file tail)
         return false;
     };
     if m.src.is_some() && m.seek.is_none() && mix.as_ref().map(&src_of) != m.src && live.as_ref().map(&src_of) == m.src {
@@ -267,4 +267,16 @@ fn sweep(dir: WipeDir, x: usize, y: usize, w: usize, h: usize, num: i64, den: i6
     let r = rem_tau(clock_angle(x, y, w, h) - q) % p;
     let f = num as f64 / den as f64;
     if fan { r.min(p - r) < p * f / 2.0 } else { r < p * f }
+}
+
+// ---- STRIAOPACITYNEXT (LEDGER SR993): the mix run handed back to the live slot (named tail block) ----
+// NLE-OPACITY-HANDBACK: outside a mix, a step with no seek whose source is the mix run's and not the live run's continues
+// the mix run (the schedule says so only after an opacity overlay: `schedule::hand_back_prev`); the old live run drops as
+// a reopen drops it. Part of [`take_outgoing`], the ONE outgoing-run rule Stria's render and the kernel Player call.
+
+/// STRIAOPACITYNEXT: `mix` into `live` when `s` (no seek) continues the mix run's source and `live` is another source's.
+fn hand_back<R>(s: &Step, live: &mut Option<R>, mix: &mut Option<R>, src_of: &impl Fn(&R) -> SourceId) {
+    if s.seek.is_none() && s.src.is_some() && mix.as_ref().map(src_of) == s.src && live.as_ref().map(src_of) != s.src {
+        *live = mix.take();
+    }
 }

@@ -978,6 +978,8 @@ pub struct EdlReport {
     /// the stand-in pictures shown.
     pub swaps: u64,
     pub stand_in_frames: u64,
+    /// STRIAOPACITYNEXT (SR993): what the current step mixes for (`opacity` / `transition`), named by a refused second slot.
+    pub mix_what: &'static str,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
 }
 
@@ -1083,7 +1085,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if rep.plan.len() < SHOWN_CAP {
             rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
         }
-        let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err();
+        rep.mix_what = mix_what(tl, s); let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err(); // STRIAOPACITYNEXT (SR993): an opacity tick's refusal names opacity (file tail)
         let mut frame = match s.src {
             None => {
                 if s.vmix.is_none() {
@@ -1258,7 +1260,7 @@ fn slot_room(w: usize, h: usize) -> Result<(), String> {
 fn edl_refuse(rep: &mut EdlReport, why: &str) {
     rep.mix_refused += 1;
     if rep.mix_refused <= 4 {
-        serial_println!("[vplay] transition: second decoder slot refused ({})", why);
+        let (what, tail) = refuse_words(rep.mix_what); serial_println!("[vplay] {}: second decoder slot refused ({}){}", what, why, tail); // STRIAOPACITYNEXT (SR993): `opacity` for an opacity tick, the transition line unchanged (file tail)
     }
 }
 
@@ -2778,4 +2780,24 @@ fn edit_roll_tool(path: &str) -> Option<u64> {
 /// A drag's wire word: `roll` for a trim the roll tool turned into a roll, else its kind's ([`drag_word`]).
 fn drag_name(d: &timeline_core::view::Drag) -> &'static str {
     if d.roll { "roll" } else { drag_word(d.kind) }
+}
+
+// ── STRIAOPACITYNEXT (LEDGER SR993): the refused second slot names an opacity tick (named tail block) ───────────────────
+// handlers.md NLE-OPACITY-KERNEL-LINE. A non-opaque clip mixes the track below through the same `VideoMix` a transition
+// carries, so a refused second decoder slot printed the transition's words. `edl_run` names each video step's mix
+// (`mix_what`) and `edl_refuse` prints `[vplay] opacity: second decoder slot refused (<why>); the top clip shows opaque`
+// for an opacity tick; every transition line is byte-identical.
+
+/// STRIAOPACITYNEXT: `opacity` when step `s` mixes and its own clip is below `timeline_core::OPAQUE`, else `transition`.
+fn mix_what(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step) -> &'static str {
+    let pct = s.track.and_then(|ti| tl.clip_at(ti, s.out_t).map(|ci| tl.tracks[ti].clips[ci].opacity));
+    match pct {
+        Some(p) if s.vmix.is_some() && p < timeline_core::OPAQUE => "opacity",
+        _ => "transition",
+    }
+}
+
+/// STRIAOPACITYNEXT: the refusal line's subject and tail for [`EdlReport::mix_what`].
+fn refuse_words(what: &str) -> (&'static str, &'static str) {
+    if what == "opacity" { ("opacity", "; the top clip shows opaque") } else { ("transition", "") }
 }

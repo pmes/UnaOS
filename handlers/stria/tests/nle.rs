@@ -6407,12 +6407,12 @@ fn striaopacityface_face_buttons_step_and_name_the_percent() {
         assert!(VERBS.contains(&"opacity-"));
         assert!(face.verb("opacity-"));
     }
-    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 50 %"));
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity: 50 %"))); // STRIAOPACITYNEXT (SR993): the percent is a note
     assert_eq!(face.state.undo_depth(), 5);
     assert_eq!(face.state.timeline, tl0.set_opacity(&[(0, 1)], 50).unwrap());
     assert!(face.verb("opacity+"));
-    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 60 %"));
-    assert_eq!(face.message_text(), face.reel_line(), "the message is taken: the idle line again");
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity: 60 %"))); // STRIAOPACITYNEXT (SR993): the percent is a note
+    assert!(face.on(&bandy::SMessage::BrowserSelectAll)); assert_eq!(face.message_text(), face.reel_line(), "the next taken input clears the note: the idle line again"); // STRIAOPACITYNEXT (SR993)
     println!("striaopacityface: opacity- x5 -> 50 %, opacity+ -> 60 %, undo depth {}", face.state.undo_depth());
 }
 
@@ -10163,10 +10163,10 @@ fn striaopacitymore_keys_step_the_selection_and_help_names_them() {
     let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
     face.state.select(0, 1).unwrap();
     assert!(face.on(&bandy::SMessage::BrowserText("8".into())));
-    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 90 %"));
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity: 90 %"))); // STRIAOPACITYNEXT (SR993): the percent is a note
     assert_eq!(face.state.undo_depth(), 1);
     assert!(face.on(&bandy::SMessage::BrowserText("9".into())));
-    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 100 %"));
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity: 100 %"))); // STRIAOPACITYNEXT (SR993): the percent is a note
     assert_eq!(face.state.undo_depth(), 2);
     assert!(!face.on(&bandy::SMessage::BrowserKey("8".into())), "a one-character key is text only");
     let rows = help_rows();
@@ -11933,4 +11933,55 @@ fn striakmarkers_host_keys_agree_with_the_players_m_and_shift_m() {
     use stria::nle_face::KEYS;
     assert!(KEYS.contains(&("m", "mark")));
     assert!(!KEYS.iter().any(|&(k, _)| k == "M"), "M is unbound on the host");
+}
+
+// ---- STRIAOPACITYNEXT (LEDGER SR993): the lower run hands back; the step note is not an error (named tail block) ----
+
+/// SR868's stack (V1 A[0,30)@0 counter 0, V2 B[0,10)@10 counter 1000 at 50 %): after the overlay A's run (kept in the mix
+/// slot) continues as the live run, so the render opens TWO runs (A at 0, B at 10), not three, and A's frames after the
+/// overlay are its own ticks.
+#[test]
+fn striaopacitynext_render_hands_back_without_a_reseek() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    let tl = tl.set_opacity(&[(1, 0)], 50).unwrap();
+    let steps = schedule(&tl, 0..30, &src).unwrap();
+    assert_eq!(steps[20].seek, None, "the schedule hands the lower run back");
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..30, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 30);
+    let at = |t: usize| TestPattern::read_counter(&sink.frames[t].1, 64, 48);
+    assert_eq!((at(9), at(20), at(21), at(29)), (Some(9), Some(20), Some(21), Some(29)));
+    assert_eq!(r.seeks, 2, "A at 0, B at 10; A continues after the overlay");
+    println!("striaopacitynext: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
+}
+
+/// The opacity step's percent is a face note: `last_error` stays empty and `message_text` reads it; a refusal is still an
+/// error; a pointer move keeps the note, a taken select-all clears it.
+#[test]
+fn striaopacitynext_step_note_is_not_an_error() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("opacity+"));
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("opacity: ")), "nothing selected: a refusal");
+    assert_eq!(face.note, None);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("opacity-"));
+    assert_eq!(face.last_error, None);
+    assert_eq!(face.message_text().as_deref(), Some("opacity: 90 %"));
+    face.on(&bandy::SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    assert_eq!(face.note.as_deref(), Some("opacity: 90 %"), "a pointer move keeps the note");
+    assert!(face.on(&bandy::SMessage::BrowserSelectAll));
+    assert_eq!(face.note, None, "a taken input clears it");
+    assert_eq!(face.message_text(), face.reel_line());
+    println!("striaopacitynext: opacity- -> note opacity: 90 %, cleared by select-all");
 }

@@ -146,7 +146,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
                     let m0 = m_next; let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?; let vmix = opacity_mix(tl, idx, ti, ci, t, vmix, (v_next, m0), &mut m_next)?; // STRIAOPACITY (SR868): a non-opaque winner mixes the track below (file tail)
-                    let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, v_next)?;
+                    let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, hand_back_prev(vmix.is_some(), m0, v_next, (c.src, src_t)))?; // STRIAOPACITYNEXT (SR993): the lower run positioned by the overlay continues without a seek (file tail)
                     v_next = Some((c.src, c.src_at(t + 1))); // STRIACLIPSPEED (SR829): a rated clip continues its run (1x: src_t + 1)
                     Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
                 }
@@ -577,4 +577,20 @@ fn below(tl: &Timeline, ti: usize, t: i64) -> Option<(usize, usize)> {
 pub fn pan_q16(pan_cq8: i8) -> [u32; 2] {
     let p = ((pan_cq8.max(-127) as i64 + 127) * ENV_ONE as i64 / 254) as u32;
     [qsin(ENV_ONE - p), qsin(p)]
+}
+
+// ---- STRIAOPACITYNEXT (LEDGER SR993): the lower run hands back after an opacity overlay (named tail block) ----
+// NLE-OPACITY-HANDBACK. While a non-opaque clip overlays the track below, `opacity_mix` keeps the lower clip's run in the
+// mix slot (`m_next`). At the first plain tick after the overlay the lower clip wins again at exactly the tick that run
+// would continue at: the step's continuing reference is then that run (no seek), and `vmix::take_outgoing` moves it back
+// to the live slot for both consumers (Stria's render, the kernel Player). Only when the live run (`v_next`) is of ANOTHER
+// source: a stack of one reel on both tracks keeps its seek (the consumers could not tell the two runs apart).
+
+/// STRIAOPACITYNEXT: the reference [`seek_for`] compares a video step against: `m0` (the mix run before this tick) when the
+/// step mixes nothing, `m0` continues at `at` exactly and `v_next` is of another source; else `v_next`.
+fn hand_back_prev(mixing: bool, m0: Option<(SourceId, i64)>, v_next: Option<(SourceId, i64)>, at: (SourceId, i64)) -> Option<(SourceId, i64)> {
+    if !mixing && m0 == Some(at) && v_next.map(|v| v.0) != Some(at.0) {
+        return m0;
+    }
+    v_next
 }
