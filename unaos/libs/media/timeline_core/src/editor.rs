@@ -726,3 +726,51 @@ mod striakshuttle_tests {
         }
     }
 }
+
+// ---- STRIAKSHUTTLEHOLD (LEDGER SR9105): the shuttle ceiling's lag rule (named tail block) ----
+// The kernel Player's 8x ceiling (vplay.rs `shuttle_top`): a face whose decode keeps up at its base ceiling may climb to
+// its top. The measure is the lag of each shown frame behind the clock (summed), not the drop count: at Nx frames are
+// passed over by design, and a decode that falls behind drops FEWER (each late frame shows alone) while its lag grows.
+
+/// Frames a face must show at a rate before the lag rule judges it.
+pub const SHUTTLE_KEEP_SHOWN: u64 = 12;
+/// The mean lag (ms) behind the clock a decode that keeps up stays within.
+pub const SHUTTLE_KEEP_LAG_MS: u64 = 100;
+
+/// The shuttle ceiling: `top` when `shown` frames (at least [`SHUTTLE_KEEP_SHOWN`]) lagged the clock by `lag_sum_ms` in
+/// all, a mean within [`SHUTTLE_KEEP_LAG_MS`]; else `base`.
+pub fn shuttle_ceiling(shown: u64, lag_sum_ms: u64, base: i64, top: i64) -> i64 {
+    if shown >= SHUTTLE_KEEP_SHOWN && lag_sum_ms <= SHUTTLE_KEEP_LAG_MS.saturating_mul(shown) { top } else { base }
+}
+
+#[cfg(test)]
+mod striakshuttlehold_tests {
+    use super::{shuttle_ceiling, shuttle_rate};
+
+    /// STRIAKSHUTTLEHOLD M3: twelve frames shown 20 ms behind the clock open the ceiling to 8x.
+    #[test]
+    fn striakshuttlehold_ceiling_opens() {
+        assert_eq!(shuttle_ceiling(12, 12 * 20, 4, 8), 8);
+    }
+
+    /// STRIAKSHUTTLEHOLD M3: eleven frames are too few to judge: the ceiling stays 4x.
+    #[test]
+    fn striakshuttlehold_ceiling_few_frames() {
+        assert_eq!(shuttle_ceiling(11, 0, 4, 8), 4);
+    }
+
+    /// STRIAKSHUTTLEHOLD M3: a mean lag past 100 ms keeps the ceiling at 4x.
+    #[test]
+    fn striakshuttlehold_ceiling_lags() {
+        assert_eq!(shuttle_ceiling(12, 12 * 101, 4, 8), 4);
+        assert_eq!(shuttle_ceiling(12, 12 * 100, 4, 8), 8);
+    }
+
+    /// STRIAKSHUTTLEHOLD M3: the ONE ladder takes the ceiling: 4x climbs to 8x when it opens, holds at 4x when not.
+    #[test]
+    fn striakshuttlehold_ladder_to_eight() {
+        assert_eq!(shuttle_rate("shuttle+", true, 4, shuttle_ceiling(12, 0, 4, 8)), 8);
+        assert_eq!(shuttle_rate("shuttle+", true, 4, shuttle_ceiling(3, 0, 4, 8)), 4);
+        assert_eq!(shuttle_rate("shuttle+", true, 8, 4), 4);
+    }
+}
