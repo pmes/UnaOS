@@ -27,7 +27,7 @@
 //! the counts, a v1 text and a bad count refuse by name. Test f's tampered line keeps the v2 count token.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_limit, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -357,7 +357,7 @@ fn i_note_stat_skips_filler() {
 // ---- H264ENCTWOPASSBLUR (LEDGER SR736): x264's complexity blur, qblur and GOP-mean I rule, the qcomp knob (named tail block) ----
 
 /// SR698's plan: no complexity blur, no QP blur, an I picture from its next P's complexity.
-const RAW: Pass2Opts = Pass2Opts { qcomp: (3, 5), cplxblur: 0, qblur_q8: 0, i_from_gop: false };
+const RAW: Pass2Opts = Pass2Opts { qcomp: (3, 5), cplxblur: 0, qblur_q8: 0, i_from_gop: false, qpstep: 0 };
 
 /// Test (a)'s first pass: 60 pictures, an IDR every 30, P complexities spread over a decade.
 fn synthetic() -> Vec<PicStat> {
@@ -576,3 +576,88 @@ fn q_stats_v2_text_carries_the_counts() {
     assert_eq!(read_stats(&text.replace(" 44/48", " 49/48")), Err(StatsError::Line(3)));
     assert_eq!(read_stats(&text.replace(" 44/48", "")), Err(StatsError::Line(3)));
 }
+
+// ---- H264ENCTWOPASSQPSTEP (LEDGER SR763): x264's get_diff_limited_q qpstep clamp over the plan (named tail block) ----
+// (r) a 10x P spike and a lasting 10x step under the default's qpstep 4 with the blurs off (the default's cplxblur 20 spreads a 10x
+// spike to ~1.4x, leaving no 4-QP step to limit): every neighbouring P pair within 4 QP (qpstep 0: the spike steps 8), the ramp
+// before the step, the I at its GOP's limited mean P QP less 3, the predicted total within 2%; (s) `rc::qpstep_limit` itself: a B
+// untouched, no limit across an I, an I against the next I only with no P between nor after it, qpstep 0 the identity; (t) moved
+// pins: none. `qpstep 0` on the default plans synthetic()'s pre-SR763 default literals, the default (qpstep 4) the same ones, and
+// the scene's first pass plans the same at both qpsteps (tests b / e / h / l unmoved); RAW (qpstep 0) keeps test k's SR698 literals.
+
+/// IDRs at 0 and 30, P pictures of 1000 bits, one 10000-bit P at 12 and 10000-bit P pictures from 45 on.
+fn spiked() -> Vec<PicStat> {
+    (0..60).map(|i| if i % 30 == 0 { pic(Pic::Idr, 30_000) } else if i == 12 || i >= 45 { pic(Pic::P, 10_000) } else { pic(Pic::P, 1000) }).collect()
+}
+
+/// The largest QP step between neighbouring P pictures of `q`.
+fn p_step(stats: &[PicStat], q: &[i32]) -> i32 {
+    (1..q.len()).filter(|&i| stats[i - 1].kind == Pic::P && stats[i].kind == Pic::P).map(|i| (q[i] - q[i - 1]).abs()).max().unwrap_or(0)
+}
+
+#[test]
+fn r_qpstep_limits_a_spike() {
+    assert_eq!(Pass2Opts::default().qpstep, QP_STEP);
+    assert_eq!(QP_STEP, 4, "x264's i_qp_step");
+    let stats = spiked();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    let sharp = Pass2Opts { cplxblur: 0, qblur_q8: 0, ..Pass2Opts::default() };
+    for target in [first / 2, first] {
+        let free = pass2_qps(&stats, target, QP_MIN, &Pass2Opts { qpstep: 0, ..sharp });
+        let held = pass2_qps(&stats, target, QP_MIN, &sharp);
+        println!("twopassqpstep spike target={target} qpstep=0 step={} {free:?}", p_step(&stats, &free));
+        println!("twopassqpstep spike target={target} qpstep=4 step={} {held:?}", p_step(&stats, &held));
+        assert!(p_step(&stats, &free) > 4, "the fixture steps more than 4 QP without the limit");
+        assert!(p_step(&stats, &held) <= 4, "every neighbouring P pair within 4 QP: {held:?}");
+        assert!(held[44] >= held[45] - 4 && held[12] <= held[13] + 4, "the ramp before the step, the spike held to its next P");
+        let mean = held[31..60].iter().sum::<i32>() as f64 / 29.0;
+        assert!((held[30] as f64 - (mean - 3.0)).abs() <= 1.0, "the I {} at its GOP's limited mean P QP {mean:.2} less 3", held[30]);
+        let got = predicted(&stats, &held);
+        assert!(got <= target && got as f64 >= target as f64 * 0.98, "plan {got} vs target {target}");
+    }
+}
+
+#[test]
+fn s_qpstep_limit_rules() {
+    let q = |v: &[i64]| -> Vec<i64> { v.iter().map(|&x| x << 16).collect() };
+    // P pictures: a B untouched, the P at 3 held to the P at 4, the P at 1 to the (held) P at 3, the P at 4 not across the IDR at 5.
+    let kinds = [Pic::Idr, Pic::P, Pic::B, Pic::P, Pic::P, Pic::Idr, Pic::P];
+    let mut v = q(&[20, 35, 99, 20, 30, 40, 10]);
+    qpstep_limit(&mut v, &kinds, 4, Pic::P);
+    assert_eq!(v, q(&[20, 30, 99, 26, 30, 40, 10]));
+    // I pictures: the I at 0 held to the I at 1 (no P between, none after 1 before 2); the I at 1 not (a P follows the I at 2); the
+    // I at 2 not (a P is its next non-B).
+    let kinds = [Pic::Idr, Pic::Idr, Pic::Idr, Pic::P, Pic::Idr];
+    let mut v = q(&[10, 30, 50, 0, 90]);
+    qpstep_limit(&mut v, &kinds, 4, Pic::Idr);
+    assert_eq!(v, q(&[26, 30, 50, 0, 90]));
+    // qpstep 0: the identity.
+    let mut v = q(&[20, 35, 99, 20, 30, 40, 10]);
+    qpstep_limit(&mut v, &[Pic::Idr, Pic::P, Pic::B, Pic::P, Pic::P, Pic::Idr, Pic::P], 0, Pic::P);
+    assert_eq!(v, q(&[20, 35, 99, 20, 30, 40, 10]));
+}
+
+#[test]
+fn t_qpstep_zero_is_the_pre_sr763_default() {
+    let stats = synthetic();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    for (target, want) in [(first / 2, &T_DEFAULT_PRE[0]), (first, &T_DEFAULT_PRE[1]), (first * 2, &T_DEFAULT_PRE[2])] {
+        let held = pass2_qps(&stats, target, QP_MIN, &Pass2Opts::default());
+        println!("twopassqpstep synthetic default target={target} {held:?}");
+        assert_eq!(&pass2_qps(&stats, target, QP_MIN, &Pass2Opts { qpstep: 0, ..Pass2Opts::default() })[..], &want[..], "qpstep 0 is the pre-SR763 default");
+        assert_eq!(&held[..], &want[..], "no moved pin: synthetic()'s default plan steps at most 4 QP between P pictures");
+    }
+    for kbps in [60u32, 100] {
+        let scene = first_pass(kbps);
+        let tb = kbps as u64 * 1000 * N as u64 / FPS as u64;
+        let held = pass2_qps(&scene, tb, QP_MIN, &Pass2Opts::default());
+        assert_eq!(held, pass2_qps(&scene, tb, QP_MIN, &Pass2Opts { qpstep: 0, ..Pass2Opts::default() }), "kbps {kbps}: the scene's plan unmoved");
+    }
+}
+
+/// pass2_qps(synthetic(), first / 2, first, first x 2, QP_MIN, Pass2Opts::default()) captured on the tree BEFORE SR763.
+const T_DEFAULT_PRE: [[i32; 60]; 3] = [
+    [30, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 30, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33],
+    [24, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 24, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27, 27],
+    [18, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 18, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21, 21],
+];
