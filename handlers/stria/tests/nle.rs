@@ -3551,3 +3551,77 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIAEXPORTPRESETS (LEDGER SR871): the export presets through the face's verb and the one table (named tail block) ----
+
+#[test]
+fn striaexportpresets_table_is_the_two_tables_words() {
+    use stria::nle_export::{PRESETS, VIDEO_NAMES, audio_named, preset_named, preset_words};
+    for p in &PRESETS {
+        assert!(VIDEO_NAMES.contains(&p.video), "{}: {} is a video word", p.name, p.video);
+        assert!(audio_named(p.audio).is_some(), "{}: {} is an audio word", p.name, p.audio);
+        assert_eq!(preset_named(p.name), Some(p), "{}: by name", p.name);
+        let o = p.opts();
+        assert_eq!((o.qp, o.crf, o.scenecut, o.aq, o.bitrate, o.gop), (p.qp, p.crf, p.scenecut, p.aq, None, None), "{}", p.name);
+    }
+    assert_eq!(preset_words(), "web|archive|proxy");
+    assert_eq!(preset_named("gif"), None);
+}
+
+#[test]
+fn striaexportpresets_archive_is_png_wav() {
+    let (pre, words) = (nlefaceexport_dir("preset-archive"), nlefaceexport_dir("preset-archive-words"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} --preset archive", pre.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" png + wav in "), "{line}");
+    assert!(face.verb(&format!("export {} png wav", words.display())));
+    assert!(face.wait_export());
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: 35 frames, ")));
+    for f in ["000000.png".to_string(), "000034.png".to_string(), "audio.wav".to_string()] {
+        assert_eq!(std::fs::read(pre.join(&f)).unwrap(), std::fs::read(words.join(&f)).unwrap(), "{f}: the preset is its words");
+    }
+    println!("striaexportpresets: archive {line}");
+}
+
+#[test]
+fn striaexportpresets_proxy_is_the_tables_encoder() {
+    use stria::nle_export::{Container, audio_named, export_as_with, preset_named, video_named_with};
+    let (pre, direct) = (nlefaceexport_dir("preset-proxy"), nlefaceexport_dir("preset-proxy-direct"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} --preset proxy", pre.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the result line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" h264 + aac:64 in "), "{line}");
+    let p = preset_named("proxy").unwrap();
+    let (tl, src) = synth_fixture();
+    std::fs::create_dir_all(&direct).unwrap();
+    let enc = video_named_with(p.video, tl.tb, p.opts()).unwrap();
+    export_as_with(&tl, 0..tl.end(), &src, &direct, enc, audio_named(p.audio).unwrap(), Container::Mp4, &mut |_, _| Ok(())).unwrap();
+    assert_eq!(std::fs::read(pre.join("movie.mp4")).unwrap(), std::fs::read(direct.join("movie.mp4")).unwrap(), "the face's preset is the table's encoder, byte-exact");
+    println!("striaexportpresets: proxy {line}");
+}
+
+#[test]
+fn striaexportpresets_refused_by_name() {
+    let root = nlefaceexport_dir("preset-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    let d = root.display().to_string();
+    for (v, want) in [
+        (format!("export {d} --preset"), "export: --preset needs one of web|archive|proxy".to_string()),
+        (format!("export {d} --preset gif"), "export: unknown preset gif (web|archive|proxy)".to_string()),
+        (format!("export {d} png --preset web"), "export: --preset web takes only [<dir>]".to_string()),
+    ] {
+        assert!(face.verb(&v), "{v}");
+        assert_eq!(face.last_error.take(), Some(want), "{v}");
+        assert!(!face.exporting() && !root.exists(), "{v}: a refused preset makes nothing");
+    }
+    assert!(face.verb(&format!("export {d} png wav extra")));
+    assert!(face.last_error.take().is_some_and(|u| u.starts_with("export: usage: export [--all] [<dir>] [") && u.ends_with(" [--preset web|archive|proxy]")), "the usage names the presets");
+}

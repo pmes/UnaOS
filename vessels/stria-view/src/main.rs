@@ -61,7 +61,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--presets]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -89,6 +89,7 @@ fn cli() -> Cli {
                 let (r, p) = v.split_once('=').unwrap_or_else(|| die(USAGE.into()));
                 c.srcs.push((r.to_string(), p.to_string()));
             }
+            "--presets" => { print!("{}", presets_text()); std::process::exit(0) } // STRIAEXPORTPRESETS (SR871): the export presets, one line each, on stdout (file tail)
             "--do" => c.script = a.next(),
             "--out" => c.out = a.next(),
             "--help" | "-h" => {
@@ -856,5 +857,26 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAEXPORTPRESETS (LEDGER SR871): the witness lists the export presets (named tail block) ----
+/// `stria-view --presets`: one line per [`stria::nle_export::PRESETS`] row, its own words ([`stria::nle_export::ExportPreset::words`]),
+/// the names the face's `export [<dir>] --preset <name>` takes.
+fn presets_text() -> String {
+    stria::nle_export::PRESETS.iter().map(|p| p.words() + "\n").collect()
+}
+
+#[cfg(test)]
+mod striaexportpresets_tests {
+    use super::*;
+
+    /// The listing is the table: one line per preset, in table order, each naming its video and audio words.
+    #[test]
+    fn striaexportpresets_lists_the_table() {
+        let t = presets_text();
+        assert_eq!(t, "web: h264 + aac crf=23 aq=10 scenecut=40\narchive: png + wav\nproxy: h264 + aac:64 crf=32\n");
+        assert_eq!(t.lines().count(), stria::nle_export::PRESETS.len());
+        assert!(USAGE.contains("[--presets]"), "{USAGE}");
     }
 }

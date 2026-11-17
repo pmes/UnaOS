@@ -2072,7 +2072,7 @@ mod playaudio_tests {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
-use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, VIDEO_NAMES, export_as_with, video_named};
+use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, H264Opts, VIDEO_NAMES, export_as_with, video_named_with}; // STRIAEXPORTPRESETS (SR871): the table with a preset's H.264 options
 
 /// NLE5d (SR694): the export band's height (px), painted over the ruler's foot while an export runs.
 pub const EXPORT_BAND_H: u32 = 2;
@@ -2103,7 +2103,7 @@ impl Face {
         if words.next() != Some("export") {
             return None;
         }
-        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, audio) = export_audio_word(args);
+        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, opts) = export_preset_words(args); let (args, audio) = export_audio_word(args);
         if let Some((d, t)) = self.export_progress() {
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
@@ -2126,7 +2126,7 @@ impl Face {
                 return Some(true);
             }
         };
-        if let Err(e) = audio.and_then(|a| self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }, a)) {
+        if let Err(e) = audio.and_then(|a| opts.and_then(|o| self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }, a, o))) { // STRIAEXPORTPRESETS (SR871): a preset's H.264 options (file tail)
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
@@ -2134,7 +2134,7 @@ impl Face {
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
     /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `audio` (the verb's word, default `AudioOut::Wav`, NLE5DEXPORTAUDIOOPTIONS SR722) into `Container::Mp4` (`nle export`'s defaults).
     /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
-    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut) -> Result<(), String> {
+    fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut, opts: H264Opts) -> Result<(), String> { // STRIAEXPORTPRESETS (SR871): `opts` moved into the thread, as `fmt` is
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
         }
@@ -2148,7 +2148,7 @@ impl Face {
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
-                let video = video_named(&fmt, tl.tb).expect("a VIDEO_NAMES word");
+                let video = video_named_with(&fmt, tl.tb, opts).expect("a VIDEO_NAMES word"); // STRIAEXPORTPRESETS (SR871): the face's defaults unless a preset set them
                 let mut progress = |n: u64, of: u64| -> Result<(), ExportError> {
                     d.store(n, Relaxed);
                     t.store(of, Relaxed);
@@ -2171,7 +2171,7 @@ impl Face {
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
     /// [`Face::cancel_export`]). The verb's own job is this with no hold.
     pub fn export_paused_at(&mut self, dir: &std::path::Path, fmt: &str, k: u64) -> Result<(), String> {
-        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav)
+        self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav, H264Opts::default())
     }
     /// True while an export's result has not been reported.
     pub fn exporting(&self) -> bool {
@@ -2744,7 +2744,7 @@ fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64, fps: 
 /// refusal both name it.
 fn export_usage() -> String {
     let audio: Vec<&str> = crate::nle_export::AUDIO_NAMES.iter().map(|w| if *w == "aac" { "aac[:KBPS]" } else { *w }).collect();
-    format!("export [--all] [<dir>] [{}] [{}]", VIDEO_NAMES.join("|"), audio.join("|"))
+    format!("export [--all] [<dir>] [{}] [{}] [--preset {}]", VIDEO_NAMES.join("|"), audio.join("|"), crate::nle_export::preset_words()) // STRIAEXPORTPRESETS (SR871): the preset words
 }
 
 impl Face {
@@ -3060,4 +3060,28 @@ pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
     let after = STALL_AFTER.as_secs_f64();
     let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
     (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
+}
+
+// ---- STRIAEXPORTPRESETS (LEDGER SR871): the export verb's `--preset <name>` through the one preset table (named tail block) ----
+/// The `export` verb's `--preset <name>` (`export [--all] [<dir>] --preset web|archive|proxy`): no `--preset` leaves the words
+/// as they are with the face's default H.264 options (every grammar before parses the same). `--preset <p>` is removed and,
+/// with at most a directory left, the preset's video and audio words ([`crate::nle_export::PRESETS`]) are appended, so the
+/// verb's own match and [`export_audio_word`] read them; the preset's H.264 options come back. Refused by name: a missing
+/// name, an unknown one, and a format / audio word beside a preset.
+fn export_preset_words(mut args: Vec<&str>) -> (Vec<&str>, Result<H264Opts, String>) {
+    let Some(i) = args.iter().position(|w| *w == "--preset") else { return (args, Ok(H264Opts::default())) };
+    args.remove(i);
+    if i >= args.len() {
+        return (args, Err(format!("--preset needs one of {}", crate::nle_export::preset_words())));
+    }
+    let w = args.remove(i);
+    let Some(p) = crate::nle_export::preset_named(w) else {
+        return (args, Err(format!("unknown preset {w} ({})", crate::nle_export::preset_words())));
+    };
+    if args.len() > 1 {
+        return (args, Err(format!("--preset {} takes only [<dir>]", p.name)));
+    }
+    args.push(p.video);
+    args.push(p.audio);
+    (args, Ok(p.opts()))
 }

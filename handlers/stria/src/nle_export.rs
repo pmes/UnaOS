@@ -1030,3 +1030,55 @@ pub fn pass2_words(cli: &Pass2Cli) -> String {
 pub fn export_total(tl: &Timeline, range: &std::ops::Range<i64>) -> u64 {
     if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 }
 }
+
+// ---- STRIAEXPORTPRESETS (LEDGER SR871): the export presets, named bundles of the two tables' words (named tail block) ----
+/// One export preset (`nle export --preset <name>`, the editor face's `export [<dir>] --preset <name>`): a [`VIDEO_NAMES`]
+/// word read by [`video_named_with`], an [`audio_named`] word, and the [`H264Opts`] fields it sets ([`ExportPreset::opts`]).
+/// A preset is no second table: both faces hand its words to the two tables they already read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportPreset {
+    /// The word after `--preset`.
+    pub name: &'static str,
+    /// A [`VIDEO_NAMES`] word.
+    pub video: &'static str,
+    /// An [`audio_named`] word.
+    pub audio: &'static str,
+    /// [`H264Opts::qp`] (the rate controller's starting QP under a CRF).
+    pub qp: u8,
+    /// [`H264Opts::crf`].
+    pub crf: Option<u8>,
+    /// [`H264Opts::scenecut`].
+    pub scenecut: Option<u8>,
+    /// [`H264Opts::aq`].
+    pub aq: Option<u8>,
+}
+
+/// THE preset table: `web` (H.264 at CRF 23 with AQ and scene cuts, AAC-LC 128), `archive` (the lossless PNG sequence and
+/// PCM16 WAV), `proxy` (H.264 at CRF 32, AAC-LC 64).
+pub const PRESETS: [ExportPreset; 3] = [
+    ExportPreset { name: "web", video: "h264", audio: "aac", qp: 26, crf: Some(23), scenecut: Some(40), aq: Some(10) },
+    ExportPreset { name: "archive", video: "png", audio: "wav", qp: 26, crf: None, scenecut: None, aq: None },
+    ExportPreset { name: "proxy", video: "h264", audio: "aac:64", qp: 26, crf: Some(32), scenecut: None, aq: None },
+];
+
+/// The preset named `word`; None for any other word.
+pub fn preset_named(word: &str) -> Option<&'static ExportPreset> {
+    PRESETS.iter().find(|p| p.name == word)
+}
+
+/// The preset names as the usages and refusals spell them: `web|archive|proxy`.
+pub fn preset_words() -> String {
+    PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join("|")
+}
+
+impl ExportPreset {
+    /// The H.264 options the preset sets, every other field [`H264Opts::default`]'s.
+    pub fn opts(&self) -> H264Opts {
+        H264Opts { qp: self.qp, crf: self.crf, scenecut: self.scenecut, aq: self.aq, ..H264Opts::default() }
+    }
+    /// The preset's one listing line: `<name>: <video> + <audio>` then ` crf=N` / ` aq=N` / ` scenecut=N` for each set knob.
+    pub fn words(&self) -> String {
+        let knobs: String = [("crf", self.crf), ("aq", self.aq), ("scenecut", self.scenecut)].iter().filter_map(|(k, v)| v.map(|v| format!(" {k}={v}"))).collect();
+        format!("{}: {} + {}{knobs}", self.name, self.video, self.audio)
+    }
+}
