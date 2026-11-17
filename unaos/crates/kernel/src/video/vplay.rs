@@ -2697,13 +2697,14 @@ struct KThumbs {
     refused: u64,
     ms_max: u64,
     said: bool,
+    peaks: alloc::collections::BTreeMap<timeline_core::SourceId, Option<timeline_core::view::Peaks>>, // STRIAKWAVEFORM (LEDGER SR9059): each audio source's peak table (`None`: no audio, refused), filled by `peaks_step` (file tail)
 }
 
 static THUMBS: crate::sync::Mutex<Option<KThumbs>> = crate::sync::Mutex::new(None);
 
 impl KThumbs {
     fn new(path: &str) -> KThumbs {
-        KThumbs { path: String::from(path), map: alloc::collections::BTreeMap::new(), seq: 0, l: None, decodes: 0, refused: 0, ms_max: 0, said: false }
+        KThumbs { path: String::from(path), map: alloc::collections::BTreeMap::new(), seq: 0, l: None, decodes: 0, refused: 0, ms_max: 0, said: false, peaks: alloc::collections::BTreeMap::new() } // STRIAKWAVEFORM (LEDGER SR9059): no peak table yet (file tail)
     }
     /// Key `k` takes `v`, the oldest entry dropped first at KTHUMB_CAP.
     fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<timeline_core::view::Still>) {
@@ -2720,10 +2721,10 @@ impl KThumbs {
 
 impl timeline_core::view::PeakSource for KThumbs {
     fn peaks(&self, _src: timeline_core::SourceId) -> Option<&timeline_core::view::Peaks> {
-        None
+        self.peaks.get(&_src).and_then(|p| p.as_ref()) // STRIAKWAVEFORM (LEDGER SR9059): the Player's scanned table (file tail)
     }
     fn gain_q16(&self, _cdb: i32) -> i64 {
-        65536
+        audio_core::ramp::gain_q16(_cdb) // STRIAKWAVEFORM (LEDGER SR9059): the mix's ONE curve (snd's `ramp::layer_q8` reads it) (file tail)
     }
     fn thumb(&self, src: timeline_core::SourceId, src_tick: i64) -> Option<&timeline_core::view::Still> {
         self.map.get(&(src, src_tick)).and_then(|e| e.1.as_ref())
@@ -2776,7 +2777,7 @@ fn thumbs_wait(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline
                 None => None,
             }
         };
-        let Some((src, tick)) = want else {
+        let Some((src, tick)) = want else { if peaks_step(jid, path, reels, tl) { snd::tick(jid); continue; } // STRIAKWAVEFORM (LEDGER SR9059): no still wanted: one step of the peak scan (file tail)
             snd::tick(jid);
             crate::arch::sched::sleep_ms(2);
             continue;
@@ -2819,5 +2820,153 @@ fn thumb_decode(reels: &Reels, tl: &timeline_core::Timeline, src: timeline_core:
 
 /// STRIAKTHUMBS (SR9019): the Player closed: its stills go.
 fn thumbs_close() {
-    *THUMBS.lock() = None;
+    *THUMBS.lock() = None; *KSCAN.lock() = None; // STRIAKWAVEFORM (LEDGER SR9059): the scan in progress goes too (file tail)
+}
+
+// ---- STRIAKWAVEFORM (LEDGER SR9059): the view band's waveforms (named tail block) ----
+// The Player's track view paints each audio clip's waveform through timeline_core's ONE painter (`paint_peaks`, from
+// `paint_in`'s audio-body arm) over the SAME hook object STRIAKTHUMBS hands it ([`KThumbs`]: its `peaks` map answers
+// `peaks`, `gain_q16` is audio_core's `ramp::gain_q16`, the curve snd's `ramp::layer_q8` mixes by). WHICH source is
+// scanned next is timeline_core's ONE want rule (`view::peaks_want`, Stria's `wave_fill` loops over it too). The scan runs
+// in the EDL job's idle time ([`thumbs_wait`]: the queue full, or paused) once no still is wanted, ONE step per call
+// ([`peaks_step`]): a tenth of a second of the source when its rate is a whole number of buckets, else a second (both
+// bucket-aligned, so the table is the one-call table), decoded through audio_core's ONE door (`container::open_demuxed`
+// over the reel's demuxer share, snd's door, from the stream top; no mixer, so the silent-twin image paints it too) and
+// reduced by THE ONE `view::peaks_of`; the decode never holds THUMBS (the paint's `try_lock` keeps its stills). A finished
+// table lands in the map and marks [`BAND_DIRTY`]. RULES: a reel with no audio track caches `None`; one audio_core does
+// not play, or its door refuses, caches `None` and counts refused; REFUSED BY SIZE: a table over KPEAK_MAX buckets (one
+// hour) or past KPEAK_BYTES across the held tables (by the track's stated duration first, then by the buckets made)
+// caches `None`. No eviction (the want is every audio clip, not the visible ones: evicting would rescan forever). The
+// tables go with the EDL path (`KThumbs` is per path) and with the Player ([`thumbs_close`]). The scan's table may differ
+// from the host face's by its origin (the host decodes from the stream's first presentation time).
+// Wire: `[nle] peaks edl=<path> scans=<n> held=<n> refused=<n> bytes=<n> ms_max=<n>` each time the want runs dry after a scan.
+// Owed: NLE-WAVEFORM-KERNEL-WITNESS, NLE-WAVEFORM-KERNEL-EVICT, NLE-WAVEFORM-KERNEL-PARTIAL (a long scan paints nothing until
+// done), NLE-WAVEFORM-KERNEL-ORIGIN.
+
+/// STRIAKWAVEFORM (SR9059): one table's most buckets (an hour at `PEAKS_PER_SEC`).
+const KPEAK_MAX: u64 = 360_000;
+/// STRIAKWAVEFORM (SR9059): the most bytes every held table takes together.
+const KPEAK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// STRIAKWAVEFORM (SR9059): the scan in progress: source `src` through its decoder, the table so far, the buckets it may
+/// reach (`cap`), the decode's reused buffer and time.
+struct KScanRun {
+    src: timeline_core::SourceId,
+    dec: audio_core::Decoder,
+    rate: u32,
+    ch: u16,
+    cap: u64,
+    buf: Vec<f32>,
+    p: timeline_core::view::Peaks,
+    ms: u64,
+}
+
+/// STRIAKWAVEFORM (SR9059): the job's scan state for the EDL at `path` and its counters for the wire.
+struct KScan {
+    path: String,
+    run: Option<KScanRun>,
+    scans: u64,
+    refused: u64,
+    ms_max: u64,
+    said: bool,
+}
+
+static KSCAN: crate::sync::Mutex<Option<KScan>> = crate::sync::Mutex::new(None);
+
+/// STRIAKWAVEFORM (SR9059): THE one place a Player table is built (empty, at `PEAKS_PER_SEC`).
+fn kpeaks_new() -> timeline_core::view::Peaks {
+    timeline_core::view::Peaks { per_sec: timeline_core::view::PEAKS_PER_SEC, buckets: Vec::new() }
+}
+
+/// STRIAKWAVEFORM (SR9059): THE one place a Player table grows (the next step's buckets appended).
+fn kpeaks_extend(p: &mut timeline_core::view::Peaks, more: timeline_core::view::Peaks) {
+    p.buckets.extend(more.buckets);
+}
+
+/// STRIAKWAVEFORM (SR9059): one step of the peak scan for the job `jid` of the EDL at `path` (the block's rules). True: a
+/// step was taken (the caller loops); false: nothing to scan (the caller waits).
+fn peaks_step(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline) -> bool {
+    use audio_core::AudioDecoder as _;
+    use timeline_core::view::{peaks_of, peaks_want, PEAKS_PER_SEC};
+    if GEN.load(Ordering::Acquire) != jid {
+        return false;
+    }
+    let mut g = KSCAN.lock();
+    if g.as_ref().is_none_or(|k| k.path != path) {
+        *g = Some(KScan { path: String::from(path), run: None, scans: 0, refused: 0, ms_max: 0, said: false });
+    }
+    let Some(k) = g.as_mut() else { return false };
+    if let Some(r) = k.run.as_mut() {
+        let t0 = now();
+        let step = (if r.rate % PEAKS_PER_SEC == 0 { r.rate / 10 } else { r.rate }) as usize;
+        let ch = r.ch.max(1) as usize;
+        r.buf.resize(step * ch, 0.0);
+        let got = r.dec.next(&mut r.buf).unwrap_or(0); // a decode error ends the table where it stands
+        if got > 0 {
+            kpeaks_extend(&mut r.p, peaks_of(r.rate, r.ch, &r.buf[..got * ch], PEAKS_PER_SEC));
+        }
+        r.ms += now().saturating_sub(t0);
+        let over = r.p.buckets.len() as u64 > r.cap;
+        if got == step && !over {
+            return true;
+        }
+        let Some(r) = k.run.take() else { return true };
+        if over {
+            k.refused += 1;
+        } else {
+            k.scans += 1;
+        }
+        k.ms_max = k.ms_max.max(r.ms);
+        if let Some(t) = THUMBS.lock().as_mut().filter(|t| t.path == path) {
+            t.peaks.insert(r.src, if over { None } else { Some(r.p) });
+        }
+        BAND_DIRTY.store(true, Ordering::Release);
+        return true;
+    }
+    let mut tg = THUMBS.lock();
+    let Some(t) = tg.as_mut().filter(|t| t.path == path) else { return false };
+    let bytes: u64 = t.peaks.values().flatten().map(|p| p.buckets.len() as u64).sum();
+    let Some(src) = peaks_want(tl, &|s| t.peaks.contains_key(&s)) else {
+        if !k.said {
+            k.said = true;
+            let held = t.peaks.values().filter(|p| p.is_some()).count();
+            serial_println!("[nle] peaks edl={} scans={} held={} refused={} bytes={} ms_max={}", path, k.scans, held, k.refused, bytes, k.ms_max);
+        }
+        return false;
+    };
+    k.said = false;
+    match peaks_open(reels, src, bytes) {
+        Ok(Some(run)) => k.run = Some(run),
+        Ok(None) => {
+            t.peaks.insert(src, None);
+        }
+        Err(()) => {
+            k.refused += 1;
+            t.peaks.insert(src, None);
+        }
+    }
+    true
+}
+
+/// STRIAKWAVEFORM (SR9059): source `src`'s scan opened, `held` bytes already in the tables (the block's rules). `Ok(None)`:
+/// no reel or no audio track; `Err(())`: audio_core does not play it, its door refused, or refused by size.
+fn peaks_open(reels: &Reels, src: timeline_core::SourceId, held: u64) -> Result<Option<KScanRun>, ()> {
+    use audio_core::AudioDecoder as _;
+    let Some(r) = reels.get(src) else { return Ok(None) };
+    let Some((i, _)) = r.a else { return Ok(None) };
+    let t = &r.d.tracks()[i];
+    if !audio_core::container::plays(r.d.format(), &t.codec) {
+        return Err(());
+    }
+    let cap = KPEAK_MAX.min(KPEAK_BYTES.saturating_sub(held));
+    let stated = (t.duration_ns as u128 * timeline_core::view::PEAKS_PER_SEC as u128).div_ceil(1_000_000_000) as u64;
+    if stated > cap {
+        return Err(());
+    }
+    let dec = audio_core::Decoder::from_source(audio_core::container::open_demuxed(r.d.share()).map_err(|_| ())?);
+    let info = dec.info();
+    if info.rate == 0 {
+        return Err(());
+    }
+    Ok(Some(KScanRun { src, dec, rate: info.rate, ch: info.channels.max(1), cap, buf: Vec::new(), p: kpeaks_new(), ms: 0 }))
 }

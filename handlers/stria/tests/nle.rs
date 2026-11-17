@@ -3978,3 +3978,33 @@ fn striathumbnailsnext_unserved_face_stays_synchronous() {
     face.bg_settle();
     assert_eq!(face.thumb_decodes(), 3, "settling a face with no worker is a no-op");
 }
+
+// ---- STRIAKWAVEFORM (LEDGER SR9059): the face's peak scans by timeline_core's ONE want rule (named tail block) ----
+
+/// STRIAKWAVEFORM (SR9059): `wave_fill` scans what `view::peaks_want` names, each audio source once, in its order, and the
+/// rule runs dry against the face's tables (the kernel Player's `peaks_step` reads the same rule; that side is unexercised).
+#[test]
+fn striakwaveform_wave_fill_scans_through_peaks_want() {
+    use timeline_core::view::peaks_want;
+    let (tl, src) = synth_fixture();
+    let mut want: Vec<SourceId> = Vec::new();
+    loop {
+        let Some(s) = peaks_want(&tl, &|s| want.contains(&s)) else { break };
+        want.push(s);
+    }
+    let audio: Vec<SourceId> = tl.tracks.iter().filter(|tr| tr.kind == Kind::Audio).flat_map(|tr| tr.clips.iter().map(|c| c.src)).fold(Vec::new(), |mut v, s| {
+        if !v.contains(&s) {
+            v.push(s);
+        }
+        v
+    });
+    assert_eq!(want, audio, "the rule names every audio clip's source once, track then clip order");
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let _ = face.paint();
+    assert_eq!(face.wave_scans() as usize, want.len(), "one scan per wanted source");
+    assert!(want.iter().all(|s| face.wave_peaks(*s).is_some()), "each wanted source holds its table");
+    assert_eq!(peaks_want(&face.state.timeline, &|s| face.wave_peaks(s).is_some()), None, "the rule runs dry on the face's tables");
+    let _ = face.paint();
+    assert_eq!(face.wave_scans() as usize, want.len(), "a second paint scans nothing");
+    println!("striakwaveform: face scans={} by peaks_want {want:?}", face.wave_scans());
+}

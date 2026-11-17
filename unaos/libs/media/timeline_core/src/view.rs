@@ -1906,3 +1906,78 @@ mod striakthumbs_tests {
         assert_eq!(thumb_want(&st.timeline, &l, &|_, _| Some(None)), None);
     }
 }
+
+// ---- STRIAKWAVEFORM (LEDGER SR9059): the peak want rule (named tail block) ----
+// WHICH source's peak table a face scans next for the waveforms [`paint_peaks`] paints: lifted from Stria's
+// `Face::wave_fill` so the host face and the kernel Player (vplay.rs `peaks_step`) read ONE rule. Every clip on an AUDIO
+// track, tracks in order then clips in order, whose source is not held yet (held: scanned, queued or refused; the face
+// owns the cache, the decode and the bound). Not the visible clips only: a table is per source, scanned once.
+
+/// THE peak want rule (the block's head): the next source to scan for `tl`, or `None` when every audio clip's source is
+/// held. `have(src)`: true once the face holds (or has asked for) that source's table.
+pub fn peaks_want(tl: &Timeline, have: &dyn Fn(crate::SourceId) -> bool) -> Option<crate::SourceId> {
+    tl.tracks.iter().filter(|tr| tr.kind == Kind::Audio).flat_map(|tr| tr.clips.iter()).map(|c| c.src).find(|s| !have(*s))
+}
+
+#[cfg(test)]
+mod striakwaveform_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+    use alloc::collections::BTreeSet;
+    use core::cell::RefCell;
+
+    /// Sources A..D; track 0 video (D), track 1 audio (B then A), track 2 audio (A then C).
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        for n in ["A", "B", "C", "D"] {
+            tl.add_source(n, 60);
+        }
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(SourceId(3), 0, 50, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(SourceId(1), 0, 20, 0), Clip::new(SourceId(0), 0, 20, 20)];
+        tl.tracks[2].clips = alloc::vec![Clip::new(SourceId(0), 10, 30, 0), Clip::new(SourceId(2), 0, 20, 30)];
+        tl
+    }
+
+    #[test]
+    fn striakwaveform_peaks_want_order_audio_only() {
+        let tl = tl();
+        let held: RefCell<BTreeSet<SourceId>> = RefCell::new(BTreeSet::new());
+        let mut order = Vec::new();
+        while let Some(s) = { let h = held.borrow(); peaks_want(&tl, &|s| h.contains(&s)) } {
+            assert!(order.len() < 10, "the want rule must run dry");
+            order.push(s);
+            held.borrow_mut().insert(s);
+        }
+        assert_eq!(order, alloc::vec![SourceId(1), SourceId(0), SourceId(2)], "audio tracks in order, clips in order, each source once; the video source never");
+        std::println!("striakwaveform: want order {order:?}");
+    }
+
+    #[test]
+    fn striakwaveform_peaks_want_skips_held_and_runs_dry() {
+        let tl = tl();
+        assert_eq!(peaks_want(&tl, &|s| s == SourceId(1)), Some(SourceId(0)));
+        assert_eq!(peaks_want(&tl, &|s| s != SourceId(2)), Some(SourceId(2)));
+        assert_eq!(peaks_want(&tl, &|_| true), None);
+        assert_eq!(peaks_want(&Timeline::new(25), &|_| false), None, "no tracks: nothing wanted");
+    }
+
+    /// The kernel's scan step (vplay.rs `peaks_step`): a tenth of a second when the rate is a whole number of buckets, else a
+    /// second; fed one after another, the table is the one call's.
+    #[test]
+    fn striakwaveform_peaks_of_bucket_aligned_steps() {
+        for (rate, ch) in [(48_000u32, 2u16), (44_100, 1), (22_050, 1)] {
+            let n = rate as usize * 2 + rate as usize / 3; // 2.33 s: a short last step
+            let pcm: Vec<f32> = (0..n * ch as usize).map(|i| ((i * 7919 % 1000) as f32 / 1000.0) * if i % 3 == 0 { -1.0 } else { 1.0 }).collect();
+            let step = (if rate % PEAKS_PER_SEC == 0 { rate / 10 } else { rate }) as usize * ch as usize;
+            let mut fed = Vec::new();
+            for chunk in pcm.chunks(step) {
+                fed.extend(peaks_of(rate, ch, chunk, PEAKS_PER_SEC).buckets);
+            }
+            assert_eq!(fed, peaks_of(rate, ch, &pcm, PEAKS_PER_SEC).buckets, "rate {rate}");
+        }
+    }
+}
