@@ -129,6 +129,7 @@ pub(crate) struct Rc {
     /// [I, P, B].
     types: [Model; 3],
     last_qp: i32,
+    after_idr: bool, // H264ENCRCFIRSTPIPOFFSET (SR844): an I was coded and no P since
     /// The lowest picture / row QP ([`crate::Config::qp_floor`], SR383).
     floor: i32,
     // The picture being coded: its type index (0 I, 1 P, 2 B).
@@ -174,6 +175,7 @@ impl Rc {
             err: 0,
             types: [Model::default(); 3],
             last_qp: start_qp,
+            after_idr: false,
             floor,
             t: 0,
             rows: Vec::new(),
@@ -228,7 +230,7 @@ impl Rc {
             RcMode::Crf(_) => {}
         }
         let m = self.types[t];
-        let refq = if m.coded {
+        let refq = if t == 1 && self.after_idr { (self.types[0].qp + IP_QP_OFFSET).min(QP_MAX) } else if m.coded { // H264ENCRCFIRSTPIPOFFSET (SR844): the first P after an IDR windows on the I QP + IP_QP_OFFSET (x264 ip_factor), prediction kept
             m.qp
         } else if t == 2 {
             (self.last_qp + B_QP_OFFSET).min(QP_MAX)
@@ -273,7 +275,7 @@ impl Rc {
         m.s = self.s.max(1);
         m.qp = self.pic_qp;
         m.avg_s = if m.avg_s == 0 { self.s } else { m.avg_s - m.avg_s / 8 + self.s / 8 };
-        self.last_qp = self.pic_qp;
+        self.last_qp = self.pic_qp; self.after_idr = self.t == 0 || (self.after_idr && self.t == 2); // H264ENCRCFIRSTPIPOFFSET (SR844): set on an I, kept through B pictures, cleared on the next P
         let b = bits as i64;
         self.full = (self.full + b - self.r).max(0);
         self.plan += self.share - self.r;
@@ -1239,7 +1241,8 @@ mod scenecut_rc_tests {
             let pred = if m.coded { m.predict(rc.s, rc.pic_qp) as u64 } else { 0 };
             let bits = rc.types[rc.t].bits;
             let oracle = if m.coded {
-                let (lo, hi) = ((m.qp - PIC_STEP).max(before.floor), (m.qp + PIC_STEP).min(QP_MAX));
+                let rq = if rc.t == 1 && before.after_idr { (before.types[0].qp + IP_QP_OFFSET).min(QP_MAX) } else { m.qp }; // SR844: the window `picture` uses
+                let (lo, hi) = ((rq - PIC_STEP).max(before.floor), (rq + PIC_STEP).min(QP_MAX));
                 let at = |q: i32| bits as u128 * step16(rc.pic_qp) as u128 / step16(q) as u128;
                 (lo..=hi).find(|&q| at(q) <= rc.target as u128).unwrap_or(hi)
             } else {
@@ -1285,33 +1288,37 @@ mod scenecut_rc_tests {
     /// The measured first P after the IDR at t = 10, per run: (fixture, kbps, scenecut Some(40) at gop 30 (true) or the control
     /// scenecut None at gop 10 (the scheduled IDR at the same picture), [pred, actual, qp, oracle qp, target], peak bucket fullness).
     const PINS: [(char, u32, bool, [i64; 5], i64); 21] = [
-        ('A', 200, true, [705, 9856, 16, 16, 19666], 93766),
-        ('A', 200, false, [1104, 13248, 16, 16, 14737], 93766),
-        ('A', 40, true, [1229, 12376, 16, 22, 2828], 28404),
-        ('A', 40, false, [1332, 12880, 16, 22, 1847], 28228),
-        ('A', 20, true, [700, 7736, 22, 22, 799], 20664),
-        ('A', 20, false, [844, 9584, 22, 22, 466], 20912),
-        ('B', 400, true, [918, 3664, 16, 16, 37301], 202811),
-        ('B', 400, false, [918, 3664, 16, 16, 26616], 202811),
-        ('B', 100, true, [3964, 1536, 22, 16, 4334], 65321),
-        ('B', 100, false, [8833, 1248, 26, 20, 2832], 61043),
-        ('B', 50, true, [783, 1672, 23, 28, 1058], 41528),
-        ('B', 50, false, [1765, 552, 32, 32, 264], 37218),
-        ('C', 400, true, [114, 2016, 16, 16, 35412], 202811),
-        ('C', 400, false, [112, 2016, 16, 16, 24762], 202811),
-        ('C', 100, true, [285, 4016, 16, 17, 3704], 68740),
-        ('C', 100, false, [333, 3664, 20, 23, 2740], 61043),
-        ('C', 50, true, [389, 608, 27, 29, 521], 39322),
-        ('C', 50, false, [305, 352, 32, 32, 471], 36534),
-        ('D', 400, false, [1819, 3664, 16, 16, 24694], 203139),
-        ('D', 100, false, [2600, 3576, 21, 24, 2736], 61419),
-        ('D', 50, false, [465, 376, 38, 36, 495], 36750),
+        ('A', 200, true, [256, 2936, 25, 25, 19666], 93766), /* was [705, 9856, 16, 16, 19666], 93766 (SR844) */
+        ('A', 200, false, [245, 2840, 29, 29, 14738], 93766), /* was [1104, 13248, 16, 16, 14737], 93766 (SR844) */
+        ('A', 40, true, [273, 1928, 29, 29, 2829], 22875), /* was [1229, 12376, 16, 22, 2828], 28404 (SR844) */
+        ('A', 40, false, [296, 1968, 29, 30, 1849], 19099), /* was [1332, 12880, 16, 22, 1847], 28228 (SR844) */
+        ('A', 20, true, [311, 1040, 29, 32, 800], 14654), /* was [700, 7736, 22, 22, 799], 20664 (SR844) */
+        ('A', 20, false, [375, 2032, 29, 41, 468], 14048), /* was [844, 9584, 22, 22, 466], 20912 (SR844) */
+        ('B', 400, true, [814, 3392, 17, 17, 37262], 202811), /* was [918, 3664, 16, 16, 37301], 202811 (SR844) */
+        ('B', 400, false, [800, 3392, 17, 17, 26612], 202811), /* was [918, 3664, 16, 16, 26616], 202811 (SR844) */
+        ('B', 100, true, [4349, 3552, 17, 17, 4421], 64844), /* was [3964, 1536, 22, 16, 4334], 65321 (SR844) */
+        ('B', 100, false, [4806, 792, 32, 22, 2910], 61043), /* was [8833, 1248, 26, 20, 2832], 61043 (SR844) */
+        ('B', 50, true, [2659, 600, 34, 30, 992], 41642), /* was [783, 1672, 23, 28, 1058], 41528 (SR844) */
+        ('B', 50, false, [321, 1112, 28, 38, 344], 36578), /* was [1765, 552, 32, 32, 264], 37218 (SR844) */
+        ('C', 400, true, [99, 1648, 17, 17, 35468], 202811), /* was [114, 2016, 16, 16, 35412], 202811 (SR844) */
+        ('C', 400, false, [98, 1648, 17, 17, 24780], 202811), /* was [112, 2016, 16, 16, 24762], 202811 (SR844) */
+        ('C', 100, true, [235, 2672, 18, 18, 3693], 67561), /* was [285, 4016, 16, 17, 3704], 68740 (SR844) */
+        ('C', 100, false, [280, 2480, 22, 22, 2714], 61043), /* was [333, 3664, 20, 23, 2740], 61043 (SR844) */
+        ('C', 50, true, [397, 608, 27, 29, 530], 39090), /* was [389, 608, 27, 29, 521], 39322 (SR844) */
+        ('C', 50, false, [641, 1016, 30, 34, 641], 36534), /* was [305, 352, 32, 32, 471], 36534 (SR844) */
+        ('D', 400, false, [1709, 3392, 17, 17, 24721], 203139), /* was [1819, 3664, 16, 16, 24694], 203139 (SR844) */
+        ('D', 100, false, [2217, 2952, 22, 23, 2753], 61419), /* was [2600, 3576, 21, 24, 2736], 61419 (SR844) */
+        ('D', 50, false, [638, 384, 39, 35, 661], 36750), /* was [465, 376, 38, 36, 495], 36750 (SR844) */
     ];
 
     /// The measured table (MEASURE SR834): the first P after a detected cut mispredicts 3.99x-17.68x at the 200 / 400 kbps rows
     /// and by the same at the scheduled IDR in the same place (an any-IDR effect); once the budget binds its QP sits 1-6 off the
     /// oracle (PIC_STEP-bound), A 40 kbps spends 4.4x its target, and A 20 kbps overflows the bucket (20664 / 20912 > 20000),
     /// pinned as measured, not asserted away (owed H264ENC-RC-CBR-IDR-OVERFLOW). Every other run stays inside its bucket.
+    /// SR844 (H264ENCRCFIRSTPIPOFFSET): the first P after any IDR windows on the I QP + IP_QP_OFFSET and the oracle is re-centred
+    /// on the same window; every run now holds `peak <= buf` (A 20 kbps 14654 / 14048), the invariant asserted on all 21. The QP /
+    /// oracle columns stay MEASURED: the kept prediction's stale k moves the first P up to 10 QP off the oracle inside the window
+    /// (B 100 kbps control: pred 4806, actual 792), owed H264ENC-RC-FIRSTP-PREDICTION.
     #[test]
     fn scenecut_rc_first_p_table() {
         let n = CUT + 7;
@@ -1325,7 +1332,26 @@ mod scenecut_rc_tests {
             assert_eq!(p.1, 1, "{f} {kbps} {cut}: picture {} is a P", CUT + 1);
             assert_eq!([p.3 as i64, p.4 as i64, p.5 as i64, p.8 as i64, p.6], want, "{f} {kbps} {cut}: the first P after the IDR");
             assert_eq!(peak, peak_want, "{f} {kbps} {cut}: the peak bucket fullness");
-            assert_eq!(peak > buf, f == 'A' && kbps == 20, "{f} {kbps} {cut}: only A at 20 kbps overflows its bucket (measured)");
+            assert!(peak <= buf, "{f} {kbps} {cut}: the CBR bucket overflowed ({peak} > {buf})"); // SR844: was `peak > buf` iff A 20 kbps (SR834's measured overflow)
+        }
+    }
+
+    // ---- H264ENCRCFIRSTPIPOFFSET (LEDGER SR844): the first P after an IDR windowed on the I QP + IP_QP_OFFSET (named tail block) ----
+    /// A scheduled IDR inside a steady scene (fixture D, scenecut None, gop 10): at 100 / 50 kbps the first P after the IDR at 10
+    /// picks inside [I QP + IP_QP_OFFSET - PIC_STEP, I QP + IP_QP_OFFSET + PIC_STEP], its (I QP, QP, oracle QP) pinned as measured,
+    /// the bucket never overflows; the stream's first P (types[1] uncoded) takes the I QP + IP_QP_OFFSET itself.
+    #[test]
+    fn firstp_ipoffset_steady_scene_idr() {
+        for (kbps, want) in [(100u32, [25i32, 22, 23]), (50, [32, 39, 35])] {
+            let (rows, buf) = run(kbps, CUT as u32, None, CUT + 7, &fixture('D'));
+            assert!(rows[CUT].0 && rows[CUT].1 == 0 && rows[CUT + 1].1 == 1, "D {kbps}: an IDR at {CUT}, then a P");
+            let (iqp, p) = (rows[CUT].5, &rows[CUT + 1]);
+            let c = (iqp + IP_QP_OFFSET).min(QP_MAX);
+            assert!((c - PIC_STEP..=c + PIC_STEP).contains(&p.5), "D {kbps}: the first P's QP {} outside I QP {iqp} + {IP_QP_OFFSET} +- {PIC_STEP}", p.5);
+            assert_eq!([iqp, p.5, p.8], want, "D {kbps}: (I QP, first P QP, oracle QP) measured (SR844)");
+            assert_eq!(rows[1].5, (rows[0].5 + IP_QP_OFFSET).min(QP_MAX), "D {kbps}: the stream's first P at the I QP + IP_QP_OFFSET");
+            let peak = rows.iter().map(|r| r.7).max().unwrap();
+            assert!(peak <= buf, "D {kbps}: the CBR bucket overflowed ({peak} > {buf})");
         }
     }
 }
