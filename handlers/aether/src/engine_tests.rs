@@ -7918,4 +7918,53 @@ mod tests {
         }
         assert!(hits.is_empty(), "literal control font size outside CONTROL_FONT_PX: {hits:?}");
     }
+
+    // ---- AETHERCSSOMFONTSIZEBOXLESS (LEDGER SR1029): a box-less node reads its parent's computed font-size (named tail block) ----
+
+    /// AETHERCSSOMFONTSIZEBOXLESS (SR1029): author `display: none` subtrees (they keep a taffy node, so the prepass writes
+    /// their used size) beside laid-out twins, and the build-skipped nodes (`hidden`, `aria-hidden`, a `hidden` subtree)
+    /// under a `2em` parent of 10px, whose report chain used to carry the parent's 16px-base parse (32px).
+    fn font_size_boxless_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:20px"><div id="h" style="display:none;font-size:1.5em"><span id="hk" style="font-size:50%">x</span></div></div>
+            <div style="font-size:20px"><div id="t" style="font-size:1.5em"><span id="tk" style="font-size:50%">x</span></div></div>
+            <div style="font-size:24px"><div id="hs" style="display:none;font-size:smaller">x</div></div>
+            <div style="font-size:24px"><div id="ts" style="font-size:smaller">x</div></div>
+            <div style="font-size:20px"><div id="ha" style="display:none;font-size:12px">x</div></div>
+            <div style="font-size:20px"><div id="ta" style="font-size:12px">x</div></div>
+            <div style="font-size:10px"><div style="font-size:2em"><span id="hid" hidden>x</span><span id="ah" aria-hidden="true">x</span><div id="hp" hidden><span id="hpk">x</span></div><span id="vis">x</span></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTSIZEBOXLESS (SR1029): a `display: none` element reads the computed size (font-size needs no layout):
+    /// 1.5em of 20px = 30px, its 50% child 15px, `smaller` of 24px 20px, an absolute 12px 12px; the laid-out twins agree.
+    #[test]
+    fn font_size_boxless_display_none_parity() {
+        let mut e = font_size_boxless_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "h", "fontSize"), "30px", "1.5em of 20px under display:none");
+        assert_eq!(font_shorthand_cs(&mut e, "hk", "fontSize"), "15px", "50% of the hidden 30px");
+        assert_eq!(font_shorthand_cs(&mut e, "hs", "fontSize"), "20px", "smaller: 24 / 1.2 under display:none");
+        assert_eq!(font_shorthand_cs(&mut e, "ha", "fontSize"), "12px", "an absolute size under display:none");
+        assert_eq!(font_shorthand_cs(&mut e, "t", "fontSize"), "30px", "the laid-out twin");
+        assert_eq!(font_shorthand_cs(&mut e, "tk", "fontSize"), "15px", "the laid-out twin's child");
+        assert_eq!(font_shorthand_cs(&mut e, "ts", "fontSize"), "20px", "the laid-out smaller twin");
+        assert_eq!(font_shorthand_cs(&mut e, "ta", "fontSize"), "12px", "the laid-out absolute twin");
+    }
+
+    /// AETHERCSSOMFONTSIZEBOXLESS (SR1029): a `hidden` / `aria-hidden` node and a `hidden` subtree's child under `2em` of
+    /// 10px read 20px, the same as their laid-out sibling (they read 32px: the parent's specified size parsed at 16px).
+    #[test]
+    fn font_size_boxless_hidden_reads_parent_computed() {
+        let mut e = font_size_boxless_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "vis", "fontSize"), "20px", "the laid-out sibling (reference)");
+        assert_eq!(font_shorthand_cs(&mut e, "hid", "fontSize"), "20px", "a hidden span inherits the parent's computed px");
+        assert_eq!(font_shorthand_cs(&mut e, "ah", "fontSize"), "20px", "an aria-hidden span the same");
+        assert_eq!(font_shorthand_cs(&mut e, "hp", "fontSize"), "20px", "a hidden div the same");
+        assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
+    }
 }
