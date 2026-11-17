@@ -7598,7 +7598,7 @@ fn striaproxymedia_verb_refusals() {
     assert!(face.verb("proxy"));
     assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: no source path"));
     assert!(!face.proxying() && !face.dirty());
-    assert_eq!(VERBS[VERBS.len() - 2], "proxy");
+    assert!(VERBS.contains(&"proxy")); // STRIAPROXYBUTTONS (SR930): words now sit between `proxy` and `help`
     assert_eq!(VERBS.last(), Some(&"help"));
     println!("striaproxymedia refusals: no clip selected; A: no source path; VERBS[{}] = proxy", VERBS.len() - 2);
 }
@@ -8682,7 +8682,7 @@ fn striaproxyoff_usage_and_refusals() {
     let (tl, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
     assert!(face.verb("proxy foo"));
-    assert_eq!(face.last_error.take().as_deref(), Some("proxy: usage: proxy [off|all]"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: usage: proxy [off|all|purge]")); // STRIAPROXYBUTTONS (SR930): purge joins the usage
     assert!(face.verb("proxy off"));
     assert_eq!(face.last_error.take().as_deref(), Some("proxy: no clip selected"));
     assert!(face.verb("proxy all"));
@@ -9041,4 +9041,75 @@ fn striagapsalltracks_face_closes_every_track() {
     assert_eq!(face.last_error.take(), Some(format!("close-gaps all: A1: {}", EditError::Handle)));
     assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (k, 0));
     println!("striagapsalltracks: V1 {:?} A1 {:?}", face.state.timeline.tracks[0].clips, face.state.timeline.tracks[1].clips);
+}
+
+// ---- STRIAPROXYBUTTONS (LEDGER SR930): the proxy's button words, purge and the attached reels (named tail block) ----
+
+/// `proxy-off` / `proxy-all` (the buttons' words) are `proxy off` / `proxy all`; `proxy_reels` follows the attachments.
+#[test]
+fn striaproxybuttons_words_alias_the_arguments() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("buttons");
+    let a = tl.sources[0].id;
+    let (xa, xb) = (stria::nle_face::proxy_paths(&pa).0, stria::nle_face::proxy_paths(&pb).0);
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["proxy-off", "proxy-all", "help"]);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    assert_eq!(face.proxy_reels(), vec!["A".to_string()]);
+    assert!(face.verb("proxy-off"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: off (the preview reads the original)"));
+    assert!(!face.has_proxy(a) && face.proxy_reels().is_empty());
+    assert!(face.verb("proxy-all"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: all: 2 reels; A: reused {}; B: building (new) -> {}", xa.display(), xb.display())));
+    assert!(face.wait_proxy());
+    assert_eq!(face.proxy_reels(), vec!["A".to_string(), "B".to_string()]);
+    assert!(!face.dirty());
+    assert_eq!(face.state.timeline, tl, "view-only");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxybuttons words: proxy-off detached A; proxy-all reused A, built B");
+}
+
+/// `proxy purge` detaches and removes the proxy file and stamp; again: nothing attached, no files. View-only.
+#[test]
+fn striaproxybuttons_purge_removes_files() {
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("purge");
+    let a = tl.sources[0].id;
+    let (xa, stamp, work) = stria::nle_face::proxy_paths(&pa);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    assert!(face.has_proxy(a) && xa.is_file() && stamp.is_file());
+    assert!(face.verb("proxy purge"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: off (the preview reads the original); removed {}, {}", xa.display(), stamp.display())));
+    assert!(!face.has_proxy(a) && !xa.exists() && !stamp.exists() && !work.exists());
+    assert!(pa.is_file(), "the source stays");
+    assert!(face.verb("proxy purge"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: no proxy attached; no proxy files"));
+    assert_eq!(face.state.timeline, tl, "view-only");
+    assert!(!face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxybuttons purge: A detached, proxy and stamp removed");
+}
+
+/// `proxy purge` is refused by name while that source's own job runs (its files untouched); without a path it detaches only.
+#[test]
+fn striaproxybuttons_purge_refusals() {
+    let (dir, pa, _, mut face, _) = striaproxyoff_face("purgebusy");
+    let work = stria::nle_face::proxy_paths(&pa).2;
+    face.hold_proxy_at(Some(3));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.proxying());
+    assert!(face.verb("proxy purge"));
+    let line = face.last_error.take().unwrap_or_default();
+    assert!(line.starts_with("proxy: A: busy (") && line.ends_with("): Esc cancels the build"), "{line}");
+    assert!(work.is_dir() && face.proxying(), "the job and its work dir untouched");
+    assert!(face.cancel_proxy() && face.wait_proxy());
+    let _ = face.last_error.take();
+    let (tl, src) = synth_fixture();
+    let mut bare = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(bare.verb("proxy purge"));
+    assert_eq!(bare.last_error.take().as_deref(), Some("proxy: no clip selected"));
+    bare.state.select(0, 0).unwrap();
+    assert!(bare.verb("proxy purge"));
+    assert_eq!(bare.last_error.take().as_deref(), Some("proxy: A: no proxy attached; no source path"));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxybuttons purge refusals: {line}");
 }

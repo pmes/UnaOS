@@ -156,7 +156,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 97] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "export-skip", "export-clear", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail)
+pub const VERBS: [&str; 99] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "export-skip", "export-clear", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "proxy-off", "proxy-all", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -6217,7 +6217,7 @@ fn proxy_gate(c: &AtomicBool, hold: Option<u64>, k: u64) -> Result<(), ExportErr
 impl Face {
     /// `proxy off` / `proxy all` / `proxy <other>` (the usage); the bare word is SR882's [`Face::proxy_verb`] (None here).
     fn proxy_words(&mut self, v: &str) -> Option<bool> {
-        let mut words = v.split_whitespace();
+        let mut words = proxy_alias(v).split_whitespace(); // STRIAPROXYBUTTONS (SR930): the button words read as their arguments (file tail)
         if words.next() != Some("proxy") {
             return None;
         }
@@ -6225,8 +6225,8 @@ impl Face {
         match args.as_slice() {
             [] => return None,
             ["off"] => self.proxy_off(),
-            ["all"] => self.proxy_all(),
-            _ => self.last_error = Some("proxy: usage: proxy [off|all]".into()),
+            ["all"] => self.proxy_all(), ["purge"] => self.proxy_purge(), // STRIAPROXYBUTTONS (SR930): purge detaches then removes the files (file tail)
+            _ => self.last_error = Some("proxy: usage: proxy [off|all|purge]".into()),
         }
         Some(true)
     }
@@ -6432,5 +6432,59 @@ impl Face {
             None => return Some(false),
         }
         Some(true)
+    }
+}
+
+// ---- STRIAPROXYBUTTONS (LEDGER SR930): the proxy's buttons, purge and reels (named tail block) ----
+// The stria-view buttons `Proxy Off` / `Proxy All` send the VERBS words `proxy-off` / `proxy-all`, read by SR915's ONE
+// dispatch (`proxy_words`) as `proxy off` / `proxy all`. `proxy purge` (an argument, no button: it deletes files) detaches
+// through SR915's `proxy_off` (its selection and busy refusals stand), then removes the selected source's proxy file, stamp
+// and any leftover work dir (SR882's `proxy_paths`). `proxy_reels` names the reels with an attached proxy (the witness's
+// `"proxy"` field). View-only: no undo step, the document clean. Owed: NLE-PROXY-PURGE-ALL.
+
+/// STRIAPROXYBUTTONS (LEDGER SR930): a button word as the `proxy` argument it stands for; any other text unchanged.
+fn proxy_alias(v: &str) -> &str {
+    match v.trim() {
+        "proxy-off" => "proxy off",
+        "proxy-all" => "proxy all",
+        _ => v,
+    }
+}
+
+impl Face {
+    /// `proxy purge` on the selected clip's source: [`Face::proxy_off`]'s line, then `; removed <proxy>, <stamp>` /
+    /// `; no proxy files` / `; no source path`; refused (proxy_off's busy line) while that source's own job runs.
+    fn proxy_purge(&mut self) {
+        self.proxy_off();
+        let Some(c) = self.state.selected() else { return };
+        let src = c.src;
+        if self.proxy.as_ref().is_some_and(|j| j.src == src) {
+            return;
+        }
+        self.proxy_queue.retain(|(s, _)| *s != src);
+        let reel = self.state.timeline.source(src).map(|s| s.reel.clone());
+        let file = reel.and_then(|r| self.reel_paths.iter().find(|(p, _)| *p == r).map(|(_, f)| f.clone()));
+        let tail = match file {
+            None => "no source path".to_string(),
+            Some(f) => {
+                let (proxy, stamp, work) = proxy_paths(&f);
+                let mut removed = Vec::new();
+                for p in [&proxy, &stamp] {
+                    if p.is_file() && std::fs::remove_file(p).is_ok() {
+                        removed.push(p.display().to_string());
+                    }
+                }
+                if work.is_dir() && std::fs::remove_dir_all(&work).is_ok() {
+                    removed.push(work.display().to_string());
+                }
+                if removed.is_empty() { "no proxy files".to_string() } else { format!("removed {}", removed.join(", ")) }
+            }
+        };
+        let line = self.last_error.take().unwrap_or_else(|| "proxy:".to_string());
+        self.last_error = Some(format!("{line}; {tail}"));
+    }
+    /// The reels whose source has an attached proxy, in source order (the witness's `"proxy"` field).
+    pub fn proxy_reels(&self) -> Vec<String> {
+        self.state.timeline.sources.iter().filter(|s| self.sources.has_proxy(s.id)).map(|s| s.reel.clone()).collect()
     }
 }
