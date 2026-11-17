@@ -3231,8 +3231,8 @@ mod shorthand_computed_before_cascade_tests {
     #[test]
     fn shorthand_computed_before_cascade_covered_rows() {
         let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
-        assert_eq!(covered, vec!["border-width", "margin", "padding"]);
-        for sh in ["border-style", "gap", "inset", "overflow", "border-left", "font-synthesis", "not-a-shorthand"] {
+        assert_eq!(covered, vec!["border-width", "border-style", "border-left", "margin", "padding"]); // SR1103 (fold compose): the three side style columns cover border-style and, with SR1096's width and the left colour column, border-left
+        for sh in ["border-color", "gap", "inset", "overflow", "border-top", "font-synthesis", "not-a-shorthand"] {
             assert!(!report_covered(sh), "{sh}: not covered");
         }
     }
@@ -3263,7 +3263,7 @@ mod shorthand_computed_before_cascade_tests {
             // Not covered: no row-gap / column-gap columns (owed AETHER-CSSOM-GAP-COLUMNS), no per-side style column
             // (owed AETHER-CSSOM-BORDER-SIDE-STYLE-COLUMNS): the cascaded text stands.
             ("g", "gap", "1em"),
-            ("s", "border-style", "solid none"),
+            ("s", "border-style", "none"), // SR1103 (fold compose): covered now; no border width, so every side computes none
         ] {
             assert_eq!(read(&by_id(id), prop), want, "#{id}: computed {prop}");
         }
