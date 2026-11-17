@@ -400,15 +400,7 @@ impl Face {
     /// was anchored or inside that view (else the page holding the playhead).
     pub fn layout(&self) -> Layout {
         let (w, h) = self.canvas;
-        let mut l = Layout::of_role(self.pointer_role(), w, h, &self.state);
-        if let Some((t0, at)) = self.view {
-            let per = (w / l.zoom).max(1) as i64;
-            let ph = self.state.playhead;
-            if ph == at || (t0..t0 + per).contains(&ph) {
-                l.t0 = t0;
-            }
-        }
-        l
+        Layout::of_role(self.pointer_role(), w, h, &self.state).anchor(self.view, self.state.playhead) // STRIAZOOMFITMORE (SR965): THE anchor rule, timeline_core's (the Player's view band reads it too)
     }
     /// The last pointer position the surface reported.
     pub fn pointer(&self) -> Option<(f64, f64)> {

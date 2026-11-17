@@ -3759,3 +3759,26 @@ fn striazoomfitkeys_resize_refits_only_after_a_fit() {
     assert_eq!(clean(&face), (0, false, true));
     println!("striazoomfitkeys: fit 640->18 480->13; zoom+ / wheel end it; sel 64 -> 32; refusal once");
 }
+
+// ---- STRIAZOOMFITMORE (LEDGER SR965): the face's layout is timeline_core's ONE anchor rule (named tail block) ----
+
+/// After a fit the face's layout equals `Layout::of_role(..).anchor(the fit's origin, the playhead)` at every playhead:
+/// the face and the kernel Player's view band read the same rule.
+#[test]
+fn striazoomfitmore_face_layout_is_the_anchor() {
+    use stria::nle_face::{Layout, Role};
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    let at = face.state.playhead;
+    assert!(face.verb("zoom-sel"));
+    assert_eq!(face.last_error, None);
+    let (w, h) = face.canvas;
+    let start = face.state.timeline.tracks[0].clips[1].at;
+    for ph in [at, start + 1, 5, 25, tl.end()] {
+        face.state.seek(ph);
+        let want = Layout::of_role(Role::Whole, w, h, &face.state).anchor(Some((start, at)), face.state.playhead);
+        assert_eq!(face.layout(), want, "playhead {ph}");
+    }
+    println!("striazoomfitmore: face layout == Layout::anchor at 5 playheads");
+}
