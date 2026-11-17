@@ -460,3 +460,36 @@ fn striacliplink_edl_group_refusals() {
         assert_eq!(edl::parse(&t, 25), Err(EdlError::Syntax { line }), "{bad}");
     }
 }
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the `* UNA COLOR` line (named tail block) ----
+
+/// `cut()` with the V2 clip (B) graded: the line sits under its event, the text reads back to the same timeline, and the
+/// ungraded `cut()` still writes the pinned `CUT` byte for byte.
+#[test]
+fn striacolorlift_color_line_round_trips() {
+    let g = timeline_core::Grade { brightness: 100, contrast: -200, saturation: 300 };
+    let tl = cut().set_grade(1, 0, g).unwrap();
+    let text = edl::write(&tl, "CUT ONE").unwrap();
+    let want = CUT.replace(
+        "003  B        V2    C        00:00:00:00 00:00:00:10 00:00:00:10 00:00:00:20\n",
+        "003  B        V2    C        00:00:00:00 00:00:00:10 00:00:00:10 00:00:00:20\n* UNA COLOR 100 -200 300\n",
+    );
+    assert_eq!(text, want);
+    assert_eq!(edl::parse(&text, 25).unwrap(), tl);
+    assert_eq!(edl::write(&cut(), "CUT ONE").unwrap(), CUT);
+}
+
+/// Refused by name: no event above, misshapen words (Syntax with the line); out of range Edit(Grade); an audio event Edit(Kind).
+#[test]
+fn striacolorlift_color_refusals_are_named() {
+    let head = "TITLE: C\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE A 00:00:02:00\n";
+    let v = "001  A        V     C        00:00:00:13 00:00:00:23 00:00:00:00 00:00:00:10\n";
+    let a = "001  A        A     C        00:00:00:13 00:00:00:23 00:00:00:00 00:00:00:10\n";
+    assert_eq!(edl::parse(&format!("{head}* UNA COLOR 1 2 3\n{v}"), 25), Err(EdlError::Syntax { line: 5 }));
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA COLOR 1 2\n"), 25), Err(EdlError::Syntax { line: 6 }));
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA COLOR 1 x 3\n"), 25), Err(EdlError::Syntax { line: 6 }));
+    assert_eq!(edl::parse(&format!("{head}{v}* UNA COLOR 1001 0 0\n"), 25), Err(EdlError::Edit(EditError::Grade)));
+    assert_eq!(edl::parse(&format!("{head}{a}* UNA COLOR 1 2 3\n"), 25), Err(EdlError::Edit(EditError::Kind)));
+    let ok = edl::parse(&format!("{head}{v}* UNA COLOR 0 0 -1000\n"), 25).unwrap();
+    assert_eq!(ok.tracks[0].clips[0].grade.saturation, -1000);
+}

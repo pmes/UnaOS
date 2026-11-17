@@ -216,7 +216,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; group_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") { // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail)
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            marker_comment(l, fps, line, &mut tl)?; alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
+            marker_comment(l, fps, line, &mut tl)?; alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; grade_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") { // STRIACOLORLIFT (SR869): `* UNA COLOR` (file tail)
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -450,7 +450,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail)
+        s.push_str(&grade_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail)
     }
     Ok(s)
 }
@@ -1249,4 +1249,26 @@ fn group_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), Ed
 /// STRIACLIPLINK: the `* UNA GROUP` line of a linked clip (empty for group 0).
 fn group_line(c: &Clip) -> String {
     if c.group == 0 { String::new() } else { format!("* UNA GROUP {}\n", c.group) }
+}
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the `* UNA COLOR` line (named tail block) ----
+// `* UNA COLOR <b> <c> <s>` is the clip's [`crate::Grade`] (three integers in 1/1000), the per-clip comment shape of
+// `* UNA GAIN`: it belongs to the event line just above, is written only when not identity (every pinned EDL unchanged) and
+// a later one overwrites. No event above it (or under a `BL` event) or misshapen words: `Syntax`; a value out of range or a
+// graded audio event is refused by `validate` (`Edit(Grade)` / `Edit(Kind)`).
+
+/// STRIACOLORLIFT: a `* UNA COLOR` line applied to the event above it (`None`: no event); any other line is left alone.
+fn grade_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA COLOR ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let w: Vec<i16> = r.split_whitespace().map(|x| x.parse::<i16>()).collect::<Result<_, _>>().map_err(|_| EdlError::Syntax { line })?;
+    let [b, k, s] = w[..] else { return Err(EdlError::Syntax { line }) };
+    c.grade = crate::Grade { brightness: b, contrast: k, saturation: s };
+    Ok(())
+}
+
+/// STRIACOLORLIFT: the clip's `* UNA COLOR` line (empty at identity).
+fn grade_line(c: &Clip) -> String {
+    let g = c.grade;
+    if g == crate::Grade::IDENTITY { String::new() } else { format!("* UNA COLOR {} {} {}\n", g.brightness, g.contrast, g.saturation) }
 }

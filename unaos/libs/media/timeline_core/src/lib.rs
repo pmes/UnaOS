@@ -107,6 +107,7 @@ pub struct Clip {
     /// STRIAOPACITY (SR868): the video clip's opacity, percent 0..=[`OPAQUE`] (opaque, the default); below it the track underneath shows through.
     pub opacity: u8,
     pub group: u32, // STRIACLIPLINK (SR863): the link group (0 = none): clips sharing a nonzero id select, move, delete and split together
+    pub grade: Grade, // STRIACOLORLIFT (SR869): the clip's colour grade, IDENTITY = none (file tail)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -115,7 +116,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE, group: 0, grade: Grade::IDENTITY }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -399,6 +400,7 @@ pub enum EditError {
     Crop,
     /// STRIAOPACITY (SR868): an opacity above [`OPAQUE`] percent, or a non-opaque clip on an audio track.
     Opacity,
+    Grade, // STRIACOLORLIFT (SR869): a grade value outside -1000..=1000, or the `color` word misshapen
 }
 
 impl core::fmt::Display for EditError {
@@ -423,6 +425,7 @@ impl core::fmt::Display for EditError {
             EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
+            EditError::Grade => "color is b c s, each in -1000..=1000",
         })
     }
 }
@@ -495,7 +498,7 @@ impl Timeline {
                 if c.fade_in < 0 || c.fade_out < 0 || c.fade_in + c.fade_out > c.len() {
                     return Err(EditError::Fade);
                 }
-                if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&c.gain_cdb) {
+                grade_ok(t.kind, c)?; if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&c.gain_cdb) { // STRIACOLORLIFT (SR869): the grade's range and kind rule (file tail)
                     return Err(EditError::Gain);
                 }
                 // An out-of-order pair always fails this too (prev.at > c.at implies prev.end > c.at).
@@ -2344,5 +2347,88 @@ impl Timeline {
         }
         tl.validate()?;
         Ok(tl)
+    }
+}
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the per-clip grade, its op and THE per-pixel pass (named tail block) ----
+// A clip's colour grade: brightness / contrast / saturation, each in 1/1000 in `GRADE_MIN..=GRADE_MAX` (0 = unchanged).
+// [`Grade::apply`] is THE per-pixel pass (integer, straight RGBA, alpha untouched): saturation about the pixel's luma Y' by
+// yuv_core's ONE RGB -> Y' weights (`rgb_coeffs(KR_KB_601, true)`, the export converter's derivation; no second table), then
+// contrast about 128, then brightness as an offset of `255 b / 1000`, one clamp at the end. Stria's render calls it on the
+// RGBA a video step holds (`handlers/stria/src/nle.rs`, its own clip's and a transition's outgoing clip's); an IDENTITY
+// grade is no pass at all. Video clips only (`validate`: a graded audio clip is `EditError::Kind`). The kernel Player
+// refuses a graded timeline by name (`grade-unsupported`, NLE-GRADE-KERNEL).
+
+/// A clip's colour grade, each field in 1/1000 (`GRADE_MIN..=GRADE_MAX`; 0 = unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Grade {
+    pub brightness: i16,
+    pub contrast: i16,
+    pub saturation: i16,
+}
+
+/// The range each [`Grade`] field may carry.
+pub const GRADE_MIN: i16 = -1000;
+pub const GRADE_MAX: i16 = 1000;
+
+impl Grade {
+    /// No change: the render runs no pass.
+    pub const IDENTITY: Grade = Grade { brightness: 0, contrast: 0, saturation: 0 };
+
+    /// Every field inside `GRADE_MIN..=GRADE_MAX`.
+    pub fn in_range(self) -> bool {
+        [self.brightness, self.contrast, self.saturation].iter().all(|v| (GRADE_MIN..=GRADE_MAX).contains(v))
+    }
+
+    /// THE per-pixel pass over straight RGBA `rgba` (alpha untouched). Exact at [`Grade::IDENTITY`].
+    pub fn apply(self, rgba: &mut [u8]) {
+        let (ky, _, _, _) = yuv_core::rgb_coeffs(yuv_core::KR_KB_601, true);
+        let (b, c, s) = (self.brightness as i64, self.contrast as i64, self.saturation as i64);
+        let off = grade_rdiv(255 * b, 1000);
+        for px in rgba.chunks_exact_mut(4) {
+            let (r, g, bl) = (px[0] as i64, px[1] as i64, px[2] as i64);
+            let y = (ky[0] * r + ky[1] * g + ky[2] * bl + 32768) >> 16;
+            for ch in px.iter_mut().take(3) {
+                let v = *ch as i64;
+                let v = y + grade_rdiv((v - y) * (1000 + s), 1000);
+                let v = 128 + grade_rdiv((v - 128) * (1000 + c), 1000);
+                *ch = (v + off).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// `n / d` (`d > 0`) rounded half away from zero.
+fn grade_rdiv(n: i64, d: i64) -> i64 {
+    if n >= 0 { (2 * n + d) / (2 * d) } else { -((-2 * n + d) / (2 * d)) }
+}
+
+/// `validate`'s grade rule: every field in range (`EditError::Grade`), and only a video clip graded (`EditError::Kind`).
+fn grade_ok(kind: Kind, c: &Clip) -> Result<(), EditError> {
+    if !c.grade.in_range() {
+        return Err(EditError::Grade);
+    }
+    if kind != Kind::Video && c.grade != Grade::IDENTITY {
+        return Err(EditError::Kind);
+    }
+    Ok(())
+}
+
+impl Timeline {
+    /// The timeline with clip `idx` of `track` graded `g` (refused by `validate`: `EditError::Grade`, `EditError::Kind`).
+    pub fn set_grade(&self, track: usize, idx: usize, g: Grade) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.grade = g;
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// The grade of the clip a video step on `track` shows at tick `t`: its own clip (`outgoing` false: the clip covering
+    /// `t`), or a transition's outgoing clip (`outgoing` true: the last clip on the track ending at or before `t`, the cut's
+    /// outgoing for a plain transition and for one to black). No track or no such clip: [`Grade::IDENTITY`].
+    pub fn grade_at(&self, track: Option<usize>, t: i64, outgoing: bool) -> Grade {
+        let Some(tr) = track.and_then(|i| self.tracks.get(i)) else { return Grade::IDENTITY };
+        let c = if outgoing { tr.clips.iter().filter(|c| c.end() <= t).max_by_key(|c| c.end()) } else { tr.clips.iter().find(|c| c.covers(t)) };
+        c.map_or(Grade::IDENTITY, |c| c.grade)
     }
 }

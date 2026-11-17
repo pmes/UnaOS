@@ -187,7 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
@@ -258,7 +258,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face) + &color_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -1307,5 +1307,37 @@ mod strialoudnessreadout_tests {
         let want = nle_face::loudness_line(&stria::nle::loudness(&tl2, 0..tl2.end(), &src2), &None);
         assert_eq!(f.last_error.take(), Some(want.clone()));
         println!("strialoudnessreadout witness: button {id} {label:?} -> {want}");
+    }
+}
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the `color:<b>:<c>:<s>` token and the JSON `color` (named tail block) ----
+/// `,"color":[b,c,s]` while the selected clip carries a grade; empty otherwise (the default line unchanged).
+fn color_json(face: &Face) -> String {
+    match face.state.selected().map(|c| c.grade) {
+        Some(g) if g != timeline_core::Grade::IDENTITY => format!(",\"color\":[{},{},{}]", g.brightness, g.contrast, g.saturation),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod striacolorlift_tests {
+    use super::*;
+
+    /// M3: `at:12:0` selects B, `color:0:0:-1000` is timeline_core's `color` word (one undo step) and the witness field names
+    /// the grade; `color:5000:0:0` is refused by EditError::Grade's name; bare `color` clears it and the field goes.
+    #[test]
+    fn striacolorlift_witness_color_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(color_json(&face), "");
+        let errors = drive(&mut face, "at:12:0,color:0:0:-1000");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(color_json(&face), r#","color":[0,0,-1000]"#);
+        assert_eq!(face.state.undo_depth(), 1);
+        assert_eq!(drive(&mut face, "color:5000:0:0"), vec![format!("color 5000 0 0: {}", timeline_core::EditError::Grade)]);
+        assert_eq!(face.state.undo_depth(), 1);
+        assert!(drive(&mut face, "undo").is_empty());
+        assert_eq!(color_json(&face), "");
+        println!("striacolorlift witness: color:0:0:-1000 -> \"color\":[0,0,-1000]");
     }
 }
