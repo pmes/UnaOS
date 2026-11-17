@@ -169,7 +169,7 @@ fn collect<H: Host>(tree: &LayoutTree<H>, id: NodeId, out: &mut Vec<Item>) {
             continue;
         }
         if let Some(f) = tree.paint_map.get(&k).and_then(|p| p.float).filter(|&f| f != 0) {
-            out.push(Item::Float(k, f));
+            out.push(Item::Float(k, crate::css::float_side(f, crate::tree::is_rtl(tree, id))));
             continue;
         }
         if tag(tree, k).as_deref() == Some("br") {

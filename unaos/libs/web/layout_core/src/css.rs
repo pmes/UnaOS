@@ -1120,22 +1120,22 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // the value, so it records the UNHANDLED value only (a real element's clearance stays owed: `clear-value:`).
             style.paint.clear = match value {
                 "none" => Some(0),
-                "left" | "inline-start" => Some(1),
-                "right" | "inline-end" => Some(2),
+                "left" => Some(1), "inline-start" => Some(4),
+                "right" => Some(2), "inline-end" => Some(5),
                 "both" => Some(3),
                 _ => { if !is_neutral_keyword(value) { H::record_css(&format!("clear-value:{}", clip(value))); } style.paint.clear }
             };
         }
         "float" => match value {
-            "left" => {
+            "left" | "inline-start" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::START);
-                style.paint.float = Some(1);
+                style.paint.float = Some(if value == "left" { 1 } else { 3 });
             }
-            "right" => {
+            "right" | "inline-end" => {
                 style.width = Some(Dimension::auto());
                 style.align_self = Some(taffy::style::AlignSelf::END);
-                style.paint.float = Some(2);
+                style.paint.float = Some(if value == "right" { 2 } else { 4 });
             }
             "none" => style.paint.float = Some(0),
             "inherit" | "initial" | "unset" => {}
@@ -5037,7 +5037,7 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
             return;
         }
     };
-    if matches!(style.paint.float, Some(1 | 2)) {
+    if matches!(style.paint.float, Some(1..=4)) {
         return;
     }
     style.align_self = v;
@@ -5183,4 +5183,29 @@ pub fn alignment_valid(prop: &str, value: &str) -> bool {
 /// a declared colour's alpha through [`color_alpha`] (`transparent` 0), None when opaque or currentcolor (SR1126's shape).
 fn deco_alpha_of<H: Host>(c: Option<Option<(u8, u8, u8)>>, v: &str) -> Option<f32> {
     c.flatten().and(Some(color_alpha::<H>(v)).filter(|a| *a < 1.0))
+}
+
+// ---- AETHERRTLFLOATSTART (LEDGER SR1157): logical float / clear sides resolved against the containing block's direction (named tail block) ----
+
+/// AETHERRTLFLOATSTART (SR1157): css-logical-1 §3.1 `float: inline-start | inline-end` (codes 3 / 4 on
+/// `PaintStyle::float`) resolved to the physical side the float readers place by (1 left, 2 right) against the
+/// containing block's direction `rtl`: inline-start is the left edge in ltr and the right edge in rtl. 0 / 1 / 2 pass
+/// through unchanged.
+pub fn float_side(code: u8, rtl: bool) -> u8 {
+    match code {
+        3 => if rtl { 2 } else { 1 },
+        4 => if rtl { 1 } else { 2 },
+        c => c,
+    }
+}
+
+/// AETHERRTLFLOATSTART (SR1157): css-logical-1 §3.2 `clear: inline-start | inline-end` (codes 4 / 5 on
+/// `PaintStyle::clear`) resolved to the physical side `clear_floats` compares (1 left, 2 right; 3 both and 0 none pass
+/// through) against the clearing box's containing block direction `rtl`.
+pub fn clear_side(code: u8, rtl: bool) -> u8 {
+    match code {
+        4 => if rtl { 2 } else { 1 },
+        5 => if rtl { 1 } else { 2 },
+        c => c,
+    }
 }

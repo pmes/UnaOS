@@ -11531,4 +11531,41 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
     }
+
+    // ---- AETHERRTLFLOATSTART (LEDGER SR1157): logical floats and clears in an inline formatting context (named tail block) ----
+
+    /// AETHERRTLFLOATSTART (SR1157, css-logical-1 §3.1 / §3.2): in an inline formatting context a `float: inline-start`
+    /// sits at the left edge in ltr and the RIGHT edge in rtl (Chromium); inline-end mirrors. A clearfix
+    /// `::after { clear: inline-start }` under a left float 80 tall and a right float 40 tall clears the LEFT float in
+    /// ltr (the container is 80) and the RIGHT one in rtl (40); inline-end mirrors; `clear: both` is 80 either way.
+    #[test]
+    fn float_inline_start_ifc_and_clear() {
+        use crate::layout::inline::Frag;
+        let css = "body{margin:0} p{margin:0;width:100px}";
+        let float_x = |dir: &str, float: &str| {
+            let html = format!(r#"<html><body><p id=p dir={dir}><span id=f style="float:{float};width:30px;height:30px"></span>ab cd</p></body></html>"#);
+            let t = laid_out(&html, css);
+            let (p, f) = (node_by_id(&t, "p").unwrap(), node_by_id(&t, "f").unwrap());
+            t.inline[&p].frags.iter().find_map(|fr| match fr { Frag::Atomic { node, x, .. } if *node == f => Some(*x), _ => None }).expect("the float is placed")
+        };
+        for (dir, float, want) in [
+            ("ltr", "inline-start", 0.0), ("rtl", "inline-start", 70.0), ("ltr", "inline-end", 70.0), ("rtl", "inline-end", 0.0),
+            ("rtl", "left", 0.0), ("rtl", "right", 70.0), ("ltr", "left", 0.0), ("ltr", "right", 70.0),
+        ] {
+            let x = float_x(dir, float); // a right-side float sits at r - w on the formatter's avail_w + 0.01
+            assert!((x - want).abs() < 0.05, "dir={dir} float: {float}: the 30px float's x in the 100px paragraph ({x} vs {want})");
+        }
+
+        let clear_h = |dir: &str, clear: &str| {
+            let html = format!(r#"<html><body><div id=c dir={dir} style="width:200px"><span style="float:left;width:30px;height:80px"></span><span style="float:right;width:30px;height:40px"></span></div></body></html>"#);
+            let t = laid_out(&html, &format!("body{{margin:0}} #c::after{{content:\"\";display:block;clear:{clear}}}"));
+            rect_by_id(&t, "c").unwrap().3
+        };
+        for (dir, clear, want) in [
+            ("ltr", "inline-start", 80.0), ("rtl", "inline-start", 40.0), ("ltr", "inline-end", 40.0), ("rtl", "inline-end", 80.0),
+            ("ltr", "left", 80.0), ("rtl", "left", 80.0), ("ltr", "right", 40.0), ("rtl", "right", 40.0), ("ltr", "both", 80.0), ("rtl", "both", 80.0),
+        ] {
+            assert_eq!(clear_h(dir, clear), want, "dir={dir} clear: {clear}: the clearfix container's height");
+        }
+    }
 }

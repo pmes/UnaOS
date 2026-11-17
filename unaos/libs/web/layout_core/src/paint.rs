@@ -160,7 +160,7 @@ pub struct PaintStyle<H: Host> {
     /// 2 super, 3 middle, 4 text-top, 5 text-bottom, 6 top, 7 bottom,
     /// 8 a length in px (raise), 9 a percentage of line-height (fraction).
     pub vertical_align: Option<(u8, f32)>,
-    /// float: 0 none, 1 left, 2 right.
+    /// float: 0 none, 1 left, 2 right, 3 inline-start, 4 inline-end (SR1157: resolved by `css::float_side`).
     pub float: Option<u8>,
     /// opacity in [0, 1] (0 also sets `hidden`).
     pub opacity: Option<f32>,
@@ -193,7 +193,7 @@ pub struct PaintStyle<H: Host> {
     pub text_shadows: Option<Vec<H::Shadow>>,
     /// AETHERGEN (SR71): the author-styled `::marker` of a list item (`generated::generate`).
     pub marker: Option<Rc<MarkerPaint>>,
-    /// clear (CSS 2.2 §9.5.2): 0 none, 1 left, 2 right, 3 both. Acted on for a generated clearfix
+    /// clear (CSS 2.2 §9.5.2): 0 none, 1 left, 2 right, 3 both, 4 inline-start, 5 inline-end (SR1157: `css::clear_side`). Acted on for a generated clearfix
     /// box at the end of an inline formatting context (`generated`, `clear_floats`).
     pub clear: Option<u8>,
     /// AETHERSTYLE2 (SR95): `transform` (css-transforms-1 §5) as its function list; empty = `none`.

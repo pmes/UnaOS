@@ -1186,7 +1186,7 @@ pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
 /// anywhere down the tree still wins.
 fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
     fn walk<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, inherited: Option<u8>) {
-        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective);
+        let effective = tree.paint_map.get(&id).and_then(|p| p.text_align).or(inherited); rtl_start_blocks(tree, id, effective); float_logical_align(tree, id);
         if let Some(align) = effective.filter(|&a| a != 0 && a != 4 && a != 7 && a != 8) {
             if let Ok(st) = tree.taffy.style(id) {
                 let mut st = st.clone();
@@ -2741,7 +2741,7 @@ fn clear_floats<H: Host>(tree: &LayoutTree<H>, root: taffy::NodeId, h: f32) -> f
     let Some(clear) = kids
         .last()
         .filter(|k| is_generated_box(tree, **k))
-        .and_then(|k| tree.paint_map.get(k).and_then(|p| p.clear))
+        .and_then(|k| tree.paint_map.get(k).and_then(|p| p.clear)).map(|c| crate::css::clear_side(c, is_rtl(tree, root)))
         .filter(|&c| c != 0)
     else {
         return h;
@@ -2750,7 +2750,7 @@ fn clear_floats<H: Host>(tree: &LayoutTree<H>, root: taffy::NodeId, h: f32) -> f
     let mut bottom = h;
     for f in &il.frags {
         let inline::Frag::Atomic { node, y, .. } = f else { continue };
-        let side = tree.paint_map.get(node).and_then(|p| p.float).unwrap_or(0);
+        let side = crate::css::float_side(tree.paint_map.get(node).and_then(|p| p.float).unwrap_or(0), is_rtl(tree, tree.taffy.parent(*node).unwrap_or(root)));
         if side == 0 || (clear != 3 && clear != side) {
             continue;
         }
@@ -4046,4 +4046,24 @@ pub fn font_units<F: Fonts + ?Sized>(fonts: &F, sel: FontSel, fs: f32, root_fs: 
     let ex = fonts.x_height(sel, fs);
     let ch = fonts.measure("0", &Adv::new(sel, fs, 0.0));
     (fs, root_fs, if ex > 0.0 { ex } else { fs * 0.5 }, ch)
+}
+
+// ---- AETHERRTLFLOATSTART (LEDGER SR1157): a block-level logical float's align-self follows its containing block's direction (named tail block) ----
+
+/// AETHERRTLFLOATSTART (SR1157): the `float` arm writes a logical float's align-self (START for inline-start, END for
+/// inline-end) before direction is known, i.e. the ltr resolution; this re-derives it in the prepass walk from the code
+/// and the containing block's direction through [`crate::css::float_side`] (a block-level float among block siblings
+/// is placed by that align-self: taffy's START is the physical left). Written only when it differs, so in ltr nothing
+/// moves, and a restyle back to ltr writes the parse value again. Physical floats (1 / 2) are never touched.
+fn float_logical_align<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId) {
+    let Some(code) = tree.paint_map.get(&id).and_then(|p| p.float).filter(|f| matches!(f, 3 | 4)) else { return };
+    let cb = tree.taffy.parent(id).unwrap_or(id);
+    let want = if crate::css::float_side(code, is_rtl(tree, cb)) == 1 { taffy::style::AlignSelf::START } else { taffy::style::AlignSelf::END };
+    let Ok(st) = tree.taffy.style(id) else { return };
+    if st.align_self == Some(want) {
+        return;
+    }
+    let mut st = st.clone();
+    st.align_self = Some(want);
+    let _ = tree.taffy.set_style(id, st);
 }

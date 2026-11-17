@@ -712,3 +712,60 @@ fn table_align_css_wins_div_caption_rtl() {
     assert_eq!(box_of(&tree, &doc.by_id("t")).0, 100.0, "rtl: align=center still centres the table box");
 }
 
+
+// ---- AETHERRTLFLOATSTART (LEDGER SR1157): logical floats resolve against the column's direction (named tail block) ----
+
+/// AETHERRTLFLOATSTART (SR1157, css-logical-1 §3.1): `float: inline-start` / `inline-end` are parsed (codes 3 / 4) and a
+/// block-level one (beside a block sibling, so the column is no inline formatting context) sits at the side its
+/// column's direction resolves: inline-start left in ltr, right in rtl; inline-end the mirror. `left` / `right` stay
+/// physical in rtl. A restyle of the column back to ltr restores the parse-time align-self (START for inline-start).
+#[test]
+fn float_inline_start_block_sides() {
+    use layout_core::taffy::style::AlignSelf;
+    let col = |col_attrs: &[(&'static str, &str)], float: &str| {
+        let mut ca: Vec<(&'static str, &str)> = vec![("id", "col")];
+        ca.extend_from_slice(col_attrs);
+        let fs = format!("float: {float}; width: 100px; height: 20px");
+        page(vec![el("div", &ca, vec![el("div", &[("id", "n"), ("style", fs.as_str())], vec![]), el("p", &[("id", "p")], vec![text("after")])])])
+    };
+    let offset_in = |tree: &Tree, doc: &N| {
+        let (cx, _, cw, _) = box_of(tree, &doc.by_id("col"));
+        let (x, _, w, _) = box_of(tree, &doc.by_id("n"));
+        assert_eq!((cw, w), (300.0, 100.0), "the column is 300 wide and the float 100");
+        x - cx
+    };
+    let ltr: &[(&'static str, &str)] = &[("style", "width: 300px")];
+    let rtl: &[(&'static str, &str)] = &[("dir", "rtl"), ("style", "width: 300px")];
+    let cases: [(&str, &[(&'static str, &str)], &str, f32, u8); 8] = [
+        ("ltr inline-start", ltr, "inline-start", 0.0, 3),
+        ("ltr inline-end", ltr, "inline-end", 200.0, 4),
+        ("rtl inline-start", rtl, "inline-start", 200.0, 3),
+        ("rtl inline-end", rtl, "inline-end", 0.0, 4),
+        ("rtl left (physical)", rtl, "left", 0.0, 1),
+        ("rtl right (physical)", rtl, "right", 200.0, 2),
+        ("ltr left", ltr, "left", 0.0, 1),
+        ("ltr right", ltr, "right", 200.0, 2),
+    ];
+    for (how, ca, float, want, code) in cases {
+        let doc = col(ca, float);
+        let tree = lay(&doc, VW, 400.0);
+        assert_eq!(table_paint(&tree, &doc, "n").float, Some(code), "{how}: the float code");
+        assert_eq!(offset_in(&tree, &doc), want, "{how}: the 100px float's offset in the 300px column");
+    }
+    let doc = col(rtl, "none");
+    assert_eq!(table_paint(&lay(&doc, VW, 400.0), &doc, "n").float, Some(0), "float: none is 0");
+
+    // rtl -> ltr restyle: the inline-start float goes back to START (the parse value) and the left edge.
+    let doc = col(rtl, "inline-start");
+    let mut tree = lay(&doc, VW, 400.0);
+    let align = |tree: &Tree| tree.taffy.style(id_of(tree, &doc.by_id("n"))).unwrap().align_self;
+    assert_eq!(align(&tree), Some(AlignSelf::END), "rtl: inline-start resolves to the right (END)");
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let mut to_ltr = layout_core::css::SpecifiedStyle::<TH>::default();
+    layout_core::css::apply_declaration("direction", "ltr", &mut to_ltr, &cx);
+    let specs = [(id_of(&tree, &doc.by_id("col")), std::rc::Rc::new(to_ltr))];
+    layout_core::apply_specs(&mut tree, &specs);
+    layout_core::remeasure(&mut tree, &F);
+    assert_eq!(align(&tree), Some(AlignSelf::START), "direction: ltr restyle: the parse-time START is back");
+    assert_eq!(offset_in(&tree, &doc), 0.0, "direction: ltr restyle: the float is back at the left");
+}
