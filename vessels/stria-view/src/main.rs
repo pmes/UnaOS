@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -902,5 +902,30 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the witness's note (named tail block) ----
+/// The witness's `"note"` field, only while the face's note stands (`Face::note`: a success reading such as
+/// `xfade: 10 equal`, no longer an error); the default line is unchanged.
+fn note_json(face: &Face) -> String {
+    face.note.as_ref().map(|s| format!(",\"note\":\"{}\"", s.replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striaxfademore_tests {
+    use super::*;
+
+    /// `at:12:1,xfade` selects the audio clip at 10 and puts its crossfade: the reading is the `"note"` field, not an
+    /// error; a bare face has no field.
+    #[test]
+    fn striaxfademore_note_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(note_json(&face), "");
+        let errors = drive(&mut face, "at:12:1,xfade");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(note_json(&face), r#","note":"xfade: 10 equal""#);
+        println!("striaxfademore witness: {}", note_json(&face));
     }
 }

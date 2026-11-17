@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub note: Option<String>, // STRIAXFADEMORE (SR980): a success reading on the message row (not an error), cleared by the next acting input (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -249,7 +250,7 @@ impl Face {
                 None => return false,
             },
         };
-        if r.is_ok() { if let Some(s) = self.state.xfade_reading(v) { self.last_error = Some(format!("xfade: {s}")); } } if let Err(e) = r { // STRIAXFADECURVEBUTTON (SR925): after any xfade word the message row reads the crossfade (`xfade: 12 equal`)
+        if r.is_ok() { if let Some(s) = self.state.xfade_reading(v) { self.note = Some(format!("xfade: {s}")); } } if let Err(e) = r { // STRIAXFADECURVEBUTTON (SR925): after any xfade word the message row reads the crossfade (`xfade: 12 equal`)
             self.last_error = Some(match self.state.xfade_refusal(v, e).or_else(|| self.state.xfade_curve_refusal(v, e)) { Some(s) => format!("{v}: {s}"), None => format!("{v}: {e}") }); // STRIAXFADECURVE (SR904): an `xfade` refusal's audio wording (timeline_core editor.rs tail); STRIAXFADECURVEBUTTON (SR925): and `xfade-curve`'s
         }
         true
@@ -2362,7 +2363,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3099,5 +3100,27 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the face's note — a success reading on the message row, not an error (named tail block) ----
+// SR925 owed NLE-XFADE-READING-STATUS: the crossfade reading (`xfade: 10 equal`) rode `last_error`, so `serve` logged a
+// success as a warn and the witness listed it under `"errors"`. It is now `Face::note`, which `message_text` reads after
+// `last_error`; the next input that acts clears it at the top of `Face::on` (a typed word, a click, a press, select-all, a
+// taken key by `Face::key`'s rule: a one-character key from `BrowserText`, a named one from `BrowserKey`); a pointer move,
+// a wheel, a resize or a zoom leaves it. Owed: NLE-FACE-NOTE-USERS (the export's done line still rides `last_error`).
+
+impl Face {
+    /// Clear the note when `msg` is an input that acts (see the block comment).
+    fn clear_note(&mut self, msg: &SMessage) {
+        let acts = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() != 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if acts {
+            self.note = None;
+        }
     }
 }

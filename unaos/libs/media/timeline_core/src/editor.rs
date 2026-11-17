@@ -809,8 +809,21 @@ impl EditorState {
         let (track, ci) = self.selection?;
         let i = self.timeline.tracks.get(track)?.clips.get(ci)?;
         Some(match self.timeline.audio_xfades.iter().find(|x| x.track == track && x.at == i.at) {
-            Some(x) => alloc::format!("{} {}", x.dur, if x.curve == crate::Curve::EqualPower { "equal" } else { "linear" }),
+            Some(x) => alloc::format!("{} {}", x.dur, x.curve.word()), // STRIAXFADEMORE (SR980): the curve's one word (file tail)
             None => alloc::string::String::from("off"),
         })
+    }
+}
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the curve's word (named tail block) ----
+// The one name of a crossfade curve, as the `xfade` words spell it (`xfade linear|equal`): the face's reading and the
+// bracket's label (view.rs `paint_xfade_name`) both read it.
+impl crate::Curve {
+    /// `linear` or `equal`.
+    pub fn word(self) -> &'static str {
+        match self {
+            crate::Curve::Linear => "linear",
+            crate::Curve::EqualPower => "equal",
+        }
     }
 }
