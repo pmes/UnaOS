@@ -152,7 +152,7 @@ impl Media {
     /// indexed reel loads its first span so the origin (and the audio `Timing`) read real samples.
     fn open(bytes: Vec<u8>) -> Result<Media, RenderError> {
         let err = |e: gneiss_pal::dsp::demux::Error| RenderError::Demux(e.to_string());
-        let mut demux = Demuxer::open_indexed(bytes).map_err(err)?;
+        let mut demux = if gneiss_pal::dsp::demux::wav::is_wav(&bytes) { Demuxer::open_wav(bytes) } else { Demuxer::open_indexed(bytes) }.map_err(err)?; // STRIAIMPORTWAV (SR889): a RIFF/WAVE reel is demux_core's one-track PCM table (its own door: Demuxer::open stays WAV-blind for the Player)
         if demux.indexed() && demux.duration_ns() == 0 {
             let data = demux.bytes();
             drop(demux);
@@ -205,7 +205,7 @@ impl Sources {
     pub fn set_audio_rate(&mut self, hz: u32) {
         self.audio_rate = hz;
     }
-    /// Open `bytes` (MP4 / Matroska / WebM) as source `id`.
+    /// Open `bytes` (MP4 / Matroska / WebM / WAV) as source `id`.
     pub fn add(&mut self, id: SourceId, bytes: Vec<u8>) -> Result<(), RenderError> {
         let m = Media::open(bytes)?; self.note_open(id, &m); // NLE-STANDIN-OPEN (SR353): a reel no decoder fits opens as a stand-in reel
         self.media.retain(|(s, _)| *s != id);
@@ -743,7 +743,7 @@ impl Sources {
     /// origin [`Media::open`] keeps; no edit list = the whole source). `Ok(None)` when the bytes are no container
     /// demux_core knows (`probe`): the caller reads them as an EDL.
     pub fn from_media(reel: &str, bytes: &[u8], fps: u32) -> Result<Option<(Timeline, Sources)>, RenderError> {
-        if gneiss_pal::dsp::demux::probe(bytes).is_none() {
+        if gneiss_pal::dsp::demux::probe(bytes).is_none() && !gneiss_pal::dsp::demux::wav::is_wav(bytes) { // STRIAIMPORTWAV (SR889): a WAV is its own one-track timeline
             return Ok(None);
         }
         let mut tl = Timeline::new(fps);
