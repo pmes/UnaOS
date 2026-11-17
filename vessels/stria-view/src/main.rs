@@ -123,7 +123,7 @@ fn load(c: &Cli) -> (Timeline, Sources) {
     let Some(path) = c.edl.as_deref() else { return nle_face::synth_fixture() };
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
     let tl = edl::parse(&text, c.fps).unwrap_or_else(|e| die(format!("{path}: {e}")));
-    let mut sources = Sources::new(&tl);
+    let mut sources = Sources::new(&tl); if c.peak_cache { if let Some(d) = stria::nle::peak_user_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) { stria::nle::prune_peak_dir(&d, stria::nle::PEAK_DIR_BUDGET); } } // STRIAWAVECACHEPRUNE (SR9123): the per-user peak dir pruned once at start (nle.rs file tail)
     for s in tl.sources.iter().filter(|s| s.title.is_none()) { // STRIATITLECLIP (SR828): a title source has no file
         let Some((_, p)) = c.srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
         if stria::nle::seq_pattern(p).is_some() { sources.add_sequence(s.id, p).unwrap_or_else(|e| die(format!("{p}: {e}"))); continue; } let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}"))); // STRIAIMPORTIMAGESEQUENCE (SR888): a `%04d` path is a PNG sequence reel
