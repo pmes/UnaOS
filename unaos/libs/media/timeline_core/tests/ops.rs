@@ -342,3 +342,36 @@ fn striarolledit_the_editor_rolls_once_per_word() {
     st.deselect();
     assert_eq!(st.verb("roll+"), Some(Err(EditError::NoClip)));
 }
+
+// ---- STRIAZOOMTOFIT (LEDGER SR859): the fit zoom over the whole timeline or the selection set (named tail block) ----
+
+/// The rule: the largest integer zoom that puts the range in `w` px (ZOOM_MIN when it cannot fit, ZOOM_MAX at most), the
+/// origin the range's start; nothing to fit is NoClip with the zoom unchanged; never an undo step, the timeline untouched.
+#[test]
+fn striazoomtofit_fit_rule() {
+    use timeline_core::editor::{EditorState, ZOOM_MAX, ZOOM_MIN};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.fit(320, false), Ok(0));
+    assert_eq!(st.zoom, 9); // 320 / 35
+    assert_eq!(st.fit(320, true), Err(EditError::NoClip), "an empty set");
+    assert_eq!(st.zoom, 9, "a refusal leaves the zoom");
+    st.select(0, 1).unwrap();
+    assert_eq!(st.fit(320, true), Ok(10));
+    assert_eq!(st.zoom, 32); // 320 / 10
+    st.select_add(0, 0).unwrap();
+    assert_eq!(st.fit(320, true), Ok(0));
+    assert_eq!(st.zoom, 16); // 320 / 20
+    assert_eq!(st.fit(20, false), Ok(0));
+    assert_eq!(st.zoom, ZOOM_MIN, "35 ticks in 20 px: the smallest zoom, the origin at the start");
+    assert_eq!(st.fit(10_000, false), Ok(0));
+    assert_eq!(st.zoom, ZOOM_MAX);
+    assert_eq!((st.undo_depth(), &st.timeline), (0, &tl), "a view change, not an edit");
+    let mut empty = EditorState::new(Timeline::new(25));
+    assert_eq!(empty.fit(320, false), Err(EditError::NoClip), "an empty timeline");
+    assert_eq!(empty.zoom, timeline_core::editor::ZOOM_DEFAULT);
+}

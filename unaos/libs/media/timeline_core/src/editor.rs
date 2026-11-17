@@ -1132,3 +1132,31 @@ mod striainsertoverwrite_tests {
         assert_eq!(edl::parse(&text, 25).unwrap(), st.timeline);
     }
 }
+
+// ---- STRIAZOOMTOFIT (LEDGER SR859): the fit zoom (named tail block) ----
+// A view change, not an edit: no `commit`, no undo step, the timeline untouched. The range is `0..end` (the whole
+// timeline) or `min at .. max end` over the selection SET; the zoom is the largest integer px-per-tick that puts the
+// range inside `w` px, within `ZOOM_MIN..=ZOOM_MAX`; a range wider than `w` ticks gets ZOOM_MIN (no fractional zoom).
+// The origin (the range's start) is the caller's to anchor: the host face writes it into `Face.view`; the kernel
+// Player's fit is owed (NLE-ZOOMFIT-KERNEL). Nothing to fit (an empty timeline, an empty set): `EditError::NoClip`.
+impl EditorState {
+    /// Fit the whole timeline (`sel` false) or the selection set (`sel` true) into `w` px: sets the zoom, returns the
+    /// origin tick (the range's start).
+    pub fn fit(&mut self, w: u32, sel: bool) -> Result<i64, EditError> {
+        let (start, end) = self.fit_range(sel).ok_or(EditError::NoClip)?;
+        let span = end - start;
+        if span < 1 {
+            return Err(EditError::NoClip);
+        }
+        self.zoom = (w as i64 / span).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32;
+        Ok(start)
+    }
+    /// The ticks a fit covers: `0..end`, or the selection set's `min at .. max end`.
+    fn fit_range(&self, sel: bool) -> Option<(i64, i64)> {
+        if !sel {
+            return Some((0, self.timeline.end()));
+        }
+        let clips = self.set.iter().filter_map(|&(t, i)| self.timeline.tracks.get(t)?.clips.get(i));
+        clips.fold(None, |r, c| Some(r.map_or((c.at, c.end()), |(a, b): (i64, i64)| (a.min(c.at), b.max(c.end())))))
+    }
+}

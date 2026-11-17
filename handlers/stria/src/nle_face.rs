@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 42] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core)
+pub const VERBS: [&str; 44] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -237,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3500,6 +3500,26 @@ impl Face {
             (timeline_core::editor::MarkerWord::Unmark, Err(EditError::Marker), None) => format!("unmark: no marker at {tc}"),
             (_, Err(e), _) => format!("{}: {e}", v.trim()),
         });
+        Some(true)
+    }
+}
+
+// ---- STRIAZOOMTOFIT (LEDGER SR859): `zoom-fit` / `zoom-sel` fit the timeline or the selection set in the window (named tail block) ----
+// timeline_core's `EditorState::fit` sets the one zoom from the face's width; the origin it returns is written into THE
+// view anchor the wheel's `zoom_at` writes (`Face.view`), which `Face::layout` applies unchanged. A view change: no undo
+// step, the document not dirtied. A refusal (nothing to fit) is `last_error` through `Face::verb`'s `<v>: <e>` text.
+
+impl Face {
+    /// The fit words; None for any other word.
+    fn fit_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "zoom-fit" && v != "zoom-sel" {
+            return None;
+        }
+        let w = self.layout().w;
+        match self.state.fit(w, v == "zoom-sel") {
+            Ok(t0) => self.view = Some((t0, self.state.playhead)),
+            Err(e) => self.last_error = Some(format!("{v}: {e}")),
+        }
         Some(true)
     }
 }

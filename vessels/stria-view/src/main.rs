@@ -526,6 +526,7 @@ fn transport() -> TetraNode {
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("roll-", "Roll -"), button("roll+", "Roll +"), // STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge
         button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
+        button("zoom-fit", "Fit"), button("zoom-sel", "Fit Sel"), // STRIAZOOMTOFIT (SR859): fit the timeline / the selection in the window
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
