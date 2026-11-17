@@ -1864,7 +1864,7 @@ impl Face {
     /// rate (the old path: `feed_meters` resets, the nudge, the paint renders `preview`). An error is `last_error` and resets
     /// the meters; the paint then renders `preview`, as before, and the next tick still steps on.
     fn play_tick(&mut self, ph: i64) -> bool {
-        if self.rate <= 0 { if self.reverse_tick(ph) { return true; } // STRIAJKLMORE (SR945): with a released device a reverse tick is ONE render, heard backward (file tail)
+        self.pace_clear(); if self.rate <= 0 { if self.reverse_tick(ph) { return true; } // STRIAPACETAIL (SR9087): a shuttle or reverse tick clears the pace queue, from what was seen (file tail); STRIAJKLMORE (SR945): with a released device a reverse tick is ONE render, heard backward (file tail)
             return false;
         }
         self.play.pending = None;
@@ -1876,7 +1876,7 @@ impl Face {
         let ph = self.state.playhead;
         let end = (ph + self.rate).min(self.state.timeline.end());
         self.play.shown = None;
-        if end <= ph {
+        if end <= ph { if self.pace_tail(ph) { return true; } // STRIAPACETAIL (SR9087): at the end the queued stills drain at the AudioClock before play stops (file tail)
             self.playing = false;
             self.sync_audio();
             return true;
@@ -1900,7 +1900,7 @@ impl Face {
                 self.meters.reset();
             }
         }
-        (self.play.shown, self.play.next) = (Some(ph), Some(end)); self.play.rev_next = None; self.pace(end); // STRIAPLAYSYNCPACE (SR9055): the still shown when the AudioClock reaches it (file tail); STRIAJKLMORE (SR945): a forward tick ends a reverse run (the next reverse tick flushes)
+        (self.play.shown, self.play.next) = (Some(ph), Some(end)); self.play.rev_next = None; self.pace(end); self.pace_queued(); // STRIAPACETAIL (SR9087): stills left queued held at the preview size (file tail); STRIAPLAYSYNCPACE (SR9055): the still shown when the AudioClock reaches it (file tail); STRIAJKLMORE (SR945): a forward tick ends a reverse run (the next reverse tick flushes)
         true
     }
 }
@@ -3763,12 +3763,12 @@ struct PlayPace {
     on: Option<(i64, i64)>,
     fresh: bool,
     held: bool,
-    queued_max: usize,
+    queued_max: usize, tail: usize, small: Vec<(i64, u32, u32)>, // STRIAPACETAIL (SR9087): the drain ticks at the end, and the queued ticks sampled down with their size (file tail)
 }
 
 impl Default for PlayPace {
     fn default() -> Self {
-        PlayPace { queue: std::collections::VecDeque::new(), sched: gneiss_pal::dsp::avsync::Scheduler::new(0), next: None, on: None, fresh: true, held: false, queued_max: 0 }
+        PlayPace { queue: std::collections::VecDeque::new(), sched: gneiss_pal::dsp::avsync::Scheduler::new(0), next: None, on: None, fresh: true, held: false, queued_max: 0, tail: 0, small: Vec::new() }
     }
 }
 
@@ -3963,5 +3963,245 @@ mod striaplaysyncpace_tests {
         f.verb("play");
         assert!(f.tick());
         assert_eq!(f.state.playhead, 1);
+    }
+}
+
+// ---- STRIAPACETAIL (LEDGER SR9087): NLEPLAY-SYNC-PACE-TAIL + NLEPLAY-PACE-STILLMEM, the paced queue at the end, across a rate change, held small (named tail block) ----
+// At the timeline's end the render cursor stops while the presented playhead is still behind: a DRAIN tick (no render, no
+// push, no flush) feeds the parent's AudioClock (`sync_mark`) and re-enters the parent's `pace` with the queue's last entry
+// handed back as `pending`, so the ONE decide loop shows the head the clock reached; the queue empty, play stops at the end as
+// before; more than 2 * PACE_HOLD drain ticks (a stalled device) stop as before. A shuttle or reverse tick clears the queue; a
+// forward shuttle with stills queued starts one frame after the presented tick (the ring flushed by `play_tick`'s jump test).
+// Stills left in the queue after a tick are sampled down to the preview's letterboxed box (never up), which paints the same
+// bytes; `Face::still_is_sampled` says when the shown still is one of them. Wire: `[STRIA] :: nle play pace tail ticks= left=`.
+// FOLD RULE: a full-size reader of `Face::still()` (SR830's frame export) re-renders through `preview` at the playhead when
+// `still_is_sampled()` is true. Owed: NLEPLAY-PACE-GAP (a gap tick's `NoSize` render clears the queue mid-run).
+
+/// STRIAPACETAIL (SR9087): `s` nearest-sampled to the size `view::Canvas::blit_fit` paints it at in a `bw` x `bh` box
+/// (`SizePolicy::Letterbox`'s placed rect, the same samples through `blit_policy`'s ONE `nearest_rows`); `None` when nothing
+/// is sized or the placed rect is not smaller than `s` (a sampled still is never sampled twice).
+fn pace_small(s: &Still, bw: u32, bh: u32) -> Option<Still> {
+    let (sw, sh) = (s.width as usize, s.height as usize);
+    if sw == 0 || sh == 0 || bw == 0 || bh == 0 || s.rgba.len() < sw * sh * 4 {
+        return None;
+    }
+    let d = timeline_core::SizePolicy::Letterbox.place(sw, sh, bw as usize, bh as usize).dst;
+    if d.w * d.h >= sw * sh {
+        return None;
+    }
+    let (dw, dh) = (d.w as u32, d.h as u32);
+    let mut c = Canvas::new(dw, dh, Order::Rgba);
+    c.blit_policy(s, 0, 0, dw, dh, timeline_core::SizePolicy::Stretch);
+    Some(Still { width: dw, height: dh, rgba: c.px })
+}
+
+impl Face {
+    /// STRIAPACETAIL (SR9087): a forward tick that hit the timeline's end at render cursor `at`: while stills are queued and the
+    /// clock lives, the parent's `pace` shows the head the clock reached (or holds); true when this was a drain tick. False
+    /// (play stops as before) when the queue is empty, the clock is gone or the drain ran past 2 * PACE_HOLD ticks.
+    fn pace_tail(&mut self, at: i64) -> bool {
+        let pace = &self.play.pace;
+        if pace.queue.is_empty() || pace.tail >= 2 * PACE_HOLD {
+            if pace.tail > 0 {
+                log::info!("[STRIA] :: nle play pace tail ticks={} left={}", pace.tail, pace.queue.len());
+            }
+            return false;
+        }
+        self.sync_mark(at);
+        if self.play.sync.clock.is_none() {
+            return false;
+        }
+        self.play.pace.tail += 1;
+        let Some((t, e, s)) = self.play.pace.queue.pop_back() else { return false };
+        self.play.pace.next = Some(t);
+        (self.play.shown, self.play.pending) = (Some(t), Some((t, s)));
+        self.pace(e);
+        true
+    }
+    /// STRIAPACETAIL (SR9087): at the top of a played tick at a rate other than 1x: the pace queue and the presented tick are
+    /// dropped; a forward shuttle with stills still queued first moves the playhead to one frame after the presented tick and
+    /// forgets `shown`, so the run starts from what was seen and `play_tick` flushes the ring (its render cursor is ahead).
+    fn pace_clear(&mut self) {
+        let (queued, on) = (!self.play.pace.queue.is_empty(), self.play.pace.on);
+        if self.rate == 1 || (!queued && on.is_none()) {
+            return;
+        }
+        if let Some((t, e)) = on {
+            if self.rate > 1 && queued && self.play.shown == Some(t) {
+                self.state.seek(e);
+                self.play.shown = None;
+            }
+        }
+        let pace = &mut self.play.pace;
+        pace.queue.clear();
+        (pace.next, pace.on, pace.fresh) = (None, None, true);
+    }
+    /// STRIAPACETAIL (SR9087): after a rendered forward tick's `pace`: the drain count restarts, and every still left in the
+    /// queue is sampled down to the preview's box (`pace_small`), its tick and size kept for `still_is_sampled`.
+    fn pace_queued(&mut self) {
+        let shown = self.play.shown;
+        let pace = &mut self.play.pace;
+        pace.tail = 0;
+        let (small, queue) = (&mut pace.small, &pace.queue);
+        small.retain(|&(t, _, _)| Some(t) == shown || queue.iter().any(|q| q.0 == t));
+        if pace.queue.is_empty() {
+            return;
+        }
+        let role = if self.split.is_some() { Role::Preview } else { Role::Whole };
+        let l = self.layout_for(role).with_message(self.labels.is_some());
+        let pace = &mut self.play.pace;
+        for q in pace.queue.iter_mut() {
+            if let Some(s) = q.2.as_ref().and_then(|s| pace_small(s, l.w, l.preview_h)) {
+                pace.small.push((q.0, s.width, s.height));
+                q.2 = Some(s);
+            }
+        }
+    }
+    /// STRIAPACETAIL (SR9087): true when the still the face shows ([`Face::still`]) is a queued still sampled down to the
+    /// preview's size (it paints the same bytes); a full-size reader re-renders through [`preview`] at the playhead then.
+    pub fn still_is_sampled(&self) -> bool {
+        let ph = self.state.playhead;
+        self.still.as_ref().is_some_and(|s| self.play.pace.small.iter().any(|&(t, w, h)| t == ph && (w, h) == (s.width, s.height)))
+    }
+}
+
+#[cfg(test)]
+mod striapacetail_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::SYNTH_RATE;
+    use std::sync::{Arc, Mutex};
+
+    /// The tests' device: takes every sample; `consumed` lags what was pushed by the shared `lag` frames.
+    struct Out {
+        pushed: u64,
+        lag: Arc<Mutex<u64>>,
+    }
+    impl AudioOut for Out {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            self.pushed += (stereo.len() / 2) as u64;
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.pushed.saturating_sub(*self.lag.lock().unwrap())
+        }
+    }
+
+    fn face(lag: u64, canvas: (u32, u32)) -> (Face, Arc<Mutex<u64>>) {
+        let (tl, src) = synth_fixture();
+        let lag = Arc::new(Mutex::new(lag));
+        let out = Out { pushed: 0, lag: lag.clone() };
+        (Face::new(EditorState::new(tl), src, canvas, PixelOrder::Rgba, false).with_audio(Box::new(out), SYNTH_RATE), lag)
+    }
+
+    /// Play from tick 25 (off the fixture's gap) with the device `lag` frames behind and tick `n` times.
+    fn played(lag: u64, canvas: (u32, u32), n: usize) -> (Face, Arc<Mutex<u64>>) {
+        let (mut f, l) = face(lag, canvas);
+        f.state.seek(25);
+        f.verb("play");
+        for _ in 0..n {
+            f.tick();
+        }
+        (f, l)
+    }
+
+    /// STRIAPACETAIL M3: three frames behind, the render reaches the end (35) with 32..34 queued: each drain tick shows the
+    /// next frame as the device plays out, nothing more is pushed, and the tick after the last stops at the end.
+    #[test]
+    fn striapacetail_tail_drains() {
+        let (mut f, lag) = played(5760, (320, 160), 10);
+        assert_eq!(f.state.playhead, 31);
+        let pushed = f.played().pushed;
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 32);
+        *lag.lock().unwrap() = 3840;
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 33);
+        *lag.lock().unwrap() = 1920;
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 34);
+        assert_eq!(f.played().pushed, pushed, "a drain tick renders and pushes nothing");
+        assert!(f.playing);
+        assert!(f.tick());
+        assert!(!f.playing);
+        assert_eq!(f.state.playhead, 35);
+    }
+
+    /// STRIAPACETAIL M3: a stalled device at the end: 2 * PACE_HOLD drain ticks hold the picture (no repaint), then play
+    /// stops at the end as before.
+    #[test]
+    fn striapacetail_tail_bounded() {
+        let (mut f, _) = played(u64::MAX, (320, 160), 10);
+        assert_eq!(f.state.playhead, 25);
+        for n in 0..2 * PACE_HOLD {
+            assert!(!f.tick(), "drain tick {n} holds");
+            assert_eq!(f.state.playhead, 25);
+        }
+        assert!(f.tick());
+        assert!(!f.playing);
+        assert_eq!(f.state.playhead, 35);
+    }
+
+    /// STRIAPACETAIL M3: reverse while 26..28 are queued behind the shown 25: the queue is dropped and the reverse tick
+    /// steps back from the frame that was seen.
+    #[test]
+    fn striapacetail_reverse_clears() {
+        let (mut f, _) = played(5760, (320, 160), 4);
+        assert_eq!((f.state.playhead, f.play.pace.queue.len()), (25, 3));
+        assert!(f.on(&SMessage::BrowserText("j".into())));
+        assert_eq!(f.rate, -1);
+        assert!(f.tick());
+        assert!(f.play.pace.queue.is_empty());
+        assert!(f.play.pace.on.is_none());
+        assert_eq!(f.state.playhead, 24);
+    }
+
+    /// STRIAPACETAIL M3: a 2x shuttle while 26..28 are queued behind the shown 25 starts at 26 (not at the render cursor,
+    /// 29), the queue dropped; the next tick steps two frames.
+    #[test]
+    fn striapacetail_shuttle_from_shown() {
+        let (mut f, _) = played(5760, (320, 160), 4);
+        assert_eq!(f.state.playhead, 25);
+        assert!(f.on(&SMessage::BrowserText("l".into())));
+        assert_eq!(f.rate, 2);
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 26);
+        assert!(f.play.pace.queue.is_empty());
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 28);
+    }
+
+    /// STRIAPACETAIL M3: on a 32 px wide face (preview box 32 x 64) the held stills are 32 x 24, not the reel's 64 x 48; the
+    /// first one shown later is marked sampled; a run with no lag shows full stills.
+    #[test]
+    fn striapacetail_queue_held_small() {
+        let (mut f, _) = played(5760, (32, 160), 4);
+        assert_eq!(f.play.pace.queue.len(), 3);
+        for q in &f.play.pace.queue {
+            let s = q.2.as_ref().expect("a queued still");
+            assert_eq!((s.width, s.height), (32, 24), "tick {}", q.0);
+        }
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 26);
+        let _ = f.frames();
+        assert_eq!(f.still().map(|s| (s.width, s.height)), Some((32, 24)));
+        assert!(f.still_is_sampled());
+        let (mut g, _) = played(0, (32, 160), 2);
+        let _ = g.frames();
+        assert_eq!(g.still().map(|s| (s.width, s.height)), Some((64, 48)));
+        assert!(!g.still_is_sampled());
+    }
+
+    /// STRIAPACETAIL M3: a still sampled to the preview box paints the same bytes as the full render; sampling it again is a no-op.
+    #[test]
+    fn striapacetail_small_paints_same() {
+        let (tl, src) = synth_fixture();
+        let full = preview(&tl, &src, 1).unwrap().expect("a frame at 1");
+        let st = EditorState::new(tl);
+        let l = Layout::of(32, 160, &st);
+        let small = pace_small(&full, l.w, l.preview_h).expect("smaller than the reel");
+        assert_eq!((small.width, small.height), (32, 24));
+        assert_eq!(paint_in(&st, l, PixelOrder::Rgba, None, Some(&small)), paint_in(&st, l, PixelOrder::Rgba, None, Some(&full)));
+        assert!(pace_small(&small, l.w, l.preview_h).is_none());
     }
 }
