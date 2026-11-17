@@ -21,7 +21,7 @@ struct Inherited {
     /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
     text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
-    underline: bool, deco_color: Option<(u8, u8, u8)>,
+    underline: bool, deco_color: Option<(u8, u8, u8)>, deco_style: u8, deco_thick: Option<f32>,
     nowrap: bool,
     white_space: u8,
     word_break: u8,
@@ -484,7 +484,7 @@ fn root_inherited() -> Inherited {
         rtl: false,
         text_shadow: None,
         line_height: 0.0, // natural
-        underline: false, deco_color: None,
+        underline: false, deco_color: None, deco_style: 0, deco_thick: None,
         nowrap: false,
         white_space: 0,
         word_break: 0,
@@ -710,16 +710,16 @@ fn draw_decorations(
     if !(deco.underline || deco.line_through) || x1 <= x0 {
         return;
     }
-    let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color);
-    let mut hline = |top: f32, thick: f32| {
+    let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color); let t = deco.thickness.unwrap_or(m.thickness);
+    let mut hline = |xa0: f32, xb0: f32, top: f32, thick: f32| {
         let yi = top.round() as i32;
         for dy in 0..thick.round().max(1.0) as i32 {
             let yy = yi + dy;
             if yy < 0 || yy as u32 >= height {
                 continue;
             }
-            let xa = x0.max(0.0).round() as u32;
-            let xb = (x1.max(0.0).round() as u32).min(width);
+            let xa = xa0.max(0.0).round() as u32;
+            let xb = (xb0.max(0.0).round() as u32).min(width);
             for x in xa..xb {
                 if in_damage(x, yy as u32, damage_rects) && in_clip(x, yy as u32, clip) {
                     put_px(surface, width, x, yy as u32, color);
@@ -728,10 +728,10 @@ fn draw_decorations(
         }
     };
     if deco.underline {
-        hline(baseline + m.underline_offset, m.thickness);
+        for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline + m.underline_offset, t) { hline(a, b, y, h); }
     }
     if deco.line_through {
-        hline(baseline - m.line_through_offset, m.thickness);
+        for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline - m.line_through_offset, t) { hline(a, b, y, h); }
     }
 }
 
@@ -986,7 +986,7 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let deco = Deco { underline, line_through: false, color: None };
+    let deco = Deco { underline, line_through: false, color: None, style: 0, thickness: None };
     draw_lines(
         text, origin_x, origin_y, max_width, adv, line_height_mult, color,
         &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
@@ -1168,7 +1168,7 @@ fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Deco {
     underline: bool,
-    line_through: bool, color: Option<(u8, u8, u8)>,
+    line_through: bool, color: Option<(u8, u8, u8)>, style: u8, thickness: Option<f32>,
 }
 
 /// Draws a run on the lines fonts::lines breaks it into — the same breaker
@@ -3459,7 +3459,7 @@ fn frame_walk(
                             inherited.line_height,
                             inherited.color,
                             &mode,
-                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color },
+                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, style: inherited.deco_style, thickness: inherited.deco_thick },
                             inherited.shadows(layout),
                             surface,
                             width,
@@ -3828,7 +3828,7 @@ fn frame_walk(
                             }
                             continue;
                         }
-                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color };
+                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, style: i.deco_style, thickness: i.deco_thick };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
                         // page once the staging buffer is composited.
@@ -4645,9 +4645,62 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// decoration paints through the descendant's text in the ancestor's `text-decoration-color`.
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
     if tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some() {
-        inherited.deco_color = None;
+        inherited.deco_color = None; inherited.deco_style = 0; inherited.deco_thick = None;
     }
-    if let Some(c) = spec.decoration_color {
+    if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(c) = spec.decoration_color {
         inherited.deco_color = c;
     }
+}
+
+// ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): the decoration line's style as rects for draw_decorations (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the rects `(x0, x1, top, height)` one decoration line of `style`
+/// (`PaintStyle::decoration_style`) and thickness `t` paints from `x0` to `x1` with its solid row at `top`; the one
+/// dispatch `draw_decorations` fills through its `hline`. Geometry RECALLED from Chromium, not measured
+/// (AETHER-CSS-TEXT-DECORATION-GEOMETRY-MEASURE owed): double = two lines of t a gap t apart; dotted = t on, t off;
+/// dashed = 3t on 2t off below 3px, 2t on t off from 3px (StrokeData's dash ratios as recalled); wavy = [`wavy_path`].
+fn deco_rects(style: u8, x0: f32, x1: f32, top: f32, t: f32) -> Vec<(f32, f32, f32, f32)> {
+    let u = t.round().max(1.0);
+    match style {
+        1 => vec![(x0, x1, top, t), (x0, x1, top + 2.0 * u, t)],
+        2 => dashes(x0, x1, u, u).into_iter().map(|(a, b)| (a, b, top, t)).collect(),
+        3 if u < 3.0 => dashes(x0, x1, 3.0 * u, 2.0 * u).into_iter().map(|(a, b)| (a, b, top, t)).collect(),
+        3 => dashes(x0, x1, 2.0 * u, u).into_iter().map(|(a, b)| (a, b, top, t)).collect(),
+        4 => wavy_path(x0, x1, top, t),
+        _ => vec![(x0, x1, top, t)],
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the `on`-long spans from `x0` every `on + off` up to `x1` (the last
+/// span clipped at `x1`); dotted and dashed decoration lines.
+fn dashes(x0: f32, x1: f32, on: f32, off: f32) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    let (on, period) = (on.max(1.0), (on + off).max(2.0));
+    let mut a = x0;
+    while a < x1 {
+        out.push((a, (a + on).min(x1)));
+        a += period;
+    }
+    out
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a wavy decoration line as 1-px-wide rects: a sine about the solid
+/// row's centre (`y + t / 2`) of half-amplitude t and wavelength 4t (t clamped to 1px; RECALLED, not measured), each
+/// column spanning from the previous column's sample to its own plus the stroke `t`, so a steep slope stays joined.
+/// No new raster primitive: `draw_decorations` fills the rects through its `hline`.
+fn wavy_path(x0: f32, x1: f32, y: f32, t: f32) -> Vec<(f32, f32, f32, f32)> {
+    let w = t.max(1.0);
+    let (amp, period, centre) = (w, 4.0 * w, y + t / 2.0);
+    let at = |x: f32| centre + amp * (core::f32::consts::TAU * (x - x0) / period).sin();
+    let mut out = Vec::new();
+    let mut prev = at(x0);
+    let mut x = x0.floor();
+    while x < x1 {
+        let cur = at(x + 0.5);
+        let (lo, hi) = (prev.min(cur), prev.max(cur));
+        out.push((x.max(x0), (x + 1.0).min(x1), lo - t / 2.0, hi - lo + t));
+        prev = cur;
+        x += 1.0;
+    }
+    out
 }
