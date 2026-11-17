@@ -105,6 +105,8 @@ pub struct PaintStyle<H: Host> {
     /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration-color` (css-text-decor-3 §2.3): `Some(Some(c))` a colour,
     /// `Some(None)` `currentcolor` (the initial value; the `text-decoration` shorthand resets to it), None unspecified.
     pub decoration_color: Option<Option<(u8, u8, u8)>>,
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the alpha of a declared `text-decoration-color` (None = opaque or currentcolor, `transparent` = Some(0.0)); moves with `decoration_color`.
+    pub deco_alpha: Option<f32>,
     /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-style` (css-text-decor-3 §2.2): 0 solid 1 double
     /// 2 dotted 3 dashed 4 wavy ([`crate::css::deco_style_code`]); the shorthand resets it to solid; None unspecified.
     pub decoration_style: Option<u8>,
@@ -326,7 +328,7 @@ impl<H: Host> Default for PaintStyle<H> {
             overflow_wrap: None,
             letter_spacing: None,
             line_through: None,
-            decoration_color: None, decoration_style: None, decoration_thickness: None, underline_offset: None, underline_position: None,
+            decoration_color: None, decoration_style: None, decoration_thickness: None, underline_offset: None, underline_position: None, deco_alpha: None,
             ws_lead: None,
             ws_trail: None,
             display_kind: None,
