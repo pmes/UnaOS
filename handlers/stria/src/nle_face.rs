@@ -235,7 +235,7 @@ impl Face {
     pub fn on(&mut self, msg: &SMessage) -> bool {
         if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
-            SMessage::Input { target, text } if target == SURFACE => self.verb(text),
+            SMessage::Input { target, text } if target == SURFACE => self.verb(text), SMessage::ConsoleInput(q) => self.help_field(q), // STRIAHELPMORE (SR977): the bar's help query field, its Enter (file tail)
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
             SMessage::BrowserResize(w, h, _) if *w > 0 && *h > 0 && (*w, *h) != self.canvas => {
                 self.canvas = (*w, *h); self.refit_on_resize(); // STRIAZOOMFITKEYS (SR907): refit while the last view word was a fit (file tail)
@@ -2780,7 +2780,7 @@ impl Face {
         }
         let (ascent, descent, gap) = self.lcache.metrics(style); // STRIAPERFLABELSHAPE (SR935): metrics once per style (file tail)
         let pitch = (ascent + descent + gap).max(1.0);
-        let top = l.ruler_y as f32 + HELP_PAD;
+        let top = l.ruler_y as f32 + HELP_PAD + self.help_query_line(pitch); // STRIAHELPMORE (SR977): a query takes the band's first line (file tail)
         let per = ((l.h as f32 - top) / pitch).floor().max(0.0) as usize;
         if per == 0 {
             return px;
@@ -2803,7 +2803,7 @@ impl Face {
         let cut = start < rows.len();
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
         c.rect(0, l.ruler_y as i64, l.w as i64, l.h as i64, view::BG);
-        let mut lab = Labels(style, Some(&self.lcache)); // STRIAPERFLABELSHAPE (SR935): the help rows through the cache (file tail)
+        let mut lab = Labels(style, Some(&self.lcache)); // STRIAPERFLABELSHAPE (SR935): the help rows through the cache (file tail) self.paint_help_query(&mut lab, &mut c, l, ascent); // STRIAHELPMORE (SR977): the query drawn on the band's first line (file tail)
         let mut x = HELP_PAD;
         for (ci, &(first, kw, pw)) in cols.iter().enumerate() {
             let end = (first + per).min(rows.len());
@@ -8285,5 +8285,41 @@ mod striaperfmore_tests {
         assert_eq!(g.preview_renders(), 1, "the seeded key is the timeline the tick read");
         let want = preview(&g.state.timeline, &g.sources, g.state.playhead).expect("renders");
         assert_eq!(g.still().cloned(), want);
+    }
+}
+
+// ---- STRIAHELPMORE (LEDGER SR977): the help query field on the bar and drawn on the band (named tail block) ----
+// The bar's query field (stria-view's TextField `HELP_FIELD`, firing `SMessage::ConsoleInput` on Enter) is a second door
+// onto THE `help <word>` road (`help_search_verb`): its text filters, a text no row matches is refused by name and the help
+// left as it was, a blank Enter is the bare `help` toggle. Every ConsoleInput the face takes is a help query (stria reads
+// no other). While a query is set, `paint_help` draws it on the band's first line (`find: <q>_`, the `_` the caret) and its
+// rows start one line lower; with no query nothing moves, so the bare help paints byte-identically. View-only.
+// Owed: NLE5D-KEYS-HELP-FIELD-SYNC (the field's text is not updated when keys change the query: quartzite has no set-text
+// message for a TextField), NLE5D-KEYS-HELP-BUTTON-STATE (a Tetra Button carries no state).
+
+/// STRIAHELPMORE (SR977): the id of the bar's help query field (stria-view's `TextField`).
+pub const HELP_FIELD: &str = "help_query";
+
+impl Face {
+    /// The bar's query field's Enter: `help <q>` through [`Face::help_search_verb`] (a blank text is the bare `help`).
+    fn help_field(&mut self, q: &str) -> bool {
+        let q = q.trim();
+        if q.is_empty() {
+            return self.verb("help");
+        }
+        self.verb(&format!("help {q}"))
+    }
+    /// The query line the help draws on the band while a query is set (`find: <q>_`); `None` without one.
+    pub fn help_query_text(&self) -> Option<String> {
+        self.help_query.as_deref().map(|q| format!("find: {q}_"))
+    }
+    /// The height the query line takes from the band's top: one `pitch` while a query is set, else nothing.
+    fn help_query_line(&self, pitch: f32) -> f32 {
+        if self.help_query.is_some() { pitch } else { 0.0 }
+    }
+    /// Draw [`Face::help_query_text`] on the band's first line; nothing without a query.
+    fn paint_help_query(&self, lab: &mut Labels<'_>, c: &mut Canvas, l: Layout, ascent: f32) {
+        let Some(s) = self.help_query_text() else { return };
+        view::Text::text(lab, c, &s, HELP_PAD, l.ruler_y as f32 + HELP_PAD + ascent, (0, l.w as i32));
     }
 }

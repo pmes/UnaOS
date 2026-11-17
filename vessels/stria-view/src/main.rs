@@ -201,7 +201,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
-        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
+        ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
     Some(vec![one])
@@ -342,9 +342,9 @@ mod tests {
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let (tl, src) = nle_face::synth_fixture();
         let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
-        assert_eq!(row.len(), nle_face::VERBS.len());
+        assert_eq!(row.len(), nle_face::VERBS.len() + 1); // STRIAHELPMORE (SR977): plus the help query field
         for b in row {
-            let TetraNode::Button { action, .. } = b else { panic!("not a button") };
+            let TetraNode::Button { action, .. } = b else { assert!(matches!(b, TetraNode::TextField { id, .. } if id == nle_face::HELP_FIELD), "not a button"); continue }; // STRIAHELPMORE (SR977): the one non-button is the help field
             let SMessage::Input { target, text } = action else { panic!("not an Input") };
             assert_eq!(target, SURFACE);
             assert!(face.verb(text), "{text}");
@@ -533,7 +533,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), button("loudness", "LUFS"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("speed", "Speed"), // STRIACLIPSPEED (SR829): the selected clip 1x -> 2x -> 4x -> 1x (THE `speed` verb)
+        TetraNode::TextField { id: nle_face::HELP_FIELD.into(), placeholder: "find a key".into(), action: quartzite::tetra::TextAction::ConsoleInput, secret: false }, button("speed", "Speed"), // STRIACLIPSPEED (SR829): the selected clip 1x -> 2x -> 4x -> 1x (THE `speed` verb)
         button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
@@ -571,7 +571,7 @@ fn transport() -> TetraNode {
         button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
-        button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal
+        button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
 
@@ -2814,5 +2814,38 @@ mod striaxformmore_tests {
         assert!(drive(&mut face, "pip:up,pip:up").is_empty());
         assert_eq!(drive(&mut face, "pip:up"), vec![format!("pip up: {}", timeline_core::EditError::Xform)]);
         assert_eq!(face.state.undo_depth(), 5);
+    }
+}
+
+// ---- STRIAHELPMORE (LEDGER SR977): the witness's help query field on the bar (named tail block) ----
+#[cfg(test)]
+mod striahelpmore_tests {
+    use super::*;
+
+    /// STRIAHELPMORE M3: the transport row's field `HELP_FIELD` sits just before the `?` button and fires ConsoleInput;
+    /// `--do find:slip` (its Enter) prints the `help:slip` line; `find:zzz` is refused by name; a blank `find:` toggles.
+    #[test]
+    fn striahelpmore_witness_help_field() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::TextField { id, action, secret, .. }) = row.get(row.len() - 2) else { panic!("no field before ?") };
+        assert_eq!((id.as_str(), *secret), (nle_face::HELP_FIELD, false));
+        assert!(matches!(action, quartzite::tetra::TextAction::ConsoleInput));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut word = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&word, "find:slip").as_deref(), Some([SMessage::ConsoleInput(q)]) if q == "slip"));
+        assert!(drive(&mut word, "help:slip").is_empty());
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "find:slip");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((help_json(&f), help_search_json(&f)), (help_json(&word), help_search_json(&word)));
+        assert_eq!(f.help_query(), Some("slip"));
+        let errors = drive(&mut f, "find:zzz");
+        assert_eq!(errors, vec!["help: no key matches \"zzz\"".to_string()]);
+        assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+        let errors = drive(&mut f, "find:");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.help_shown(), f.help_query()), (false, None));
+        println!("striahelpmore witness: find:slip -> {}", help_search_json(&word));
     }
 }

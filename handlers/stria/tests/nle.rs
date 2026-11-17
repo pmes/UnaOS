@@ -11473,3 +11473,78 @@ fn striawavvalidbitsnext_rf64_table_refusal_by_name() {
         assert!(e.contains("wav: RF64 chunk size not in the ds64 table"), "{e}");
     }
 }
+
+// ---- STRIAHELPMORE (LEDGER SR977): the help query field on the bar and drawn on the band (named tail block) ----
+
+fn striahelpmore_field(f: &mut Face, q: &str) -> bool {
+    f.on(&bandy::SMessage::ConsoleInput(q.into()))
+}
+
+/// The bar field's Enter is `help <q>`: `slip` shows the filtered help as `help slip` does; `zzz` is refused by name and
+/// the help left as it was; a blank Enter is the bare `help` toggle (hides it, clears the query); view-only.
+#[test]
+fn striahelpmore_field_enter_filters() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (tl, ph, depth) = (f.state.timeline.clone(), f.state.playhead, f.state.undo_depth());
+    assert!(striahelpmore_field(&mut f, "slip"));
+    assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+    assert_eq!(f.help_rows_shown(), stria::nle_face::help_matching("slip"));
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(striahelpmore_field(&mut f, "zzz"));
+    assert_eq!(f.last_error.take().as_deref(), Some("help: no key matches \"zzz\""));
+    assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+    assert!(striahelpmore_field(&mut f, "  "));
+    assert_eq!((f.help_shown(), f.help_query()), (false, None));
+    assert!(striahelpmore_field(&mut f, ""));
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    assert_eq!((&f.state.timeline, f.state.playhead, f.state.undo_depth(), f.dirty()), (&tl, ph, depth, false));
+    println!("striahelpmore: field slip -> {} rows, zzz refused, blank toggles", f.help_rows_shown().len());
+}
+
+/// While a query is set the band's first line reads `find: <q>_`: `help slip` and `help SLIP` show the same rows and their
+/// frames differ (only below the ruler) by that line; the bare help paints as a fresh face's; labels off byte-identical.
+#[test]
+fn striahelpmore_query_drawn_on_the_band() {
+    let mut lower = nle5dkeyshelp_face(640, 480, true);
+    assert!(lower.verb("help slip"));
+    assert_eq!(lower.help_query_text().as_deref(), Some("find: slip_"));
+    let mut upper = nle5dkeyshelp_face(640, 480, true);
+    assert!(upper.verb("help SLIP"));
+    assert_eq!(upper.help_rows_shown(), lower.help_rows_shown());
+    let (a, b) = (lower.paint(), upper.paint());
+    let cut = lower.layout().ruler_y as usize * 640 * 4;
+    assert_eq!(a[..cut], b[..cut], "the preview band is untouched");
+    assert_ne!(a[cut..], b[cut..], "the query line differs");
+    let mut fresh = nle5dkeyshelp_face(640, 480, true);
+    assert!(fresh.verb("help"));
+    assert_eq!(fresh.help_query_text(), None);
+    let bare = fresh.paint();
+    assert!(lower.verb("help"));
+    assert!(lower.verb("help"));
+    assert_eq!(lower.paint(), bare, "no query: no line, the whole table as before");
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let p = plain.paint();
+    assert!(plain.verb("help slip"));
+    assert_eq!(plain.paint(), p, "labels off: no overlay");
+    println!("striahelpmore: find: slip_ fnv {:016x}", stria::nle_face::fnv1a(&a[cut..]));
+}
+
+/// The typed query is drawn as typed: `sl` then Backspace reads `find: s_` and paints as `help s`; Backspace to empty
+/// draws no line and paints the bare help.
+#[test]
+fn striahelpmore_typed_query_drawn() {
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    assert!(f.verb("help"));
+    let bare = f.paint();
+    striahelpsearchlive_type(&mut f, "sl");
+    assert_eq!(f.help_query_text().as_deref(), Some("find: sl_"));
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert_eq!(f.help_query_text().as_deref(), Some("find: s_"));
+    let mut word = nle5dkeyshelp_face(640, 480, true);
+    assert!(word.verb("help s"));
+    assert_eq!(f.paint(), word.paint());
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert_eq!((f.help_shown(), f.help_query_text()), (true, None));
+    assert_eq!(f.paint(), bare);
+    println!("striahelpmore: typed sl, Backspace -> find: s_, Backspace -> bare");
+}
