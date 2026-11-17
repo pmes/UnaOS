@@ -3835,3 +3835,113 @@ fn striaautosave_older_autosave_is_not_offered() {
     assert!(face.last_error.is_none(), "an autosave older than the document is not offered: {:?}", face.last_error);
     assert_eq!(face.state.timeline, tl0);
 }
+
+// ---- STRIAAUTOSAVECAP (LEDGER SR913): the count past UNDO_MAX, the witness field, a declined autosave kept (named tail block) ----
+// `EditorState::commits` moves at every commit / undo / redo and never falls back, so the face's edit count keeps seeing
+// edits after the undo stack is full; an autosave this face neither wrote nor recovered is renamed to
+// `<stem>.autosave.1.edl` before the first write or a save would replace / remove it.
+
+use stria::nle_face::{UNDO_MAX, autosave_keep_path};
+
+/// A newer foreign autosave (holding `tl0` split at 15) beside a document of `tl0`; the face opened from it (offered,
+/// not recovered): the face, the document path, the foreign bytes.
+fn striaautosavecap_foreign(name: &str) -> (Face, std::path::PathBuf, String) {
+    let (tl0, src) = synth_fixture();
+    let doc = common::fresh_dir("striaautosavecap", name).join("cut.edl");
+    std::fs::write(&doc, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let old = edl::write(&tl0.split(0, 15).unwrap(), "cut").unwrap();
+    std::fs::write(autosave_path(&doc), &old).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&doc).unwrap().set_modified(past).unwrap();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("autosave: cut.autosave.edl is newer")), "offered at open");
+    (face, doc, old)
+}
+
+#[test]
+fn striaautosavecap_commits_counts_every_change() {
+    let (tl0, _) = synth_fixture();
+    let mut st = EditorState::new(tl0.clone());
+    assert_eq!(st.commits(), 0);
+    assert!(st.split_at_playhead().is_err(), "nothing selected");
+    assert_eq!(st.commits(), 0, "a refused edit counts nothing");
+    st.select_at(0, 15).unwrap();
+    st.seek(15);
+    st.split_at_playhead().unwrap();
+    assert_eq!(st.commits(), 1);
+    assert!(st.undo());
+    assert_eq!((st.commits(), st.undo_depth()), (2, 0), "undo is a change; the depth falls, the count does not");
+    assert!(st.redo());
+    assert_eq!(st.commits(), 3);
+    assert!(st.undo() && !st.undo());
+    assert_eq!(st.commits(), 4, "an empty undo counts nothing");
+    assert!(!st.restore(tl0));
+    assert_eq!(st.commits(), 4, "a restore of the same timeline counts nothing");
+}
+
+#[test]
+fn striaautosavecap_writes_past_undo_max() {
+    let (mut face, doc, tl0) = striaautosave_face("cap");
+    let auto = autosave_path(&doc);
+    let (a, b) = (tl0.split(0, 15).unwrap(), tl0.split(0, 5).unwrap());
+    let flip = |face: &mut Face, n: usize| {
+        for _ in 0..n {
+            let next = if face.state.timeline == a { b.clone() } else { a.clone() };
+            assert!(face.state.restore(next));
+        }
+    };
+    flip(&mut face, UNDO_MAX + 44);
+    assert_eq!(face.state.undo_depth(), UNDO_MAX);
+    assert!(!face.autosave_tick());
+    assert_eq!(face.autosaved(), Some(&face.state.timeline));
+    flip(&mut face, AUTOSAVE_EDITS - 1);
+    assert_eq!(face.state.undo_depth(), UNDO_MAX, "the depth no longer moves");
+    assert!(!face.autosave_tick());
+    assert_ne!(face.autosaved(), Some(&face.state.timeline), "7 edits and one tick: not yet");
+    flip(&mut face, 2);
+    assert!(!face.autosave_tick());
+    assert_eq!(face.autosaved(), Some(&face.state.timeline), "the count saw the edits at the cap");
+    assert_eq!(std::fs::read_to_string(&auto).unwrap(), edl::write(&face.state.timeline, "cut").unwrap());
+    assert_eq!(face.state.undo_depth(), UNDO_MAX);
+    println!("striaautosavecap: {} commits at undo depth {}; the autosave follows", face.state.commits(), UNDO_MAX);
+}
+
+#[test]
+fn striaautosavecap_declined_autosave_kept_on_first_write() {
+    let (mut face, doc, old) = striaautosavecap_foreign("write");
+    let (auto, keep) = (autosave_path(&doc), autosave_keep_path(&doc));
+    assert_eq!(keep, doc.with_file_name("cut.autosave.1.edl"));
+    for t in 1..=AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+    }
+    assert!(!face.autosave_tick());
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), old, "the declined autosave is kept");
+    assert_eq!(std::fs::read_to_string(&auto).unwrap(), edl::write(&face.state.timeline, "cut").unwrap());
+    std::fs::write(&keep, "unchanged").unwrap();
+    striaautosave_split(&mut face, 30);
+    for _ in 0..AUTOSAVE_SECS * 25 {
+        face.autosave_tick();
+    }
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), "unchanged", "this session's own autosave is never kept");
+}
+
+#[test]
+fn striaautosavecap_declined_autosave_kept_on_save() {
+    let (mut face, doc, old) = striaautosavecap_foreign("save");
+    striaautosave_split(&mut face, 15);
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!autosave_path(&doc).exists(), "saved: no autosave");
+    assert_eq!(std::fs::read_to_string(autosave_keep_path(&doc)).unwrap(), old, "the declined autosave is kept");
+}
+
+#[test]
+fn striaautosavecap_recovered_is_not_kept() {
+    let (mut face, doc, _) = striaautosavecap_foreign("recover");
+    assert!(face.verb("recover"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("save"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!autosave_path(&doc).exists());
+    assert!(!autosave_keep_path(&doc).exists(), "a recovered autosave is this session's: removed, not kept");
+}

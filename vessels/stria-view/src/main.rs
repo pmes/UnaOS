@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &autosaved_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -798,7 +798,7 @@ mod exportaudio_tests {
 fn tick_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
     let n = tok.strip_prefix("tick:")?.parse::<u32>().ok()?;
     for _ in 0..n {
-        face.tick();
+        face.tick(); face.autosave_tick(); // STRIAAUTOSAVECAP (SR913): serve's clock arm also ticks the autosave (file tail)
     }
     Some(Vec::new())
 }
@@ -902,6 +902,45 @@ mod exportstall_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAAUTOSAVECAP (LEDGER SR913): the witness's autosave reading (named tail block) ----
+/// The witness's `"autosaved"` field, only while an autosave this session wrote (or recovered) stands
+/// (`Face::autosaved`); the default line is unchanged.
+fn autosaved_json(face: &Face) -> String {
+    if face.autosaved().is_some() { ",\"autosaved\":true".into() } else { String::new() }
+}
+
+#[cfg(test)]
+mod striaautosavecap_tests {
+    use super::*;
+
+    /// STRIAAUTOSAVECAP M3: a face opened from a document carries no field; one split then `tick:<60 s at 25 fps>` (the
+    /// clock arm's autosave tick) writes `<stem>.autosave.edl` and the field reads true; `save` removes it and the field.
+    #[test]
+    fn striaautosavecap_witness_autosaved_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaautosavecap-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("cut.edl");
+        let (tl, src) = nle_face::synth_fixture();
+        std::fs::write(&doc, edl::write(&tl, "cut").unwrap()).unwrap();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+        assert_eq!(autosaved_json(&face), "");
+        assert!(drive(&mut face, "at:12:0,split").is_empty());
+        assert!(face.dirty());
+        assert_eq!(autosaved_json(&face), "", "nothing written before the clock");
+        let ticks = format!("tick:{}", nle_face::AUTOSAVE_SECS * 25);
+        let errors = drive(&mut face, &ticks);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(nle_face::autosave_path(&doc).is_file());
+        assert_eq!(autosaved_json(&face), r#","autosaved":true"#);
+        assert!(drive(&mut face, "save").is_empty());
+        assert!(!nle_face::autosave_path(&doc).exists());
+        assert_eq!(autosaved_json(&face), "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
