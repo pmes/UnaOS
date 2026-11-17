@@ -7745,4 +7745,72 @@ mod tests {
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
+
+    // ---- AETHERCSSTEXTDECORATIONPROPAGATEINK (LEDGER SR1053): currentcolor resolves at the decorating box, not the run (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): 20px serif rows of black text 12px apart, each probe a child span of a
+    /// decorating parent: `#pu` blue under a red `u`; `#pc` blue with its own underline under a red `u`; `#pg` blue under a
+    /// red parent whose line is an explicit green; `#pa` red under a link (UA link blue (0, 0, 238)); `#pn` an uncoloured
+    /// span under a plain underlined div (the control).
+    fn text_decoration_propagate_ink_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div><u style="color:red"><span id="pu" style="color:blue">Hgjx Hgjx</span></u></div>
+            <div><u style="color:red"><span id="pc" style="color:blue;text-decoration:underline">Hgjx Hgjx</span></u></div>
+            <div style="color:red;text-decoration:underline green"><span id="pg" style="color:blue">Hgjx Hgjx</span></div>
+            <div><a href="#x"><span id="pa" style="color:red">Hgjx Hgjx</span></a></div>
+            <div style="text-decoration:underline"><span id="pn">Hgjx Hgjx</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): `<u style="color:red"><span style="color:blue">` underlines in the
+    /// decorating box's RED under blue glyphs (Chromium); before SR1053 the line took the run's blue.
+    #[test]
+    fn text_decoration_propagate_ink_u_red_child_blue() {
+        let mut e = text_decoration_propagate_ink_engine();
+        assert!(text_decoration_ink(&mut e, "pu", css_wide_red) > 40, "#pu paints the u's red underline");
+        assert!(text_decoration_ink(&mut e, "pu", css_wide_blue) > 40, "armed: #pu's glyphs are blue");
+    }
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): a child with its own `text-decoration: underline` is its own decorating
+    /// box: its line is its own blue, no red.
+    #[test]
+    fn text_decoration_propagate_ink_child_own_line() {
+        let mut e = text_decoration_propagate_ink_engine();
+        assert!(text_decoration_ink(&mut e, "pc", css_wide_blue) > 40, "#pc paints blue");
+        assert_eq!(text_decoration_ink(&mut e, "pc", css_wide_red), 0, "#pc's own line is blue, not the u's red");
+    }
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): an explicit `text-decoration-color` (green) on the decorating parent
+    /// wins over both its red colour and the child's blue.
+    #[test]
+    fn text_decoration_propagate_ink_explicit_parent_wins() {
+        let mut e = text_decoration_propagate_ink_engine();
+        assert!(text_decoration_ink(&mut e, "pg", css_wide_green) > 40, "#pg paints the parent's green line");
+        assert_eq!(text_decoration_ink(&mut e, "pg", css_wide_red), 0, "#pg paints no red");
+    }
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): a link's underline is the link colour (the UA (0, 0, 238), Chromium's
+    /// -webkit-link) under a red child.
+    #[test]
+    fn text_decoration_propagate_ink_link_colour() {
+        let mut e = text_decoration_propagate_ink_engine();
+        assert!(text_decoration_ink(&mut e, "pa", css_wide_blue) > 40, "#pa paints the link-blue underline");
+        assert!(text_decoration_ink(&mut e, "pa", css_wide_red) > 40, "armed: #pa's glyphs are red");
+    }
+
+    /// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): the control: an uncoloured child of a plain underlined div paints its
+    /// line black, no red.
+    #[test]
+    fn text_decoration_propagate_ink_plain_control() {
+        let mut e = text_decoration_propagate_ink_engine();
+        assert!(text_decoration_ink(&mut e, "pn", text_decoration_black) > 40, "#pn paints black");
+        assert_eq!(text_decoration_ink(&mut e, "pn", css_wide_red), 0, "#pn paints no red");
+    }
 }
