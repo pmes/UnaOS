@@ -59,7 +59,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 35. STRIAHELPSEARCH — `help <word>` filters the help rows (SR744 HELP table) by substring.
 
 ## E. Media (stria-side; the cloud seat owns h264enc_core / hevc_core internals)
-36. STRIAEXPORTAACBITRATE — `--audio aac:KBPS` on the face's export verb (the CLI has it: measure the face's export_usage word list).
+36. [SR887 started] STRIAEXPORTAACBITRATE — `--audio aac:KBPS` on the face's export verb (the CLI has it: measure the face's export_usage word list).
 37. STRIAIMPORTIMAGESEQUENCE — `open` of a `frame_%04d.png` pattern as a video source (a PNG-sequence demux arm in Sources; `lux::decode_png` EXISTS).
 38. STRIAIMPORTWAV — a `.wav` as an audio source (measure whether demux_core has a WAV demux; if not, ONE 44-byte header reader + PCM frames).
 39. STRIASOURCEINFO — `info` shows the selected source's `summary_parts` (media.rs :1292 EXISTS) on the message row for 5 s; stria-view `"info"`.
