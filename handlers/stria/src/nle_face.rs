@@ -251,7 +251,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail)
+        if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -411,6 +411,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
     ("\\", "zoom-fit"), ("|", "zoom-sel"), // STRIAZOOMFITKEYS (SR907): `\` / `|` (Shift+\, text) fit the timeline / the selection (Shift+Z is redo)
     ("Ctrl+c", "copy"), ("Meta+c", "copy"), ("Ctrl+x", "cut"), ("Meta+x", "cut"), ("Ctrl+v", "paste"), ("Meta+v", "paste"), ("Ctrl+Shift+V", "paste-insert"), ("Meta+Shift+V", "paste-insert"), // STRIAPASTEKEYS (SR921): the clipboard words as chords (GTK / AppKit send Ctrl / Cmd+c as BrowserCopy and Ctrl / Cmd+v as BrowserPaste: Face::on routes them here, file tail)
+    ("Alt+Up", "track-up"), ("Alt+Down", "track-down"), // STRIATRACKORDERKEYS (SR922): Alt with Up / Down (GTK's names) move the selected clip's track within its kind
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2633,6 +2634,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("tc", "playhead readout: off / timecode / frames / seconds"), // STRIATCSET (SR908)
     ("zoom-fit", "fit the whole timeline in the window"), ("zoom-sel", "fit the selection in the window"), // STRIAZOOMFITKEYS (SR907)
     ("copy", "copy the selection"), ("cut", "cut the selection (the gap stays)"), ("paste", "paste at the playhead"), ("paste-insert", "paste at the playhead, pushing later clips on"), // STRIAPASTEKEYS (SR921): the clipboard chords' phrases
+    ("track-up", "move the clip's track up (same kind)"), ("track-down", "move the clip's track down (same kind)"), // STRIATRACKORDERKEYS (SR922)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -6138,5 +6140,25 @@ impl Face {
         }
         let keep = autosave_keep_path(doc);
         std::fs::rename(&path, &keep).map_err(|e| format!("{} -> {}: {e}", path.display(), keep.display()))
+    }
+}
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): track-up / track-down name the move on the message row (named tail block) ----
+// `Alt+Up` / `Alt+Down` (KEYS rows, HELP phrases) and the two transport words reach `Face::verb`, whose first line hands them
+// here: the ONE dispatch (`EditorState::verb` -> `move_track`, one commit) runs, a refusal is `<word>: <why>` as before, and a
+// move is named on the message row from the state after it (`EditorState::track_move_line`: `track-up: V2 above V1`).
+impl Face {
+    /// The `track-up` / `track-down` words; `None` for any other word.
+    fn track_order_word(&mut self, v: &str) -> Option<bool> {
+        let up = match v {
+            "track-up" => true,
+            "track-down" => false,
+            _ => return None,
+        };
+        match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
+            Ok(()) => self.last_error = self.state.track_move_line(up),
+            Err(e) => self.last_error = Some(format!("{v}: {e}")),
+        }
+        Some(true)
     }
 }

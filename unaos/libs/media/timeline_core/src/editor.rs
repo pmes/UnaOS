@@ -2891,3 +2891,18 @@ impl EditorState {
         self.commits
     }
 }
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): the message row's line for a track move (named tail block) ----
+// Read from the state AFTER `track-up` / `track-down` committed: the moved track is the selection's (the selection follows
+// its clip), and the track it passed is its nearest same-kind neighbour the other way (nothing of their kind lies between
+// them, so that is the moved track's old slot). The line names both as they were BEFORE the move: `track-up: V2 above V1`,
+// `track-down: V1 below V2`. A pure read; no state, no undo step.
+impl EditorState {
+    /// STRIATRACKORDERKEYS: `track-up: V2 above V1` / `track-down: V1 below V2` after a move (`None`: nothing selected).
+    pub fn track_move_line(&self, up: bool) -> Option<alloc::string::String> {
+        let (n, _) = self.selection?;
+        let m = self.timeline.track_neighbour(n, !up).ok()?;
+        let (word, rel) = if up { ("track-up", "above") } else { ("track-down", "below") };
+        Some(alloc::format!("{word}: {} {rel} {}", self.timeline.track_name(m)?, self.timeline.track_name(n)?))
+    }
+}
