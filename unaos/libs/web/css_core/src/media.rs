@@ -47,7 +47,7 @@ impl Default for Environment {
             height: 600.0,
             dppx: 1.0,
             media_type: "screen",
-            dark: false,
+            dark: prefs.dark,
             reduced_motion: prefs.reduced_motion,
             contrast: prefs.contrast.keyword(prefs.forced_colors),
             forced_colors: prefs.forced_colors,
@@ -105,9 +105,11 @@ pub struct UserPreferences {
     pub reduced_motion: bool,
     pub contrast: Contrast,
     pub forced_colors: bool,
+    /// AETHERCOLORSCHEMEMETA (SR1047): the user prefers a dark colour scheme (`prefers-color-scheme: dark`; `color-scheme: light dark` resolves dark).
+    pub dark: bool,
 }
 
-/// One byte: bit 0 reduced motion, bits 1..=2 contrast (0 none, 1 more, 2 less), bit 3 forced colors.
+/// One byte: bit 0 reduced motion, bits 1..=2 contrast (0 none, 1 more, 2 less), bit 3 forced colors, bit 4 the dark scheme (SR1047).
 /// Process-wide (no_std has no thread-locals): it is the user's preference, the same for every page.
 static USER_PREFS: AtomicU8 = AtomicU8::new(0);
 
@@ -119,7 +121,7 @@ pub fn set_user_preferences(p: UserPreferences) {
         Contrast::More => 1,
         Contrast::Less => 2,
     };
-    USER_PREFS.store((p.reduced_motion as u8) | (c << 1) | ((p.forced_colors as u8) << 3), Ordering::Relaxed);
+    USER_PREFS.store((p.reduced_motion as u8) | (c << 1) | ((p.forced_colors as u8) << 3) | ((p.dark as u8) << 4), Ordering::Relaxed);
 }
 
 /// The preferences [`set_user_preferences`] last recorded.
@@ -133,6 +135,7 @@ pub fn user_preferences() -> UserPreferences {
             _ => Contrast::NoPreference,
         },
         forced_colors: b & 8 != 0,
+        dark: b & 16 != 0, // AETHERCOLORSCHEMEMETA (SR1047)
     }
 }
 

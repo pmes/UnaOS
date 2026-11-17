@@ -3976,6 +3976,48 @@ fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>)
     true
 }
 
+// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the `color-scheme` property parsed into PaintStyle::color_scheme (named tail block) ----
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `normal | [ light | dark | <custom-ident> ]+ && only?`
+/// as the field's bits: bit 0 light, bit 1 dark; `normal` (and `initial`: the initial value) Some(0), so a `normal` under a
+/// dark root resets (None is the inherit road). `only` and custom idents are accepted and ignored; `normal` beside another
+/// keyword, a lone `only`, a second `only` or a non-ident token is invalid: None (the declaration is dropped). `inherit` /
+/// `unset` never reach here (`css_wide`: the INHERIT_COLOR_SCHEME bit); `revert` is invalid here (dropped, as elsewhere).
+pub fn parse_color_scheme(value: &str) -> Option<u8> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("normal") || v.eq_ignore_ascii_case("initial") {
+        return Some(0);
+    }
+    let (mut bits, mut only, mut idents) = (0u8, false, 0usize);
+    for tok in v.split_ascii_whitespace() {
+        let ident = tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !ident {
+            return None;
+        }
+        if tok.eq_ignore_ascii_case("only") {
+            if only {
+                return None;
+            }
+            only = true;
+            continue;
+        }
+        if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("revert") || tok.eq_ignore_ascii_case("initial") {
+            return None;
+        }
+        idents += 1;
+        if tok.eq_ignore_ascii_case("light") {
+            bits |= 1;
+        } else if tok.eq_ignore_ascii_case("dark") {
+            bits |= 2;
+        }
+    }
+    if idents == 0 {
+        return None;
+    }
+    Some(bits)
+}
+
 // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): css-writing-modes-4 §2.2 unicode-bidi keyword codes (named tail block) ----
 
 /// AETHERCSSOMUNICODEBIDI (SR1008): the `unicode-bidi` keyword as its `PaintStyle::unicode_bidi` code: 0 normal, 1 embed,
@@ -4290,46 +4332,4 @@ fn bg_shorthand_layer_props<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
         paint.bg_position_more = Some(positions);
         paint.bg_size_more = Some(sizes);
     }
-}
-
-// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the `color-scheme` property parsed into PaintStyle::color_scheme (named tail block) ----
-
-/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `normal | [ light | dark | <custom-ident> ]+ && only?`
-/// as the field's bits: bit 0 light, bit 1 dark; `normal` (and `initial`: the initial value) Some(0), so a `normal` under a
-/// dark root resets (None is the inherit road). `only` and custom idents are accepted and ignored; `normal` beside another
-/// keyword, a lone `only`, a second `only` or a non-ident token is invalid: None (the declaration is dropped). `inherit` /
-/// `unset` never reach here (`css_wide`: the INHERIT_COLOR_SCHEME bit); `revert` is invalid here (dropped, as elsewhere).
-pub fn parse_color_scheme(value: &str) -> Option<u8> {
-    let v = value.trim();
-    if v.eq_ignore_ascii_case("normal") || v.eq_ignore_ascii_case("initial") {
-        return Some(0);
-    }
-    let (mut bits, mut only, mut idents) = (0u8, false, 0usize);
-    for tok in v.split_ascii_whitespace() {
-        let ident = tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
-            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        if !ident {
-            return None;
-        }
-        if tok.eq_ignore_ascii_case("only") {
-            if only {
-                return None;
-            }
-            only = true;
-            continue;
-        }
-        if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("revert") || tok.eq_ignore_ascii_case("initial") {
-            return None;
-        }
-        idents += 1;
-        if tok.eq_ignore_ascii_case("light") {
-            bits |= 1;
-        } else if tok.eq_ignore_ascii_case("dark") {
-            bits |= 2;
-        }
-    }
-    if idents == 0 {
-        return None;
-    }
-    Some(bits)
 }
