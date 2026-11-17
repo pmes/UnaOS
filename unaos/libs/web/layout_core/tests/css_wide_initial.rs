@@ -1737,6 +1737,22 @@ fn text_align_justify_container_start() {
     assert_eq!(styled(&[("text-align", "start")]).paint.text_align, Some(0), "start stays 0");
 }
 
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): border_style_word is the exact inverse of border_style_code (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): every paint code round-trips through its keyword, and the 3D styles
+/// (which paint solid) collapse to code 0 and read back `solid`.
+#[test]
+fn border_style_word_round_trip() {
+    use layout_core::css::{border_style_code, border_style_word};
+    for (w, c) in [("solid", 0u8), ("dashed", 1), ("dotted", 2), ("double", 3)] {
+        assert!(border_style_code(w) == Some(c) && border_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["groove", "ridge", "inset", "outset"] {
+        assert_eq!(border_style_code(w).map(border_style_word), Some("solid"), "{w}");
+    }
+    assert_eq!((border_style_code("none"), border_style_code("hidden")), (None, None), "none / hidden clear the side, no code");
+}
+
 // ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last (named tail block) ----
 
 /// AETHERTEXTALIGNLAST (SR1062): the frag (x0, x1) per line of `#p` inside `outer`-styled div.
@@ -1835,6 +1851,33 @@ fn text_align_last_codes() {
     assert!(ALL_LONGHANDS.contains(&"text-align-last"), "the arm is listed for all:");
 }
 
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): text_decoration_style_word / underline_position_word invert the parsers' codes (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-decoration-style code round-trips through its keyword; the
+/// CSS-wide spellings the parser folds (initial / unset) read `solid`.
+#[test]
+fn text_decoration_style_word_round_trip() {
+    use layout_core::css::{deco_style_code, text_decoration_style_word};
+    for (w, c) in [("solid", 0u8), ("double", 1), ("dotted", 2), ("dashed", 3), ("wavy", 4)] {
+        assert!(deco_style_code(w) == Some(c) && text_decoration_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["initial", "unset"] {
+        assert_eq!(deco_style_code(w).map(text_decoration_style_word), Some("solid"), "{w}");
+    }
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-underline-position code round-trips through its keyword; the
+/// spellings the parser folds (initial, and left / right, which only place the line in vertical writing) read their code's word.
+#[test]
+fn underline_position_word_round_trip() {
+    use layout_core::css::{underline_position_code, underline_position_word};
+    for (w, c) in [("auto", 0u8), ("from-font", 1), ("under", 2)] {
+        assert!(underline_position_code(w) == Some(c) && underline_position_word(c) == w, "{w} <-> {c}");
+    }
+    for (w, want) in [("initial", "auto"), ("left", "auto"), ("under right", "under"), ("from-font left", "from-font")] {
+        assert_eq!(underline_position_code(w).map(underline_position_word), Some(want), "{w}");
+    }
+}
 
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
@@ -1950,11 +1993,13 @@ fn border_color_stored_merge() {
 
 /// AETHERCSSBORDERCOLORSTORED (SR1058): `transparent` forgets a pending entry; `border: inherit` forgets the block's.
 /// SR1069 (flipped in place): a style creates the side (`border-width` alone no longer does).
+/// SR1112 (flipped in place): `transparent` is pended as a colour (black RGB, alpha 0 on that side), not forgotten.
 #[test]
 fn border_color_stored_transparent_and_inherit() {
     let s = styled(&[("border-top-color", "red"), ("border-top-color", "transparent"), ("border-width", "2px"), ("border-style", "solid")]);
-    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, STORED_GREY)));
-    assert_eq!(s.paint.currentcolor & 1, 1);
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, (0, 0, 0))), "SR1112: the pending transparent (was STORED_GREY)");
+    assert_eq!(s.paint.currentcolor & 1, 0, "SR1112: a colour, not currentcolor (was 1)");
+    assert_eq!(s.paint.border_alpha.expect("alpha")[0], Some(0.0), "SR1112: alpha 0 on the top");
     assert_eq!(styled(&[("border-color", "red"), ("border", "inherit")]).paint.border_pending, None);
 }
 
@@ -2104,6 +2149,67 @@ fn alignment_words_safe_center_layout() {
     let (c, s) = (x("center"), x("safe center"));
     assert!((c - 75.0).abs() <= 0.5, "armed: center puts the child at 75: {c}");
     assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
+}
+
+// ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border: 2px solid transparent` keeps four 2px sides (black RGB) at alpha 0
+/// each (before SR1112 grey sides with no alpha: a grey frame), and the sides size the box in `fold_into`.
+#[test]
+fn border_transparent_keeps_shorthand_sides() {
+    use taffy::style::{LengthPercentage, Style};
+    let s = styled(&[("border", "2px solid transparent")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]));
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "alpha 0 on every side");
+    assert_eq!(s.paint.currentcolor & 0x0f, 0, "a colour, not currentcolor");
+    let s = styled(&[("border-left", "3px solid rgba(0, 0, 0, 0)")]);
+    assert_eq!(s.paint.border.expect("border")[3], Some((3.0, (0, 0, 0))), "a zero-alpha rgba is a colour too");
+    assert_eq!(s.paint.border_alpha, Some([None, None, None, Some(0.0)]), "the side shorthand writes its side only");
+    let mut st = Style::default();
+    styled(&[("border", "2px solid transparent")]).fold_into(&mut st);
+    assert_eq!(st.border.top, LengthPercentage::length(2.0), "the transparent side sizes the box");
+    let s = styled(&[("border", "2px solid transparent"), ("border", "1px solid")]);
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0); 4]), "a later shorthand resets the alpha with the colour");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-color: transparent` keeps the sides at alpha 0 (before SR1112
+/// `Some([None; 4])`); `border-top-color: transparent` makes the top alpha 0 and leaves the right opaque (before SR1112
+/// the top was dropped).
+#[test]
+fn border_transparent_keeps_per_side_alpha() {
+    use layout_core::css::border_side_alpha;
+    let s = styled(&[("border", "2px solid red"), ("border-color", "transparent")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]));
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]));
+    let s = styled(&[("border", "1px solid red"), ("border-top-color", "transparent")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((1.0, (0, 0, 0))), "the top is kept");
+    assert_eq!((border_side_alpha(&s.paint, 0), border_side_alpha(&s.paint, 1)), (0.0, 1.0), "top alpha 0, right alpha 1");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-top-color: transparent` on a side with no entry pends the colour,
+/// so a later `border-style: solid` creates the top at medium in it, alpha 0 (before SR1112 the entry was forgotten and
+/// the top came up currentcolor).
+#[test]
+fn border_transparent_keeps_pending_entry() {
+    let s = styled(&[("border-top-color", "transparent"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border_pending.expect("pending")[0], Some(((0, 0, 0), false)), "the entry is kept");
+    assert_eq!(s.paint.border.expect("border")[0], Some((3.0, (0, 0, 0))));
+    assert_eq!(s.paint.border_alpha.expect("alpha")[0], Some(0.0));
+    assert_eq!(s.paint.border.expect("border")[1], Some((3.0, STORED_GREY)), "the right side currentcolor");
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the alpha merges per side across rules: a later `border-top-color: red`
+/// over `border: 2px solid transparent` makes only the top opaque (the reserve-space idiom's hover rule).
+#[test]
+fn border_transparent_keeps_merge_per_side() {
+    use layout_core::css::border_side_alpha;
+    let s = cascade(&[&[("border", "2px solid transparent")], &[("border-top-color", "red")]]);
+    let red = s.paint.border.expect("border")[0].expect("top").1;
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, red)), "the top recoloured, width kept");
+    assert_ne!(red, (0, 0, 0));
+    assert_eq!((border_side_alpha(&s.paint, 0), border_side_alpha(&s.paint, 1)), (1.0, 0.0), "top opaque, right still alpha 0");
+    let s = cascade(&[&[("border", "2px solid transparent")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0); 4]), "a later border-color: red makes every side opaque");
 }
 
 // ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
