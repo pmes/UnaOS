@@ -1196,7 +1196,7 @@ mod scenecut_rc_tests {
 
     const W: usize = 64;
     const H: usize = 64;
-    const CUT: usize = 10;
+    pub(super) const CUT: usize = 10;
 
     /// A fixed LCG texture (luma 60..=140) of width 2W, seeded `seed`, windowed at column offset `off` (wrapping): `off` moving
     /// with t is a scene panning left.
@@ -1276,7 +1276,7 @@ mod scenecut_rc_tests {
         ratio
     }
 
-    fn fixture(f: char) -> impl Fn(usize) -> [Vec<u8>; 3] {
+    pub(super) fn fixture(f: char) -> impl Fn(usize) -> [Vec<u8>; 3] {
         move |t| match f {
             'A' => if t < CUT { flat(100) } else { pattern(0x2545_f491_4f6c_dd1d, 0) },
             'B' => if t < CUT { pattern(1, 0) } else { pattern(2, 3 * t) },
@@ -1287,7 +1287,7 @@ mod scenecut_rc_tests {
 
     /// The measured first P after the IDR at t = 10, per run: (fixture, kbps, scenecut Some(40) at gop 30 (true) or the control
     /// scenecut None at gop 10 (the scheduled IDR at the same picture), [pred, actual, qp, oracle qp, target], peak bucket fullness).
-    const PINS: [(char, u32, bool, [i64; 5], i64); 21] = [
+    pub(super) const PINS: [(char, u32, bool, [i64; 5], i64); 21] = [
         ('A', 200, true, [256, 2936, 25, 25, 19666], 93766), /* was [705, 9856, 16, 16, 19666], 93766 (SR844) */
         ('A', 200, false, [245, 2840, 29, 29, 14738], 93766), /* was [1104, 13248, 16, 16, 14737], 93766 (SR844) */
         ('A', 40, true, [273, 1928, 29, 29, 2829], 22875), /* was [1229, 12376, 16, 22, 2828], 28404 (SR844) */
@@ -1353,5 +1353,193 @@ mod scenecut_rc_tests {
             let peak = rows.iter().map(|r| r.7).max().unwrap();
             assert!(peak <= buf, "D {kbps}: the CBR bucket overflowed ({peak} > {buf})");
         }
+    }
+}
+
+// ---- H264ENCRCFIRSTPPREDICTION (LEDGER SR1002): what predicts the first P after an IDR, measured (named tail block) ----
+// SR844 windows the first P after any IDR on the I QP + IP_QP_OFFSET but keeps the stale P model's prediction (k of the previous
+// GOP's last P). This module measures, on SR834's 21 runs, what predicts that one P: (a) the stale P model (today), (b) the I's
+// bits moved by the QP step (no complexity term), (c) the I's bits per complexity on the P's own S' (= the I model's `predict`),
+// (d) k damped from (a) toward (c) by 1/2. T1 is static on today's stream (each candidate's bits at the picked QP vs actual, and the
+// QP the window would pick with it against SR844's oracle); T2 re-runs the stream with (c) / (d) injected for that one pick only
+// (the P model's `s` rewritten so `predict` equals the candidate; bits / step / qp untouched, so r16 / share / target / refq are
+// today's and `update` refits from the coded P as today). x264 (e): 1-pass ABR picks a picture's qscale from the stream-long
+// complexity rate factor (wanted_bits_window / cplxr_sum, the I from the P by ip_factor), its per-type predictor (not reset at a
+// scenecut) only clips for VBV: there is no per-picture reseed to copy, owed H264ENC-RC-CPLX-WINDOW.
+
+#[cfg(test)]
+mod firstp_prediction_tests {
+    extern crate std;
+    use super::scenecut_rc_tests::{fixture, CUT, PINS};
+    use super::*;
+    use crate::{Config, Yuv420};
+    use alloc::vec::Vec;
+    use std::println;
+
+    const W: usize = 64;
+    const H: usize = 64;
+
+    /// The candidate injected for the first P after the IDR at CUT (T2).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Cand {
+        C,
+        D,
+    }
+
+    /// One coded picture: (type index, QP, bits, CBR fullness after it, oracle QP (the picked QP when its type was uncoded)).
+    type Pic1 = (usize, i32, u64, i64, i32);
+
+    /// The `s` that makes `mp.predict` equal candidate `c` (A = mp.bits x mp.step, C = mi.bits x mi.step; k = A / s).
+    fn injected_s(c: Cand, mi: Model, mp: Model) -> u64 {
+        let (a, cc) = (mp.bits as u128 * mp.step as u128, mi.bits as u128 * mi.step as u128);
+        let s = match c {
+            Cand::C => a * mi.s as u128 / cc.max(1),
+            Cand::D => 2 * a * mp.s as u128 * mi.s as u128 / (a * mi.s as u128 + cc * mp.s as u128).max(1),
+        };
+        (s as u64).max(1)
+    }
+
+    /// Encode `n` frames of `src` at 64x64 CBR `kbps` 30 fps (SR834's `run` shape), `inject` the first P after the IDR at CUT: every
+    /// picture's [`Pic1`], the rate controller before and after that first P (before the injection), and the bucket size.
+    fn run_with(kbps: u32, gop: u32, sc: Option<u8>, n: usize, src: &dyn Fn(usize) -> [Vec<u8>; 3], inject: Option<Cand>) -> (Vec<Pic1>, Rc, Rc, i64) {
+        let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop, scenecut: sc, rate: Some(RateControl::cbr(kbps, (30, 1))), ..Default::default() };
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut pics = Vec::new();
+        let (mut first_before, mut first_after) = (None, None);
+        for t in 0..n {
+            let p = src(t);
+            let before = enc.rc.clone().unwrap();
+            if t == CUT + 1 {
+                if let Some(c) = inject {
+                    let r = enc.rc.as_mut().unwrap();
+                    let (mi, mp) = (r.types[0], r.types[1]);
+                    assert!(mi.coded && mp.coded && r.after_idr, "inject: both models coded and after an IDR");
+                    r.types[1].s = injected_s(c, mi, mp);
+                }
+            }
+            enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap();
+            let rc = enc.rc.as_ref().unwrap();
+            let m = before.types[rc.t];
+            let bits = rc.types[rc.t].bits;
+            let oracle = if m.coded {
+                let rq = if rc.t == 1 && before.after_idr { (before.types[0].qp + IP_QP_OFFSET).min(QP_MAX) } else { m.qp };
+                let (lo, hi) = ((rq - PIC_STEP).max(before.floor), (rq + PIC_STEP).min(QP_MAX));
+                let at = |q: i32| bits as u128 * step16(rc.pic_qp) as u128 / step16(q) as u128;
+                (lo..=hi).find(|&q| at(q) <= rc.target as u128).unwrap_or(hi)
+            } else {
+                rc.pic_qp
+            };
+            if t == CUT + 1 {
+                first_before = Some(before);
+                first_after = Some(rc.clone());
+            }
+            pics.push((rc.t, rc.pic_qp, bits, rc.full, oracle));
+        }
+        let buf = enc.rc.as_ref().unwrap().buf;
+        (pics, first_before.unwrap(), first_after.unwrap(), buf)
+    }
+
+    /// T1 for one run: per candidate (a)..(d), [actual x 100 / predicted at the picked QP, the window's pick with it - oracle], and
+    /// the oracle QP.
+    fn t1(before: &Rc, after: &Rc, oracle: i32) -> [[i64; 2]; 4] {
+        let (mi, mp) = (before.types[0], before.types[1]);
+        let (s, q, target, actual) = (after.s, after.pic_qp, after.target, after.types[1].bits);
+        let pred = |c: usize, q: i32| -> u128 {
+            let a = mp.predict(s, q);
+            let cc = mi.predict(s, q);
+            match c {
+                0 => a,
+                1 => mi.bits as u128 * mi.step as u128 / step16(q) as u128,
+                2 => cc,
+                _ => (a + cc) / 2,
+            }
+        };
+        let rq = (mi.qp + IP_QP_OFFSET).min(QP_MAX);
+        let (lo, hi) = ((rq - PIC_STEP).max(before.floor), (rq + PIC_STEP).min(QP_MAX));
+        let mut out = [[0i64; 2]; 4];
+        for (c, o) in out.iter_mut().enumerate() {
+            let pick = (lo..=hi).find(|&k| pred(c, k) <= target as u128).unwrap_or(hi);
+            *o = [(actual as u128 * 100 / pred(c, q).max(1)) as i64, (pick - oracle) as i64];
+        }
+        out
+    }
+
+    /// The measured table (MEASURE SR1002), in [`PINS`]'s order: (fixture, kbps, cut, T1 [window pick - oracle QP] for (a) (b) (c)
+    /// (d), T2 [first P QP, peak fullness] with (c) injected then (d)). Within 2 QP of the oracle on the 14 binding rows (kbps <= 100):
+    /// T1 a 7, b 2, c 6, d 7; T2 c 6, d 7, and (d) moves later pictures up to 8 QP further from their oracles (C 50 control): no
+    /// candidate reaches the 12 / 14 the rule asked, so nothing in `picture` changes (MEASURED-NOT-NEEDED, SR809 / SR834 precedent).
+    const TABLE: [(char, u32, bool, [i64; 4], [i64; 4]); 21] = [
+        ('A', 200, true, [0, 1, 0, 0], [25, 93766, 25, 93766]),
+        ('A', 200, false, [0, 2, 0, 0], [29, 93766, 29, 93766]),
+        ('A', 40, true, [0, 12, 0, 0], [29, 22875, 29, 22875]),
+        ('A', 40, false, [-1, 11, 0, -1], [30, 19099, 29, 19099]),
+        ('A', 20, true, [-3, 9, 6, 0], [38, 13662, 32, 14410]),
+        ('A', 20, false, [-12, 0, 0, -3], [41, 11978, 38, 11978]),
+        ('B', 400, true, [0, 0, 0, 0], [17, 202811, 17, 202811]),
+        ('B', 400, false, [0, 2, 0, 0], [17, 202811, 17, 202811]),
+        ('B', 100, true, [0, 12, 11, 7], [28, 64625, 24, 64625]),
+        ('B', 100, false, [10, 10, 10, 10], [32, 61043, 32, 61043]),
+        ('B', 50, true, [4, 4, 4, 4], [34, 41642, 34, 41642]),
+        ('B', 50, false, [-10, 0, 0, 0], [38, 36578, 38, 36578]),
+        ('C', 400, true, [0, 0, 0, 0], [17, 202811, 17, 202811]),
+        ('C', 400, false, [0, 3, 0, 0], [17, 202811, 17, 202811]),
+        ('C', 100, true, [0, 12, 0, 0], [18, 67561, 18, 67561]),
+        ('C', 100, false, [0, 12, 0, 0], [22, 61043, 22, 61043]),
+        ('C', 50, true, [-2, 10, 9, 5], [38, 39090, 34, 39090]),
+        ('C', 50, false, [-4, 7, 6, 2], [40, 36534, 36, 36534]),
+        ('D', 400, false, [0, 3, 0, 0], [17, 203139, 17, 203139]),
+        ('D', 100, false, [-1, 11, 11, 7], [34, 61419, 30, 61419]),
+        ('D', 50, false, [4, 6, 6, 6], [41, 36750, 41, 36750]),
+    ];
+
+    #[test]
+    fn firstp_prediction_table() {
+        let n = CUT + 7;
+        let mut within = [0u32; 2];
+        let mut within_t1 = [0u32; 4];
+        let mut binding = 0u32;
+        for (&(f, kbps, cut, _, _), &(tf, tk, tc, want1, want2)) in PINS.iter().zip(TABLE.iter()) {
+            assert_eq!((f, kbps, cut), (tf, tk, tc), "TABLE follows PINS' order");
+            let (gop, sc) = if cut { (30, Some(40)) } else { (CUT as u32, None) };
+            let (base, before, after, buf) = run_with(kbps, gop, sc, n, &fixture(f), None);
+            assert!(before.after_idr && after.t == 1, "{f} {kbps} {cut}: the first P after the IDR at {CUT}");
+            let oracle = base[CUT + 1].4;
+            let e = t1(&before, &after, oracle);
+            assert_eq!(e[0][1] as i32 + oracle, base[CUT + 1].1, "{f} {kbps} {cut}: (a) is today's pick");
+            let bind = kbps <= 100;
+            binding += bind as u32;
+            assert_eq!([e[0][1], e[1][1], e[2][1], e[3][1]], want1, "{f} {kbps} {cut}: T1 window pick - oracle for (a)..(d)");
+            for (w, x) in within_t1.iter_mut().zip(e.iter()) {
+                *w += (bind && x[1].abs() <= 2) as u32;
+            }
+            println!(
+                "T1 {f} {kbps:3} {}: qp={:2} oracle={:2} | a {:4}% {:+3} | b {:4}% {:+3} | c {:4}% {:+3} | d {:4}% {:+3}",
+                if cut { "cut " } else { "ctrl" },
+                base[CUT + 1].1,
+                oracle,
+                e[0][0], e[0][1], e[1][0], e[1][1], e[2][0], e[2][1], e[3][0], e[3][1]
+            );
+            for (i, c) in [Cand::C, Cand::D].into_iter().enumerate() {
+                let (pics, _, _, _) = run_with(kbps, gop, sc, n, &fixture(f), Some(c));
+                let peak = pics.iter().map(|r| r.3).max().unwrap();
+                let p = pics[CUT + 1];
+                assert_eq!([p.1 as i64, peak], [want2[2 * i], want2[2 * i + 1]], "{f} {kbps} {cut} {c:?}: T2 first P QP and peak");
+                assert!(peak <= buf, "{f} {kbps} {cut} {c:?}: the CBR bucket overflowed ({peak} > {buf})");
+                let d1 = (p.1 - oracle).abs();
+                if bind && d1 <= 2 {
+                    within[i] += 1;
+                }
+                // a later picture further from its own oracle than in the baseline: the largest growth of |qp - oracle|.
+                let grow = (CUT + 2..n).map(|t| (pics[t].1 - pics[t].4).abs() - (base[t].1 - base[t].4).abs()).max().unwrap();
+                let moved = (CUT + 2..n).map(|t| (pics[t].1 - base[t].1).abs()).max().unwrap();
+                println!(
+                    "T2 {f} {kbps:3} {} {c:?}: firstP qp={:2} bits={:5} |qp-oracle|={} peak={:6}/{} second P qp {}->{} bits {}->{} later maxdq={} grow={}",
+                    if cut { "cut " } else { "ctrl" },
+                    p.1, p.2, d1, peak, buf, base[CUT + 2].1, pics[CUT + 2].1, base[CUT + 2].2, pics[CUT + 2].2, moved, grow
+                );
+            }
+        }
+        println!("binding rows {binding}: within 2 QP of the oracle: c {} d {}", within[0], within[1]);
+        assert_eq!((binding, within_t1, within), (14, [7, 2, 6, 7], [6, 7]), "binding rows; within 2 QP: T1 (a)..(d), T2 (c) (d)");
     }
 }
