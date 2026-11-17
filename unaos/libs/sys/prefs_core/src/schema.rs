@@ -177,6 +177,12 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "stria-view (`window_keys` through quartzite `chrome_rows::stored_str`, at a window's open; `--keys` wins; the witness never reads it), handed to `nle_face::Face::with_keys`",
         doc: "The editor's key overlay over its built-in table: `<key> <action>` entries split on a newline or `;` (`Space` names the space bar, an action is a VERBS word or a KEYS action, `none` unbinds); a refused map (an unknown action, a key named twice, no key showing the help) keeps the built-in table and says why on the message row (STRIAKEYMAPSTORE, SR917).",
     },
+    // ── stria — the NLE editor's witness (STRIAWAVECACHEPREF SR9098; read once at start by stria-view) ──
+    Key {
+        ns: "stria", key: "waveform.peak_cache", kind: Kind::Bool, default: Default::Bool(false),
+        writers: OP, reader: "stria-view (`vessels/stria-view/src/main.rs` peak_cache_pref, once at start)",
+        doc: "Keep each reel's waveform peak table in a cache file (beside the media, else the per-user cache dir `$XDG_CACHE_HOME/unaos/stria/peaks`) so a reopen skips the audio decode; `--peak-cache` / `--no-peak-cache` override it for one run (STRIAWAVECACHEPREF, SR9098).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
     //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──

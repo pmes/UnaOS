@@ -19,6 +19,8 @@ timeline_core = { path = "../../unaos/libs/media/timeline_core" }
 bandy = { path = "../../libs/bandy" }
 quartzite = { path = "../../libs/quartzite", default-features = false }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# STRIAWAVECACHEPREF (SR9098): `stria.waveform.peak_cache` read once at start, read-only (the tabula / vug-view shape).
+principia = { path = "../../handlers/principia" }
 
 [features]
 default = []
