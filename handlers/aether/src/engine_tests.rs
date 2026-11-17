@@ -7483,6 +7483,63 @@ mod tests {
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
 
+    // ---- AETHERCSSOMFONTFAMILYUSED (LEDGER SR1024): getComputedStyle fontFamily is the specified list, pinned (named tail block) ----
+
+    fn cssom_font_family_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="root">Hello</div>
+            <div id="list" style='font-family: Arial, "Times New Roman", serif'>Hello</div>
+            <pre id="pre">Hello</pre>
+            <button id="btn">Hello</button>
+            <div style="font-family: Georgia, serif"><pre id="inh" style="font-family: inherit">Hello</pre></div>
+            <div style="font-family: Georgia, serif"><span id="bad" style="font-family: 12px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): an author list reads back as written (Chromium: generics bare, a one-ident
+    /// name bare, other names quoted); no family at all reads the standard font.
+    #[test]
+    fn cssom_font_family_specified_list() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "list", "fontFamily"), r#"Arial, "Times New Roman", serif"#);
+        assert_eq!(font_shorthand_cs(&mut e, "root", "fontFamily"), r#""Times New Roman""#);
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): the UA tag defaults: `pre` reads `monospace`; a button reads Aether's control
+    /// family word (`Arial`; Chromium's per-platform word is owed AETHER-CSSOM-FONT-FAMILY-UA-CONTROL).
+    #[test]
+    fn cssom_font_family_tag_defaults() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pre", "fontFamily"), "monospace");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontFamily"), "Arial");
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): `font-family: inherit` on a `pre` takes the parent's list, not the tag's monospace.
+    #[test]
+    fn cssom_font_family_inherit() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inh", "fontFamily"), "Georgia, serif");
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): an unquoted word that is not an identifier (`12px`) makes the declaration
+    /// invalid: it is dropped and the child reads the inherited list (it used to read `"12px"`).
+    #[test]
+    fn cssom_font_family_bogus_dropped() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "bad", "fontFamily"), "Georgia, serif");
+        for bad in ["12px", "Font 2", "#x", "a/b", "-1x", "Arial, 12px"] {
+            assert!(crate::fonts::parse_family_list(bad).is_none(), "{bad} is not a family list");
+        }
+        for good in ["-x", "_a", "Times   New Roman", "Font2, sans-serif", "--x"] {
+            assert!(crate::fonts::parse_family_list(good).is_some(), "{good} is a family list");
+        }
+    }
+
     // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
 
     /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a
