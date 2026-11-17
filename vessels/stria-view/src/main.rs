@@ -268,7 +268,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -2621,5 +2621,42 @@ mod striamarkersmore_tests {
         println!("striamarkersmore witness: {}", markers_json(&face));
         assert_eq!(drive(&mut face, "unmark all"), vec!["unmarked 2 markers".to_string()]);
         assert_eq!(markers_json(&face), "");
+    }
+}
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the witness's waiting export count (named tail block) ----
+/// The witness's `"queued"` field, only while export requests wait (`Face::export_queued`); the default line is unchanged.
+fn queued_json(face: &Face) -> String {
+    match face.export_queued() {
+        0 => String::new(),
+        n => format!(",\"queued\":{n}"),
+    }
+}
+
+#[cfg(test)]
+mod striaexportqueuemore_tests {
+    use super::*;
+
+    /// STRIAEXPORTQUEUEMORE (SR971): a paused job with one request queued behind it carries `"queued":1`; `export-clear`
+    /// drops it and the field is gone; cancelled and joined, nothing is left.
+    #[test]
+    fn striaexportqueuemore_witness_queued_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaexportqueuemore-witness-a");
+        let other = exe.parent().expect("its directory").join("striaexportqueuemore-witness-b");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(queued_json(&face), "");
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        assert!(face.verb(&format!("export {} png", other.display())));
+        assert_eq!(queued_json(&face), r#","queued":1"#);
+        assert!(face.verb("export-clear"));
+        assert_eq!(queued_json(&face), "");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert!(!other.exists(), "the dropped request made nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("striaexportqueuemore witness: ,\"queued\":1 then cleared");
     }
 }

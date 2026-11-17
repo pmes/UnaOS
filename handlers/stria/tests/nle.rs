@@ -10898,3 +10898,70 @@ fn striaautosavemore_older_kept_not_offered() {
     let face = face.with_doc(Some(doc.as_path()));
     assert_eq!(face.last_error.as_deref(), Some("an earlier message"), "the offer never replaces a standing message");
 }
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the queue's range / audio on the list, the Esc and running counts (named tail block) ----
+
+#[test]
+fn striaexportqueuemore_list_names_range_and_audio() {
+    let (a, b, c) = (nlefaceexport_dir("more-a"), nlefaceexport_dir("more-b"), nlefaceexport_dir("more-c"));
+    let mut face = striaexportqueue_paused(&a);
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert!(face.verb(&format!("export --all {} h264 none", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    assert!(face.verb("export-list"));
+    let want = format!("export: 2 waiting: {} png ticks 5..15, {} h264 none", striaexportqueuelist_name(&b), striaexportqueuelist_name(&c));
+    assert_eq!(face.last_error.take(), Some(want));
+    assert_eq!(face.export_queued(), 2, "the list leaves the queue");
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(!b.exists() && !c.exists());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueuemore: the list names the range and the audio word");
+}
+
+#[test]
+fn striaexportqueuemore_esc_names_the_dropped() {
+    let (a, b, c) = (nlefaceexport_dir("moreesc-a"), nlefaceexport_dir("moreesc-b"), nlefaceexport_dir("moreesc-c"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert!(face.verb(&format!("export {} png", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running export");
+    assert_eq!(face.last_error.take().as_deref(), Some("export: cancelling (dropped 2 waiting)"));
+    assert_eq!(face.export_queued(), 0);
+    assert!(face.wait_export());
+    assert_eq!(face.last_error.take(), Some(format!("export: cancelled at 3/35 frames; partial files left in {}", a.display())));
+    let _ = std::fs::remove_dir_all(&a);
+    let d = nlefaceexport_dir("moreesc-d");
+    let mut face = striaexportqueue_paused(&d);
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(face.last_error.is_none(), "nothing queued: no dropped line {:?}", face.last_error);
+    assert!(face.wait_export());
+    assert!(!b.exists() && !c.exists(), "the dropped requests made nothing");
+    let _ = std::fs::remove_dir_all(&d);
+    println!("striaexportqueuemore: Esc named 2 dropped");
+}
+
+#[test]
+fn striaexportqueuemore_running_line_counts_the_waiting() {
+    let (a, b) = (nlefaceexport_dir("morerun-a"), nlefaceexport_dir("morerun-b"));
+    let mut face = striaexportqueue_paused(&a);
+    let line = face.message_text().expect("the running line");
+    assert!(line.starts_with("export: 3 / 35") && !line.contains("waiting"), "{line}");
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    let line = face.message_text().expect("the running line");
+    assert!(line.starts_with("export: 3 / 35") && line.ends_with(" (1 waiting)"), "{line}");
+    assert!(face.verb("export-clear"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: dropped 1 waiting"));
+    let line = face.message_text().expect("the running line");
+    assert!(!line.contains("waiting"), "{line}");
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(!b.exists());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueuemore: the running line counts the waiting");
+}
+
