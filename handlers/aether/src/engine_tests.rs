@@ -11073,4 +11073,89 @@ b</div>
         e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
         assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
     }
+
+    // ---- AETHERBOXPAINTSIDEALPHA (LEDGER SR1151): boxpaint's Side carries its alpha, the ring blend multiplies by the owner's (named tail block) ----
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): one engine, white page, each box absolutely placed (20x20 content, 10px sides):
+    /// `#mx` red 0.5 top / bottom and blue left / right at (0,0); `#ma` red 0.5 top / bottom and opaque red left / right
+    /// at (100,0); `#bg` an rgb(1, 2, 3) background (SR1147's first ghost candidate) under a red / blue frame at (200,0);
+    /// an unchecked checkbox at (300,0); a `<p>` at y 200 holding `#it`, an inline CSS triangle (transparent 10px sides,
+    /// red top) around one white glyph.
+    fn boxpaint_side_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            .a { position: absolute; top: 0; width: 20px; height: 20px; margin: 0 }
+            p { position: absolute; left: 0; top: 200px; margin: 0; padding: 0 8px; font: 16px sans-serif }
+            </style></head><body>
+            <div id="mx" class="a" style="left:0;border:10px solid;border-color:rgba(255, 0, 0, 0.5) blue"></div>
+            <div id="ma" class="a" style="left:100px;border:10px solid;border-color:rgba(255, 0, 0, 0.5) red"></div>
+            <div id="bg" class="a" style="left:200px;border:10px solid;border-color:red blue;background:rgb(1, 2, 3)"></div>
+            <input id="cb" type="checkbox" style="position:absolute;left:300px;top:0;margin:0">
+            <p><span id="it" style="border:10px solid transparent;border-top-color:red;color:#fff">x</span></p>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): `border-color: rgba(255, 0, 0, 0.5) blue` strokes each side at its own alpha: the
+    /// top edge composites red at 0.5 over white (~(255, 127, 127)), the left edge is opaque blue. Before SR1151 the frame
+    /// stroked at the max of its side alphas (1.0): the top read opaque red (AETHER-CSS-BORDER-SIDE-ALPHA-MIXED).
+    #[test]
+    fn boxpaint_side_alpha_mixed_colour() {
+        let e = boxpaint_side_alpha_engine();
+        let top = imgalt_px(&e, 20, 2);
+        assert!(inline_border_alpha_near(top, (255, 127, 127)), "armed: #mx top side at its own 0.5: {top:?}");
+        assert_eq!(imgalt_px(&e, 2, 20), (0, 0, 255), "#mx left side opaque blue");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the same RGB at two alphas (`rgba(255, 0, 0, 0.5) red`) differs by alpha alone
+    /// (sides_differ takes it to boxpaint): the top at 0.5, the left opaque red (before SR1151 both opaque).
+    #[test]
+    fn boxpaint_side_alpha_mixed_alpha_same_rgb() {
+        let e = boxpaint_side_alpha_engine();
+        let top = imgalt_px(&e, 120, 2);
+        assert!(inline_border_alpha_near(top, (255, 127, 127)), "armed: #ma top side at its own 0.5: {top:?}");
+        assert_eq!(imgalt_px(&e, 102, 20), (255, 0, 0), "#ma left side opaque red");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the inline road's CSS triangle: the transparent left / right sides own their
+    /// diagonal halves and paint nothing, so the top-centre is red and the left- and right-middle stay the white page.
+    /// Before SR1151 the inline road handed boxpaint only the visible top side and it owned a whole band
+    /// (AETHER-CSS-INLINE-BORDER-TRANSPARENT-SIDE). One white glyph inside: an EMPTY inline's box fragment is not
+    /// established (AETHER-INLINE-EMPTY-BOX-FRAG).
+    #[test]
+    fn boxpaint_side_alpha_inline_triangle() {
+        let mut e = boxpaint_side_alpha_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "it");
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        assert!(css_wide_red(imgalt_px(&e, l + w / 2, t + 2)), "#it top-centre is red: {:?}", imgalt_px(&e, l + w / 2, t + 2));
+        assert_eq!(imgalt_px(&e, l + 2, t + h / 2), (255, 255, 255), "armed: #it left-middle is the transparent left side's");
+        assert_eq!(imgalt_px(&e, l + w - 3, t + h / 2), (255, 255, 255), "armed: #it right-middle is the transparent right side's");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): no colour sentinel exists any more: an rgb(1, 2, 3) background under a two-colour
+    /// frame paints its interior, with the red top and the blue left over it.
+    #[test]
+    fn boxpaint_side_alpha_background_123() {
+        let e = boxpaint_side_alpha_engine();
+        assert_eq!(imgalt_px(&e, 220, 20), (1, 2, 3), "#bg interior is its rgb(1, 2, 3) background");
+        assert_eq!(imgalt_px(&e, 220, 2), (255, 0, 0), "#bg top side red");
+        assert_eq!(imgalt_px(&e, 202, 20), (0, 0, 255), "#bg left side blue");
+    }
+
+    /// AETHERBOXPAINTSIDEALPHA (SR1151): the control glyphs pass alpha 1.0 (one token each): an unchecked checkbox keeps
+    /// its #767676 frame on its top row and its white centre.
+    #[test]
+    fn boxpaint_side_alpha_checkbox_frame() {
+        let mut e = boxpaint_side_alpha_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "cb");
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        let grey = |c: (u8, u8, u8)| c.0 == c.1 && c.1 == c.2 && (100..=140).contains(&c.0);
+        let rows: Vec<(u8, u8, u8)> = (t.saturating_sub(1)..=t + 1).map(|y| imgalt_px(&e, l + w / 2, y)).collect();
+        assert!(rows.iter().any(|&c| grey(c)), "#cb top row carries the grey frame: {rows:?}");
+        assert_eq!(imgalt_px(&e, l + w / 2, t + h / 2), (255, 255, 255), "#cb centre is white");
+    }
 }

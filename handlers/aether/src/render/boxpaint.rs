@@ -12,8 +12,9 @@
 //! dashed: dashes of 2w with gaps of w; dotted: w-square dots every 2w;
 //! double: two strokes of w/3 with a w/3 gap — Chromium's pattern sizes.
 
-/// One side: (width px, colour, style code 0 solid / 1 dashed / 2 dotted / 3 double).
-pub(crate) type Side = Option<(f32, (u8, u8, u8), u8)>;
+/// One side: (width px, colour, style code 0 solid / 1 dashed / 2 dotted / 3 double, alpha 0..1). An alpha-0 side keeps
+/// its geometry (it owns its diagonal half of each corner) and paints nothing (AETHERBOXPAINTSIDEALPHA, SR1151).
+pub(crate) type Side = Option<(f32, (u8, u8, u8), u8, f32)>;
 
 /// Signed distance from (px, py) to a rounded rect (negative inside).
 pub(crate) fn sdf(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: [f32; 4]) -> f32 {
@@ -159,15 +160,15 @@ pub(crate) fn paint(
                 }
             }
             let Some(i) = best else { continue };
-            let Some((sw, color, style)) = sides[i] else { continue };
+            let Some((sw, color, style, sa)) = sides[i] else { continue };
             let (along, across, len) = match i {
                 0 => (px as f32 - x0, fy - y0, w),
                 1 => (py as f32 - y0, x1 - fx, h),
                 2 => (px as f32 - x0, y1 - fy, w),
                 _ => (py as f32 - y0, fx - x0, h),
             };
-            if style_on(style, sw.max(1.0), along, across, len) {
-                blend(px, py, color, ring);
+            if sa > 0.0 && style_on(style, sw.max(1.0), along, across, len) {
+                blend(px, py, color, ring * sa);
             }
         }
     }
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn rounded_ring_paint_kat() {
         let mut px = std::collections::HashMap::new();
-        let side = Some((2.0, (255, 0, 0), 0));
+        let side = Some((2.0, (255, 0, 0), 0, 1.0));
         paint(0.0, 0.0, 40.0, 40.0, [10.0; 4], [side; 4], Some((0, 0, 255)), 40, 40, &mut |x, y, c, a| {
             px.insert((x, y), (c, a));
         });
