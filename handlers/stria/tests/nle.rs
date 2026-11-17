@@ -2264,6 +2264,7 @@ fn nle5dkeyshelp_paints_over_the_timeline_band_only_with_labels() {
     assert!(plain.verb("help"));
     assert_eq!(plain.paint(), a, "labels off: no overlay");
     println!("nle5dkeyshelp: band fnv {:016x} -> {:016x}", stria::nle_face::fnv1a(&off[cut..]), stria::nle_face::fnv1a(&on[cut..]));
+}
 // ---- NLE5DKEYSHELPBUTTON (LEDGER SR765): the keys help word on the transport — `help` the last VERBS word (named tail block) ----
 
 /// The button's message: `Input { target: SURFACE, text: "help" }`, what stria-view's `?` transport button fires.
@@ -2309,8 +2310,6 @@ fn nle5dkeyshelpbutton_paint_toggles_back_byte_identical() {
     assert!(nle5dkeyshelpbutton_press(&mut plain));
     assert_eq!(plain.paint(), a);
     println!("nle5dkeyshelpbutton: fnv {:016x} -> {:016x} -> back", stria::nle_face::fnv1a(&before), stria::nle_face::fnv1a(&shown));
-}
-
 }
 
 // ---- STRIAINFOREELAUDIO (LEDGER SR761): an editor reel's line carries its audio part, equal to the Player's (named tail block) ----
@@ -3550,4 +3549,90 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
+}
+
+// ---- STRIAHELPSEARCH (LEDGER SR874): `help <word>` filters the keys help rows; bare `help` unchanged (named tail block) ----
+
+/// `help slip` shows the help with only the rows whose keys or phrase contain "slip" (ASCII case-insensitive), fewer than the
+/// whole table; `help SLIP` the same rows; `help Space` finds the play row by its key.
+#[test]
+fn striahelpsearch_filters_by_substring() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help slip"));
+    assert!(f.help_shown());
+    assert_eq!(f.help_query(), Some("slip"));
+    let shown = f.help_rows_shown();
+    let want: Vec<_> = help_rows().into_iter().filter(|(k, p)| k.to_ascii_lowercase().contains("slip") || p.contains("slip")).collect();
+    assert!(!shown.is_empty() && shown.len() < help_rows().len(), "{} of {}", shown.len(), help_rows().len());
+    assert_eq!(shown, want);
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(f.verb("help SLIP"));
+    assert_eq!(f.help_rows_shown(), want);
+    assert!(f.verb("help Space"));
+    assert!(f.help_rows_shown().iter().any(|(k, p)| *p == help_phrase("play") && k.split(" / ").any(|x| x == "Space")));
+    println!("striahelpsearch: help slip -> {} of {} rows", want.len(), help_rows().len());
+}
+
+/// A query no row matches is refused by name on the message line; the help is left as it was (hidden here; shown and
+/// filtered when it was).
+#[test]
+fn striahelpsearch_no_match_refused_by_name() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help zzz"));
+    assert_eq!(f.last_error.take().as_deref(), Some("help: no key matches \"zzz\""));
+    assert_eq!((f.help_shown(), f.help_query()), (false, None));
+    assert!(f.verb("help slip"));
+    assert!(f.verb("help zzz"));
+    assert_eq!(f.last_error.take().as_deref(), Some("help: no key matches \"zzz\""));
+    assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+    println!("striahelpsearch: help zzz refused, the help left as it was");
+}
+
+/// View-only: no undo step, the document not dirtied, the timeline and playhead untouched.
+#[test]
+fn striahelpsearch_view_only() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (tl, ph, depth) = (f.state.timeline.clone(), f.state.playhead, f.state.undo_depth());
+    assert!(f.verb("help slip"));
+    assert!(f.verb("help"));
+    assert_eq!((&f.state.timeline, f.state.playhead, f.state.undo_depth(), f.dirty()), (&tl, ph, depth, false));
+    println!("striahelpsearch: undo depth {depth} kept, clean");
+}
+
+/// Bare `help` after a filtered help hides it and clears the query; a blank query is the bare word.
+#[test]
+fn striahelpsearch_bare_help_toggles_off_a_filtered_help() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help slip"));
+    assert!(f.verb("help"));
+    assert_eq!((f.help_shown(), f.help_query()), (false, None));
+    assert!(f.verb("help   "));
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    assert_eq!(f.help_rows_shown(), help_rows());
+    println!("striahelpsearch: bare help clears the query");
+}
+
+/// PIN: bare `help` paints exactly as today — after `help slip`, Escape, `help` the labelled frame equals a fresh face's bare
+/// help; the filtered frame differs only below the ruler; labels off stays byte-identical; `help` is still the last of 26.
+#[test]
+fn striahelpsearch_bare_help_unchanged() {
+    assert_eq!((VERBS.len(), VERBS.last()), (26, Some(&"help")));
+    let mut fresh = nle5dkeyshelp_face(640, 480, true);
+    assert!(fresh.verb("help"));
+    let bare = fresh.paint();
+    let mut f = nle5dkeyshelp_face(640, 480, true);
+    assert!(f.verb("help slip"));
+    let filtered = f.paint();
+    let cut = f.layout().ruler_y as usize * 640 * 4;
+    assert_eq!(filtered[..cut], bare[..cut], "the preview band is untouched");
+    assert_ne!(filtered[cut..], bare[cut..], "the filtered help paints fewer rows");
+    assert!(f.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(!f.help_shown());
+    assert!(f.verb("help"));
+    assert_eq!(f.paint(), bare, "bare help after a search paints the whole table");
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let a = plain.paint();
+    assert!(plain.verb("help slip"));
+    assert_eq!(plain.paint(), a, "labels off: no overlay");
+    println!("striahelpsearch: bare fnv {:016x}, filtered {:016x}", stria::nle_face::fnv1a(&bare[cut..]), stria::nle_face::fnv1a(&filtered[cut..]));
 }

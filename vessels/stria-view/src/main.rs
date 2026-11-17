@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "help"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &help_search_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -856,5 +856,41 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAHELPSEARCH (LEDGER SR874): the witness's `help <word>` reading (named tail block) ----
+/// `"help_query"` and the shown row count, only while the keys help shows filtered (`help:<word>`, `Face::help_query`);
+/// the bare help's line is unchanged.
+fn help_search_json(face: &Face) -> String {
+    match face.help_query() {
+        Some(q) if face.help_shown() => format!(",\"help_query\":\"{}\",\"help_rows\":{}", q.replace('"', "'"), face.help_rows_shown().len()),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod striahelpsearch_tests {
+    use super::*;
+
+    /// STRIAHELPSEARCH M3: `--do help:slip` shows the filtered help, the line carries the query and the shown count; a
+    /// bare `help` hides it and both fields are gone; `help:zzz` is refused by name.
+    #[test]
+    fn striahelpsearch_witness_query_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(help_search_json(&f), "");
+        let errors = drive(&mut f, "help:slip");
+        assert!(errors.is_empty(), "{errors:?}");
+        let n = nle_face::help_matching("slip").len();
+        assert!(n > 0);
+        assert_eq!(help_json(&f), ",\"help\":true");
+        assert_eq!(help_search_json(&f), format!(",\"help_query\":\"slip\",\"help_rows\":{n}"));
+        drive(&mut f, "help");
+        assert_eq!((help_json(&f), help_search_json(&f)), (String::new(), String::new()));
+        let errors = drive(&mut f, "help:zzz");
+        assert_eq!(errors, vec!["help: no key matches \"zzz\"".to_string()]);
+        assert!(!f.help_shown());
+        println!("striahelpsearch witness: help:slip -> ,\"help_query\":\"slip\",\"help_rows\":{n}");
     }
 }
