@@ -426,8 +426,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("c", "xfade"), // STRIAXFADECURVEBUTTON (SR925): c / C (Shift+c, text) put / take the crossfade and swap its curve (x is the kernel's delete, X the mark clear)
     ("C", "xfade-curve"),
     ("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo"), // STRIATRACKGAINKEYS (SR926): text keys for the audio words (Face::verb: the buttons' commit and message line; the natural - / = / m / s are taken)
-    ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
-    ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word
+    ("h", "history"), ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
+    ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -2661,8 +2661,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("xfade", "put / take the selected audio clip's crossfade"), // STRIAXFADECURVEBUTTON (SR925)
     ("xfade-curve", "switch the crossfade's curve linear / equal"),
     ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
-    ("help", "show / hide this help"),
-    ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row
+    ("history", "list the last undo steps"), ("help", "show / hide this help"),
+    ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
 const HELP_PAD: f32 = 4.0;
@@ -3217,7 +3217,7 @@ impl Face {
     /// by name, as `export` refuses. `None` for any other word.
     fn frame_verb(&mut self, v: &str) -> Option<bool> {
         let rest = v.strip_prefix("frame")?;
-        if !(rest.is_empty()let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if  || rest.starts_with(char::is_whitespace)) { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
+        if !(rest.is_empty()let Some(r) = self.gaps_all_note_verbundo_jump_verb(v) { return r; } if let Some(r) = self.(v) { return Some(r); } if  || rest.starts_with(char::is_whitespace)) { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
             return None;
         }
         let rest = rest.trim();
@@ -6557,5 +6557,49 @@ impl Face {
         }).collect();
         let more = if n > EXPORT_LIST_SHOWN { format!(", +{} more", n - EXPORT_LIST_SHOWN) } else { String::new() };
         format!("export: {n} waiting: {}{more}", names.join(", "))
+    }
+}
+
+// ---- STRIAUNDOJUMP (LEDGER SR934): `undo <n>` / `redo <n>` and the landing line (named tail block) ----
+// `undo <n>` / `redo <n>` step the core's ONE `undo` / `redo` n times (n in 1..=the stack's depth), so every step stays its
+// own entry and `redo <n>` returns exactly. The message line names where it landed through SR876's names: the oldest of
+// the n entries undone (`history(n)` read BEFORE stepping), or the newest entry after a redo (`history(1)`); an unnamed
+// step reads `(unnamed)`. Any other count is refused by name and nothing moves. Plain `undo` / `redo` are unchanged.
+impl Face {
+    /// `undo <n>` / `redo <n>`: the steps and the landing line, or the refusal; `None` for any other word.
+    fn undo_jump_verb(&mut self, v: &str) -> Option<bool> {
+        let (back, arg) = match (v.strip_prefix("undo "), v.strip_prefix("redo ")) {
+            (Some(a), _) => (true, a.trim()),
+            (_, Some(a)) => (false, a.trim()),
+            _ => return None,
+        };
+        let (word, depth) = if back { ("undo", self.state.undo_depth()) } else { ("redo", self.state.redo_depth()) };
+        let n = match arg.parse::<usize>() {
+            Ok(n) if depth > 0 && (1..=depth).contains(&n) => n,
+            _ if depth == 0 => {
+                self.last_error = Some(format!("{word}: nothing to {word}"));
+                return Some(true);
+            }
+            _ => {
+                self.last_error = Some(format!("{word}: {arg:?} is not a count 1..={depth}"));
+                return Some(true);
+            }
+        };
+        let name = |w: Option<&str>| w.map_or_else(|| "(unnamed)".to_string(), |w| format!("{w:?}"));
+        let line = if back {
+            let at = name(self.state.history(n).last().and_then(|&(_, w)| w));
+            for _ in 0..n {
+                self.state.undo();
+            }
+            format!("undo {n}: back to before {at}")
+        } else {
+            for _ in 0..n {
+                self.state.redo();
+            }
+            let at = name(self.state.history(1).first().and_then(|&(_, w)| w));
+            format!("redo {n}: forward to after {at}")
+        };
+        self.last_error = Some(line);
+        Some(true)
     }
 }
