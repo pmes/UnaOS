@@ -228,7 +228,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                 tl.clip_at(ti, t).map(|ci| {
                     let c = &tl.tracks[ti].clips[ci];
                     let seg = if t < c.at + c.fade_in { 0 } else if t >= c.end() - c.fade_out { 2 } else { 1 };
-                    (ci, seg, xpiece(xfade(ti, ci, t), t))
+                    (ci, seg, env_piece(c, t, xpiece(xfade(ti, ci, t), t)))
                 }).or_else(|| black_key(tl, ti, t))
             })
             .collect()
@@ -268,7 +268,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                     let src_t = c.src_in + (t - c.at);
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, src_t + (end - t)));
-                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb), env }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, c.gain_cdb + c.gain_env.peak()), env: genv_scale(&c, t, end, env) }); // STRIATRACKGAIN (SR864): the clip's gain plus its track's
                 }
                 None => (next[ti], xnext[ti]) = (None, None),
             }
@@ -375,7 +375,7 @@ fn under_layer(
     *xnext = Some((o.src, src_t + (end - t)));
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb + o.gain_env.at(src_t)), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
@@ -500,5 +500,89 @@ fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]
             [env[0].min(fall(t)), env[1].min(fall(end))]
         }
         None => env,
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): a clip's gain envelope through the layer's one gain and edge envelope (named tail block) ----
+// No second ramp: a layer keeps ONE gain and the linear envelope at its two edges that every renderer interpolates. A clip
+// with gain points is heard at `gain_cdb + peak` (the envelope's largest offset) and each edge of its envelope is scaled
+// down by `cdb_q16(at(edge) - peak)` (<= ENV_ONE). Inside a RAMPING segment (two neighbouring points of different value)
+// the run key breaks at every tick, as an equal-power span does, so every edge carries the exact dB value; a flat stretch
+// stays one run. An empty envelope keys and scales nothing: the runs are byte-identical. The under layer of a crossfade
+// holds the envelope at each run's first tick, and a fade-to-silence tail is not broken per tick (NLE-GAIN-ENV-HANDLE owed).
+
+/// The run key's fade word with clip `c`'s envelope: `t + 1` (one run per tick) inside a ramping segment, else `xp`.
+fn env_piece(c: &crate::Clip, t: i64, xp: i64) -> i64 {
+    if c.gain_env.ramps(c.src_tick(t)) { t + 1 } else { xp }
+}
+
+/// Run `t..end` of clip `c`: its edge envelope `env` scaled by the gain points relative to their peak.
+fn genv_scale(c: &crate::Clip, t: i64, end: i64, env: [u32; 2]) -> [u32; 2] {
+    if c.gain_env.is_empty() {
+        return env;
+    }
+    let peak = c.gain_env.peak();
+    let k = |e: i64, v: u32| (v as u64 * cdb_q16(c.gain_env.at(c.src_tick(e)) - peak) as u64 / ENV_ONE as u64) as u32;
+    [k(t, env[0]), k(end, env[1])]
+}
+
+/// A gain in centi-dB as a Q16 factor, rounded: `round(10^(cdb / 2000) * 65536)` (0 cdB = [`ENV_ONE`] exactly), through
+/// libm (timeline_core's math dependency). audio_core's `ramp::gain_q16` is the same formula (NLE-GAIN-ENV-ONE-DB owed:
+/// one dB-to-linear for both crates).
+pub fn cdb_q16(cdb: i32) -> u32 {
+    if cdb == 0 {
+        return ENV_ONE;
+    }
+    let v = libm::pow(10.0, cdb as f64 / 2000.0) * ENV_ONE as f64;
+    libm::round(v).clamp(0.0, u32::MAX as f64) as u32
+}
+
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+    use crate::{Clip, GainEnv, Timeline};
+
+    struct Idx;
+    impl SourceIndex for Idx {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            Some(100)
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, ns: i64) -> Option<i64> {
+            Some(ns)
+        }
+    }
+
+    fn one(c: Clip) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let s = tl.add_source("A", 100);
+        let a = tl.add_track(Kind::Audio);
+        tl.tracks[a].clips.push(Clip { src: s, ..c });
+        tl
+    }
+
+    /// M3: no points: one run at the flat gain; a ramp -6 dB at source tick 10 to 0 dB at 14 breaks per tick there,
+    /// each edge the exact dB value under a gain of the peak (0); a flat -6 dB pair is one run at gain -600, env full.
+    #[test]
+    fn striagainenvelope_runs() {
+        let c = Clip::new(SourceId(0), 0, 20, 0);
+        let plain = audio_runs(&one(c), 0..20, &Idx).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!((plain[0].layers[0].gain_cdb, plain[0].layers[0].env), (0, [ENV_ONE, ENV_ONE]));
+        let ramp = GainEnv::EMPTY.with(10, -600).unwrap().with(14, 0).unwrap();
+        let r = audio_runs(&one(Clip { gain_env: ramp, ..c }), 0..20, &Idx).unwrap();
+        let spans: Vec<(i64, i64)> = r.iter().map(|x| (x.out_t, x.len)).collect();
+        assert_eq!(spans, [(0, 10), (10, 1), (11, 1), (12, 1), (13, 1), (14, 6)]);
+        assert!(r.iter().all(|x| x.layers[0].gain_cdb == 0));
+        assert_eq!(r[0].layers[0].env, [cdb_q16(-600), cdb_q16(-600)]);
+        assert_eq!(r[1].layers[0].env, [cdb_q16(-600), cdb_q16(-450)]);
+        assert_eq!(r[4].layers[0].env, [cdb_q16(-150), ENV_ONE]);
+        assert_eq!(r[5].layers[0].env, [ENV_ONE, ENV_ONE]);
+        assert_eq!(r[1].layers[0].seek, None, "the per-tick runs continue the source");
+        let flat = GainEnv::EMPTY.with(2, -600).unwrap().with(8, -600).unwrap();
+        let f = audio_runs(&one(Clip { gain_env: flat, ..c }), 0..20, &Idx).unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].layers[0].gain_cdb, f[0].layers[0].env), (-600, [ENV_ONE, ENV_ONE]));
+        assert_eq!(cdb_q16(0), ENV_ONE);
+        assert!((32_700..=32_900).contains(&cdb_q16(-602)), "{}", cdb_q16(-602));
     }
 }

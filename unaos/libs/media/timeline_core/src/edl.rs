@@ -216,7 +216,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            if l.starts_with("* UNA XFADE") {
+            genv_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -449,7 +449,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(xfade_line(tl, *ti, c.at)); // NLEXFADEPOWER (SR678)
+        s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&genv_line(c, fps)); // NLEXFADEPOWER (SR678); STRIAGAINENVELOPE (SR9047): the clip's `* UNA GENV` line (file tail)
     }
     Ok(s)
 }
@@ -828,5 +828,99 @@ mod striatrackgain_tests {
         let t = empty.add_track(Kind::Audio);
         empty = empty.set_track_gain(t, -600).unwrap();
         assert_eq!(write(&empty, "T").unwrap(), write(&tl(), "T").unwrap());
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the `* UNA GENV` line (named tail block) ----
+// `* UNA GENV <tc> <cdb> [<tc> <cdb> ...]` is the event's gain envelope ([`crate::Clip::gain_env`]): each pair a SOURCE
+// timecode and a centi-dB offset, in tick order. Written under the event (after its GAIN / FADE / XFADE lines) only when
+// the envelope has a point, so a timeline without one writes as before. A bad timecode is `parse_tc`'s refusal; refused as a
+// syntax error: no event above, no pair or an odd word count, a bad integer, ticks not strictly increasing, more than
+// [`crate::GAIN_ENV_MAX`] points or an offset out of range, a second GENV line on one event.
+
+/// STRIAGAINENVELOPE: apply a `* UNA GENV` line to the event above it; any other line is left alone.
+fn genv_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA GENV ") else { return Ok(()) };
+    let bad = EdlError::Syntax { line };
+    let c = clip.ok_or(bad.clone())?;
+    let w: Vec<&str> = r.split_whitespace().collect();
+    if w.is_empty() || w.len() % 2 != 0 || !c.gain_env.is_empty() {
+        return Err(bad);
+    }
+    let mut env = crate::GainEnv::EMPTY;
+    let mut last: Option<i64> = None;
+    for p in w.chunks(2) {
+        let t = parse_tc(p[0], fps, line)?;
+        let v: i32 = p[1].parse().map_err(|_| bad.clone())?;
+        if last.is_some_and(|x| t <= x) {
+            return Err(bad);
+        }
+        last = Some(t);
+        env = env.with(t, v).map_err(|_| bad.clone())?;
+    }
+    c.gain_env = env;
+    Ok(())
+}
+
+/// STRIAGAINENVELOPE: the event's `* UNA GENV` line (empty for no point).
+fn genv_line(c: &Clip, fps: u32) -> String {
+    if c.gain_env.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("* UNA GENV");
+    for (t, v) in c.gain_env.points() {
+        s.push_str(&format!(" {} {v}", timecode(*t, fps)));
+    }
+    s.push('\n');
+    s
+}
+
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    /// M3: an envelope round trips as ONE line under its event; write(parse(write)) is byte-identical; a timeline with
+    /// no point writes no line.
+    #[test]
+    fn striagainenvelope_edl_round_trip() {
+        let plain = write(&tl(), "T").unwrap();
+        assert!(!plain.contains("* UNA GENV"));
+        let e = crate::GainEnv::EMPTY.with(5, -600).unwrap().with(30, 150).unwrap();
+        let g = tl().set_gain_env(0, 0, e).unwrap();
+        let text = write(&g, "T").unwrap();
+        assert!(text.ends_with("\n* UNA GENV 00:00:00:05 -600 00:00:01:05 150\n"), "{text}");
+        let back = parse(&text, 25).unwrap();
+        assert_eq!(back, g);
+        assert_eq!(write(&back, "T").unwrap(), text);
+        assert_eq!(plain + "* UNA GENV 00:00:00:05 -600 00:00:01:05 150\n", text, "only the one line differs");
+    }
+
+    /// M3: each refusal names its line.
+    #[test]
+    fn striagainenvelope_edl_refusals() {
+        let text = write(&tl(), "T").unwrap();
+        let n = text.lines().count();
+        let with = |extra: &str| parse(&format!("{text}{extra}\n"), 25);
+        let at = n + 1;
+        assert_eq!(with("* UNA GENV"), Ok(tl()), "no space after the word: not this line (a comment)");
+        assert_eq!(with("* UNA GENV 00:00:00:05"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA GENV 00:00:00:05 -6.0"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA GENV 00:00:00:05 2401"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA GENV 00:00:00:05 0 00:00:00:05 0"), Err(EdlError::Syntax { line: at }));
+        assert_eq!(with("* UNA GENV 00:00:00:09 0 00:00:00:05 0"), Err(EdlError::Syntax { line: at }));
+        assert!(with("* UNA GENV 0 0 1 0 2 0 3 0 4 0 5 0 6 0 7 0 8 0").is_err());
+        assert_eq!(with("* UNA GENV 00:00:00:05 0\n* UNA GENV 00:00:00:06 0"), Err(EdlError::Syntax { line: at + 1 }));
+        let head = text.replace("\n\n001", "\n* UNA GENV 00:00:00:05 0\n\n001");
+        let hl = text.lines().position(|l| l.is_empty()).unwrap() + 1;
+        assert_eq!(parse(&head, 25), Err(EdlError::Syntax { line: hl }), "no event above");
+        assert_eq!(with("* UNA GENV 00:00:00:05 -300").map(|t| t.tracks[0].clips[0].gain_env.points().to_vec()), Ok(alloc::vec![(5, -300)]));
     }
 }

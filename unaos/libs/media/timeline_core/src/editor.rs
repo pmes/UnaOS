@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail)
+        let ph = self.playhead; if let Some(r) = self.env_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAGAINENVELOPE (SR9047): the `env` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1188,5 +1188,122 @@ mod striatrackgainthree_tests {
         assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
         assert_eq!(st.verb("track-gain a2"), Some(Err(EditError::Gain)), "lowercase: not a channel, SR864's number refusal");
         assert_eq!(st.verb("track-gainA2"), None, "not this word");
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the selected clip's gain envelope points at the playhead through the one commit (named tail block) ----
+// The words ride THE verb dispatch both faces call; each acts on the selected clip under the playhead, at the playhead's
+// SOURCE tick: `env` puts a point there at the envelope's current offset (the sound unchanged), `env <dB>` sets / adds
+// one, `env-` / `env+` step it by [`GAIN_STEP_CDB`] (added at the current offset if absent), `env-del` removes it,
+// `env-clear` removes every point (no playhead needed). Each is ONE commit through `Timeline::set_gain_env`; the same
+// envelope commits nothing. Refused: no selected clip, or the playhead outside it, `NoClip`; a bad number, an extra word, a
+// full envelope, an offset out of range or no point to remove, `Gain`.
+impl EditorState {
+    /// The selected clip's gain envelope set to `env` (`Timeline::set_gain_env`, ONE commit; the same commits nothing).
+    pub fn set_selected_gain_env(&mut self, env: crate::GainEnv) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if c.gain_env == env {
+            return Ok(());
+        }
+        let tl = self.timeline.set_gain_env(track, idx, env)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `env` words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn env_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let word = w.next().filter(|w| matches!(*w, "env" | "env-" | "env+" | "env-del" | "env-clear"))?;
+        let (arg, extra) = (w.next(), w.next());
+        Some(self.env_word(word, arg, extra.is_some()))
+    }
+    fn env_word(&mut self, word: &str, arg: Option<&str>, extra: bool) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if extra || (arg.is_some() && word != "env") {
+            return Err(EditError::Gain);
+        }
+        if word == "env-clear" {
+            return self.set_selected_gain_env(crate::GainEnv::EMPTY);
+        }
+        if !c.covers(self.playhead) {
+            return Err(EditError::NoClip);
+        }
+        let s = c.src_tick(self.playhead);
+        let (e, cur) = (c.gain_env, c.gain_env.at(s));
+        let next = match (word, arg) {
+            ("env", None) => e.with(s, cur),
+            ("env", Some(db)) => cdb_of(db).ok_or(EditError::Gain).and_then(|cdb| e.with(s, cdb)),
+            ("env-", _) => e.with(s, cur.saturating_sub(GAIN_STEP_CDB)),
+            ("env+", _) => e.with(s, cur.saturating_add(GAIN_STEP_CDB)),
+            _ => e.without(s),
+        }?;
+        self.set_selected_gain_env(next)
+    }
+}
+
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// A1: A 10..30 at tick 5 (source tick = tick + 5), selected, the playhead at 10.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 10, 30, 5)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.seek(10);
+        st
+    }
+
+    fn pts(st: &EditorState) -> Vec<(i64, i32)> {
+        st.timeline.tracks[0].clips[0].gain_env.points().to_vec()
+    }
+
+    /// M3: each word one undo step at the playhead's SOURCE tick; the same envelope commits nothing; undo restores.
+    #[test]
+    fn striagainenvelope_words() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("env -6"), Some(Ok(())));
+        assert_eq!((pts(&st), st.undo_depth()), (alloc::vec![(15, -600)], 1));
+        assert_eq!(st.verb("env -6.0"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same envelope commits nothing");
+        st.seek(20);
+        assert_eq!(st.verb("env"), Some(Ok(())));
+        assert_eq!(pts(&st), alloc::vec![(15, -600), (25, -600)], "bare: the current (held) offset");
+        assert_eq!(st.verb("env+"), Some(Ok(())));
+        assert_eq!(pts(&st), alloc::vec![(15, -600), (25, -500)]);
+        assert_eq!(st.verb("env-"), Some(Ok(())));
+        assert_eq!(pts(&st), alloc::vec![(15, -600), (25, -600)]);
+        assert_eq!(st.verb("env-del"), Some(Ok(())));
+        assert_eq!(pts(&st), alloc::vec![(15, -600)]);
+        assert_eq!(st.verb("env-clear"), Some(Ok(())));
+        assert_eq!((pts(&st), st.undo_depth()), (alloc::vec![], 6));
+        assert_eq!(st.verb("env-clear"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 6, "nothing to clear commits nothing");
+        for _ in 0..6 {
+            st.undo();
+        }
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// M3: refusals by name leave the state.
+    #[test]
+    fn striagainenvelope_refusals() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        for (w, e) in [("env x", EditError::Gain), ("env -6 1", EditError::Gain), ("env- 3", EditError::Gain), ("env-del", EditError::Gain), ("env 25", EditError::Gain)] {
+            assert_eq!(st.verb(w), Some(Err(e)), "{w}");
+        }
+        st.seek(30);
+        assert_eq!(st.verb("env"), Some(Err(EditError::NoClip)), "the playhead past the clip");
+        st.deselect();
+        st.seek(10);
+        assert_eq!(st.verb("env"), Some(Err(EditError::NoClip)));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
+        assert_eq!(st.verb("envelope"), None);
     }
 }

@@ -190,6 +190,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
         ["track-gain", ch, db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {ch} {db}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain:A2:-6` the named track
         [w @ ("track-gain-" | "track-gain+"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain-:A2` / `track-gain+:V1`
+        ["env", db] => SMessage::Input { target: SURFACE.into(), text: format!("env {db}") }, // STRIAGAINENVELOPE (SR9047): `env:-6` a gain point at the playhead
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -524,6 +525,7 @@ fn transport() -> TetraNode {
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
         button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
+        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -1020,5 +1022,37 @@ mod striatrackgainthree_tests {
         assert_eq!(drive(&mut face, "track-gain:A9:-6"), vec![format!("track-gain A9 -6: {}", timeline_core::EditError::NoTrack)]);
         assert_eq!(face.state.undo_depth(), 3);
         println!("striatrackgainthree witness: track-gain:A1:-6 -> A1 -6.0 dB, +1 step, unity; A9 -> {}", timeline_core::EditError::NoTrack);
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the `env:<dB>` token and the Env buttons (named tail block) ----
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+
+    /// M3: the four Env buttons are on the row (help still last); `at:12:1,env:-6` puts a -6 dB point on the selected A1
+    /// clip at the playhead's source tick (one undo step, no error line); `env+` steps it; `env-del` removes it; `env:x` is
+    /// refused by name.
+    #[test]
+    fn striagainenvelope_witness_env() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        for w in ["env", "env-", "env+", "env-del"] {
+            assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == w)), "{w}");
+        }
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:1,env:-6").is_empty());
+        let c = face.state.selected().unwrap();
+        let s = c.src_tick(face.state.playhead);
+        assert_eq!((c.gain_env.points(), face.state.undo_depth()), (&[(s, -600)][..], 1));
+        assert!(face.note.as_deref().is_some_and(|n| n.starts_with("env: -6.0 dB at ")));
+        assert!(drive(&mut face, "env+").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(s, -500)]);
+        assert!(drive(&mut face, "env-del").is_empty());
+        assert!(face.state.selected().unwrap().gain_env.is_empty());
+        assert_eq!(drive(&mut face, "env:x"), vec![format!("env x: {}", timeline_core::EditError::Gain)]);
+        assert_eq!(face.state.undo_depth(), 3);
+        println!("striagainenvelope witness: at:12:1,env:-6 -> ({s}, -600); env+ -> -500; env-del -> empty; env:x -> {}", timeline_core::EditError::Gain);
     }
 }

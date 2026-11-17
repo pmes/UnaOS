@@ -99,6 +99,8 @@ pub struct Clip {
     pub fade_in: i64,
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
+    /// STRIAGAINENVELOPE (SR9047): the clip's gain keyframes on its SOURCE ticks, centi-dB offsets over `gain_cdb` (empty = the flat gain).
+    pub gain_env: GainEnv,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -107,7 +109,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, gain_env: GainEnv::EMPTY }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -1727,5 +1729,161 @@ mod striatrackgainkeysnext_tests {
             assert_eq!(tl.track_named(bad), None, "{bad}");
         }
         assert_eq!(tl.track_name(4), None);
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): a clip's gain keyframes on its source ticks (named tail block) ----
+// A clip carries up to [`GAIN_ENV_MAX`] points `(source tick, centi-dB offset)`, ticks strictly increasing, each offset in
+// `GAIN_MIN_CDB..=GAIN_MAX_CDB`. The heard gain at source tick `s` is `gain_cdb + gain_env.at(s)` (plus the track's):
+// linear in centi-dB between two points, held before the first and after the last, 0 when empty. The points sit on
+// SOURCE ticks so a split, trim or move (update syntax copies the field) keeps them on the same audio. A fixed array keeps
+// `Clip` `Copy`; the fields are private so the invariant lives in [`GainEnv::with`] / [`GainEnv::without`].
+
+/// STRIAGAINENVELOPE (SR9047): the most points one clip's envelope holds.
+pub const GAIN_ENV_MAX: usize = 8;
+
+/// STRIAGAINENVELOPE (SR9047): a clip's gain envelope (see the block comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GainEnv {
+    n: u8,
+    pts: [(i64, i32); GAIN_ENV_MAX],
+}
+
+impl GainEnv {
+    /// No point: the flat gain.
+    pub const EMPTY: GainEnv = GainEnv { n: 0, pts: [(0, 0); GAIN_ENV_MAX] };
+    /// The points, in tick order.
+    pub fn points(&self) -> &[(i64, i32)] {
+        &self.pts[..self.n as usize]
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// The same envelope with a point at source tick `src_t` of `cdb` (the point already there takes the value). Refused:
+    /// `Negative` for a negative tick, `Gain` for an offset out of range or a full envelope.
+    pub fn with(self, src_t: i64, cdb: i32) -> Result<GainEnv, EditError> {
+        if src_t < 0 {
+            return Err(EditError::Negative);
+        }
+        if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&cdb) {
+            return Err(EditError::Gain);
+        }
+        let mut e = self;
+        let n = e.n as usize;
+        let i = e.pts[..n].iter().position(|p| p.0 >= src_t).unwrap_or(n);
+        if i < n && e.pts[i].0 == src_t {
+            e.pts[i].1 = cdb;
+            return Ok(e);
+        }
+        if n == GAIN_ENV_MAX {
+            return Err(EditError::Gain);
+        }
+        let mut j = n;
+        while j > i {
+            e.pts[j] = e.pts[j - 1];
+            j -= 1;
+        }
+        e.pts[i] = (src_t, cdb);
+        e.n += 1;
+        Ok(e)
+    }
+    /// The same envelope without its point at source tick `src_t`; `Gain` when no point sits there.
+    pub fn without(self, src_t: i64) -> Result<GainEnv, EditError> {
+        let n = self.n as usize;
+        let i = self.pts[..n].iter().position(|p| p.0 == src_t).ok_or(EditError::Gain)?;
+        let mut e = self;
+        for j in i..n - 1 {
+            e.pts[j] = e.pts[j + 1];
+        }
+        e.pts[n - 1] = (0, 0);
+        e.n -= 1;
+        Ok(e)
+    }
+    /// The offset (centi-dB) at source tick `src_t`: linear between points (truncating toward zero), held at both ends,
+    /// 0 when empty.
+    pub fn at(&self, src_t: i64) -> i32 {
+        let p = self.points();
+        let (Some(first), Some(last)) = (p.first(), p.last()) else { return 0 };
+        if src_t <= first.0 {
+            return first.1;
+        }
+        if src_t >= last.0 {
+            return last.1;
+        }
+        let i = p.iter().rposition(|q| q.0 <= src_t).unwrap_or(0);
+        let ((s0, v0), (s1, v1)) = (p[i], p[i + 1]);
+        (v0 as i64 + (v1 - v0) as i64 * (src_t - s0) / (s1 - s0)) as i32
+    }
+    /// The largest offset (0 when empty).
+    pub fn peak(&self) -> i32 {
+        self.points().iter().map(|p| p.1).max().unwrap_or(0)
+    }
+    /// True when source tick `src_t` lies in a RAMPING segment: between two neighbouring points of different value
+    /// (from the first's tick, up to but not including the second's).
+    pub fn ramps(&self, src_t: i64) -> bool {
+        self.points().windows(2).any(|w| w[0].0 <= src_t && src_t < w[1].0 && w[0].1 != w[1].1)
+    }
+}
+
+impl Clip {
+    /// STRIAGAINENVELOPE (SR9047): the source tick heard at timeline tick (edge) `t` (past the ends too).
+    pub fn src_tick(&self, t: i64) -> i64 {
+        self.src_in + (t - self.at)
+    }
+}
+
+impl Timeline {
+    /// STRIAGAINENVELOPE (SR9047): set a clip's gain envelope.
+    pub fn set_gain_env(&self, track: usize, idx: usize, env: GainEnv) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.gain_env = env;
+        tl.validate()?;
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+
+    /// M3: points insert sorted, a point at the same tick takes the new value, removal and refusals by name; `at` is
+    /// linear in cdB between points and held at both ends; `peak` / `ramps`; a new clip's envelope is empty.
+    #[test]
+    fn striagainenvelope_points_and_value() {
+        assert!(Clip::new(SourceId(0), 0, 10, 0).gain_env.is_empty());
+        assert_eq!(GainEnv::default(), GainEnv::EMPTY);
+        let e = GainEnv::EMPTY.with(20, 0).unwrap().with(10, -600).unwrap();
+        assert_eq!(e.points(), &[(10, -600), (20, 0)]);
+        assert_eq!((e.at(0), e.at(10), e.at(15), e.at(20), e.at(99)), (-600, -600, -300, 0, 0));
+        assert_eq!(e.peak(), 0);
+        assert!(!e.ramps(9) && e.ramps(10) && e.ramps(19) && !e.ramps(20));
+        let e2 = e.with(20, -600).unwrap();
+        assert_eq!((e2.points(), e2.peak(), e2.ramps(15)), (&[(10, -600), (20, -600)][..], -600, false));
+        assert_eq!(e.without(10).unwrap().points(), &[(20, 0)]);
+        assert_eq!(e.without(11), Err(EditError::Gain));
+        assert_eq!(e.with(-1, 0), Err(EditError::Negative));
+        assert_eq!(e.with(5, GAIN_MAX_CDB + 1), Err(EditError::Gain));
+        let mut full = GainEnv::EMPTY;
+        for k in 0..GAIN_ENV_MAX as i64 {
+            full = full.with(k, 0).unwrap();
+        }
+        assert_eq!(full.with(99, 0), Err(EditError::Gain));
+        assert!(full.with(3, -100).is_ok(), "a full envelope still moves a point it has");
+        assert_eq!(GainEnv::EMPTY.at(5), 0);
+    }
+
+    /// M3: set_gain_env sets one clip and a split keeps the points on both halves (source ticks).
+    #[test]
+    fn striagainenvelope_set_and_split() {
+        let mut tl = Timeline::new(25);
+        let s = tl.add_source("A", 50);
+        let a = tl.add_track(Kind::Audio);
+        tl.tracks[a].clips.push(Clip::new(s, 0, 20, 0));
+        let e = GainEnv::EMPTY.with(5, -600).unwrap();
+        let tl = tl.set_gain_env(a, 0, e).unwrap();
+        assert_eq!(tl.tracks[a].clips[0].gain_env, e);
+        assert_eq!(tl.set_gain_env(a, 3, e), Err(EditError::NoClip));
+        let sp = tl.split(a, 10).unwrap();
+        assert!(sp.tracks[a].clips.iter().all(|c| c.gain_env == e));
     }
 }

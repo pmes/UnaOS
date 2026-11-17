@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 36] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mute", "solo", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "track-gain-", "track-gain+", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help
+pub const VERBS: [&str; 40] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mute", "solo", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "track-gain-", "track-gain+", "env", "env-", "env+", "env-del", "help"]; // STRIAGAINENVELOPE (SR9047): the selected clip's gain envelope point at the playhead (timeline_core's verb; the note in the file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail)
+        if let Some(r) = self.env_face_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIAGAINENVELOPE (SR9047): the env words and their note (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3187,6 +3187,26 @@ impl Face {
             Some(Ok(())) => {
                 let tl = &self.state.timeline;
                 self.note = track.and_then(|t| tl.tracks.get(t).map(|tr| format!("{word}: {} {}", track_word(tl, t), if (if word == "solo" { tr.solo } else { tr.muted }) { "on" } else { "off" })));
+            }
+            Some(Err(e)) => self.last_error = Some(format!("{v}: {e}")),
+            None => return None,
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the gain envelope words and their note (named tail block) ----
+// `env [<dB>]` / `env-` / `env+` / `env-del` / `env-clear` ride timeline_core's ONE verb dispatch (`set_selected_gain_env`
+// through the one commit). After an edit the NOTE reads `env: <db_words> at <playhead>, <n> points` (the envelope's offset
+// at the playhead's source tick, the point count); a refusal stays `<the word as typed>: <EditError>` on `last_error`.
+impl Face {
+    /// The env words and their note; `None` for any other word.
+    fn env_face_verb(&mut self, v: &str) -> Option<bool> {
+        v.split_ascii_whitespace().next().filter(|w| matches!(*w, "env" | "env-" | "env+" | "env-del" | "env-clear"))?;
+        match self.state.verb(v) {
+            Some(Ok(())) => {
+                let ph = self.state.playhead;
+                self.note = self.state.selected().map(|c| format!("env: {} at {ph}, {} points", db_words(c.gain_env.at(c.src_tick(ph))), c.gain_env.points().len()));
             }
             Some(Err(e)) => self.last_error = Some(format!("{v}: {e}")),
             None => return None,
