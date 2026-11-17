@@ -286,7 +286,7 @@ impl Face {
             return true;
         }
         if !self.play_tick(ph) { self.feed_meters(ph, self.rate); self.state.nudge(self.rate); } // NLEPLAYAUDIO (SR676): a forward played tick is ONE render, shown at its own playhead
-        true
+        !std::mem::take(&mut self.play.pace.held) // STRIAPLAYSYNCPACE (SR9055): a held tick (the still waits for the AudioClock) asks no repaint (file tail)
     }
     /// The canvas as painted now (the preview at the playhead rendered first). While a drag is live the drag's
     /// preview state ([`Drag::shown`]) is painted: the edit as it would commit, the timeline itself untouched.
@@ -1765,7 +1765,7 @@ struct PlayAudio {
     pushed: u64,
     run_base: u64,
     run_pushed: u64,
-    rate: u32, stretch: Option<ShuttleStretch>, rev_next: Option<i64>, sync: PlaySync, // STRIAJKLNEXT (SR987): the A/V offset against consumed (file tail); STRIAJKLTRANSPORT (SR873): the shuttle's ONE stretch (file tail); STRIAJKLMORE (SR945): two stages past 4x, and where the last reverse render began (file tail)
+    rate: u32, stretch: Option<ShuttleStretch>, rev_next: Option<i64>, sync: PlaySync, pace: PlayPace, // STRIAPLAYSYNCPACE (SR9055): the shown still paced to the AudioClock (file tail); STRIAJKLNEXT (SR987): the A/V offset against consumed (file tail); STRIAJKLTRANSPORT (SR873): the shuttle's ONE stretch (file tail); STRIAJKLMORE (SR945): two stages past 4x, and where the last reverse render began (file tail)
 }
 
 impl PlayAudio {
@@ -1842,7 +1842,7 @@ impl Face {
         if want == self.play.live {
             return;
         }
-        self.play.live = want; self.sync_run(want); // STRIAJKLNEXT (SR987): a heard run starts / ends its A/V measurement (file tail)
+        self.play.live = want; self.sync_run(want); self.pace_run(want); // STRIAJKLNEXT (SR987): a heard run starts / ends its A/V measurement (file tail); STRIAPLAYSYNCPACE (SR9055): and its pacing (file tail)
         let rate = self.play.rate;
         let Some(o) = self.play.out.as_mut() else { return };
         if want {
@@ -1900,7 +1900,7 @@ impl Face {
                 self.meters.reset();
             }
         }
-        (self.play.shown, self.play.next) = (Some(ph), Some(end)); self.play.rev_next = None; // STRIAJKLMORE (SR945): a forward tick ends a reverse run (the next reverse tick flushes)
+        (self.play.shown, self.play.next) = (Some(ph), Some(end)); self.play.rev_next = None; self.pace(end); // STRIAPLAYSYNCPACE (SR9055): the still shown when the AudioClock reaches it (file tail); STRIAJKLMORE (SR945): a forward tick ends a reverse run (the next reverse tick flushes)
         true
     }
 }
@@ -3635,7 +3635,7 @@ impl Face {
         if !jump && s.clock.is_some() {
             if let Some(c) = s.clock.as_mut() {
                 c.on_played(consumed.saturating_sub(s.seen));
-                s.meter.av_offset(pts, c.media_ns());
+                // STRIAPLAYSYNCPACE (SR9055): the offset is recorded when the still is presented, `Face::pace` (file tail)
             }
             s.seen = consumed;
         } else {
@@ -3734,5 +3734,234 @@ mod striajklnext_tests {
             assert!(f.tick());
         }
         assert_eq!(f.play_sync().av_count, 0);
+    }
+}
+
+// ---- STRIAPLAYSYNCPACE (LEDGER SR9055): NLEPLAY-SYNC-PACE, the played still shown at the AudioClock's tick (named tail block) ----
+// The render and push cadence stay as they are (the device ring keeps its fill); only what is SHOWN is paced. Each forward 1x
+// heard tick's rendered still is queued with its tick and end; the parent's ONE AudioClock (as `sync_mark` fed it before the
+// push) and ONE gneiss_pal `avsync::Scheduler` (early = half a timeline frame, media.rs's `Player::tick` loop shape) decide
+// Present / Wait / Drop for the queue's head. The presented tick becomes the playhead and the paint's `pending`, and the
+// parent's DriftMeter records ITS pts against the clock; nothing presented holds the playhead and `shown` on the last
+// presented tick and `tick` returns false (no repaint: the glass holds). More than PACE_HOLD queued stills present the head
+// regardless, so a stalled device delays the picture by at most PACE_HOLD ticks and never freezes it. No clock (no device,
+// muted, paused, shuttle, reverse): pass-through, the queue cleared. Wire: `[STRIA] :: nle play pace presented= dropped=
+// held= queued_max=` once per heard run; `Face::play_pace`. Owed: NLEPLAY-SYNC-PACE-TAIL (the queued stills at the
+// timeline's end are not shown), NLEPLAY-PACE-STILLMEM (the queue holds full render frames).
+
+/// STRIAPLAYSYNCPACE (SR9055): the most stills the pace holds back: half a second at 25 fps, the depth of
+/// `media::resonance_out`'s ring (sample_rate / 2 frames). Past it the head is shown regardless (a stalled device).
+pub const PACE_HOLD: usize = 12;
+
+/// STRIAPLAYSYNCPACE (SR9055): the rendered stills not yet shown (tick, end, still), the one Scheduler, where the queue's last
+/// render ended, the presented tick (tick, end), whether the next presentation is a run's seed (not recorded), whether this
+/// tick held, and the deepest the queue went.
+struct PlayPace {
+    queue: std::collections::VecDeque<(i64, i64, Option<Still>)>,
+    sched: gneiss_pal::dsp::avsync::Scheduler,
+    next: Option<i64>,
+    on: Option<(i64, i64)>,
+    fresh: bool,
+    held: bool,
+    queued_max: usize,
+}
+
+impl Default for PlayPace {
+    fn default() -> Self {
+        PlayPace { queue: std::collections::VecDeque::new(), sched: gneiss_pal::dsp::avsync::Scheduler::new(0), next: None, on: None, fresh: true, held: false, queued_max: 0 }
+    }
+}
+
+impl Face {
+    /// STRIAPLAYSYNCPACE (SR9055): after a forward played tick at `shown` rendered to `end`: queue its still and show the
+    /// head the AudioClock has reached (Scheduler::decide), or hold the last presented tick. Pass-through without a clock.
+    fn pace(&mut self, end: i64) {
+        use gneiss_pal::dsp::avsync::{Decision, Scheduler};
+        let Some(ph) = self.play.shown else { return };
+        let pending = self.play.pending.take();
+        let (now, still) = match (self.play.sync.clock.as_ref().map(|c| c.media_ns()), pending) {
+            (Some(now), Some((at, s))) if at == ph => (now, s),
+            (_, p) => {
+                self.play.pending = p;
+                let pace = &mut self.play.pace;
+                pace.queue.clear();
+                (pace.next, pace.on, pace.fresh) = (None, None, true);
+                return;
+            }
+        };
+        let tb = &self.state.timeline.tb;
+        let pace = &mut self.play.pace;
+        if pace.next != Some(ph) {
+            pace.queue.clear();
+            pace.fresh = true;
+            pace.sched = Scheduler::new((tb.to_ns(1) / 2).max(0) as u64);
+        }
+        pace.next = Some(end);
+        pace.queue.push_back((ph, end, still));
+        pace.queued_max = pace.queued_max.max(pace.queue.len());
+        let mut shown = None;
+        while let Some(t) = pace.queue.front().map(|q| q.0) {
+            let pts = tb.to_ns(t);
+            let next = pace.queue.get(1).map(|q| tb.to_ns(q.0));
+            let d = if pace.queue.len() > PACE_HOLD {
+                pace.sched.stats.presented += 1;
+                Decision::Present
+            } else {
+                pace.sched.decide(pts, next, now)
+            };
+            match d {
+                Decision::Wait(_) => break,
+                Decision::Drop => {
+                    pace.queue.pop_front();
+                }
+                Decision::Present => {
+                    shown = pace.queue.pop_front().map(|(t, e, s)| (pts, t, e, s));
+                    break;
+                }
+            }
+        }
+        pace.sched.on_display_tick(shown.is_none() && pace.on.is_some());
+        match shown {
+            Some((pts, t, e, s)) => {
+                if !pace.fresh {
+                    self.play.sync.meter.av_offset(pts, now);
+                }
+                pace.fresh = false;
+                pace.on = Some((t, e));
+                self.play.pending = Some((t, s));
+                self.play.shown = Some(t);
+                self.state.seek(t);
+            }
+            None => {
+                pace.held = true;
+                if let Some((t, _)) = pace.on {
+                    self.play.shown = Some(t);
+                    self.state.seek(t);
+                }
+            }
+        }
+    }
+    /// STRIAPLAYSYNCPACE (SR9055): a heard run starts (a fresh pace) or ends: the next resume steps ONE frame from the presented
+    /// tick (not from the render cursor ahead of it), the run's counts are logged once and the queue is dropped.
+    fn pace_run(&mut self, live: bool) {
+        if live {
+            self.play.pace = PlayPace::default();
+            return;
+        }
+        if let Some((t, e)) = self.play.pace.on {
+            if self.play.shown == Some(t) {
+                self.play.next = Some(e);
+            }
+        }
+        let st = self.play.pace.sched.stats;
+        if st.presented > 0 {
+            log::info!("[STRIA] :: nle play pace presented={} dropped={} held={} queued_max={}", st.presented, st.dropped, st.repeated, self.play.pace.queued_max);
+        }
+        let pace = &mut self.play.pace;
+        pace.queue.clear();
+        (pace.next, pace.on, pace.fresh, pace.held) = (None, None, true, false);
+    }
+    /// STRIAPLAYSYNCPACE (SR9055): the current (or last) heard run's pace: stills presented, dropped, and ticks held.
+    pub fn play_pace(&self) -> gneiss_pal::dsp::avsync::SchedStats {
+        self.play.pace.sched.stats
+    }
+}
+
+#[cfg(test)]
+mod striaplaysyncpace_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::SYNTH_RATE;
+    use std::sync::{Arc, Mutex};
+
+    /// The tests' device: takes every sample; `consumed` lags what was pushed by `lag` frames.
+    struct Out {
+        pushed: Arc<Mutex<u64>>,
+        lag: u64,
+    }
+    impl AudioOut for Out {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            *self.pushed.lock().unwrap() += (stereo.len() / 2) as u64;
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.pushed.lock().unwrap().saturating_sub(self.lag)
+        }
+    }
+
+    fn face(lag: u64) -> Face {
+        let (tl, src) = synth_fixture();
+        let out = Out { pushed: Arc::new(Mutex::new(0)), lag };
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(out), SYNTH_RATE)
+    }
+
+    /// STRIAPLAYSYNCPACE M3: a device 5760 frames behind (120 ms, three frames at 25 fps): tick 1 seeds and shows 0, ticks
+    /// 2-4 hold the picture on 0 (no repaint), then every tick shows the next frame at the clock: offsets 0.
+    #[test]
+    fn striaplaysyncpace_holds_ring_lead() {
+        let mut f = face(5760);
+        f.verb("play");
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 0);
+        for n in 2..=4 {
+            assert!(!f.tick(), "tick {n} holds");
+            assert_eq!(f.state.playhead, 0, "tick {n}");
+        }
+        for n in 5..=8 {
+            assert!(f.tick(), "tick {n} shows");
+            assert_eq!(f.state.playhead, n - 4, "tick {n}");
+        }
+        let r = f.play_sync();
+        assert_eq!((r.av_count, r.av_max_ns), (4, 0), "{r:?}");
+        assert_eq!(f.play_pace().repeated, 3);
+    }
+
+    /// STRIAPLAYSYNCPACE M3: a stalled device (nothing consumed): the picture holds PACE_HOLD ticks, then moves one frame a
+    /// tick, the queue never deeper than PACE_HOLD.
+    #[test]
+    fn striaplaysyncpace_stalled_device_moves() {
+        let mut f = face(u64::MAX);
+        f.verb("play");
+        assert!(f.tick());
+        for n in 2..=(PACE_HOLD + 1) {
+            assert!(!f.tick(), "tick {n} holds");
+            assert_eq!(f.state.playhead, 0);
+        }
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 1);
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 2);
+        assert_eq!(f.play.pace.queue.len(), PACE_HOLD);
+    }
+
+    /// STRIAPLAYSYNCPACE M3: no device: every tick shows its own render, nothing queued (today's path).
+    #[test]
+    fn striaplaysyncpace_no_device_passthrough() {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        f.verb("play");
+        for n in 0..3 {
+            assert!(f.tick());
+            assert_eq!(f.state.playhead, n);
+            assert!(f.play.pace.queue.is_empty());
+        }
+    }
+
+    /// STRIAPLAYSYNCPACE M3: stopped while the picture held on 0 (the render cursor at 4): play again shows frame 1, one
+    /// frame from what was seen.
+    #[test]
+    fn striaplaysyncpace_resume_one_frame() {
+        let mut f = face(5760);
+        f.verb("play");
+        for _ in 0..4 {
+            f.tick();
+        }
+        assert_eq!(f.state.playhead, 0);
+        assert!(f.on(&SMessage::BrowserText("k".into())));
+        assert!(!f.playing);
+        assert_eq!(f.state.playhead, 0);
+        f.verb("play");
+        assert!(f.tick());
+        assert_eq!(f.state.playhead, 1);
     }
 }
