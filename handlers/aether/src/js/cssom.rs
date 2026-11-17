@@ -1131,7 +1131,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
-    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); } if prop == "text-decoration" { if let Some(v) = text_decoration_computed(el) { return v; } }
+    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); } if report_covered(prop) { if let Some(v) = shorthand_computed(el, prop) { return v; } }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -2912,11 +2912,12 @@ fn shorthand_from(sh: &str, value_of: impl Fn(&str) -> String) -> Option<String>
 /// AETHERCSSOMSHORTHANDCOMPUTED (SR1092): a shorthand's computed value is the serialization of its longhands' computed
 /// values (each through [`computed_value`]: report column, cascaded, inherited or initial on its own) — the SR764
 /// `font_synthesis_computed` road generalised. `computed_value` takes it at its fallback, so an undeclared or partly
-/// declared shorthand (`margin-top: 5px` alone) composes (`5px 0px 0px`) and a fully declared one keeps its cascaded
-/// read. None where a longhand has no computed value or the grammar does not serialize (border with no colour row;
-/// owed AETHER-CSSOM-BORDER-COMPUTED).
+/// declared shorthand (`margin-top: 5px` alone) composes (`5px 0px 0px`); SR1125: a [`report_covered`] row takes it
+/// BEFORE the cascaded read, so a declared `margin: 1em` reads `16px`. ONE match: text-decoration keeps SR1113's composer,
+/// border / border-<side> / outline the all-parts form ([`border_computed`]), the rest the generic serialization.
+/// None where a longhand has no computed value or the grammar does not serialize.
 fn shorthand_computed(el: usize, sh: &str) -> Option<String> {
-    shorthand_from(sh, |l| computed_value(el, l))
+    match sh { "text-decoration" => text_decoration_computed(el), "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "outline" => border_computed(el, sh), _ => shorthand_from(sh, |l| computed_value(el, l)) } // SR1125
 }
 
 #[cfg(test)]
@@ -2966,15 +2967,15 @@ mod shorthand_computed_tests {
             ("a", "flex", "0 1 auto"),
             ("a", "border-width", "0px"),
             ("a", "border-style", "none"),
-            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: border / outline / background still
-            // have a longhand with no computed row, so they read "".
-            ("a", "border", ""),
+            // Owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: outline / background still have a longhand with no computed row, so
+            // they read "".
+            ("a", "border", "0px none rgb(0, 0, 0)"), // SR1125: the four sides' columns, all parts kept (Chromium's computed border)
             ("a", "border-color", "rgb(0, 0, 0)"), // SR1104: the four colour longhands are report columns, so border-color composes
             ("a", "outline", ""),
             ("a", "background", ""),
             ("o", "overflow", "hidden visible"),
-            // A fully declared shorthand keeps the cascaded road (the composition sits at the fallback).
-            ("f", "margin", "1em"),
+            // SR1125: a fully declared report-covered shorthand composes from its columns before the cascaded road.
+            ("f", "margin", "16px"),
             ("p", "place-items", "center"),
             ("s", "font-synthesis", "style small-caps"),
         ] {
@@ -3121,5 +3122,55 @@ mod text_decoration_shorthand_tests {
         assert_eq!(camel("text-underline-position"), "textUnderlinePosition");
         assert_eq!(prop_from_attr("textUnderlinePosition"), "text-underline-position");
         assert!(PROPERTIES.windows(2).all(|w| w[0] < w[1]), "PROPERTIES stays sorted");
+    }
+}
+
+// ---- AETHERCSSOMREPORTSHORTHANDCOMPUTED (LEDGER SR1125): a shorthand whose longhands are all report columns composes from the columns before the cascaded read (named tail block) ----
+
+/// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): every longhand of the [`SHORTHANDS`] row is a report column (`border`: its
+/// first 12; the border-image tail has no column and Chromium's computed border ignores it). False for every longhand.
+fn report_covered(sh: &str) -> bool {
+    let n = if sh == "border" { 12 } else { usize::MAX };
+    longhands(sh).is_some_and(|ls| ls.iter().take(n).all(|l| crate::css::REPORT_PROPS.contains(&l.as_str())))
+}
+
+/// AETHERCSSOMREPORTSHORTHANDCOMPUTED (SR1125): Chromium's computed form of a component shorthand keeps every part
+/// (`0px none rgb(0, 0, 0)`, row order); `border` is border-top's value when the four sides agree, else "".
+fn border_computed(el: usize, sh: &str) -> Option<String> {
+    let rows: Vec<&str> = if sh == "border" { vec!["border-top", "border-right", "border-bottom", "border-left"] } else { vec![sh] };
+    let sides: Vec<Vec<String>> = rows.iter().map(|r| longhands(r).unwrap_or_default().iter().map(|l| computed_value(el, l)).collect()).collect();
+    if sides.iter().flatten().any(|v| v.is_empty()) { return None; }
+    Some(if sides.iter().all(|s| *s == sides[0]) { sides[0].join(" ") } else { String::new() })
+}
+
+#[cfg(test)]
+mod report_shorthand_computed_tests {
+    use super::*;
+
+    /// The rows whose longhands are all report columns on this tree (45 columns), and rows that are not.
+    #[test]
+    fn cssom_report_shorthand_computed_covered_rows() {
+        for sh in [
+            "margin", "padding", "border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom",
+            "border-left", "text-decoration", "border",
+        ] {
+            assert!(report_covered(sh), "{sh}: covered");
+        }
+        for sh in ["inset", "background", "border-image", "place-items", "margin-top", "bogus"] {
+            assert!(!report_covered(sh), "{sh}: not covered");
+        }
+        assert!(longhands("border").unwrap()[12..].iter().all(|l| !crate::css::REPORT_PROPS.contains(&l.as_str())));
+    }
+
+    /// A declared `margin: 1em` reads the columns' px (before SR1125: the cascaded `1em`).
+    #[test]
+    fn cssom_report_shorthand_computed_declared() {
+        let html = r#"<!doctype html><html><body><div id="f" style="margin: 1em"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let v = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('f')).margin").unwrap();
+        assert_eq!(v, "16px");
     }
 }
