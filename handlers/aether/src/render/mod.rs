@@ -1075,11 +1075,11 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.color = spec.color.unwrap_or(if tag == "a" {
+    inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
         (0, 0, 238) // UA default link blue
     } else {
         inherited.color
-    });
+    }));
 }
 
 /// Draws one line's worth of text with its baseline at `baseline_y` — an
