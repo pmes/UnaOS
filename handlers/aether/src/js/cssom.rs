@@ -1330,7 +1330,7 @@ fn get_client_rects(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn box_metric(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_element(vm, ctx)?;
     let which = callee_str(vm, ctx);
-    let first = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied()));
+    let first = with_layout(|f| offset_held_first(f, el)); // AETHERCSSOMOFFSETTOPSTICKY (SR1149): the origin at a stuck sticky root's held place
     let Some((x, y, w, h)) = first else { return Ok(num(0.0)) };
     let (bt, bl, br, bb) = with_layout(|f| {
         // borders from the taffy layout of this element's box
@@ -1367,7 +1367,7 @@ fn box_metric(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             let is_body = parent.is_some_and(|p| with_doc(|d| dom::is_html_tag(d, p, "body")));
             match parent.filter(|_| !is_body) {
                 Some(p) => {
-                    let pr = with_layout(|f| f.boxes.get(&NodeId(p)).and_then(|v| v.first().copied()));
+                    let pr = with_layout(|f| offset_held_first(f, p)); // AETHERCSSOMOFFSETTOPSTICKY (SR1149): the offsetParent through the same hold
                     let pb = border_of(p);
                     match pr {
                         Some(r) => {
@@ -2839,4 +2839,17 @@ fn sticky_held_at(f: &Flushed, id: NodeId, x: f32, y: f32, scroll: (f64, f64)) -
     let (vw, vh) = page(|p| p.viewport);
     let (hx, hy) = crate::render::placed_origin(&f.tree, root, ax, ay, l, vw as u32, vh as u32, scroll.0 as i32, scroll.1 as i32);
     (x + hx - (ax + l.location.x), y + hy - (ay + l.location.y))
+}
+
+// ---- AETHERCSSOMOFFSETTOPSTICKY (LEDGER SR1149): offsetTop / offsetLeft read a stuck sticky box at its held place (named tail block) ----
+
+/// AETHERCSSOMOFFSETTOPSTICKY (SR1149): element `el`'s first border-box rect in document space with its origin through
+/// SR1144's ONE read-time hold ([`sticky_held_at`] at the page's scroll: document space, before any scroll subtraction),
+/// so `box_metric`'s offsetTop / offsetLeft read a stuck sticky box (and its subtree) where it is painted, as
+/// getBoundingClientRect does. Width and height are untouched (a hold moves, it does not resize). Read for both the
+/// element and its offsetParent: inside the parent's own stuck subtree both shift equally and the difference holds.
+fn offset_held_first(f: &Flushed, el: usize) -> Option<(f32, f32, f32, f32)> {
+    let (x, y, w, h) = f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())?;
+    let (x, y) = sticky_held_at(f, NodeId(el), x, y, page(|p| p.scroll));
+    Some((x, y, w, h))
 }
