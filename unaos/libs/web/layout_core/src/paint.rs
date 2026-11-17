@@ -84,6 +84,12 @@ pub struct PaintStyle<H: Host> {
     /// white-space (css-text-3 §3): 0 normal, 1 nowrap, 2 pre, 3 pre-wrap,
     /// 4 pre-line, 5 break-spaces. Inherited.
     pub white_space: Option<u8>,
+    /// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): a lone `white-space-collapse` (css-text-4 §4): a representative
+    /// white-space code whose collapse half is the value; resolved over the inherited code by `css::white_space_halves`.
+    pub ws_collapse: Option<u8>,
+    /// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): a lone `text-wrap-mode` / `text-wrap`: a representative code whose
+    /// wrap half is the value (the same resolve).
+    pub ws_wrap: Option<u8>,
     /// word-break: 0 normal, 1 break-all, 2 keep-all. Inherited.
     pub word_break: Option<u8>,
     /// overflow-wrap: 0 normal, 1 break-word/anywhere. Inherited.
@@ -292,7 +298,7 @@ impl<H: Host> Default for PaintStyle<H> {
             flex_container: None,
             border_style: None,
             radius: None,
-            white_space: None,
+            white_space: None, ws_collapse: None, ws_wrap: None,
             word_break: None,
             overflow_wrap: None,
             letter_spacing: None,
@@ -902,7 +908,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "line-height" => INHERIT_LINE_HEIGHT,
         "font-family" => INHERIT_FAMILY,
         "color" => INHERIT_COLOR,
-        "white-space" | "white-space-collapse" => INHERIT_WHITE_SPACE,
+        "white-space" | "white-space-collapse" | "text-wrap-mode" | "text-wrap" => INHERIT_WHITE_SPACE,
         "direction" => INHERIT_DIRECTION,
         "list-style-type" | "list-style" => INHERIT_LIST_STYLE,
         _ => 0,
@@ -922,7 +928,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.line_height.is_some(), INHERIT_LINE_HEIGHT)
             | on(self.family.is_some(), INHERIT_FAMILY)
             | on(self.color.is_some(), INHERIT_COLOR)
-            | on(self.white_space.is_some(), INHERIT_WHITE_SPACE)
+            | on(self.white_space.is_some() || self.ws_collapse.is_some() || self.ws_wrap.is_some(), INHERIT_WHITE_SPACE)
             | on(self.rtl.is_some(), INHERIT_DIRECTION)
             | on(self.list_style.is_some(), INHERIT_LIST_STYLE)
     }
@@ -958,7 +964,7 @@ impl<H: Host> PaintStyle<H> {
             self.family = None;
         }
         if bits & INHERIT_COLOR != 0 { self.color = None; }
-        if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
+        if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; self.ws_collapse = None; self.ws_wrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
         if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; }
         self.inherit |= bits;

@@ -673,3 +673,97 @@ fn css_wide_all_list_covers_arms() {
     }
     assert!(!ALL_LONGHANDS.contains(&"direction"), "direction is excluded (css-cascade-4 §3.1)");
 }
+
+// ---- AETHERCSSOMWHITESPACELONGHANDSWRITE (LEDGER SR1044): white-space-collapse / text-wrap-mode / text-wrap write the one white-space code (named tail block) ----
+
+use layout_core::css::{white_space_from_longhands, white_space_halves, white_space_longhands};
+
+/// The code a style resolves to over a parent's `base` code (a div: no tag default), as every walker reads it.
+fn ws_over(s: &SpecifiedStyle<TH>, base: u8) -> u8 {
+    s.paint.white_space.unwrap_or_else(|| white_space_halves(Some(&s.paint), base))
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): the inverse table round-trips all six codes; the two pairs no code
+/// holds are None.
+#[test]
+fn white_space_longhands_write_table_round_trips() {
+    for c in 0..6u8 {
+        let (collapse, wrap) = white_space_longhands(c);
+        assert_eq!(white_space_from_longhands(collapse, wrap), Some(c), "code {c}");
+    }
+    assert_eq!(white_space_from_longhands("preserve-breaks", "nowrap"), None);
+    assert_eq!(white_space_from_longhands("break-spaces", "nowrap"), None);
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): `white-space: pre; text-wrap-mode: wrap` is pre-wrap (Chromium), in one
+/// block and across two rules; its nowrap is false; no half survives beside the full code.
+#[test]
+fn white_space_longhands_write_pre_then_wrap() {
+    let s = styled(&[("white-space", "pre"), ("text-wrap-mode", "wrap")]);
+    assert_eq!((s.paint.white_space, s.paint.nowrap), (Some(3), Some(false)), "one block: pre-wrap");
+    assert_eq!((s.paint.ws_collapse, s.paint.ws_wrap), (None, None));
+    let s = cascade(&[&[("white-space", "pre")], &[("text-wrap-mode", "wrap")]]);
+    assert_eq!((s.paint.white_space, s.paint.nowrap), (Some(3), Some(false)), "across rules: pre-wrap");
+    let s = cascade(&[&[("white-space", "pre-wrap")], &[("white-space-collapse", "collapse")]]);
+    assert_eq!(s.paint.white_space, Some(0), "pre-wrap with collapse is normal");
+    assert_eq!(styled(&[("white-space", "pre")]).paint.white_space, Some(2), "armed: pre alone");
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): a lone longhand holds no code: it resolves over the parent's code
+/// (`text-wrap-mode: nowrap` under pre is pre, under pre-wrap pre, under normal nowrap; `white-space-collapse: preserve`
+/// under normal is pre-wrap, pinned).
+#[test]
+fn white_space_longhands_write_lone_half_over_parent() {
+    let s = styled(&[("text-wrap-mode", "nowrap")]);
+    assert_eq!(s.paint.white_space, None, "no code at parse time");
+    assert_eq!(s.paint.nowrap, Some(true), "its nowrap");
+    assert_eq!((ws_over(&s, 2), ws_over(&s, 3), ws_over(&s, 0)), (2, 2, 1));
+    let s = styled(&[("white-space-collapse", "preserve")]);
+    assert_eq!(s.paint.nowrap, None, "a collapse half leaves nowrap to the parent");
+    assert_eq!((ws_over(&s, 0), ws_over(&s, 1)), (3, 2), "preserve over normal is pre-wrap, over nowrap pre");
+    let s = styled(&[("white-space-collapse", "preserve-breaks")]);
+    assert_eq!(ws_over(&s, 0), 4, "preserve-breaks over normal is pre-line");
+    assert_eq!(ws_over(&s, 1), 1, "a pair no code holds keeps the parent's code");
+    let s = styled(&[("text-wrap-mode", "wrap")]);
+    assert_eq!((s.paint.nowrap, ws_over(&s, 2)), (Some(false), 3), "wrap under pre is pre-wrap, nowrap false");
+    assert_eq!(ws_over(&styled(&[("padding", "1px")]), 2), 2, "armed: no half inherits as before");
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): the shorthand after a longhand wins, in one block and across rules.
+#[test]
+fn white_space_longhands_write_shorthand_wins() {
+    let s = styled(&[("text-wrap-mode", "nowrap"), ("white-space", "pre-wrap")]);
+    assert_eq!((s.paint.white_space, s.paint.nowrap, s.paint.ws_wrap), (Some(3), Some(false), None));
+    assert_eq!(ws_over(&s, 0), 3);
+    let s = cascade(&[&[("white-space-collapse", "preserve"), ("text-wrap-mode", "nowrap")], &[("white-space", "normal")]]);
+    assert_eq!((s.paint.white_space, s.paint.ws_collapse, s.paint.ws_wrap), (Some(0), None, None));
+    let s = cascade(&[&[("text-wrap-mode", "nowrap")], &[("white-space-collapse", "preserve")]]);
+    assert_eq!(ws_over(&s, 0), 2, "two lone halves from two rules combine: pre");
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): `text-wrap` sets the mode (an omitted mode is wrap: `balance` resets
+/// an earlier nowrap); a bogus value, two modes, and `white-space-collapse: pre` (a white-space word) are dropped.
+#[test]
+fn white_space_longhands_write_text_wrap_and_bogus() {
+    assert_eq!(ws_over(&styled(&[("text-wrap", "nowrap")]), 0), 1);
+    assert_eq!(ws_over(&styled(&[("text-wrap", "nowrap balance")]), 3), 2);
+    assert_eq!(styled(&[("white-space", "nowrap"), ("text-wrap", "balance")]).paint.white_space, Some(0), "balance resets the mode to wrap");
+    assert_eq!(styled(&[("white-space", "pre"), ("text-wrap", "WRAP")]).paint.white_space, Some(3), "any case");
+    for (p, v) in [("text-wrap", "bogus"), ("text-wrap", "wrap nowrap"), ("text-wrap-mode", "balance"), ("white-space-collapse", "pre"), ("white-space-collapse", "discard"), ("text-wrap-mode", "")] {
+        let s = styled(&[(p, v)]);
+        assert_eq!((s.paint.white_space, s.paint.ws_collapse, s.paint.ws_wrap, s.paint.nowrap), (None, None, None, None), "{p}: {v} dropped");
+    }
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): a later `white-space: inherit` clears the earlier halves (one block and
+/// across rules); a half after it stands over the inherited code.
+#[test]
+fn white_space_longhands_write_inherit_clears_halves() {
+    let s = styled(&[("text-wrap-mode", "nowrap"), ("white-space", "inherit")]);
+    assert_eq!((s.paint.ws_wrap, s.paint.nowrap), (None, None));
+    let s = cascade(&[&[("white-space-collapse", "preserve")], &[("white-space", "inherit")]]);
+    assert_eq!(s.paint.ws_collapse, None, "across rules");
+    assert_eq!(ws_over(&s, 0), 0);
+    let s = styled(&[("white-space", "inherit"), ("text-wrap-mode", "nowrap")]);
+    assert_eq!(ws_over(&s, 3), 2, "the parent's preserve with the later nowrap: pre");
+}

@@ -280,7 +280,7 @@ pub fn collapses_at<H: Host>(tree: &LayoutTree<H>, tid: NodeId) -> bool {
     for p in chain.into_iter().rev() {
         if let Some(dn) = tree.node_map.get(&p) {
             if let Some(tag) = dn.tag().filter(|_| dn.is_element()) {
-                cur = tree.paint_map.get(&p).and_then(|s| s.white_space).unwrap_or_else(|| crate::paint::or_tag(tree.paint_map.get(&p), crate::paint::INHERIT_WHITE_SPACE, cur, |w| crate::default_white_space(&tag, w)));
+                cur = tree.paint_map.get(&p).and_then(|s| s.white_space).unwrap_or_else(|| crate::css::white_space_halves(tree.paint_map.get(&p), crate::paint::or_tag(tree.paint_map.get(&p), crate::paint::INHERIT_WHITE_SPACE, cur, |w| crate::default_white_space(&tag, w))));
                 ws = Some(cur);
             }
         }

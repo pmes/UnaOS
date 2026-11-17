@@ -1042,7 +1042,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     }
     inherited.white_space = spec
         .white_space
-        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WHITE_SPACE, inherited.white_space, |w| crate::layout::default_white_space(tag, w)));
+        .unwrap_or_else(|| layout_core::css::white_space_halves(Some(spec), layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WHITE_SPACE, inherited.white_space, |w| crate::layout::default_white_space(tag, w))));
     if let Some(v) = spec.word_break { inherited.word_break = v; }
     if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
     if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }

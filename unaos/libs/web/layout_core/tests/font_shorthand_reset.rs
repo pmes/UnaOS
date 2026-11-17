@@ -328,7 +328,7 @@ use layout_core::paint::{INHERIT_DIRECTION, INHERIT_LIST_STYLE, INHERIT_WHITE_SP
 /// value it takes and the bit its explicit inherit sets.
 const REST_BITS: [(&str, &str, u32); 5] = [
     ("white-space", "pre", INHERIT_WHITE_SPACE),
-    ("white-space-collapse", "pre", INHERIT_WHITE_SPACE),
+    ("white-space-collapse", "preserve", INHERIT_WHITE_SPACE),
     ("direction", "rtl", INHERIT_DIRECTION),
     ("list-style-type", "square", INHERIT_LIST_STYLE),
     ("list-style", "square inside", INHERIT_LIST_STYLE),
