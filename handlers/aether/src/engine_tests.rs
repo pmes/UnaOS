@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34)
+        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7833,7 +7833,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34)
+        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37)
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8669,11 +8669,11 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34)
+        assert_eq!(crate::css::REPORT_COLS, 37); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "34"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns)
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "37"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns)
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
@@ -11467,14 +11467,14 @@ b</div>
     #[test]
     fn box_side_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 34);
+        assert_eq!(crate::css::REPORT_COLS, 37); // SR1103: three border side style columns appended after the nine
         assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
         assert_eq!(
-            &crate::css::REPORT_PROPS[25..],
+            &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
             &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
         );
         let mut e = box_side_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "34");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "37"); // SR1103
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
     }
 
@@ -11530,5 +11530,232 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginLeft"), "auto", "margin: 0 auto: margin-left");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
+    }
+
+    // ---- AETHERCSSOMNESTEDSCROLLERRECTS (LEDGER SR1154): CSSOM rects inside a scrolled panel read where the painter places them (named tail block) ----
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): 400x300, body margin 0: a 50px spacer, `#p` (position: relative, 200px tall,
+    /// overflow: auto) holding twenty 50px rows `#r0..#r19` (row k at content y 50k, document y 50 + 50k) and a fixed `#fx`
+    /// (top 5, left 300, 10x10), then a 2000px spacer `#tail`.
+    fn cssom_nested_scroller_rects_engine() -> crate::AetherEngine {
+        let rows: String = (0..20).map(|k| format!(r#"<div id="r{k}" style="height:50px"></div>"#)).collect();
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0">
+            <div id="top" style="height:50px"></div>
+            <div id="p" style="position:relative;height:200px;overflow:auto">{rows}<div id="fx" style="position:fixed;top:5px;left:300px;width:10px;height:10px"></div></div>
+            <div id="tail" style="height:2000px"></div>
+        </body></html>"#
+        );
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a wheel of `dy` with the pointer at viewport (`px`, `py`), then a repaint and
+    /// the shell's per-turn `tick` (the page scroll handed to the CSSOM).
+    fn cssom_nested_scroller_rects_wheel(e: &mut crate::AetherEngine, px: f64, py: f64, dy: f64) {
+        e.handle_event(crate::api::events::Event::MouseMove(px, py));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        e.tick();
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): unscrolled every rect is its flow place: `#r8` top 450 (50 + 8 x 50).
+    #[test]
+    fn cssom_nested_scroller_rects_unscrolled_flow_place() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "p").1, 50.0, "#p at document y 50");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 450.0, "#r8 at its flow place");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a wheel of 300 inside `#p` scrolls the panel (not the page); `#r8`'s
+    /// getBoundingClientRect() and getClientRects() read top 150 (Chromium: 50 + 400 - 300) and elementFromPoint(10, 160) is
+    /// `#r8` (armed: 450, and the point hit `#r2`'s old flow place, before SR1154).
+    #[test]
+    fn cssom_nested_scroller_rects_wheel_reads_painted_place() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel, not the page");
+        assert_eq!(js_num(&mut e, "document.getElementById('p').scrollTop"), 300.0, "#p scrolled 300");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 150.0, "#r8's bounding top moves with the panel (armed: 450 before SR1154)");
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').getClientRects()[0].top"), 150.0, "getClientRects follows the same conversion");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 160.0), "r8", "elementFromPoint at #r8's painted place (armed before SR1154)");
+        assert_eq!(imgalt_rect(&mut e, "p").1, 50.0, "the panel itself does not move");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the cache does not go stale on a SCRIPT scroll either: after
+    /// `p.scrollTop = 300` and one frame (the request lands in `scroll_frame`), `#r8` reads 150 (armed: 450 before SR1154).
+    #[test]
+    fn cssom_nested_scroller_rects_script_scroll_top() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 450.0, "read once unscrolled: the cache is warm");
+        e.js_engine.as_mut().unwrap().eval_string("document.getElementById('p').scrollTop = 300").unwrap();
+        e.tick();
+        assert_eq!(js_num(&mut e, "document.getElementById('p').scrollTop"), 300.0, "#p scrolled 300");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 150.0, "#r8 after a script scroll (armed: 450 before SR1154)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 160.0), "r8", "elementFromPoint follows");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): offsetTop is relative to the offsetParent (`#p`, positioned) in its content
+    /// space and does NOT take the scroll: `#r8`.offsetTop is 400 before and after the panel scrolls 300 (pin).
+    #[test]
+    fn cssom_nested_scroller_rects_offset_top_unchanged() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        let parent = e.js_engine.as_mut().unwrap().eval_string("String(document.getElementById('r8').offsetParent.id)").unwrap();
+        assert_eq!(parent, "p", "#r8's offsetParent is the positioned panel");
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').offsetTop"), 400.0, "unscrolled");
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(js_num(&mut e, "document.getElementById('r8').offsetTop"), 400.0, "the panel scrolled 300: unchanged");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the panel shift and the page scroll compose: panel 300, then a wheel of 100
+    /// over `#tail` scrolls the page, and `#r8` reads 450 - 300 - 100 = 50.
+    #[test]
+    fn cssom_nested_scroller_rects_page_scroll_composes() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 280.0, 100.0);
+        assert_eq!(e.scroll_y, 100.0, "the page scrolled 100");
+        assert_eq!(imgalt_rect(&mut e, "r8").1, 50.0, "#r8: panel and page scroll both subtracted");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): the claim — with `#p` scrolled 300, the shell's hit test (the painter's
+    /// `content_shift`) and elementFromPoint (through `client_rect`) name the same row at three points inside the panel.
+    #[test]
+    fn cssom_nested_scroller_rects_shell_and_cssom_agree() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        for (x, y, want) in [(10.0, 60.0, "r6"), (10.0, 160.0, "r8"), (10.0, 240.0, "r9")] {
+            let shell = hit_sticky_origin_id(&e, x, y);
+            assert_eq!(shell, want, "the shell hits {want} at ({x}, {y})");
+            assert_eq!(bounding_sticky_from_point(&mut e, x, y), shell, "shell hit test and elementFromPoint agree at ({x}, {y})");
+        }
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): AETHER-CSSOM-HIT-SCROLLER-CLIP for the chain case — with `#p` scrolled 300, the
+    /// rows scrolled out of it have shifted rects outside its padding box (`#r5` over the spacer above at 0..50, `#r10` over
+    /// `#tail` below at 250..300, both in the positioned panel's layer above the flow): elementFromPoint there is NOT a row.
+    #[test]
+    fn cssom_nested_scroller_rects_hit_clipped_to_panel() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(imgalt_rect(&mut e, "r5").1, 0.0, "#r5's shifted rect lies over the spacer above the panel");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 20.0), "top", "above #p: the spacer, not the hidden #r5");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 270.0), "tail", "below #p: #tail, not the hidden #r10");
+    }
+
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): a fixed box inside the panel is placed against the viewport, so the panel's
+    /// shift does not move it: `#fx` reads top 5 before and after the panel scrolls 300 (the chain resets at a fixed box).
+    #[test]
+    fn cssom_nested_scroller_rects_fixed_inside_unchanged() {
+        let mut e = cssom_nested_scroller_rects_engine();
+        assert_eq!(imgalt_rect(&mut e, "fx").1, 5.0, "#fx at top: 5px");
+        cssom_nested_scroller_rects_wheel(&mut e, 10.0, 100.0, 300.0);
+        assert_eq!(imgalt_rect(&mut e, "fx").1, 5.0, "#fx ignores the panel's scroll");
+    }
+
+    // ---- AETHERSCROLLSTATESTUCKNESTED (LEDGER SR1155): the scroll-state query and the painter agree on stuck-ness (named tail block) ----
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): `#h`'s layout id, its document-space flow y (`box_origin`, no sticky hold)
+    /// and layout_core's `sticky_stuck` bit at the engine's page scroll and viewport.
+    fn sticky_scroll_state_stuck_probe(e: &crate::AetherEngine) -> (f32, u8) {
+        let t = e.layout_tree.as_ref().expect("laid out");
+        let id = t.node_map.iter().find(|(_, n)| layout_core::DomNode::attr(*n, "id").as_deref() == Some("h")).map(|(k, _)| *k).expect("#h has a box");
+        let vs = (e.scroll_x as f32, e.scroll_y as f32);
+        let flow = layout_core::scroll::box_origin(t, id, vs).expect("#h has an origin").1;
+        (flow, layout_core::scroll::sticky_stuck(t, id, vs, (e.width as f32, e.height as f32)))
+    }
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): SR1152's panel fixture at panel offsets 0, 20 and 300: the painter's first red
+    /// row in column 10 against `#h`'s flow y says whether the painter holds it; the query's bit says the same (flow 80 /
+    /// painted 80; flow 60 / painted 60; flow -220 / painted 50 = `stuck: top`).
+    #[test]
+    fn sticky_scroll_state_stuck_nested_agrees_with_painter() {
+        for (to, want_painted, want_stuck) in [(0.0, 80usize, 0u8), (20.0, 60, 0), (300.0, 50, css_core::container::TOP)] {
+            let mut e = sticky_nested_scroller_panel();
+            if to > 0.0 {
+                sticky_nested_scroller_wheel(&mut e, to);
+            }
+            let painted = (0..e.height as usize).find(|&y| imgalt_px(&e, 10, y) == STICKY_NESTED_RED).expect("#h is painted");
+            let (flow, stuck) = sticky_scroll_state_stuck_probe(&e);
+            assert_eq!(painted, want_painted, "painter at panel offset {to}");
+            assert_eq!(stuck, want_stuck, "query at panel offset {to} (armed at 300 for the nested scrollport)");
+            assert_eq!(stuck != 0, (painted as f32 - flow).abs() > 0.5, "painter and query agree at panel offset {to}");
+        }
+    }
+
+    /// AETHERSCROLLSTATESTUCKNESTED (SR1155): SR1152's `overflow: hidden` panel, the PAGE scrolled 400px: the painter leaves
+    /// `#h` in the panel (rows 0..19 not red) and the query reads not stuck (armed: the viewport copy read `stuck: top`).
+    #[test]
+    fn sticky_scroll_state_stuck_nested_hidden_page_scroll() {
+        let mut e = sticky_nested_scroller_engine(
+            r#"<div style="height:50px"></div>"#,
+            "overflow:hidden;height:600px",
+            r#"<div style="height:30px"></div><div id="h" style="position:sticky;top:0;height:20px;background-color:rgb(255, 0, 0)"></div><div style="height:1000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert!((0..20usize).all(|y| imgalt_px(&e, 10, y) != STICKY_NESTED_RED), "the painter does not hold #h at the viewport");
+        assert_eq!(sticky_scroll_state_stuck_probe(&e).1, 0, "the query reads not stuck (armed: TOP before SR1155)");
+    }
+
+    // ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): four border-style report columns read through layout_core's border_style_word (named tail block) ----
+
+    fn border_side_style_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div id="dd" style="border: 1px dashed; border-left-style: dotted">a</div>
+            <div id="tn" style="border: 1px solid; border-top-style: none">b</div>
+            <div id="w0" style="border: 2px double; border-bottom-width: 0px">c</div>
+            <div id="pl">d</div>
+            <div id="bt" style="border-top: 1px dashed red">e</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the three side style columns append after SR1096's nine (no earlier
+    /// index moves) and the computed declaration enumerates all 37.
+    #[test]
+    fn border_side_style_columns_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 37);
+        assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
+        assert_eq!(&crate::css::REPORT_PROPS[34..], &["border-right-style", "border-bottom-style", "border-left-style"]);
+        let mut e = border_side_style_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "37");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
+    }
+
+    /// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): each side reads its own style word (before SR1103 the top column read
+    /// `solid` for any painted side and the other three had no column, so a dashed card read back `solid`); a side with
+    /// no border or a 0 width reads `none` (the render's paint rule; owed AETHER-CSSOM-BORDER-STYLE-SPECIFIED).
+    #[test]
+    fn border_side_style_columns_words() {
+        let mut e = border_side_style_engine();
+        for (id, prop, want) in [
+            ("dd", "borderTopStyle", "dashed"),
+            ("dd", "borderRightStyle", "dashed"),
+            ("dd", "borderBottomStyle", "dashed"),
+            ("dd", "borderLeftStyle", "dotted"),
+            ("tn", "borderTopStyle", "none"),
+            ("tn", "borderBottomStyle", "solid"),
+            ("w0", "borderTopStyle", "double"),
+            ("w0", "borderBottomStyle", "none"),
+            ("pl", "borderTopStyle", "none"),
+            ("pl", "borderRightStyle", "none"),
+            ("pl", "borderBottomStyle", "none"),
+            ("pl", "borderLeftStyle", "none"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "{id} {prop}");
+        }
+        // A partly declared border-style composes from the four columns (SR1092's fallback): before SR1103 the top
+        // column read `solid`, so this read `solid none none`; four_serialize drops the left side equal to the right.
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "borderStyle"), "dashed none none");
     }
 }

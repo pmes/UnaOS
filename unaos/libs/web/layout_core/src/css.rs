@@ -3143,7 +3143,7 @@ fn apply_display<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
 /// 3 double); the 3D styles paint solid in their colour.
-fn border_style_code(v: &str) -> Option<u8> {
+pub fn border_style_code(v: &str) -> Option<u8> {
     match v.trim() {
         "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
         "dashed" => Some(1),
@@ -5202,5 +5202,18 @@ fn text_justify_code<H: Host>(value: &str) -> Option<u8> {
             H::record_css(&format!("text-justify:{}", clip(other)));
             None
         }
+    }
+}
+
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): the border-style paint code back to its keyword (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the inverse of [`border_style_code`] — 1 dashed, 2 dotted, 3 double,
+/// every other code `solid` (the render's `style_on` default; groove / ridge / inset / outset collapse to 0 and read solid).
+pub fn border_style_word(code: u8) -> &'static str {
+    match code {
+        1 => "dashed",
+        2 => "dotted",
+        3 => "double",
+        _ => "solid",
     }
 }
