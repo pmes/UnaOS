@@ -254,17 +254,17 @@ fn striaundohistory_verbs_name_their_steps() {
     assert_eq!(st.verb("split"), Some(Ok(())));
     assert_eq!(st.verb("]"), Some(Ok(())));
     assert_eq!(st.verb("mark in"), Some(Ok(())));
-    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("]")), (1, Some("split"))]);
-    assert_eq!(st.history_line(HISTORY_N), "history: 3 mark in | 2 ] | 1 split");
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("trim in +1")), (1, Some("split"))]);
+    assert_eq!(st.history_line(HISTORY_N), "history: 3 mark in | 2 trim in +1 | 1 split");
     let sel = st.selection;
     st.deselect();
     assert_eq!(st.verb("split"), Some(Err(EditError::NoClip)));
     assert_eq!(st.verb("play"), None);
     assert_eq!(st.history(HISTORY_N).len(), 3);
     assert_eq!(st.verb("undo"), Some(Ok(())));
-    assert_eq!(st.history(HISTORY_N), vec![(2, Some("]")), (1, Some("split"))]);
+    assert_eq!(st.history(HISTORY_N), vec![(2, Some("trim in +1")), (1, Some("split"))]);
     assert_eq!(st.verb("redo"), Some(Ok(())));
-    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("]")), (1, Some("split"))]);
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark in")), (2, Some("trim in +1")), (1, Some("split"))]);
     st.select(0, 0).unwrap();
     st.move_selected(0, 100).unwrap();
     assert_eq!(st.history(2), vec![(4, None), (3, Some("mark in"))]);
@@ -274,7 +274,7 @@ fn striaundohistory_verbs_name_their_steps() {
     assert_eq!(st.redo_depth(), 2);
     assert_eq!(st.verb("mark out"), Some(Ok(())));
     assert_eq!(st.redo_depth(), 0);
-    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark out")), (2, Some("]")), (1, Some("split"))]);
+    assert_eq!(st.history(HISTORY_N), vec![(3, Some("mark out")), (2, Some("trim in +1")), (1, Some("split"))]);
     let armed = st.arm_word("outer");
     assert!(armed);
     assert!(!st.arm_word("inner"), "a word is armed: the outer one wins");
@@ -319,7 +319,7 @@ fn striaundohistory_bounded() {
     st.disarm_word(armed);
     let top = st.history(1)[0].1.unwrap().to_string();
     assert!(top.len() <= WORD_MAX && long.starts_with(&top));
-    assert_eq!(top.len(), 23, "24 falls inside a two-byte char: clipped to 23");
+    assert_eq!(top.len(), 31, "32 falls inside a two-byte char: clipped to 31"); // STRIAHISTORYNAMES (SR9106): WORD_MAX 32
     assert_eq!(st.undo_depth(), UNDO_MAX);
 }
 
@@ -364,11 +364,11 @@ fn striaundothree_redo_history() {
     assert_eq!(st.verb("]"), Some(Ok(())));
     assert_eq!(st.verb("mark in"), Some(Ok(())));
     assert!(st.undo() && st.undo());
-    assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("]")), (2, Some("mark in"))]);
-    assert_eq!(st.redo_history(1), vec![(1, Some("]"))]);
+    assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("trim in +1")), (2, Some("mark in"))]);
+    assert_eq!(st.redo_history(1), vec![(1, Some("trim in +1"))]);
     assert!(st.redo());
     assert_eq!(st.redo_history(HISTORY_N), vec![(1, Some("mark in"))]);
-    assert_eq!(st.history(1), vec![(2, Some("]"))]);
+    assert_eq!(st.history(1), vec![(2, Some("trim in +1"))]);
     assert!(st.undo());
     assert_eq!(st.verb("mark out"), Some(Ok(())));
     assert!(st.redo_history(HISTORY_N).is_empty(), "a commit drops the redo words");
@@ -411,4 +411,49 @@ fn striahistoryripple_set_words_carry_count() {
     assert_eq!(st.counted_word("delete"), "delete");
     assert_eq!(st.verb("delete"), Some(Ok(())));
     assert_eq!(st.history_line(HISTORY_N), "history: 2 delete | 1 lift (2 clips)");
+}
+
+// ---- STRIAHISTORYNAMES (LEDGER SR9106): readable undo words with their amount (named tail block) ----
+
+/// The glyph trims name the trim they commit (`]` -> `trim in +1`, `{` -> `trim out -1`), `mark-in` its amount, a selected
+/// transition's `[` / `]` `transition -1` / `+1`; a bare cycle arms nothing and names its result (`size B fill`,
+/// `kind W001`, `ease in`); a set word with its amount keeps its count and reads whole within `WORD_MAX`.
+#[test]
+fn striahistorynames_words_carry_amounts() {
+    use timeline_core::editor::{EditorState, HISTORY_N, WORD_MAX};
+    use timeline_core::{SizePolicy, TransitionKind};
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("]"), Some(Ok(())));
+    assert_eq!(st.verb("{"), Some(Ok(())));
+    assert_eq!(st.history_line(HISTORY_N), "history: 2 trim out -1 | 1 trim in +1");
+    st.seek(13);
+    let want = format!("trim in {:+}", 13 - st.selected().unwrap().at);
+    assert_eq!(st.entry_word("mark-in"), Some(want.clone()));
+    assert_eq!(st.verb("mark-in"), Some(Ok(())));
+    assert_eq!(st.history(1)[0].1, Some(want.as_str()));
+    for bare in ["kind", "ease", "size"] {
+        assert_eq!(st.entry_word(bare), None, "{bare}");
+    }
+    assert_eq!(st.entry_word("split").as_deref(), Some("split"));
+    assert_eq!(st.verb("size"), Some(Ok(())));
+    assert_eq!(st.history(1)[0].1, Some(format!("size B {}", SizePolicy::Letterbox.next().name()).as_str()));
+
+    let tl2 = tl.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+    let mut st = EditorState::new(tl2);
+    st.select_transition(0, 0).unwrap();
+    assert_eq!(st.entry_word("[").as_deref(), Some("transition -1"));
+    assert_eq!(st.entry_word("]").as_deref(), Some("transition +1"));
+    assert_eq!(st.verb("kind"), Some(Ok(())));
+    assert_eq!(st.verb("ease"), Some(Ok(())));
+    assert_eq!(st.history_line(HISTORY_N), "history: 2 ease in | 1 kind W001");
+
+    let mut st = EditorState::new(tl);
+    st.select(0, 0).unwrap();
+    st.select_add(0, 1).unwrap();
+    assert_eq!(st.counted_word("drag move +5"), "drag move +5 (2 clips)");
+    let w = st.counted_word("drag move -1000");
+    assert_eq!(w, "drag move -1000 (2 clips)");
+    assert!(w.len() <= WORD_MAX);
 }

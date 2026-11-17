@@ -430,8 +430,8 @@ impl EditorState {
     pub fn cycle_size(&mut self) -> Result<(), EditError> {
         let c = self.selected().ok_or(EditError::NoClip)?;
         let src = self.timeline.source(c.src).ok_or(EditError::NoSource)?;
-        let tl = self.timeline.set_size_policy(src.id, src.size_policy.next())?;
-        self.commit(tl);
+        let w = alloc::format!("size {} {}", src.reel, src.size_policy.next().name()); let tl = self.timeline.set_size_policy(src.id, src.size_policy.next())?; // STRIAHISTORYNAMES (SR9106): the cycle names its result (file tail)
+        let armed = self.arm_word(&w); self.commit(tl); self.disarm_word(armed);
         Ok(())
     }
     /// The `size` words of [`EditorState::verb`]; `None` when `v` is not a `size` verb.
@@ -619,7 +619,7 @@ impl EditorState {
             crate::TransitionKind::Wipe(d) => d.code(),
         };
         let next = (from.saturating_add(1)..=999).find_map(crate::WipeDir::from_code);
-        self.set_transition_kind(next.map_or(crate::TransitionKind::Dissolve, crate::TransitionKind::Wipe))
+        let k = next.map_or(crate::TransitionKind::Dissolve, crate::TransitionKind::Wipe); self.with_word(&alloc::format!("kind {}", edl::kind_code(k)), |s| s.set_transition_kind(k)) // STRIAHISTORYNAMES (SR9106): the cycle names its result (file tail)
     }
     /// The selected transition given `ease` (one commit of `remove_transition` + `put_transition`; the same ease again
     /// commits nothing).
@@ -639,7 +639,7 @@ impl EditorState {
         let x = self.selected_transition().ok_or(EditError::Transition)?;
         let all = crate::Ease::ALL;
         let i = all.iter().position(|&e| e == x.ease).unwrap_or(0);
-        self.set_transition_ease(all[(i + 1) % all.len()])
+        let e = all[(i + 1) % all.len()]; self.with_word(&alloc::format!("ease {}", e.name()), |s| s.set_transition_ease(e)) // STRIAHISTORYNAMES (SR9106): the cycle names its result (file tail)
     }
     /// The `kind` / `ease` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn look_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
@@ -673,7 +673,7 @@ impl EditorState {
 /// How many entries the history line lists (newest first).
 pub const HISTORY_N: usize = 10;
 /// The longest word kept on an undo entry (bytes; clipped on a char boundary).
-pub const WORD_MAX: usize = 24;
+pub const WORD_MAX: usize = 32; // STRIAHISTORYNAMES (SR9106): a counted word with its amount reads whole (`drag move -1000 (3 clips)`)
 
 /// The words of the undo and redo entries (`None`: an unnamed step), and the word armed by the running verb call.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -727,7 +727,7 @@ impl EditorState {
         if self.hist.word.is_some() {
             return false;
         }
-        self.hist.word = Some(clip_word(&self.counted_word(v))); // STRIAHISTORYRIPPLE (SR9072): a set edit's word carries its clip count (file tail)
+        let Some(w) = self.entry_word(v) else { return false }; self.hist.word = Some(clip_word(&self.counted_word(&w))); // STRIAHISTORYRIPPLE (SR9072): a set edit's word carries its clip count (file tail); STRIAHISTORYNAMES (SR9106): the word names what it commits, a bare cycle arms nothing (file tail)
         true
     }
     /// Drop the armed word when this caller armed it ([`EditorState::arm_word`]'s result).
@@ -784,10 +784,44 @@ impl EditorState {
     /// clips, else `v` unchanged.
     pub fn counted_word(&self, v: &str) -> alloc::string::String {
         let n = self.set.len();
-        if n > 1 && SET_WORDS.contains(&v) {
+        if n > 1 && SET_WORDS.iter().any(|w| v == *w || v.strip_prefix(w).is_some_and(|r| r.starts_with(' '))) { // STRIAHISTORYNAMES (SR9106): a set word with its amount (`drag move +5`) keeps its count
             alloc::format!("{v} ({n} clips)")
         } else {
             alloc::string::String::from(v)
         }
+    }
+}
+
+// ---- STRIAHISTORYNAMES (LEDGER SR9106): readable undo words with their amount (named tail block) ----
+// SR876's ONE name store ([`EditorState::arm_word`]) reads [`EditorState::entry_word`] before SR9072's `counted_word`: the
+// glyph trims (`[` `]` `{` `}`) name what they commit (`trim in -1` ... `trim out +1`; the face's `[` / `]` on a selected
+// transition `transition -1` / `transition +1`), `mark-in` / `mark-out` the trim they commit with its amount (`trim in +3`),
+// and a bare cycle (`kind`, `ease`, `size`) arms nothing so the cycle names its result through [`EditorState::with_word`]
+// (`kind W001`, `ease inout`, `size A fill`). A drag's word carries its delta (`Drag::word`: `drag slip -5`).
+
+impl EditorState {
+    /// `v` as the word an undo entry is armed with: the commit it names, with its amount; `None` for a bare cycle word.
+    pub fn entry_word(&self, v: &str) -> Option<alloc::string::String> {
+        let trim = |edge: &str, d: i64| Some(alloc::format!("trim {edge} {d:+}"));
+        let on_transition = self.selected_transition().is_some();
+        match v {
+            "kind" | "ease" | "size" => None,
+            "[" if on_transition => Some(alloc::string::String::from("transition -1")),
+            "]" if on_transition => Some(alloc::string::String::from("transition +1")),
+            "[" => trim("in", -1),
+            "]" => trim("in", 1),
+            "{" => trim("out", -1),
+            "}" => trim("out", 1),
+            "mark-in" if self.selected().is_some() => trim("in", self.playhead - self.selected().map_or(0, |c| c.at)),
+            "mark-out" if self.selected().is_some() => trim("out", self.playhead - self.selected().map_or(0, |c| c.end())),
+            _ => Some(alloc::string::String::from(v)),
+        }
+    }
+    /// Run `f` with `w` armed as the name of the commit it makes (an outer armed word wins, as in [`EditorState::verb`]).
+    pub fn with_word<R>(&mut self, w: &str, f: impl FnOnce(&mut EditorState) -> R) -> R {
+        let armed = self.arm_word(w);
+        let r = f(self);
+        self.disarm_word(armed);
+        r
     }
 }

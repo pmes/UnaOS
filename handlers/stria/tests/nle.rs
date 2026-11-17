@@ -3685,7 +3685,7 @@ fn striaundohistory_face_word() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.verb("history"));
     let line = face.last_error.take();
-    assert_eq!(line.as_deref(), Some("history: 1 ]"));
+    assert_eq!(line.as_deref(), Some("history: 1 transition +1")); // STRIAHISTORYNAMES (SR9106): the face's `]` names what it commits
     println!("striaundohistory: {line:?}");
 }
 
@@ -3703,20 +3703,21 @@ fn striaundohistorydrag_drag_names_its_step() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert_eq!(face.state.undo_depth(), 1);
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    let mv = format!("drag move {:+}", face.state.selected().unwrap().at - 10); // STRIAHISTORYNAMES (SR9106): the drag's word carries its delta
+    assert_eq!(face.last_error.take(), Some(format!("history: 1 {mv}")));
     let l = face.layout();
     let at = face.state.selected().map(|c| c.at).unwrap();
     let (x, y) = l.point(0, at + 2);
     nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 2 drag slip +5 | 1 {mv}")));
     assert!(face.verb("undo"));
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 1 {mv}")));
     assert!(face.verb("redo"));
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+    assert_eq!(face.last_error.take(), Some(format!("history: 2 drag slip +5 | 1 {mv}")));
 
     let (tl, src) = synth_fixture();
     let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
@@ -3737,7 +3738,7 @@ fn striaundohistorydrag_drag_names_its_step() {
     assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 5);
     assert!(face.verb("history"));
     let line = face.last_error.take();
-    assert_eq!(line.as_deref(), Some("history: 1 drag transition out"));
+    assert_eq!(line.as_deref(), Some("history: 1 drag transition out +1"));
     println!("striaundohistorydrag: {line:?}");
 }
 
@@ -4085,15 +4086,44 @@ fn striahistoryripple_face_set_drag_and_delete() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert_eq!(face.state.undo_depth(), 1);
     assert!(face.verb("history"));
-    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move (2 clips)"));
+    let mv = format!("drag move {:+} (2 clips)", face.state.selected().unwrap().at - 10); // STRIAHISTORYNAMES (SR9106): the drag's word carries its delta
+    assert_eq!(face.last_error.take(), Some(format!("history: 1 {mv}")));
     assert_eq!(face.state.set.len(), 2, "the set follows its clips");
     assert!(face.verb("delete"));
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.verb("history"));
     let line = face.last_error.take();
-    assert_eq!(line.as_deref(), Some("history: 2 delete (2 clips) | 1 drag move (2 clips)"));
+    assert_eq!(line, Some(format!("history: 2 delete (2 clips) | 1 {mv}")));
     assert!(face.verb("undo 1"));
     assert_eq!(face.last_error.take().as_deref(), Some("undo 1: back to before \"delete (2 clips)\""));
     assert_eq!(face.state.undo_depth(), 1);
     println!("striahistoryripple: {line:?}");
+}
+
+// ---- STRIAHISTORYNAMES (LEDGER SR9106): the face's undo words name what they commit, with the amount (named tail block) ----
+
+/// A Ctrl 40 px drag on B's body (8 px a tick, no snap) is `drag slip +5`; the face's `]` on a selected transition is
+/// `transition +1`; the bare `kind` cycle names its result `kind W001` (the first built wipe after the dissolve).
+#[test]
+fn striahistorynames_face_words() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 12);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag slip +5"));
+
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.verb("]"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("kind"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 2 kind W001 | 1 transition +1"));
+    println!("striahistorynames: {line:?}");
 }
