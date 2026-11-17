@@ -43,7 +43,7 @@ pub struct PaintStyle<H: Host> {
     /// Text transform: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
     pub text_transform: Option<u8>,
     /// border-top-width, border-right-width, border-bottom-width, border-left-width.
-    /// Overrides border[side].0 if set.
+    /// Overrides border[side].0 if set. AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the ONE per-side width store (`border-width`, the longhands and the shorthands' width write it; a style-created side takes it, else medium).
     pub border_width: Option<[Option<f32>; 4]>,
     /// background-size: (width, height) in pixels or as fractional shorthand values.
     /// Empty string means default (cover), other values stored as-is for rendering.
@@ -1208,8 +1208,10 @@ impl<H: Host> PaintStyle<H> {
 
 /// AETHERCSSBORDERCOLORSTORED (SR1058): the 1px theme frame a control paints when the author gave it no side: each side
 /// takes its pending colour (`PaintStyle::border_pending`; the element's ink when the entry is currentcolor), else
-/// the scheme's theme frame (`frame`: Chromium's #767676 in light). Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
-pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8), frame: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] { // SR1058 fold: `frame` is the scheme's theme frame (SR1031 ua_colours), light #767676
+/// Chromium's #767676. Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
+/// Trunk-merge seam with AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the theme colour is the caller's `frame` (the
+/// scheme's `ua_colours(..).frame`: #767676 light, #858585 dark) instead of a #767676 literal.
+pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8), frame: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
     let p = pending.unwrap_or([None; 4]);
     let mut sides = [Some((1.0, frame)); 4];
     for (i, side) in sides.iter_mut().enumerate() {
