@@ -1010,3 +1010,40 @@ fn striakslip_slipslide_word_maps_the_words() {
         assert_eq!(slipslide_word(w), None, "{w}");
     }
 }
+
+// ---- STRIATRANSITIONKERNEL (LEDGER SR9057): `dur-` / `dur+` the head cut's transition one tick (named tail block) ----
+
+/// `dur+` with B selected (its head cut at 20 carries the dissolve) selects the transition and lengthens it, one undo step;
+/// `dur-` on the selected transition shortens it; A / C (no head transition), a length below 1 and a length past the
+/// handle are refused with the state exactly as it was.
+#[test]
+fn striatransitionkernel_head_step() {
+    let tl0 = cuts().add_transition(0, 20, TransitionKind::Dissolve, 4).unwrap();
+    let mut st = timeline_core::editor::EditorState::new(tl0.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.head_transition(), Some((0, 0)));
+    assert_eq!(st.verb("dur+"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 5);
+    assert_eq!((st.transition, st.selection, st.undo_depth()), (Some((0, 0)), None, 1));
+    assert_eq!(st.verb("dur-"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 4);
+    assert_eq!(st.undo_depth(), 2);
+    for clip in [0, 2] {
+        st.select(0, clip).unwrap();
+        let before = st.clone();
+        assert_eq!(st.verb("dur+"), Some(Err(EditError::Transition)), "clip {clip}");
+        assert_eq!(st, before, "clip {clip}");
+    }
+    st.select_transition(0, 0).unwrap();
+    assert_eq!(st.verb("dur 1"), Some(Ok(())));
+    let before = st.clone();
+    assert_eq!(st.verb("dur-"), Some(Err(EditError::Transition)));
+    assert_eq!(st, before);
+    assert_eq!(st.verb("dur 20"), Some(Ok(())));
+    st.select(0, 1).unwrap();
+    let before = st.clone();
+    assert_eq!(st.verb("dur+"), Some(Err(EditError::Handle)));
+    assert_eq!(st, before, "a refusal keeps the clip selection");
+    while st.undo() {}
+    assert_eq!(st.timeline, tl0);
+}

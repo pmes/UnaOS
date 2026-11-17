@@ -13905,3 +13905,28 @@ fn striagainenvelope_face_words() {
     assert_eq!(face.state.timeline, tl);
     println!("striagainenvelope face: env -6 at 5 -> point (18, -600), note; env 99 -> {}", EditError::Gain);
 }
+
+// ---- STRIATRANSITIONKERNEL (LEDGER SR9057): a released transition edge drag names its new length (named tail block) ----
+
+/// The right edge zone of the 4-tick dissolve on V1's cut at 10 (the widget x 80..112, y 108..118 at zoom 8): +24 px
+/// released commits dur 7 and the message row names it; the next press drops the note; a press-release that did not move
+/// sets none.
+#[test]
+fn striatransitionkernel_edge_drag_note() {
+    use bandy::SMessage;
+    let btn = |down: bool, x: f64, y: f64| SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 };
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.on(&btn(true, 110.0, 113.0)));
+    face.on(&SMessage::BrowserMouseMove(134.0, 113.0, 0));
+    assert!(face.on(&btn(false, 134.0, 113.0)));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 7);
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:07 (7 ticks)"));
+    face.on(&btn(true, 110.0, 113.0));
+    assert_eq!(face.note, None, "the next press drops the note");
+    face.on(&btn(false, 110.0, 113.0));
+    assert_eq!(face.note, None, "a press and release that did not move sets no note");
+    assert_eq!(face.state.undo_depth(), 1);
+}
