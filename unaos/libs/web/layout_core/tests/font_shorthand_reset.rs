@@ -573,6 +573,7 @@ fn border_side_color_currentcolor_bits() {
 
 /// AETHERCSSBORDERSIDECOLOR (SR1014): a longhand on a borderless style creates no side (style none: no ink, as
 /// Chromium); `transparent` drops that side only; an invalid value or `inherit` leaves the side as it was.
+/// SR1112 (flipped in place): `transparent` keeps the side (black RGB) at alpha 0 on that side only.
 #[test]
 fn border_side_color_alone_transparent_invalid() {
     assert_eq!(styled(&[("border-top-color", "red")]).paint.border, None, "no border created");
@@ -581,16 +582,19 @@ fn border_side_color_alone_transparent_invalid() {
     assert_eq!(s.paint.border.expect("border")[3], None, "an absent side stays absent");
     let blue = side_color_rgb("blue");
     let s = styled(&[("border", "2px solid blue"), ("border-bottom-color", "transparent")]);
-    assert_eq!(s.paint.border, Some([Some((2.0, blue)), Some((2.0, blue)), None, Some((2.0, blue))]));
+    assert_eq!(s.paint.border, Some([Some((2.0, blue)), Some((2.0, blue)), Some((2.0, (0, 0, 0))), Some((2.0, blue))]), "SR1112: the bottom kept (was None)");
+    assert_eq!(s.paint.border_alpha, Some([Some(1.0), Some(1.0), Some(0.0), Some(1.0)]), "SR1112: alpha 0 on the bottom only");
     let s = styled(&[("border", "2px solid blue"), ("border-right-color", "rgba(0, 0, 0, 0)")]);
-    assert_eq!(s.paint.border.expect("border")[1], None, "a zero-alpha rgba is transparent");
+    assert_eq!(s.paint.border.expect("border")[1], Some((2.0, (0, 0, 0))), "SR1112: a zero-alpha rgba is transparent: kept at alpha 0 (was None)");
+    assert_eq!(s.paint.border_alpha.expect("alpha")[1], Some(0.0));
     for bad in ["bogus", "inherit", "12px"] {
         let s = styled(&[("border", "2px solid blue"), ("border-left-color", bad)]);
         assert_eq!(s.paint.border, Some([Some((2.0, blue)); 4]), "{bad}: unchanged");
         assert_eq!(s.paint.currentcolor, 0, "{bad}: bits unchanged");
     }
     let s = styled(&[("border", "2px solid blue"), ("border-color", "transparent")]);
-    assert_eq!(s.paint.border, Some([None; 4]), "border-color: transparent unchanged by the lift");
+    assert_eq!(s.paint.border, Some([Some((2.0, (0, 0, 0))); 4]), "SR1112: border-color: transparent keeps the sides (was Some([None; 4]))");
+    assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "SR1112: alpha 0 on every side");
 }
 
 // ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color and the shorthand's colour word (named tail block) ----
