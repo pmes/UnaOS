@@ -1212,7 +1212,7 @@ pub const WAVE_LIFT: u8 = 0x30;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Peaks {
     pub per_sec: u32,
-    pub buckets: Vec<u8>,
+    pub buckets: Vec<u8>, pub chans: Vec<Peaks>, pub lod: Vec<Vec<u8>>, // STRIAWAVEFORMSTEREO (SR9051): a stereo source's L / R tables (else empty) and the max pyramid `finish` builds (file tail)
 }
 
 /// The waveform hook: a source's peak table (none: the body stays flat) and the clip gain's Q16 factor by the mix's ONE
@@ -1232,7 +1232,7 @@ pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> 
     let ch = channels.max(1) as usize;
     let frames = interleaved.len() / ch;
     if rate == 0 || per_sec == 0 {
-        return Peaks { per_sec, buckets: Vec::new() };
+        return Peaks { per_sec, buckets: Vec::new(), chans: Vec::new(), lod: Vec::new() };
     }
     let (r, p) = (rate as u64, per_sec as u64);
     let n = (frames as u64 * p).div_ceil(r) as usize;
@@ -1245,7 +1245,7 @@ pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> 
         });
         buckets.push((m.min(1.0) * 255.0 + 0.5) as u8);
     }
-    Peaks { per_sec, buckets }
+    Peaks { per_sec, buckets, chans: sides_of(rate, channels, interleaved, per_sec), lod: Vec::new() } // STRIAWAVEFORMSTEREO (SR9051): each channel of a stereo source through this same reduction (file tail)
 }
 
 /// THE ONE waveform painter: inside `body` (`x0, y0, x1, y1`, the clip body rect [`paint_in`] filled) a vertical bar per
@@ -1254,7 +1254,7 @@ pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> 
 /// fade envelope at the column's tick (`schedule::env_q16`, the mix's), half-height `round(v * (body_h / 2) / 255)`,
 /// inked in the audio clip colour + [`WAVE_LIFT`]. No table for the clip's source (or an empty one): nothing painted.
 pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource) {
-    let Some(p) = src.peaks(clip.src) else { return };
+    let Some(p) = src.peaks(clip.src) else { return }; if p.chans.len() == 2 { return paint_sides(c, l, body, clip, tb, src, p); } // STRIAWAVEFORMSTEREO (SR9051): a stereo table paints L over R, each in half the body (file tail)
     if p.buckets.is_empty() || p.per_sec == 0 {
         return;
     }
@@ -1280,7 +1280,7 @@ pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip:
         if b0 >= b1 {
             continue;
         }
-        let peak = p.buckets[b0..b1].iter().copied().max().unwrap_or(0) as i64;
+        let peak = p.range_max(b0, b1) as i64; // STRIAWAVEFORMSTEREO (SR9051): the pyramid's O(log n) max, the same value as the linear one (file tail)
         let e = crate::schedule::env_q16(clip, clip.at + dx.max(0) / z) as i64;
         let v = ((((peak * g) >> 16) * e) >> 16).clamp(0, 255);
         let hh = (v * half + 127) / 255;
@@ -1379,8 +1379,8 @@ mod waveform_tests {
 
     #[test]
     fn waveform_body_not_flat_and_video_unchanged() {
-        let ramp = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() });
-        let empty = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: Vec::new() });
+        let ramp = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect(), chans: Vec::new(), lod: Vec::new() });
+        let empty = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: Vec::new(), chans: Vec::new(), lod: Vec::new() });
         let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
         let l = Layout::of(320, 160, &st);
         let flat = paint_in(&st, l, Order::Rgba, None, None, None);
@@ -1403,7 +1403,7 @@ mod waveform_tests {
 
     #[test]
     fn waveform_gain_minus_6db_halves_the_bars() {
-        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200], chans: Vec::new(), lod: Vec::new() });
         let at = |cdb: i32| {
             let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).gained(cdb));
             let l = Layout::of(320, 160, &st);
@@ -1418,7 +1418,7 @@ mod waveform_tests {
 
     #[test]
     fn waveform_fade_in_tapers() {
-        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200], chans: Vec::new(), lod: Vec::new() });
         let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).faded(25, 0));
         let l = Layout::of(320, 160, &st);
         let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&full));
@@ -1567,7 +1567,7 @@ mod head_tests {
         let none = paint_in(&st, l, Order::Rgba, None, None, None);
         assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&Hook(None, None))), none, "no still: the body as before");
         // the audio body under a hook holding BOTH a still and SR827's ramp table is SR827's golden: no head on audio
-        let ramp = Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() };
+        let ramp = Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect(), chans: Vec::new(), lod: Vec::new() };
         let a = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
         let la = Layout::of(320, 160, &a);
         let wave = paint_in(&a, la, Order::Rgba, None, None, Some(&Hook(Some(pattern()), Some(ramp))));
@@ -1769,5 +1769,253 @@ mod strip_tests {
         assert!(box_is(&buf, l.w, x0, y0, &marked(0)));
         let bar = clip_colour(0, Kind::Video);
         assert!((x0 + 48..x1).all(|x| px(&buf, l.w, x, y0 + 10) == bar), "undecoded middles and tail keep the bar");
+    }
+}
+
+// ---- STRIAWAVEFORMSTEREO (LEDGER SR9051): a stereo clip's two envelopes and the peak pyramid (named tail block) ----
+// STEREO: a 2-channel source's table keeps one MONO table per channel in `Peaks.chans` ([L, R], each built by THE ONE
+// [`peaks_of`] over its de-interleaved channel; `buckets` stays the folded max), and [`paint_peaks`] hands such a table to
+// [`paint_sides`], which calls THE SAME [`paint_peaks`] twice through the [`Side`] adapter: L in the body's upper half, R in
+// its lower half (same ink, gain, fade envelope, column walk). Every other table has `chans` empty and paints as before.
+// LOD: [`Peaks::finish`] (called once the table is whole: Stria's `nle::scan_peaks`) builds `Peaks.lod`, the max pyramid
+// (`lod[k - 1][i]` = max of `buckets[i << k .. (i + 1) << k]`, up to one byte), and [`Peaks::range_max`] answers a column's
+// bucket range in O(log n) through it: the SAME value as the linear max, so the bars are byte-identical at every zoom, and a
+// squeezed zoom (many ticks per pixel) reads a bounded number of bytes per column. No pyramid (a literal, a bare
+// `peaks_of`): the linear max. Owed: NLE-WAVEFORM-MULTICHANNEL (more than two channels stay folded).
+
+/// STRIAWAVEFORMSTEREO (SR9051): the per-channel tables of a 2-channel `interleaved` (empty for any other count), each
+/// through THE ONE [`peaks_of`] (`channels` 1, so its own `chans` is empty).
+fn sides_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> Vec<Peaks> {
+    if channels != 2 {
+        return Vec::new();
+    }
+    let (mut lt, mut rt) = (Vec::with_capacity(interleaved.len() / 2), Vec::with_capacity(interleaved.len() / 2));
+    for f in interleaved.chunks_exact(2) {
+        lt.push(f[0]);
+        rt.push(f[1]);
+    }
+    vec![peaks_of(rate, 1, &lt, per_sec), peaks_of(rate, 1, &rt, per_sec)]
+}
+
+impl Peaks {
+    /// STRIAWAVEFORMSTEREO (SR9051): `more` (the next stretch of the same source at the same `per_sec`) appended: the
+    /// buckets, and each channel's table (taken whole on the first stretch). A pyramid built before is dropped (stale).
+    pub fn append(&mut self, more: Peaks) {
+        if self.buckets.is_empty() && self.chans.is_empty() {
+            self.chans = more.chans;
+        } else {
+            for (a, b) in self.chans.iter_mut().zip(more.chans) {
+                a.append(b);
+            }
+        }
+        self.buckets.extend(more.buckets);
+        self.lod.clear();
+    }
+
+    /// STRIAWAVEFORMSTEREO (SR9051): build the max pyramid of the whole table (and of each channel's): level `k` halves
+    /// level `k - 1` by max (a ragged last pair keeps its one byte) until a level holds one byte.
+    pub fn finish(&mut self) {
+        let mut lod: Vec<Vec<u8>> = Vec::new();
+        let mut len = self.buckets.len();
+        while len > 1 {
+            let up: Vec<u8> = lod.last().unwrap_or(&self.buckets).chunks(2).map(|c| c.iter().copied().max().unwrap_or(0)).collect();
+            len = up.len();
+            lod.push(up);
+        }
+        self.lod = lod;
+        for c in &mut self.chans {
+            c.finish();
+        }
+    }
+
+    /// STRIAWAVEFORMSTEREO (SR9051): true when `lod` is the pyramid of `buckets` (each level half the one below, rounded
+    /// up, down to one byte).
+    fn lod_ok(&self) -> bool {
+        let mut len = self.buckets.len();
+        for t in &self.lod {
+            if len <= 1 || t.len() != len.div_ceil(2) {
+                return false;
+            }
+            len = t.len();
+        }
+        !self.lod.is_empty() && len == 1
+    }
+
+    /// STRIAWAVEFORMSTEREO (SR9051): the max of `buckets[b0..b1]` (0 when empty): through the pyramid in O(log n) when
+    /// `finish` built it, else the linear max. Both give the same byte.
+    pub fn range_max(&self, b0: usize, b1: usize) -> u8 {
+        let b1 = b1.min(self.buckets.len());
+        if b0 >= b1 {
+            return 0;
+        }
+        if b1 - b0 <= 8 || !self.lod_ok() {
+            return self.buckets[b0..b1].iter().copied().max().unwrap_or(0);
+        }
+        let (mut lo, mut hi, mut k, mut m) = (b0, b1, 0usize, 0u8);
+        while lo < hi {
+            let t: &[u8] = if k == 0 { &self.buckets } else { &self.lod[k - 1] };
+            if lo & 1 == 1 {
+                m = m.max(t[lo]);
+                lo += 1;
+            }
+            if hi & 1 == 1 {
+                hi -= 1;
+                m = m.max(t[hi]);
+            }
+            lo >>= 1;
+            hi >>= 1;
+            k += 1;
+        }
+        m
+    }
+}
+
+/// STRIAWAVEFORMSTEREO (SR9051): one channel's table presented as a [`PeakSource`] (the face's ONE gain curve kept).
+struct Side<'a>(&'a dyn PeakSource, &'a Peaks);
+
+impl PeakSource for Side<'_> {
+    fn peaks(&self, _src: crate::SourceId) -> Option<&Peaks> {
+        Some(self.1)
+    }
+    fn gain_q16(&self, cdb: i32) -> i64 {
+        self.0.gain_q16(cdb)
+    }
+}
+
+/// STRIAWAVEFORMSTEREO (SR9051): a stereo table's two envelopes: `body` split at `y0 + (y1 - y0) / 2`, L painted by THE
+/// ONE [`paint_peaks`] in the upper half, R in the lower half.
+fn paint_sides(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource, p: &Peaks) {
+    let (x0, y0, x1, y1) = body;
+    let ym = y0 + (y1 - y0) / 2;
+    paint_peaks(c, l, (x0, y0, x1, ym), clip, tb, &Side(src, &p.chans[0]));
+    paint_peaks(c, l, (x0, ym, x1, y1), clip, tb, &Side(src, &p.chans[1]));
+}
+
+#[cfg(test)]
+mod striawaveformstereo_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    struct Fixed(Peaks);
+    impl PeakSource for Fixed {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, cdb: i32) -> i64 {
+            if cdb == 0 { 65536 } else { libm::round(libm::pow(10.0, cdb as f64 / 2000.0) * 65536.0) as i64 }
+        }
+    }
+
+    fn table(buckets: Vec<u8>) -> Peaks {
+        Peaks { per_sec: PEAKS_PER_SEC, buckets, chans: Vec::new(), lod: Vec::new() }
+    }
+
+    fn stereo(lt: u8, rt: u8) -> Peaks {
+        Peaks { chans: alloc::vec![table(alloc::vec![lt; 200]), table(alloc::vec![rt; 200])], ..table(alloc::vec![lt.max(rt); 200]) }
+    }
+
+    fn one_clip(clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    /// The inked pixels of column `x` in rows `ya..yb`.
+    fn inked(buf: &[u8], l: &Layout, x: i64, ya: i64, yb: i64) -> i64 {
+        let b = clip_colour(0, Kind::Audio);
+        let ink = [b[0] + WAVE_LIFT, b[1] + WAVE_LIFT, b[2] + WAVE_LIFT, 255];
+        (ya..yb)
+            .filter(|&y| {
+                let i = (y as usize * l.w as usize + x as usize) * 4;
+                buf[i..i + 4] == ink
+            })
+            .count() as i64
+    }
+
+    #[test]
+    fn striawaveformstereo_peaks_of_keeps_each_channel() {
+        let lr: Vec<f32> = (0..9_600).map(|i| if i % 2 == 0 { 0.25 } else { -0.75 }).collect();
+        let p = peaks_of(48_000, 2, &lr, PEAKS_PER_SEC);
+        assert!(p.buckets.iter().all(|&b| b == 191), "the folded table unchanged");
+        assert_eq!(p.chans.len(), 2);
+        assert!(p.chans[0].buckets.iter().all(|&b| b == 64) && p.chans[1].buckets.iter().all(|&b| b == 191));
+        assert_eq!((p.chans[0].buckets.len(), p.chans[1].buckets.len()), (p.buckets.len(), p.buckets.len()));
+        assert!(p.chans.iter().all(|c| c.chans.is_empty()));
+        let mono = alloc::vec![0.5f32; 4_800];
+        assert!(peaks_of(48_000, 1, &mono, PEAKS_PER_SEC).chans.is_empty(), "mono: no channel tables");
+        assert!(peaks_of(48_000, 6, &mono, PEAKS_PER_SEC).chans.is_empty(), "more than two channels stay folded");
+        // two one-second stretches appended == one call
+        let two: Vec<f32> = (0..2 * 2 * 48_000).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 * if i % 2 == 0 { 1.0 } else { -0.5 }).collect();
+        let mut fed = peaks_of(48_000, 2, &two[..2 * 48_000], PEAKS_PER_SEC);
+        fed.append(peaks_of(48_000, 2, &two[2 * 48_000..], PEAKS_PER_SEC));
+        assert_eq!(fed, peaks_of(48_000, 2, &two, PEAKS_PER_SEC));
+        let mut mfed = table(Vec::new());
+        mfed.append(peaks_of(48_000, 1, &mono, PEAKS_PER_SEC));
+        assert_eq!(mfed, peaks_of(48_000, 1, &mono, PEAKS_PER_SEC), "a mono stretch appends its buckets only");
+    }
+
+    #[test]
+    fn striawaveformstereo_two_half_height_envelopes() {
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let y0 = l.row_y(0) + 2;
+        let y1 = l.row_y(0) + ROW_H as i64 - 2;
+        let ym = y0 + (y1 - y0) / 2;
+        let paint = |p: Peaks| paint_in(&st, l, Order::Rgba, None, None, Some(&Fixed(p)));
+        let lfull = paint(stereo(255, 0));
+        let (up, down) = (inked(&lfull, &l, 160, y0, ym), inked(&lfull, &l, 160, ym, y1));
+        std::println!("striawaveformstereo: L full / R silent upper={up} lower={down} body={}", y1 - y0);
+        assert_eq!((up, down), ((y1 - y0) / 2, 0), "L fills the upper half, R silent");
+        let rfull = paint(stereo(0, 255));
+        assert_eq!((inked(&rfull, &l, 160, y0, ym), inked(&rfull, &l, 160, ym, y1)), (0, (y1 - y0) / 2), "R fills the lower half");
+        let both = paint(stereo(255, 255));
+        assert_ne!(both, paint(table(alloc::vec![255; 200])), "a stereo table paints two envelopes, not the folded bar");
+        let ramp: Vec<u8> = (0..200u32).map(|i| (i * 37 % 256) as u8).collect();
+        let mut fin = table(ramp.clone());
+        fin.finish();
+        assert_eq!(paint(fin), paint(table(ramp)), "the pyramid paints the same bytes as the linear max");
+        let g = one_clip(Clip::new(SourceId(0), 0, 50, 0).gained(-600));
+        let half = paint_in(&g, l, Order::Rgba, None, None, Some(&Fixed(stereo(255, 0))));
+        let h6 = inked(&half, &l, 160, y0, ym);
+        assert!((h6 - up / 2).abs() <= 1, "-6 dB halves each envelope: {h6} of {up}");
+    }
+
+    #[test]
+    fn striawaveformstereo_lod_range_max_is_exact() {
+        for n in [0usize, 1, 2, 3, 7, 8, 9, 17, 100, 1000, 1023, 1025] {
+            let mut s = 12_345u32;
+            let mut p = table(
+                (0..n)
+                    .map(|_| {
+                        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        (s >> 16) as u8
+                    })
+                    .collect(),
+            );
+            p.finish();
+            assert_eq!(p.lod.is_empty(), n <= 1);
+            if n > 1 {
+                assert_eq!(p.lod.last().map(|t| t.len()), Some(1));
+                assert_eq!(p.lod.last().unwrap()[0], p.buckets.iter().copied().max().unwrap());
+            }
+            let step = (n / 37).max(1);
+            for b0 in (0..=n).step_by(step) {
+                for b1 in (b0..=n + 2).step_by(step) {
+                    let lin = p.buckets[b0..b1.min(n)].iter().copied().max().unwrap_or(0);
+                    assert_eq!(p.range_max(b0, b1), lin, "n={n} {b0}..{b1}");
+                }
+            }
+        }
+        let mut st = stereo(10, 200);
+        st.finish();
+        assert!(st.chans.iter().all(|c| c.lod.last().map(|t| t[0]) == c.buckets.iter().copied().max()), "each channel gets its pyramid");
+        let mut stale = table(alloc::vec![1, 2, 3, 4]);
+        stale.finish();
+        stale.append(table(alloc::vec![9]));
+        assert!(stale.lod.is_empty(), "append drops a pyramid built before");
+        assert_eq!(stale.range_max(0, 5), 9);
     }
 }
