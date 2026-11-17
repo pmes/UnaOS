@@ -1290,7 +1290,7 @@ pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip:
             continue;
         }
         let peak = p.buckets[b0..b1].iter().copied().max().unwrap_or(0) as i64;
-        let e = crate::schedule::env_q16(clip, clip.at + dx.max(0) / z) as i64;
+        let e = env_sub_q16(clip, dx.max(0), z) as i64; // STRIATHUMBNAILSTHREE (SR9044): the mix's envelope at the column, below a tick (file tail)
         let v = ((((peak * g) >> 16) * e) >> 16).clamp(0, 255);
         let hh = (v * half + 127) / 255;
         if hh > 0 {
@@ -4966,5 +4966,88 @@ fn paint_headers(c: &mut Canvas, l: Layout, st: &EditorState, mut labels: Option
         if let (Some(text), Some(word)) = (labels.as_mut(), st.timeline.track_word(row)) {
             text.text(c, &word, 4.0, y0 as f32 + 15.0, (0, (left - 1) as i32));
         }
+    }
+}
+
+// ---- STRIATHUMBNAILSTHREE (LEDGER SR9044): the fade envelope below a tick (named tail block) ----
+// [`paint_peaks`] sampled the fade envelope once per tick, so at zoom z > 1 px/tick a fade drew z-column stairs. The mix
+// ramps each audio run LINEARLY from `env[0]` to `env[1]` per sample (Stria nle.rs `mix_into`), and runs split at the fade
+// edges, which are whole ticks; `schedule::env_q16` is piecewise linear with integer breakpoints. So the envelope at
+// `t + r / z` IS `env(t) + (env(t + 1) - env(t)) * r / z`: [`env_sub_q16`] is that, read through the mix's own `env_q16`.
+// At one pixel per tick `r` is always 0: the bytes are the old ones.
+
+/// STRIATHUMBNAILSTHREE (SR9044): clip `clip`'s fade envelope (Q16) at the column `dx` px right of its start at `z` px per
+/// tick: `env_q16` at the tick under the column, linearly toward the next tick by the column's offset `dx % z` inside it.
+fn env_sub_q16(clip: &crate::Clip, dx: i64, z: i64) -> u32 {
+    let z = z.max(1);
+    let (t, r) = (clip.at + dx.div_euclid(z), dx.rem_euclid(z));
+    let e0 = crate::schedule::env_q16(clip, t) as i64;
+    if r == 0 {
+        return e0 as u32;
+    }
+    let e1 = crate::schedule::env_q16(clip, t + 1) as i64;
+    (e0 + (e1 - e0) * r / z) as u32
+}
+
+#[cfg(test)]
+mod striathumbnailsthree_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// A full-scale table and the unity gain (the gain curve is not under test here).
+    struct Full(Peaks);
+    impl PeakSource for Full {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, _cdb: i32) -> i64 {
+            65536
+        }
+    }
+
+    #[test]
+    fn striathumbnailsthree_env_sub_is_the_tick_at_zoom_one_and_lerps_between() {
+        let c = Clip::new(SourceId(0), 0, 50, 10).faded(4, 4);
+        for dx in 0..60 {
+            assert_eq!(env_sub_q16(&c, dx, 1), crate::schedule::env_q16(&c, c.at + dx), "zoom 1 is the tick: dx {dx}");
+            assert_eq!(env_sub_q16(&c, dx * 8, 8), crate::schedule::env_q16(&c, c.at + dx), "a tick's first column is the tick");
+        }
+        let (e1, e2) = (crate::schedule::env_q16(&c, 11) as i64, crate::schedule::env_q16(&c, 12) as i64);
+        assert_eq!(env_sub_q16(&c, 8 + 4, 8) as i64, e1 + (e2 - e1) * 4 / 8, "half way inside tick 1");
+        let rising: Vec<u32> = (0..32).map(|dx| env_sub_q16(&c, dx, 8)).collect();
+        assert!(rising.windows(2).all(|w| w[0] < w[1]), "the fade-in rises every column: {rising:?}");
+        let (fo0, fo1) = (env_sub_q16(&c, 46 * 8 + 3, 8), env_sub_q16(&c, 46 * 8 + 4, 8));
+        assert!(fo1 < fo0, "the fade-out falls inside a tick: {fo0} {fo1}");
+        std::println!("striathumbnailsthree: env tick1={e1} mid={} tick2={e2}", env_sub_q16(&c, 12, 8));
+    }
+
+    #[test]
+    fn striathumbnailsthree_fade_in_rises_inside_a_tick() {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(SourceId(0), 0, 50, 0).faded(4, 0)];
+        let mut st = EditorState::new(tl);
+        st.zoom = 8;
+        let l = Layout::of(400, 160, &st);
+        let full = Full(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&full));
+        let b = clip_colour(0, Kind::Audio);
+        let ink = [b[0] + WAVE_LIFT, b[1] + WAVE_LIFT, b[2] + WAVE_LIFT, 255];
+        let (y0, y1) = (l.row_y(0) + 2, l.row_y(0) + ROW_H as i64 - 2);
+        let bar = |x: i64| {
+            (y0..y1)
+                .filter(|&y| {
+                    let i = (y as usize * l.w as usize + x as usize) * 4;
+                    buf[i..i + 4] == ink
+                })
+                .count() as i64
+        };
+        let x = l.x_of(1);
+        let bars: Vec<i64> = (x..x + 8).map(bar).collect();
+        std::println!("striathumbnailsthree: fade_in=4 zoom=8 tick1 bars={bars:?}");
+        assert!(bars.windows(2).all(|w| w[0] <= w[1]), "nondecreasing inside the tick: {bars:?}");
+        assert!(bars[7] > bars[0], "the bar grows inside one tick: {bars:?}");
     }
 }

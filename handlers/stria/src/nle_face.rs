@@ -3323,7 +3323,7 @@ impl Face {
         let mut want: Vec<timeline_core::SourceId> = Vec::new(); self.peaks.drain_bg(false); // STRIATHUMBNAILSNEXT (SR997): the worker's finished heads and tables land first (file tail)
         for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
             for c in &tr.clips {
-                if !self.peaks.map.contains_key(&c.src) && !want.contains(&c.src) {
+                if !self.peaks.wantc.src) && !want.contains(&c.src { // STRIATHUMBNAILSTHREE (SR9044): marked wanted, then the same keyed test (file tail)
                     want.push(c.src);
                 }
             }
@@ -3433,6 +3433,7 @@ pub struct Thumbs {
     decodes: u32,
     pending: bool,
     bg: Option<Bg>, // STRIATHUMBNAILSNEXT (SR997): the served face's decode worker (None: decode on the face's thread) (file tail)
+    wanted: std::collections::BTreeSet<(timeline_core::SourceId, i64)>, kept: std::collections::BTreeSet<(timeline_core::SourceId, i64)>, // STRIATHUMBNAILSTHREE (SR9044): the keys this paint and the last one wanted, never evicted (file tail)
 }
 
 impl Thumbs {
@@ -3445,7 +3446,7 @@ impl Thumbs {
     fn fill(&mut self, tl: &Timeline, sources: &Sources, l: Layout) {
         let t0 = std::time::Instant::now();
         let mut done = 0u32;
-        self.pending = false;
+        self.pending = false; self.begin_paint(); // STRIATHUMBNAILSTHREE (SR9044): the wanted keys roll and the map trims back (file tail)
         loop {
             let want = view::thumb_want(tl, &l, &|s, t| self.map.get(&(s, t)).map(|e| e.1.as_ref().map(|st| st.width as i64)));
             let Some((src, tick)) = want else { break };
@@ -3484,7 +3485,7 @@ impl Thumbs {
     /// Key `k` takes `v`, the oldest entry dropped first at THUMB_CACHE.
     fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<Still>) {
         if !self.map.contains_key(&k) && self.map.len() >= THUMB_CACHE {
-            if let Some(old) = self.map.iter().min_by_key(|e| (e.1).0).map(|e| *e.0) {
+            if let Some(old) = self.map.iter().filter(|e| !self.spared(e.0)).min_by_key(|e| (e.1).0).map(|e| *e.0) { // STRIATHUMBNAILSTHREE (SR9044): a key this or the last paint wanted is never evicted (file tail)
                 self.map.remove(&old);
             }
         }
@@ -9911,5 +9912,101 @@ impl Face {
             Some(word) if v.trim() == "track-" => format!("track- {word}"),
             _ => v.to_string(),
         }
+    }
+}
+
+// ---- STRIATHUMBNAILSTHREE (LEDGER SR9044): the visible tiles are never evicted (named tail block) ----
+// SR839's `Thumbs::insert` dropped the OLDEST entry at THUMB_CACHE with no regard for the paint in hand: a view wanting more
+// tiles than the cap (SR949's filmstrip on a wide canvas or many rows) evicted tiles that same paint wanted, so every paint
+// re-decoded THUMBS_PER_PAINT of them, `pending` never cleared and `serve`'s clock decoded forever. RULE (the same map,
+// `thumb_for` and budget; seq untouched, so "a hit refreshes nothing" stays true):
+// * `fill` and `fill_strip` mark every visible key they test (`want`, in place of the bare `contains_key`) into `wanted`.
+// * `insert` evicts the oldest key that is NOT `spared` (wanted by this paint or kept from the last one); none such: no
+//   eviction, the map holds the visible set past the cap.
+// * `begin_paint` (the first line of `fill`) rolls the sets (`kept` = the last paint's `wanted`) and trims the map back to
+//   THUMB_CACHE oldest-first among keys the last paint did not want, so a view that moved gives its memory back.
+// Steady state over an unchanged view: zero decodes and `pending` false. SR997 (worker folds on `thumb_for` / `wave_fill`)
+// and SR9019 (`fill` one loop over `view::thumb_want`, `fill_strip` deleted) touch the same fns on their branches: at the
+// fold the `want` marking goes inside that one loop; `spared` / `begin_paint` stay as written.
+
+impl Thumbs {
+    /// STRIATHUMBNAILSTHREE (SR9044): mark `(src, tick)` wanted by this paint; true when it is keyed already.
+    fn want(&mut self, src: timeline_core::SourceId, tick: i64) -> bool {
+        self.wanted.insert((src, tick));
+        self.map.contains_key(&(src, tick))
+    }
+    /// STRIATHUMBNAILSTHREE (SR9044): key `k` was wanted by this paint or the last one (never evicted).
+    fn spared(&self, k: &(timeline_core::SourceId, i64)) -> bool {
+        self.wanted.contains(k) || self.kept.contains(k)
+    }
+    /// STRIATHUMBNAILSTHREE (SR9044): a paint starts: the last paint's wanted keys are kept, and the map trims back to
+    /// THUMB_CACHE, the oldest unkept first.
+    fn begin_paint(&mut self) {
+        self.kept = std::mem::take(&mut self.wanted);
+        while self.map.len() > THUMB_CACHE {
+            let Some(old) = self.map.iter().filter(|e| !self.kept.contains(e.0)).min_by_key(|e| (e.1).0).map(|e| *e.0) else { break };
+            self.map.remove(&old);
+        }
+    }
+}
+
+#[cfg(test)]
+mod striathumbnailsthree_tests {
+    use super::*;
+
+    fn still() -> Option<Still> {
+        Some(Still { width: 1, height: 1, rgba: vec![1, 2, 3, 255] })
+    }
+
+    #[test]
+    fn striathumbnailsthree_wanted_tiles_outlive_the_cap() {
+        let mut t = Thumbs::default();
+        let id = timeline_core::SourceId(0);
+        t.begin_paint();
+        for i in 0..=THUMB_CACHE as i64 {
+            assert!(!t.want(id, i));
+            t.insert((id, i), still());
+        }
+        assert_eq!(t.map.len(), THUMB_CACHE + 1, "every key the paint wants stays past the cap");
+        assert!(t.get(id, 0).is_some(), "the oldest wanted key was not evicted");
+        t.begin_paint();
+        assert_eq!(t.map.len(), THUMB_CACHE + 1, "the next paint keeps the last paint's keys");
+        assert!((0..=THUMB_CACHE as i64).all(|i| t.want(id, i)), "the same view: every key a hit, no decode");
+        println!("striathumbnailsthree: {} wanted keys kept over a cap of {}", t.map.len(), THUMB_CACHE);
+    }
+
+    #[test]
+    fn striathumbnailsthree_eviction_takes_the_oldest_unwanted() {
+        let mut t = Thumbs::default();
+        let id = timeline_core::SourceId(0);
+        for i in 0..THUMB_CACHE as i64 {
+            t.insert((id, i), still());
+        }
+        t.begin_paint();
+        for i in 0..10 {
+            assert!(t.want(id, i));
+        }
+        t.insert((id, 1000), still());
+        assert_eq!(t.map.len(), THUMB_CACHE);
+        assert!(t.get(id, 0).is_some(), "a wanted key survives though it is the oldest");
+        assert!(!t.map.contains_key(&(id, 10)), "the oldest unwanted key went");
+        assert!(t.get(id, 1000).is_some());
+    }
+
+    #[test]
+    fn striathumbnailsthree_trim_back_after_the_view_moves() {
+        let mut t = Thumbs::default();
+        let id = timeline_core::SourceId(0);
+        t.begin_paint();
+        for i in 0..THUMB_CACHE as i64 + 40 {
+            t.want(id, i);
+            t.insert((id, i), still());
+        }
+        assert_eq!(t.map.len(), THUMB_CACHE + 40);
+        t.begin_paint(); // the view moved: this paint wants other keys
+        t.want(id, 5000);
+        t.begin_paint(); // the paint after it: the old view's keys are no longer kept
+        assert_eq!(t.map.len(), THUMB_CACHE, "trimmed back to the cap");
+        assert!(!t.map.contains_key(&(id, 39)) && t.get(id, 40).is_some(), "oldest first");
     }
 }
