@@ -467,6 +467,7 @@ fn rtl_margins_over_constrained() {
         layout_core::remeasure(&mut tree, &F);
         assert_eq!(offset_in(&tree, &doc), want, "direction: {dir} restyle: the block's offset");
     }
+} // AETHERMARGINAUTOOVERFLOW (SR1065): SR781's fn closes here (SR782's test below was nested in it and never ran)
 
 // ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): the rule's container align-items / justify-content undone (named tail block) ----
 
@@ -566,4 +567,42 @@ fn center_restyle_undoes_rule_align_items() {
     layout_core::remeasure(&mut tree, &F);
     assert_eq!(justify(&tree, &row, "row"), JustifyContent::CENTER, "an author justify-content: center folded by the restyle is kept");
 }
+
+// ---- AETHERMARGINAUTOOVERFLOW (LEDGER SR1065): an over-constrained auto margin is 0, the box overflows to the end side (named tail block) ----
+
+/// AETHERMARGINAUTOOVERFLOW (SR1065): CSS 2.2 §10.3.3: a definite width wider than its containing block treats its
+/// auto margins as zero, so the box overflows to the end side (Chromium: a 600px `margin: 0 auto` box in a 400px
+/// parent sits at x 0). Before SR1065 taffy's `resolve_cross_axis_auto_margins` handed the auto margins the negative
+/// free space: x -100 (both auto), -200 (`margin-left: auto` alone), rtl -100. In rtl the box's right edge stays at
+/// the container's (margin-left is the one ignored: place_narrow_blocks' END). A box that fits still centres; a
+/// `max-width: 100%` twin is clamped and never over-constrained; a block image takes the same road.
+#[test]
+fn margin_auto_overflow_starts_at_the_start_edge() {
+    let col = |col_style: &str, kid: Spec| page(vec![el("div", &[("id", "col"), ("style", col_style)], vec![kid])]);
+    let div = |kid_style: &str| el("div", &[("id", "n"), ("style", kid_style)], vec![text("ab")]);
+    let placed = |doc: &N| {
+        let tree = lay(doc, VW, 400.0);
+        let (cx, _, cw, _) = box_of(&tree, &doc.by_id("col"));
+        let (x, _, w, _) = box_of(&tree, &doc.by_id("n"));
+        assert_eq!(cw, 400.0, "the column is 400 wide");
+        (x - cx, w)
+    };
+    let ltr = "width: 400px";
+    let rtl = "width: 400px; direction: rtl";
+    let cases: [(&str, N, (f32, f32)); 7] = [
+        ("ltr 600 0 auto (was -100)", col(ltr, div("width: 600px; margin: 0 auto")), (0.0, 600.0)),
+        ("ltr 600 margin-left auto (was -200)", col(ltr, div("width: 600px; margin-left: auto; margin-right: 0")), (0.0, 600.0)),
+        ("ltr 200 0 auto still centres", col(ltr, div("width: 200px; margin: 0 auto")), (100.0, 200.0)),
+        ("rtl 600 0 auto overflows left (was -100)", col(rtl, div("width: 600px; margin: 0 auto")), (-200.0, 600.0)),
+        ("rtl 600 margin-right auto", col(rtl, div("width: 600px; margin-left: 0; margin-right: auto")), (-200.0, 600.0)),
+        ("ltr max-width 100% twin", col(ltr, div("width: 600px; max-width: 100%; margin: 0 auto")), (0.0, 400.0)),
+        (
+            "ltr block img 600 0 auto",
+            col(ltr, el("img", &[("id", "n"), ("style", "display: block; width: 600px; height: 10px; margin: 0 auto")], vec![])),
+            (0.0, 600.0),
+        ),
+    ];
+    for (how, doc, want) in &cases {
+        assert_eq!(placed(doc), *want, "{how}: (offset in the column, width)");
+    }
 }

@@ -9360,4 +9360,20 @@ b</div>
         assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-overflow:safe"), "the safe modifier is recorded");
     }
 
+    // ---- AETHERMARGINAUTOOVERFLOW (LEDGER SR1065): an over-constrained auto margin is 0, the box overflows to the end side (named tail block) ----
+
+    /// AETHERMARGINAUTOOVERFLOW (SR1065): CSS 2.2 §10.3.3 through the host engine: a 600px `margin: 0 auto` block in a
+    /// 400px parent sits at x 0 and is 600 wide (taffy gave it x -100 before); in an rtl parent its right edge stays at
+    /// 400 (x -200: it overflows to the left); a 200px twin still centres at x 100.
+    #[test]
+    fn test_margin_auto_overflow_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="width:400px"><div id=a style="width:600px;margin:0 auto">a</div><div id=b style="width:200px;margin:0 auto">b</div></div><div style="width:400px;direction:rtl"><div id=c style="width:600px;margin:0 auto">c</div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b, c) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!((a.0, a.2), (0.0, 600.0), "ltr over-constrained: the auto margins are 0 {a:?}");
+        assert_eq!((b.0, b.2), (100.0, 200.0), "a box that fits still centres {b:?}");
+        assert_eq!((c.0, c.2), (-200.0, 600.0), "rtl over-constrained: the right edge at 400 {c:?}");
+    }
 }
