@@ -3914,7 +3914,7 @@ fn striaautosavecap_declined_autosave_kept_on_first_write() {
     for t in 1..=AUTOSAVE_EDITS as i64 {
         striaautosave_split(&mut face, t);
     }
-    assert!(!face.autosave_tick());
+    assert!(face.autosave_tick(), "the keep note repaints"); assert_eq!(face.last_error.take().as_deref(), Some("autosave: kept the older autosave as cut.autosave.1.edl")); // STRIAAUTOSAVEKEEPREAD (SR933): the keep is named once
     assert_eq!(std::fs::read_to_string(&keep).unwrap(), old, "the declined autosave is kept");
     assert_eq!(std::fs::read_to_string(&auto).unwrap(), edl::write(&face.state.timeline, "cut").unwrap());
     std::fs::write(&keep, "unchanged").unwrap();
@@ -3930,7 +3930,7 @@ fn striaautosavecap_declined_autosave_kept_on_save() {
     let (mut face, doc, old) = striaautosavecap_foreign("save");
     striaautosave_split(&mut face, 15);
     assert!(face.verb("save"));
-    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.last_error.take().as_deref(), Some("autosave: kept the older autosave as cut.autosave.1.edl"), "save refused nothing; the keep is named"); // STRIAAUTOSAVEKEEPREAD (SR933)
     assert!(!autosave_path(&doc).exists(), "saved: no autosave");
     assert_eq!(std::fs::read_to_string(autosave_keep_path(&doc)).unwrap(), old, "the declined autosave is kept");
 }
@@ -3944,4 +3944,66 @@ fn striaautosavecap_recovered_is_not_kept() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(!autosave_path(&doc).exists());
     assert!(!autosave_keep_path(&doc).exists(), "a recovered autosave is this session's: removed, not kept");
+}
+
+// ---- STRIAAUTOSAVEKEEPREAD (LEDGER SR933): recover 1 reads the kept autosave; the keep named (named tail block) ----
+// `recover 1` applies `<stem>.autosave.1.edl` through SR883's one recover road (`Face::recover_from`): one commit, the
+// same refusals by name; the face does not own `<stem>.autosave.edl` after it. SR913's keep is named once on the
+// message row, and never over a message that already stands.
+
+#[test]
+fn striaautosavekeepread_recover_1_applies_the_kept_file() {
+    let (mut face, doc, old) = striaautosavecap_foreign("keepread");
+    let keep = autosave_keep_path(&doc);
+    for t in 1..=AUTOSAVE_EDITS as i64 {
+        striaautosave_split(&mut face, t);
+    }
+    assert!(face.autosave_tick(), "the keep note repaints");
+    assert_eq!(face.last_error.take().as_deref(), Some("autosave: kept the older autosave as cut.autosave.1.edl"));
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), old);
+    let kept = edl::parse(&old, 25).unwrap();
+    let depth = face.state.undo_depth();
+    assert!(face.verb("recover 1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, kept, "the kept autosave is applied");
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    assert!(face.dirty());
+    assert_eq!(face.autosaved(), None, "the face does not own <stem>.autosave.edl after recover 1");
+    assert!(face.autosave_pending(), "the clock will write the recovered timeline");
+    assert!(keep.is_file(), "the kept file stays");
+    assert!(face.verb("recover 1"));
+    assert_eq!(face.last_error.take().as_deref(), Some("recover: the autosave matches the timeline"));
+    assert_eq!(face.state.undo_depth(), depth + 1, "a refused recover pushes nothing");
+    assert!(face.verb("undo"));
+    assert_ne!(face.state.timeline, kept, "undo returns to the edits before recover 1");
+    println!("striaautosavekeepread: recover 1 applied {} in one step", keep.display());
+}
+
+#[test]
+fn striaautosavekeepread_refusals_by_name() {
+    let (tl0, src) = synth_fixture();
+    let mut bare = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(bare.verb("recover 1"));
+    assert_eq!(bare.last_error.take().as_deref(), Some("recover: no document path"));
+    let (mut face, doc, tl0) = striaautosave_face("keepread-refuse");
+    assert!(face.verb("recover 1"));
+    assert_eq!(face.last_error.take(), Some(format!("recover: no autosave ({})", autosave_keep_path(&doc).display())));
+    for w in ["recover 2", "recover x"] {
+        assert!(face.verb(w), "{w} is the recover word");
+        assert_eq!(face.last_error.take().as_deref(), Some("recover: one older autosave is kept: recover 1"), "{w}");
+    }
+    assert!(face.verb("recover"));
+    assert_eq!(face.last_error.take(), Some(format!("recover: no autosave ({})", autosave_path(&doc).display())), "bare recover unchanged");
+    assert_eq!(face.state.undo_depth(), 0);
+    assert_eq!(face.state.timeline, tl0);
+}
+
+#[test]
+fn striaautosavekeepread_keep_note_never_hides_an_error() {
+    let (mut face, doc, old) = striaautosavecap_foreign("keepread-quiet");
+    striaautosave_split(&mut face, 15);
+    face.last_error = Some("an earlier message".into());
+    assert!(face.verb("save"));
+    assert_eq!(face.last_error.take().as_deref(), Some("an earlier message"), "the keep note never replaces a standing message");
+    assert_eq!(std::fs::read_to_string(autosave_keep_path(&doc)).unwrap(), old, "kept all the same");
 }

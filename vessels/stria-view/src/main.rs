@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "recover"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -941,6 +941,31 @@ mod striaautosavecap_tests {
         assert!(drive(&mut face, "save").is_empty());
         assert!(!nle_face::autosave_path(&doc).exists());
         assert_eq!(autosaved_json(&face), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAAUTOSAVEKEEPREAD (LEDGER SR933): the witness's `recover:1` token (named tail block) ----
+#[cfg(test)]
+mod striaautosavekeepread_tests {
+    use super::*;
+
+    /// STRIAAUTOSAVEKEEPREAD M3: `recover:1` is the word `recover 1` at the face: with no kept file beside the document it
+    /// is refused by name (`recover: no autosave (<stem>.autosave.1.edl)`); `recover:2` is refused as one generation.
+    #[test]
+    fn striaautosavekeepread_witness_recover_1() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaautosavekeepread-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("cut.edl");
+        let (tl, src) = nle_face::synth_fixture();
+        std::fs::write(&doc, edl::write(&tl, "cut").unwrap()).unwrap();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(doc.as_path()));
+        let keep = nle_face::autosave_keep_path(&doc);
+        assert_eq!(drive(&mut face, "recover:1"), vec![format!("recover: no autosave ({})", keep.display())]);
+        assert_eq!(drive(&mut face, "recover:2"), vec!["recover: one older autosave is kept: recover 1".to_string()]);
+        assert_eq!(face.state.undo_depth(), 0, "a refused recover pushes nothing");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
