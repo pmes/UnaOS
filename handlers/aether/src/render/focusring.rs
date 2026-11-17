@@ -220,7 +220,7 @@ fn band(
 }
 
 /// The nearest specified `color` on `id` or an ancestor box (an outline's `currentColor`), else black.
-fn current_color(layout: &LayoutTree, id: taffy::prelude::NodeId) -> (u8, u8, u8) {
+pub(crate) fn current_color(layout: &LayoutTree, id: taffy::prelude::NodeId) -> (u8, u8, u8) {
     let mut cur = Some(id);
     while let Some(c) = cur {
         if let Some(col) = layout.paint_map.get(&c).and_then(|p| p.color) {
