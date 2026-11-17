@@ -36,7 +36,7 @@
 //! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 //! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
-//! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>}` after the other fields (the default line unchanged).
+//! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>,"audio":"<word>"[,"pass":<k>,"passes":<n>][,"eta_secs":<s>][,"stalled_secs":<s>]}` (the keys: [`EXPORT_JSON_KEYS`]) after the other fields (the default line unchanged).
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -616,7 +616,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}{}}}", face.export_audio().unwrap_or_default(), face.export_pass().map(|(k, n)| format!(",\"pass\":{k},\"passes\":{n}")).unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default() + &face.export_stall().map(|s| format!(",\"stalled_secs\":{}", nle_face::eta_secs(s))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known; NLE5DEXPORTMESSAGEETASTALLWITNESS (SR825): stalled_secs while stalled; NLEFACEEXPORTPASSJSON (SR1097): pass / passes after audio under two-pass
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -901,6 +901,171 @@ mod exportstall_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the witness's export object names the pass (named tail block) ----
+#[cfg(test)]
+mod exportpassjson_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTPASSJSON (SR1097): a two-pass export held at 50 of 70 (pass 2 of 2) carries `"pass":2,"passes":2` right
+    /// after `"audio"`; once it is cancelled and joined the object is gone. Single-pass heads are pinned byte-exact above.
+    #[test]
+    fn nlefaceexportpassjson_witness_two_pass_fields() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportpassjson-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.export_paused_plan(&dir, "h264", 50, nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+        let t0 = std::time::Instant::now();
+        while face.export_progress() != Some((50, 70)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(120), "reading {:?}", face.export_progress());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(face.export_pass(), Some((2, 2)));
+        let j = export_json(&face);
+        let head = j.split_once(",\"eta_secs\":").map_or(j.as_str(), |(h, _)| h);
+        assert_eq!(head.trim_end_matches('}'), r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2"#, "{j}");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportpassjson witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONSCHEMA (LEDGER SR1106): the witness's export object keys, listed once (named tail block) ----
+/// The keys of the witness's `"export"` object in the order [`export_json`] (the one writer) emits them. `done` / `total` /
+/// `audio` are always there while an export runs; `pass` / `passes` together only when the job has more than one pass
+/// (`Face::export_pass`); `eta_secs` while the face has an eta (`Face::export_eta`: from the first frame on);
+/// `stalled_secs` past the stall rule (`Face::export_stall`). The bench reads the line by these names.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const EXPORT_JSON_KEYS: [&str; 7] = ["done", "total", "audio", "pass", "passes", "eta_secs", "stalled_secs"];
+
+#[cfg(test)]
+mod exportjsonschema_tests {
+    use super::*;
+
+    /// The key names of one `export_json` line, in order (every value is a number or a comma-free quoted word).
+    fn keys_of(j: &str) -> Vec<String> {
+        let body = j.strip_prefix(",\"export\":{").and_then(|b| b.strip_suffix('}')).unwrap_or_else(|| panic!("not an export object: {j}"));
+        body.split(',').map(|kv| kv.split_once("\":").and_then(|(k, _)| k.strip_prefix('"')).unwrap_or_else(|| panic!("{kv} in {j}")).to_string()).collect()
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): the two-pass hold at 50 of 70 (SR1097's fixture), read once stalled (SR825's wait
+    /// shape: the flat 5 s from the start, the same 20 s ceiling), emits all seven keys in `EXPORT_JSON_KEYS`' order.
+    #[test]
+    fn nlefaceexportjsonschema_two_pass_stalled_walk() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonschema-walk");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_plan(&dir, "h264", 50, nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+        while face.export_progress() != Some((50, 70)) {
+            assert!(start.elapsed() < Duration::from_secs(120), "reading {:?}", face.export_progress());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = loop {
+            let j = export_json(&face);
+            if j.contains(",\"stalled_secs\":") {
+                break j;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "the paused two-pass job never carried stalled_secs: {j}");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(keys_of(&j), EXPORT_JSON_KEYS, "{j}");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportjsonschema witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): a fresh single-pass job emits done / total / audio (no pass keys), a stalled_secs only
+    /// past the stall rule, each key in `EXPORT_JSON_KEYS`' order. NLEFACEEXPORTJSONZERO (SR1110): read at the k = 0 hold (before
+    /// the first frame, done 0, so no eta yet): exactly the three keys, where SR1106 held at 3 and had to accept eta_secs.
+    #[test]
+    fn nlefaceexportjsonschema_fresh_single_pass_keys() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonschema-fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = export_json(&face);
+        let keys = keys_of(&j);
+        let fresh = ["done", "total", "audio"];
+        if start.elapsed() < Duration::from_secs(4) {
+            assert_eq!(keys, fresh, "{j}");
+        } else {
+            assert!(keys == fresh || keys == ["done", "total", "audio", "stalled_secs"], "{j}");
+        }
+        let at: Vec<usize> = keys.iter().map(|k| EXPORT_JSON_KEYS.iter().position(|e| e == k).unwrap_or_else(|| panic!("{k} not in EXPORT_JSON_KEYS: {j}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{j}: out of EXPORT_JSON_KEYS order");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): seven names, none twice, and `keys_of` reads back a line of all seven.
+    #[test]
+    fn nlefaceexportjsonschema_keys_const() {
+        assert_eq!(EXPORT_JSON_KEYS.len(), 7);
+        let mut sorted = EXPORT_JSON_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 7, "a key listed twice");
+        let line = r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2,"eta_secs":3,"stalled_secs":6}"#;
+        assert_eq!(keys_of(line), EXPORT_JSON_KEYS);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONZERO (LEDGER SR1110): the witness's three-key export line before the first frame (named tail block) ----
+// `Face::start_export`'s progress closure is called once with reading 0 before the first frame, so `export_paused_at(.., 0)`
+// holds there: the line a page sees for the whole first frame of a real export (done 0, no eta: `eta_of` guards 0) is pinned.
+
+#[cfg(test)]
+mod exportjsonzero_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTJSONZERO (SR1110): a job held at k = 0 of 35 reads `,"export":{"done":0,"total":35,"audio":"wav"}` byte for
+    /// byte (read fresh, under SR825's stall window), has written no frame, and the object is gone once it is cancelled and joined.
+    #[test]
+    fn nlefaceexportjsonzero_three_key_line_byte_exact() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonzero-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = export_json(&face);
+        assert!(start.elapsed() < Duration::from_secs(4), "read under the stall window");
+        assert_eq!(j, r#","export":{"done":0,"total":35,"audio":"wav"}"#);
+        let written = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(written, 0, "held before the first frame: no frame file in {}", dir.display());
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportjsonzero witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
