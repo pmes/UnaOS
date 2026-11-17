@@ -3656,7 +3656,7 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
 /// message row reads the laid clip's reel line.
 #[test]
 fn striainsertoverwrite_face_words_are_place_at_the_playhead() {
-    assert_eq!(VERBS[VERBS.len() - 3..], ["insert", "overwrite", "help"]);
+    assert_eq!(VERBS[VERBS.len() - 9..], ["insert", "overwrite", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "help"]); // STRIASOURCEVIEWER (SR9045): the source monitor's six words before help
     for (word, mode) in [("insert", timeline_core::Mode::Insert), ("overwrite", timeline_core::Mode::Overwrite)] {
         let (tl, src) = synth_fixture();
         let mut face = nlefaceexport_face(tl.clone(), src);

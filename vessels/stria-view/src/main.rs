@@ -62,7 +62,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split [--bin]] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, bin:ROW, binsize:W:H, binwheel:N)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split [--bin]] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, bin:ROW, binsize:W:H, binwheel:N, source:REEL, binload:ROW)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -207,7 +207,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| source_token(face, tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail); STRIASOURCEVIEWER (SR9045): `source:<reel>` / `binload:<row>` (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -256,7 +256,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &source_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIASOURCEVIEWER (SR9045): the loaded source (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -521,6 +521,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
+        button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -927,7 +928,7 @@ mod striainsertoverwrite_tests {
     fn striainsertoverwrite_buttons_and_token() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 3..], ["insert", "overwrite", "help"]);
+        assert_eq!(ids[ids.len() - 9..], ["insert", "overwrite", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "help"]); // STRIASOURCEVIEWER (SR9045): the source monitor's six buttons before help
         let mut f = face();
         let a1 = f.state.timeline.tracks[1].clone();
         let errors = drive(&mut f, "at:12:0,ruler:15,insert");
@@ -1091,5 +1092,72 @@ mod striabinmore_tests {
         let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(drive(&mut plain, "binwheel:1,binsize:9:9"), vec!["bad token binwheel:1".to_string(), "bad token binsize:9:9".to_string()]);
         println!("striabinmore witness: --split --bin --do binsize:320:18,binwheel:1,ruler:15,bin:0 -> B at 15 on V1, bintop 1");
+    }
+}
+
+// ---- STRIASOURCEVIEWER (LEDGER SR9045): the source monitor's tokens and the witness's loaded source (named tail block) ----
+
+/// `source:<reel>` is the face's word `source <reel>` (load that reel); `binload:<row>` is a Shift release on that bin
+/// row, stamped with the bin's Surface number into `Face::on` (the bin's load), as `bin_token` does. `None` for any other
+/// token, and `binload` with no bin (a bad token). The six bare words are VERBS (`token`).
+fn source_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
+    let parts: Vec<&str> = tok.split(':').collect();
+    match parts.as_slice() {
+        ["source", reel] => Some(vec![SMessage::Input { target: SURFACE.into(), text: format!("source {reel}") }]),
+        ["binload", row] => {
+            let row = row.parse::<usize>().ok()?;
+            let b = face.bin()?;
+            let (x, y) = timeline_core::view::bin_point(row);
+            face.on(&SMessage::BrowserButton { down: false, x, y, mods: bandy::MOD_SHIFT, surface: b.n });
+            Some(Vec::new())
+        }
+        _ => None,
+    }
+}
+
+/// The witness's `"source"` while a source is loaded: its reel, source playhead and marks (`null` when unset); nothing
+/// otherwise (the default line is unchanged).
+fn source_json(face: &Face) -> String {
+    let Some(m) = face.state.source.as_ref() else { return String::new() };
+    let tl = &face.state.timeline;
+    let reel = tl.source(m.src).map_or_else(|| m.src.0.to_string(), |s| s.reel.replace('"', "'"));
+    let mark = |t: Option<i64>| t.map_or_else(|| "null".to_string(), |t| t.to_string());
+    format!(",\"source\":{{\"reel\":\"{reel}\",\"at\":{},\"in\":{},\"out\":{}}}", m.at, mark(m.marks.0), mark(m.marks.1))
+}
+
+#[cfg(test)]
+mod striasourceviewer_tests {
+    use super::*;
+    use timeline_core::{Clip, Mode, SourceId};
+
+    fn bin_cli() -> Cli {
+        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true }
+    }
+
+    /// `binload:1` loads B, the words step and mark it, `ruler:15,insert` lays B 1..3 at 15 on V1 and A1 (one undo step);
+    /// `"source"` reads the monitor until `unload`; `source:A` is the face's word; `binload` without a bin is bad.
+    #[test]
+    fn striasourceviewer_binload_marks_insert_and_json() {
+        let c = bin_cli();
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        assert_eq!(source_json(&face), "");
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "binload:1,src-next,src-in,src-next,src-next,src-out,ruler:15,insert", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        let b = Clip::new(SourceId(1), 1, 3, 15);
+        assert_eq!(face.state.timeline, tl0.place(0, b, Mode::Insert).unwrap().place(1, b, Mode::Insert).unwrap());
+        assert_eq!(face.state.undo_depth(), 1);
+        assert_eq!(source_json(&face), r#","source":{"reel":"B","at":3,"in":1,"out":3}"#);
+        assert!(drive_on(&mut face, "unload", Some((1, 0)), &mut presses).is_empty());
+        assert_eq!(source_json(&face), "");
+        assert!(matches!(source_token(&mut face, "source:A").as_deref(), Some([SMessage::Input { text, .. }]) if text == "source A"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut plain, "binload:1"), vec!["bad token binload:1".to_string()]);
+        assert!(drive(&mut plain, "source:B,src-next").is_empty());
+        assert_eq!(source_json(&plain), r#","source":{"reel":"B","at":1,"in":null,"out":null}"#);
+        println!("striasourceviewer witness: --split --bin --do binload:1,src-next,src-in,src-next,src-next,src-out,ruler:15,insert -> B 1..3 at 15 on V1 + A1, undo 1");
     }
 }

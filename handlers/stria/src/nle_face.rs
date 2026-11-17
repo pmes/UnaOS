@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "insert", "overwrite", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core)
+pub const VERBS: [&str; 34] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "insert", "overwrite", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIASOURCEVIEWER (SR9045): the source monitor's words (timeline_core)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -1592,7 +1592,7 @@ impl Face {
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
-            self.still = match preview(&st.timeline, &self.sources, st.playhead) {
+            self.still = match preview_shown(st, &self.sources) { // STRIASOURCEVIEWER (SR9045): a loaded source shows through the same frame road (file tail)
                 Ok(s) => s,
                 Err(e) => {
                     self.last_error = Some(format!("preview: {e}"));
@@ -2361,7 +2361,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.state.source_line()).or_else(|| self.reel_line()) // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3153,7 +3153,7 @@ impl Face {
                 set(self, BinSurface { buttons: true, ..b });
                 false
             }
-            SMessage::BrowserButton { down: false, x, y, .. } => self.bin_click(x, y),
+            SMessage::BrowserButton { down: false, x, y, mods, .. } => if mods & bandy::MOD_SHIFT != 0 { self.bin_load(x, y) } else { self.bin_click(x, y) }, // STRIASOURCEVIEWER (SR9045): Shift on the release loads the row's reel (file tail)
             SMessage::BrowserClick(x, y, _) if !b.buttons => self.bin_click(x, y),
             SMessage::BrowserScroll(_, dy, _) => self.bin_scroll(dy), // STRIABINSCROLL (SR939): the wheel scrolls the rows (file tail)
             _ => false,
@@ -3463,5 +3463,112 @@ mod striabinmore_tests {
         let got = f.paint_role(Role::Bin);
         assert_eq!(got, view::paint_bin_thumb(&f.state.timeline, 320, view::BIN_ROW_H, 0, Order::Rgba, None));
         assert_ne!(got, view::paint_bin_from(&f.state.timeline, 320, view::BIN_ROW_H, 0, Order::Rgba, None), "the thumb shows");
+    }
+}
+
+// ---- STRIASOURCEVIEWER (LEDGER SR9045): the source monitor's preview and the bin's load (named tail block) ----
+// A source loaded into timeline_core's `EditorState::source` (session state: its own playhead and in / out marks) shows
+// in the preview through THE one frame road, [`preview`], over `EditorState::source_view` (a one-clip timeline at its tick
+// 0); nothing loaded paints exactly as before. Playback stays the timeline's transport (its played stills show) and a live
+// drag paints the timeline (`Drag::shown` carries no source). Shift on the bin's release loads that row's reel with the
+// kinds its media holds (`Sources::holds`); a plain click still lays it. The words and the three-point insert are
+// timeline_core's (`EditorState::verb`); the message line reads `EditorState::source_line`.
+
+/// The frame the preview shows: the loaded source's one-clip view at its tick 0, else the timeline at the playhead.
+fn preview_shown(st: &EditorState, sources: &Sources) -> Result<Option<Still>, RenderError> {
+    match st.source_view() {
+        Some(v) => preview(&v, sources, 0),
+        None => preview(&st.timeline, sources, st.playhead),
+    }
+}
+
+impl Face {
+    /// A Shift release on the bin at `(x, y)`: that row's reel loaded into the source monitor (the kinds its media holds;
+    /// none opened: the kinds of the tracks it sits on); false under the last row. Pushes nothing.
+    fn bin_load(&mut self, x: f64, y: f64) -> bool {
+        let Some(b) = self.bin() else { return false };
+        let Some(i) = view::bin_hit_from(&self.state.timeline, b.canvas.0, b.canvas.1, b.top, x, y) else { return false };
+        let Some(src) = self.state.timeline.sources.get(i).map(|s| s.id) else { return false };
+        let kinds: Vec<Kind> = [Kind::Video, Kind::Audio].into_iter().filter(|k| self.sources.holds(src, *k)).collect();
+        if let Err(e) = self.state.load_source(src, &kinds) {
+            self.last_error = Some(format!("source: {e}"));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod striasourceviewer_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    fn plain() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// A loaded source paints its own frame through the one frame road; stepping and `unload` push nothing and dirty
+    /// nothing; unloaded, the preview is the timeline's again.
+    #[test]
+    fn striasourceviewer_preview_shows_the_loaded_source() {
+        let mut f = plain();
+        f.paint();
+        let timeline = preview(&f.state.timeline, &f.sources, 0).unwrap();
+        assert_eq!(f.still().cloned(), timeline);
+        for v in ["source B", "src-next", "src-next", "src-next"] {
+            assert!(f.verb(v), "{v}");
+        }
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        f.paint();
+        let want = preview(&f.state.source_view().unwrap(), &f.sources, 0).unwrap();
+        assert!(want.is_some(), "B's frame 3");
+        assert_eq!(f.still().cloned(), want);
+        assert_ne!(f.still().cloned(), timeline, "the source, not the timeline");
+        assert!(f.verb("unload"));
+        f.paint();
+        assert_eq!(f.still().cloned(), timeline);
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+    }
+
+    /// Shift on the bin's release loads the row's reel (no edit); a plain click still lays; with marks, `insert` lays the
+    /// marked range at the timeline playhead on V1 and A1 in one undo step.
+    #[test]
+    fn striasourceviewer_bin_shift_release_loads_then_insert_lays() {
+        let mut f = plain().on_surfaces(0, 1).with_bin(2);
+        let tl0 = f.state.timeline.clone();
+        let (x, y) = view::bin_point(1);
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y, mods: bandy::MOD_SHIFT, surface: 2 }));
+        assert_eq!(f.state.source.as_ref().map(|m| (m.src, m.at, m.kinds.clone())), Some((SourceId(1), 0, vec![Kind::Video, Kind::Audio])));
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0), "loading lays nothing");
+        for v in ["src-next", "src-in", "src-next", "src-next", "src-out"] {
+            assert!(f.verb(v), "{v}");
+        }
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.verb("insert"));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        let c = Clip::new(SourceId(1), 1, 3, 15);
+        assert_eq!(f.state.timeline, tl0.place(0, c, Mode::Insert).unwrap().place(1, c, Mode::Insert).unwrap());
+        assert_eq!((f.state.undo_depth(), f.state.playhead), (1, 17));
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0);
+        assert!(f.verb("unload"));
+        f.state.seek(15);
+        assert!(f.on(&SMessage::BrowserClick(x, y, 2)), "a plain click is SR852's insert word, as before");
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap());
+    }
+
+    /// The message line reads the loaded source after a standing error; a src word with nothing loaded is refused by name.
+    #[test]
+    fn striasourceviewer_message_line_reads_the_source() {
+        let mut f = plain();
+        assert!(f.verb("src-in"));
+        assert_eq!(f.last_error.take(), Some(format!("src-in: {}", EditError::NoSource)));
+        for v in ["source B", "src-next", "src-next", "src-next", "src-in"] {
+            assert!(f.verb(v), "{v}");
+        }
+        assert_eq!(f.message_text().as_deref(), Some("source B 00:00:00:03  in 00:00:00:03  out --"));
+        assert!(f.verb("src-out"));
+        assert_eq!(f.message_text(), Some(format!("src-out: {}", EditError::Marks)), "the error first");
     }
 }
