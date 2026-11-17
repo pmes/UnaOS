@@ -11241,3 +11241,31 @@ fn striaundomore_pick_misses_and_clears() {
     assert_eq!(off.state.undo_depth(), 3, "no row: nothing is picked");
     assert!(off.message_text().is_none_or(|m| !m.starts_with("history:")), "the press clears the note");
 }
+
+// ---- STRIAGAPSMORE (LEDGER SR969): the Close All button word and `close-gaps sync` on the host face (named tail block) ----
+
+/// `close-all` sits right before `gap` in VERBS and is the argument word `close-gaps all` (one commit, the timeline_core op by
+/// hand). On the synth fixture (V1 and A1 both A@0|B@10|A@25) with a to-black at 20 and a from-black at 25 on V1,
+/// `close-gaps sync` with nothing selected closes the one span empty on both tracks (20..25), removes both of V1's fades in
+/// ONE commit and names them.
+#[test]
+fn striagapsmore_face_close_all_and_sync() {
+    let i = VERBS.iter().position(|&v| v == "close-all").expect("close-all in VERBS");
+    assert_eq!(VERBS[i + 1], "gap");
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let tl = tl.add_transition_from_black(0, 25, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("close-all"));
+    assert_eq!(face.state.timeline, tl.close_gaps_all().unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    let (_, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert_eq!(tl.sync_gaps(), vec![(20, 25)]);
+    assert!(face.verb("close-gaps sync"));
+    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps sync: closed 1 gap, removed 2 fades"));
+    assert_eq!(face.state.timeline, tl.close_gaps_sync().unwrap());
+    assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (20, 20));
+    assert_eq!(face.state.undo_depth(), 1);
+    println!("striagapsmore: V1 {:?} A1 {:?}", face.state.timeline.tracks[0].clips, face.state.timeline.tracks[1].clips);
+}

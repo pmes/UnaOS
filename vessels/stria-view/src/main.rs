@@ -543,6 +543,7 @@ fn transport() -> TetraNode {
         button("zoom-fit", "Fit"), button("zoom-sel", "Fit Sel"), // STRIAZOOMTOFIT (SR859): fit the timeline / the selection in the window
         button("xfade", "Xfade"), button("tc", "TC"), // STRIATIMECODEDISPLAY (SR872): the playhead readout off / timecode / frames / seconds
         button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
+        button("close-all", "Close All"), // STRIAGAPSMORE (SR969): closes every gap on every track (`close-gaps all`, one undo step)
         button("gap", "Gap"), // STRIAGAPSBLACK (SR909): opens one second of gap at the playhead on the selected clip's track (one undo step)
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
@@ -2765,5 +2766,32 @@ mod strialinkmore_tests {
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
         assert_eq!(&ids[ids.len() - 2..], ["alone", "help"]);
+    }
+}
+
+// ---- STRIAGAPSMORE (LEDGER SR969): the witness's Close All button and `close-gaps:sync` token (named tail block) ----
+#[cfg(test)]
+mod striagapsmore_tests {
+    use super::*;
+
+    /// The Close All button sits right before Gap (Gap, Close Gaps, help stay last); its word `close-all` is the argument
+    /// word `close-gaps all`; `close-gaps:sync` closes the spans empty on every track, the timeline_core op by hand.
+    #[test]
+    fn striagapsmore_witness_button_and_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        let i = ids.iter().position(|x| x == "close-all").expect("close-all button");
+        assert_eq!(ids[i + 1], "gap");
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "close-all").is_empty());
+        assert_eq!(face.state.timeline, tl0.close_gaps_all().unwrap());
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "close-gaps:sync").is_empty());
+        assert_eq!(face.state.timeline, tl0.close_gaps_sync().unwrap());
+        assert_eq!(tl0.sync_gaps(), vec![(20, 25)]);
+        println!("striagapsmore witness: close-gaps:sync -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }

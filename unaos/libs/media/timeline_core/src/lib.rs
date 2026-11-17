@@ -3499,3 +3499,45 @@ mod striafreezemore_tests {
         assert_eq!(tl.set_title(SourceId(99), "X"), Err(EditError::NoSource), "no such source");
     }
 }
+
+// ---- STRIAGAPSMORE (LEDGER SR969): close-gaps sync, the spans empty on every track (named tail block) ----
+// A sync gap is a span no clip of ANY track covers (the leading one, tick 0 to the first clip anywhere, included).
+// `close_gaps_sync` closes only those, shifting EVERY track by the same delta at the same edge through SR857's one
+// `shift_from`, so a derived audio crossfade (paired by tick with a video transition on another track) keeps its pairing
+// and A / V stay locked. A track whose own gap closes fully there (a clip ends at the span's start and one starts at its
+// end) loses that gap's black fades through SR909's one `drop_gap_blacks`; a track whose own gap stays open keeps them.
+// One `validate` at the end (no half-closed value is checked).
+impl Timeline {
+    /// STRIAGAPSMORE: the spans `(start, end)` no clip of any track covers, in order, the leading one included.
+    pub fn sync_gaps(&self) -> Vec<(i64, i64)> {
+        let mut spans: Vec<(i64, i64)> = self.tracks.iter().flat_map(|t| t.clips.iter().map(|c| (c.at, c.end()))).collect();
+        spans.sort_unstable();
+        let mut end = 0;
+        let mut gaps = Vec::new();
+        for (at, e) in spans {
+            if at > end {
+                gaps.push((end, at));
+            }
+            end = end.max(e);
+        }
+        gaps
+    }
+
+    /// STRIAGAPSMORE: close every span empty on every track ([`Timeline::sync_gaps`]): every track moves alike. No such
+    /// span: an equal value.
+    pub fn close_gaps_sync(&self) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for _ in 0..self.sync_gaps().len() {
+            let Some(&(s, e)) = tl.sync_gaps().first() else { break };
+            for t in 0..tl.tracks.len() {
+                let k = &tl.tracks[t];
+                if s > 0 && k.clips.iter().any(|c| c.end() == s) && k.clips.iter().any(|c| c.at == e) {
+                    tl.drop_gap_blacks(t, s, e);
+                }
+                tl.shift_from(t, e, s - e, None);
+            }
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+}

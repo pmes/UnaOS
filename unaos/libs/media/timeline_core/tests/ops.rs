@@ -2819,3 +2819,70 @@ fn strialinkmore_alone_on_an_unlinked_clip_keeps_it() {
     assert_eq!((st.selection, st.set.clone()), (Some((1, 1)), vec![(1, 1)]), "the primary is the last added");
     assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
 }
+
+// ---- STRIAGAPSMORE (LEDGER SR969): close-gaps sync, the spans empty on every track (named tail block) ----
+
+/// SR909's black base: V1 A@0|B@20|A@30|B@45, A1 A@0. The spans no track covers are 10..20 and 40..45; A1 has no clip
+/// there, so the sync close is V1's own close (both black fades of 10..20 go, V1 abutting on both sides).
+#[test]
+fn striagapsmore_sync_close_on_one_covered_track_is_its_own_close() {
+    let k = striagapsblack_base();
+    assert_eq!(k.sync_gaps(), vec![(10, 20), (40, 45)]);
+    let c = k.close_gaps_sync().unwrap();
+    assert_eq!(c, k.close_gaps(0).unwrap());
+    assert_eq!(c.sync_gaps(), Vec::<(i64, i64)>::new());
+    assert_eq!(c.close_gaps_sync().unwrap(), c);
+    println!("striagapsmore: V1 {:?}", c.tracks[0].clips);
+}
+
+/// SR857's base: every tick 0..40 is covered by one track or the other: no sync gap, an equal value, although each track
+/// has gaps of its own (the per-track and all-tracks closes would move them).
+#[test]
+fn striagapsmore_no_span_empty_everywhere_is_an_equal_value() {
+    let (tl, _, _) = striagapclose_base();
+    assert_eq!(tl.sync_gaps(), Vec::<(i64, i64)>::new());
+    assert_eq!(tl.close_gaps_sync().unwrap(), tl);
+    assert!(tl.gap_count_all() > 0);
+}
+
+/// Differing layouts: V1 A[0,10)@5 | B[20,30)@25 with a from-black at 25, A1 A[0,10)@8 | B[20,30)@30. The spans empty on
+/// both are 0..5 (leading) and 18..25; every track moves alike: V1 A@0 B@13 (its own gap 10..13 stays open, so its
+/// from-black stays, now at 13), A1 A@3 B@18. The value validates and round-trips through the EDL.
+#[test]
+fn striagapsmore_every_track_moves_alike() {
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 5), Clip::new(b, 20, 30, 25)];
+    k.tracks[1].clips = vec![Clip::new(a, 0, 10, 8), Clip::new(b, 20, 30, 30)];
+    let k = k.add_transition_from_black(0, 25, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(k.sync_gaps(), vec![(0, 5), (18, 25)]);
+    let c = k.close_gaps_sync().unwrap();
+    assert_eq!(c.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 13)]);
+    assert_eq!(c.tracks[1].clips, vec![Clip::new(a, 0, 10, 3), Clip::new(b, 20, 30, 18)]);
+    let xs: Vec<(i64, bool, bool)> = c.tracks[0].transitions.iter().map(|x| (x.at, x.from_black, x.to_black)).collect();
+    assert_eq!(xs, vec![(13, true, false)]);
+    assert_eq!(c.sync_gaps(), Vec::<(i64, i64)>::new());
+    assert_eq!(c.validate(), Ok(()));
+    let text = timeline_core::edl::write(&c, "GAPSMORE").unwrap();
+    let back = timeline_core::edl::parse(&text, 25).unwrap();
+    assert_eq!(timeline_core::edl::write(&back, "GAPSMORE").unwrap(), text);
+    println!("striagapsmore: V1 {:?} A1 {:?}", c.tracks[0].clips, c.tracks[1].clips);
+}
+
+/// `close-gaps sync` through THE verb dispatch: no selection needed, one commit, a second is an equal value (nothing), undo
+/// restores; a third word is not this verb.
+#[test]
+fn striagapsmore_editor_one_undo_step() {
+    use timeline_core::editor::EditorState;
+    let k = striagapsblack_base();
+    let mut st = EditorState::new(k.clone());
+    assert_eq!(st.verb("close-gaps sync"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (k.close_gaps_sync().unwrap(), 1));
+    assert_eq!(st.verb("close-gaps sync"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1);
+    assert!(st.undo());
+    assert_eq!(st.timeline, k);
+    assert_eq!(st.verb("close-gaps sync x"), None);
+}
