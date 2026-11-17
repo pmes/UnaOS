@@ -302,7 +302,7 @@ fn main() {
     let mut engine: Option<Box<dyn std::any::Any>> = None; // NLEPLAYAUDIO (SR676): the audio engine, held for the process life
     {
         let rx = synapse.subscribe();
-        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_keys(c.keys.as_deref().unwrap_or(""))));
+        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_keys(&window_keys(&c)))); // STRIAKEYMAPSTORE (SR917): `--keys`, else Principia's `stria.keys` (file tail)
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -928,4 +928,12 @@ mod striakeyboardmap_tests {
         assert!(face.keymap().is_empty());
         println!("striakeyboardmap witness: --keys \"p play\" + key:p -> playing");
     }
+}
+
+// ---- STRIAKEYMAPSTORE (LEDGER SR917): the window's key map from Principia's store (named tail block) ----
+
+/// STRIAKEYMAPSTORE (SR917): a window's key map: `--keys` wins, else Principia's `stria.keys` row through quartzite's host
+/// prefs get (`chrome_rows::stored_str`, read once here at the open), else "" (the built-in KEYS). The witness never calls it.
+fn window_keys(c: &Cli) -> String {
+    nle_face::keys_text(c.keys.as_deref(), || quartzite::widgets::chrome_rows::stored_str(nle_face::KEYS_NS, nle_face::KEYS_KEY))
 }

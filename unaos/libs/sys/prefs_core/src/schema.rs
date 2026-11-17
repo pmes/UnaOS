@@ -165,6 +165,12 @@ pub static SCHEMA: &[Key] = &[
         writers: OP, reader: "comscan serve_pump (`handlers/comscan/src/pump.rs` machine_from_prefs, once at start)",
         doc: "The machine declared behind the pump desk's ports, as the declare's own text `<name> x=<mm> y=<mm> z=<mm>[ dialect=<d>]` (`comscan::pump::declare_request` parses it back; a name holding `=` or whitespace is refused at the declare); written by the desk on an accepted PumpDeclare (VUGCOMSCANMACHINEDECLAREPREFS, SR619).",
     },
+    // ── stria — the editor (STRIAKEYMAPSTORE, SR917) ──
+    Key {
+        ns: "stria", key: "keys", kind: Kind::Str { max_len: 2048, printable: false }, default: Default::Consumer("empty: the built-in KEYS table"),
+        writers: OP, reader: "stria-view (`window_keys` through quartzite `chrome_rows::stored_str`, at a window's open; `--keys` wins; the witness never reads it), handed to `nle_face::Face::with_keys`",
+        doc: "The editor's key overlay over its built-in table: `<key> <action>` entries split on a newline or `;` (`Space` names the space bar, an action is a VERBS word or a KEYS action, `none` unbinds); a refused map (an unknown action, a key named twice, no key showing the help) keeps the built-in table and says why on the message row (STRIAKEYMAPSTORE, SR917).",
+    },
     // ── system — the kernel's namespace (kernel `src/prefs.rs` `mod key`; PREFS B300) ─────────────────
     // ── AETHERA11Y (SR119): the user's accessibility preferences — the web's `prefers-*` / `forced-colors` media
     //    features (css_core `media::set_user_preferences`), recorded by aether `a11y::prefs::A11yPrefs::from_prefs` ──

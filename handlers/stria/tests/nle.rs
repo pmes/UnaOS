@@ -3771,3 +3771,39 @@ fn striakeyboardmap_dismiss_through_overlay() {
     assert!(!f.help_shown(), "p dismissed the help");
     assert!(!f.playing, "and was not applied");
 }
+
+// ---- STRIAKEYMAPSTORE (LEDGER SR917): the key map's Principia row — names, precedence, the stored map into the face (named tail block) ----
+use stria::nle_face::{KEYS_KEY, KEYS_NS, keys_text};
+
+/// The row is `stria.keys` (prefs_core SCHEMA's declared key).
+#[test]
+fn striakeymapstore_row_names() {
+    assert_eq!((KEYS_NS, KEYS_KEY), ("stria", "keys"));
+}
+
+/// The flag wins and the store is not asked; `--keys ""` wins over a stored map; an unset row is the built-in table.
+#[test]
+fn striakeymapstore_flag_wins_over_store() {
+    assert_eq!(keys_text(Some("p play"), || panic!("the store is not asked when --keys is given")), "p play");
+    assert_eq!(keys_text(Some(""), || panic!("the store is not asked when --keys is given")), "");
+    assert_eq!(keys_text(None, || Some("p play".to_string())), "p play");
+    assert_eq!(keys_text(None, || None), "");
+}
+
+/// An unset row gives the face the empty map and no message; a stored map binds through `Face::with_keys`; a refused stored
+/// map keeps the built-in table and says why.
+#[test]
+fn striakeymapstore_stored_map_reaches_the_face() {
+    let f = striakeyboardmap_face(&keys_text(None, || None));
+    assert!(f.keymap().is_empty());
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    let mut f = striakeyboardmap_face(&keys_text(None, || Some("p play;? help".to_string())));
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(!f.playing);
+    assert!(striakeyboardmap_text(&mut f, "p"));
+    assert!(f.playing, "p plays through the stored map");
+    let f = striakeyboardmap_face(&keys_text(None, || Some("p spilt".to_string())));
+    assert!(f.keymap().is_empty());
+    assert_eq!(f.last_error.as_deref(), Some("keys: line 1: unknown action \"spilt\""));
+    println!("striakeymapstore witness: stored \"p play;? help\" + p -> playing");
+}

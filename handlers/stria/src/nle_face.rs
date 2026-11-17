@@ -3214,3 +3214,22 @@ impl Face {
         self.keymap.action(k)
     }
 }
+
+// ---- STRIAKEYMAPSTORE (LEDGER SR917): the key map's Principia row (named tail block) ----
+// The key map's HOME is Principia's store (`stria.keys`, prefs_core SCHEMA): stria-view reads it once at a window's open
+// through quartzite `chrome_rows::stored_str` and hands the text to [`Face::with_keys`]; `--keys` on the command line wins.
+// The face reads no store; the witness never reads the person's store.
+
+/// STRIAKEYMAPSTORE (SR917): Principia's namespace for the key map row.
+pub const KEYS_NS: &str = "stria";
+/// STRIAKEYMAPSTORE (SR917): Principia's key for the key map row (`stria.keys`).
+pub const KEYS_KEY: &str = "keys";
+
+/// STRIAKEYMAPSTORE (SR917): the key map text a window opens with: the `--keys` flag when given (even empty; the store is
+/// then not asked), else the stored row, else "" (the built-in KEYS table alone).
+pub fn keys_text(flag: Option<&str>, stored: impl FnOnce() -> Option<String>) -> String {
+    match flag {
+        Some(t) => t.to_string(),
+        None => stored().unwrap_or_default(),
+    }
+}
