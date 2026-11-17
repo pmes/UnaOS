@@ -533,7 +533,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             match (row, col) {
                 (Some(r), Some(c)) => {
                     style.row_gap = Some(r);
-                    style.column_gap = Some(c);
+                    style.column_gap = Some(c); if let Some(g) = parts.get(1).or(parts.first()).and_then(|v| col_gap_of(v, cx)) { style.paint.col_gap = Some(g) }
                 }
                 _ => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("gap-value:{}", clip(value))) }
             }
@@ -545,11 +545,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "column-gap" | "grid-column-gap" => {
             // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
             if prop == "column-gap" {
-                if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
-                    style.paint.col_gap = Some(Some(px));
-                } else if value == "normal" {
-                    style.paint.col_gap = Some(None);
-                }
+                if let Some(g) = col_gap_of(value, cx) { style.paint.col_gap = Some(g) }
             }
             apply_column_gap(value, style, cx); if value != "normal" && parse_length_percentage_str(value, cx).is_none() { font_rel_undo(&mut style.paint, prop, &fr); }
         }
@@ -4306,6 +4302,32 @@ fn deco_thickness_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
     parse_px(v, cx).filter(|px| *px >= 0.0).map(Some)
 }
 
+// ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+/// A flex / grid gap value (`gap`, `row-gap`, `column-gap`): `normal` is the gap's initial 0 (css-align-3 §8.1),
+/// written as an explicit zero so a later `normal` beats an earlier length in one block and across rules (merge
+/// copies Somes); anything else is `parse_length_percentage_str`. The multicol gutter's `normal` (1em) stays
+/// `PaintStyle::col_gap`'s Some(None), written by the column-gap arm.
+fn gap_length(value: &str, cx: &ParseCx) -> Option<LengthPercentage> {
+    if value.trim() == "normal" {
+        return Some(LengthPercentage::length(0.0));
+    }
+    parse_length_percentage_str(value, cx)
+}
+
+// ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the multicol gutter value of a gap token (named tail block) ----
+
+/// The multicol gutter (`PaintStyle::col_gap`) for one `column-gap` value or the `gap` / `grid-gap` shorthand's
+/// column token (css-multicol-1 §4.1, css-align-3 §8.3): `normal` is Some(None) (1em, SR1016); a length that is not a
+/// percentage is Some(Some(px)); anything else is None (the gutter is left untouched).
+fn col_gap_of(value: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = value.trim();
+    if v == "normal" {
+        return Some(None);
+    }
+    parse_px(v, cx).filter(|_| !v.ends_with('%')).map(Some)
+}
+
 // ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset and text-underline-position values (named tail block) ----
 
 /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-position` value (css-text-decor-4 §2.5:
@@ -5073,17 +5095,4 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
     }
     style.align_self = v;
     style.align_self_auto = v.is_none();
-}
-
-// ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
-
-/// A flex / grid gap value (`gap`, `row-gap`, `column-gap`): `normal` is the gap's initial 0 (css-align-3 §8.1),
-/// written as an explicit zero so a later `normal` beats an earlier length in one block and across rules (merge
-/// copies Somes); anything else is `parse_length_percentage_str`. The multicol gutter's `normal` (1em) stays
-/// `PaintStyle::col_gap`'s Some(None), written by the column-gap arm.
-fn gap_length(value: &str, cx: &ParseCx) -> Option<LengthPercentage> {
-    if value.trim() == "normal" {
-        return Some(LengthPercentage::length(0.0));
-    }
-    parse_length_percentage_str(value, cx)
 }

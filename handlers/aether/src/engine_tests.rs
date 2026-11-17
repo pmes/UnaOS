@@ -9445,4 +9445,36 @@ b</div>
         assert!((left(&mut e, "g2", "g") - 60.0).abs() <= 0.5, "column-gap: 10px: x 60 (armed): {}", left(&mut e, "g2", "g"));
         assert!((left(&mut e, "t2", "t") - 50.0).abs() <= 0.5, "a later column-gap: normal is 0: x 50: {}", left(&mut e, "t2", "t"));
     }
+
+    // ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the gap shorthand writes the multicol gutter (named tail block) ----
+
+    /// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): SR1016's shape, a two-column 410px div at 20px with red blocks: alone
+    /// the gutter is 1em (195..215) so x 220 is column two's red; `gap: 40px`, `grid-gap: 40px` and `gap: 0px 40px`
+    /// each set the 40px gutter (185..225), so x 220 is gutter. Before, the shorthand left the 1em gutter.
+    #[test]
+    fn gap_shorthand_multicol_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .mc { width: 410px; column-count: 2; font-size: 20px; margin: 0 0 20px }
+            .mc div { height: 20px; background-color: rgb(255, 0, 0) }
+            .mc.g { gap: 40px }
+            .mc.gg { grid-gap: 40px }
+            .mc.g2 { gap: 0px 40px }
+            </style></head><body style="margin:0">
+            <div class="mc"><div></div><div></div></div>
+            <div class="mc g"><div></div><div></div></div>
+            <div class="mc gg"><div></div><div></div></div>
+            <div class="mc g2"><div></div><div></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(500, 200));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        for y in [10, 50, 90, 130] {
+            assert_eq!(imgalt_px(&e, 100, y), (255, 0, 0), "y {y}: the first column paints red");
+        }
+        assert_eq!(imgalt_px(&e, 220, 10), (255, 0, 0), "no gap: 1em gutter, x 220 is column two (armed)");
+        assert_ne!(imgalt_px(&e, 220, 50), (255, 0, 0), "gap: 40px: x 220 is gutter");
+        assert_ne!(imgalt_px(&e, 220, 90), (255, 0, 0), "grid-gap: 40px: x 220 is gutter");
+        assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
+    }
 }
