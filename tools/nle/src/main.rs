@@ -91,7 +91,7 @@ fn load(edl_path: &str, fps: u32, srcs: &[(String, String)]) -> (Timeline, Sourc
     let mut sources = Sources::new(&tl);
     for s in tl.sources.iter().filter(|s| s.title.is_none()) { // STRIATITLECLIP (SR828): a title source has no file
         let Some((_, path)) = srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
-        let bytes = std::fs::read(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+        if stria::nle::seq_pattern(path).is_some() { sources.add_sequence(s.id, path).unwrap_or_else(|e| die(format!("{path}: {e}"))); continue; } let bytes = std::fs::read(path).unwrap_or_else(|e| die(format!("{path}: {e}"))); // STRIAIMPORTIMAGESEQUENCE (SR888): a `%04d` path is a PNG sequence reel
         sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{path}: {e}")));
     }
     (tl, sources)

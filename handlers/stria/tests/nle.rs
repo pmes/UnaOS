@@ -7315,3 +7315,153 @@ fn striacropface_face_words() {
     assert_eq!(face.state.undo_depth(), 4);
     println!("striacropface: crop-l+ crop-r+ -> {s}/0/{s}/0 badge painted; crop clears; crop-l+ past the frame refused");
 }
+
+// ---- STRIAIMPORTIMAGESEQUENCE (LEDGER SR888): a PNG sequence as a video reel (named tail block) ----
+// A `--src REEL=<dir>/frame_%04d.png` reel is one PNG file per timeline tick (file number `first + tick`), opened by
+// `Sources::add_sequence`, read and decoded one file per render tick; a hole is refused by name at its tick. The frames
+// sink is SR828's `StriaTitleFrames` (above).
+
+/// A `w` x `h` opaque frame of one colour.
+fn striaimportimagesequence_px(w: u32, h: u32, c: [u8; 3]) -> Vec<u8> {
+    [c[0], c[1], c[2], 255].repeat(w as usize * h as usize)
+}
+
+/// Writes `frame_<n:04>.png` for each `(n, colour)` into a fresh dir; returns the dir's `frame_%04d.png` pattern.
+fn striaimportimagesequence_dir(name: &str, w: u32, h: u32, frames: &[(u64, [u8; 3])]) -> String {
+    let d = common::fresh_dir("striaimportimagesequence", name);
+    for (n, c) in frames {
+        let png = gneiss_pal::dsp::image::encode_rgba(w, h, &striaimportimagesequence_px(w, h, *c)).unwrap();
+        std::fs::write(d.join(format!("frame_{n:04}.png")), png).unwrap();
+    }
+    format!("{}/frame_%04d.png", d.display())
+}
+
+/// 25 fps, one video track cutting source `SEQ` ticks `0..len` at 0.
+fn striaimportimagesequence_tl(len: i64) -> (Timeline, SourceId) {
+    let mut tl = Timeline::new(25);
+    let s = tl.add_source("SEQ", len);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(s, 0, len, 0)];
+    (tl, s)
+}
+
+#[test]
+fn striaimportimagesequence_pattern_parses() {
+    use stria::nle::seq_pattern;
+    assert_eq!(seq_pattern("shots/frame_%04d.png"), Some(("shots/frame_", 4, ".png")));
+    assert_eq!(seq_pattern("f%d.PNG"), Some(("f", 0, ".PNG")));
+    assert_eq!(seq_pattern("a_%06d.jpg"), Some(("a_", 6, ".jpg")), "a pattern: its format is add_sequence's refusal");
+    for p in ["clip.mp4", "100%.mp4", "f_%s.png", "f_%4d.png", "f_%04d_%04d.png", "f_%04x.png"] {
+        assert_eq!(seq_pattern(p), None, "{p}");
+    }
+}
+
+#[test]
+fn striaimportimagesequence_renders_each_file_per_tick() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("ticks", 16, 8, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(3), "one tick per file number 7..=9");
+    let mut sink = StriaTitleFrames::default();
+    let r = render(&tl, 0..3, &src, &mut sink).unwrap();
+    assert_eq!((r.width, r.height), (16, 8), "the first file's header sizes the frame");
+    assert_eq!(sink.0.len(), 3);
+    for (i, f) in sink.0.iter().enumerate() {
+        assert_eq!((f.0, f.1, f.2), (i as i64, 16, 8));
+        assert!(f.3 == striaimportimagesequence_px(16, 8, cols[i]), "tick {i}: file {}", 7 + i);
+    }
+    println!("striaimportimagesequence: frame_0007..0009.png -> ticks 0..3 at 16x8");
+}
+
+#[test]
+fn striaimportimagesequence_hole_refused_by_name() {
+    let pat = striaimportimagesequence_dir("hole", 4, 4, &[(7, [1, 2, 3]), (9, [4, 5, 6])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut sink = StriaTitleFrames::default();
+    let e = render(&tl, 0..3, &src, &mut sink).unwrap_err().to_string();
+    assert!(e.contains("image sequence reel=0 frame 8 missing") && e.contains("frame_0008.png"), "{e}");
+    assert_eq!(sink.0.len(), 1, "file 7 drawn before the hole");
+    assert!(render(&tl, 2..3, &src, &mut StriaTitleFrames::default()).is_ok(), "a range past the hole renders");
+    println!("striaimportimagesequence: hole -> {e}");
+}
+
+#[test]
+fn striaimportimagesequence_refusals_by_name() {
+    let pat = striaimportimagesequence_dir("refuse", 4, 4, &[(1, [9, 9, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    let none = pat.replace("frame_%04d", "shot_%04d");
+    let jpg = pat.replace("%04d.png", "%04d.jpg");
+    for (p, why) in [(none.as_str(), "no file matches"), (jpg.as_str(), "only .png frames"), ("clip.mp4", "no %d or %0Nd")] {
+        let e = src.add_sequence(s, p).unwrap_err().to_string();
+        assert!(e.contains(&format!("image sequence {p}: ")) && e.contains(why), "{e}");
+    }
+    let dir = std::path::Path::new(&pat).parent().unwrap().to_path_buf();
+    std::fs::write(dir.join("junk_0001.png"), b"not a png").unwrap();
+    let junk = format!("{}/junk_%04d.png", dir.display());
+    let e = src.add_sequence(s, &junk).unwrap_err().to_string();
+    assert!(e.contains("junk_0001.png: not a PNG header"), "{e}");
+    assert!(src.add_sequence(s, &pat).is_ok(), "the good pattern still opens");
+}
+
+#[test]
+fn striaimportimagesequence_round_trip_from_png_export() {
+    use stria::nle_export::{AudioOut, Container, export_png};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let dir = common::fresh_dir("striaimportimagesequence", "roundtrip").join("out");
+    let (r, _) = export_png(&tl, 0..12, &src, &dir, AudioOut::None, Container::Mp4).unwrap();
+    assert_eq!(r.frames, 12);
+    let mut want = StriaTitleFrames::default();
+    render(&tl, 0..12, &src, &mut want).unwrap();
+    let (seq_tl, s) = striaimportimagesequence_tl(12);
+    let mut seq = Sources::new(&seq_tl);
+    seq.add_sequence(s, &format!("{}/%06d.png", dir.display())).unwrap();
+    let mut got = StriaTitleFrames::default();
+    render(&seq_tl, 0..12, &seq, &mut got).unwrap();
+    assert_eq!(got.0.len(), 12);
+    for (g, w) in got.0.iter().zip(&want.0) {
+        assert!(g == w, "tick {}: the exported file reads back as it rendered", g.0);
+    }
+    println!("striaimportimagesequence: export 0..12 -> %06d.png -> 12 frames byte-equal");
+}
+
+#[test]
+fn striaimportimagesequence_cuts_with_a_movie_reel() {
+    let (tl0, src0) = stria::nle_face::synth_fixture();
+    let mut a_alone = StriaTitleFrames::default();
+    render(&tl0, 0..2, &src0, &mut a_alone).unwrap(); // the fixture's A[13,23)@0
+    let (w, h) = (a_alone.0[0].1, a_alone.0[0].2);
+    let (c0, c1) = ([250, 0, 250], [0, 250, 250]);
+    let pat = striaimportimagesequence_dir("cut", w, h, &[(0, c0), (1, c1)]);
+    let mut tl = Timeline::new(25);
+    let sq = tl.add_source("SEQ", 2);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(sq, 0, 2, 0), Clip::new(a, 13, 15, 2), Clip::new(sq, 1, 2, 4)];
+    let mut src = Sources::new(&tl);
+    src.add_sequence(sq, &pat).unwrap();
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let mut got = StriaTitleFrames::default();
+    render(&tl, 0..5, &src, &mut got).unwrap();
+    assert_eq!(got.0.len(), 5);
+    assert!(got.0[0].3 == striaimportimagesequence_px(w, h, c0) && got.0[1].3 == striaimportimagesequence_px(w, h, c1), "the sequence's two files");
+    assert!(got.0[2].3 == a_alone.0[0].3 && got.0[3].3 == a_alone.0[1].3, "the movie step reopens by its seek after the sequence");
+    assert!(got.0[4].3 == striaimportimagesequence_px(w, h, c1), "back on the sequence: file 1");
+}
+
+#[test]
+fn striaimportimagesequence_readd_forgets_sequence() {
+    let pat = striaimportimagesequence_dir("readd", 4, 4, &[(0, [1, 1, 1])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(1));
+    src.add(s, synth_source(0, 50, 25)).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(50), "the movie, not the sequence");
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(1), "the sequence again");
+}

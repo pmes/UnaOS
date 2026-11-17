@@ -64,7 +64,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media|dir/frame_%04d.png> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -118,7 +118,7 @@ fn load(c: &Cli) -> (Timeline, Sources) {
     let mut sources = Sources::new(&tl);
     for s in tl.sources.iter().filter(|s| s.title.is_none()) { // STRIATITLECLIP (SR828): a title source has no file
         let Some((_, p)) = c.srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
-        let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
+        if stria::nle::seq_pattern(p).is_some() { sources.add_sequence(s.id, p).unwrap_or_else(|e| die(format!("{p}: {e}"))); continue; } let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}"))); // STRIAIMPORTIMAGESEQUENCE (SR888): a `%04d` path is a PNG sequence reel
         sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{p}: {e}")));
     }
     (tl, sources)
