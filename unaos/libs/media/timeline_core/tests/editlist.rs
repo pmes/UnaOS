@@ -49,9 +49,9 @@ fn a_repeat_is_two_clips_over_the_same_source_range() {
 
 #[test]
 fn a_rate_is_refused_by_name() {
-    assert_eq!(clips(&[seg(0, 400, Some(0), 0x2_0000)], 0), Err(EditError::Rate), "double speed");
+    assert_eq!(clips(&[seg(0, 400, Some(0), 0x2_0000)], 0), Ok(vec![Clip::new(SourceId(0), 0, 20, 0).at_rate(0x2_0000)]), "double speed lays a 2x clip (STRIACLIPSPEED SR829)");
     assert_eq!(clips(&[seg(0, 400, Some(0), 0)], 0), Err(EditError::Rate), "a rate-0 dwell hold");
-    assert_eq!(EditError::Rate.to_string(), "edit list rate is not 1 (no speed op)");
+    assert_eq!(EditError::Rate.to_string(), "rate is not a positive speed (a dwell or reverse)"); // STRIACLIPSPEED (SR829): was "edit list rate is not 1 (no speed op)"
 }
 
 #[test]

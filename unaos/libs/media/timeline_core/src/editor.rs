@@ -343,11 +343,11 @@ impl EditorState {
             "}" => self.trim(Edge::Out, 1),
             "lift" => self.lift_selected(),
             "mark-in" => match self.selected() {
-                Some(c) => self.trim(Edge::In, ph - c.at),
+                Some(c) => self.trim(Edge::In, c.src_at(ph) - c.src_in), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - at)
                 None => Err(EditError::NoClip),
             },
             "mark-out" => match self.selected() {
-                Some(c) => self.trim(Edge::Out, ph - c.end()),
+                Some(c) => self.trim(Edge::Out, c.src_at(ph) - c.src_out), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - end)
                 None => Err(EditError::NoClip),
             },
             "home" => {
@@ -859,5 +859,17 @@ impl EditorState {
             "solo" => Some(self.toggle_solo()),
             _ => None,
         }
+    }
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): the selected clip's speed as ONE commit (named tail block) ----
+impl EditorState {
+    /// The selected clip at speed `rate_q16` (Q16.16) through `Timeline::set_rate`: ONE commit, so undo restores the whole
+    /// pre-op timeline; a refusal (`Rate`, `Overlap`, `Transition`, `NoClip`) leaves the state.
+    pub fn set_speed(&mut self, rate_q16: u32) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_rate(track, idx, rate_q16)?;
+        self.commit(tl);
+        Ok(())
     }
 }

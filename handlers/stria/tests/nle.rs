@@ -596,7 +596,7 @@ fn editmap_the_editor_plays_the_whole_edit_list() {
 
 #[test]
 fn editmap_a_rate_edit_is_refused_and_an_edl_is_not_media() {
-    assert!(matches!(Sources::from_media("AX", &editmap_file(0x2_0000), 25), Err(stria::nle::RenderError::Edit(EditError::Rate))));
+    let (two, _) = Sources::from_media("AX", &editmap_file(0x2_0000), 25).unwrap().unwrap(); let fast = vec![Clip::new(SourceId(0), 25, 45, 0).at_rate(0x2_0000), Clip::new(SourceId(0), 5, 25, 10).at_rate(0x2_0000)]; assert_eq!((&two.tracks[0].clips, &two.tracks[1].clips), (&fast, &fast)); // STRIACLIPSPEED (SR829): a 2x edit list now LAYS 2x clips (was EditError::Rate)
     let edl_text = edl::write(&timeline(), "EDITMAP").unwrap();
     assert!(Sources::from_media("AX", edl_text.as_bytes(), 25).unwrap().is_none());
     // A file without an edit list is the whole source.
@@ -4348,4 +4348,146 @@ fn striathumbnails_ten_clips_fill_over_three_paints() {
     let _ = face.paint();
     assert_eq!(face.thumb_decodes(), 10, "a fourth paint decodes nothing");
     println!("striathumbnails: ten clips decodes={}/{}/{} pending={pending:?}", seen[0], seen[1], seen[2]);
+}
+
+// ---- STRIACLIPSPEED (LEDGER SR829): per-clip speed through the schedule and the render (named tail block) ----
+
+/// V1 = A[0,20)@0 at `rate` over the NLE1 reel A (utp1 counters 0..49): the counter each output tick shows, the schedule's
+/// video seeks, the render report.
+fn striaclipspeed_video(rate: u32, ticks: i64) -> (Vec<Option<u32>>, usize, stria::nle::RenderReport) {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0).at_rate(rate)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let seeks = schedule(&tl, 0..ticks, &src).unwrap().iter().filter(|s| s.seek.is_some()).count();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..ticks, &src, &mut sink).unwrap();
+    (sink.frames.iter().map(|f| TestPattern::read_counter(&f.1, 64, 48)).collect(), seeks, r)
+}
+
+#[test]
+fn striaclipspeed_a_2x_clip_shows_every_other_frame_and_a_half_speed_clip_holds() {
+    let (fast, seeks, r) = striaclipspeed_video(0x2_0000, 10);
+    assert_eq!(fast, (0..10).map(|k| Some(2 * k)).collect::<Vec<_>>());
+    assert_eq!((seeks, r.seeks, r.frames), (1, 1, 10), "one run, decoded and dropped forward");
+    let (slow, seeks, r) = striaclipspeed_video(0x8000, 40);
+    assert_eq!(slow, (0..40).map(|k| Some(k / 2)).collect::<Vec<_>>());
+    assert_eq!((seeks, r.seeks), (1, 1), "one run, each frame held twice");
+    println!("striaclipspeed: 2x over 20 -> 10 ticks, frames 0,2,..,18, seeks=1 runup={}; 0.5x -> 40 ticks, each frame twice, seeks=1", r.runup_frames);
+}
+
+/// The zero crossings (sign changes, 0 counted positive) of `pcm` past its first and last `skip` samples.
+fn striaclipspeed_crossings(pcm: &[f32], skip: usize) -> usize {
+    let body = &pcm[skip..pcm.len() - skip];
+    body.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count()
+}
+
+/// A1 = T[0,25 * rate)@0 at `rate` over a 2 s mono 1 kHz tone (PCM16 at SYNTH_RATE): 25 output ticks of its render.
+fn striaclipspeed_tone(rate: u32) -> Vec<f32> {
+    let n = 2 * SYNTH_RATE as usize;
+    let tone: Vec<i16> = (0..n).map(|i| (16_000.0 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / SYNTH_RATE as f64 + 0.3).sin()) as i16).collect();
+    let file = build::mp4(&[build::pcm16_track(2, SYNTH_RATE, 1, &tone, 960)], &build::Mp4Options::default());
+    let mut tl = Timeline::new(25);
+    let t = tl.add_source("T", 50);
+    let a = tl.add_track(Kind::Audio);
+    let span = (25 * rate as i64) >> 16;
+    tl.tracks[a].clips = vec![Clip::new(t, 0, span, 0).at_rate(rate)];
+    let mut src = Sources::new(&tl);
+    src.add(t, file).unwrap();
+    let mut sink = Pcm::default();
+    render(&tl, 0..25, &src, &mut sink).unwrap();
+    assert_eq!((sink.rate, sink.pcm.len()), (SYNTH_RATE, 25 * PER));
+    sink.pcm
+}
+
+#[test]
+fn striaclipspeed_a_1khz_tone_at_2x_renders_at_2khz() {
+    let (one, two) = (striaclipspeed_tone(0x1_0000), striaclipspeed_tone(0x2_0000));
+    let (z1, z2) = (striaclipspeed_crossings(&one, 480), striaclipspeed_crossings(&two, 480));
+    assert!((1900..2000).contains(&z1), "1x: {z1} crossings of a 1 kHz tone over 0.98 s");
+    assert!((z2 as i64 - 2 * z1 as i64).abs() <= 2, "1x {z1} crossings, 2x {z2}");
+    println!("striaclipspeed: tone 1x z={z1} 2x z={z2} (pitch follows speed through the one Sinc)");
+}
+
+#[test]
+fn striaclipspeed_face_speed_word_halves_the_drawn_width_and_undo_restores() {
+    assert_eq!(VERBS.iter().position(|v| *v == "speed").map(|i| VERBS[i + 1]), Some("title"), "speed sits right before title");
+    assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("speed"));
+    assert_eq!(face.last_error.take(), Some(format!("speed: {}", EditError::NoClip)), "nothing selected");
+    face.state.select(0, 0).unwrap();
+    let width = |f: &Face| {
+        let (l, c) = (f.layout(), f.state.selected().unwrap());
+        l.x_of(c.end()) - l.x_of(c.at)
+    };
+    let w1 = width(&face);
+    assert!(face.verb("speed 2"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let c = face.state.selected().unwrap();
+    assert_eq!((c.rate_q16, c.at, c.len()), (0x2_0000, 0, 5));
+    assert_eq!(width(&face) * 2, w1, "half the drawn width");
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "undo restores");
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        assert!(face.verb("speed"));
+        seen.push(face.state.selected().unwrap().rate_q16);
+    }
+    assert_eq!(seen, vec![0x2_0000, 0x4_0000, 0x1_0000], "bare speed cycles 1x -> 2x -> 4x -> 1x");
+    assert!(face.verb("speed 0"));
+    assert_eq!(face.last_error.take(), Some(format!("speed 0: {}", EditError::Rate)));
+    assert!(face.verb("speed 0.5"));
+    assert_eq!(face.last_error.take(), Some(format!("speed 0.5: {}", EditError::Overlap)), "0.5x runs into B at 10");
+    assert!(!face.verb("speed fast"), "an unreadable speed is not a face word");
+    println!("striaclipspeed: `speed 2` -> width {w1} -> {}; undo restores; cycle {seen:x?}", w1 / 2);
+}
+
+/// The seat's pin: on the NLE1 synth fixture (every clip 1x) the schedule's video steps and audio runs are exactly the
+/// pre-arc identity: each source tick is `src_in + (t - at)` and each seek falls where the old `src_t + 1` / `src_t + len`
+/// continuity says (the kernel Player plays exactly this).
+#[test]
+fn striaclipspeed_a_1x_timeline_schedules_as_before() {
+    let tl = timeline();
+    let src = sources(&tl);
+    assert!(tl.tracks.iter().flat_map(|t| t.clips.iter()).all(|c| c.rate_q16 == 0x1_0000));
+    let steps = schedule(&tl, 0..35, &src).unwrap();
+    let mut v_next: Option<(SourceId, i64)> = None;
+    let mut vseeks = 0;
+    for s in steps.iter().filter(|s| s.kind == Kind::Video) {
+        match (s.track, s.src) {
+            (Some(ti), Some(id)) => {
+                let c = tl.tracks[ti].clips[tl.clip_at(ti, s.out_t).unwrap()];
+                let want = c.src_in + (s.out_t - c.at);
+                assert_eq!(s.src_t, want, "video tick {}", s.out_t);
+                assert_eq!(s.seek.is_some(), v_next != Some((id, want)), "video seek at {}", s.out_t);
+                vseeks += s.seek.is_some() as usize;
+                v_next = Some((id, want + 1));
+            }
+            _ => v_next = None,
+        }
+    }
+    let runs = timeline_core::schedule::audio_runs(&tl, 0..35, &src).unwrap();
+    let mut next: Vec<Option<(SourceId, i64)>> = vec![None; tl.tracks.len()];
+    let mut aseeks = 0;
+    for r in &runs {
+        for (ti, n) in next.iter_mut().enumerate() {
+            if !r.layers.iter().any(|l| l.track == ti) {
+                *n = None;
+            }
+        }
+        for l in &r.layers {
+            let c = tl.tracks[l.track].clips[tl.clip_at(l.track, r.out_t).unwrap()];
+            let want = c.src_in + (r.out_t - c.at);
+            assert_eq!(l.src_t, want, "audio run at {}", r.out_t);
+            assert_eq!(l.seek.is_some(), next[l.track] != Some((l.src, want)), "audio seek at {}", r.out_t);
+            aseeks += l.seek.is_some() as usize;
+            next[l.track] = Some((l.src, want + r.len));
+        }
+    }
+    assert_eq!((vseeks, aseeks), (3, 3));
+    println!("striaclipspeed: 1x fixture schedule = the old identity: {} steps, {} runs, seeks v={vseeks} a={aseeks}", steps.len(), runs.len());
 }
