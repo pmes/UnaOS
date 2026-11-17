@@ -885,8 +885,8 @@ pub fn rescale_stats(stats: &[PicStat], n: usize) -> Vec<PicStat> {
 // its own when none follows), then the anchors' QP curve blurred over same-type neighbours ([`blur_qscale`], qblur), rounded and
 // clamped; a B picture its anchor's + `B_QP_OFFSET` as SR698. The bisection and the predicted total (each picture's OWN complexity /
 // step16) are SR698's. Departures, named: the intra mask WAS the kind (an IDR all intra, a P / B none; x264's weight by the intra
-// macroblock count since H264ENCTWOPASSBLURINTRA SR751), and qblur averages the Q16 QP (log qscale) where x264 averages the linear qscale. [`Pass2Opts`] with cplxblur 0,
-// qblur 0 and `i_from_gop` false plans SR698's exact QPs. Owed: H264ENC-TWOPASS-BLUR-INTRA, H264ENC-TWOPASS-QBLUR-LINEAR,
+// macroblock count since H264ENCTWOPASSBLURINTRA SR751), and qblur averaged the Q16 QP (log qscale) where x264 averages the linear qscale (linear since SR1042). [`Pass2Opts`] with cplxblur 0,
+// qblur 0 and `i_from_gop` false plans SR698's exact QPs. Owed: H264ENC-TWOPASS-BLUR-INTRA, H264ENC-TWOPASS-QBLUR-LINEAR (BUILT by SR1042, the H264ENCTWOPASSQBLURLINEAR tail block),
 // H264ENC-TWOPASS-QPSTEP (BUILT by SR763, the H264ENCTWOPASSQPSTEP tail block), H264ENC-TWOPASS-BLUR-RATETOL, H264ENC-TWOPASS-QCOMP-CLI, H264ENC-TWOPASS-BLUR-RUNTIME.
 
 /// The options of a second pass's plan (H264ENCTWOPASSBLUR SR736); Default = x264's (qcomp 0.6, cplxblur 20, qblur 0.5, qpstep 4).
@@ -973,8 +973,8 @@ pub fn blur_complexity(stats: &[PicStat], cplxblur: u32) -> Vec<u64> {
 }
 
 /// The anchors' planned QPs `q16` (Q16) blurred as x264 blurs qscale (H264ENCTWOPASSBLUR SR736): over the (qblur x 4) | 1 pictures
-/// centred on each, same kind only, weights exp(-d^2 / qblur^2) with qblur = `qblur_q8` / 256, floor of the weighted mean. B
-/// entries are returned unchanged (a B follows its anchor); a window of one picture (`qblur_q8` < 64) returns `q16` unchanged.
+/// centred on each, same kind only, weights exp(-d^2 / qblur^2) with qblur = `qblur_q8` / 256, the mean of the LINEAR qscale (SR1042:
+/// [`qp2qscale_q16`] / [`qscale2qp_q16`]). B entries are returned unchanged (a B follows its anchor); a window of one picture (`qblur_q8` < 64) returns `q16` unchanged.
 pub fn blur_qscale(q16: &[i64], kinds: &[Pic], qblur_q8: u32) -> Vec<i64> {
     let half = ((((qblur_q8 as u64 * 4) >> 8) | 1) / 2) as usize;
     if half == 0 || q16.is_empty() {
@@ -986,17 +986,19 @@ pub fn blur_qscale(q16: &[i64], kinds: &[Pic], qblur_q8: u32) -> Vec<i64> {
             if kinds[i] == Pic::B {
                 return q16[i];
             }
-            let (mut num, mut den) = (0i128, 0i128);
-            for idx in i.saturating_sub(half)..=(i + half).min(q16.len() - 1) {
+            let win = i.saturating_sub(half)..=(i + half).min(q16.len() - 1);
+            let m = win.clone().filter(|&idx| kinds[idx] == kinds[i]).map(|idx| q16[idx]).max().unwrap_or(q16[i]);
+            let (mut num, mut den) = (0u128, 0u128);
+            for idx in win {
                 if kinds[idx] != kinds[i] {
                     continue;
                 }
                 let d = idx.abs_diff(i) as u128;
-                let c = exp_neg_q16((((d * d) << 32) / qq).min(u64::MAX as u128) as u64) as i128;
-                num += c * q16[idx] as i128;
-                den += c;
+                let c = exp_neg_q16((((d * d) << 32) / qq).min(u64::MAX as u128) as u64) as u128;
+                num += c * qp2qscale_q16(m - q16[idx]);
+                den += c << 64;
             }
-            num.div_euclid(den.max(1)) as i64
+            m + qscale2qp_q16(num, den)
         })
         .collect()
 }
@@ -1109,7 +1111,7 @@ pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
         }
         if let Some(j) = next {
             if kinds[i] == kind && kinds[j] == kind && (kind != Pic::Idr || !next_p) {
-                q16[i] = q16[i].clamp(q16[j] - step, q16[j] + step);
+                q16[i] = qpstep_bound(q16[i], q16[j], step, (false, false));
             }
         }
         next_p = next.is_some_and(|j| kinds[j] == Pic::P);
@@ -1136,7 +1138,7 @@ pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
 pub fn qpstep_clamp(qp: i32, last: Option<i32>, qpstep: u8, wide: (bool, bool)) -> i32 {
     let Some(l) = last.filter(|_| qpstep > 0) else { return qp };
     let s = qpstep as i32;
-    qp.clamp(l - s - if wide.0 { s } else { 0 }, l + s + if wide.1 { s } else { 0 })
+    (qpstep_bound((qp as i64) << 16, (l as i64) << 16, (s as i64) << 16, wide) >> 16) as i32
 }
 
 impl Rc {
@@ -1542,4 +1544,56 @@ mod firstp_prediction_tests {
         println!("binding rows {binding}: within 2 QP of the oracle: c {} d {}", within[0], within[1]);
         assert_eq!((binding, within_t1, within), (14, [7, 2, 6, 7], [6, 7]), "binding rows; within 2 QP: T1 (a)..(d), T2 (c) (d)");
     }
+}
+
+// ---- H264ENCTWOPASSQPSTEPONERULE (LEDGER SR1026): x264's get_diff_limited_q bound as one Q16 core (named tail block) ----
+// SR769's owed H264ENC-TWOPASS-QPSTEP-ONE-RULE. x264 holds a qscale within lstep = 2^(qpstep / 6) of its same-type neighbour in two
+// places: init_pass2's get_diff_limited_q over the plan ([`qpstep_limit`], SR763) and the ABR lmin / lmax at runtime
+// ([`qpstep_clamp`], SR769, its asymmetric widening on under / over-spend). Both bodies now call this ONE bound in the Q16 QP (log)
+// domain: the plan with wide (false, false) over its Q16 slice, the runtime with its integer QPs shifted to Q16 and back (exact:
+// every bound is then a multiple of 65536). The wrappers keep their signatures, callers and qpstep-0 / no-last guards; the plan's
+// QPs and the coded bytes are unmoved (tests/twopass.rs zb-zc). Owed: H264ENC-TWOPASS-QPSTEP-DOC.
+
+/// `q` (Q16 QP) held within `step_q16` of `last` (H264ENCTWOPASSQPSTEPONERULE SR1026), the low bound a further `step_q16` lower
+/// when `wide.0`, the high bound a further `step_q16` higher when `wide.1`. Equal to `clamp` for `step_q16 >= 0` (what both callers
+/// pass); a negative step never panics (max then min).
+pub fn qpstep_bound(q: i64, last: i64, step_q16: i64, wide: (bool, bool)) -> i64 {
+    let lo = last - step_q16 - if wide.0 { step_q16 } else { 0 };
+    let hi = last + step_q16 + if wide.1 { step_q16 } else { 0 };
+    q.max(lo).min(hi)
+}
+
+// ---- H264ENCTWOPASSQBLURLINEAR (LEDGER SR1042): qblur over the linear qscale (named tail block) ----
+// SR736's owed H264ENC-TWOPASS-QBLUR-LINEAR. x264's `init_pass2` smooth-curve loop averages the LINEAR qscale (qp2qscale(qp) =
+// 0.85 x 2^((qp - 12) / 6)) with the gaussian alone as the weight; [`blur_qscale`] now does the same in integers: the 0.85 and the
+// 12 are a common factor that cancels in the weighted mean, so each same-kind qscale is taken RELATIVE to the window's highest QP m
+// (2^(-(m - q) / 6), in (0, 1], [`qp2qscale_q16`] over the tree's ONE exponential [`exp_neg_q16`]) and the mean goes back to QP
+// through the ONE log2 [`log2_q16`] ([`qscale2qp_q16`]). No f64: the crate is no_std and links into the soft-float kernel. A mean
+// of 2^(q / 6) is never below the mean of q (Jensen), so the blur now plans each picture at a HIGHER-or-equal QP than SR736's
+// (a 30 / 20 / 30 spike at qblur 0.5: the middle 20.35 -> 20.64); a flat window blurs to itself exactly; qblur < 0.25 stays the
+// identity. x264's second blur carries no complexity weight (H264ENC-TWOPASS-QBLUR-WEIGHT-DOMAIN measured not needed).
+
+/// round(2^32 ln 2).
+const LN2_Q32: u128 = 2977044472;
+
+/// 2^(-d / 6) in Q64 for d = `d_q16` / 65536 (H264ENCTWOPASSQBLURLINEAR SR1042): a linear qscale d QP below the window's highest,
+/// relative to it; a negative d is 0. d = 6k + f: the mantissa round(65536 e^-(f ln2 / 6)) in (32768, 65536] from [`exp_neg_q16`],
+/// shifted to Q64 and down by k (exact when f = 0); k >= 48 is 0 (below 2^-48 of the highest: no weight).
+pub fn qp2qscale_q16(d_q16: i64) -> u128 {
+    let d = d_q16.max(0) as u64;
+    let six = 6u64 << 16;
+    let k = d / six;
+    if k >= 48 {
+        return 0;
+    }
+    let f = (d % six) as u128;
+    let t = ((f * LN2_Q32 / 6 + (1 << 31)) >> 32) as u64;
+    ((exp_neg_q16(t) as u128) << 48) >> k
+}
+
+/// 6 log2(`num` / `den`) in Q16 QP (H264ENCTWOPASSQBLURLINEAR SR1042): a qscale ratio back to a QP difference, by [`log2_q16`]
+/// of both shifted together until the larger fits a u64.
+pub fn qscale2qp_q16(num: u128, den: u128) -> i64 {
+    let s = (128 - num.max(den).leading_zeros()).saturating_sub(64);
+    6 * (log2_q16((num >> s) as u64) - log2_q16((den >> s) as u64))
 }
