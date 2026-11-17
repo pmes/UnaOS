@@ -2384,7 +2384,7 @@ impl EditorState {
     }
     /// The `pip` / `scale` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn xform_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if let Some(r) = self.xform_preset_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMPRESETS (SR938): `pip tl|tr|bl|br`, `scale-` / `scale+` (file tail)
         let (Some(&word), args) = (w.first(), w.get(1..).unwrap_or(&[])) else { return None };
         if word != "pip" && word != "scale" {
             return None;
@@ -3022,5 +3022,30 @@ impl EditorState {
             self.commit(tl);
         }
         Ok(())
+    }
+}
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the placement's corner presets and scale steps through the one commit (named tail block) ----
+// `pip tl|tr|bl|br` ([`crate::Xform::corner`]) and `scale-` / `scale+` ([`crate::Xform::stepped`] by
+// [`crate::Xform::SCALE_STEP`] about the rect's centre) on the selected clip, each ONE commit of SR879's
+// [`EditorState::set_xform`]. Refused: no clip selected `EditError::NoClip`; an audio clip `EditError::Kind`; a step that
+// would take the rect off the frame `EditError::Xform`. Any other word falls through to SR879's `pip` / `scale` arms.
+impl EditorState {
+    /// The preset / step words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn xform_preset_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        let d = crate::Xform::SCALE_STEP as i32;
+        let xf = match w.as_slice() {
+            ["pip", c] => crate::Xform::corner(c)?,
+            [step @ ("scale-" | "scale+")] => {
+                let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+                match cur.stepped(if *step == "scale+" { d } else { -d }) {
+                    Some(xf) => xf,
+                    None => return Some(Err(EditError::Xform)),
+                }
+            }
+            _ => return None,
+        };
+        Some(self.set_xform(xf))
     }
 }

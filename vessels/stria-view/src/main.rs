@@ -197,7 +197,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, // STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -564,6 +564,7 @@ fn transport() -> TetraNode {
         button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
         button("xfade-curve", "Curve"), button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
+        button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal
     ])
 }
@@ -2337,5 +2338,28 @@ mod striaundojump_tests {
         let errors = drive(&mut f, "redo:1");
         assert_eq!(errors, vec!["redo 1: forward to after \"split\"".to_string()]);
         assert_eq!((f.state.undo_depth(), f.state.redo_depth()), (1, 0));
+    }
+}
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the witness's corner tokens and scale step buttons (named tail block) ----
+#[cfg(test)]
+mod striaxformpresets_tests {
+    use super::*;
+
+    /// STRIAXFORMPRESETS (SR938): `pip:bl` (a corner preset) and `scale-` / `scale+` (VERBS words, their buttons) are
+    /// timeline_core's words on the selected clip, one undo step each, no error; a step off the frame is refused by name;
+    /// an unknown corner is a bad token.
+    #[test]
+    fn striaxformpresets_witness_corner_and_step_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,pip:bl,scale+,scale-,scale-");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.undo_depth(), 4);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform { x: 50, y: 750, s: 200 }));
+        assert_eq!(drive(&mut face, "pip:xx"), vec!["bad token pip:xx".to_string()]);
+        assert!(drive(&mut face, "pip:off").is_empty());
+        assert_eq!(drive(&mut face, "scale+"), vec![format!("scale+: {}", timeline_core::EditError::Xform)]);
+        assert_eq!(face.state.undo_depth(), 5);
     }
 }

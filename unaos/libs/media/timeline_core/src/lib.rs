@@ -3195,3 +3195,33 @@ mod striafreezemarks_tests {
         assert_eq!(st.timeline.marks, (Some(2), Some(35)), "plain freeze leaves the marks");
     }
 }
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the placement's corner presets and its centre-kept scale step (named tail block) ----
+// `pip tl|tr|bl|br` put the quarter-size picture ([`Xform::PIP`]'s scale, 1/40 of the frame in from the edges) in that
+// corner (`br` is [`Xform::PIP`] itself); `scale-` / `scale+` step the scale by [`Xform::SCALE_STEP`] about the rect's
+// centre. Pure geometry: the words are editor.rs's (one `commit` through `EditorState::set_xform`).
+impl Xform {
+    /// The `scale-` / `scale+` step, 1/1000 of the frame (even, so the centre moves by none).
+    pub const SCALE_STEP: u16 = 50;
+    /// The quarter-size picture in corner `c` (`tl`, `tr`, `bl`, `br`); `None` for any other word.
+    pub fn corner(c: &str) -> Option<Xform> {
+        let (x, y) = match c {
+            "tl" => (25, 25),
+            "tr" => (725, 25),
+            "bl" => (25, 725),
+            "br" => (725, 725),
+            _ => return None,
+        };
+        Some(Xform { x, y, s: Xform::PIP.s })
+    }
+    /// The same rect with its scale moved by `d` (1/1000) about its centre (`x`, `y` move by `-d / 2`); `None` when the
+    /// rect would leave the frame (or vanish).
+    pub fn stepped(self, d: i32) -> Option<Xform> {
+        let (s, x, y) = (self.s as i32 + d, self.x as i32 - d / 2, self.y as i32 - d / 2);
+        if s < 1 || x < 0 || y < 0 || s > 1000 || x > 1000 || y > 1000 {
+            return None;
+        }
+        let xf = Xform { x: x as u16, y: y as u16, s: s as u16 };
+        xf.ok().then_some(xf)
+    }
+}
