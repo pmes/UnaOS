@@ -233,31 +233,8 @@ fn b_picture_bi_predicts_the_rounded_average() {
     };
     let mut d = Decoder::new();
     d.decode_annexb(&s).unwrap();
-    d.decode_annexb(&picture(&bcfg, |mut e| {
-        // CTB 0: PRED_BI, ref_idx 0 in both lists, zero mvds (mvp 0); CTBs 1..3 merge its bi-prediction.
-        e.split_cu(0, false);
-        e.cu_skip(0, false);
-        e.pred_inter();
-        e.part_mode_2nx2n();
-        e.merge_flag(false);
-        e.pred_bi(0);
-        for _ in 0..2 {
-            e.ref_idx(0, 2);
-            e.mvd([0, 0]);
-            e.mvp_flag(0);
-        }
-        e.rqt_root_cbf(false);
-        for (inc, last) in [(0usize, false), (0, false), (2, true)] {
-            e.terminate(0);
-            e.split_cu(0, false);
-            e.cu_skip(inc, true);
-            if last {
-                break;
-            }
-        }
-        e.finish().out
-    }))
-    .unwrap();
+    // CTB 0: PRED_BI, ref_idx 0 in both lists, zero mvds (mvp 0); CTBs 1..3 merge its bi-prediction.
+    d.decode_annexb(&picture(&bcfg, |e| bi_body(e, 2, [0, 0], [0, 0]))).unwrap();
     let lists = d.slice_ref_lists();
     assert_eq!((lists[0][0].poc.clone(), lists[0][1].poc.clone()), (vec![0, 8], vec![8, 0]));
     d.flush();
@@ -641,21 +618,17 @@ fn bidir_conceal_stream(l1_only: bool) -> hevc_core::Decoder {
         ..Default::default()
     };
     s.extend(picture(&bcfg, |mut e| {
+        if !l1_only {
+            return bi_body(e, 2, [32, 16], [-64, 0]);
+        }
         e.split_cu(0, false);
         e.cu_skip(0, false);
         e.pred_inter();
         e.part_mode_2nx2n();
         e.merge_flag(false);
-        if l1_only {
-            // inter_pred_idc PRED_L1: bin 0 (ctxInc CtDepth 0) "0", then bin 1 (ctxInc 4) "1".
-            e.decision(hevc_core::tables::INTER_PRED_IDC, 0);
-            e.decision(hevc_core::tables::INTER_PRED_IDC + 4, 1);
-        } else {
-            e.pred_bi(0);
-            e.ref_idx(0, 2);
-            e.mvd([32, 16]);
-            e.mvp_flag(0);
-        }
+        // inter_pred_idc PRED_L1: bin 0 (ctxInc CtDepth 0) "0", then bin 1 (ctxInc 4) "1".
+        e.decision(hevc_core::tables::INTER_PRED_IDC, 0);
+        e.decision(hevc_core::tables::INTER_PRED_IDC + 4, 1);
         e.ref_idx(0, 2);
         e.mvd([-64, 0]);
         e.mvp_flag(0);
@@ -817,32 +790,6 @@ fn bi_mixed_weights() -> (Option<(u32, Vec<Option<(i32, i32)>>)>, Option<Vec<Opt
     (Some((6, vec![Some((-16, 5)), None])), Some(vec![Some((-48, -3)), None]))
 }
 
-/// One B picture's slice data: CTB 0 a 2Nx2N AMVP unit, PRED_BI, ref_idx 0 in both lists of `n` active references, L0 mvd
-/// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion.
-fn bi_body(mut e: CabacEnc, n: u32, m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
-    e.split_cu(0, false);
-    e.cu_skip(0, false);
-    e.pred_inter();
-    e.part_mode_2nx2n();
-    e.merge_flag(false);
-    e.pred_bi(0);
-    for mv in [m0, m1] {
-        e.ref_idx(0, n);
-        e.mvd(mv);
-        e.mvp_flag(0);
-    }
-    e.rqt_root_cbf(false);
-    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
-        e.terminate(0);
-        e.split_cu(0, false);
-        e.cu_skip(inc, true);
-        if last {
-            break;
-        }
-    }
-    e.finish().out
-}
-
 /// The PPS carries weighted_bipred_flag (not weighted_pred_flag: the P pictures carry no table). IDR0 (the gradient), P4
 /// (skip-only: I0), B2 (StCurrBefore {0}, StCurrAfter {4}, two references per list, the mixed table of
 /// [`bi_mixed_weights`]; PRED_BI L0 (32, 16) to POC 0, L1 (-64, 0) to POC 4), P6 (skip-only, references the lost POC 3 and
@@ -945,32 +892,6 @@ fn conceal_weighted_chroma_applies_the_source_chroma_weights() {
 }
 
 // ---- HEVCCONCEALWEIGHTEDBIDIRECT (LEDGER SR774): a bi source block with one long-term list conceals uni with the surviving list's weights (named tail block) ----
-
-/// [`bi_body`] with ref_idx `refs` (L0, L1) of `n` active references per list: CTB 0 a 2Nx2N AMVP unit, PRED_BI, L0 mvd
-/// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion.
-fn bi_ref_body(mut e: CabacEnc, n: u32, refs: [u32; 2], m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
-    e.split_cu(0, false);
-    e.cu_skip(0, false);
-    e.pred_inter();
-    e.part_mode_2nx2n();
-    e.merge_flag(false);
-    e.pred_bi(0);
-    for (r, mv) in refs.into_iter().zip([m0, m1]) {
-        e.ref_idx(r, n);
-        e.mvd(mv);
-        e.mvp_flag(0);
-    }
-    e.rqt_root_cbf(false);
-    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
-        e.terminate(0);
-        e.split_cu(0, false);
-        e.cu_skip(inc, true);
-        if last {
-            break;
-        }
-    }
-    e.finish().out
-}
 
 /// The SPS carries long_term_ref_pics_present_flag; the PPS weighted_pred_flag and weighted_bipred_flag. IDR0 (the
 /// gradient), P4 (I0, default table: a copy), B2 (StCurrAfter {4}, LtCurr {POC 0 by PocLsbLt 0}: L0 = L1 = [POC 4,
@@ -1562,4 +1483,135 @@ fn conceal_weighted_chroma_444_l1_surviving() {
 fn conceal_forward_bi_inverse_chroma_444_joins_both_lists() {
     assert!(!sps_cfg().separate_colour_plane, "the idc-3 SPS writes separate_colour_plane_flag 0");
     conceal_forward_bi_inverse_chroma_joins_both_lists_at(3);
+}
+
+// ---- HEVCTESTKITBBODY (LEDGER SR833): the kit's B body equals the inline B CUs it replaced (named tail block) ----
+
+/// SR833: the two B coding units inter.rs wrote inline (`b_picture_bi_predicts_the_rounded_average`'s B4 with zero mvds,
+/// `bidir_conceal_stream`'s PRED_BI B2 with L0 (32, 16), L1 (-64, 0)) were captured as the bytes those tests fed the
+/// decoder before they moved onto the kit's [`bi_body`]; the kit's writer must reproduce them exactly.
+#[test]
+fn kit_b_body_equals_the_inline_b_cus() {
+    const PIN_A: &[u8] = &[0, 0, 0, 1, 2, 1, 224, 132, 137, 38, 144, 184, 48, 252, 18, 128];
+    const PIN_B: &[u8] = &[0, 0, 0, 1, 2, 1, 224, 68, 149, 105, 11, 128, 43, 156, 132, 62, 204, 100, 169, 24];
+    for (poc, m0, m1, pin) in [(4u32, [0, 0], [0, 0], PIN_A), (2, [32, 16], [-64, 0], PIN_B)] {
+        let cfg = SliceCfg {
+            nal_type: 1,
+            slice_type: 0,
+            poc_lsb: poc,
+            neg: vec![(-(poc as i32), true)],
+            pos: vec![(poc as i32, true)],
+            num_ref: Some((2, 2)),
+            five_minus_max_num_merge_cand: 4,
+            deblocking_disabled: true,
+            ..Default::default()
+        };
+        assert_eq!(picture(&cfg, |e| bi_body(e, 2, m0, m1)), pin, "B POC {poc}");
+    }
+}
+
+// ---- HEVCCONCEALBI444 (LEDGER SR845): bi concealment averaged on every chroma sample at chroma_format_idc 1 / 2 / 3 (named tail block) ----
+
+/// SR845: [`bidir_conceal_stream`]'s PRED_BI shape over the kit's [`head_fmt`] at chroma_format_idc `idc` (the non-linear
+/// pcm pattern): IDR0, P4 (skip-only: I0), B2 (StCurrBefore {0}, StCurrAfter {4}, two references per list; CTB 0 PRED_BI
+/// through the kit's `bi_body` with L0 mvd (32, 16) to POC 0 and L1 mvd (-64, 0) to POC 4, CTBs 1..3 skip-merge it),
+/// then P6 (skip-only, references only the lost POC 3). Returns the stream and the byte range of B2's NAL.
+fn bidir_conceal_stream_fmt(idc: u32) -> (Vec<u8>, std::ops::Range<usize>) {
+    let mut s = head_fmt(idc, &inter_sps(false), &PpsInter::default());
+    s.extend(picture(&p_slice(4, vec![(-4, true)]), skip_picture));
+    let bcfg = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 2,
+        neg: vec![(-2, true)],
+        pos: vec![(2, true)],
+        num_ref: Some((2, 2)),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    let start = s.len();
+    s.extend(picture(&bcfg, |e| bi_body(e, 2, [32, 16], [-64, 0])));
+    let b2 = start..s.len();
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    (s, b2)
+}
+
+/// SR845: [`conceal_bidir_averages_both_projections`] at chroma_format_idc `idc`. POC 3 is concealed from B2 along both
+/// lists: L0 (32, 16) rescaled by td 2, tb 1 to (16, 8) quarter samples, L1 (-64, 0) by td -2, tb 1 to (32, 0); dpb.rs
+/// `conceal_fetch` takes chroma mvC = mv * 2 / (SubWidthC, SubHeightC) ([`mvc_at`]): whole chroma samples on every format
+/// (4:2:0 (2, 1) / (4, 0), 4:2:2 (2, 2) / (4, 0), 4:4:4 (4, 2) / (8, 0)), so each 14-bit fetch is s << 6 and 8-262's
+/// `bi_default` is (s + t + 1) >> 1 exactly. P6 (the concealed picture's skip copy) equals that average of the two fetches
+/// of B2 on EVERY sample of every plane (the 4:4:4 concealed chroma block is 8x8 = 64: `second` filled whole), and differs
+/// from either fetch alone and (idc 2 / 3) from the previous format's mvC.
+fn conceal_bidir_averages_both_projections_at(idc: u32) {
+    let (sub, (cw, ch), prev) = if idc == 1 { ((2, 2), (16, 16), (2, 2)) } else { fmt_geom(idc) };
+    let (s, _) = bidir_conceal_stream_fmt(idc);
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3], "idc {idc}");
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 16, forward_blocks: 16 }], "idc {idc}: every block bi");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6], "idc {idc}: output in decoding order");
+    let (b2, p6) = (by_poc(&f, 2), by_poc(&f, 6));
+    let avg = |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).map(|(&x, &y)| ((x as u32 + y as u32 + 1) >> 1) as u8).collect::<Vec<u8>>();
+    let whole = |p: i32| (p + 32) >> 6;
+    let (pl, ql) = (fetch_map(&b2.planes[0], 0, 32, 32, [16, 8], whole), fetch_map(&b2.planes[0], 0, 32, 32, [32, 0], whole));
+    assert_eq!(p6.planes[0], avg(&pl, &ql), "idc {idc}: luma, the 8-262 average of (4, 2) and (8, 0)");
+    assert_ne!(p6.planes[0], pl, "idc {idc}: luma not the L0 projection alone");
+    assert_ne!(p6.planes[0], ql, "idc {idc}: luma not the L1 projection alone");
+    let (m0, m1) = (mvc_at([16, 8], sub), mvc_at([32, 0], sub));
+    for c in 1..3 {
+        let r = &b2.planes[c][..];
+        assert_eq!(p6.planes[c].len(), (cw * ch) as usize, "idc {idc} plane {c}: the format's sample count");
+        let (p, q) = (fetch_map(r, c, cw, ch, m0, whole), fetch_map(r, c, cw, ch, m1, whole));
+        let want = avg(&p, &q);
+        for i in 0..want.len() {
+            assert_eq!(p6.planes[c][i], want[i], "idc {idc} plane {c} sample ({}, {}): the average of mvC {m0:?} and {m1:?}", i as i32 % cw, i as i32 / cw);
+        }
+        assert_ne!(p6.planes[c], p, "idc {idc} plane {c}: not the L0 projection alone");
+        assert_ne!(p6.planes[c], q, "idc {idc} plane {c}: not the L1 projection alone");
+        if idc != 1 {
+            let (n0, n1) = (mvc_at([16, 8], prev), mvc_at([32, 0], prev));
+            assert_ne!(p6.planes[c], avg(&fetch_map(r, c, cw, ch, n0, whole), &fetch_map(r, c, cw, ch, n1, whole)), "idc {idc} plane {c}: not the previous format's mvC {n0:?} / {n1:?}");
+        }
+    }
+}
+
+/// SR845: the bi concealment at 4:2:0 over the kit's non-linear pattern (the gradient pin above unchanged).
+#[test]
+fn conceal_bidir_averages_both_projections_420_pattern() {
+    conceal_bidir_averages_both_projections_at(1);
+}
+
+/// SR845: the bi concealment at 4:2:2: 4x8 chroma blocks, both fetches averaged on every chroma sample.
+#[test]
+fn conceal_bidir_averages_both_projections_422() {
+    conceal_bidir_averages_both_projections_at(2);
+}
+
+/// SR845: the bi concealment at 4:4:4: 8x8 chroma blocks, `conceal_fetch`'s 64-sample `second` filled whole.
+#[test]
+fn conceal_bidir_averages_both_projections_444() {
+    assert!(!sps_cfg().separate_colour_plane, "the idc-3 SPS writes separate_colour_plane_flag 0");
+    conceal_bidir_averages_both_projections_at(3);
+}
+
+/// SR845: the fuzz-shape pin on the 4:4:4 bi concealment road: each byte of B2's slice NAL after its start code and
+/// two-byte header, xor-ed with 0xff and with 0x01 in turn, decodes (Ok or Err), flushes and yields its frames without
+/// a panic.
+#[test]
+fn conceal_bidir_444_damaged_b_decodes_without_panic() {
+    let (s, b2) = bidir_conceal_stream_fmt(3);
+    for i in b2.start + 6..b2.end {
+        for mask in [0xffu8, 0x01] {
+            let mut t = s.clone();
+            t[i] ^= mask;
+            let mut d = Decoder::new();
+            let _ = d.decode_annexb(&t);
+            d.flush();
+            let _ = d.take_frames();
+        }
+    }
 }
