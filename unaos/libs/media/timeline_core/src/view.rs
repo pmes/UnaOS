@@ -302,7 +302,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     }
     // The ruler: a short mark per tick when they are 4 px apart, a long one per second.
     let fps = tl.fps().or(edl::ntsc_nominal(tl.tb)).unwrap_or(25).max(1) as i64; // STRIATCTHREE (SR9030): an NTSC base rules at its nominal (file tail)
-    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
+    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64); let mut tc = alloc::string::String::new(); // STRIAPERFTHREE (SR9037): one ruler timecode buffer (edl.rs tail)
     c.rect(0, ry, w as i64, ty, RULER);
     let t_end = if l.band_on(ry, ty) { l.tick_at(w as f64) + 1 } else { l.t0 - 1 }; // STRIAPERFCANVASFILL (SR919): an off-canvas ruler runs no tick
     for t in l.t0..=t_end {
@@ -310,7 +310,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         if ruler_second(tl, t, fps) { // STRIATCTHREE (SR9030): a drop-frame base marks where the label's second changes (file tail)
             c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
             if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60) {
-                text.text(&mut c, &ruler_tc(tl, t, fps), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32)); // STRIATCTHREE (SR9030): drop-frame labels on a drop-frame base (file tail)
+                text.text(&mut c, ruler_tctimecode_in(tl, &mut tc, t, fps), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32)); // STRIATCTHREE (SR9030): drop-frame labels on a drop-frame base (file tail)
             }
         } else if l.zoom >= 4 {
             c.rect(x, ty - 3, x + 1, ty, TICK);

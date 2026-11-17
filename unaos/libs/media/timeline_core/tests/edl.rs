@@ -628,3 +628,18 @@ fn striatcthree_drop_number_inverse() {
     assert_eq!((drop_number(7, 25), drop_tick(7, 25), drop_number(-3, 30)), (7, Some(7), 0));
     assert_eq!(timecode_drop(1800, 30), "00:01:00;02");
 }
+
+// ---- STRIAPERFTHREE (LEDGER SR9037): timecode_in is timecode into a reused buffer (named tail block) ----
+#[test]
+fn striaperfthree_timecode_in_matches() {
+    let mut buf = String::new();
+    for fps in [0u32, 24, 25, 30] {
+        for t in [-5i64, 0, 24, 25, 90_125, 10_000_000] {
+            let want = edl::timecode(t, fps);
+            assert_eq!(edl::timecode_in(&mut buf, t, fps), want, "t {t} fps {fps}");
+        }
+    }
+    let cap = buf.capacity();
+    assert_eq!(edl::timecode_in(&mut buf, 0, 25), "00:00:00:00");
+    assert_eq!(buf.capacity(), cap, "the buffer is reused");
+}
