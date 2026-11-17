@@ -3648,3 +3648,345 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- H264ENCTWOPASSQCOMPFACE (LEDGER SR1076): the face's export takes the rate and two-pass plan words (named tail block) ----
+
+#[test]
+fn face_export_twopass_words_parse_as_the_cli() {
+    use stria::nle_export::{Pass2Cli, pass2_cli_of, qblur_of, qcomp_of, qpstep_of};
+    use stria::nle_face::export_plan_of;
+    let p = export_plan_of("out/ h264 bitrate 400 two-pass qcomp 0.6 qblur 1 cplxblur 10 qpstep 2").expect("the plan words");
+    assert!(p.two_pass);
+    assert_eq!(p.opts.bitrate, Some(400));
+    assert_eq!(p.opts.qcomp, qcomp_of("0.6"), "the CLI's own parse of 0.6");
+    assert_eq!(p.opts.qcomp, Some((60, 100)));
+    assert_eq!((p.opts.qblur_q8, qblur_of("1")), (Some(256), Some(256)));
+    assert_eq!(p.opts.cplxblur, Some(10));
+    assert_eq!((p.opts.qpstep, qpstep_of("2")), (Some(2), Some(2)));
+    let cli = pass2_cli_of("qcomp=0.6,qblur=1,cplxblur=10,qpstep=2").expect("the CLI's --pass2 of the same four");
+    assert_eq!(Pass2Cli { qcomp: p.opts.qcomp, cplxblur: p.opts.cplxblur, qblur_q8: p.opts.qblur_q8, qpstep: p.opts.qpstep }, cli);
+    assert_eq!(export_plan_of("bitrate 400 two-pass qcomp 0.2 qcomp 0.7").expect("last wins").opts.qcomp, Some((70, 100)));
+    let d = export_plan_of("out/ png").expect("no plan words");
+    assert!(!d.two_pass && d.opts.bitrate.is_none() && d.opts.qcomp.is_none() && d.opts.qpstep.is_none());
+    assert_eq!(export_plan_of("bitrate 400 two-pass qcomp bogus").unwrap_err(), "qcomp bogus: not a fraction within 0..=1");
+    assert_eq!(export_plan_of("bitrate 400 two-pass qpstep 52").unwrap_err(), "qpstep 52: not an integer within 0..=51");
+    assert_eq!(export_plan_of("bitrate 400 two-pass qpstep").unwrap_err(), "qpstep: a value is required");
+    assert_eq!(export_plan_of("h264 qcomp 0.6").unwrap_err(), "qcomp needs two-pass");
+    assert_eq!(export_plan_of("two-pass qcomp 0.6").unwrap_err(), "two-pass needs bitrate");
+    assert_eq!(export_plan_of("bitrate x").unwrap_err(), "bitrate x: not a positive integer");
+    println!("face_export_twopass: words parse as the CLI's pass2_cli_of, qcomp 0.6 = {:?}", p.opts.qcomp);
+}
+
+#[test]
+fn face_export_twopass_refused_by_name_exports_nothing() {
+    let root = nlefaceexport_dir("twopass-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    for (words, want) in [
+        ("h264 bitrate 400 two-pass qcomp bogus", "export: qcomp bogus: not a fraction within 0..=1"),
+        ("h264 qcomp 0.6", "export: qcomp needs two-pass"),
+        ("h264 two-pass", "export: two-pass needs bitrate"),
+        ("png bitrate 400 two-pass", "export: two-pass needs h264"),
+        ("png bitrate 400", "export: bitrate needs h264"),
+    ] {
+        assert!(face.verb(&format!("export {} {words}", root.display())));
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{words}");
+        assert!(!face.exporting() && !root.exists(), "{words}: a refused word makes nothing");
+    }
+    assert!(face.verb(&format!("export {} h264 x y z", root.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    for w in ["bitrate <kbps>", "two-pass", "qcomp F", "cplxblur N", "qblur F", "qpstep N"] {
+        assert!(usage.starts_with("export: usage: ") && usage.contains(w), "{w}: {usage}");
+    }
+    println!("face_export_twopass: refused by name, nothing exported; {usage}");
+}
+
+#[test]
+fn face_export_twopass_plans_from_a_first_pass() {
+    let dir = nlefaceexport_dir("twopass");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} h264 bitrate 400 two-pass qcomp 0.6 qblur 1 cplxblur 10 qpstep 2", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("video.mp4").is_file(), "{line}");
+    assert!(!dir.join("pass1").exists(), "the first pass's dir is removed");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass: planned export {line}");
+}
+
+// ---- NLEFACEEXPORTQPWORDS (LEDGER SR1091): the face's export takes the CLI's rate words (named tail block) ----
+
+#[test]
+fn face_export_qp_words_parse_as_the_lib() {
+    use stria::nle_export::{H264Opts, knob_or_default, rate_word_into};
+    use stria::nle_face::export_plan_of;
+    let p = export_plan_of("out/ h264 crf 23").expect("crf");
+    assert_eq!(p.opts.crf, Some(23));
+    assert_eq!(p.opts.qp, 26, "qp stays the Default's under crf (the CLI's rule)");
+    assert_eq!(export_plan_of("qp 30").expect("qp").opts.qp, 30);
+    assert_eq!(export_plan_of("gop 48").expect("gop").opts.gop, Some(48));
+    let s = export_plan_of("scenecut 40 min-keyint 12").expect("scenecut + min-keyint");
+    assert_eq!((s.opts.scenecut, s.opts.min_keyint), (Some(40), Some(12)));
+    assert_eq!(export_plan_of("aq 2").expect("aq").opts.aq, Some(2));
+    let h = export_plan_of("bitrate 400 hrd").expect("hrd");
+    assert!(h.opts.hrd && h.opts.bitrate == Some(400));
+    let bare = export_plan_of("scenecut aq").expect("bare scenecut / aq");
+    assert_eq!((bare.opts.scenecut, bare.opts.aq), (Some(40), Some(10)), "x264's defaults");
+    assert_eq!(knob_or_default("aq", Some("h264")), (10, false), "a non-number next word is left unread");
+    // Each face word equals the lib's parse of the same word (the CLI's `num` / `what` and its optional arms are these fns).
+    for (k, v) in [("qp", "30"), ("crf", "23"), ("gop", "48"), ("min-keyint", "12"), ("scenecut", "55"), ("aq", "2")] {
+        let mut want = H264Opts { scenecut: Some(40), ..H264Opts::default() };
+        rate_word_into(k, v, &mut want).expect("a rate word").expect("a good value");
+        let face = export_plan_of(&format!("scenecut 40 {k} {v}")).expect(k).opts;
+        assert_eq!((face.qp, face.crf, face.gop, face.min_keyint, face.scenecut, face.aq), (want.qp, want.crf, want.gop, want.min_keyint, want.scenecut, want.aq), "{k} {v}");
+    }
+    for k in ["scenecut", "aq"] {
+        assert_eq!(knob_or_default(k, Some("7")), (7, true));
+        assert_eq!(knob_or_default(&format!("--{k}"), None), knob_or_default(k, None), "the CLI's flag and the face's word");
+    }
+    assert!(rate_word_into("bitrate", "400", &mut H264Opts::default()).is_none(), "bitrate is not a rate knob of the lib's");
+    assert_eq!(export_plan_of("crf bogus").unwrap_err(), "crf bogus: not a whole number within 0..=255");
+    assert_eq!(export_plan_of("gop x").unwrap_err(), "gop x: not a whole number within 0..=4294967295");
+    assert_eq!(export_plan_of("crf").unwrap_err(), "crf: a value is required");
+    assert_eq!(export_plan_of("crf 23 bitrate 400").unwrap_err(), "bitrate and crf are exclusive");
+    assert_eq!(export_plan_of("hrd").unwrap_err(), "hrd needs bitrate");
+    assert_eq!(export_plan_of("min-keyint 12").unwrap_err(), "min-keyint needs scenecut");
+    println!("face_export_qp_words: crf 23 = {:?}, bare scenecut / aq = {:?}", p.opts.crf, (bare.opts.scenecut, bare.opts.aq));
+}
+
+#[test]
+fn face_export_qp_words_refused_by_name_exports_nothing() {
+    let root = nlefaceexport_dir("qpwords-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    for (words, want) in [
+        ("h264 crf 23 bitrate 400", "export: bitrate and crf are exclusive"),
+        ("h264 hrd", "export: hrd needs bitrate"),
+        ("h264 min-keyint 12", "export: min-keyint needs scenecut"),
+        ("h264 crf bogus", "export: crf bogus: not a whole number within 0..=255"),
+        ("png crf 23", "export: crf needs h264"),
+        ("y4m gop 12", "export: gop needs h264"),
+    ] {
+        assert!(face.verb(&format!("export {} {words}", root.display())));
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{words}");
+        assert!(!face.exporting() && !root.exists(), "{words}: a refused word makes nothing");
+    }
+    assert!(face.verb(&format!("export {} h264 x y z", root.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    for w in ["qp N", "gop N", "crf N", "scenecut [K]", "min-keyint N", "aq [K]", "[hrd]", "bitrate <kbps>", "two-pass"] {
+        assert!(usage.starts_with("export: usage: ") && usage.contains(w), "{w}: {usage}");
+    }
+    println!("face_export_qp_words: refused by name, nothing exported; {usage}");
+}
+
+#[test]
+fn face_export_qp_words_constant_quality_export() {
+    let dir = nlefaceexport_dir("qpwords-crf");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} h264 crf 23 gop 12 scenecut aq 2", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("video.mp4").is_file(), "{line}");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_qp_words: constant-quality export {line}");
+}
+
+// ---- H264ENCTWOPASSFACEPROGRESS (LEDGER SR1093): one progress road over both passes of the face's two-pass export (named tail block) ----
+
+/// The held job's reading `(k, total)`, then Esc: the cancel line and whether a pass-2 video exists.
+fn twopassprogress_hold(dir: &std::path::Path, k: u64, plan: stria::nle_face::ExportPlan, want: (u64, u64)) -> (String, bool) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_plan(dir, "h264", k, plan).unwrap();
+    nlefaceexport_until(&face, want);
+    let video = dir.join("video.mp4").exists();
+    assert!(face.cancel_export() && face.wait_export());
+    let line = face.last_error.take().expect("the cancel line");
+    (line, video)
+}
+
+#[test]
+fn face_export_twopass_progress_one_road_over_both_passes() {
+    use stria::nle_face::export_plan_of;
+    let mut readings = Vec::new();
+    for k in [10u64, 35, 50, 70] {
+        let dir = nlefaceexport_dir(&format!("twopassprogress-{k}"));
+        let (line, video) = twopassprogress_hold(&dir, k, export_plan_of("bitrate 400 two-pass").unwrap(), (k, 70));
+        assert_eq!(line, format!("export: cancelled at {k}/70 frames; partial files left in {}", dir.display()));
+        if k <= 35 {
+            assert!(!video, "reading {k}: pass 1 reads 1..=35 before any pass-2 frame");
+        }
+        readings.push((k, 70u64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(readings.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 == w[1].1), "monotone over one total: {readings:?}");
+    assert_eq!(readings.last(), Some(&(70, 70)), "the last reading is the total, 2 x 35");
+    println!("face_export_twopass_progress: readings {readings:?} over both passes");
+}
+
+#[test]
+fn face_export_twopass_progress_cancel_in_pass1_writes_no_video() {
+    let dir = nlefaceexport_dir("twopassprogress-cancel");
+    let plan = stria::nle_face::export_plan_of("bitrate 400 two-pass").unwrap();
+    let (line, _) = twopassprogress_hold(&dir, 10, plan, (10, 70));
+    assert_eq!(line, format!("export: cancelled at 10/70 frames; partial files left in {}", dir.display()), "the face's own Interrupted error through pass 1");
+    assert!(!dir.join("video.mp4").exists(), "no planned pass after a first-pass cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass_progress: {line}");
+}
+
+#[test]
+fn face_export_twopass_progress_single_pass_unchanged() {
+    let dir = nlefaceexport_dir("twopassprogress-single");
+    let (line, _) = twopassprogress_hold(&dir, 10, stria::nle_face::ExportPlan::default(), (10, 35));
+    assert_eq!(line, format!("export: cancelled at 10/35 frames; partial files left in {}", dir.display()));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass_progress: single pass {line}");
+}
+
+// ---- NLEFACEEXPORTPASSWORD (LEDGER SR1095): the pass word on the export message row (named tail block) ----
+
+#[test]
+fn face_export_pass_word_unit() {
+    use stria::nle_face::{export_line, export_line_passes, finishing_words};
+    let rows: [(u64, u64, u8, Option<&str>, &str); 9] = [
+        (10, 70, 2, None, "export: 10 / 35 (pass 1/2)"),
+        (50, 70, 2, None, "export: 15 / 35 (pass 2/2)"),
+        (35, 70, 2, None, "export: 35 / 35 (pass 1/2)"),
+        (36, 70, 2, None, "export: 1 / 35 (pass 2/2)"),
+        (0, 70, 2, None, "export: 0 / 35 (pass 1/2)"),
+        (10, 70, 2, Some("~12 s"), "export: 10 / 35 (pass 1/2) ~12 s"),
+        (50, 70, 2, Some("stalled 7 s"), "export: 15 / 35 (pass 2/2) stalled 7 s"),
+        (0, 0, 2, None, "export: starting"),
+        (10, 35, 1, Some("~12 s"), "export: 10 / 35 ~12 s"),
+    ];
+    for (d, t, n, e, want) in rows {
+        assert_eq!(export_line_passes(d, t, n, e.map(String::from)), want, "export_line_passes({d}, {t}, {n}, {e:?})");
+    }
+    assert_eq!(export_line_passes(70, 70, 2, finishing_words(70, 70)), "export: 35 / 35 (pass 2/2) finishing", "the finishing word after the pass word");
+    for e in [None, Some("~12 s"), Some("stalled 7 s")] {
+        assert_eq!(export_line_passes(10, 35, 1, e.map(String::from)), export_line(10, 35, e.map(String::from)), "one pass is export_line byte for byte ({e:?})");
+    }
+    println!("face_export_pass_word: {} KAT rows + finishing + 3 single-pass identities", rows.len());
+}
+
+/// The held job's message row after `want` (the combined reading), its per-pass head checked against `head` and its tail
+/// (empty, the eta, or the stall word) after the pass word; then Esc and the cancel line (the combined numbers).
+fn password_hold(name: &str, k: u64, plan: stria::nle_face::ExportPlan, want: (u64, u64), head: &str) -> String {
+    let dir = nlefaceexport_dir(name);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_plan(&dir, "h264", k, plan).unwrap();
+    nlefaceexport_until(&face, want);
+    let line = face.message_text().expect("the running export's line");
+    let tail = line.strip_prefix(head).unwrap_or_else(|| panic!("{line}: want the head {head:?}"));
+    assert!(tail.is_empty() || tail.strip_prefix(" ~").is_some_and(nle5dexportmessageetaband_eta_shaped) || tail.starts_with(" stalled "), "{line}: the eta / stall word follows the head");
+    assert_eq!(face.export_progress(), Some(want), "the band keeps the combined reading");
+    assert!(face.cancel_export() && face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at {}/{} frames; partial files left in {}", want.0, want.1, dir.display()), "the cancel line keeps the combined numbers");
+    let _ = std::fs::remove_dir_all(&dir);
+    line
+}
+
+#[test]
+fn face_export_pass_word_twopass_held_reads_the_pass() {
+    use stria::nle_face::export_plan_of;
+    for (k, head) in [(10u64, "export: 10 / 35 (pass 1/2)"), (50, "export: 15 / 35 (pass 2/2)")] {
+        let line = password_hold(&format!("password-{k}"), k, export_plan_of("bitrate 400 two-pass").unwrap(), (k, 70), head);
+        println!("face_export_pass_word: held at {k}/70 reads {line}");
+    }
+}
+
+#[test]
+fn face_export_pass_word_single_pass_unchanged() {
+    let line = password_hold("password-single", 10, stria::nle_face::ExportPlan::default(), (10, 35), "export: 10 / 35");
+    assert!(!line.contains("(pass"), "{line}: no pass word on a single pass");
+    println!("face_export_pass_word: single pass reads {line}");
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the pass on the witness's export object (named tail block) ----
+
+#[test]
+fn face_export_pass_json_pass_of() {
+    use stria::nle_face::{export_line_passes, pass_of};
+    for ((d, t, n), want) in [((10u64, 70u64, 2u8), (1u64, 2u64)), ((35, 70, 2), (1, 2)), ((36, 70, 2), (2, 2)), ((70, 70, 2), (2, 2)), ((10, 35, 1), (1, 1))] {
+        assert_eq!(pass_of(d, t, n), want, "pass_of({d}, {t}, {n})");
+    }
+    for d in 0..=70u64 {
+        let (k, n) = pass_of(d, 70, 2);
+        let line = export_line_passes(d, 70, 2, None);
+        assert!(line.ends_with(&format!("(pass {k}/{n})")), "{line}: the row's pass word is pass_of's ({k}/{n}) at {d}");
+    }
+    println!("face_export_pass_json: 5 pass_of KAT rows + the row agrees over 0..=70");
+}
+
+#[test]
+fn face_export_pass_json_accessor() {
+    use stria::nle_face::export_plan_of;
+    let (tl, src) = synth_fixture();
+    assert_eq!(nlefaceexport_face(tl, src).export_pass(), None, "no job");
+    for (name, k, plan, want, pass) in [("passjson-two", 50u64, export_plan_of("bitrate 400 two-pass").unwrap(), (50u64, 70u64), Some((2u8, 2u8))), ("passjson-single", 10, stria::nle_face::ExportPlan::default(), (10, 35), None)] {
+        let dir = nlefaceexport_dir(name);
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl, src);
+        face.export_paused_plan(&dir, "h264", k, plan).unwrap();
+        nlefaceexport_until(&face, want);
+        assert_eq!(face.export_pass(), pass, "{name} held at {want:?}");
+        assert!(face.cancel_export() && face.wait_export());
+        assert_eq!(face.export_pass(), None, "{name}: no job after the cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("face_export_pass_json: {name} held at {want:?} -> {pass:?}");
+    }
+}
+
+// ---- NLEFACEEXPORTJSONZERO (LEDGER SR1110): the k = 0 hold before the first frame (named tail block) ----
+
+/// Hold `face` for 250 ms at the reading `want` (the k = 0 hold never moves it), then the message row and the frame-file count.
+fn exportzero_held(face: &Face, dir: &std::path::Path, want: (u64, u64)) -> (String, usize) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_millis(250) {
+        assert_eq!(face.export_progress(), Some(want), "the k = 0 hold keeps the reading at 0");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let line = face.message_text().expect("the running export's line");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(4), "read under the stall window");
+    (line, std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0))
+}
+
+#[test]
+fn face_export_zero_hold_before_first_frame() {
+    let dir = nlefaceexport_dir("exportzero-single");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 0).unwrap();
+    let (line, written) = exportzero_held(&face, &dir, (0, 35));
+    assert_eq!(face.export_eta(), None, "no eta at done 0 (eta_of guards 0)");
+    assert_eq!(face.export_pass(), None, "one pass: no pass");
+    assert_eq!(line, "export: 0 / 35", "the row at done 0: the real count, no eta word");
+    assert_eq!(written, 0, "held before the first frame: no frame file");
+    assert!(face.cancel_export() && face.wait_export());
+    assert_eq!(face.last_error.take(), Some(format!("export: cancelled at 0/35 frames; partial files left in {}", dir.display())));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_zero: single \"{line}\"");
+
+    let dir = nlefaceexport_dir("exportzero-twopass");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_plan(&dir, "h264", 0, stria::nle_face::export_plan_of("bitrate 400 two-pass").unwrap()).unwrap();
+    let (two, _) = exportzero_held(&face, &dir, (0, 70));
+    assert_eq!(face.export_eta(), None, "no eta at done 0");
+    assert_eq!(face.export_pass(), Some((1, 2)), "the reading 0 is pass 1 (pass_of)");
+    assert_eq!(two, "export: 0 / 35 (pass 1/2)", "the two-pass row at done 0");
+    assert!(!dir.join("video.mp4").exists(), "held before pass 1: no video");
+    assert!(face.cancel_export() && face.wait_export());
+    assert_eq!(face.last_error.take(), Some(format!("export: cancelled at 0/70 frames; partial files left in {}", dir.display())));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_zero: two-pass \"{two}\"");
+}
