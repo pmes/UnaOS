@@ -41,6 +41,8 @@ struct Inherited {
     /// control. A `<button>`'s label is an ordinary text child, so the box it
     /// must be centred in is only known from the ancestor.
     center_box: Option<(f32, f32, f32, f32)>,
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the resolved `color-scheme` (PaintStyle::color_scheme, inherited); read through `layout_core::ua_colours`.
+    scheme: Option<u8>,
 }
 
 use crate::layout::default_font_size;
@@ -497,6 +499,7 @@ fn root_inherited() -> Inherited {
         text_hidden: false,
         text_transform: 0,
         center_box: None,
+        scheme: None,
     }
 }
 
@@ -1062,9 +1065,9 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
+    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
         (0, 0, 238) // UA default link blue
-    } else if control_tag(tag) { (0, 0, 0) } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
+    } else if control_tag(tag) { layout_core::ua_colours(inherited.scheme).ink } else if tag == "html" { layout_core::ua_colours(inherited.scheme).canvastext } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
         inherited.color
     }));
 }
@@ -1466,8 +1469,8 @@ fn paint_file_color(
             // control frame, square, over ButtonFace) as the swatch's fill_rect pair draws a framed fill; the input paints none.
             let (fx0, fy0, fx1, fy1) = (cx0, cy0, cx0 + btn_bw, cy0 + ch);
             if fx1 > fx0 && fy1 > fy0 {
-                fill_rect(fx0, fy0, fx1, fy1, (118, 118, 118), 255, surface, width, height, damage_rects, clip);
-                fill_rect(fx0 + 1.0, fy0 + 1.0, fx1 - 1.0, fy1 - 1.0, layout_core::BUTTON_FACE, 255, surface, width, height, damage_rects, clip);
+                fill_rect(fx0, fy0, fx1, fy1, layout_core::ua_colours(inherited.scheme).frame, 255, surface, width, height, damage_rects, clip);
+                fill_rect(fx0 + 1.0, fy0 + 1.0, fx1 - 1.0, fy1 - 1.0, layout_core::ua_colours(inherited.scheme).face, 255, surface, width, height, damage_rects, clip);
             }
             draw_text(button, btn.x, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
             draw_text(&file_status_fit(dom_node, &adv, bx + bw - bord.right - pad.right - (cx0 + btn_bw + 4.0)), cx0 + btn_bw + 4.0, btn.top, f32::MAX, &adv, 0.0, color, false, surface, width, height, damage_rects, clip);
@@ -1578,7 +1581,7 @@ pub fn canvas_background(layout: &LayoutTree) -> Option<(u8, u8, u8)> {
         let mix = |v: u8| (v as f32 * a + 255.0 * (1.0 - a)).round() as u8;
         Some((mix(c.0), mix(c.1), mix(c.2)))
     };
-    bg(find("html")).or_else(|| bg(find("body")))
+    bg(find("html")).or_else(|| bg(find("body"))).or_else(|| ua_canvas(layout, find("html")))
 }
 
 /// Paint a `<video>`/`<audio>` box (AETHERVIDEO, LEDGER SR39): the picture (poster or the
@@ -2656,11 +2659,11 @@ fn frame_walk(
         let mut inherited = inherited;
 
         if let Some(dom_node) = layout.node_map.get(&node_id) {
-            let spec = layout.paint_map.get(&node_id).cloned().unwrap_or_default();
+            let mut spec = layout.paint_map.get(&node_id).cloned().unwrap_or_default();
 
             if let Some(el) = dom_node.as_element() {
                 let tag = el.name.local.as_ref();
-                inherit_element(&mut inherited, tag, &spec, dom_node, node_id);
+                inherit_element(&mut inherited, tag, &spec, dom_node, node_id); ua_scheme_spec(&mut spec, dom_node, inherited.scheme);
                 // AETHERPAINTPERF (SR130): the index walk records the box's own ink and paints nothing.
                 'paint: {
                 if walk_mode() == 1 {
@@ -2975,7 +2978,7 @@ fn frame_walk(
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
                 let mut border = spec.border.map(|b| layout_core::paint::border_ink(b, spec.currentcolor, inherited.color)).or(if is_control && !checkable && !image_input && !file_input {
-                    Some([Some((1.0, (118, 118, 118))); 4])
+                    Some([Some((1.0, layout_core::ua_colours(inherited.scheme).frame)); 4])
                 } else {
                     None
                 });
@@ -4650,4 +4653,45 @@ fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintSty
     if let Some(c) = spec.decoration_color {
         inherited.deco_color = c;
     }
+}
+
+// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the UA control colours and the canvas under color-scheme: dark (named tail block) ----
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): a control's UA colours under its resolved `color-scheme` when that is dark
+/// (`layout_core::scheme_dark`), written into the paint walk's `spec` once so every later read (the background road,
+/// the label / value / caret / chevron ink) takes them: a push button whose background is still the UA face
+/// (`BUTTON_FACE`, the test AETHER.ELF's paint.rs makes; not a currentColor carrier) takes the dark face; a text field /
+/// textarea / select with no background takes the dark Field; a control with no `color` and no explicit inherit takes
+/// the dark ButtonText / FieldText. An author background or colour is a Some that is not the UA face: it wins. The
+/// light scheme writes nothing (the light road unchanged).
+fn ua_scheme_spec(spec: &mut crate::layout::PaintStyle, dom_node: &crate::dom::NodeRef, scheme: Option<u8>) {
+    if !layout_core::scheme_dark(scheme) {
+        return;
+    }
+    let Some(kind) = crate::layout::control_kind(dom_node) else { return };
+    let ua = layout_core::ua_colours(scheme);
+    match kind {
+        crate::layout::Control::Button => {
+            if spec.background == Some(layout_core::BUTTON_FACE) && spec.currentcolor & layout_core::paint::CC_BG == 0 {
+                spec.background = Some(ua.face);
+            }
+        }
+        crate::layout::Control::Field | crate::layout::Control::Textarea | crate::layout::Control::Select => {
+            if spec.background.is_none() {
+                spec.background = Some(ua.field);
+            }
+        }
+        _ => {}
+    }
+    if spec.color.is_none() && !spec.inherits(layout_core::paint::INHERIT_COLOR) {
+        spec.color = Some(ua.ink);
+    }
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the canvas when neither the root nor body paints a background: the dark
+/// Canvas (#121212) when the ROOT element's `color-scheme` is dark (css-color-adjust-1 §2.1), else None (the caller's
+/// light white stands). `html` is `canvas_background`'s own `find("html")`.
+fn ua_canvas(layout: &LayoutTree, html: Option<NodeId>) -> Option<(u8, u8, u8)> {
+    let scheme = html.and_then(|i| layout.paint_map.get(&i)).and_then(|p| p.color_scheme);
+    layout_core::scheme_dark(scheme).then(|| layout_core::ua_colours(scheme).canvas)
 }

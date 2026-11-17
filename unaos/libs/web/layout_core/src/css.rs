@@ -1406,6 +1406,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "ltr" => style.paint.rtl = Some(false),
             _ => {}
         },
+        "color-scheme" => { if let Some(s) = parse_color_scheme(value) { style.paint.color_scheme = Some(s); } } // AETHERCSSWIDECOLORCONTROLSDARK (SR1031)
         // css-text-decor-3 §4: offset-x offset-y [blur] && [color], comma-separated layers.
         "text-shadow" => {
             let layers: Vec<H::Shadow> = H::parse_box_shadow(value).into_iter().filter(|s| !H::shadow_is_inset(s)).collect();
@@ -2598,7 +2599,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
+        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps, color_scheme,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
     if let Some(src_list) = &src.font_rel {
@@ -4007,4 +4008,46 @@ fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>)
     }
     style.set_inherit_box(bit);
     true
+}
+
+// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the `color-scheme` property parsed into PaintStyle::color_scheme (named tail block) ----
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `normal | [ light | dark | <custom-ident> ]+ && only?`
+/// as the field's bits: bit 0 light, bit 1 dark; `normal` (and `initial`: the initial value) Some(0), so a `normal` under a
+/// dark root resets (None is the inherit road). `only` and custom idents are accepted and ignored; `normal` beside another
+/// keyword, a lone `only`, a second `only` or a non-ident token is invalid: None (the declaration is dropped). `inherit` /
+/// `unset` never reach here (`css_wide`: the INHERIT_COLOR_SCHEME bit); `revert` is invalid here (dropped, as elsewhere).
+pub fn parse_color_scheme(value: &str) -> Option<u8> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("normal") || v.eq_ignore_ascii_case("initial") {
+        return Some(0);
+    }
+    let (mut bits, mut only, mut idents) = (0u8, false, 0usize);
+    for tok in v.split_ascii_whitespace() {
+        let ident = tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+            && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !ident {
+            return None;
+        }
+        if tok.eq_ignore_ascii_case("only") {
+            if only {
+                return None;
+            }
+            only = true;
+            continue;
+        }
+        if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("revert") || tok.eq_ignore_ascii_case("initial") {
+            return None;
+        }
+        idents += 1;
+        if tok.eq_ignore_ascii_case("light") {
+            bits |= 1;
+        } else if tok.eq_ignore_ascii_case("dark") {
+            bits |= 2;
+        }
+    }
+    if idents == 0 {
+        return None;
+    }
+    Some(bits)
 }
