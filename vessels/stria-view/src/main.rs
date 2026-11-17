@@ -194,8 +194,8 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help" | "opacity" | "tc" | "history" | "close-gaps" | "proxy" | "recover" | "undo" | "redo" | "target"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; STRIAOPACITYFACE (SR898): `opacity:50`; STRIAAUTOSAVEKEEPREAD (SR933): `recover:1` (file tail); NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
+        [w @ ("insert" | "overwrite" | "insert-all"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
@@ -574,6 +574,7 @@ fn transport() -> TetraNode {
         button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
+        button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -1079,7 +1080,7 @@ mod striainsertoverwrite_tests {
     fn striainsertoverwrite_buttons_and_token() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 5..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "help"]); // STRIAINSERTMARKS (SR905)
+        assert_eq!(ids[ids.len() - 8..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKS (SR905); STRIAINSERTMARKSKEYSNEXT (SR985)
         let mut f = face();
         let a1 = f.state.timeline.tracks[1].clone();
         let errors = drive(&mut f, "at:12:0,ruler:15,insert");
@@ -2031,7 +2032,7 @@ mod striainsertmarks_tests {
     fn striainsertmarks_buttons_and_drive() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 3..], ["insert-marked", "overwrite-marked", "help"]);
+        assert_eq!(ids[ids.len() - 6..], ["insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKSKEYSNEXT (SR985)
         let (tl, src) = nle_face::synth_fixture();
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         let a1 = f.state.timeline.tracks[1].clone();
@@ -3006,5 +3007,33 @@ mod striatransitionnext_tests {
         let before = face.state.clone();
         assert_eq!(drive(&mut face, "dur:0:9"), vec![format!("dur 0:9: {}", timeline_core::EditError::Transition)]);
         assert_eq!(face.state, before);
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the insert-all / insert-marked-all / target buttons through `--do` (named tail block) ----
+
+#[cfg(test)]
+mod striainsertmarkskeysnext_tests {
+    use super::*;
+    use timeline_core::{Clip, SourceId};
+
+    /// The three buttons sit just before `help`; `--do at:12:0,ruler:15,insert-all` lays B 0..10 at 15 on V1 and ripples A1
+    /// (its B split at 15, the tail at 25); `target:A1` then `insert` is refused by kind on the witness's error list.
+    #[test]
+    fn striainsertmarkskeysnext_buttons_and_drive() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids[ids.len() - 4..], ["insert-all", "insert-marked-all", "target", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "at:12:0,ruler:15,insert-all");
+        assert!(errors.is_empty(), "{errors:?}");
+        let c = f.state.selected().expect("the laid clip selected");
+        assert_eq!(format!("{}:{}:{}", c.at, c.src_in, c.src_out), "15:0:10");
+        assert_eq!(f.state.timeline.tracks[1].clips[2], Clip::new(SourceId(1), 5, 10, 25), "A1 rippled");
+        let errors = drive(&mut f, "target:A1,insert");
+        assert_eq!(f.state.target, Some(1));
+        assert!(errors.iter().any(|e| e.contains("video and audio tracks do not mix")), "{errors:?}");
+        println!("striainsertmarkskeysnext witness: at:12:0,ruler:15,insert-all -> clip 15:0:10, A1 rippled; target:A1,insert -> {errors:?}");
     }
 }

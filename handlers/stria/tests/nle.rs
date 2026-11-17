@@ -4676,7 +4676,7 @@ fn striarolledit_refusals_read_on_the_message_row() {
 /// message row reads the laid clip's reel line.
 #[test]
 fn striainsertoverwrite_face_words_are_place_at_the_playhead() {
-    assert_eq!(VERBS[VERBS.len() - 5..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "help"]); // STRIAINSERTMARKS (SR905): the two marked words before help
+    assert_eq!(VERBS[VERBS.len() - 8..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKS (SR905): the two marked words before help; STRIAINSERTMARKSKEYSNEXT (SR985)
     for (word, mode) in [("insert", timeline_core::Mode::Insert), ("overwrite", timeline_core::Mode::Overwrite)] {
         let (tl, src) = synth_fixture();
         let mut face = nlefaceexport_face(tl.clone(), src);
@@ -11791,4 +11791,53 @@ fn striatransitionnext_length_note_on_message_row() {
     assert!(face.note.is_some());
     face.on(&input("zoom+"));
     assert_eq!(face.note, None, "the next command input drops the note");
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the all-tracks insert words and the target track on the face (named tail block) ----
+
+/// `insert-all` at 15 with B selected lays B 0..10 on V1 and ripples A1 (place's `Mode::InsertAll`, one undo step); the
+/// message row names it `insert-all: B 00:00:00:10 at 00:00:00:15`.
+#[test]
+fn striainsertmarkskeysnext_face_insert_all_ripples_every_track() {
+    assert_eq!(VERBS[VERBS.len() - 4..], ["insert-all", "insert-marked-all", "target", "help"]);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("insert-all"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.place(0, Clip::new(SourceId(1), 0, 10, 15), timeline_core::Mode::InsertAll).unwrap());
+    assert_eq!(face.state.timeline.tracks[1].clips[2], Clip::new(SourceId(1), 5, 10, 25), "A1 rippled");
+    assert_eq!(face.message_text().as_deref(), Some("insert-all: B 00:00:00:10 at 00:00:00:15"));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl, "one undo");
+    println!("striainsertmarkskeysnext: insert-all at 15 -> V1 B 0..10 at 15, A1 B 5..10 at 25");
+}
+
+/// `target V2` notes `target: V2` (no undo step, the document clean) and steers `insert` onto V2; `target A1` with a V1
+/// clip refuses `insert` by kind; `target off` notes `target: off`; an unknown label is `target V9: no such track`.
+#[test]
+fn striainsertmarkskeysnext_face_target_steers_and_notes() {
+    let (mut tl, src) = synth_fixture();
+    tl.add_track(Kind::Video);
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("target V2"));
+    assert_eq!(face.message_text().as_deref(), Some("target: V2"));
+    assert_eq!((face.state.undo_depth(), &face.state.timeline), (0, &tl), "the target is not the document");
+    face.state.select(0, 1).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("insert"));
+    assert_eq!(face.state.timeline, tl.place(2, Clip::new(SourceId(1), 0, 10, 5), timeline_core::Mode::Insert).unwrap());
+    assert_eq!(face.message_text().as_deref(), Some("insert: B 00:00:00:10 at 00:00:00:05"));
+    assert!(face.verb("target A1"));
+    face.state.select(0, 0).unwrap();
+    let before = face.state.timeline.clone();
+    assert!(face.verb("insert"));
+    assert_eq!(face.last_error.take(), Some("insert: video and audio tracks do not mix".to_string()));
+    assert_eq!(face.state.timeline, before);
+    assert!(face.verb("target off"));
+    assert_eq!(face.message_text().as_deref(), Some("target: off"));
+    assert!(face.verb("target V9"));
+    assert_eq!(face.last_error.take(), Some("target V9: no such track".to_string()));
+    println!("striainsertmarkskeysnext: target V2 -> insert on V2; target A1 -> insert refused by kind");
 }
