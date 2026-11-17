@@ -3648,3 +3648,66 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIATRACKREORDER (LEDGER SR877): track-up / track-down on the transport through the one commit (named tail block) ----
+
+/// NLE1's fixture with a second video track V2 (index 2) holding B[0, 10)@0, the selected clip.
+fn striatrackreorder_face() -> (Face, Timeline) {
+    let (mut tl, src) = synth_fixture();
+    let v2 = tl.add_track(Kind::Video);
+    tl.tracks[v2].clips = vec![Clip::new(SourceId(1), 0, 10, 0)];
+    tl.validate().unwrap();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(v2, 5).unwrap();
+    (face, tl)
+}
+
+/// The two words are transport words, before `help` (still the last).
+#[test]
+fn striatrackreorder_words_are_verbs_before_help() {
+    let n = VERBS.len();
+    assert_eq!(&VERBS[n - 3..], &["track-up", "track-down", "help"]);
+}
+
+/// Rule: `track-up` on V2's clip is `Timeline::swap_track` by hand (V2 swaps with V1, A1 skipped) as ONE undo step; the
+/// selection follows its clip; the document is dirty; undo restores it and reads clean; `track-down` swaps it back.
+#[test]
+fn striatrackreorder_track_up_is_one_commit_and_the_selection_follows() {
+    let (mut face, tl) = striatrackreorder_face();
+    let clip = face.state.selected().unwrap();
+    assert!(face.verb("track-up"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.timeline, tl.swap_track(2, true).unwrap());
+    assert_eq!(face.state.selection, Some((0, 0)), "the selection moved with the track");
+    assert_eq!(face.state.set, vec![(0, 0)]);
+    assert_eq!(face.state.selected(), Some(clip));
+    assert_eq!(face.state.undo_depth(), 1, "ONE undo step");
+    assert!(face.dirty());
+    assert!(face.verb("track-down"));
+    assert_eq!(face.state.timeline, tl, "down swaps it back");
+    assert_eq!(face.state.selection, Some((2, 0)));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(face.verb("undo"));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(!face.dirty(), "undo back to the opened timeline reads clean");
+    println!("striatrackreorder: track-up V2 -> V1, selection {:?} follows, one undo step", Some((0, 0)));
+}
+
+/// Refusals by name on the message line: the top video track has no video track above; nothing selected; the timeline
+/// does not move and no undo step is pushed.
+#[test]
+fn striatrackreorder_refusals_name_the_reason() {
+    let (mut face, tl) = striatrackreorder_face();
+    face.state.select_at(0, 5).unwrap();
+    assert!(face.verb("track-up"));
+    assert_eq!(face.last_error.take(), Some(format!("track-up: {}", EditError::NoTrack)));
+    face.state.select_at(1, 5).unwrap();
+    assert!(face.verb("track-down"));
+    assert_eq!(face.last_error.take(), Some(format!("track-down: {}", EditError::NoTrack)), "A1 is the only audio track");
+    face.state.deselect();
+    assert!(face.verb("track-down"));
+    assert_eq!(face.last_error.take(), Some(format!("track-down: {}", EditError::NoClip)));
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.state.undo_depth(), 0);
+}

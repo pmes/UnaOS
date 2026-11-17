@@ -237,3 +237,91 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIATRACKREORDER (LEDGER SR877): swap a track with its same-kind neighbour (named tail block) ----
+
+/// Tracks of `kinds`, track k holding A[k, k + 10)@0 and B[20, 30)@10 (each track's clips its own); every video track a
+/// dissolve on its cut at 10, the LAST audio track an explicit audio crossfade there.
+fn striatrackreorder_tl(kinds: &[Kind]) -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 100);
+    let b = tl.add_source("B", 60);
+    for (k, &kind) in kinds.iter().enumerate() {
+        let t = tl.add_track(kind);
+        tl.tracks[t].clips = vec![Clip::new(a, k as i64, k as i64 + 10, 0), Clip::new(b, 20, 30, 10)];
+    }
+    for k in 0..kinds.len() {
+        if kinds[k] == Kind::Video {
+            tl = tl.add_transition(k, 10, timeline_core::TransitionKind::Dissolve, 2).unwrap();
+        }
+    }
+    if let Some(k) = kinds.iter().rposition(|&x| x == Kind::Audio) {
+        tl = tl.add_audio_xfade(k, 10, 2, timeline_core::Curve::Linear).unwrap();
+    }
+    tl.validate().unwrap();
+    tl
+}
+
+/// Rule: the track swaps with the NEAREST track of its kind (other-kind tracks skipped); its clips and transitions travel
+/// with it; every other track stays where it was.
+#[test]
+fn striatrackreorder_swaps_with_the_nearest_same_kind_track() {
+    let tl = striatrackreorder_tl(&[Kind::Video, Kind::Audio, Kind::Video, Kind::Audio]);
+    assert_eq!(tl.track_neighbour(2, true), Ok(0));
+    assert_eq!(tl.track_neighbour(0, false), Ok(2));
+    let up = tl.swap_track(2, true).unwrap();
+    assert_eq!((&up.tracks[0], &up.tracks[2]), (&tl.tracks[2], &tl.tracks[0]), "V2 and V1 swapped, transitions with them");
+    assert_eq!((&up.tracks[1], &up.tracks[3]), (&tl.tracks[1], &tl.tracks[3]), "the audio tracks unmoved");
+    assert_eq!(up.audio_xfades, tl.audio_xfades);
+    assert_eq!(tl.swap_track(0, false).unwrap(), up, "down from V1 is the same swap");
+    assert_eq!(up.swap_track(0, false).unwrap(), tl, "swapping back is the identity");
+}
+
+/// Rule: `audio_xfades[].track` follows its track and the list stays in `(track, at)` order.
+#[test]
+fn striatrackreorder_remaps_the_audio_crossfade_track() {
+    let tl = striatrackreorder_tl(&[Kind::Video, Kind::Audio, Kind::Video, Kind::Audio]);
+    assert_eq!(tl.audio_xfades.len(), 1);
+    assert_eq!(tl.audio_xfades[0].track, 3);
+    let up = tl.swap_track(3, true).unwrap();
+    assert_eq!(up.audio_xfades[0].track, 1, "the crossfade moved with A2");
+    assert_eq!((&up.tracks[1], &up.tracks[3]), (&tl.tracks[3], &tl.tracks[1]));
+    let mut two = tl.add_audio_xfade(1, 10, 3, timeline_core::Curve::EqualPower).unwrap();
+    two = two.swap_track(1, false).unwrap();
+    let order: Vec<(usize, i64)> = two.audio_xfades.iter().map(|x| (x.track, x.dur)).collect();
+    assert_eq!(order, vec![(1, 2), (3, 3)], "re-sorted by track after the swap");
+}
+
+/// Refusals by name: no same-kind track that way, no such track; the timeline is unchanged.
+#[test]
+fn striatrackreorder_refusals() {
+    let tl = striatrackreorder_tl(&[Kind::Video, Kind::Audio, Kind::Video, Kind::Audio]);
+    let before = tl.clone();
+    assert_eq!(tl.swap_track(0, true), Err(EditError::NoTrack), "V1 has no video track above");
+    assert_eq!(tl.swap_track(2, false), Err(EditError::NoTrack), "V2 has no video track below (A2 is skipped)");
+    assert_eq!(tl.swap_track(1, true), Err(EditError::NoTrack), "A1 has no audio track above (V1 is skipped)");
+    assert_eq!(tl.swap_track(3, false), Err(EditError::NoTrack));
+    assert_eq!(tl.swap_track(9, true), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
+
+/// Rule: a within-kind reorder survives the EDL (channels renumber by rank within a kind; the reader is canonical).
+#[test]
+fn striatrackreorder_edl_round_trip_keeps_the_order() {
+    use timeline_core::edl;
+    let tl = striatrackreorder_tl(&[Kind::Video, Kind::Video, Kind::Audio, Kind::Audio]);
+    for (track, up) in [(1, true), (3, true)] {
+        let moved = tl.swap_track(track, up).unwrap();
+        assert_ne!(moved, tl);
+        let text = edl::write(&moved, "REORDER").unwrap();
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back, moved, "track {track}");
+        assert_eq!(edl::write(&back, "REORDER").unwrap(), text);
+    }
+    // Interleaved in memory, the reader brings the tracks back canonical, each kind in its swapped order.
+    let mixed = striatrackreorder_tl(&[Kind::Video, Kind::Audio, Kind::Video, Kind::Audio]).swap_track(2, true).unwrap();
+    let back = edl::parse(&edl::write(&mixed, "MIXED").unwrap(), 25).unwrap();
+    let clips = |t: &Timeline, k: Kind| t.tracks.iter().filter(|x| x.kind == k).map(|x| x.clips.clone()).collect::<Vec<_>>();
+    assert_eq!(clips(&back, Kind::Video), clips(&mixed, Kind::Video));
+    assert_eq!(clips(&back, Kind::Audio), clips(&mixed, Kind::Audio));
+}
