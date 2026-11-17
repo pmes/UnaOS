@@ -107,7 +107,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish")), &args[2..]); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, &format!("one of {}", SHELLS.join("|")))), &args[2..]); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -485,19 +485,16 @@ fn completions(shell: &str) -> Option<String> {
     Some(match shell {
         "bash" => bash_script(&words().collect::<Vec<_>>().join(" ")),
         "zsh" => {
-            let mut s = format!("#compdef nle\n_arguments '1:verb:({})'", VERBS.join(" "));
-            for f in FLAGS {
-                s.push_str(&format!(" '*{f}{}'", zsh_value(f)));
-            }
-            s.push_str(&format!("{} '*:file:{{{}}}'\n", zsh_size(), zsh_file()));
+            let mut s = format!("#compdef nle\n{}_arguments '1:verb:({})' $flags", zsh_verbs(), VERBS.join(" ")); // NLECLICOMPLETIONSVERBFLAGS (SR1033): each verb's flag specs in `$flags` (zsh_verbs, file tail)
+            s.push_str(&format!("{}{} '*:file:{{{}}}'\n", zsh_shells(), zsh_size(), zsh_file()));
             s
         }
         "fish" => words()
             .map(|w| match w.strip_prefix("--") {
-                Some(l) => format!("complete -c nle -l {l}{}\n", fish_value(w)),
+                Some(l) => format!("complete -c nle{} -l {l}{}\n", fish_when(w), fish_value(w)),
                 None => format!("complete -c nle -n __fish_use_subcommand -a {w}\n"),
             })
-            .chain([fish_size(), fish_dirs()]).collect(),
+            .chain([fish_size(), fish_dirs(), fish_completions()]).collect(),
         _ => return None,
     })
 }
@@ -532,12 +529,12 @@ fn values_of(flag: &str) -> Option<String> {
 /// flags by default, a valued flag's words after it, the size policies at `nle size <edl> <reel> _`; filenames still when
 /// nothing matches (`-o default`).
 fn bash_script(words: &str) -> String {
-    let mut s = format!("_nle() {{\n    local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} w=\"{words}\"\n    case $prev in\n");
+    let mut s = format!("_nle() {{\n    local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} w=\"{words}\"\n{}    case $prev in\n", bash_verbs());
     for (f, v) in flag_values() {
         s.push_str(&format!("        {f}) w=\"{}\" ;;\n", v.join(" ")));
     }
     s.push_str(&bash_free()); s.push_str(&bash_paths()); s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
-    s.push_str(&bash_after()); s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
+    s.push_str(&bash_after()); s.push_str(&bash_shells()); s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
     s
 }
 
@@ -801,4 +798,80 @@ fn uninstall_completions(shell: &str, dir: Option<std::path::PathBuf>, force: bo
             Ok((path, false))
         }
     }
+}
+
+// ---- NLECLICOMPLETIONSVERBFLAGS (LEDGER SR1033): each verb's own flag words in every completion script (named tail block) ----
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): THE shells `nle completions <shell>` writes a script for ([`completions`]' three
+/// arms): main's dispatch refusal names them and every script offers them at `nle completions _`.
+const SHELLS: [&str; 3] = ["bash", "zsh", "fish"];
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): THE flag words each [`VERBS`] word takes, in VERBS order. schedule / render / export
+/// share ONE option loop, so each lists the FLAGS whose loop variable it READS (`load`'s `fps` / `srcs` for all three,
+/// render's `out`, export every one); `size` its one `--fps` literal; `--make-src` / `help` / `--help` none; `completions`
+/// its own [`COMPLETIONS_FLAGS`]. tests/cli.rs `cli_completions_verb_flags_scan` pins it to those reads both ways.
+const VERB_FLAGS: [(&str, &[&str]); 8] = [
+    ("schedule", &["--fps", "--src"]),
+    ("render", &["--fps", "--out", "--src"]),
+    ("export", &FLAGS),
+    ("size", &["--fps"]),
+    ("--make-src", &[]),
+    ("completions", &COMPLETIONS_FLAGS),
+    ("help", &[]),
+    ("--help", &[]),
+];
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): the verbs whose [`VERB_FLAGS`] list holds `flag`, in VERBS order.
+fn verbs_of(flag: &str) -> Vec<&'static str> {
+    VERB_FLAGS.iter().filter(|(_, f)| f.contains(&flag)).map(|(v, _)| *v).collect()
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): bash's verb case before `case $prev` — `f` the verb's flag words (a name of its own,
+/// so SR847 / SR1005's `) w="` arms stay the only ones), taken as `w` past the verb's own word (word 1 keeps the verbs).
+fn bash_verbs() -> String {
+    let mut s = String::from("    local f=\"\"\n    case ${COMP_WORDS[1]} in\n");
+    for (v, flags) in VERB_FLAGS {
+        s.push_str(&format!("        {v}) f=\"{}\" ;;\n", flags.join(" ")));
+    }
+    s.push_str("    esac\n    (( COMP_CWORD > 1 )) && w=$f\n");
+    s
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): bash's [`SHELLS`] at `nle completions _` (SR847's size-line shape).
+fn bash_shells() -> String {
+    format!("    [[ ${{COMP_WORDS[1]}} == completions && $COMP_CWORD == 2 ]] && w=\"{}\"\n", SHELLS.join(" "))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): zsh's `flags` array per verb (`case $words[2]`), each spec SR847 / SR1005 / SR1019's
+/// [`zsh_value`]; `_arguments` reads `$flags` (empty before a verb and for a verb with none).
+fn zsh_verbs() -> String {
+    let mut s = String::from("local -a flags\ncase $words[2] in\n");
+    for (v, flags) in VERB_FLAGS {
+        let specs: String = flags.iter().map(|f| format!(" '*{f}{}'", zsh_value(f))).collect();
+        s.push_str(&format!("    {v}) flags=({specs} ) ;;\n"));
+    }
+    s.push_str("esac\n");
+    s
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): zsh's second positional — [`SHELLS`] after `nle completions`, else SR1019's file
+/// action ([`zsh_size`]'s shape).
+fn zsh_shells() -> String {
+    format!(" '2:shell:{{if [[ $words[2] == completions ]]; then compadd -- {}; else {}; fi}}'", SHELLS.join(" "), zsh_file())
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): fish's condition on a flag's `-l` line — the verbs that take it ([`fish_dirs`]' shape).
+fn fish_when(flag: &str) -> String {
+    format!(" -n \"__fish_seen_subcommand_from {}\"", verbs_of(flag).join(" "))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): fish's [`SHELLS`] line at `nle completions _` ([`fish_size`]'s count test) and a line
+/// per non-`Dir` [`COMPLETIONS_FLAGS`] word (`--force`; the `Dir` words are [`fish_dirs`]' lines).
+fn fish_completions() -> String {
+    let mut s = format!("complete -c nle -n \"__fish_seen_subcommand_from completions; and test (count (commandline -opc)) -eq 2\" -xa \"{}\"\n", SHELLS.join(" "));
+    for (w, a) in COMPLETIONS_FLAGS.iter().zip(COMPLETIONS_ARG) {
+        if a != Arg::Dir {
+            s.push_str(&format!("complete -c nle{} -l {}\n", fish_when(w), w.trim_start_matches('-')));
+        }
+    }
+    s
 }
