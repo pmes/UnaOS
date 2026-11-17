@@ -634,12 +634,12 @@ fn mix_run(
 /// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
 /// `env[0]` at the run's first sample toward `env[1]` at its end edge).
 fn mix_into(acc: &mut [i64], pcm: &[f32], l: &Layer, n: i64, ch: usize) {
-    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); let pw = pan_mix(l.pan_cq8, ch); // STRIAPAN (SR861): the pan factor per channel (file tail); NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
+    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); let pw = [pan_mix(l.pan_cq8, ch), pan_mix(l.pan_to, ch)]; // STRIAPANAUTOMATION (SR9050): the factor at both edges (file tail); STRIAPAN (SR861): the pan factor per channel (file tail); NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
     let (e0, e1) = (l.env[0] as i64, l.env[1] as i64);
     for (j, frame) in pcm.chunks(ch).enumerate() {
         let e = gneiss_pal::dsp::audio::ramp::at(e0, e1, j as i64, n);
         for (c, &x) in frame.iter().enumerate() {
-            acc[j * ch + c] += (to_i16(x) * (g * pw[c.min(1)] >> 16) * e) >> 32;
+            acc[j * ch + c] += (to_i16(x) * (g * pan_frame(&pw, c.min(1), j as i64, n) >> 16) * e) >> 32;
         }
     }
 }
@@ -1011,7 +1011,7 @@ mod striapan_tests {
     use timeline_core::schedule::ENV_ONE;
 
     fn layer(pan_cq8: i8) -> Layer {
-        Layer { track: 0, src: SourceId(0), src_t: 0, seek: None, gain_cdb: 0, pan_cq8, env: [ENV_ONE, ENV_ONE] }
+        Layer { track: 0, src: SourceId(0), src_t: 0, seek: None, gain_cdb: 0, pan_cq8, pan_to: pan_cq8, env: [ENV_ONE, ENV_ONE] }
     }
 
     /// A stereo frame through `mix_into` at centre is the unpanned arithmetic exactly; hard left / right keep their own
@@ -1035,5 +1035,46 @@ mod striapan_tests {
         assert_eq!(mix(127, 1), plain, "a mono render ignores pan");
         assert_eq!(mix(-128, 1), plain);
         println!("striapan: stereo hard right {:?}, centre {:?}", mix(127, 2), mix(0, 2));
+    }
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the pan factor ramped between a run's two edges (named tail block) ----
+
+/// STRIAPANAUTOMATION: channel `c`'s pan factor at frame `j` of a run of `n` frames: the ONE law's factor at the run's first
+/// tick (`pw[0]`, from `Layer::pan_cq8`) ramped to the one at its end edge (`pw[1]`, `Layer::pan_to`) by the envelope's own
+/// interpolation (`ramp::at`). Equal edges (every unautomated layer) give `pw[0][c]` exactly: byte-identical.
+fn pan_frame(pw: &[[i64; 2]; 2], c: usize, j: i64, n: i64) -> i64 {
+    gneiss_pal::dsp::audio::ramp::at(pw[0][c], pw[1][c], j, n)
+}
+
+#[cfg(test)]
+mod striapanautomation_tests {
+    use super::*;
+    use timeline_core::SourceId;
+    use timeline_core::schedule::ENV_ONE;
+
+    /// A stereo layer panned from hard left at its first tick to hard right at its end edge ramps each channel's factor
+    /// linearly over the run; a layer with equal edges mixes exactly as the static pan.
+    #[test]
+    fn striapanautomation_mix_into_ramps_between_edges() {
+        let pcm = [0.5f32; 8];
+        let l = Layer { track: 0, src: SourceId(0), src_t: 0, seek: None, gain_cdb: 0, pan_cq8: -127, pan_to: 127, env: [ENV_ONE, ENV_ONE] };
+        let mut acc = vec![0i64; pcm.len()];
+        mix_into(&mut acc, &pcm, &l, 4, 2);
+        let (hi, x) = (92681i64, to_i16(0.5));
+        let f = |a: i64, b: i64, j: i64| (x * (65536 * (a + (b - a) * j / 4) >> 16) * 65536) >> 32;
+        let want: Vec<i64> = (0..4).flat_map(|j| [f(hi, 0, j), f(0, hi, j)]).collect();
+        assert_eq!(acc, want);
+        assert_eq!((acc[0], acc[1]), (f(hi, 0, 0), 0), "the first frame is the hard-left edge");
+        let flat = Layer { pan_cq8: 64, pan_to: 64, ..l };
+        let (mut a, mut b) = (vec![0i64; 8], vec![0i64; 8]);
+        mix_into(&mut a, &pcm, &flat, 4, 2);
+        let w = pan_mix(64, 2);
+        for (j, fr) in pcm.chunks(2).enumerate() {
+            for (c, &s) in fr.iter().enumerate() {
+                b[j * 2 + c] += (to_i16(s) * (65536 * w[c] >> 16) * 65536) >> 32;
+            }
+        }
+        assert_eq!(a, b, "equal edges are the static pan");
     }
 }

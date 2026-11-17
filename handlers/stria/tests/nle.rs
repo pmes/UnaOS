@@ -3791,3 +3791,29 @@ fn striapannext_note_reads_after_last_error() {
     assert_eq!((face.note.as_deref(), face.last_error.as_deref()), (Some("pan: R 100"), None), "the release reads the pan");
     println!("striapannext: note pan: R 13 kept by a move, cleared by Home; grip drag -> R 100");
 }
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the pan point words through the face (named tail block) ----
+
+/// `pan-key 1` / `pan-unkey` are transport words (before `help`) that reach timeline_core's one verb: with nothing selected
+/// the refusal is `last_error`; on the selected audio clip each sets / clears the point at the playhead in one undo step.
+#[test]
+fn striapanautomation_face_words_set_and_clear_a_point() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |f: &mut Face, v: &str| f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: v.into() });
+    assert!(VERBS.contains(&"pan-key") && VERBS.contains(&"pan-unkey"));
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert!(input(&mut face, "pan-key 1"));
+    assert!(face.last_error.take().is_some(), "nothing selected: refused");
+    face.state.select(1, 1).unwrap();
+    let c = face.state.selected().unwrap();
+    face.state.seek(c.at);
+    let d0 = face.state.undo_depth();
+    assert!(input(&mut face, "pan-key 1"));
+    assert_eq!(face.last_error.take(), None);
+    let k = face.state.selected().unwrap().pan_keys;
+    assert_eq!((k.points().to_vec(), face.state.undo_depth()), (vec![(c.src_in, 127i8)], d0 + 1));
+    assert!(input(&mut face, "pan-unkey"));
+    assert_eq!((face.state.selected().unwrap().pan_keys.n, face.state.undo_depth()), (0, d0 + 2));
+    println!("striapanautomation face: pan-key 1 then pan-unkey on audio clip (1, 1)");
+}

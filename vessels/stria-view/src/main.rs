@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "pan"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "pan" | "pan-key"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -518,6 +518,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("pan-", "Pan L"), button("pan", "Pan C"), button("pan+", "Pan R"), // STRIAPANFACE (SR897): step / centre the selected clip's pan
+        button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -963,5 +964,29 @@ mod striapannext_tests {
         face.on(&SMessage::BrowserKey("Home".into()));
         assert_eq!(note_json(&face), "");
         println!("striapannext witness: pan+ -> note pan: R 13");
+    }
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the pan point words on the witness (named tail block) ----
+#[cfg(test)]
+mod striapanautomation_tests {
+    use super::*;
+
+    /// `at:12:1,pan-key:-0.5` sets a pan point on the selected audio clip at the playhead (-64, no error line); `pan-unkey`
+    /// clears it; each is one undo step.
+    #[test]
+    fn striapanautomation_do_tokens_set_and_clear_a_point() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let lines = drive(&mut face, "at:12:1,pan-key:-0.5");
+        assert!(lines.is_empty(), "{lines:?}");
+        let c = face.state.selected().expect("a clip is selected");
+        assert_eq!((c.pan_keys.n, c.pan_at(12)), (1, -64));
+        let depth = face.state.undo_depth();
+        let lines = drive(&mut face, "pan-unkey");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(face.state.selected().map(|c| c.pan_keys.n), Some(0));
+        assert_eq!(face.state.undo_depth(), depth + 1);
+        println!("striapanautomation witness: pan-key -0.5 then pan-unkey");
     }
 }

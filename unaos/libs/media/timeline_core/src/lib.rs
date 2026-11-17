@@ -100,6 +100,7 @@ pub struct Clip {
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
     pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan, -128..=127 (0 = centre; -127 / -128 hard left, 127 hard right; schedule::pan_q16 is the law)
+    pub pan_keys: PanKeys, // STRIAPANAUTOMATION (LEDGER SR9050): pan points on source ticks (empty = the static pan_cq8; Clip::pan_at reads them)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -108,7 +109,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, pan_cq8: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, pan_cq8: 0, pan_keys: PanKeys::EMPTY }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -377,6 +378,8 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    /// STRIAPANAUTOMATION (SR9050): a clip's pan points are full ([`PAN_KEYS_MAX`]), or there is no point to clear.
+    PanKey,
 }
 
 impl core::fmt::Display for EditError {
@@ -397,6 +400,7 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::PanKey => "pan points full, or no pan point there",
         })
     }
 }
@@ -1540,6 +1544,107 @@ impl Timeline {
     pub fn set_pan(&self, track: usize, idx: usize, pan_cq8: i8) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         clip_mut(&mut tl, track, idx)?.pan_cq8 = pan_cq8;
+        tl.validate()?;
+        Ok(tl)
+    }
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): per-clip pan points, linear between (named tail block) ----
+// A clip's [`Clip::pan_keys`] are up to [`PAN_KEYS_MAX`] points `(source tick, pan_cq8)` sorted by tick. On SOURCE ticks so a
+// trim, slip or split (`..c` gives both halves every point) keeps the curve on the material. [`Clip::pan_at`] is THE pan
+// reading: with points it is the curve (held flat before the first and after the last, linear between, rounded) and it
+// overrides the static [`Clip::pan_cq8`]; without points it IS `pan_cq8`. `schedule::audio_runs` reads it at each run's two
+// edges ([`schedule::Layer::pan_cq8`] / `pan_to`) and breaks a run wherever an automated clip's pan changes.
+
+/// STRIAPANAUTOMATION: the most pan points one clip carries.
+pub const PAN_KEYS_MAX: usize = 8;
+
+/// STRIAPANAUTOMATION: a clip's pan points (a fixed-capacity Copy value: `Clip` is Copy). Slots past `n` stay zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanKeys {
+    pub n: u8,
+    pub pts: [(i64, i8); PAN_KEYS_MAX],
+}
+
+impl PanKeys {
+    /// No points.
+    pub const EMPTY: PanKeys = PanKeys { n: 0, pts: [(0, 0); PAN_KEYS_MAX] };
+
+    /// The points, sorted by source tick.
+    pub fn points(&self) -> &[(i64, i8)] {
+        &self.pts[..self.n as usize]
+    }
+
+    /// The pan at source tick `s` (`None` with no points): held before the first / after the last, linear between, rounded
+    /// half away from zero.
+    pub fn at(&self, s: i64) -> Option<i8> {
+        let p = self.points();
+        let (first, last) = (p.first()?, p.last()?);
+        if s <= first.0 {
+            return Some(first.1);
+        }
+        if s >= last.0 {
+            return Some(last.1);
+        }
+        let i = p.iter().position(|q| q.0 > s)?;
+        let ((s0, p0), (s1, p1)) = (p[i - 1], p[i]);
+        let (num, den) = ((p1 as i64 - p0 as i64) * (s - s0), s1 - s0);
+        let r = (2 * num + num.signum() * den) / (2 * den);
+        Some((p0 as i64 + r).clamp(-128, 127) as i8)
+    }
+
+    /// The points with `(s, pan)` set (replacing a point at `s`, else inserted in order); `None` when full.
+    pub fn with(&self, s: i64, pan: i8) -> Option<PanKeys> {
+        let mut k = *self;
+        let n = k.n as usize;
+        let same = k.points().iter().position(|q| q.0 == s);
+        if let Some(i) = same {
+            k.pts[i].1 = pan;
+            return Some(k);
+        }
+        if n >= PAN_KEYS_MAX {
+            return None;
+        }
+        let i = k.points().iter().position(|q| q.0 > s).unwrap_or(n);
+        k.pts.copy_within(i..n, i + 1);
+        k.pts[i] = (s, pan);
+        k.n += 1;
+        Some(k)
+    }
+
+    /// The points without the one at `s`; `None` when there is no point at `s`.
+    pub fn without(&self, s: i64) -> Option<PanKeys> {
+        let mut k = *self;
+        let n = k.n as usize;
+        let i = k.points().iter().position(|q| q.0 == s)?;
+        k.pts.copy_within(i + 1..n, i);
+        k.pts[n - 1] = (0, 0);
+        k.n -= 1;
+        Some(k)
+    }
+}
+
+impl Clip {
+    /// STRIAPANAUTOMATION: THE pan reading at timeline tick `t` (an edge may lie past the clip: the curve holds there).
+    pub fn pan_at(&self, t: i64) -> i8 {
+        self.pan_keys.at(self.src_in + (t - self.at)).unwrap_or(self.pan_cq8)
+    }
+}
+
+impl Timeline {
+    /// STRIAPANAUTOMATION: set the pan point at source tick `s` of a clip (`EditError::PanKey` when its points are full).
+    pub fn set_pan_key(&self, track: usize, idx: usize, s: i64, pan: i8) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let c = clip_mut(&mut tl, track, idx)?;
+        c.pan_keys = c.pan_keys.with(s, pan).ok_or(EditError::PanKey)?;
+        tl.validate()?;
+        Ok(tl)
+    }
+    /// STRIAPANAUTOMATION: clear the pan point at source tick `s` of a clip (`EditError::PanKey` when there is none).
+    pub fn clear_pan_key(&self, track: usize, idx: usize, s: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let c = clip_mut(&mut tl, track, idx)?;
+        c.pan_keys = c.pan_keys.without(s).ok_or(EditError::PanKey)?;
         tl.validate()?;
         Ok(tl)
     }

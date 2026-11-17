@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } // STRIAPAN (SR861): `pan <x>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.pankey_verb(v) { return Some(r); } // STRIAPANAUTOMATION (SR9050): `pan-key [<x>]` / `pan-unkey` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -746,4 +746,54 @@ impl EditorState {
         }
         Ok(())
     }
+}
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): the pan points at the playhead (named tail block) ----
+// `pan-key` sets a pan point on the selected clip at the playhead holding the clip's pan there (`Clip::pan_at`), `pan-key <x>`
+// sets it to `round(x * 127)` (SR861's `pan_words` parses the decimal, so there is one rule), `pan-unkey` clears the point
+// at the playhead. The point's tick is the SOURCE tick under the playhead. Each rides THE one `commit` (one undo step; a
+// point already holding the value commits nothing). Refused by name: no clip selected, or the playhead outside the selected
+// clip's `[at, end)`, `EditError::NoClip`; the points full, or no point to clear, `EditError::PanKey`. A malformed word is
+// not this verb (`None`).
+impl EditorState {
+    /// The `pan-key [<x>]` / `pan-unkey` words of [`EditorState::verb`]; `None` for any other word.
+    fn pankey_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let set = pankey_words(v)?;
+        Some(self.pan_key_at_playhead(set))
+    }
+    /// The pan point at the playhead on the selected clip: `Some(None)` sets it to the clip's pan there, `Some(Some(p))` to
+    /// `p`, `None` clears it (one commit).
+    pub fn pan_key_at_playhead(&mut self, set: Option<Option<i8>>) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if self.playhead < c.at || self.playhead >= c.end() {
+            return Err(EditError::NoClip);
+        }
+        let s = c.src_in + (self.playhead - c.at);
+        let tl = match set {
+            Some(p) => {
+                let p = p.unwrap_or(c.pan_at(self.playhead));
+                if c.pan_keys.points().iter().any(|&q| q == (s, p)) {
+                    return Ok(());
+                }
+                self.timeline.set_pan_key(track, idx, s, p)?
+            }
+            None => self.timeline.clear_pan_key(track, idx, s)?,
+        };
+        self.commit(tl);
+        Ok(())
+    }
+}
+
+/// `pan-key` -> `Some(Some(None))`, `pan-key <x>` (x as `pan <x>` takes it) -> `Some(Some(Some(p)))`, `pan-unkey` ->
+/// `Some(None)`; any other shape is not this verb.
+fn pankey_words(v: &str) -> Option<Option<Option<i8>>> {
+    if v == "pan-unkey" {
+        return Some(None);
+    }
+    let rest = v.strip_prefix("pan-key")?;
+    if rest.is_empty() {
+        return Some(Some(None));
+    }
+    rest.starts_with(' ').then(|| pan_words(&alloc::format!("pan{rest}")))?.map(|p| Some(Some(p)))
 }

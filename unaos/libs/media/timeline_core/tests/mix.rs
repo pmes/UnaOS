@@ -579,3 +579,129 @@ fn striapannext_pan_drag_on_the_grip() {
     assert_eq!(Drag::begin_with(&mut vs, vl, x, vy, false, false, false).map(|d| d.kind), Some(DragKind::Move), "no grip on a video clip");
     println!("striapannext: grip drag +{} px -> pan 64, far left -> -127", half / 2.0);
 }
+
+// ---- STRIAPANAUTOMATION (LEDGER SR9050): pan points on source ticks, the run split, the words and the EDL line (named tail block) ----
+use timeline_core::{PAN_KEYS_MAX, PanKeys};
+
+/// `PanKeys`: points stay sorted, a point at the same tick is replaced, the ninth is refused, `without` clears one and zeroes
+/// the freed slot; `at` holds flat outside the points and is linear and rounded half away from zero between them.
+#[test]
+fn striapanautomation_pan_keys_at_with_without() {
+    assert_eq!(PanKeys::EMPTY.at(5), None);
+    let k = PanKeys::EMPTY.with(3, 10).unwrap().with(0, 0).unwrap();
+    assert_eq!(k.points().to_vec(), vec![(0i64, 0i8), (3, 10)]);
+    assert_eq!([k.at(-4), k.at(0), k.at(1), k.at(2), k.at(3), k.at(99)], [Some(0), Some(0), Some(3), Some(7), Some(10), Some(10)]);
+    let m = PanKeys::EMPTY.with(0, 0).unwrap().with(3, -10).unwrap();
+    assert_eq!((m.at(1), m.at(2)), (Some(-3), Some(-7)));
+    let h = PanKeys::EMPTY.with(0, 0).unwrap().with(2, 1).unwrap();
+    assert_eq!(h.at(1), Some(1), "half rounds away from zero");
+    let h = PanKeys::EMPTY.with(0, 0).unwrap().with(2, -1).unwrap();
+    assert_eq!(h.at(1), Some(-1));
+    assert_eq!(k.with(3, -5).unwrap().points().to_vec(), vec![(0i64, 0i8), (3, -5)], "the same tick is replaced");
+    let mut full = PanKeys::EMPTY;
+    for i in 0..PAN_KEYS_MAX as i64 {
+        full = full.with(10 - i, i as i8).unwrap();
+    }
+    assert_eq!(full.n as usize, PAN_KEYS_MAX);
+    assert!(full.points().windows(2).all(|w| w[0].0 < w[1].0));
+    assert_eq!(full.with(99, 1), None, "full");
+    assert_eq!(full.with(10, 1).map(|f| f.n as usize), Some(PAN_KEYS_MAX), "a replace fits when full");
+    assert_eq!(k.without(3).unwrap(), PanKeys::EMPTY.with(0, 0).unwrap(), "the freed slot is zero again");
+    assert_eq!(k.without(1), None);
+    println!("striapanautomation keys: {:?} at 1,2 = {:?},{:?}", k.points(), k.at(1), k.at(2));
+}
+
+/// `audio_runs`: a clip with points splits its runs wherever its pan changes and each layer carries the pan at both edges;
+/// a flat stretch is one run; no points anywhere gives the unautomated runs with `pan_to == pan_cq8`; a split carries the
+/// curve to both halves.
+#[test]
+fn striapanautomation_runs_split_at_the_pan_and_carry_both_edges() {
+    let plain = audio_runs(&two_tracks(), 0..20, &Gop).unwrap();
+    assert!(plain.iter().flat_map(|r| r.layers.iter()).all(|l| l.pan_to == l.pan_cq8));
+    let tl = two_tracks().set_pan_key(0, 0, 0, -127).unwrap().set_pan_key(0, 0, 10, 127).unwrap();
+    let c = tl.tracks[0].clips[0];
+    assert_eq!([c.pan_at(0), c.pan_at(3), c.pan_at(5), c.pan_at(10), c.pan_at(19)], [-127, -51, 0, 127, 127]);
+    let runs = audio_runs(&tl, 0..20, &Gop).unwrap();
+    for r in &runs {
+        let l = r.layers.iter().find(|l| l.track == 0).unwrap();
+        assert_eq!((l.pan_cq8, l.pan_to), (c.pan_at(r.out_t), c.pan_at(r.out_t + r.len)), "run at {}", r.out_t);
+        if r.out_t < 10 {
+            assert_eq!(r.len, 1, "the ramp breaks every tick its pan changes");
+        }
+        let b = r.layers.iter().find(|l| l.track == 1);
+        assert!(b.is_none_or(|b| (b.pan_cq8, b.pan_to) == (0, 0)), "a clip without points keeps its static pan");
+    }
+    assert_eq!(runs.iter().find(|r| r.out_t == 10).map(|r| r.len), Some(5), "flat 10..15 is one run");
+    let s = tl.split(0, 4).unwrap();
+    for t in 0..20 {
+        let h = &s.tracks[0].clips[if t < 4 { 0 } else { 1 }];
+        assert_eq!(h.pan_at(t), c.pan_at(t), "tick {t}");
+    }
+    assert_eq!(tl.set_pan_key(0, 3, 0, 1).map(|_| ()), Err(EditError::NoClip));
+    assert_eq!(tl.clear_pan_key(0, 0, 4).map(|_| ()), Err(EditError::PanKey));
+    println!("striapanautomation runs: {} (unautomated {})", runs.len(), plain.len());
+}
+
+/// `pan-key` / `pan-key <x>` / `pan-unkey`: a point at the playhead's source tick, one undo step each, the same value commits
+/// nothing; refused `NoClip` with nothing selected or the playhead off the clip, `PanKey` full or nothing to clear; malformed
+/// words are not the verb.
+#[test]
+fn striapanautomation_words_one_undo_step_and_refusals() {
+    let mut st = EditorState::new(two_tracks());
+    assert_eq!(st.verb("pan-key"), Some(Err(EditError::NoClip)));
+    st.select(1, 0).unwrap();
+    st.seek(2);
+    assert_eq!(st.verb("pan-key"), Some(Err(EditError::NoClip)), "the playhead is off the clip");
+    st.seek(7);
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("pan-key"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(2i64, 0i8)], "src_in 0 + (7 - at 5)");
+    assert_eq!(st.undo_depth(), d0 + 1);
+    assert_eq!(st.verb("pan-key"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1, "the same point commits nothing");
+    assert_eq!(st.verb("pan-key -0.5"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(2i64, -64i8)]);
+    assert_eq!(st.verb("pan-unkey"), Some(Ok(())));
+    assert_eq!(st.timeline, two_tracks());
+    assert_eq!(st.verb("pan-unkey"), Some(Err(EditError::PanKey)));
+    assert!(st.undo());
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(2i64, -64i8)], "one undo step per word");
+    for t in 5..5 + PAN_KEYS_MAX as i64 {
+        st.seek(t);
+        assert_eq!(st.verb("pan-key 1"), Some(Ok(())));
+    }
+    st.seek(14);
+    assert_eq!(st.verb("pan-key 1"), Some(Err(EditError::PanKey)), "full");
+    for bad in ["pan-key 2", "pan-key x", "pan-keyx", "pan-key 0.5 1", "pan-unkey 1", "pan-keys"] {
+        assert_eq!(st.verb(bad), None, "{bad}");
+    }
+}
+
+/// The EDL: `* UNA PANKEYS <tc>=<cq8> ...` under an automated event only, after `* UNA PAN`, read back exactly; refused as
+/// `Syntax` with no event above, a token not `<tc>=<i8>`, ticks not rising, or more than eight points.
+#[test]
+fn striapanautomation_edl_round_trip_and_refusals() {
+    assert!(!edl::write(&two_tracks(), "MIX").unwrap().contains("PANKEYS"));
+    let tl = two_tracks().set_pan(1, 0, 20).unwrap().set_pan_key(1, 0, 0, -127).unwrap().set_pan_key(1, 0, 8, 127).unwrap();
+    let text = edl::write(&tl, "MIX").unwrap();
+    assert!(text.contains("* UNA PAN 20\n* UNA PANKEYS 00:00:00:00=-127 00:00:00:08=127\n"), "{text}");
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!(back.tracks[1].clips[0], tl.tracks[1].clips[0]);
+    assert_eq!(edl::write(&back, "MIX").unwrap(), text);
+    let nine: Vec<String> = (0..9).map(|i| format!("00:00:00:{i:02}=1")).collect();
+    let nine = format!("* UNA PANKEYS {}", nine.join(" "));
+    for (bad, with) in [
+        ("* UNA PANKEYS 00:00:00:01", true),
+        ("* UNA PANKEYS 00:00:00:02=1 00:00:00:01=2", true),
+        ("* UNA PANKEYS 00:00:00:01=1 00:00:00:01=2", true),
+        ("* UNA PANKEYS 00:00:00:01=128", true),
+        (nine.as_str(), true),
+        ("* UNA PANKEYS 00:00:00:01=5", false),
+    ] {
+        let mut lines: Vec<&str> = text.lines().collect();
+        let at = if with { lines.iter().position(|l| l.starts_with("001")).unwrap() + 1 } else { lines.iter().position(|l| l.starts_with("001")).unwrap() };
+        lines.insert(at, bad);
+        let t = lines.join("\n");
+        assert_eq!(edl::parse(&t, 25).map(|_| ()), Err(edl::EdlError::Syntax { line: at + 1 }), "{bad}");
+    }
+}
