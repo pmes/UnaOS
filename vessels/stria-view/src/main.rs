@@ -27,6 +27,7 @@
 //! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
 //! STRIATRANSITIONLENGTH (SR870): `dur:<n>` gives the selected transition exactly n ticks (timeline_core's `dur <n>` word).
 //! STRIATRANSITIONMORE (SR956): `dur:HH:MM:SS:FF` gives it a timecode count (the EDL's one parser, at the timeline's fps).
+//! STRIATRANSITIONNEXT (SR991): `dur:SS:FF` / `dur:MM:SS:FF` are the short forms (two-digit fields, padded to the four).
 //! NLE4C (SR301): `meters` feeds the face's meters the tick at the playhead (what one played tick feeds); the JSON line
 //! then ends `"meters":[{"track":<n>,"peak":<dBFS>,"rms":<dBFS>},...,{"track":"master",...}]`.
 //! SURFACEID (SR332): `--two-surfaces` puts a second Surface ([`AUX_SURFACE`]) above the editor's in the tree, so the
@@ -202,6 +203,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
+        ["dur", t @ ..] if (2..=3).contains(&t.len()) => SMessage::Input { target: SURFACE.into(), text: format!("dur {}", t.join(":")) }, // STRIATRANSITIONNEXT (SR991): `dur:00:07`, `dur:00:00:07`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
@@ -2978,5 +2980,31 @@ mod striaxfademore_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(note_json(&face), r#","note":"xfade: 10 equal""#);
         println!("striaxfademore witness: {}", note_json(&face));
+    }
+}
+
+// ---- STRIATRANSITIONNEXT (LEDGER SR991): the `dur:SS:FF` / `dur:MM:SS:FF` short tokens (named tail block) ----
+
+#[cfg(test)]
+mod striatransitionnext_tests {
+    use super::*;
+
+    /// M3: `transition:0:0,dur:00:07` gives the selected dissolve 7 ticks at 25 fps (one undo step) and the face note
+    /// names it; `dur:00:00:08` gives 8; a one-digit field (`dur:0:9`) is refused by name, the state left.
+    #[test]
+    fn striatransitionnext_witness_dur_short_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "transition:0:0,dur:00:07");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(transition_json(&face).contains(r#""at":10,"dur":7,"#), "{}", transition_json(&face));
+        assert_eq!(face.state.undo_depth(), 1);
+        assert_eq!(face.note.as_deref(), Some("transition: 00:00:00:07 (7 ticks)"));
+        assert!(drive(&mut face, "dur:00:00:08").is_empty());
+        assert!(transition_json(&face).contains(r#""at":10,"dur":8,"#), "{}", transition_json(&face));
+        let before = face.state.clone();
+        assert_eq!(drive(&mut face, "dur:0:9"), vec![format!("dur 0:9: {}", timeline_core::EditError::Transition)]);
+        assert_eq!(face.state, before);
     }
 }
