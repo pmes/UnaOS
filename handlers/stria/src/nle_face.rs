@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 36] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "marker colour", "marker range", "marker marks", "help"]; // STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail)
+pub const VERBS: [&str; 41] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "marker colour", "marker range", "marker marks", "export marker", "export markers", "export-skip", "export-clear", "export-list", "help"]; // STRIAEXPORTRANGE (SR9075): `export marker` / `export markers` queue the marker ranges as export-queue entries (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -195,13 +195,14 @@ pub struct Face {
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     pub note: Option<String>, // STRIAMARKERJUMPKEYSNEXT (SR984): a success line on the message row, read after last_error, cleared by the next acting input (file tail)
+    export_queue: std::collections::VecDeque<ExportRequest>, // STRIAEXPORTQUEUE (SR881): export requests waiting behind the running job, started in order from export_tick (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None, export_queue: std::collections::VecDeque::new() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -236,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } // STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_marker_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } // STRIAEXPORTRANGE (SR9075): `export marker(s)` before `export` takes the words (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -396,6 +397,8 @@ pub const KEYS: &[(&str, &str)] = &[
     (";", "marker-"),
     ("'", "marker+"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
+    ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word
+    ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -2113,29 +2116,12 @@ impl Face {
             return None;
         }
         let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, audio) = export_audio_word(args);
-        if let Some((d, t)) = self.export_progress() {
+        if let Some((d, t)) = self.export_progress().filter(|_| self.export_queue.len() >= EXPORT_QUEUE_MAX) { // STRIAEXPORTQUEUE (SR881): busy = running and the queue full
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
         }
-        let (dir, fmt) = match args.as_slice() {
-            [] => (None, "h264"),
-            [f] if VIDEO_NAMES.contains(f) => (None, *f),
-            [d] => (Some(*d), "h264"),
-            [d, f] => (Some(*d), *f),
-            _ => {
-                self.last_error = Some(format!("export: usage: {}", export_usage())); // NLE5DEXPORTMESSAGEAUDIO (SR756): the one usage
-                return Some(true);
-            }
-        };
-        let dir = match (dir, &self.doc_path) {
-            (Some(d), _) => std::path::PathBuf::from(d),
-            (None, Some(p)) => p.with_file_name(format!("{}-export", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
-            (None, None) => {
-                self.last_error = Some("export: no directory (no document path)".into());
-                return Some(true);
-            }
-        };
-        if let Err(e) = audio.and_then(|a| self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }, a)) {
+        let (dir, fmt) = match self.export_args(&args) { Ok(x) => x, Err(e) => { self.last_error = Some(format!("export: {e}")); return Some(true); } }; // STRIAEXPORTRANGE (SR9075): the dir / format grammar lifted once (file tail)
+        if let Err(e) = audio.and_then(|a| self.export_or_queue(&dir, &fmt, if all { None } else { self.export_range() }, a)) { // STRIAEXPORTQUEUE (SR881): a running job queues the request (file tail)
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
@@ -2206,7 +2192,7 @@ impl Face {
     pub fn export_tick(&mut self) -> bool {
         let Some(j) = self.export.as_mut() else { return false };
         if j.handle.as_ref().is_some_and(|h| h.is_finished()) {
-            self.finish_export();
+            self.finish_export(); self.start_queued(); // STRIAEXPORTQUEUE (SR881): the next queued request starts as this one is reported (file tail)
             return true;
         }
         eta_sample(j, std::time::Instant::now()); let d = fnv1a(job_line(j).as_bytes());
@@ -2217,7 +2203,7 @@ impl Face {
     /// Esc's export arm: ask the running job to stop (its next frame refuses); false when none runs.
     pub fn cancel_export(&mut self) -> bool {
         let Some(j) = self.export.as_ref() else { return false };
-        j.cancel.store(true, Relaxed);
+        j.cancel.store(true, Relaxed); self.drop_queue_on_cancel(); // STRIAEXPORTQUEUE (SR881): Esc drops the waiting requests too; STRIAEXPORTQUEUEMORE (SR971): and names the dropped count (file tail)
         true
     }
     /// Block until the running export ends and report it as [`Face::export_tick`] would; false when none runs.
@@ -2369,7 +2355,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.reel_line()) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2617,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("cut-", "go to the previous clip edge"),
     ("cut+", "go to the next clip edge"),
     ("help", "show / hide this help"),
+    ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
 const HELP_PAD: f32 = 4.0;
@@ -3286,6 +3273,341 @@ impl Face {
             (Err(EditError::Marker), Some((name, _, 0))) => self.last_error = Some(format!("marker marks: {name} is a point marker (no range)")),
             (r, _) => self.last_error = Some(format!("marker marks: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
         }
+        Some(true)
+    }
+}
+
+// ---- STRIAEXPORTQUEUE (LEDGER SR881): queued export requests run in order from export_tick (named tail block) ----
+// A second `export` while one runs no longer refuses `busy`: `export_verb`'s parsed request (dir, format word, range, audio)
+// waits in `Face.export_queue` (face thread only: the export thread never sees it, no lock) and `export_tick` starts the
+// next one through the unchanged `start_export` the moment the running job is reported, so `exporting()` never drops
+// between jobs and serve's clock needs no new condition. The running job (`ExportJob`) and its line (`job_line`) are
+// unchanged. `export: busy (d/t)` now means running AND `EXPORT_QUEUE_MAX` waiting. Esc (`cancel_export`) cancels the
+// running job and drops the queue; `Face::export_skip` cancels the running job only. A queued job exports the timeline
+// as it stands when it STARTS (`start_export`'s clone); its range is the one the verb resolved. SR871 (presets) joins as
+// ONE more `ExportRequest` field `opts: H264Opts`, set from `export_or_queue`'s new last parameter and passed as
+// `start_export`'s last argument in both calls below. Owed: NLE5D-EXPORT-QUEUE-SNAPSHOT, NLE5D-EXPORT-QUEUE-SKIP,
+// NLE5D-EXPORT-QUEUE-WITNESS, NLE5D-EXPORT-QUEUE-LINE.
+
+/// STRIAEXPORTQUEUE (SR881): the most export requests that wait behind a running job; one more is refused `export: busy (d/t)`.
+pub const EXPORT_QUEUE_MAX: usize = 16;
+
+/// STRIAEXPORTQUEUE (SR881): one parsed `export` request waiting its turn: exactly [`Face::start_export`]'s arguments
+/// but the test hold (`pause_at`), as `export_verb` resolved them (the range captured at the verb, `--all` as `None`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportRequest {
+    dir: std::path::PathBuf,
+    fmt: String,
+    range: Option<std::ops::Range<i64>>,
+    audio: AudioOut,
+    timeline: Timeline, // STRIAEXPORTQUEUESKIP (SR914): the timeline as it stood when queued, swapped in around start_export (file tail)
+}
+
+impl Face {
+    /// The verb's start: with no job running, [`Face::start_export`] as before; with one running, the request is checked
+    /// at once (the format word and [`Face::range_check`], refused by the same words) and queued, the message line
+    /// `export: queued (<n> waiting)`.
+    fn export_or_queue(&mut self, dir: &std::path::Path, fmt: &str, range: Option<std::ops::Range<i64>>, audio: AudioOut) -> Result<(), String> {
+        if self.export.is_none() {
+            return self.start_export(dir, fmt, None, range, audio);
+        }
+        if !VIDEO_NAMES.contains(&fmt) {
+            return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
+        }
+        self.range_check(&range)?;
+        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio, timeline: self.state.timeline.clone() }); // STRIAEXPORTQUEUESKIP (SR914): the queued snapshot
+        self.last_error = Some(format!("export: queued ({} waiting)", self.export_queue.len()));
+        Ok(())
+    }
+    /// Start the next queued request through [`Face::start_export`] (no job runs: called after `finish_export`). A request
+    /// that no longer starts (its directory; its range and timeline are the snapshot taken when queued, SR914) is named after the finished job's line
+    /// (`; queued <dir>: <e>`) and the next one is tried, until one starts or the queue is empty.
+    fn start_queued(&mut self) {
+        while self.export.is_none() {
+            let Some(mut r) = self.export_queue.pop_front() else { return }; // STRIAEXPORTQUEUESKIP (SR914): mutable for the timeline swap
+            if let Err(e) = self.start_request(&mut r) { // STRIAEXPORTQUEUESKIP (SR914): the request's own timeline (file tail)
+                let prev = self.last_error.take().map(|l| format!("{l}; ")).unwrap_or_else(|| "export: ".to_string());
+                self.last_error = Some(format!("{prev}queued {}: {e}", r.dir.display()));
+            }
+        }
+    }
+    /// The test seam over the whole queue: [`Face::wait_export`] the running job, start the next queued request, until
+    /// none is left; the number of jobs reported (each one's line on `last_error` in turn, the last one standing).
+    pub fn wait_exports(&mut self) -> usize {
+        let mut n = 0;
+        while self.wait_export() {
+            n += 1;
+            self.start_queued();
+        }
+        n
+    }
+    /// The number of export requests waiting behind the running job.
+    pub fn export_queued(&self) -> usize {
+        self.export_queue.len()
+    }
+    /// Cancel the running export only (its next frame refuses, as Esc's [`Face::cancel_export`]), the queue kept: the
+    /// next request starts when this one is reported. False when none runs. (NLE5D-EXPORT-QUEUE-SKIP owes its key / word.)
+    pub fn export_skip(&mut self) -> bool {
+        let Some(j) = self.export.as_ref() else { return false };
+        j.cancel.store(true, Relaxed);
+        true
+    }
+}
+
+// ---- STRIAEXPORTQUEUESKIP (LEDGER SR914): the queue's skip / clear words and the queued-timeline snapshot (named tail block) ----
+// `export-skip` cancels the running export through SR881's `Face::export_skip` (the next queued request starts when
+// `export_tick` reports the cancel); `export-clear` drops the waiting requests and leaves the running job. Both are view
+// words: no `commit`, no undo step, no dirty document. Each queued request carries the timeline as it stood when queued
+// (`ExportRequest.timeline`); `start_request` swaps it into `self.state.timeline` around the unchanged `start_export`
+// (face thread only, nothing paints in between), so its range check, total, span and the thread's clone all read the
+// snapshot. Owed: NLE5D-EXPORT-QUEUE-KEY (a key for export-skip; Esc stays cancel-all).
+
+impl Face {
+    /// Start a queued request over its own snapshot timeline through the unchanged [`Face::start_export`]; the live
+    /// timeline is back in place before this returns, whatever the outcome.
+    fn start_request(&mut self, r: &mut ExportRequest) -> Result<(), String> {
+        std::mem::swap(&mut self.state.timeline, &mut r.timeline);
+        let res = self.start_export(&r.dir, &r.fmt, None, r.range.clone(), r.audio);
+        std::mem::swap(&mut self.state.timeline, &mut r.timeline);
+        res
+    }
+    /// The queue's words: `export-skip` (`export: skipping (<n> waiting)`, or `export-skip: no export running`) and
+    /// `export-clear` (`export: dropped <n> waiting`); `None` for any other word.
+    fn export_queue_verb(&mut self, v: &str) -> Option<bool> {
+        match v {
+            "export-skip" => {
+                let line = if self.export_skip() { format!("export: skipping ({} waiting)", self.export_queue.len()) } else { "export-skip: no export running".to_string() };
+                self.last_error = Some(line);
+                Some(true)
+            }
+            "export-clear" => {
+                let n = self.export_clear();
+                self.last_error = Some(format!("export: dropped {n} waiting"));
+                Some(true)
+            }
+            "export-list" => { self.last_error = Some(self.export_list()); Some(true) } // STRIAEXPORTQUEUELIST (SR932): the waiting requests on the message row, a view word (file tail)
+            _ => None,
+        }
+    }
+    /// Drop the waiting export requests, the running job untouched; the number dropped.
+    pub fn export_clear(&mut self) -> usize {
+        let n = self.export_queue.len();
+        self.export_queue.clear();
+        n
+    }
+}
+
+// ---- STRIAEXPORTQUEUELIST (LEDGER SR932): the export queue read back on the message row (named tail block) ----
+// `export-list` (a third arm of SR914's `export_queue_verb`) puts the waiting requests on the message row: `export: <n>
+// waiting: <name> <fmt>, ...`, at most `EXPORT_LIST_SHOWN` entries then `, +<k> more`, or `export: nothing waiting`. A view
+// word: no `commit`, no undo step, no dirty document; the queue and the running job untouched. KEYS `E` (Shift+e, text:
+// GTK and AppKit both send it; AppKit drops Escape) keys SR914's `export-skip` through `Face::verb`.
+// Owed: NLE5D-EXPORT-QUEUE-LIST-RANGE (each request's range / audio word), NLE5D-EXPORT-QUEUE-ESC-GTK (a GTK `Shift+Escape` alias).
+
+/// STRIAEXPORTQUEUELIST (SR932): the most waiting requests `export-list` names; the rest are counted `+<k> more`.
+pub const EXPORT_LIST_SHOWN: usize = 3;
+
+impl Face {
+    /// The waiting export requests as one message line: `export: nothing waiting`, else `export: <n> waiting: <name> <fmt>,
+    /// ...` (the request directory's last component, else the whole path; at most [`EXPORT_LIST_SHOWN`], then `, +<k> more`).
+    pub fn export_list(&self) -> String {
+        let n = self.export_queue.len();
+        if n == 0 {
+            return "export: nothing waiting".to_string();
+        }
+        let names: Vec<String> = self.export_queue.iter().take(EXPORT_LIST_SHOWN).map(|r| {
+            let name = r.dir.file_name().map_or_else(|| r.dir.display().to_string(), |f| f.to_string_lossy().into_owned());
+            format!("{name} {}{}", r.fmt, list_entry_note(r)) // STRIAEXPORTQUEUEMORE (SR971): the range / audio word (file tail)
+        }).collect();
+        let more = if n > EXPORT_LIST_SHOWN { format!(", +{} more", n - EXPORT_LIST_SHOWN) } else { String::new() };
+        format!("export: {n} waiting: {}{more}", names.join(", "))
+    }
+}
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the queue's range / audio on the list, the Esc and running counts (named tail block) ----
+// SR932's `export-list` entry names the request's marked range (` ticks <a>..<b>`, `ticks_note`) and its audio word when not
+// the default `wav` (`nle_export::audio_word`), so SR932's plain lines are unchanged. Esc (`cancel_export`) drops the waiting
+// requests through `drop_queue_on_cancel`, which names them `export: cancelling (dropped <n> waiting)` (none waiting: no
+// message, as before); the cancel line replaces it when the job is reported, as SR914's skipping line. The running row
+// (`message_text`) carries ` (<n> waiting)` after the cloud's unchanged `job_line` while requests wait. Face thread only.
+// Owed: NLE5D-EXPORT-QUEUE-ESC-GTK (a GTK `Shift+Escape` alias: a new key).
+
+/// STRIAEXPORTQUEUEMORE (SR971): an `export-list` entry's tail after `<name> <fmt>`: ` ticks <a>..<b>` for a marked range,
+/// then ` <audio>` when the audio is not the default `wav`; empty for a whole-timeline `wav` request.
+fn list_entry_note(r: &ExportRequest) -> String {
+    let audio = if r.audio == AudioOut::Wav { String::new() } else { format!(" {}", crate::nle_export::audio_word(&r.audio)) };
+    format!("{}{audio}", ticks_note(&r.range))
+}
+
+impl Face {
+    /// Esc's queue arm: drop the waiting requests; when any were dropped the message line names them
+    /// (`export: cancelling (dropped <n> waiting)`).
+    fn drop_queue_on_cancel(&mut self) {
+        let n = self.export_queue.len();
+        self.export_queue.clear();
+        if n > 0 {
+            self.last_error = Some(format!("export: cancelling (dropped {n} waiting)"));
+        }
+    }
+    /// The running row's waiting count: ` (<n> waiting)` while requests wait, else empty.
+    fn waiting_note(&self) -> String {
+        match self.export_queue.len() {
+            0 => String::new(),
+            n => format!(" ({n} waiting)"),
+        }
+    }
+}
+
+// ---- STRIAEXPORTQUEUETHREE (LEDGER SR9042): GTK's Shift+Escape keys export-skip (named tail block) ----
+// GTK names Shift+Esc `Shift+Escape` (a BrowserKey, no BrowserText); one KEYS row keys SR914's `export-skip` word through
+// `Face::key` -> `Face::verb` -> `export_queue_verb`, so the queue is kept and the next request starts. Esc stays cancel-all
+// (`cancel_export`); AppKit drops Escape, `E` is its key. The help row (`help_rows`) reads `E / Shift+Escape`. No new fn.
+
+// ---- STRIAEXPORTRANGE (LEDGER SR9075): export marker / export markers as export-queue entries (named tail block) ----
+// `export marker [<dir>] [fmt] [audio]` exports the range of the marker at or before the playhead (SR9052's
+// `Timeline::marker_before`; its range `at..min(at + len, end)`) and `export markers [..]` every ranged marker in tick
+// order, each as ONE `export_or_queue` call (SR881's road: idle starts at once, running queues with the snapshot), so
+// export-skip / export-clear / export-list / Esc / the waiting note / the witness `queued` all apply unchanged. An entry
+// is named by its marker through its directory `<dir>/<safe name>` (`export_safe_name`): export-list reads `M1 png ticks
+// 12..20`, the result line ends `-> <dir>/M1`. The dir / format grammar is `export`'s own, lifted once into
+// `Face::export_args` (the `export` verb calls it). Face words: no commit, no undo step, no dirty document. Refusals are
+// `last_error` and queue nothing (`export markers` is all-or-nothing against `EXPORT_QUEUE_MAX`); the success is the note.
+// Owed: NLE-EXPORT-RANGE-QUEUE-NAME (the result line is named by the dir, no `M1:` prefix), NLE-EXPORT-RANGE-QUEUE-KERNEL.
+
+/// STRIAEXPORTRANGE (SR9075): a marker's name as one directory component: every char outside `[A-Za-z0-9_-]` becomes
+/// `_` (an empty name is `_`), so no name climbs out of the export directory.
+fn export_safe_name(name: &str) -> String {
+    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    if s.is_empty() { "_".to_string() } else { s }
+}
+
+impl Face {
+    /// The `export` grammar's directory and format words (`--all` and the audio word already taken): none = the default
+    /// directory `<document's dir>/<stem>-export` and h264; a lone format word the format; a lone other word the directory;
+    /// `<dir> <fmt>`. Refused: more words (`usage: ..`), no directory and no document path.
+    fn export_args(&self, args: &[&str]) -> Result<(std::path::PathBuf, String), String> {
+        let (dir, fmt) = match args {
+            [] => (None, "h264"),
+            [f] if VIDEO_NAMES.contains(f) => (None, *f),
+            [d] => (Some(*d), "h264"),
+            [d, f] => (Some(*d), *f),
+            _ => return Err(format!("usage: {}", export_usage())), // NLE5DEXPORTMESSAGEAUDIO (SR756): the one usage
+        };
+        let dir = match (dir, &self.doc_path) {
+            (Some(d), _) => std::path::PathBuf::from(d),
+            (None, Some(p)) => p.with_file_name(format!("{}-export", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
+            (None, None) => return Err("no directory (no document path)".into()),
+        };
+        Ok((dir, fmt.to_string()))
+    }
+    /// The ranged markers' entries in tick order, `(name, safe name, at..min(at + len, end))`, and how many ranged markers
+    /// lie past the timeline's end (an empty range: skipped).
+    fn export_marker_ranges(&self) -> (Vec<(String, String, std::ops::Range<i64>)>, usize) {
+        let end = self.state.timeline.end();
+        let (mut v, mut past) = (Vec::new(), 0);
+        for m in self.state.timeline.markers.iter().filter(|m| m.len > 0) {
+            let r = m.at..(m.at + m.len).min(end);
+            if r.is_empty() {
+                past += 1;
+            } else {
+                v.push((m.name.clone(), export_safe_name(&m.name), r));
+            }
+        }
+        (v, past)
+    }
+    /// The `export marker` / `export markers` words (before `export` takes them); `None` for any other word.
+    fn export_marker_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("export") {
+            return None;
+        }
+        let all = match words.next() {
+            Some("marker") => false,
+            Some("markers") => true,
+            _ => return None,
+        };
+        let word = if all { "export markers" } else { "export marker" };
+        let (args, audio) = export_audio_word(words.collect());
+        let ph = self.state.playhead;
+        let (list, past) = if all {
+            let (list, past) = self.export_marker_ranges();
+            if list.is_empty() {
+                self.last_error = Some(format!("{word}: no ranged marker"));
+                return Some(true);
+            }
+            if let Some((_, safe, _)) = list.iter().enumerate().find(|(i, e)| list[..*i].iter().any(|p| p.1 == e.1)).map(|(_, e)| e) {
+                self.last_error = Some(format!("{word}: two markers named {safe}"));
+                return Some(true);
+            }
+            (list, past)
+        } else {
+            let end = self.state.timeline.end();
+            let Some(m) = self.state.timeline.marker_before(ph).cloned() else {
+                self.last_error = Some(format!("{word}: no marker at or before {}", self.marker_tc(ph)));
+                return Some(true);
+            };
+            let r = m.at..(m.at + m.len).min(end);
+            if m.len == 0 {
+                self.last_error = Some(format!("{word}: {} is a point marker (no range)", m.name));
+                return Some(true);
+            }
+            if r.is_empty() {
+                self.last_error = Some(format!("{word}: {}'s range {}..{} is past the timeline's end {end}", m.name, m.at, m.at + m.len));
+                return Some(true);
+            }
+            (vec![(m.name.clone(), export_safe_name(&m.name), r)], 0)
+        };
+        let room = EXPORT_QUEUE_MAX.saturating_sub(self.export_queue.len()) + usize::from(self.export.is_none());
+        if list.len() > room {
+            let (d, t) = self.export_progress().unwrap_or((0, 0));
+            self.last_error = Some(if all { format!("{word}: {} ranges, room for {room}", list.len()) } else { format!("{word}: busy ({d}/{t})") });
+            return Some(true);
+        }
+        let (base, fmt) = match self.export_args(&args) {
+            Ok(x) => x,
+            Err(e) => {
+                self.last_error = Some(format!("{word}: {e}"));
+                return Some(true);
+            }
+        };
+        let audio = match audio {
+            Ok(a) => a,
+            Err(e) => {
+                self.last_error = Some(format!("{word}: {e}"));
+                return Some(true);
+            }
+        };
+        if !VIDEO_NAMES.contains(&fmt.as_str()) {
+            self.last_error = Some(format!("{word}: unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
+            return Some(true);
+        }
+        let mut started = None;
+        for (i, (_, safe, r)) in list.iter().enumerate() {
+            let dir = base.join(safe);
+            let idle = self.export.is_none();
+            if let Err(e) = self.export_or_queue(&dir, &fmt, Some(r.clone()), audio) {
+                self.last_error = Some(if all { format!("{word}: {safe}: {e} ({i} queued before it)") } else { format!("{word}: {e}") });
+                return Some(true);
+            }
+            if idle {
+                started = Some(dir);
+            }
+        }
+        if self.last_error.as_deref().is_some_and(|l| l.starts_with("export: queued")) {
+            self.last_error = None; // SR881's `export: queued (<n> waiting)`: the note below says it
+        }
+        let n = self.export_queue.len();
+        self.note = Some(if all {
+            let names: Vec<&str> = list.iter().map(|e| e.0.as_str()).collect();
+            let skipped = if past > 0 { format!(", {past} past the end skipped") } else { String::new() };
+            format!("{word}: {} entries ({}){skipped}", list.len(), names.join(", "))
+        } else {
+            let (name, _, r) = &list[0];
+            match &started {
+                Some(d) => format!("{word}: {name} ticks {}..{} started -> {}", r.start, r.end, d.display()),
+                None => format!("{word}: {name} ticks {}..{} queued ({n} waiting)", r.start, r.end),
+            }
+        });
         Some(true)
     }
 }

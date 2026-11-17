@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &markers_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAMARKERS (SR835): the markers (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &markers_json(&face) + &queued_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -520,7 +520,9 @@ fn transport() -> TetraNode {
         button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("marker-", "Marker <"), button("marker+", "Marker >"), button("cut-", "Cut <"), button("cut+", "Cut >"), // STRIAMARKERJUMP (SR894): the playhead to the previous / next marker / clip edge (view words)
-        button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), button("marker marks", "Marker Marks"), // STRIAMARKERRANGES (SR9052): the export marks to the playhead's marker's range; STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
+        button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), button("marker marks", "Marker Marks"), button("export marker", "Export Marker"), button("export markers", "Export Markers"), // STRIAEXPORTRANGE (SR9075): the marker ranges as export-queue entries; STRIAMARKERRANGES (SR9052): the export marks to the playhead's marker's range; STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
+        button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
+        button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -984,5 +986,42 @@ mod striamarkerjumpkeysnext_tests {
         assert!(face.verb("marker range"));
         assert_eq!(markers_json(&face), r#","markers":[{"t":12,"name":"M1","colour":"red","len":8}]"#);
         println!("striamarkerjumpkeysnext witness: {}", markers_json(&face));
+    }
+}
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the witness's waiting export count (named tail block) ----
+/// The witness's `"queued"` field, only while export requests wait (`Face::export_queued`); the default line is unchanged.
+fn queued_json(face: &Face) -> String {
+    match face.export_queued() {
+        0 => String::new(),
+        n => format!(",\"queued\":{n}"),
+    }
+}
+
+#[cfg(test)]
+mod striaexportqueuemore_tests {
+    use super::*;
+
+    /// STRIAEXPORTQUEUEMORE (SR971): a paused job with one request queued behind it carries `"queued":1`; `export-clear`
+    /// drops it and the field is gone; cancelled and joined, nothing is left.
+    #[test]
+    fn striaexportqueuemore_witness_queued_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaexportqueuemore-witness-a");
+        let other = exe.parent().expect("its directory").join("striaexportqueuemore-witness-b");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(queued_json(&face), "");
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        assert!(face.verb(&format!("export {} png", other.display())));
+        assert_eq!(queued_json(&face), r#","queued":1"#);
+        assert!(face.verb("export-clear"));
+        assert_eq!(queued_json(&face), "");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert!(!other.exists(), "the dropped request made nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("striaexportqueuemore witness: ,\"queued\":1 then cleared");
     }
 }
