@@ -360,7 +360,7 @@ pub trait Fonts {
     /// The used line height: `mult` x size, `-mult` px when negative, or (0 = `normal`) the metrics sum.
     fn line_height(&self, sel: FontSel, size: f32, mult: f32) -> f32 {
         if mult < 0.0 {
-            -mult
+            crate::paint::line_height_length_px(mult)
         } else if mult > 0.0 {
             size * mult
         } else {
