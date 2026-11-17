@@ -1930,3 +1930,31 @@ mod striapanautomation_tests {
         assert_eq!(a, b, "equal edges are the static pan");
     }
 }
+
+// ---- STRIANORMALIZELUFS (LEDGER SR9054): one clip's loudness through the one measure (named tail block) ----
+// `normalize lufs` reads the selected clip ALONE at unity: a clone of the timeline with every other clip, every
+// transition and every audio crossfade taken out, the export marks cleared, and the one clip put back on its own track
+// at gain 0 (its fades kept: the clip as it plays at unity), measured over the clip's own ticks by SR995's
+// `loudness_reading`, the one measure body. No timeline literal is built: the clone keeps every field.
+
+/// STRIANORMALIZELUFS (SR9054): clip `idx` of track `track` alone at unity gain, and the ticks it covers; `None` when
+/// there is no such clip.
+pub fn clip_alone(tl: &Timeline, track: usize, idx: usize) -> Option<(Timeline, std::ops::Range<i64>)> {
+    let c = *tl.tracks.get(track)?.clips.get(idx)?;
+    let mut alone = tl.clone();
+    for t in alone.tracks.iter_mut() {
+        t.clips.clear();
+        t.transitions.clear();
+    }
+    alone.audio_xfades.clear();
+    alone.marks = (None, None);
+    alone.tracks[track].clips.push(timeline_core::Clip { gain_cdb: 0, ..c });
+    Some((alone, c.at..c.end()))
+}
+
+/// STRIANORMALIZELUFS (SR9054): the integrated loudness, range and true peak of clip `idx` of track `track` alone at
+/// unity ([`clip_alone`]) through [`loudness_reading`]; `Ok(None)` when there is no such clip or it sent no PCM.
+pub fn loudness_clip(tl: &Timeline, track: usize, idx: usize, sources: &Sources, watch: Option<LoudnessWatch>) -> Result<Option<LoudnessReading>, RenderError> {
+    let Some((alone, range)) = clip_alone(tl, track, idx) else { return Ok(None) };
+    loudness_reading(&alone, range, sources, watch)
+}
