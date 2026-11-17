@@ -9327,4 +9327,59 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "m", "fontFamily"), r#""serif", serif"#, "the name, then the generic");
         assert_eq!(font_synth_eval(&mut e, "document.getElementById('q').style.fontFamily"), r#""serif""#, "el.style (kept)");
     }
+
+    // ---- AETHERCSSOMWHITESPACELONGHANDSACCESSOR (LEDGER SR1109): the camelCase accessors for white-space's longhands (named tail block) ----
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): one div per case at 400 px wide.
+    fn cssom_white_space_longhands_accessor_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div id="c">a b</div><div id="m">a b</div><div id="t">a b</div><div id="d">a b</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `whiteSpaceCollapse` writes the declaration (getPropertyValue
+    /// and cssText read it) and getComputedStyle reads `preserve` (without the accessor: '' / '' / `collapse`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_collapse() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('c').style; s.whiteSpaceCollapse = 'preserve'; [s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse'), s.cssText].join('|')");
+        assert_eq!(got, "preserve|preserve|white-space-collapse: preserve;");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "c", "whiteSpaceCollapse"), "preserve", "computed white-space-collapse");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrapMode = 'nowrap'` reaches the declaration and the
+    /// computed column (without the accessor: `wrap`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_wrap_mode() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('m').style; s.textWrapMode = 'nowrap'; [s.textWrapMode, s.getPropertyValue('text-wrap-mode')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "m", "textWrapMode"), "nowrap", "computed text-wrap-mode");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrap = 'nowrap'` is stored as text-wrap (no SHORTHANDS row:
+    /// owed) and SR1044's layout_core arm makes the computed text-wrap-mode `nowrap`.
+    #[test]
+    fn cssom_white_space_longhands_accessor_text_wrap() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('t').style; s.textWrap = 'nowrap'; [s.textWrap, s.getPropertyValue('text-wrap')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "t", "textWrapMode"), "nowrap", "computed text-wrap-mode under text-wrap");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): the same loop installs the dashed accessor.
+    #[test]
+    fn cssom_white_space_longhands_accessor_dashed() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('d').style; s['white-space-collapse'] = 'preserve-breaks'; [s['white-space-collapse'], s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse')].join('|')");
+        assert_eq!(got, "preserve-breaks|preserve-breaks|preserve-breaks");
+    }
 }
