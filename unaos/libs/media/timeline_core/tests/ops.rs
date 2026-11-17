@@ -447,3 +447,35 @@ mod striacropface {
         assert_eq!(view::paint(&narrow, w, h, Order::Rgba, None, None), view::paint(&narrow_plain, w, h, Order::Rgba, None, None), "10 px: no badge");
     }
 }
+
+// ---- STRIAKCROP (LEDGER SR9010): the lifted reel fit and the crop pass on packed pixels (named tail block) ----
+mod striakcrop {
+    use super::base;
+    use timeline_core::{Crop, SizePolicy, SourceId, crop_frame};
+
+    #[test]
+    fn striakcrop_reel_fit_alone_and_in_mix() {
+        let (tl, a, b) = base();
+        assert_eq!(tl.reel_fit(SourceId(999), true), SizePolicy::Letterbox, "an absent source places as Letterbox");
+        assert_eq!(tl.reel_fit(a, true), SizePolicy::Letterbox);
+        let tl = tl.set_size_policy(a, SizePolicy::Fill).unwrap().set_size_policy(b, SizePolicy::Adopt).unwrap();
+        assert_eq!((tl.reel_fit(a, true), tl.reel_fit(a, false)), (SizePolicy::Fill, SizePolicy::Fill));
+        assert_eq!(tl.reel_fit(b, true), SizePolicy::Adopt, "Adopt alone keeps its own size");
+        assert_eq!(tl.reel_fit(b, false), SizePolicy::Letterbox, "Adopt mixes as Letterbox");
+    }
+
+    #[test]
+    fn striakcrop_crop_frame_packed_equals_rgba() {
+        // the kernel Player crops 0RGB u32, the host RGBA quads: one pass, the same pixels
+        let (w, h) = (6usize, 4usize);
+        let rgba: Vec<[u8; 4]> = (0..w * h).map(|i| [i as u8, (i * 3) as u8, (i * 7) as u8, 255]).collect();
+        let packed: Vec<u32> = rgba.iter().map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32).collect();
+        let crop = Crop { l: 200, t: 250, r: 100, b: 0 };
+        for fit in [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt] {
+            let a = crop_frame(&rgba, w, h, crop, fit, [0, 0, 0, 255]);
+            let b = crop_frame(&packed, w, h, crop, fit, 0u32);
+            let a: Vec<u32> = a.iter().map(|p| ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | p[2] as u32).collect();
+            assert_eq!(a, b, "{fit:?}");
+        }
+    }
+}

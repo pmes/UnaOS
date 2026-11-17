@@ -931,10 +931,7 @@ fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>,
 /// NLESIZEPOLICY (LEDGER SR394): source `src`'s size policy on `tl` (absent: Letterbox). `alone` is false inside a
 /// transition: the mix is one size, so Adopt mixes as Letterbox there.
 fn reel_fit(tl: &Timeline, src: SourceId, alone: bool) -> SizePolicy {
-    match tl.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
-        SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
-        p => p,
-    }
+    tl.reel_fit(src, alone) // STRIAKCROP (SR9010): the rule lifted into timeline_core, the kernel Player's crop calls it too
 }
 
 /// SWAPBACK-NLECACHE (LEDGER SR388): the editor's runs park their decoder across runs. A run's close (a cut, a seek step, the
