@@ -187,7 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, // STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -520,6 +520,7 @@ fn transport() -> TetraNode {
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("pip", "PiP"), // STRIAPOSITIONSCALE (SR879): the selected clip to the bottom-right quarter (THE `pip` verb)
+        button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -949,5 +950,28 @@ mod striapositionscale_tests {
         assert_eq!(drive(&mut face, "pip:950:0"), vec![format!("pip 950 0: {}", timeline_core::EditError::Xform)]);
         assert!(drive(&mut face, "pip:off").is_empty());
         assert_eq!((face.state.undo_depth(), face.state.selected().map(|c| c.xform)), (4, Some(timeline_core::Xform::NONE)));
+    }
+}
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the witness's corner tokens and scale step buttons (named tail block) ----
+#[cfg(test)]
+mod striaxformpresets_tests {
+    use super::*;
+
+    /// STRIAXFORMPRESETS (SR938): `pip:bl` (a corner preset) and `scale-` / `scale+` (VERBS words, their buttons) are
+    /// timeline_core's words on the selected clip, one undo step each, no error; a step off the frame is refused by name;
+    /// an unknown corner is a bad token.
+    #[test]
+    fn striaxformpresets_witness_corner_and_step_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,pip:bl,scale+,scale-,scale-");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.undo_depth(), 4);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform { x: 50, y: 750, s: 200 }));
+        assert_eq!(drive(&mut face, "pip:xx"), vec!["bad token pip:xx".to_string()]);
+        assert!(drive(&mut face, "pip:off").is_empty());
+        assert_eq!(drive(&mut face, "scale+"), vec![format!("scale+: {}", timeline_core::EditError::Xform)]);
+        assert_eq!(face.state.undo_depth(), 5);
     }
 }

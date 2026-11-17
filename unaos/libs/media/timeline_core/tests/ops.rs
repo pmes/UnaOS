@@ -543,3 +543,59 @@ mod striapositionscale {
         }
     }
 }
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the placement's corner presets and centre-kept scale steps (named tail block) ----
+mod striaxformpresets {
+    use super::base;
+    use timeline_core::editor::EditorState;
+    use timeline_core::{EditError, Xform};
+
+    #[test]
+    fn striaxformpresets_corners_and_steps() {
+        assert_eq!(Xform::corner("tl"), Some(Xform { x: 25, y: 25, s: 250 }));
+        assert_eq!(Xform::corner("tr"), Some(Xform { x: 725, y: 25, s: 250 }));
+        assert_eq!(Xform::corner("bl"), Some(Xform { x: 25, y: 725, s: 250 }));
+        assert_eq!(Xform::corner("br"), Some(Xform::PIP));
+        assert_eq!(Xform::corner("off"), None);
+        assert!(["tl", "tr", "bl", "br"].iter().all(|c| Xform::corner(c).is_some_and(Xform::ok)));
+        let d = Xform::SCALE_STEP as i32;
+        assert_eq!(Xform::PIP.stepped(d), Some(Xform { x: 700, y: 700, s: 300 }));
+        assert_eq!(Xform::PIP.stepped(-d), Some(Xform { x: 750, y: 750, s: 200 }));
+        assert_eq!(Xform::NONE.stepped(-d), Some(Xform { x: 25, y: 25, s: 950 }));
+        assert_eq!(Xform::NONE.stepped(d), None, "past the whole frame");
+        assert_eq!(Xform { x: 0, y: 0, s: 500 }.stepped(d), None, "off the left / top edge");
+        assert_eq!(Xform { x: 500, y: 500, s: 500 }.stepped(d), None, "off the right / bottom edge");
+        assert_eq!(Xform { x: 10, y: 10, s: 50 }.stepped(-d), None, "the rect would vanish");
+        assert_eq!(Xform { x: 10, y: 10, s: 51 }.stepped(-d), Some(Xform { x: 35, y: 35, s: 1 }));
+    }
+
+    #[test]
+    fn striaxformpresets_words_one_undo_step_each() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip tl"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("scale+"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("pip tr"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (1, Some(Xform { x: 725, y: 25, s: 250 })));
+        assert_eq!(st.verb("pip tr"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same placement commits nothing");
+        assert_eq!(st.verb("scale+"), Some(Ok(())));
+        assert_eq!(st.verb("scale-"), Some(Ok(())));
+        assert_eq!(st.verb("scale-"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (4, Some(Xform { x: 750, y: 50, s: 200 })));
+        assert_eq!(st.verb("pip off"), Some(Ok(())));
+        assert_eq!(st.verb("scale+"), Some(Err(EditError::Xform)));
+        assert_eq!(st.undo_depth(), 5, "a refused step commits nothing");
+        assert_eq!(st.verb("pip on"), Some(Err(EditError::Xform)), "SR879's arms still refuse an unknown word");
+        assert_eq!(st.verb("scale+ 1"), None, "not a step word");
+        for _ in 0..5 {
+            assert!(st.undo());
+        }
+        assert_eq!(st.timeline, tl);
+        st.timeline.tracks[1].clips = tl.tracks[0].clips.clone();
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("pip bl"), Some(Err(EditError::Kind)));
+        assert_eq!(st.verb("scale-"), Some(Err(EditError::Kind)));
+    }
+}

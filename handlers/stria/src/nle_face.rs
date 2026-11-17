@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "pip", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail)
+pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "pip", "scale-", "scale+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    xform_note: Option<String>, // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word, until the next message (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, xform_note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.xform_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2360,7 +2361,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.xform_note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3095,5 +3096,26 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the message row reads the placement after a pip / scale word (named tail block) ----
+// A `pip` / `scale` word (SR879's and SR938's presets / steps) goes through timeline_core's ONE verb dispatch; when it is
+// taken the message row reads the selected clip's placement (`pip: x 725 y 725 scale 250`) through `xform_note`, which
+// [`Face::message_text`] reads after `last_error`; the next message [`Face::on`] takes clears it. Not `last_error`: a
+// success is no error (serve logs `last_error` as a warn; the witness counts it). A refusal is `last_error` as every verb's.
+impl Face {
+    /// A `pip` / `scale` word: `Some(true)` (taken; the note or the refusal set); `None` for any other word.
+    fn xform_note_verb(&mut self, v: &str) -> Option<bool> {
+        if !matches!(v.split_ascii_whitespace().next(), Some("pip" | "scale" | "scale-" | "scale+")) {
+            return None;
+        }
+        match self.state.verb(v)? {
+            Ok(()) => {
+                self.xform_note = self.state.selected().map(|c| format!("pip: x {} y {} scale {}", c.xform.x, c.xform.y, c.xform.s));
+            }
+            Err(e) => self.last_error = Some(format!("{v}: {e}")),
+        }
+        Some(true)
     }
 }

@@ -3797,7 +3797,7 @@ fn striapositionscale_pip_renders_over_the_track_below() {
 #[test]
 fn striapositionscale_face_pip_is_one_undo_step() {
     use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
-    assert_eq!(VERBS[VERBS.len() - 2], "pip", "pip just before help");
+    assert!(VERBS.contains(&"pip"), "pip is a VERBS word"); // STRIAXFORMPRESETS (SR938): `scale-` / `scale+` now stand between pip and help
     let (tl0, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
     assert!(face.verb("pip"));
@@ -3813,4 +3813,34 @@ fn striapositionscale_face_pip_is_one_undo_step() {
     assert!(face.verb("pip"));
     assert_eq!(face.last_error.take(), Some(format!("pip: {}", EditError::Kind)));
     assert_eq!(face.state.undo_depth(), 1);
+}
+
+// ---- STRIAXFORMPRESETS (LEDGER SR938): the face's corner presets, scale steps and the placement line (named tail block) ----
+
+/// `pip tr` and `scale-` / `scale+` (VERBS words just before `help`) reach timeline_core's ONE verb dispatch, one undo step
+/// each; the message row then reads the placement (`pip: x 725 y 25 scale 250`) with no error, until the next message the
+/// face takes; a step off the frame is refused by name on the message row with no undo step.
+#[test]
+fn striaxformpresets_face_presets_and_placement_line() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, SURFACE, VERBS, synth_fixture};
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["scale-", "scale+", "help"]);
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("scale+"));
+    assert_eq!(face.last_error.take(), Some(format!("scale+: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("pip tr"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 725 y 25 scale 250"));
+    assert_eq!(face.state.timeline, tl0.set_xform(0, 1, timeline_core::Xform { x: 725, y: 25, s: 250 }).unwrap());
+    assert!(face.verb("scale-"));
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 750 y 50 scale 200"));
+    assert_eq!(face.state.undo_depth(), 2);
+    face.on(&bandy::SMessage::Input { target: SURFACE.into(), text: "zoom+".into() });
+    assert_ne!(face.message_text().as_deref(), Some("pip: x 750 y 50 scale 200"), "the next message clears the line");
+    assert!(face.verb("pip off"));
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 0 y 0 scale 1000"));
+    assert!(face.verb("scale+"));
+    assert_eq!(face.last_error.take(), Some(format!("scale+: {}", EditError::Xform)));
+    assert_eq!(face.state.undo_depth(), 3);
 }
