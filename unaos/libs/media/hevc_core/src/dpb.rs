@@ -440,7 +440,7 @@ impl Dpb {
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().filter(|_| only.is_none()).map(|(pw, high)| [0, 1].map(|l| crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high))), &mut out);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().map(|(pw, high)| [0, 1].map(|l| crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high))), only.is_some(), &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
@@ -479,8 +479,8 @@ fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Optio
 /// candidate of [`project_lists`] (quarter-sample luma vectors; chroma by (SubWidthC, SubHeightC) `sub` as `predict_pu`) through
 /// `luma_mc` / `chroma_mc`'s fractional filters (HEVCCONCEALSUBPEL SR733), written to `out` at sample depth, clipped: two candidates averaged by inter.rs
 /// `bi_default` (8-262), one rounded by inter.rs `uni_default` (8-261); HEVCCONCEALWEIGHTED (SR741): with `wp` (the source's explicit
-/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead. A block is at most 8x8 in every plane (the stack buffer).
-fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, out: &mut [i32]) {
+/// (w, o, log2WD) per list) through inter.rs `bi_explicit` / `uni_explicit` (8.5.3.3.4.3) instead; HEVCCONCEALBIDIRECTFORWARD (SR778): with `inv` (the forward road: `wp` is the referencer's) one candidate through inter.rs `uni_explicit_inv`, two by `bi_default` (HEVC-CONCEAL-FORWARD-BI-INVERSE owed). A block is at most 8x8 in every plane (the stack buffer).
+fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32, ch: i32, cand: &[Option<[i32; 2]>; 2], sub: (i32, i32), bd: u32, wp: Option<[(i32, i32, u32); 2]>, inv: bool, out: &mut [i32]) {
     let n = (cw * ch) as usize;
     let max = (1i32 << bd) - 1;
     let mut second = [0i32; 64];
@@ -497,11 +497,11 @@ fn conceal_fetch(r: &crate::picture::Plane, c: usize, cx: i32, cy: i32, cw: i32,
     }
     if got == 2 {
         for (a, &b) in out[..n].iter_mut().zip(second[..n].iter()) {
-            *a = match wp { Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
+            *a = match wp.filter(|_| !inv) { Some(w) => crate::inter::bi_explicit(*a, b, w[0], w[1]), None => crate::inter::bi_default(*a, b, bd) }.clamp(0, max);
         }
     } else {
         for a in out[..n].iter_mut() {
-            *a = match wp { Some(w) => crate::inter::uni_explicit(*a, w[cand[0].is_none() as usize]), None => crate::inter::uni_default(*a, bd) }.clamp(0, max);
+            *a = match wp { Some(w) if inv => crate::inter::uni_explicit_inv(*a, w[cand[0].is_none() as usize], bd), Some(w) => crate::inter::uni_explicit(*a, w[cand[0].is_none() as usize]), None => crate::inter::uni_default(*a, bd) }.clamp(0, max);
         }
     }
 }
@@ -577,7 +577,7 @@ impl Dpb {
     /// block's motion; every other block of L keeps its projection from the source S. C is only read: its samples (which
     /// read L's S-projection) never change, so only pictures decoded after C read the refined L. `forward` is drained, so
     /// each L is refined once, by the first picture finished after its concealment (HEVC-CONCEAL-FORWARD-DEPTH owed). C's
-    /// explicit weights are not applied (they map L to C: HEVC-CONCEAL-FORWARD-WEIGHTED owed). The untaken [`Concealed`]
+    /// explicit weights are inverted (they map L to C: HEVCCONCEALBIDIRECTFORWARD SR778, `conceal_fetch`'s `inv`). The untaken [`Concealed`]
     /// note of L gets `forward_blocks` (a note taken before C's end keeps 0). Returns the blocks refined.
     pub fn conceal_forward(&mut self) -> u32 {
         let Some(c) = self.pics.len().checked_sub(1) else {
