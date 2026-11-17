@@ -585,6 +585,7 @@ fn transport() -> TetraNode {
         button("headers", "Hdr"), button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
         button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
         button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
+        button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }

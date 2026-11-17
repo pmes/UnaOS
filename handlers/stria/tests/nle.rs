@@ -14079,3 +14079,59 @@ fn striaxformkeysease_face_ease_note() {
     assert_eq!(face.state.undo_depth(), 4);
 }
 
+
+// ---- STRIATITLESTYLEFACE (LEDGER SR9077): the title step words and buttons through the face, the note on the message row (named tail block) ----
+
+/// synth_fixture: a title at 12, then each title step word is one undo step with its note on the message row; the
+/// document keeps the style as SR9029's TITLESTYLE line; the next input clears the note; a media clip and no selection
+/// are refused by name with no note.
+#[test]
+fn striatitlestyleface_face_steps_and_note() {
+    use bandy::SMessage;
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(12);
+    assert!(face.verb("title"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.note, None);
+    let d = face.state.undo_depth();
+    assert!(face.verb("title-size+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), d + 1, "one undo step");
+    assert_eq!(face.note.as_deref(), Some("title style: 15 centre FFFFFF"));
+    assert_eq!(face.message_text().as_deref(), Some("title style: 15 centre FFFFFF"), "the message row reads the note");
+    let doc = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(doc.contains("* UNA TITLESTYLE T1 15 centre FFFFFF\n"), "{doc}");
+    assert!(face.on(&SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "title-align".into() }));
+    assert_eq!(face.note.as_deref(), Some("title style: 15 right FFFFFF"), "the button's message: a new note");
+    assert!(face.verb("title-ink"));
+    assert_eq!(face.note.as_deref(), Some("title style: 15 right FFCC00"));
+    assert!(face.verb("title-size-"));
+    assert_eq!(face.note.as_deref(), Some("title style: 10 right FFCC00"));
+    assert_eq!(face.state.undo_depth(), d + 4, "four words, four steps");
+    assert!(face.state.undo());
+    assert_eq!(face.state.selected_title_style().map(|s| s.size), Ok(15), "one undo restores");
+    face.on(&SMessage::BrowserSelectAll);
+    assert_eq!(face.note, None, "the next input clears the note");
+    face.state.select(0, 0).unwrap();
+    let d = face.state.undo_depth();
+    assert!(face.verb("title-ink"));
+    assert_eq!(face.last_error.take().as_deref(), Some("title-ink: no such source"));
+    assert_eq!(face.note, None, "a refusal writes no note");
+    face.state.deselect();
+    assert!(face.verb("title-size+"));
+    assert_eq!(face.last_error.take().as_deref(), Some("title-size+: no such clip"));
+    assert_eq!(face.state.undo_depth(), d, "refusals commit nothing");
+    println!("striatitlestyleface: title-size+ -> 15 centre FFFFFF, title-align -> right, title-ink -> FFCC00; refusals named");
+}
+
+/// The four step words are transport words, immediately before `help` (still the last).
+#[test]
+fn striatitlestyleface_verbs_before_help() {
+    use stria::nle_face::VERBS;
+    let n = VERBS.len();
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert_eq!(&VERBS[n - 5..n - 1], &timeline_core::editor::TITLE_STEP_WORDS[..]);
+    println!("striatitlestyleface: VERBS[{}..{}] = {:?}", n - 5, n - 1, &VERBS[n - 5..n - 1]);
+}
