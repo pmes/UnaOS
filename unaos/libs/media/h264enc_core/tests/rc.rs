@@ -175,8 +175,8 @@ fn fnv(aus: &[Vec<u8>]) -> u64 {
 #[test]
 fn d_rate_none_keeps_the_constant_qp_bytes() {
     for (name, cfg, want) in [
-        ("qp26 gop30", base(26), 0x1fbc_56dc_6807_f2a8u64),
-        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0x1c1e_9579_5119_5ceb),
+        ("qp26 gop30", base(26), 0xd572_6ae5_9a9b_6d9cu64), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1fbc_56dc_6807_f2a8
+        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0xd7c3_16c6_beb0_6d49), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1c1e_9579_5119_5ceb
         ("qp36 gop1", Config { gop: 1, ..base(36) }, 0x7785_4898_5213_d0db),
     ] {
         let mut enc = Encoder::new(cfg).unwrap();
@@ -212,8 +212,8 @@ fn e_cabac_rate_controlled_decode_is_the_reconstruction() {
 fn f_cavlc_named_keeps_the_pinned_bytes() {
     let cavlc = |c: Config| Config { entropy: h264enc_core::Entropy::Cavlc, ..c };
     for (name, cfg, want) in [
-        ("qp26 gop30", cavlc(base(26)), 0x1fbc_56dc_6807_f2a8u64),
-        ("qp30 gop10 deblock subpel2", cavlc(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0x1c1e_9579_5119_5ceb),
+        ("qp26 gop30", cavlc(base(26)), 0xd572_6ae5_9a9b_6d9cu64), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1fbc_56dc_6807_f2a8
+        ("qp30 gop10 deblock subpel2", cavlc(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0xd7c3_16c6_beb0_6d49), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1c1e_9579_5119_5ceb
         ("qp36 gop1", cavlc(Config { gop: 1, ..base(36) }), 0x7785_4898_5213_d0db),
     ] {
         let mut enc = Encoder::new(cfg).unwrap();
@@ -254,8 +254,8 @@ fn h_transform8x8_gop30_decodes_and_is_not_larger() {
 fn i_transform8x8_off_keeps_the_pinned_bytes() {
     let off = |c: Config| Config { transform8x8: false, ..c };
     for (name, cfg, want) in [
-        ("qp26 gop30", off(base(26)), 0x1fbc_56dc_6807_f2a8u64),
-        ("qp30 gop10 deblock subpel2", off(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0x1c1e_9579_5119_5ceb),
+        ("qp26 gop30", off(base(26)), 0xd572_6ae5_9a9b_6d9cu64), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1fbc_56dc_6807_f2a8
+        ("qp30 gop10 deblock subpel2", off(Config { gop: 10, deblock: true, subpel: 2, ..base(30) }), 0xd7c3_16c6_beb0_6d49), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1c1e_9579_5119_5ceb
         ("qp36 gop1", off(Config { gop: 1, ..base(36) }), 0x7785_4898_5213_d0db),
     ] {
         let mut enc = Encoder::new(cfg).unwrap();
