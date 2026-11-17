@@ -3797,3 +3797,26 @@ fn striaclipspeed_a_1x_timeline_schedules_as_before() {
     assert_eq!((vseeks, aseeks), (3, 3));
     println!("striaclipspeed: 1x fixture schedule = the old identity: {} steps, {} runs, seeks v={vseeks} a={aseeks}", steps.len(), runs.len());
 }
+
+// ---- STRIACLIPSPEEDMORE (LEDGER SR951): the rippling speed word on the face (named tail block) ----
+
+/// STRIACLIPSPEEDMORE: on the synth fixture (A 13..23 @0, B @10, A 23..33 @25) `speed 0.5` on the first clip runs into B
+/// (`Overlap`), while `rspeed 0.5` (THE editor verb, reached by the face's fall-through) ripples: the clip is 20 ticks, B
+/// moves to 20 and the last clip to 35, ONE undo step restores the fixture; the other track is untouched.
+#[test]
+fn striaclipspeedmore_face_rspeed_ripples_where_speed_overlaps() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("speed 0.5"));
+    assert_eq!(face.last_error.take(), Some(format!("speed 0.5: {}", EditError::Overlap)));
+    assert!(face.verb("rspeed 0.5"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let ats: Vec<(i64, i64, u32)> = face.state.timeline.tracks[0].clips.iter().map(|c| (c.at, c.end(), c.rate_q16)).collect();
+    assert_eq!(ats, vec![(0, 20, 0x8000), (20, 30, 0x1_0000), (35, 45, 0x1_0000)]);
+    assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "the other track stays (NLE-SPEED-RIPPLE-LINKED owed)");
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "undo restores");
+    println!("striaclipspeedmore: rspeed 0.5 -> {ats:?}; speed 0.5 -> {}", EditError::Overlap);
+}

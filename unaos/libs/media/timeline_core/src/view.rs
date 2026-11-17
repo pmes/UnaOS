@@ -720,8 +720,8 @@ impl Drag {
             st.select(self.track, self.idx)?;
         }
         match self.kind {
-            DragKind::TrimIn => st.trim(Edge::In, self.delta),
-            DragKind::TrimOut => st.trim(Edge::Out, self.delta),
+            DragKind::TrimIn => st.trim_by_ticks(Edge::In, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
+            DragKind::TrimOut => st.trim_by_ticks(Edge::Out, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::Slip => st.slip_selected(self.delta),
             DragKind::Slide => st.slide_selected(self.delta),
             DragKind::Move if st.set.len() > 1 => st.move_set(self.delta),

@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } // STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -691,5 +691,40 @@ impl EditorState {
         let tl = self.timeline.set_rate(track, idx, rate_q16)?;
         self.commit(tl);
         Ok(())
+    }
+}
+
+// ---- STRIACLIPSPEEDMORE (LEDGER SR951): the drag's timeline delta through src_at, the rippling speed word (named tail block) ----
+// A drag moves a trim edge by TIMELINE ticks while `trim` takes SOURCE ticks; `trim_by_ticks` converts through THE
+// `Clip::src_at` (the source point that puts the edge at the moved tick; exactly `dt` at 1x) and calls THE `trim`, so the
+// edge lands under the pointer at any rate (NLE-SPEED-DRAG; the keys keep source ticks, NLE-SPEED-KEYS owed). `rspeed <q>`
+// (q a decimal read by `speed_q16`) sets the selected clip's speed through `Timeline::ripple_set_rate`: ONE commit.
+impl EditorState {
+    /// Move the selected clip's in or out edge by `dt` TIMELINE ticks through [`EditorState::trim`]: the source delta is
+    /// `src_at(edge + dt)` minus the source edge. A rated conversion that rounds to no source change (a 0.5x hold) commits
+    /// nothing.
+    pub fn trim_by_ticks(&mut self, edge: Edge, dt: i64) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let delta = match edge {
+            Edge::In => c.src_at(c.at + dt) - c.src_in,
+            Edge::Out => c.src_at(c.end() + dt) - c.src_out,
+        };
+        if delta == 0 && dt != 0 {
+            return Ok(());
+        }
+        self.trim(edge, delta)
+    }
+    /// The selected clip at speed `rate_q16` (Q16.16) with the rest of its track following (`Timeline::ripple_set_rate`):
+    /// ONE commit; a refusal (`Rate`, `NoClip`, ...) leaves the state.
+    pub fn ripple_speed(&mut self, rate_q16: u32) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.ripple_set_rate(track, idx, rate_q16)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `rspeed <q>` word of [`EditorState::verb`]; `None`: not this word (an unreadable `q` included).
+    fn rspeed_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let q = crate::speed_q16(v.strip_prefix("rspeed ")?.trim(), 1)?;
+        Some(self.ripple_speed(q))
     }
 }
