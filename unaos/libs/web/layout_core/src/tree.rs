@@ -1123,6 +1123,7 @@ pub fn default_weight(tag: &str, inherited: u16) -> u16 {
     match tag {
         "b" | "strong" => FontWeight::Bolder.resolve(inherited),
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th" => 700,
+        "input" | "select" | "textarea" | "button" => 400, // AETHERCSSCONTROLUAFONT (SR1009): font: -webkit-small-control resets the weight
         _ => inherited,
     }
 }
@@ -1140,9 +1141,9 @@ pub fn default_rtl<N: DomNode>(node: &N, inherited: bool) -> bool {
     }
 }
 
-/// UA default italic per element, shared by the measurer and the painter.
+/// UA default italic per element, shared by the measurer and the painter. AETHERCSSCONTROLUAFONT (SR1009): a form control is upright (font: -webkit-small-control).
 pub fn default_italic(tag: &str, inherited: bool) -> bool {
-    inherited || matches!(tag, "i" | "em" | "cite" | "var" | "dfn" | "address")
+    !matches!(tag, "input" | "select" | "textarea" | "button") && (inherited || matches!(tag, "i" | "em" | "cite" | "var" | "dfn" | "address"))
 }
 
 /// The used font size of an element with no author `font-size`: the UA

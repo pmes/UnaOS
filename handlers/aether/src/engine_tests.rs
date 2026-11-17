@@ -6063,4 +6063,96 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
         assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
     }
+
+    // ---- AETHERCSSCONTROLUAFONT (LEDGER SR1009): a form control takes the UA weight 400 and upright style, not the parent's (named tail block) ----
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): one row per probe under `body { font: 24px serif }`, the rules in a sheet, every
+    /// button label red so its ink is countable. A text span; a plain button; a button under `<b>` and under `<i>`; an
+    /// author `font-weight: bold` button (the armed heavy ink); `.h { font: inherit }` button / input / select / textarea
+    /// under a bold italic row; plain input / select / textarea under `<b><i>`; an author `font-size: 20px` button.
+    /// Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn control_ua_font_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            button { color: rgb(255, 0, 0) }
+            .h { font: inherit }
+            </style></head><body style="margin:0;font:24px serif">
+            <div><span id="txt">Hello</span></div>
+            <div><button id="bp">Hello</button></div>
+            <div><b><button id="bb">Hello</button></b></div>
+            <div><i><button id="bi">Hello</button></i></div>
+            <div><button id="bw" style="font-weight:bold">Hello</button></div>
+            <div style="font-weight:bold;font-style:italic"><button id="bh" class="h">Hello</button></div>
+            <div style="font-weight:bold;font-style:italic"><input id="ih" class="h" value="Hello"></div>
+            <div style="font-weight:bold;font-style:italic"><select id="sh" class="h"><option>Hello</option></select></div>
+            <div style="font-weight:bold;font-style:italic"><textarea id="th" class="h">Hello</textarea></div>
+            <div><b><i><input id="ip" value="Hello"></i></b></div>
+            <div><b><i><select id="sp"><option>Hello</option></select></i></b></div>
+            <div><b><i><textarea id="tp">Hello</textarea></i></b></div>
+            <div><button id="bs" style="font-size:20px">Hello</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): the size and family were already the UA control font's (layout_core's
+    /// `default_font_size` / `default_family` control arms): an unset button reads 13.333px Arial under the 24px serif
+    /// body, a textarea monospace, and `font: inherit` takes the body's 24px serif (a taller box).
+    #[test]
+    fn control_ua_font_size_family() {
+        let mut e = control_ua_font_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "txt", "fontSize"), "24px", "the body text is 24px");
+        let bp = font_shorthand_cs(&mut e, "bp", "fontSize");
+        assert!(bp.starts_with("13.333"), "an unset button reads the control size, got {bp}");
+        assert_eq!(font_shorthand_cs(&mut e, "bp", "fontFamily"), "Arial", "the control family");
+        assert_eq!(font_shorthand_cs(&mut e, "tp", "fontFamily"), "monospace", "Chromium's textarea monospace");
+        assert_eq!(font_shorthand_cs(&mut e, "bh", "fontSize"), "24px", "font: inherit takes the body's size");
+        assert_eq!(font_shorthand_cs(&mut e, "bh", "fontFamily"), "serif", "font: inherit takes the body's family");
+        let (_, _, _, h) = imgalt_rect(&mut e, "bp");
+        let (_, _, _, hh) = imgalt_rect(&mut e, "bh");
+        assert!(h < hh, "the 13.333px button {h} is shorter than the 24px font: inherit twin {hh}");
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): `font: -webkit-small-control` resets the weight and style, so a control under
+    /// `<b>` / `<i>` is 400 upright (it was 700 / italic: `default_weight` / `default_italic` fell to the parent): the
+    /// report reads it, and the painter draws it: the `<b>` button's red label ink is the plain button's, the author-bold
+    /// button's is heavier (armed).
+    #[test]
+    fn control_ua_font_weight_style() {
+        let mut e = control_ua_font_engine();
+        for id in ["bb", "ip", "sp", "tp"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontWeight"), "400", "{id} under <b> takes the UA weight");
+        }
+        for id in ["bi", "ip", "sp", "tp"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "normal", "{id} under <i> is upright");
+        }
+        let plain = css_wide_color_ink(&mut e, "bp", css_wide_red);
+        let under_b = css_wide_color_ink(&mut e, "bb", css_wide_red);
+        let bold = css_wide_color_ink(&mut e, "bw", css_wide_red);
+        assert!(plain > 3, "the plain button paints its red label ({plain})");
+        assert!(under_b.abs_diff(plain) * 10 <= plain, "the <b> button's ink {under_b} is the plain button's {plain}");
+        assert!(bold * 100 > plain * 115, "the author-bold button's ink {bold} is heavier than {plain} (armed)");
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): `font: inherit` (the INHERIT_FONT bits) beats the UA arm: the controls under the
+    /// bold italic row read 700 italic.
+    #[test]
+    fn control_ua_font_inherit() {
+        let mut e = control_ua_font_engine();
+        for id in ["bh", "ih", "sh", "th"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontWeight"), "700", "{id} font: inherit takes the parent's bold");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "italic", "{id} font: inherit takes the parent's italic");
+        }
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): an author value on the control wins over the UA font as before.
+    #[test]
+    fn control_ua_font_author_wins() {
+        let mut e = control_ua_font_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "bs", "fontSize"), "20px", "the author size wins");
+        assert_eq!(font_shorthand_cs(&mut e, "bw", "fontWeight"), "700", "the author weight wins");
+    }
 }
