@@ -193,13 +193,14 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
+    hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -275,6 +276,7 @@ impl Face {
     /// One playback tick: the playhead steps `rate` frames (back when negative); playback stops at the end going
     /// forward and at 0 going back. True when it moved or stopped.
     pub fn tick(&mut self) -> bool {
+        if self.hover_dwell_tick() && !self.playing { return true; } // STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
         if !self.playing {
             return false;
         }
@@ -305,7 +307,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
     use tokio::sync::broadcast::error::RecvError;
     for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
-    let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64));
+    let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
     loop {
         tokio::select! {
             m = rx.recv() => match m {
@@ -320,7 +322,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() => { // NLEFACEEXPORT (SR694): the clock also paints a running export's band
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
                 if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
@@ -2216,7 +2218,7 @@ impl Face {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames), j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames, (self.state.timeline.tb.den, self.state.timeline.tb.num)), j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2344,7 +2346,7 @@ impl Face {
     /// The hovered clip's reel ([`Face::hovered_clip`], STRIAINFOREELHOVER SR762), else the selected clip's: `<reel name>: <summary>` (`nle::Sources::summary`); `None` with no clip
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
-        let c = self.hovered_clip().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
+        let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
         let s = self.sources.summary(c.src)?;
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         Some(format!("{name}: {s}"))
@@ -2722,11 +2724,11 @@ impl Face {
 
 // ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the words (named tail block) ----
 /// The result line's words for what was written: `<video> + <audio>` (the audio as the table spells it,
-/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775), and ` (<r> fps)` ([`rate_words`], NLE5DEXPORTMESSAGERATE SR785).
-fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64) -> String {
+/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775), and ` (<r> fps, <m>x)` ([`rate_words`], NLE5DEXPORTMESSAGERATE SR785; the multiple of real time at the timeline's frame rate `fps` as (num, den), [`realtime_words`], SR794).
+fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64, fps: (u64, u64)) -> String {
     match audio {
-        AudioOut::None => format!("{video}, no audio in {}{}", wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
-        a => format!("{video} + {} in {}{}", crate::nle_export::audio_word(&a), wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
+        AudioOut::None => format!("{video}, no audio in {}{}", wall_words(wall), rate_words(frames, wall, fps).map(|r| format!(" ({r})")).unwrap_or_default()),
+        a => format!("{video} + {} in {}{}", crate::nle_export::audio_word(&a), wall_words(wall), rate_words(frames, wall, fps).map(|r| format!(" ({r})")).unwrap_or_default()),
     }
 }
 
@@ -2774,7 +2776,52 @@ impl Face {
         if self.drag.is_some() {
             return None;
         }
-        Some(self.labels.is_some() && self.hovered_clip() != was)
+        Some(self.hover_moved(was) && self.labels.is_some()) // STRIAINFOREELHOVERDELAY (SR789): a move repaints only when a dwelt hover ends (file tail)
+    }
+}
+
+// ---- STRIAINFOREELHOVERDELAY (LEDGER SR789): a dwell of HOVER_DWELL face ticks before the hover line replaces the selected one (named tail block) ----
+// SR762 swapped the message line on the very move that entered a clip, so a pointer crossing the timeline flickered the line
+// through every clip it passed; every editor dwells first (Chromium's hover intent ~300 ms, macOS tooltips 500 ms). The dwell
+// counts on THE face clock (`serve`'s one interval, `Face::tick`): no timer, no Instant, no thread. `hover_ticks` keys the count
+// to its clip, so a change with no move (an edit, a select, a playback scroll) is seen at the next tick. `serve` runs the clock
+// while a dwell counts (`hover_pending`) and skips the ticks missed while it was idle. Owed: STRIA-INFO-REEL-HOVER-DWELL-MS
+// (the dwell in wall ms: today HOVER_DWELL frames of the timeline's rate), STRIA-PLAY-IDLE-BURST (pin play after idle under Skip).
+
+/// STRIAINFOREELHOVERDELAY (SR789): the face ticks a hover must stand before its line shows: one tick is one timeline
+/// frame (`serve`'s clock), so 8 is 320 ms at 25 fps, 333 ms at 24, 267 ms at 30.
+pub const HOVER_DWELL: u16 = 8;
+
+impl Face {
+    /// STRIAINFOREELHOVERDELAY (SR789): one face tick of the dwell: the same hovered clip counts on, another starts at 1,
+    /// none clears it. True only on the tick the count reaches [`HOVER_DWELL`], and only with labels on (the message paints).
+    fn hover_dwell_tick(&mut self) -> bool {
+        let next = match (self.hover_ticks, self.hovered_clip()) {
+            (Some((c, n)), Some(h)) if c == h => Some((c, n.saturating_add(1))),
+            (_, Some(h)) => Some((h, 1)),
+            (_, None) => None,
+        };
+        self.hover_ticks = next;
+        self.labels.is_some() && next.is_some_and(|(_, n)| n == HOVER_DWELL)
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): the hovered clip once it has stood [`HOVER_DWELL`] ticks (the line `reel_line` names).
+    pub fn hover_dwelt(&self) -> Option<(usize, usize)> {
+        let h = self.hovered_clip()?;
+        self.hover_ticks.filter(|&(c, n)| c == h && n >= HOVER_DWELL).map(|(c, _)| c)
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): a dwell is counting (labels on, a hovered clip not yet dwelt): `serve` runs its clock.
+    pub fn hover_pending(&self) -> bool {
+        self.labels.is_some() && self.hovered_clip().is_some() && self.hover_dwelt().is_none()
+    }
+    /// STRIAINFOREELHOVERDELAY (SR789): the pointer moved off `was`: when the hovered clip changed the count resets, and the
+    /// answer is whether `was` had dwelt (its line was showing); false when the hovered clip is unchanged.
+    fn hover_moved(&mut self, was: Option<(usize, usize)>) -> bool {
+        if self.hovered_clip() == was {
+            return false;
+        }
+        let dwelt = was.is_some() && self.hover_ticks.is_some_and(|(c, n)| Some(c) == was && n >= HOVER_DWELL);
+        self.hover_ticks = None;
+        dwelt
     }
 }
 
@@ -2808,11 +2855,41 @@ pub fn wall_words(d: Duration) -> String {
 /// An export's speed as a person reads it (every encoder prints one: x264's `42.1 fps`): `frames` over `wall`, rounded
 /// half up in integer arithmetic on microseconds; 100 or more a whole number (`120 fps`, `500 fps`), below that one
 /// decimal (`43.8 fps`, `3.0 fps`, `0.3 fps`). `None` for 0 frames or a wall under 1 ms: such an export says nothing of speed.
-pub fn rate_words(frames: u64, wall: Duration) -> Option<String> {
+pub fn rate_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<String> {
     if frames == 0 || wall < Duration::from_millis(1) {
         return None;
     }
     let (f, us) = (frames as u128, wall.as_micros());
     let tenths = (f * 20_000_000 + us) / (2 * us);
-    Some(if tenths >= 1000 { format!("{} fps", (f * 2_000_000 + us) / (2 * us)) } else { format!("{}.{} fps", tenths / 10, tenths % 10) })
+    Some(format!("{}{}", if tenths >= 1000 { format!("{} fps", (f * 2_000_000 + us) / (2 * us)) } else { format!("{}.{} fps", tenths / 10, tenths % 10) }, realtime_words(frames, wall, fps).map(|m| format!(", {m}")).unwrap_or_default()))
+}
+
+// ---- NLE5DEXPORTMESSAGERATEREALTIME (LEDGER SR794): the export's speed as a multiple of real time (named tail block) ----
+// `rate_words` takes the timeline's frame rate as (num, den) — `(tb.den, tb.num)` from the face's `Timeline.tb` (seconds
+// per tick; written only by `Timeline::new`, so the face's timeline carries the exported clone's rate) — and appends
+// `, <m>x` inside its parenthesis. Owed: NLE5D-EXPORT-MESSAGE-ETA (a running export's remaining time from the multiple so
+// far, on the progress band and stria-view's export JSON), NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// An export's speed as a multiple of real time (`1.8x`: it ran 1.8 times faster than the timeline plays; `0.40x`:
+/// slower): `frames` over `wall`, divided by the frame rate `fps` = (num, den) frames per second, each grade rounded half up
+/// in integer arithmetic on microseconds (the [`rate_words`] road); 10 or more a whole number (`12x`, `20x`), 1 to 10 one
+/// decimal (`1.8x`), below 1 two decimals (`0.40x`). `None` for 0 frames, a wall under 1 ms, a rate with a zero term (a
+/// timeline without a rate), or an overflow.
+pub fn realtime_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<String> {
+    let (num, den) = fps;
+    if frames == 0 || num == 0 || den == 0 || wall < Duration::from_millis(1) {
+        return None;
+    }
+    let top = (frames as u128).checked_mul(den as u128)?;
+    let bot = wall.as_micros().checked_mul(num as u128)?;
+    let q = |k: u128| -> Option<u128> { Some(top.checked_mul(k * 2_000_000)?.checked_add(bot)? / bot.checked_mul(2)?) };
+    let tenths = q(10)?;
+    Some(if tenths >= 100 {
+        format!("{}x", q(1)?)
+    } else if tenths >= 10 {
+        format!("{}.{}x", tenths / 10, tenths % 10)
+    } else {
+        let h = q(100)?;
+        format!("{}.{:02}x", h / 100, h % 100)
+    })
 }
