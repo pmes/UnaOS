@@ -12,6 +12,8 @@ use crate::Host;
 pub struct PaintStyle<H: Host> {
     pub background: Option<(u8, u8, u8)>,
     pub color: Option<(u8, u8, u8)>,
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the alpha of `color` (css-color-4 §4: one <color>; None = opaque, `transparent` = Some(0.0)); moves with `color`.
+    pub color_alpha: Option<f32>,
     pub font_size: Option<f32>,
     /// font-weight (css-fonts-4 §2.2): absolute, or relative to the parent's.
     pub weight: Option<FontWeight>,
@@ -164,8 +166,8 @@ pub struct PaintStyle<H: Host> {
     pub table_fixed: Option<bool>,
     /// Alpha of the background colour (css-color-4; absent = opaque).
     pub bg_alpha: Option<f32>,
-    /// Alpha of the border colour(s) (absent = opaque).
-    pub border_alpha: Option<f32>,
+    /// Alpha of each side's border colour, [top, right, bottom, left] (absent / a None side = opaque; SR1112: per side).
+    pub border_alpha: Option<[Option<f32>; 4]>,
     /// How `font_size` was specified: (0, f) = f x the parent's font-size
     /// (em, %, smaller/larger), (1, f) = f x the root's (rem), (2, _) =
     /// absolute (font_size as is).
@@ -345,6 +347,7 @@ impl<H: Host> Default for PaintStyle<H> {
             opacity: None,
             table_fixed: None,
             bg_alpha: None,
+            color_alpha: None,
             border_alpha: None,
             font_size_rel: None,
             used_font_size: None,
@@ -988,7 +991,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_FAMILY != 0 {
             self.family = None;
         }
-        if bits & INHERIT_COLOR != 0 { self.color = None; }
+        if bits & INHERIT_COLOR != 0 { self.color = None; self.color_alpha = None; }
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; self.ws_collapse = None; self.ws_wrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
         if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; } if bits & INHERIT_UNDERLINE_POSITION != 0 { self.underline_position = None; } if bits & INHERIT_CARET_COLOR != 0 { self.caret_color = None; }

@@ -1610,7 +1610,7 @@ mod tests {
     }
 
     /// A later, more specific `opacity: 1` un-hides what `opacity: 0` hid,
-    /// and `border-color: transparent` drops the UA control stroke.
+    /// and `border-color: transparent` drops the UA control stroke (SR1112: the sides kept at alpha 0, painting nothing).
     #[test]
     fn test_opacity_and_transparent_border_override() {
         let html = r#"<html><body class="on"><button class="b" id="q">go</button></body></html>"#;
@@ -1630,7 +1630,8 @@ mod tests {
             })
             .expect("button has a paint entry");
         assert_eq!(p.hidden, Some(false), "opacity:1 must win over an earlier opacity:0");
-        assert_eq!(p.border, Some([None; 4]), "transparent border-color = no stroke");
+        assert_eq!(p.border, Some([Some((1.0, (0, 0, 0))); 4]), "SR1112 (flipped in place; was Some([None; 4])): the sides are kept, black RGB");
+        assert_eq!(p.border_alpha, Some([Some(0.0); 4]), "SR1112: transparent border-color = alpha 0 on every side, no stroke (the UA frame stays off: spec.border is Some)");
     }
 
     /// float:left/right sizes to content and hugs its edge (approximation).
@@ -9476,6 +9477,202 @@ b</div>
         assert_ne!(imgalt_px(&e, 220, 50), (255, 0, 0), "gap: 40px: x 220 is gutter");
         assert_ne!(imgalt_px(&e, 220, 90), (255, 0, 0), "grid-gap: 40px: x 220 is gutter");
         assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
+    }
+
+    // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): one 40x20 box per row under a green parent: `#ta` `border: 2px solid
+    /// transparent`, `#tb` its borderless twin, `#td` `border: 2px solid red; border-color: transparent`, and `#th` the
+    /// reserve-space idiom: a transparent frame that `:hover` colours red.
+    fn border_transparent_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div div { width: 40px; height: 20px; margin: 0 0 12px }
+            .f { border: 2px solid; border-color: transparent }
+            .f:hover { border-color: red }
+            </style></head><body style="margin:0">
+            <div style="background:rgb(0, 160, 0);padding:8px">
+            <div id="ta" style="border:2px solid transparent"></div>
+            <div id="tb"></div>
+            <div id="td" style="border:2px solid red;border-color:transparent"></div>
+            <div id="th" class="f"></div>
+            </div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn border_transparent_not_green(c: (u8, u8, u8)) -> bool {
+        !css_wide_green(c)
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border: 2px solid transparent` reserves its 2px (a 44x24 border box)
+    /// and paints nothing over the green parent (before SR1112 a grey 2px frame: the shorthand read no colour); the
+    /// borderless twin is 40x20.
+    #[test]
+    fn border_transparent_shorthand_reserves_and_paints_nothing() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "ta");
+        assert_eq!((w, h), (44.0, 24.0), "#ta: the transparent 2px sides size the box");
+        assert_eq!(css_wide_color_ink(&mut e, "ta", border_transparent_not_green), 0, "#ta: no ink over the green parent");
+        let (_, _, w, h) = imgalt_rect(&mut e, "tb");
+        assert_eq!((w, h), (40.0, 20.0), "#tb: the borderless twin");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `border-color: transparent` over `border: 2px solid red` keeps the
+    /// sides (44x24; before SR1112 the sides were dropped and the box was 40x20) and paints no red.
+    #[test]
+    fn border_transparent_color_keeps_box() {
+        let mut e = border_transparent_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "td");
+        assert_eq!((w, h), (44.0, 24.0), "#td: border-color: transparent keeps the 2px sides");
+        assert_eq!(css_wide_color_ink(&mut e, "td", css_wide_red), 0, "#td: paints no red");
+        assert_eq!(css_wide_color_ink(&mut e, "td", border_transparent_not_green), 0, "#td: paints nothing");
+    }
+
+    /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the reserve-space idiom: `#th`'s transparent frame is 44x24 before and
+    /// under the pointer, so `:hover { border-color: red }` paints red without a layout shift (before SR1112 the frame
+    /// was dropped: 40x20 and no red on hover).
+    #[test]
+    fn border_transparent_hover_no_shift() {
+        let mut e = border_transparent_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "th");
+        assert_eq!((w, h), (44.0, 24.0), "#th: the transparent frame reserves its space");
+        assert_eq!(css_wide_color_ink(&mut e, "th", css_wide_red), 0, "#th: no red before hover");
+        e.handle_event(crate::api::events::Event::MouseMove(l + w / 2.0, t + h / 2.0));
+        e.render_frame();
+        let (_, _, w2, h2) = imgalt_rect(&mut e, "th");
+        assert_eq!((w2, h2), (44.0, 24.0), "#th: hover does not shift the box");
+        assert!(css_wide_color_ink(&mut e, "th", css_wide_red) > 0, "#th: the hover colour paints the reserved frame");
+    }
+
+    // ---- AETHERCSSOUTLINETRANSPARENT (LEDGER SR1119): an alpha-0 outline-color paints nothing and reads its cascaded text (named tail block) ----
+
+    /// AETHERCSSOUTLINETRANSPARENT (SR1119): three 40x20 boxes 12px apart, each outline pulled inside its box by
+    /// `outline-offset: -6px` (so the box's own rect holds the band): `#or` `2px solid red` (the reference), `#oa` the same
+    /// then `outline-color: rgba(255, 0, 0, 0)`, `#ob` `outline: 2px solid rgba(255, 0, 0, 0)`.
+    fn outline_transparent_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { width: 40px; height: 20px; margin: 0 0 12px; outline-offset: -6px }
+            </style></head><body style="margin:0">
+            <div id="or" style="outline:2px solid red"></div>
+            <div id="oa" style="outline:2px solid red;outline-color:rgba(255, 0, 0, 0)"></div>
+            <div id="ob" style="outline:2px solid rgba(255, 0, 0, 0)"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOUTLINETRANSPARENT (SR1119): an alpha-0 outline colour paints no ink (focusring's `paint_outlines` skips
+    /// alpha 0): `#oa` (red before SR1119: the alpha-0 longhand was dropped and the red stayed) and `#ob` paint no red
+    /// while `#or` does; getComputedStyle(#oa).outlineColor reads the cascaded `rgba(255, 0, 0, 0)` (no outline column:
+    /// AETHER-CSSOM-OUTLINE-COLUMNS owed).
+    #[test]
+    fn outline_transparent_paints_nothing() {
+        let mut e = outline_transparent_engine();
+        assert!(css_wide_color_ink(&mut e, "or", css_wide_red) > 20, "#or: the reference paints its red outline");
+        assert_eq!(css_wide_color_ink(&mut e, "oa", css_wide_red), 0, "armed: #oa's alpha-0 outline-color paints no red");
+        assert_eq!(css_wide_color_ink(&mut e, "ob", css_wide_red), 0, "#ob: the alpha-0 shorthand paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "oa", "outlineColor"), "rgba(255, 0, 0, 0)", "#oa: cssom");
+    }
+
+    // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
+    /// `rgba(0, 0, 0, 0.5)` with an inheriting span `#hfs`, `#tr` `transparent`, `#pr` a half-alpha parent of a
+    /// `color: red` span `#prc`, `#bd` half-alpha text in a `4px solid currentcolor` frame, `#sh` transparent text with
+    /// a red `text-shadow`.
+    fn color_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { font-size: 20px; line-height: 30px; margin: 0 0 10px; width: 300px }
+            </style></head><body>
+            <div id="op" style="color:#000"><span id="ops">MMMM</span></div>
+            <div id="hf" style="color:rgba(0, 0, 0, 0.5)"><span id="hfs">MMMM</span></div>
+            <div id="tr" style="color:transparent"><span id="trs">MMMM</span></div>
+            <div id="pr" style="color:rgba(0, 0, 0, 0.5)"><span id="prc" style="color:red">MMMM</span></div>
+            <div id="bd" style="color:rgba(0, 0, 0, 0.5);border:4px solid currentcolor"><span>MMMM</span></div>
+            <div id="sh" style="color:transparent;text-shadow:2px 2px 0 red"><span id="shs">MMMM</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the darkest channel of any pixel in element `id`'s rect, and the count of
+    /// pixels in it that are not white.
+    fn color_alpha_ink(e: &mut crate::AetherEngine, id: &str) -> (u8, usize) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize).min(sh));
+        let (mut dark, mut n) = (255u8, 0usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (r, g, b) = imgalt_px(e, x, y);
+                dark = dark.min(r.min(g).min(b));
+                if (r, g, b) != (255, 255, 255) {
+                    n += 1;
+                }
+            }
+        }
+        (dark, n)
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): half-alpha text paints at half ink (its darkest pixel ~127 where the opaque
+    /// control's is ~0; before SR1126 both were opaque), and transparent text paints no ink while its span keeps the
+    /// control's box (the run is measured and laid out; only the glyph pixels are skipped).
+    #[test]
+    fn color_alpha_paints_half_and_none() {
+        let mut e = color_alpha_engine();
+        let (op_dark, op_n) = color_alpha_ink(&mut e, "ops");
+        assert!(op_n > 20 && op_dark < 30, "the opaque control paints black ink: darkest {op_dark}, {op_n} px");
+        let (hf_dark, hf_n) = color_alpha_ink(&mut e, "hfs");
+        assert!(hf_n > 20, "the half-alpha text paints ink: {hf_n} px");
+        assert!((110..=150).contains(&hf_dark), "armed: the half-alpha text's darkest pixel is half ink: {hf_dark}");
+        assert_eq!(color_alpha_ink(&mut e, "trs").1, 0, "armed: transparent text paints no ink");
+        let (ow, oh) = (imgalt_rect(&mut e, "ops").2, imgalt_rect(&mut e, "ops").3);
+        let (tw, th) = (imgalt_rect(&mut e, "trs").2, imgalt_rect(&mut e, "trs").3);
+        assert_eq!((tw, th), (ow, oh), "transparent text keeps its laid-out box");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): `color: red` under a half-alpha parent is opaque red (the alpha is part of
+    /// the colour value, so the child's own colour resets it), and transparent text keeps its text-shadow (the shadow
+    /// paints from its own mask in its own colour, as Chromium's blur-text idiom).
+    #[test]
+    fn color_alpha_child_reset_and_shadow() {
+        let mut e = color_alpha_engine();
+        assert!(css_wide_color_ink(&mut e, "prc", css_wide_red) > 10, "the red child paints opaque red");
+        assert!(css_wide_color_ink(&mut e, "shs", css_wide_red) > 10, "transparent text keeps its red shadow");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the `color` column reads the alpha (Chromium's strings): `rgba(0, 0, 0,
+    /// 0.5)`, the inheriting span the same, `rgba(0, 0, 0, 0)` for transparent, `rgb(255, 0, 0)` for the reset child
+    /// (before SR1126 `rgb(0, 0, 0)` for the first three).
+    #[test]
+    fn color_alpha_cssom_column() {
+        let mut e = color_alpha_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "op", "color"), "rgb(0, 0, 0)", "the opaque control");
+        assert_eq!(font_shorthand_cs(&mut e, "hf", "color"), "rgba(0, 0, 0, 0.5)", "armed: the half alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "hfs", "color"), "rgba(0, 0, 0, 0.5)", "armed: the span inherits the alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "tr", "color"), "rgba(0, 0, 0, 0)", "armed: transparent");
+        assert_eq!(font_shorthand_cs(&mut e, "prc", "color"), "rgb(255, 0, 0)", "the child's own colour is opaque");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): a `currentcolor` border under half-alpha text still paints the opaque RGB
+    /// (pinned: AETHER-CSS-CURRENTCOLOR-ALPHA owed; Chromium paints it at half alpha).
+    #[test]
+    fn color_alpha_currentcolor_border_opaque_owed() {
+        let mut e = color_alpha_engine();
+        let (l, t, _, _) = imgalt_rect(&mut e, "bd");
+        assert_eq!(imgalt_px(&e, l as usize + 1, t as usize + 1), (0, 0, 0), "owed: the currentcolor frame is opaque black");
     }
 
     // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
