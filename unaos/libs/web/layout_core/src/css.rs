@@ -1167,7 +1167,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // descendant block, not just this box's own flex children. The
         // paint field carries it down (see layout::remeasure); the justify
         // here is the immediate effect on this box's own row.
-        "text-align" => match value {
+        "text-align-last" => { if let Some(c) = text_align_last_code::<H>(value) { style.paint.text_align_last = Some(c); } } "text-align" => match value { // AETHERTEXTALIGNLAST (SR1062): text-align-last parses through text_align_last_code
             "center" => {
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
@@ -2549,7 +2549,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align, object_fit, flex_container, border_style, radius,
+        mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
@@ -4105,7 +4105,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "writing-mode", "text-combine-upright", "text-orientation",
     "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
     "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
-    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content",
+    "vertical-align", "clear", "float", "text-indent", "text-align", "text-align-last", "justify-content", "align-items", "align-content",
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
@@ -4791,5 +4791,28 @@ pub fn border_style_word(code: u8) -> &'static str {
         2 => "dotted",
         3 => "double",
         _ => "solid",
+    }
+}
+
+// ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last parses to the text-align codes (named tail block) ----
+
+/// AETHERTEXTALIGNLAST (SR1062): css-text-3 §7.2 `text-align-last` to its code (the `text-align` table: 0 start,
+/// 1 center, 2 right, 3 end, 4 left, 8 justify; 255 = `auto`, which `initial` also writes, so an explicit auto overrides
+/// an inherited value). `inherit` / `unset` / `revert` are dropped as the `text-align` arm drops them (the field stays
+/// unspecified and inherits: AETHER-TEXT-ALIGN-LAST-WIDE owed); anything else is recorded and dropped.
+fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "initial" => Some(255),
+        "start" => Some(0),
+        "center" => Some(1),
+        "right" => Some(2),
+        "end" => Some(3),
+        "left" => Some(4),
+        "justify" => Some(8),
+        "inherit" | "unset" | "revert" | "revert-layer" => None,
+        other => {
+            H::record_css(&format!("text-align-last:{}", clip(other)));
+            None
+        }
     }
 }
