@@ -9123,8 +9123,8 @@ b</div>
 
     /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): each side reads its own ink through `border_ink` (before SR1104 the top /
     /// right / bottom colours had no column and read cssom's road); a colourless side reads currentcolor resolved; the
-    /// report serializes no alpha (one `border_alpha` for four sides: owed AETHER-CSS-BORDER-SIDE-ALPHA), so a half-alpha
-    /// red reads `rgb(255, 0, 0)`; an undeclared side reads the element's color (Chromium's currentcolor).
+    /// report serializes the side's alpha (SR1115: `rgba` over SR1112's `border_side_alpha`), so a half-alpha
+    /// red reads `rgba(255, 0, 0, 0.5)`; an undeclared side reads the element's color (Chromium's currentcolor).
     #[test]
     fn border_side_color_columns_read() {
         let mut e = border_side_color_columns_engine();
@@ -9134,7 +9134,7 @@ b</div>
             ("bc", "borderBottomColor", "rgb(255, 0, 0)"),
             ("bc", "borderLeftColor", "rgb(0, 0, 255)"),
             ("cc", "borderTopColor", "rgb(0, 128, 0)"),
-            ("ac", "borderTopColor", "rgb(255, 0, 0)"),
+            ("ac", "borderTopColor", "rgba(255, 0, 0, 0.5)"), // SR1115: the side's alpha reads through border_side_alpha
             ("nc", "borderTopColor", "rgb(0, 0, 0)"),
             ("nc", "borderRightColor", "rgb(0, 0, 0)"),
             ("nc", "borderBottomColor", "rgb(0, 0, 0)"),
@@ -9235,8 +9235,8 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "td", "textUnderlineOffset"), "2px");
     }
 
-    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): caret-color reads what `caret_ink` paints: a declared colour as rgb (no
-    /// alpha: owed AETHER-CSSOM-CARET-COLOR-ALPHA), auto the element's color, and the value inherits (`caret_inherit`).
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): caret-color reads what `caret_ink` paints: a declared colour as rgb (SR1115:
+    /// its alpha byte reads as rgba, `border_side_alpha_read_caret`), auto the element's color, and the value inherits (`caret_inherit`).
     #[test]
     fn text_decoration_columns_caret() {
         let mut e = text_decoration_columns_engine();
@@ -9518,5 +9518,81 @@ b</div>
         let (_, _, w2, h2) = imgalt_rect(&mut e, "th");
         assert_eq!((w2, h2), (44.0, 24.0), "#th: hover does not shift the box");
         assert!(css_wide_color_ink(&mut e, "th", css_wide_red) > 0, "#th: the hover colour paints the reserved frame");
+    }
+
+    // ---- AETHERCSSOMBORDERSIDEALPHAREAD (LEDGER SR1115): the report's colour columns serialize alpha (named tail block) ----
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): `#ha` a half-alpha red frame; `#tr` a transparent 2px frame; `#tz` a
+    /// zero-alpha red frame; `#ps` a red frame with a quarter-alpha blue left; `#ta` an alpha of 0.502 (128/255 in 8 bits);
+    /// `#nb` a plain div; `#ch` an input with a half-alpha green caret, `#ct` one with a transparent caret.
+    fn border_side_alpha_read_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="ha" style="width:40px;height:20px;border:1px solid rgba(255, 0, 0, 0.5)"></div>
+            <div id="tr" style="width:40px;height:20px;border:2px solid transparent"></div>
+            <div id="tz" style="width:40px;height:20px;border:2px solid rgba(255, 0, 0, 0)"></div>
+            <div id="ps" style="width:40px;height:20px;border:1px solid red;border-left-color:rgba(0, 0, 255, 0.25)"></div>
+            <div id="ta" style="width:40px;height:20px;border:1px solid rgba(255, 0, 0, 0.502)"></div>
+            <div id="nb" style="width:40px;height:20px"></div>
+            <input id="ch" style="caret-color: rgba(0, 128, 0, 0.5)">
+            <input id="ct" style="caret-color: transparent">
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): a half-alpha side reads `rgba(255, 0, 0, 0.5)` on all four sides (before
+    /// SR1115 `rgb(255, 0, 0)`: the report's helper dropped the alpha SR1112 stores).
+    #[test]
+    fn border_side_alpha_read_half() {
+        let mut e = border_side_alpha_read_engine();
+        for prop in ["borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor"] {
+            assert_eq!(font_shorthand_cs(&mut e, "ha", prop), "rgba(255, 0, 0, 0.5)", "armed: #ha {prop}");
+        }
+    }
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): `transparent` (SR1112: black at alpha 0) reads `rgba(0, 0, 0, 0)` on four
+    /// sides, as Chromium; a zero-alpha rgba keeps its stored RGB: `rgba(255, 0, 0, 0)`.
+    #[test]
+    fn border_side_alpha_read_transparent() {
+        let mut e = border_side_alpha_read_engine();
+        for prop in ["borderTopColor", "borderRightColor", "borderBottomColor", "borderLeftColor"] {
+            assert_eq!(font_shorthand_cs(&mut e, "tr", prop), "rgba(0, 0, 0, 0)", "#tr {prop}");
+            assert_eq!(font_shorthand_cs(&mut e, "tz", prop), "rgba(255, 0, 0, 0)", "#tz {prop}");
+        }
+    }
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): the alpha is per side: the quarter-alpha blue left reads
+    /// `rgba(0, 0, 255, 0.25)` while the opaque red top / right / bottom keep `rgb(255, 0, 0)`.
+    #[test]
+    fn border_side_alpha_read_per_side() {
+        let mut e = border_side_alpha_read_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ps", "borderLeftColor"), "rgba(0, 0, 255, 0.25)", "armed: #ps left");
+        for prop in ["borderTopColor", "borderRightColor", "borderBottomColor"] {
+            assert_eq!(font_shorthand_cs(&mut e, "ps", prop), "rgb(255, 0, 0)", "#ps {prop}");
+        }
+    }
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): caret-color reads its alpha byte: a half-alpha green
+    /// `rgba(0, 128, 0, 0.5)` (before SR1115 `rgb(0, 128, 0)`), `transparent` `rgba(0, 0, 0, 0)`.
+    #[test]
+    fn border_side_alpha_read_caret() {
+        let mut e = border_side_alpha_read_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ch", "caretColor"), "rgba(0, 128, 0, 0.5)", "armed: #ch caretColor");
+        assert_eq!(font_shorthand_cs(&mut e, "ct", "caretColor"), "rgba(0, 0, 0, 0)", "#ct caretColor");
+    }
+
+    /// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): the alpha text is css_core's `Rgba::serialize` (the tree's one serializer):
+    /// 0.502 rounds to 128/255 and prints the shortest round-tripping decimal `0.5` (modern Chromium prints 0.502: owed
+    /// AETHER-CSSOM-ALPHA-FLOAT); background none still `rgba(0, 0, 0, 0)` through the same helper; 45 columns.
+    #[test]
+    fn border_side_alpha_read_text() {
+        let mut e = border_side_alpha_read_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ta", "borderTopColor"), "rgba(255, 0, 0, 0.5)", "#ta: 128/255");
+        assert_eq!(font_shorthand_cs(&mut e, "nb", "backgroundColor"), "rgba(0, 0, 0, 0)", "#nb backgroundColor");
+        assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "45");
     }
 }
