@@ -1133,6 +1133,10 @@ struct EdlRun {
     pic: Pic,
     at: i64, // STRIAKSPEED (SR9012): the source tick of the last picture this run returned (`edl_rated`, file tail)
     last: Option<(usize, usize, Vec<u32>, Option<u32>)>, // STRIAKSPEED (SR9012): that picture, kept only under a clip slower than 1x (the hold)
+    /// STRIAKREVERSE (SR9095): a BACKWARD run's last pictures (timeline_core's `BACK_CACHE`), served newest first ([`edl_back`]).
+    back: VecDeque<BackPic>,
+    /// STRIAKREVERSE (SR9095): the source tick this run served last.
+    last_t: i64,
 }
 
 /// The ONE open-or-continue fn (Stria's `vid_frame` shape), for a step's own source and a transition's outgoing alike:
@@ -1149,12 +1153,12 @@ fn edl_frame(
     rep: &mut EdlReport,
     outgoing: bool,
 ) -> Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)> {
-    if let Some(f) = seq_frame(reels, id, src_t, slot) { return f; } let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?; // STRIAKSEQ (LEDGER SR9065): a sequence step reads and decodes its one file (file tail)
+    if let Some(f) = seq_frame(reels, id, src_t, slot) { return f; } if let Some(p) = edl_back(reels, tb, slot, id, src_t, seek, rep)? { return Ok(p); } let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?; // STRIAKSEQ (LEDGER SR9065): a sequence step reads and decodes its one file (file tail) // STRIAKREVERSE (SR9095): a run stepping backwards is served from its back cache (file tail)
     let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
         let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tb.to_ns(src_t)).collect();
         let pic = Pic::open(vt, tb.to_ns(src_t)); rep.swaps += pic.on_stand_in() as u64; // SWAPBACKVPLAY (rmbp-ledger B956): a fresh decoder per run (the kernel's reseed), else the open-time stand-in
-        *slot = Some(EdlRun { src: id, reads, pos: 0, pic, at: src_t - 1, last: None }); // STRIAKSPEED (SR9012): the run's first picture is source tick src_t
+        *slot = Some(EdlRun { src: id, reads, pos: 0, pic, at: src_t - 1, last: None, back: VecDeque::new(), last_t: src_t }); // STRIAKSPEED (SR9012): the run's first picture is source tick src_t
         if outgoing {
             rep.mix_seeks += 1;
         } else {
@@ -1403,6 +1407,8 @@ mod snd {
         cut: bool,
         done: bool, pan_w: [i64; 2], // STRIAKPAN (LEDGER SR9015): the playing layer's per-channel pan factor (Q16, timeline_core's pan_mix_q16)
         meter_gain: (i64, i64, u64), // STRIAKMETER (SR9058): the run's mixer ramp `(e0, e1, cnt)` (Q8), so the level meter reads what the mixer plays (file tail)
+        /// STRIAKREVERSE (SR9095): a reversed run's frames read forward, not yet served (served from the tail, reversed).
+        rev: Option<Vec<i32>>,
     }
 
     /// A reel's sound: its demuxer share when audio_core plays its audio track, and the track's format.
@@ -1416,6 +1422,8 @@ mod snd {
     struct Snd {
         q: Vec<Vec<u32>>, // STRIAKSPEED (SR9012): per run, per layer, the speed it plays at (`rated_q`, the tail of this module)
         runs: Vec<AudioRun>,
+        /// STRIAKREVERSE (SR9095): every reversed layer: (run, layer, its lowest source tick) ([`rev_layers`]).
+        back: Vec<(usize, usize, i64)>,
         tb: Timebase,
         reels: Vec<ReelSnd>,
         slots: Vec<Slot>,
@@ -1439,7 +1447,7 @@ mod snd {
     }
 
     fn slot(track: usize, under: bool, id: u32, rate: u32, ch: u8, ri: usize) -> Slot {
-        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false, pan_w: [65536; 2], meter_gain: (0, 0, 0) }
+        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false, pan_w: [65536; 2], meter_gain: (0, 0, 0), rev: None }
     }
 
     /// The EDL's sound (see the section head); a refusal leaves the pictures playing silent.
@@ -1481,7 +1489,8 @@ mod snd {
             return;
         }
         *SND.lock() = Some(Snd {
-            q: rated_q(&runs, tl), runs, // STRIAKSPEED (SR9012): every layer's speed through timeline_core's `AudioRun::layer_rate`
+            q: rated_q(&back: rev_layers(tl, &runs),
+            runs, tl), runs, // STRIAKSPEED (SR9012): every layer's speed through timeline_core's `AudioRun::layer_rate`
             tb: tl.tb,
             reels: rs,
             slots,
@@ -1680,7 +1689,7 @@ mod snd {
                 self.slots[i].meter_gain = (e0, e1, cnt); if !mixer::set_gain_ramp(id, from, e1 as u16, n48) { // STRIAKMETER (SR9058): the ramp the level meter applies (file tail)
                     self.refuse("ramp-queue");
                 }
-                play = self.seat(i, l.src, l.src_t, l.seek.is_some(), s0, self.q.get(self.slots[i].ri).and_then(|r| r.get(li)).copied().unwrap_or(0x1_0000)); // STRIAKSPEED (SR9012): the layer's speed
+                play = match self.seat_rev(i, li, s0, cnt) { Some(p) => p, None => self.seat(i, l.src, l.src_t, l.seek.is_some(), s0, self.q.get(self.slots[i].ri).and_then(|r| r.get(li)).copied().unwrap_or(0x1_0000)) }; // STRIAKSPEED (SR9012): the layer's speed // STRIAKREVERSE (SR9095): a reversed layer read forward from its lowest tick (section tail)
             }
             let sl = &mut self.slots[i];
             sl.play = play;
@@ -1777,7 +1786,7 @@ mod snd {
     fn make(sl: &mut Slot, k: u64) {
         if make_rated(sl, k) { return; } let ch = sl.ch.max(1) as usize; // STRIAKSPEED (SR9012): a rated layer through its converter (the tail of this module)
         let mut buf = alloc::vec![0i32; k as usize * ch];
-        if let (true, Some(a)) = (sl.play, sl.aud.as_mut()) {
+        if let (true, Some(a), false) = (sl.play, sl.aud.as_mut(), rev_take(sl.play, &mut sl.rev, &mut buf, ch)) { // STRIAKREVERSE (SR9095): a reversed run serves its read-ahead, reversed (section tail)
             let got = a.dec.next_i32(&mut buf).unwrap_or(0);
             a.pos += got as u64;
         }
@@ -1834,6 +1843,71 @@ mod snd {
         sl.pend.reserve(out.len() * 2);
         for v in &out {
             sl.pend.extend_from_slice(&v.to_le_bytes());
+        }
+        true
+    }
+
+    // ---- STRIAKREVERSE (LEDGER SR9095): a reversed layer's sound — read forward from its lowest tick, served reversed (named tail block) ----
+    // `open` names every reversed layer once (timeline_core's `AudioRun::reversed_lo`, the host's `take_reversed` reads the
+    // same); `setup` seats such a layer through `seat_rev`: THE `seat` at the run's LOWEST source tick (a reopen), the run's
+    // `cnt - s0` frames read forward into `Slot.rev`; `make` serves the tail of `rev` turned round (timeline_core's
+    // `reverse_frames`) and truncates it, so the run's first frame is its highest tick. A read-ahead the heap cannot hold
+    // (free < twice its bytes) is refused by name, `[nle] audio reverse refused (reel <id>: heap ...)`: that run is silent,
+    // the pictures play. A forward layer never touches `rev` (`None`: the decoder's read, unchanged).
+
+    /// STRIAKREVERSE: every reversed layer of `runs`: (run, layer, its lowest source tick).
+    fn rev_layers(tl: &timeline_core::Timeline, runs: &[AudioRun]) -> Vec<(usize, usize, i64)> {
+        runs.iter().enumerate().flat_map(|(ri, r)| (0..r.layers.len()).filter_map(move |li| r.reversed_lo(tl, li).map(|lo| (ri, li, lo)))).collect()
+    }
+
+    impl Snd {
+        /// STRIAKREVERSE: slot `i`'s layer `li` of its run when it is reversed: seated at the run's lowest tick and its
+        /// `cnt - s0` frames read ahead into `rev`; `Some(false)`: refused or no sound (the run is silent); `None`: a
+        /// forward layer (THE `seat` road).
+        fn seat_rev(&mut self, i: usize, li: usize, s0: u64, cnt: u64) -> Option<bool> {
+            self.slots[i].rev = None;
+            let ri = self.slots[i].ri;
+            let lo = self.back.iter().find(|b| b.0 == ri && b.1 == li)?.2;
+            let src = self.runs[ri].layers[li].src;
+            let ch = self.slots[i].ch.max(1) as usize;
+            let n = cnt.saturating_sub(s0) as usize;
+            if let Err(why) = super::heap_room(n * ch * 4) {
+                self.said += 1;
+                if self.said <= 4 {
+                    serial_println!("[nle] audio reverse refused (reel {}: {})", src.0, why);
+                }
+                return Some(false);
+            }
+            if !self.seat(i, src, lo, true, 0) {
+                return Some(false);
+            }
+            let Some(a) = self.slots[i].aud.as_mut() else { return Some(false) };
+            let mut pcm = alloc::vec![0i32; n * ch];
+            let mut got = 0usize;
+            while got < n {
+                let k = (n - got).min(CHUNK as usize);
+                let g = a.dec.next_i32(&mut pcm[got * ch..(got + k) * ch]).unwrap_or(0) as usize;
+                if g == 0 {
+                    break; // the reel ends: the rest stays silence
+                }
+                got += g;
+            }
+            a.pos += got as u64;
+            self.slots[i].rev = Some(pcm);
+            Some(true)
+        }
+    }
+
+    /// STRIAKREVERSE: a reversed run's next `buf.len() / ch` frames: the tail of its read-ahead, turned round (written only
+    /// while the slot plays); false: not a reversed run (the decoder's read).
+    fn rev_take(play: bool, rev: &mut Option<Vec<i32>>, buf: &mut [i32], ch: usize) -> bool {
+        let Some(v) = rev.as_mut() else { return false };
+        if play {
+            let n = (buf.len() / ch).min(v.len() / ch) * ch;
+            let at = v.len() - n;
+            buf[..n].copy_from_slice(&v[at..]);
+            timeline_core::schedule::reverse_frames(&mut buf[..n], ch);
+            v.truncate(at);
         }
         true
     }
@@ -1913,7 +1987,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 2021201920201920222022192021202019] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys) // STRIAKSHUTTLE (SR9061): + j / k / l, the host KEYS words // STRIAKXFORMKEYS (LEDGER SR9073): 18 -> 20, `p` / `P`
+const EDIT_KEYS: [(u8, &str); 202120192020192022202219202120201919] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys) // STRIAKSHUTTLE (SR9061): + j / k / l, the host KEYS words // STRIAKXFORMKEYS (LEDGER SR9073): 18 -> 20, `p` / `P`
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1954,6 +2028,7 @@ const EDIT_KEYS: [(u8, &str); 2021201920201920222022192021202019] = [ // STRIAXF
     (b'l', "shuttle+"),
     (b'8', "opacity-"), (b'9', "opacity+"), // STRIAKOPACITY (SR9013): the host's KEYS 8 / 9, the shown clip's opacity 10 % down / up (file tail)
     (b'p', "pip key"), (b'P', "pip unkey"), // STRIAKXFORMKEYS (LEDGER SR9073): the placement point at the playhead set / removed on the shown clip (the host KEYS p / P) (b'!', "meters-reset"), // STRIAKMETERRESET (SR9101): `!` clears every clip latch and peak hold, the host KEYS' `!` too (file tail)
+    (b'a', "reverse"), // STRIAKREVERSE (SR9095): the selected clip played backwards / forwards (timeline_core's `reverse`, the host's `a`)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -4653,4 +4728,111 @@ fn edit_begin(st: &mut timeline_core::editor::EditorState, l: timeline_core::vie
         }
         None => Drag::begin_with(st, l, x, y, false, nosnap, false).ok_or(false),
     }
+}
+
+// ---- STRIAKREVERSE (LEDGER SR9095): a reversed clip on the Player — the back cache in edl_frame, the reversed sound in snd (named tail block) ----
+// NLE-REVERSE-KERNEL. A reversed 1x clip's source ticks DESCEND (THE `Clip::src_at`; the schedule seeks only at its first
+// step), and `edl_frame`'s continuing run returns the NEXT decoded picture, so it would play forward. `edl_back`, folded
+// first in `edl_frame`, keeps each run's last served tick (`EdlRun.last_t`) and steps by timeline_core's ONE back-cache rule
+// (`schedule::back_step`, the host's `vid_back` too): a forward run never fills `EdlRun.back` and takes the old road; a run
+// behind its last tick is served the newest cached picture at or before the target (`back_pick`), else REFILLED: the same
+// run re-seated at the keyframe at or before the target (`samples_from`, its `preroll` marks cleared so every picture comes
+// out), THE `edl_frame` called once per picture up to the target (its nested `edl_back` sees an empty cache: the continue
+// road), the last `BACK_CACHE` kept as 0RGB (`back_keep`; a refill's pictures count as `runup`, not as `stand_in_frames`),
+// one `seeks` per refill: one GOP decode per `BACK_CACHE` backward steps. Entries take the sorted pts of the non-skip reads
+// up to the target (output order taken as presentation order, as the forward road does). The cache's heap is asked first
+// (`heap_room`: free >= twice `w x h x 4 x BACK_CACHE`); a refusal ends the job by name, `why=reverse-heap`. A forward EDL is
+// byte-identical (empty cache: `Forward`). Sound: `snd`'s section tail (`seat_rev` / `rev_take`).
+
+/// STRIAKREVERSE: one cached picture of a backward run: its source time (ns from the reel's origin), its 0RGB, its ordinal.
+struct BackPic {
+    ns: i64,
+    w: usize,
+    h: usize,
+    rgb: Vec<u32>,
+    ord: Option<u32>,
+}
+
+/// STRIAKREVERSE: the picture at `src_t` when `slot`'s run of `id` (no `seek`) steps backwards; `None`: `edl_frame`'s road.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn edl_back(
+    reels: &Reels,
+    tb: timeline_core::Timebase,
+    slot: &mut Option<EdlRun>,
+    id: timeline_core::SourceId,
+    src_t: i64,
+    seek: bool,
+    rep: &mut EdlReport,
+) -> Result<Option<(usize, usize, Px, Option<u32>)>, (&'static str, Option<String>)> {
+    use timeline_core::schedule::{back_keep, back_step, BackStep, BACK_CACHE};
+    let (target, tol) = (tb.to_ns(src_t), tb.to_ns(1) / 2);
+    let Some(x) = slot.as_mut().filter(|x| x.src == id && !seek) else { return Ok(None) };
+    match back_step(target, tb.to_ns(x.last_t), tol, x.back.front().map(|b| b.ns)) {
+        BackStep::Forward => {
+            x.last_t = src_t;
+            return Ok(None);
+        }
+        BackStep::Drop => {
+            *slot = None;
+            return Ok(None);
+        }
+        BackStep::Hold | BackStep::Cached => {
+            if let Some(p) = back_serve(x, target, tol, src_t, rep) {
+                return Ok(Some(p));
+            }
+        }
+        BackStep::Refill => {}
+    }
+    let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
+    let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
+    heap_room(vt.width as usize * vt.height as usize * 4 * BACK_CACHE).map_err(|why| ("reverse-heap", Some(why)))?;
+    let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + target).collect();
+    let mut at: Vec<i64> = reads.iter().filter(|rd| !rd.skip).map(|rd| vt.timebase.to_ns(rd.sample.pts) - o).filter(|&p| p <= target + tol).collect();
+    at.sort_unstable();
+    if at.is_empty() {
+        return Err(("reel-short", Some(alloc::format!("reel {} has no picture at or before source tick {}", id.0, src_t))));
+    }
+    let pic = Pic::open(vt, target);
+    rep.swaps += pic.on_stand_in() as u64;
+    x.reads = reads.into_iter().map(|rd| demux_core::SampleRead { preroll: false, ..rd }).collect();
+    x.pos = 0;
+    x.pic = pic;
+    x.back.clear();
+    x.last_t = src_t;
+    rep.seeks += 1;
+    let mut back = VecDeque::new();
+    let n = at.len();
+    for (k, &ns) in at.iter().enumerate() {
+        let (w, h, px, ord) = edl_frame(reels, tb, slot, id, src_t, false, rep, false)?;
+        if let Some(x) = slot.as_ref() {
+            rep.stand_in_frames = rep.stand_in_frames.saturating_sub(x.pic.on_stand_in() as u64); // a refill's picture is not shown
+        }
+        if k + BACK_CACHE >= n {
+            back_keep(&mut back, BackPic { ns, w, h, rgb: px.rgb().to_vec(), ord });
+        }
+    }
+    rep.runup += n as u64 - 1;
+    let Some(x) = slot.as_mut() else { return Err(("superseded", None)) };
+    x.back = back;
+    back_serve(x, target, tol, src_t, rep).map(Some).ok_or_else(|| ("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, src_t))))
+}
+
+/// STRIAKREVERSE: the newest cached picture of `x` at or before `target + tol` (timeline_core's `back_pick`), its tick kept
+/// as the run's last; counted as a stand-in frame when the run is on its stand-in (the forward road's rule).
+fn back_serve(x: &mut EdlRun, target: i64, tol: i64, src_t: i64, rep: &mut EdlReport) -> Option<(usize, usize, Px, Option<u32>)> {
+    let b = timeline_core::schedule::back_pick(&x.back, target, tol, |b| b.ns)?;
+    let p = (b.w, b.h, Px::from(b.rgb.clone()), b.ord);
+    x.last_t = src_t;
+    rep.stand_in_frames += x.pic.on_stand_in() as u64;
+    Some(p)
+}
+
+/// STRIAKREVERSE: room on the heap for `need` more bytes: granted while the free heap holds twice that (`slot_room`'s rule).
+fn heap_room(need: usize) -> Result<(), String> {
+    let (lo, hi) = crate::allocator::heap_bounds();
+    let free = hi.saturating_sub(lo).saturating_sub(crate::allocator::heap_used());
+    if free < 2 * need {
+        return Err(alloc::format!("heap free_kb={} need_kb={}", free / 1024, need / 1024));
+    }
+    Ok(())
 }

@@ -15732,3 +15732,21 @@ fn striakgainenv_face_order() {
     assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv), "a plain press on the line");
     println!("striakgainenv face: edge -> TransitionIn, middle -> picked, Shift on the line -> not GainEnv, plain -> GainEnv");
 }
+
+// ---- STRIAKREVERSE (LEDGER SR9095): `a` is the word `reverse` on the host face (the kernel Player's EDIT_KEYS `a` too) (named tail block) ----
+
+/// `a` (text) toggles the selected clip's reverse through the ONE word (one undo step each way), and the help names it.
+#[test]
+fn striakreverse_key_a_toggles_reverse_in_one_step() {
+    assert!(KEYS.contains(&("a", "reverse")));
+    assert_eq!(help_phrase("reverse"), "play the clip backwards (again: forwards)");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    assert!(nle5drangekeys_press(&mut face, "a"));
+    assert_eq!((face.state.selected().map(|c| c.reverse), face.state.undo_depth()), (Some(true), 1));
+    assert!(nle5drangekeys_press(&mut face, "a"));
+    assert_eq!((face.state.selected().map(|c| c.reverse), face.state.undo_depth()), (Some(false), 2));
+    assert_eq!(face.state.timeline, tl, "two presses restore the forward clip");
+    println!("striakreverse: key a -> reverse x2, undo={}", face.state.undo_depth());
+}

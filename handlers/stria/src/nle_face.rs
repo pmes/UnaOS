@@ -485,6 +485,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+g", "enter goto"),
     ("Ctrl+Return", "enter"),
     ("Meta+Return", "enter"),
+    ("a", "reverse"), // STRIAKREVERSE (SR9095): `a` (text) is the word `reverse` (VERBS), the kernel Player's `a` too (vplay.rs EDIT_KEYS)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
     ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
@@ -2673,6 +2674,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("env", "gain point at the playhead"), ("env-del", "remove the gain point at the playhead"), ("env-", "gain point down one step"), ("env+", "gain point up one step"), // STRIAGAINENVDRAG (SR9082)
     ("enter goto", "go to a typed timecode (Return: go, Escape: cancel)"), // STRIAGOTOMORE (SR9097)
     ("enter", "type a face word (Return: do it, Escape: cancel)"),
+    ("reverse", "play the clip backwards (again: forwards)"), // STRIAKREVERSE (SR9095)
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
