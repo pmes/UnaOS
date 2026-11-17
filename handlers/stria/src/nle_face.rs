@@ -1666,7 +1666,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
-        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_snap_badge(view::paint_drag(view::paint_roll_cue(self.paint_transition_still(px, l), l, vo(self.order), &self.state, self.roll_tool && self.drag.is_none()), l, vo(self.order), self.drag.as_ref()), l, vo(self.order), self.snap_off), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
+        { let px = paint_marks(paint_queue_depth(paint_export(paint_meter_clips(paint_meters(view::paint_snap_badge(view::paint_drag(view::paint_roll_cue(self.paint_transition_still(px, l), l, vo(self.order), &self.state, self.roll_tool && self.drag.is_none()), l, vo(self.order), self.drag.as_ref()), l, vo(self.order), self.snap_off), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.export_queue.len()), l, self.order, self.marks()); self.paint_help(px, l) } // STRIAEXPORTRANGEBAND (SR9099): the queue depth's notches on the band (file tail); NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -2155,7 +2155,7 @@ pub struct ExportJob {
     /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), chapters: String, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), chapters: String, named: bool, // STRIAEXPORTRANGEBAND (SR9099): the entry is named on the running row (a queued start or a marker word, file tail); NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2213,7 +2213,7 @@ impl Face {
                 export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, chapters: self.export_chapters(&range), range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, chapters: self.export_chapters(&range), range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0), named: false }); // STRIAEXPORTRANGEBAND (SR9099): a plain start is unnamed (file tail)
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2405,7 +2405,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.entry_line().or_else(|| self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone())).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.state.source_line()).or_else(|| self.stack_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIASTACKTOOL (SR9093): the layer count under the playhead (file tail). STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail) // STRIAGOTOMORE (SR9097): the open entry line wins the row (file tail)
+        self.entry_line().or_else(|| self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone())).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.running_note() + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.state.source_line()).or_else(|| self.stack_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTRANGEBAND (SR9099): the running entry's name (file tail); STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIASTACKTOOL (SR9093): the layer count under the playhead (file tail). STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail) // STRIAGOTOMORE (SR9097): the open entry line wins the row (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -6475,7 +6475,7 @@ impl Face {
             return "export: nothing waiting".to_string();
         }
         let names: Vec<String> = self.export_queue.iter().take(EXPORT_LIST_SHOWN).map(|r| {
-            let name = r.dir.file_name().map_or_else(|| r.dir.display().to_string(), |f| f.to_string_lossy().into_owned());
+            let name = entry_name(&r.dir); // STRIAEXPORTRANGEBAND (SR9099): the one name rule, lifted (file tail)
             format!("{name} {}{}", r.fmt, list_entry_note(r)) // STRIAEXPORTQUEUEMORE (SR971): the range / audio word (file tail)
         }).collect();
         let more = if n > EXPORT_LIST_SHOWN { format!(", +{} more", n - EXPORT_LIST_SHOWN) } else { String::new() };
@@ -11206,7 +11206,7 @@ impl Face {
                 return Some(true);
             }
             if idle {
-                started = Some(dir);
+                started = Some(dir); self.mark_named(&Ok(())); // STRIAEXPORTRANGEBAND (SR9099): a lone marker entry started idle is named on the running row (file tail)
             }
         }
         if self.last_error.as_deref().is_some_and(|l| l.starts_with("export: queued")) {
@@ -11866,4 +11866,53 @@ mod striagotomore_tests {
         assert_eq!(goto_target("-20", 12, &tl), Ok(-8), "the seek clamps, not the reader");
         assert!(goto_target("+", 12, &tl).is_err());
     }
+}
+
+// ---- STRIAEXPORTRANGEBAND (LEDGER SR9099): the running entry's name and the queue depth on the band (named tail block) ----
+// The running row (`Face::message_text`) carries ` -> <name>` between the cloud's unchanged `job_line` and SR971's
+// `waiting_note` while requests wait, or when the running job is a named entry (`ExportJob.named`: started from the
+// queue by SR914's `start_request`, or started idle by SR9075's `export marker(s)`), so the last queued entry and a lone
+// marker entry stay named; a lone plain export reads exactly as before. The name is `entry_name`, SR932's rule lifted
+// once (export-list calls it). The painted 2 px export band gains one `view::TICK` notch per waiting request at its
+// right end (`paint_queue_depth`); none waiting paints nothing, so every golden is byte-identical. NLE-EXPORT-QUEUE-PLAIN
+// needs no code: SR881's `export_or_queue` already queues a plain export behind a running one (busy only when full).
+// Face thread only, no lock. Owed: NLE-EXPORT-QUEUE-BAND-WITNESS, NLE-EXPORT-QUEUE-BAND-KERNEL.
+
+/// STRIAEXPORTRANGEBAND (SR9099): an export entry's name: its directory's last component, else the whole path
+/// (SR932's export-list rule, the one copy).
+fn entry_name(dir: &std::path::Path) -> String {
+    dir.file_name().map_or_else(|| dir.display().to_string(), |f| f.to_string_lossy().into_owned())
+}
+
+impl Face {
+    /// Mark the running job as a named entry when `res` says it started.
+    fn mark_named(&mut self, res: &Result<(), String>) {
+        if let (Ok(()), Some(j)) = (res, self.export.as_mut()) {
+            j.named = true;
+        }
+    }
+    /// The running entry's name while the row names it: a named entry, or any request waiting; `None` otherwise.
+    pub fn export_running_name(&self) -> Option<String> {
+        self.export.as_ref().filter(|j| j.named || !self.export_queue.is_empty()).map(|j| entry_name(&j.dir))
+    }
+    /// The running row's name part: ` -> <name>` ([`Face::export_running_name`]), else empty.
+    fn running_note(&self) -> String {
+        self.export_running_name().map(|n| format!(" -> {n}")).unwrap_or_default()
+    }
+}
+
+/// STRIAEXPORTRANGEBAND (SR9099): the queue depth over the export band: `n` (at most [`EXPORT_QUEUE_MAX`]) notches on the
+/// band's rows (`tracks_y - EXPORT_BAND_H .. tracks_y`), notch i at x `w - 4(i + 1) .. w - 4(i + 1) + 2`, in `view::TICK`.
+/// `n == 0` paints nothing.
+fn paint_queue_depth(px: Vec<u8>, l: Layout, order: PixelOrder, n: usize) -> Vec<u8> {
+    if n == 0 {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
+    let y1 = l.tracks_y as i64;
+    for i in 0..n.min(EXPORT_QUEUE_MAX) as i64 {
+        let x0 = l.w as i64 - 4 * (i + 1);
+        c.rect(x0, y1 - EXPORT_BAND_H as i64, x0 + 2, y1, view::TICK);
+    }
+    c.px
 }
