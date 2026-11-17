@@ -1597,7 +1597,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "text-decoration" | "text-decoration-line" => {
-            let v = value.trim();
+            let v = value.trim(); deco_shorthand_color::<H>(prop, v, &mut style.paint);
             if v.contains("underline") {
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
@@ -1606,6 +1606,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
             if v.contains("line-through") {
                 style.paint.line_through = Some(true);
+            }
+        }
+        "text-decoration-color" => {
+            if let Some(c) = deco_color_value::<H>(value) {
+                style.paint.decoration_color = Some(c);
             }
         }
         "white-space" | "white-space-collapse" => {
@@ -2585,7 +2590,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
-        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
@@ -3747,4 +3752,28 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "border-width" => "3px",
         _ => value,
     }
+}
+
+// ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color and the shorthand's colour word (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a `text-decoration-color` value in the [`PaintStyle::decoration_color`] marker
+/// shape: `currentcolor`, `initial` and `unset` (not inherited: unset == initial, css-cascade-4 §7.3.3) are `Some(None)`;
+/// a colour [`parse_color_str`] reads is `Some(Some(c))`; anything else (inherit, transparent, an invalid value) None.
+fn deco_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8)>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
+        return Some(None);
+    }
+    parse_color_str::<H>(v).map(Some)
+}
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the `text-decoration` shorthand (css-text-decor-3 §2.4) sets its colour
+/// longhand: the first top-level token that is a colour (or `currentcolor`), else the initial currentcolor (the reset);
+/// `inherit` / `revert` leave it. `text-decoration-line` never touches it.
+fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>) {
+    if prop != "text-decoration" || v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("revert") {
+        return;
+    }
+    let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
+    paint.decoration_color = Some(c.unwrap_or(None));
 }

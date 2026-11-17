@@ -528,3 +528,55 @@ fn font_inherit_leaves_inherited_rest() {
     assert_eq!(dst.paint.inherit, INHERIT_FONT);
     assert_eq!(INHERIT_FONT & (INHERIT_WHITE_SPACE | INHERIT_DIRECTION | INHERIT_LIST_STYLE), 0);
 }
+
+// ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color and the shorthand's colour word (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the longhand: a colour is `Some(Some(c))`; currentcolor, initial and unset
+/// (not inherited: unset == initial) are `Some(None)`; inherit, transparent and an invalid value write nothing.
+#[test]
+fn text_decoration_color_longhand() {
+    let red = Some(Some((255, 0, 0)));
+    assert_eq!(styled(&[("text-decoration-color", "red")]).paint.decoration_color, red);
+    assert_eq!(styled(&[("text-decoration-color", "rgb(0, 160, 0)")]).paint.decoration_color, Some(Some((0, 160, 0))));
+    for v in ["currentcolor", "currentColor", "initial", "unset"] {
+        assert_eq!(styled(&[("text-decoration-color", v)]).paint.decoration_color, Some(None), "{v}");
+    }
+    for v in ["inherit", "transparent", "bogus"] {
+        assert_eq!(styled(&[("text-decoration-color", v)]).paint.decoration_color, None, "{v}");
+    }
+    let s = styled(&[("text-decoration-color", "red"), ("text-decoration-color", "bogus")]);
+    assert_eq!(s.paint.decoration_color, red, "an invalid later value is dropped");
+    assert_eq!(styled(&[("color", "red")]).paint.decoration_color, None, "armed: color alone writes none");
+}
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the `text-decoration` shorthand writes its colour word, and without one resets
+/// the colour to currentcolor; `text-decoration-line` keeps it.
+#[test]
+fn text_decoration_color_shorthand() {
+    let s = styled(&[("text-decoration", "underline red")]);
+    assert_eq!(s.paint.underline, Some(true));
+    assert_eq!(s.paint.decoration_color, Some(Some((255, 0, 0))));
+    let s = styled(&[("text-decoration", "rgb(0, 160, 0) line-through")]);
+    assert_eq!(s.paint.line_through, Some(true));
+    assert_eq!(s.paint.decoration_color, Some(Some((0, 160, 0))));
+    let s = styled(&[("text-decoration-color", "red"), ("text-decoration", "underline")]);
+    assert_eq!(s.paint.decoration_color, Some(None), "the shorthand resets the colour to currentcolor");
+    let s = styled(&[("text-decoration-color", "red"), ("text-decoration-line", "underline")]);
+    assert_eq!(s.paint.decoration_color, Some(Some((255, 0, 0))), "the line longhand keeps the colour");
+    let s = styled(&[("text-decoration", "underline red"), ("text-decoration-color", "currentcolor")]);
+    assert_eq!(s.paint.decoration_color, Some(None), "a later longhand wins");
+    let s = styled(&[("text-decoration-color", "red"), ("text-decoration", "inherit")]);
+    assert_eq!(s.paint.decoration_color, Some(Some((255, 0, 0))), "inherit leaves it");
+}
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): merge_paint carries the colour later-wins; a rule without it keeps the earlier.
+#[test]
+fn text_decoration_color_merge() {
+    let mut dst = styled(&[("text-decoration-color", "red")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!(dst.paint.decoration_color, Some(Some((255, 0, 0))), "a rule without it keeps red");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration-color", "currentcolor")]).paint);
+    assert_eq!(dst.paint.decoration_color, Some(None), "a later currentcolor wins");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline blue")]).paint);
+    assert_eq!(dst.paint.decoration_color, Some(Some((0, 0, 255))), "a later shorthand colour wins");
+}
