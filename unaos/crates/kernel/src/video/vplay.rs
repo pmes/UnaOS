@@ -1847,7 +1847,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 20212019202019] = [
+const EDIT_KEYS: [(u8, &str); 2021201920201920] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1876,6 +1876,7 @@ const EDIT_KEYS: [(u8, &str); 20212019202019] = [
     (b'y', "link-av"), (b'Y', "unlink"), // STRIAKLINK (LEDGER SR9006): `y` links every coincident V1 / A1 pair (SR928's `link-av` verb word; None until it folds), `Y` unlinks the shown clip's group
     (b'T', "track+ video"), (b'R', "track-"), // STRIAKTRACKADD (SR9007): `T` adds an empty video track, `R` removes the shown clip's track (timeline_core's words; file tail)
     (b'e', "freeze"), // STRIAKFREEZE (SR9008): the bare `freeze` word at the playhead (file tail)
+    (b'Q', "mute"), (b'S', "solo"), // STRIAKMUTE (SR9017): the host's own characters for the track's mute / solo (SR926; file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1921,7 +1922,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
         if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
-            let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
+            let top = flag_target(&st.timeline, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
                     let _ = st.select(t, i);
@@ -2617,7 +2618,7 @@ static PRESENT_FIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8:
 
 /// The clip tick `at` shows: `(track, clip)` on the highest-numbered video track holding one (what the schedule shows).
 fn shown_clip(tl: &timeline_core::Timeline, at: i64) -> Option<(usize, usize)> {
-    (0..tl.tracks.len()).rev().filter(|&i| tl.tracks[i].kind == timeline_core::Kind::Video).find_map(|i| tl.clip_at(i, at).map(|c| (i, c)))
+    timeline_core::schedule::top(tl, timeline_core::Kind::Video, at) // STRIAKMUTE (SR9017): the schedule's ONE winner rule (active_tracks: a muted / unsoloed track is never shown)
 }
 
 /// The presented frame's reel and its size policy, from the live job's EDL editor state at the frame's tick (`pts_ms` is
@@ -2994,4 +2995,22 @@ fn edl_keep(held: &mut Option<EdlHeld>, holds: &[i64], s: &timeline_core::schedu
     serial_println!("[nle] hold src={} src_t={} at={}", id.0, s.src_t, s.out_t);
     *held = Some(EdlHeld { src: id, src_t: s.src_t, w: f.0, h: f.1, rgb: f.2.rgb().to_vec(), ord: f.3 });
     f
+}
+
+// ---- STRIAKMUTE (LEDGER SR9017): the Player's mute / solo keys and their target (named tail block) ----
+// NLE-TRACK-MUTE-KERNEL. The Player's picture and sound already follow `Timeline::active_tracks` (the schedule's winner
+// `schedule::top`, `schedule::audio_runs`); [`shown_clip`] now calls that same winner, so the present's size policy and the
+// editing keys follow the clip on screen. `Q` / `S` in [`EDIT_KEYS`] (the host's characters, SR926) name timeline_core's
+// `mute` / `solo` (`EditorState::toggle_mute` / `toggle_solo`: ONE commit, saved as `* UNA MUTE` / `* UNA SOLO`) on the
+// track [`flag_target`] picks. Wire: the existing `[nle] edit mute|solo at=<tick> clips=<n> undo=<n> saved=<..>`.
+
+/// The clip an editing key acts on: for `mute` the highest video track with a clip at `at` that is MUTED, for `solo` the
+/// highest that is SOLO (so a second press undoes the flag the first set); else (and for every other verb) [`shown_clip`].
+fn flag_target(tl: &timeline_core::Timeline, at: i64, verb: &str) -> Option<(usize, usize)> {
+    let flagged = |t: &timeline_core::Track| match verb {
+        "mute" => t.muted,
+        "solo" => t.solo,
+        _ => false,
+    };
+    (0..tl.tracks.len()).rev().filter(|&i| tl.tracks[i].kind == timeline_core::Kind::Video && flagged(&tl.tracks[i])).find_map(|i| tl.clip_at(i, at).map(|c| (i, c))).or_else(|| shown_clip(tl, at))
 }
