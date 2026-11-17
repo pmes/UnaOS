@@ -27,7 +27,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 9. STRIATRACKREORDER — drag a track header up / down (needs SR837's badge column or a header column: name).
 10. STRIAGAPCLOSE — `close-gaps` removes every gap on the selected track (ripple); `gap <n>` inserts n frames of gap at the playhead.
 11. STRIASLIPVIEW — while slipping (SR737), the preview shows the clip's new first and last frame side by side (two `preview` calls into one split still).
-12. STRIAZOOMTOFIT — `zoom-fit` fits the whole timeline in the window; `zoom-sel` fits the selection (Layout.zoom + the view origin: measure `Face.view`).
+12. [SR859 started] STRIAZOOMTOFIT — `zoom-fit` fits the whole timeline in the window; `zoom-sel` fits the selection (Layout.zoom + the view origin: measure `Face.view`).
 
 ## B. Audio (nle.rs mix + nle_face.rs meters)
 13. STRIAAUDIOCROSSFADE — an audio transition (equal-power crossfade) at an audio cut: `Transition` on audio tracks (today video only per the `Track.transitions` doc); `mix_run` applies the curve; EDL `* UNA XFADE` EXISTS (edl.rs :219: measure what it carries today).
