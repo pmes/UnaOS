@@ -3717,3 +3717,48 @@ mod striaxformkeys {
         assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "a point with no event above");
     }
 }
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words through the one commit (named tail block) ----
+
+/// `opacity-key <pct>` sets a point at the playhead on the selected clip under it as ONE undo step; the same point again
+/// commits nothing; a bare word pins the clip's own value; `opacity-unkey` removes it; each refusal is named.
+#[test]
+fn striaopacitykeys_words_are_one_undo_step() {
+    use timeline_core::OpacityKeys;
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("opacity-key 50"), Some(Err(EditError::NoClip)), "nothing selected");
+    st.select(0, 0).unwrap();
+    st.seek(5);
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("opacity-key 50"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1);
+    assert_eq!(st.timeline.tracks[0].clips[0].opacity_keys, OpacityKeys::NONE.with(5, 50).unwrap());
+    assert_eq!(st.verb("opacity-key"), Some(Ok(())), "bare: the clip's own value at the playhead");
+    assert_eq!(st.undo_depth(), d0 + 1, "the same point commits nothing");
+    st.seek(0);
+    assert_eq!(st.verb("opacity-key 0"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].clips[0].opacity_at(2), 20, "linear between the points");
+    assert_eq!(st.timeline.tracks[0].clips[0].opacity_at(9), 50, "held after the last");
+    for bad in ["opacity-key 101", "opacity-key half", "opacity-key 5 6", "opacity-unkey now"] {
+        assert_eq!(st.verb(bad), Some(Err(EditError::Opacity)), "{bad}");
+    }
+    st.seek(15);
+    assert_eq!(st.verb("opacity-key 10"), Some(Err(EditError::OpacityKey)), "the selected clip is not under the playhead");
+    st.seek(3);
+    assert_eq!(st.verb("opacity-unkey"), Some(Err(EditError::OpacityKey)), "no point at the playhead");
+    st.seek(0);
+    let d1 = st.undo_depth();
+    assert_eq!(st.verb("opacity-unkey"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d1 + 1);
+    assert_eq!(st.timeline.tracks[0].clips[0].opacity_keys, OpacityKeys::NONE.with(5, 50).unwrap());
+    for t in 0..10 {
+        st.seek(t);
+        assert_eq!(st.verb("opacity-key 30").map(|r| r.is_ok()), Some(t < timeline_core::OPACITY_KEYS_MAX as i64 || t == 5), "tick {t}");
+    }
+    while st.undo_depth() > 0 {
+        assert!(st.undo());
+    }
+    assert_eq!(st.timeline, tl);
+}

@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; group_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; pan_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") { // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail) // STRIAPAN (SR861): the `* UNA PAN` line (file tail)
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            marker_comment(l, fps, line, &mut tl)?; marker_style_comment(l, fps, line, &mut tl)?; alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; grade_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") { // STRIACOLORLIFT (SR869): `* UNA COLOR` (file tail) // STRIAMARKERJUMPKEYSNEXT (SR984): `* UNA MCOLOUR` / `* UNA MRANGE` (file tail)
+            marker_comment(l, fps, line, &mut tl)?; marker_style_comment(l, fps, line, &mut tl)?; alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; grade_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; alpha_keys_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") { // STRIACOLORLIFT (SR869): `* UNA COLOR` (file tail) // STRIAMARKERJUMPKEYSNEXT (SR984): `* UNA MCOLOUR` / `* UNA MRANGE` (file tail)
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -447,7 +447,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(&grade_line(c)); s.push_str(&pan_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail); STRIAPAN (SR861): `* UNA PAN` (file tail)
+        s.push_str(&grade_line(c)); s.push_str(&pan_line(c)); s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); s.push_str(&alpha_keys_line(c)); s.push_str(&group_line(c)); // STRIACLIPLINK (SR863): `* UNA GROUP` (file tail); STRIACOLORLIFT (SR869): the clip's `* UNA COLOR` line (file tail); NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail); STRIAPAN (SR861): `* UNA PAN` (file tail); STRIAOPACITYKEYS (SR9048): `* UNA ALPHAKEYS` (file tail)
     }
     Ok(drop_write(s, tl)) // STRIATCTHREE (SR9030): an NTSC 30 / 60 timeline's labels become drop-frame (file tail)
 }
@@ -1687,4 +1687,43 @@ fn xkey_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), Edl
 /// STRIAXFORMKEYS: the clip's `* UNA XKEY` lines, or nothing when it has no points.
 fn xkey_lines(c: &Clip) -> String {
     c.xkeys.iter().map(|(t, xf)| format!("* UNA XKEY {} {} {} {}\n", t, xf.x, xf.y, xf.s)).collect()
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the `* UNA ALPHAKEYS` line (named tail block) ----
+// `* UNA ALPHAKEYS <tick>:<pct> ...` is the event line just above's opacity points ([`crate::Clip::opacity_keys`]: source
+// ticks, percents 0..=100), ONE line written after its `* UNA ALPHA` line and only when the clip has points (every other
+// EDL writes what it always wrote). A syntax error: no event above, a second line on one event, a malformed pair, a
+// percent above 100, ticks not strictly ascending, more than [`crate::OPACITY_KEYS_MAX`] points. On an audio event
+// `validate` refuses it (`EditError::Opacity`).
+
+/// STRIAOPACITYKEYS: a `* UNA ALPHAKEYS` line applied to the event above (`None`: no event); any other line is left alone.
+fn alpha_keys_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA ALPHAKEYS ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    if !c.opacity_keys.is_empty() {
+        return Err(EdlError::Syntax { line });
+    }
+    let mut keys = crate::OpacityKeys::NONE;
+    let mut last: Option<i64> = None;
+    for w in r.split_whitespace() {
+        let (t, p) = w.split_once(':').ok_or(EdlError::Syntax { line })?;
+        let t = t.parse::<i64>().ok().filter(|&t| t >= 0 && last.is_none_or(|l| t > l)).ok_or(EdlError::Syntax { line })?;
+        let p = p.parse::<u8>().ok().filter(|&p| p <= crate::OPAQUE).ok_or(EdlError::Syntax { line })?;
+        keys = keys.with(t, p).ok_or(EdlError::Syntax { line })?;
+        last = Some(t);
+    }
+    if keys.is_empty() {
+        return Err(EdlError::Syntax { line });
+    }
+    c.opacity_keys = keys;
+    Ok(())
+}
+
+/// STRIAOPACITYKEYS: the event's `* UNA ALPHAKEYS` line (empty for a clip with no points).
+fn alpha_keys_line(c: &Clip) -> String {
+    if c.opacity_keys.is_empty() {
+        return String::new();
+    }
+    let pairs: Vec<String> = c.opacity_keys.iter().map(|(t, p)| format!("{t}:{p}")).collect();
+    format!("* UNA ALPHAKEYS {}\n", pairs.join(" "))
 }

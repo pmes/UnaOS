@@ -276,7 +276,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     fn verb_unnamed(&mut self, v: &str) -> bool {
-        if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail)
+        if let Some(r) = self.opacity_key_word(v) { return r; } if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.opacity_word(v) { return r; } if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.gaps_note_verb(v) { return r; } if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.xform_note_verb(v) { return r; } if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.track_flag_face_verb(v) { return r; } if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.snap_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } if let Some(r) = self.autosave_verb(v) { return r; } if let Some(r) = self.pan_face_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.roll_tool_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.ripple_all_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` and their note (file tail); STRIAOPACITYFACE (SR898): the opacity step words name the percent (file tail); STRIAPANFACE (SR897): the pan words and their readout (file tail); STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIAGAPSBLACK (SR909): the close-gaps note of removed black fades (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): mute / solo and their note (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -10147,5 +10147,35 @@ impl Face {
             self.buttons = true;
         }
         self.history_pick_at(x, y, Role::Preview)
+    }
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words and their note (named tail block) ----
+// `opacity-key [<pct>]` / `opacity-unkey` (typed words) go through timeline_core's ONE verb dispatch (one commit each);
+// a success is the face note `opacity key: <pct> % at <tick>` (the first selected clip under the playhead, its value
+// there) or `opacity key cleared at <tick>`; a refusal reads `<word>: <EditError>` in `last_error`.
+
+impl Face {
+    /// STRIAOPACITYKEYS: an opacity point word through the one dispatch, its result on the note; `None` for any other word.
+    fn opacity_key_word(&mut self, v: &str) -> Option<bool> {
+        let word = v.split_ascii_whitespace().next()?;
+        if !matches!(word, "opacity-key" | "opacity-unkey") {
+            return None;
+        }
+        let ph = self.state.playhead;
+        match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
+            Ok(()) if word == "opacity-key" => {
+                let tl = &self.state.timeline;
+                let pct = self.state.set.iter().filter_map(|&(t, i)| tl.tracks.get(t)?.clips.get(i).copied()).find(|c| c.covers(ph)).map_or(timeline_core::OPAQUE, |c| c.opacity_at(ph));
+                self.last_error = None;
+                self.note = Some(format!("opacity key: {pct} % at {ph}"));
+            }
+            Ok(()) => {
+                self.last_error = None;
+                self.note = Some(format!("opacity key cleared at {ph}"));
+            }
+            Err(e) => self.last_error = Some(format!("{word}: {e}")),
+        }
+        Some(true)
     }
 }

@@ -310,7 +310,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
+        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -4578,5 +4578,53 @@ impl EditorState {
             Some(k) => self.set_xkeys(k),
             None => Err(EditError::XKey),
         })
+    }
+}
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words through the one commit (named tail block) ----
+// `opacity-key [<pct>]` sets (or replaces) an opacity point at the playhead on every selected clip under it (bare: the
+// clip's own `opacity_at(playhead)`, pinning the curve there); `opacity-unkey` removes the point at the playhead. Each is
+// ONE commit through `Timeline::set_opacity_key` / `clear_opacity_key` (nothing commits when nothing changes). Refused by
+// name: no selection `EditError::NoClip`; no selected clip under the playhead, a full clip, or no point to clear
+// `EditError::OpacityKey`; a percent that is not 0..=100, an extra word, or an audio clip `EditError::Opacity`.
+impl EditorState {
+    /// STRIAOPACITYKEYS: an opacity point at the playhead on each selected clip under it, at `pct` (or its own value).
+    pub fn set_opacity_key(&mut self, pct: Option<u8>) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let tl = self.timeline.set_opacity_key(&self.set, self.playhead, pct)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+    /// STRIAOPACITYKEYS: the opacity point at the playhead removed from each selected clip under it.
+    pub fn clear_opacity_key(&mut self) -> Result<(), EditError> {
+        if self.set.is_empty() {
+            return Err(EditError::NoClip);
+        }
+        let tl = self.timeline.clear_opacity_key(&self.set, self.playhead)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// STRIAOPACITYKEYS: the `opacity-key` / `opacity-unkey` words of [`EditorState::verb`]; `None` for any other word.
+    fn opacity_key_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        match w.next() {
+            Some("opacity-key") => Some(match (w.next(), w.next()) {
+                (None, _) => self.set_opacity_key(None),
+                (Some(p), None) => match p.parse::<u8>().ok().filter(|&p| p <= crate::OPAQUE) {
+                    Some(p) => self.set_opacity_key(Some(p)),
+                    None => Err(EditError::Opacity),
+                },
+                _ => Err(EditError::Opacity),
+            }),
+            Some("opacity-unkey") => Some(match w.next() {
+                None => self.clear_opacity_key(),
+                Some(_) => Err(EditError::Opacity),
+            }),
+            _ => None,
+        }
     }
 }

@@ -13500,3 +13500,34 @@ fn striawaveformstereo_scan_keeps_both_channels() {
     assert_eq!(m.lod.last().map(|top| top.len()), Some(1));
     println!("striawaveformstereo: stereo scan buckets={} chans={} L max={lmax} lod levels={}", p.buckets.len(), p.chans.len(), p.lod.len());
 }
+
+// ---- STRIAOPACITYKEYS (LEDGER SR9048): the opacity point words on the face, their note (named tail block) ----
+
+/// A typed `opacity-key 40` on the selected clip under the playhead is one undo step and reads the note
+/// `opacity key: 40 % at 12` (not an error); a bare `opacity-key` pins the curve's own value; `opacity-unkey` off a point
+/// is a named refusal in `last_error`; on the point it clears it with its own note.
+#[test]
+fn striaopacitykeys_face_note() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, SURFACE, synth_fixture};
+    let typed = |f: &mut Face, w: &str| f.on(&bandy::SMessage::Input { target: SURFACE.into(), text: w.into() });
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(12);
+    let d0 = face.state.undo_depth();
+    assert!(typed(&mut face, "opacity-key 40"));
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity key: 40 % at 12")));
+    assert_eq!(face.state.undo_depth(), d0 + 1);
+    assert_eq!(face.state.timeline.tracks[0].clips[1].opacity_at(12), 40);
+    face.state.seek(18);
+    assert!(typed(&mut face, "opacity-key"));
+    assert_eq!(face.note.as_deref(), Some("opacity key: 40 % at 18"), "bare: the value held after the last point");
+    face.state.seek(15);
+    assert!(typed(&mut face, "opacity-unkey"));
+    assert_eq!(face.note, None, "the typed word cleared the old note");
+    assert!(face.last_error.take().is_some_and(|e| e.starts_with("opacity-unkey: ")), "no point at 15: a refusal");
+    face.state.seek(12);
+    assert!(typed(&mut face, "opacity-unkey"));
+    assert_eq!((face.last_error.take(), face.note.as_deref()), (None, Some("opacity key cleared at 12")));
+    println!("striaopacitykeys: opacity-key 40 -> note, unkey off a point -> refusal");
+}
