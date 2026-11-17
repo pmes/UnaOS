@@ -47,11 +47,11 @@ pub struct PaintStyle<H: Host> {
     pub border_width: Option<[Option<f32>; 4]>,
     /// background-size: (width, height) in pixels or as fractional shorthand values.
     /// Empty string means default (cover), other values stored as-is for rendering.
-    pub bg_size: Option<String>,
+    pub bg_size: Option<String>, pub bg_size_more: Option<Vec<String>>,
     /// background-position: stored as-is for rendering (e.g., "center", "50% 50%").
-    pub bg_position: Option<String>,
+    pub bg_position: Option<String>, pub bg_position_more: Option<Vec<String>>,
     /// background-repeat: 0 = repeat, 1 = no-repeat, 2 = repeat-x, 3 = repeat-y.
-    pub bg_repeat: Option<u8>,
+    pub bg_repeat: Option<u8>, pub bg_repeat_more: Option<Vec<u8>>,
     /// The image-replacement idiom (text-indent:-9999px): the fallback TEXT
     /// is hidden, but the box and its background image still paint.
     pub text_hidden: Option<bool>,
@@ -303,9 +303,9 @@ impl<H: Host> Default for PaintStyle<H> {
             italic: None,
             text_transform: None,
             border_width: None,
-            bg_size: None,
-            bg_position: None,
-            bg_repeat: None,
+            bg_size: None, bg_size_more: None,
+            bg_position: None, bg_position_more: None,
+            bg_repeat: None, bg_repeat_more: None,
             text_hidden: None,
             mask_image: None,
             mask_size: None,
@@ -1120,47 +1120,46 @@ pub enum BgLayer<H: Host> {
 }
 
 /// A borrowed layer for the painter: the first layer lives in `bg_image` / `bg_gradient`, the rest in `bg_more`.
-pub enum BgLayerRef<'a, H: Host> {
-    Url(&'a str),
-    Gradient(&'a H::Gradient),
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): with its own background-size / -position / -repeat (the longhand list's
+/// value at the layer's index, the list repeated cyclically; None = unspecified, the initial).
+pub struct BgLayerRef<'a, H: Host> {
+    url: Option<&'a str>,
+    gradient: Option<&'a H::Gradient>,
+    pub size: Option<&'a str>,
+    pub position: Option<&'a str>,
+    pub repeat: Option<u8>,
 }
 
 impl<'a, H: Host> BgLayerRef<'a, H> {
     pub fn url(&self) -> Option<&'a str> {
-        match self {
-            BgLayerRef::Url(u) => Some(*u),
-            BgLayerRef::Gradient(_) => None,
-        }
+        self.url
     }
 
     pub fn gradient(&self) -> Option<&'a H::Gradient> {
-        match self {
-            BgLayerRef::Gradient(g) => Some(*g),
-            BgLayerRef::Url(_) => None,
-        }
+        self.gradient
     }
 }
 
 impl<H: Host> PaintStyle<H> {
     /// The layers in paint order, bottom first: `bg_more` reversed, then the gradient field, then the url field (the
     /// first layer of a list is painted last, on top; the two fields keep their pre-list order, the image over the
-    /// gradient).
+    /// gradient). SR1070: the first layer's fields are layer 0, `bg_more[i]` layer i + 1 (`bg_layer_ref`'s index).
     pub fn bg_layers_bottom_up(&self) -> Vec<BgLayerRef<'_, H>> {
-        let mut out: Vec<BgLayerRef<'_, H>> = self
-            .bg_more
+        let more: &[BgLayer<H>] = self.bg_more.as_deref().unwrap_or(&[]);
+        let mut out: Vec<BgLayerRef<'_, H>> = more
             .iter()
-            .flatten()
+            .enumerate()
             .rev()
-            .map(|l| match l {
-                BgLayer::Url(u) => BgLayerRef::Url(u.as_str()),
-                BgLayer::Gradient(g) => BgLayerRef::Gradient(g),
+            .map(|(i, l)| match l {
+                BgLayer::Url(u) => self.bg_layer_ref(i + 1, Some(u.as_str()), None),
+                BgLayer::Gradient(g) => self.bg_layer_ref(i + 1, None, Some(g)),
             })
             .collect();
         if let Some(Some(g)) = self.bg_gradient.as_ref() {
-            out.push(BgLayerRef::Gradient(g));
+            out.push(self.bg_layer_ref(0, None, Some(g)));
         }
         if let Some(u) = self.bg_image.as_deref() {
-            out.push(BgLayerRef::Url(u));
+            out.push(self.bg_layer_ref(0, Some(u), None));
         }
         out
     }
@@ -1168,5 +1167,35 @@ impl<H: Host> PaintStyle<H> {
     /// Whether any layer is a url image (its pixels arrive later).
     pub fn has_bg_url(&self) -> bool {
         self.bg_image.is_some() || self.bg_more.iter().flatten().any(|l| matches!(l, BgLayer::Url(_)))
+    }
+}
+
+// ---- AETHERCSSBACKGROUNDLAYERPROPS (LEDGER SR1070): background-repeat / -position / -size are per-layer lists (named tail block) ----
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): css-backgrounds-3 §2.3: the value for layer `k` of a list whose first value is
+/// `first` and whose values 2..n are `more`: the list is repeated cyclically when shorter than the layer count (values
+/// past the last layer are never asked for).
+fn bg_list_at<T>(first: Option<T>, mut more: impl ExactSizeIterator<Item = T>, k: usize) -> Option<T> {
+    match k % (1 + more.len()) {
+        0 => first,
+        i => more.nth(i - 1),
+    }
+}
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): the painter's ref for layer `k` (0 = the first layer's fields), carrying
+    /// that layer's repeat / position / size from the first-layer fields and their `_more` lists.
+    fn bg_layer_ref<'a>(&'a self, k: usize, url: Option<&'a str>, gradient: Option<&'a H::Gradient>) -> BgLayerRef<'a, H> {
+        BgLayerRef {
+            url,
+            gradient,
+            size: bg_list_at(self.bg_size.as_deref(), self.bg_size_more.as_deref().unwrap_or(&[]).iter().map(String::as_str), k),
+            position: bg_list_at(
+                self.bg_position.as_deref(),
+                self.bg_position_more.as_deref().unwrap_or(&[]).iter().map(String::as_str),
+                k,
+            ),
+            repeat: bg_list_at(self.bg_repeat, self.bg_repeat_more.as_deref().unwrap_or(&[]).iter().copied(), k),
+        }
     }
 }
