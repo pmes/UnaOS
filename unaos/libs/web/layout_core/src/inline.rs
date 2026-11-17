@@ -357,11 +357,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     let mut has_content = false;
     let mut forced = false;
     // css-text-3 §6.1: start/end resolve against the paragraph direction → 0 left, 1 center, 2 right.
-    let align = match (root_run.text_align, root_run.mode.rtl) {
-        (1, _) => 1, (8, rtl) => 3 + rtl as u8, // AETHERTEXTALIGNJUSTIFY (SR1057): 3 justify ltr, 4 justify rtl
-        (2, _) | (0, true) | (3, false) => 2,
-        _ => 0,
-    };
+    let align = align_code(root_run.text_align, root_run.mode.rtl); let last_align = last_line_align(align, root_run.text_align_last, root_run.mode.rtl); // AETHERTEXTALIGNLAST (SR1062): the map moved to align_code; the last / forced-break line's code
 
     let edges = |floats: &[Float], y: f32| -> (f32, f32) {
         let mut l = 0.0f32;
@@ -490,7 +486,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
         let free = (right - left - content_w).max(0.0); let (free, content_w) = justify_line(ctx, default_run, &mut pcs, align, forced, free, content_w);
         let dx = left + match align {
             1 => free / 2.0,
-            2 | 4 => free,
+            2 | 4 | 6 => free,
             _ => 0.0,
         };
         // Box fragment extents: from the box's open on this line (or the line
@@ -776,7 +772,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                 let (left, right) = edges(&floats, y);
                 finish_line(
                     tree, ctx, root, root_m, &default_run, &shift, &mut pieces, &line_open, &stack, cur_x,
-                    true, true, left, right, align, &mut y, &mut out,
+                    true, true, left, right, last_align, &mut y, &mut out,
                 );
                 for (f, side) in pending_floats.drain(..) {
                     place_float(&mut floats, &mut out, f, side, y);
@@ -792,7 +788,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     let (left, right) = edges(&floats, y);
     finish_line(
         tree, ctx, root, root_m, &default_run, &shift, &mut pieces, &line_open, &stack, cur_x, has_content, forced,
-        left, right, justify_last(align), &mut y, &mut out,
+        left, right, last_align, &mut y, &mut out,
     );
     for (f, side) in pending_floats.drain(..) {
         place_float(&mut floats, &mut out, f, side, y);
@@ -1161,7 +1157,7 @@ fn justify_line<F: Fonts + ?Sized>(
     free: f32,
     content_w: f32,
 ) -> (f32, f32) {
-    if !matches!(align, 3 | 4) || forced || free <= 0.0 {
+    if !matches!(align, 3..=6) || (forced && align < 5) || free <= 0.0 {
         return (free, content_w);
     }
     let mut split: Vec<Piece> = Vec::with_capacity(pcs.len());
@@ -1228,5 +1224,30 @@ fn justify_last(align: u8) -> u8 {
         3 => 0,
         4 => 2,
         a => a,
+    }
+}
+
+// ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last places the last line and every forced-break line (named tail block) ----
+
+/// AETHERTEXTALIGNLAST (SR1062): a `text-align` code (or a `text-align-last` code: the same table) to the local line
+/// alignment against the paragraph direction (css-text-3 §6.1): 0 left, 1 center, 2 right, 3 justify ltr, 4 justify rtl
+/// (moved verbatim from the head of `layout`).
+fn align_code(code: u8, rtl: bool) -> u8 {
+    match (code, rtl) {
+        (1, _) => 1, (8, rtl) => 3 + rtl as u8, // AETHERTEXTALIGNJUSTIFY (SR1057): 3 justify ltr, 4 justify rtl
+        (2, _) | (0, true) | (3, false) => 2,
+        _ => 0,
+    }
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): css-text-3 §7.2 — the alignment of the paragraph's last line and of every line that
+/// ends at a forced break. `auto` (None) keeps SR1057's rule ([`justify_last`]: justify places it at the start, every
+/// other code unchanged); `justify` is 5 ltr / 6 rtl, which [`justify_line`] stretches even on a forced line; any other
+/// code goes through [`align_code`], whatever `text-align` is.
+fn last_line_align(align: u8, last: Option<u8>, rtl: bool) -> u8 {
+    match last {
+        None => justify_last(align),
+        Some(8) => 5 + rtl as u8,
+        Some(c) => align_code(c, rtl),
     }
 }

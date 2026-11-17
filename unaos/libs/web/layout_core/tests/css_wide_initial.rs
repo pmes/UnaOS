@@ -1578,3 +1578,101 @@ fn text_align_justify_container_start() {
     assert_eq!(styled(&[("text-align", "justify")]).paint.text_align, Some(8), "justify is code 8");
     assert_eq!(styled(&[("text-align", "start")]).paint.text_align, Some(0), "start stays 0");
 }
+
+// ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last (named tail block) ----
+
+/// AETHERTEXTALIGNLAST (SR1062): the frag (x0, x1) per line of `#p` inside `outer`-styled div.
+fn align_last_lines(outer: &str, style: &str, kids: Vec<Spec>) -> Vec<Vec<(f32, f32)>> {
+    let p = el("p", &[("id", "p"), ("style", &format!("margin: 0; font-size: 10px; width: 200px; {style}"))], kids);
+    let doc = page(vec![el("div", &[("style", outer)], vec![p])]);
+    let tree = lay(&doc, 600.0, 400.0);
+    let il = &tree.inline[&id_of(&tree, &doc.by_id("p"))];
+    il.lines
+        .iter()
+        .map(|l| {
+            il.frags
+                .iter()
+                .filter_map(|f| match f {
+                    layout_core::inline::Frag::Text { x, width, baseline, .. } if *baseline == l.2 => Some((*x, *x + *width)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn left_edge(line: &[(f32, f32)]) -> f32 {
+    line.iter().map(|f| f.0).fold(f32::MAX, f32::min)
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): on a justified paragraph the last line follows text-align-last: center (x0 15),
+/// justify (flush at 200, the auto twin stays 170), right (x0 30, right 200); lines 1-2 stay flush at 200.
+#[test]
+fn text_align_last_justify_paragraph() {
+    let c = justify_lines("text-align: justify; text-align-last: center", fifteen());
+    assert_eq!(c.len(), 3, "three lines: {c:?}");
+    for l in &c[..2] {
+        assert!((right_edge(l) - 200.0).abs() <= 0.5 && left_edge(l) == 0.0, "lines 1-2 stay justified: {c:?}");
+    }
+    assert!((left_edge(&c[2]) - 15.0).abs() <= 0.5 && (right_edge(&c[2]) - 185.0).abs() <= 0.5, "the last line is centred: {:?}", c[2]);
+    let j = justify_lines("text-align: justify; text-align-last: justify", fifteen());
+    assert!((right_edge(&j[2]) - 200.0).abs() <= 0.5 && left_edge(&j[2]) == 0.0, "justify stretches the last line: {:?}", j[2]);
+    let auto = justify_lines("text-align: justify; text-align-last: auto", fifteen());
+    assert!((right_edge(&auto[2]) - 170.0).abs() <= 0.5, "armed: auto leaves the last line at start: {:?}", auto[2]);
+    let r = justify_lines("text-align: justify; text-align-last: right", fifteen());
+    assert!((left_edge(&r[2]) - 30.0).abs() <= 0.5 && (right_edge(&r[2]) - 200.0).abs() <= 0.5, "right: {:?}", r[2]);
+    let rtl = justify_lines("direction: rtl; text-align: justify; text-align-last: justify", fifteen());
+    assert!((right_edge(&rtl[2]) - 200.0).abs() <= 0.5 && left_edge(&rtl[2]) == 0.0, "rtl: the last line is flush both sides: {:?}", rtl[2]);
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): a line ending at a `<br>` takes text-align-last too: centred (100px → x0 50) under
+/// center, stretched to 200 under justify; the line after it is justified and the paragraph's last line centred.
+#[test]
+fn text_align_last_forced_break() {
+    let kids = || vec![text("abcdef abcdef abcdef"), el("br", &[], vec![]), text(&["abcdef"; 10].join(" "))];
+    let c = justify_lines("text-align: justify; text-align-last: center", kids());
+    assert_eq!(c.len(), 3, "three lines: {c:?}");
+    assert!((left_edge(&c[0]) - 50.0).abs() <= 0.5 && (right_edge(&c[0]) - 150.0).abs() <= 0.5, "the <br> line is centred: {:?}", c[0]);
+    assert!((right_edge(&c[1]) - 200.0).abs() <= 0.5, "the full line after it is justified: {:?}", c[1]);
+    assert!((left_edge(&c[2]) - 15.0).abs() <= 0.5, "the last line is centred: {:?}", c[2]);
+    let j = justify_lines("text-align: justify; text-align-last: justify", kids());
+    assert!((right_edge(&j[0]) - 200.0).abs() <= 0.5 && left_edge(&j[0]) == 0.0, "justify stretches the <br> line: {:?}", j[0]);
+    assert_eq!(j[0].len(), 3, "one frag per word on the stretched <br> line: {:?}", j[0]);
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): text-align-last applies whatever text-align is: `start` on a centred paragraph puts
+/// the last line at x 0 while lines 1-2 stay centred.
+#[test]
+fn text_align_last_start_on_center() {
+    let l = justify_lines("text-align: center; text-align-last: start", fifteen());
+    for line in &l[..2] {
+        assert!((left_edge(line) - 15.0).abs() <= 0.5, "lines 1-2 centred: {l:?}");
+    }
+    assert!(left_edge(&l[2]).abs() <= 0.5, "the last line at the start: {:?}", l[2]);
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): text-align-last is inherited from a parent div; an explicit `auto` on the child
+/// (255) overrides the inherited value.
+#[test]
+fn text_align_last_inherits() {
+    let c = align_last_lines("text-align-last: center", "text-align: justify", fifteen());
+    assert!((left_edge(&c[2]) - 15.0).abs() <= 0.5, "the inherited center: {:?}", c[2]);
+    let a = align_last_lines("text-align-last: center", "text-align: justify; text-align-last: auto", fifteen());
+    assert!(left_edge(&a[2]).abs() <= 0.5 && (right_edge(&a[2]) - 170.0).abs() <= 0.5, "an own auto wins: {:?}", a[2]);
+}
+
+/// AETHERTEXTALIGNLAST (SR1062): the parse codes (the text-align table, 255 auto), merge_paint carries the field
+/// across rules, and the arm's name is in ALL_LONGHANDS.
+#[test]
+fn text_align_last_codes() {
+    let code = |v: &str| styled(&[("text-align-last", v)]).paint.text_align_last;
+    assert_eq!(code("center"), Some(1));
+    assert_eq!(code("justify"), Some(8));
+    assert_eq!(code("end"), Some(3));
+    assert_eq!(code("auto"), Some(255));
+    assert_eq!(code("initial"), Some(255));
+    assert_eq!(code("inherit"), None);
+    assert_eq!(code("bogus"), None);
+    assert_eq!(cascade(&[&[("text-align-last", "right")], &[("color", "red")]]).paint.text_align_last, Some(2), "merge_paint keeps it");
+    assert!(ALL_LONGHANDS.contains(&"text-align-last"), "the arm is listed for all:");
+}
