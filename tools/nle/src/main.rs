@@ -107,7 +107,8 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); print!("{}", completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish"))); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); print!("{}", completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish"))); return; } if args.first().map(String::as_str) == Some("frame") { frame_verb(&args[1..]); return; } // STRIAEXPORTFRAME (SR830): the frame at a tick as a PNG (file tail)
+    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -500,4 +501,40 @@ fn completions(shell: &str) -> Option<String> {
             .collect(),
         _ => return None,
     })
+}
+
+// ---- STRIAEXPORTFRAME (LEDGER SR830): `nle frame`, the frame at a tick as a PNG through the face's one save (named tail block) ----
+/// `nle frame <edl|media> <tick> [<out.png>] [--fps N] [--src REEL=<media> ...]`: the frame tick `<tick>` shows, saved by
+/// `stria::nle_face::save_frame` (the editor face's `frame` verb's own fn: the preview road and pixel_core's PNG writer) to
+/// `<out.png>`, else `stria::nle_face::frame_path` beside the EDL (`<stem>-<HH-MM-SS-FF>.png`). Prints
+/// `nle: frame <tick> <w>x<h> -> <path>`; a refusal is `nle: frame: <why>`, exit 1. Not in the usage text (owed
+/// NLE-EXPORT-FRAME-USAGE); a tick only (owed NLE-EXPORT-FRAME-TC).
+fn frame_verb(args: &[String]) {
+    let (Some(path), Some(at)) = (args.first(), args.get(1)) else { usage() };
+    let t: i64 = at.parse().unwrap_or_else(|_| bad("frame", at, "not a whole tick"));
+    let mut rest = args[2..].iter().peekable();
+    let out = rest.next_if(|a| !a.starts_with("--")).cloned();
+    let (mut fps, mut srcs) = (25u32, Vec::new());
+    let flags: Vec<String> = rest.cloned().collect();
+    let mut it = flags.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--fps" => fps = num(&mut it, "--fps"),
+            "--src" => {
+                let v = value(&mut it, "--src");
+                let Some((r, p)) = v.split_once('=') else { usage() };
+                srcs.push((r.to_string(), p.to_string()));
+            }
+            _ => usage(),
+        }
+    }
+    let (tl, sources) = load(path, fps, &srcs);
+    let out = out.map(std::path::PathBuf::from).unwrap_or_else(|| {
+        let tc = tl.fps().map_or_else(|| t.to_string(), |f| edl::timecode(t, f));
+        stria::nle_face::frame_path(Some(std::path::Path::new(path)), &tc)
+    });
+    match stria::nle_face::save_frame(&tl, &sources, t, &out) {
+        Ok((w, h)) => println!("nle: frame {t} {w}x{h} -> {}", out.display()),
+        Err(e) => die(format!("frame: {e}")),
+    }
 }

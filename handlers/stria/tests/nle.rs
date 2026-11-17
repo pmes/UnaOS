@@ -3648,3 +3648,108 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIAEXPORTFRAME (LEDGER SR830): the playhead frame as a PNG — preview road, pixel_core's writer, the face's `frame` verb (named tail block) ----
+
+/// `frame_path`: beside the document, `<stem>-<tc with : as ->.png`; no document, the cwd-relative `untitled-<tc>.png`.
+#[test]
+fn striaexportframe_frame_path_kats() {
+    use stria::nle_face::frame_path;
+    use std::path::{Path, PathBuf};
+    assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), "00:00:01:12"), PathBuf::from("/x/reel-00-00-01-12.png"));
+    assert_eq!(frame_path(None, "00:00:01:12"), PathBuf::from("untitled-00-00-01-12.png"));
+    assert!(frame_path(None, "00:00:01:12").is_relative());
+    assert_eq!(frame_path(Some(Path::new("/x/reel.edl")), &edl::timecode(37, 25)), PathBuf::from("/x/reel-00-00-01-12.png"), "edl's own timecode");
+    println!("striaexportframe: /x/reel.edl at 00:00:01:12 -> /x/reel-00-00-01-12.png");
+}
+
+/// `save_frame` at tick 7 of NLE1's fixture writes a PNG whose header and decoded size are the frame's own (64x48) and whose
+/// decoded RGBA is `preview(.., 7)`'s, byte for byte (lossless).
+#[test]
+fn striaexportframe_save_frame_is_the_preview_lossless() {
+    use gneiss_pal::dsp::image::{decode_png, facts_of};
+    use stria::nle_face::{preview, save_frame};
+    let (tl, src) = synth_fixture();
+    let dir = fresh_dir("nle", "striaexportframe-save");
+    let path = dir.join("seven.png");
+    assert_eq!(save_frame(&tl, &src, 7, &path).unwrap(), (64, 48));
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"), "a PNG signature");
+    let f = facts_of(&bytes).expect("a PNG header");
+    assert_eq!((f.width, f.height), (64, 48));
+    let img = decode_png(&bytes).unwrap();
+    let want = preview(&tl, &src, 7).unwrap().expect("a frame at 7");
+    assert_eq!((img.width, img.height), (want.width, want.height));
+    assert!(img.rgba == want.rgba, "the saved frame is the preview's RGBA");
+    println!("striaexportframe: tick 7 -> {} bytes, 64x48, lossless", bytes.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The face's `frame` verb: beside the document at the playhead's timecode, the message `frame: <name>`, `frame_saved` the
+/// path; `frame <path>` writes that path; an unwritable path is `frame: <path>: <io>` with no file; no document is refused.
+#[test]
+fn striaexportframe_face_verb_writes_and_names_it() {
+    let dir = fresh_dir("nle", "striaexportframe-face");
+    let doc = dir.join("reel.edl");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(&doc));
+    assert_eq!(face.frame_saved(), None);
+    face.state.seek(12);
+    assert!(face.verb("frame"));
+    let png = dir.join("reel-00-00-00-12.png");
+    assert!(png.exists(), "{}", png.display());
+    assert_eq!(face.message_text().as_deref(), Some("frame: reel-00-00-00-12.png"));
+    assert_eq!(face.frame_message(), Some("frame: reel-00-00-00-12.png"));
+    assert_eq!(face.frame_saved(), Some(png.as_path()));
+    let named = dir.join("named frame.png");
+    assert!(face.verb(&format!("frame {}", named.display())));
+    assert!(named.exists());
+    assert_eq!(face.last_error.take().as_deref(), Some("frame: named frame.png"));
+    assert!(face.verb("frame /nonexistent-striaexportframe/x.png"));
+    let e = face.last_error.take().unwrap_or_default();
+    assert!(e.starts_with("frame: /nonexistent-striaexportframe/x.png: "), "{e}");
+    assert!(!std::path::Path::new("/nonexistent-striaexportframe/x.png").exists());
+    assert_eq!(face.frame_saved(), None, "a refused frame clears the saved path");
+    assert!(!face.verb("frames"), "not the frame word");
+    let (tl, src) = synth_fixture();
+    let mut bare = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(bare.verb("frame"));
+    assert_eq!(bare.last_error.take().as_deref(), Some("frame: no file (no document path)"));
+    assert_eq!(bare.frame_saved(), None);
+    println!("striaexportframe: face frame -> {}; refused: {e}", png.display());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `frame` is a transport word, before `help` (still the last).
+#[test]
+fn striaexportframe_frame_is_a_verb_before_help() {
+    assert_eq!(VERBS.len(), 27);
+    assert!(VERBS.contains(&"frame"));
+    assert_eq!(VERBS.last(), Some(&"help"));
+}
+
+/// The 100 ms rule's measurement: one `save_frame` of a 1280x720 utp1 frame (render + PNG encode + write), timed and printed
+/// (not asserted); the saved size is the reel's.
+#[test]
+fn striaexportframe_hd_frame_save_time() {
+    use gneiss_pal::dsp::image::facts_of;
+    use stria::nle_face::save_frame;
+    let reel = build::mp4(&[build::test_pattern_track(1, 1280, 720, 25, 10, 10)], &build::Mp4Options::default());
+    let mut tl = Timeline::new(25);
+    let id = tl.add_source("HD", 10);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(id, 0, 10, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(id, reel).expect("the HD reel opens");
+    let dir = fresh_dir("nle", "striaexportframe-hd");
+    let path = dir.join("hd.png");
+    let t0 = std::time::Instant::now();
+    let size = save_frame(&tl, &src, 3, &path).unwrap();
+    let took = t0.elapsed();
+    assert_eq!(size, (1280, 720));
+    let bytes = std::fs::read(&path).unwrap();
+    let f = facts_of(&bytes).expect("a PNG header");
+    assert_eq!((f.width, f.height), (1280, 720));
+    println!("striaexportframe: 1280x720 save_frame took {:.1} ms ({} bytes)", took.as_secs_f64() * 1000.0, bytes.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
