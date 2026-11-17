@@ -3551,3 +3551,90 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIASOURCEINFO (LEDGER SR875): the `info` word's line stands INFO_SECS on the face clock (named tail block) ----
+/// The fixture face (25 fps, labels off) with reel B's clip on V1 selected.
+fn striasourceinfo_face() -> Face {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 1).unwrap();
+    face
+}
+
+/// Rule: `info` stands the selected clip's reel line (`info: <reel>: <summary>`) for INFO_SECS x fps face ticks, over a
+/// dwelt hover on another clip; it pushes no undo step and dirties nothing; the tick it ends on asks a repaint.
+#[test]
+fn striasourceinfo_word_stands_five_seconds() {
+    let mut face = striasourceinfo_face();
+    let (undo, tl) = (face.state.undo_depth(), face.state.timeline.clone());
+    assert!(face.verb("info"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let line = face.message_text().expect("the info line");
+    assert_eq!(line, format!("info: {}", face.reel_line().expect("B's reel line")));
+    assert!(line.starts_with("info: B: utp1 64x48 ~") && line.ends_with(" kb/s"), "{line}");
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.timeline == tl), (undo, false, true));
+    assert!(face.info_pending());
+    let (x, y) = face.layout().point(0, 5);
+    face.on(&bandy::SMessage::BrowserMouseMove(x, y, 0));
+    let n = stria::nle_face::INFO_SECS * 25;
+    for k in 1..n {
+        assert!(!face.tick(), "tick {k}: no repaint while it stands (labels off)");
+    }
+    assert!(face.hover_dwelt().is_some(), "the hover on A has dwelt");
+    assert_eq!(face.message_text().as_deref(), Some(line.as_str()), "standing over the dwelt hover");
+    assert!(face.tick(), "the ending tick repaints");
+    assert!(!face.info_pending());
+    assert!(face.message_text().is_some_and(|m| m.starts_with("A: ")), "{:?}", face.message_text());
+    println!("striasourceinfo: \"{line}\" for {n} ticks, then the hover line");
+}
+
+/// Rule: refused by name on the message line: nothing selected `info: no such clip`; a reel with no summary (B not
+/// opened) `info: B: no media summary`; neither stands a line.
+#[test]
+fn striasourceinfo_refusals_by_name() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("info"));
+    assert_eq!(face.last_error.take(), Some(format!("info: {}", EditError::NoClip)));
+    assert!(!face.info_pending());
+    let mut only_a = Sources::new(&tl);
+    only_a.add(SourceId(0), synth_source(0, 50, 25)).unwrap();
+    let mut face = nlefaceexport_face(tl, only_a);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("info"));
+    assert_eq!(face.last_error.take().as_deref(), Some("info: B: no media summary"));
+    assert!(!face.info_pending());
+    println!("striasourceinfo: info: {} / info: B: no media summary", EditError::NoClip);
+}
+
+/// Rule: another selection ends the line at once (the message never names a clip no longer selected); the next tick
+/// clears it and repaints.
+#[test]
+fn striasourceinfo_selection_ends_it() {
+    let mut face = striasourceinfo_face();
+    assert!(face.verb("info"));
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.info_text(), None);
+    assert!(face.message_text().is_some_and(|m| m.starts_with("A: ")), "{:?}", face.message_text());
+    assert!(face.tick());
+    assert!(!face.info_pending());
+}
+
+/// Rule: a standing line reads over a running export's line; when it ends the export's line is back.
+#[test]
+fn striasourceinfo_over_the_export_line() {
+    let dir = nlefaceexport_dir("striasourceinfo");
+    let mut face = striasourceinfo_face();
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    assert!(face.message_text().is_some_and(|m| m.starts_with("export: ")));
+    assert!(face.verb("info"));
+    assert!(face.message_text().is_some_and(|m| m.starts_with("info: B: ")), "{:?}", face.message_text());
+    for _ in 0..stria::nle_face::INFO_SECS * 25 {
+        face.tick();
+    }
+    assert!(face.message_text().is_some_and(|m| m.starts_with("export: ")), "{:?}", face.message_text());
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let _ = face.last_error.take();
+    let _ = std::fs::remove_dir_all(&dir);
+}

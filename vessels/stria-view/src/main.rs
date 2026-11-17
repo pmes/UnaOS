@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &info_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("info", "Info"), // STRIASOURCEINFO (SR875): the selected clip's reel line, standing five seconds on the message row
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,41 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIASOURCEINFO (LEDGER SR875): the witness's standing info line (named tail block) ----
+/// The witness's `"info"` field, only while an `info` line stands (`Face::info_text`); the default line is unchanged.
+fn info_json(face: &Face) -> String {
+    face.info_text().map(|s| format!(",\"info\":\"{}\"", s.replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striasourceinfo_tests {
+    use super::*;
+
+    /// STRIASOURCEINFO M3: the button before `help` fires the face's `info` word; `at:12:0,info` carries reel B's line on
+    /// `"info"`; `tick:<INFO_SECS x 25 - 1>` keeps it, one more tick ends it (the field absent); `info` alone is refused by name.
+    #[test]
+    fn striasourceinfo_button_and_field() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.get(row.len() - 2) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("info", "Info"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "info"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut f, "info"), vec![format!("info: {}", timeline_core::EditError::NoClip)]);
+        assert_eq!(info_json(&f), "");
+        let errors = drive(&mut f, "at:12:0,info");
+        assert!(errors.is_empty(), "{errors:?}");
+        let j = info_json(&f);
+        assert!(j.starts_with(",\"info\":\"info: B: utp1 64x48 ~") && j.ends_with(" kb/s\""), "{j}");
+        let n = nle_face::INFO_SECS * 25;
+        assert!(drive(&mut f, &format!("tick:{}", n - 1)).is_empty());
+        assert_eq!(info_json(&f), j, "still standing one tick before the end");
+        assert!(drive(&mut f, "tick:1").is_empty());
+        assert_eq!(info_json(&f), "");
+        println!("striasourceinfo witness: at:12:0,info -> {j}; tick:{n} -> absent");
     }
 }
