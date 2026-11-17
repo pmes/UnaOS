@@ -216,7 +216,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            marker_comment(l, fps, line, &mut tl)?; if l.starts_with("* UNA XFADE") {
+            marker_comment(l, fps, line, &mut tl)?; marker_style_comment(l, fps, line, &mut tl)?; if l.starts_with("* UNA XFADE") { // STRIAMARKERJUMPKEYSNEXT (SR984): `* UNA MCOLOUR` / `* UNA MRANGE` (file tail)
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -398,7 +398,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         }
         s.push_str(&title_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail)
     }
-    s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail); STRIAMARKERS (SR835): one `* UNA MARKER` line per marker after it (file tail)
+    s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push_str(&marker_style_lines(tl, fps)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail); STRIAMARKERS (SR835): one `* UNA MARKER` line per marker after it (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -811,6 +811,104 @@ mod striamarkers_tests {
         let twice = head.replacen("* UNA FPS 25\n", "* UNA FPS 25\n* UNA MARKER 00:00:00:12 \"a\"\n* UNA MARKER 00:00:00:12 \"b\"\n", 1);
         assert_eq!(parse(&twice, 25), Err(EdlError::Syntax { line: 5 }));
         let ok = parse(&with("* UNA MARKER 00:00:00:12 \"M1\""), 25).unwrap();
-        assert_eq!(ok.markers, alloc::vec![crate::Marker { at: 12, name: "M1".into() }]);
+        assert_eq!(ok.markers, alloc::vec![crate::Marker { at: 12, name: "M1".into(), colour: 0, len: 0 }]);
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): the `* UNA MCOLOUR` / `* UNA MRANGE` lines (named tail block) ----
+// A marker's non-default colour and range length ([`crate::Marker::colour`] / `len`) are kept as their own header lines,
+// written after every `* UNA MARKER` line in tick order and only when not the default, so an EDL whose markers carry
+// neither writes as before: `* UNA MCOLOUR <HH:MM:SS:FF> <colour name>` and `* UNA MRANGE <HH:MM:SS:FF> <end HH:MM:SS:FF>`.
+// Read after the MARKER lines they belong to. A bad timecode is `Timecode`; no marker at the tick, an unknown colour, an
+// end at or before the tick, or the field already set (a second line for one marker) is a syntax error.
+
+/// STRIAMARKERJUMPKEYSNEXT: a `* UNA MCOLOUR` / `* UNA MRANGE` line applied to the timeline being read; any other line is
+/// left alone.
+fn marker_style_comment(l: &str, fps: u32, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let (colour, r) = match (l.strip_prefix("* UNA MCOLOUR "), l.strip_prefix("* UNA MRANGE ")) {
+        (Some(r), _) => (true, r),
+        (None, Some(r)) => (false, r),
+        (None, None) => return Ok(()),
+    };
+    let w: Vec<&str> = r.split_whitespace().collect();
+    if w.len() != 2 {
+        return Err(EdlError::Syntax { line });
+    }
+    let at = parse_tc(w[0], fps, line)?;
+    let m = tl.marker_at(at).ok_or(EdlError::Syntax { line })?;
+    let next = if colour {
+        let c = crate::marker_colour(w[1]).filter(|_| m.colour == 0).ok_or(EdlError::Syntax { line })?;
+        tl.colour_marker(at, c)
+    } else {
+        let end = parse_tc(w[1], fps, line)?;
+        if m.len != 0 || end <= at {
+            return Err(EdlError::Syntax { line });
+        }
+        tl.range_marker(at, end - at)
+    };
+    *tl = next.ok_or(EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAMARKERJUMPKEYSNEXT: the header's `* UNA MCOLOUR` / `* UNA MRANGE` lines (empty when every marker is a plain
+/// orange point).
+fn marker_style_lines(tl: &Timeline, fps: u32) -> String {
+    let mut s = String::new();
+    for m in &tl.markers {
+        if m.colour != 0 {
+            s.push_str(&format!("* UNA MCOLOUR {} {}\n", timecode(m.at, fps), crate::MARKER_COLOURS[usize::from(m.colour)]));
+        }
+        if m.len != 0 {
+            s.push_str(&format!("* UNA MRANGE {} {}\n", timecode(m.at, fps), timecode(m.at + m.len, fps)));
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod striamarkerjumpkeysnext_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    fn cut() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.mark(12, "M1").unwrap().mark(15, "M2").unwrap()
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: plain markers write no style line; a red ranged marker writes MCOLOUR then MRANGE right
+    /// after the MARKER lines and round-trips byte for byte.
+    #[test]
+    fn striamarkerjumpkeysnext_style_lines_round_trip() {
+        let plain = write(&cut(), "T").unwrap();
+        assert!(!plain.contains("UNA MCOLOUR") && !plain.contains("UNA MRANGE"), "{plain}");
+        let tl = cut().colour_marker(12, 1).unwrap().range_marker(12, 8).unwrap().colour_marker(15, 5).unwrap();
+        let s = write(&tl, "T").unwrap();
+        let want = "* UNA MARKER 00:00:00:15 \"M2\"\n* UNA MCOLOUR 00:00:00:12 red\n* UNA MRANGE 00:00:00:12 00:00:00:20\n* UNA MCOLOUR 00:00:00:15 blue\n\n";
+        assert!(s.contains(want), "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back, tl);
+        assert_eq!(write(&back, "T").unwrap(), s);
+    }
+
+    /// STRIAMARKERJUMPKEYSNEXT M3: a malformed or orphan style line is refused by name.
+    #[test]
+    fn striamarkerjumpkeysnext_malformed_style_lines_refused() {
+        let head = write(&cut(), "T").unwrap();
+        let after = "* UNA MARKER 00:00:00:15 \"M2\"\n";
+        let at = head.find(after).expect("the MARKER lines") + after.len();
+        let n = head[..at].lines().count() + 1;
+        let with = |l: &str| alloc::format!("{}{l}\n{}", &head[..at], &head[at..]);
+        for bad in ["* UNA MCOLOUR 00:00:00:13 red", "* UNA MCOLOUR 00:00:00:12 mauve", "* UNA MCOLOUR 00:00:00:12", "* UNA MCOLOUR 00:00:00:12 red x",
+                    "* UNA MRANGE 00:00:00:12 00:00:00:12", "* UNA MRANGE 00:00:00:12 00:00:00:10", "* UNA MRANGE 00:00:00:13 00:00:00:20",
+                    "* UNA MCOLOUR 00:00:00:12 red\n* UNA MCOLOUR 00:00:00:12 blue", "* UNA MRANGE 00:00:00:12 00:00:00:20\n* UNA MRANGE 00:00:00:12 00:00:00:22"] {
+            let line = n + bad.matches('\n').count();
+            assert_eq!(parse(&with(bad), 25), Err(EdlError::Syntax { line }), "{bad}");
+        }
+        assert_eq!(parse(&with("* UNA MRANGE 00:00:0x:12 00:00:00:20"), 25), Err(EdlError::Timecode { line: n }));
+        let ok = parse(&with("* UNA MCOLOUR 00:00:00:12 green"), 25).unwrap();
+        assert_eq!(ok.marker_at(12).map(|m| (m.colour, m.len)), Some((3, 0)));
     }
 }

@@ -3807,7 +3807,7 @@ fn striamarkers_face_words_messages_and_undo() {
     f.state.seek(12);
     assert!(f.verb("mark"));
     assert_eq!(f.last_error.take().as_deref(), Some("marked M1 at 00:00:00:12"));
-    assert_eq!(f.state.timeline.markers, vec![timeline_core::Marker { at: 12, name: "M1".into() }]);
+    assert_eq!(f.state.timeline.markers, vec![timeline_core::Marker { at: 12, name: "M1".into(), colour: 0, len: 0 }]);
     assert_eq!(f.state.undo_depth(), 1);
     assert!(f.dirty(), "a marker dirties the document");
     assert!(f.verb("mark"));
@@ -3950,4 +3950,57 @@ fn striamarkerjumpkeys_message_names_where_it_landed() {
     assert_eq!(f.last_error.take().as_deref(), Some("cut+: 00:00:00:10"), "the key words the same message");
     assert_eq!(f.state.undo_depth(), depth, "a jump is not an undo step");
     println!("striamarkerjumpkeys: marker+ -> Intro at 00:00:01:05, cut+ -> 00:00:00:10, still cut- -> no message");
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): marker colour / marker range on the face, the note (named tail block) ----
+
+/// `marker colour` / `marker range` sit before `help`; each success is ONE undo step that dirties the document and words
+/// the face note (read by `message_text` after `last_error`, cleared by the next named key); refusals are `last_error`;
+/// the EDL carries `* UNA MCOLOUR` / `* UNA MRANGE`.
+#[test]
+fn striamarkerjumpkeysnext_face_colour_range_note_and_refusals() {
+    let help = VERBS.iter().position(|v| *v == "help").unwrap();
+    for v in ["marker colour", "marker range"] {
+        let i = VERBS.iter().position(|x| *x == v).unwrap_or_else(|| panic!("{v} is a VERBS word"));
+        assert!(i < help, "{v} before help");
+    }
+    let mut f = striamarkerjumpkeys_face();
+    assert!(f.verb("marker colour"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker colour: no marker at 00:00:00:00"));
+    assert!(f.verb("marker range"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker range: no marker at or before 00:00:00:00"));
+    assert_eq!((f.state.undo_depth(), f.note.as_deref()), (0, None));
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    let _ = f.last_error.take();
+    let depth = f.state.undo_depth();
+    assert!(f.verb("marker colour"));
+    assert_eq!(f.note.as_deref(), Some("marker M1 colour red at 00:00:00:12"));
+    assert_eq!(f.message_text().as_deref(), Some("marker M1 colour red at 00:00:00:12"));
+    assert!(f.verb("marker colour red"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker colour: M1 is already red"));
+    assert!(f.verb("marker colour mauve"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker colour: no colour mauve (orange, red, yellow, green, cyan, blue, purple, pink)"));
+    assert!(f.verb("marker colour blue"));
+    assert_eq!(f.note.as_deref(), Some("marker M1 colour blue at 00:00:00:12"));
+    f.state.seek(20);
+    assert!(f.verb("marker range"));
+    assert_eq!(f.note.as_deref(), Some("marker M1 range 00:00:00:12..00:00:00:20"));
+    assert!(f.verb("marker range"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker range: M1 already ends at 00:00:00:20"));
+    assert_eq!(f.state.undo_depth(), depth + 3, "colour, colour, range: one step each");
+    assert!(f.dirty());
+    let m = f.state.timeline.marker_at(12).cloned().unwrap();
+    assert_eq!((m.colour, m.len), (5, 8));
+    let text = edl::write(&f.state.timeline, "T").unwrap();
+    assert!(text.contains("* UNA MARKER 00:00:00:12 \"M1\"\n* UNA MCOLOUR 00:00:00:12 blue\n* UNA MRANGE 00:00:00:12 00:00:00:20\n"), "{text}");
+    assert!(f.on(&bandy::SMessage::BrowserKey("Down".into())));
+    assert_eq!(f.note, None, "a named key clears the note");
+    f.state.seek(12);
+    assert!(f.verb("marker range"));
+    assert_eq!(f.note.as_deref(), Some("marker M1 range cleared at 00:00:00:12"));
+    assert_eq!(f.state.timeline.marker_at(12).map(|m| m.len), Some(0));
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline.marker_at(12).map(|m| m.len), Some(8));
+    println!("striamarkerjumpkeysnext: M1 red -> blue, range 12..20, cleared, undone; EDL {}", text.lines().filter(|l| l.starts_with("* UNA M")).count());
 }

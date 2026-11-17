@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 33] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail)
+pub const VERBS: [&str; 35] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "marker colour", "marker range", "help"]; // STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub note: Option<String>, // STRIAMARKERJUMPKEYSNEXT (SR984): a success line on the message row, read after last_error, cleared by the next acting input (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } // STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2368,7 +2369,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3186,6 +3187,73 @@ impl Face {
                 }
                 timeline_core::editor::Jump::Cut => format!("{}: {tc}", v.trim()),
             });
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYSNEXT (LEDGER SR984): the marker style words' note and refusals; the face note (named tail block) ----
+// `marker colour [<name>]` / `marker range` (the Marker Colour / Marker Range buttons) are timeline_core's `EditorState::verb`
+// words (ONE commit each); the face words the result: a success is the face `note` (`marker M1 colour red at <tc>`,
+// `marker M1 range <tc>..<tc>`, `marker M1 range cleared at <tc>`), a refusal is `last_error` (`marker colour: no marker at
+// <tc>`, `marker colour: M1 is already red`, `marker colour: no colour <x> (orange, red, ...)`, `marker range: no marker
+// at or before <tc>`, `marker range: M1 already ends at <tc>`). `Face.note` is read by `message_text` after `last_error`
+// and cleared by `clear_note` on the next acting input (the rule SR980 / SR990 / SR991 wrote).
+
+impl Face {
+    /// Clear the note on an acting input: a typed word, a click, a press, select-all, a named key, a one-char text
+    /// key. A move, a release, the wheel, a zoom and a resize keep it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let acts = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() > 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if acts {
+            self.note = None;
+        }
+    }
+    /// The playhead tick `t` as the message rows word it (`HH:MM:SS:FF`, the tick when the rate is not an integer fps).
+    fn marker_tc(&self, t: i64) -> String {
+        self.state.timeline.fps().map_or_else(|| t.to_string(), |f| timeline_core::edl::timecode(t, f))
+    }
+    /// The marker style words (`timeline_core::editor::marker_style_word`) through the one dispatch, with their note or
+    /// refusal; `None` for any other word.
+    fn marker_style_verb(&mut self, v: &str) -> Option<bool> {
+        let ph = self.state.playhead;
+        let Some(word) = timeline_core::editor::marker_style_word(v) else {
+            let mut w = v.split_ascii_whitespace();
+            if let (Some("marker"), Some("colour"), Some(x), None) = (w.next(), w.next(), w.next(), w.next()) {
+                self.last_error = Some(format!("marker colour: no colour {x} ({})", timeline_core::MARKER_COLOURS.join(", ")));
+                return Some(true);
+            }
+            return None;
+        };
+        let colour_name = |c: u8| timeline_core::MARKER_COLOURS.get(usize::from(c)).copied().unwrap_or("?");
+        match word {
+            timeline_core::editor::MarkerStyle::Colour(c) => {
+                let before = self.state.timeline.marker_at(ph).map(|m| (m.name.clone(), m.colour));
+                let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
+                let now = self.state.timeline.marker_at(ph).map(|m| (m.name.clone(), m.colour));
+                match (r, before, now) {
+                    (Ok(()), _, Some((name, k))) => self.note = Some(format!("marker {name} colour {} at {}", colour_name(k), self.marker_tc(ph))),
+                    (Err(EditError::Marker), None, _) => self.last_error = Some(format!("marker colour: no marker at {}", self.marker_tc(ph))),
+                    (Err(EditError::Marker), Some((name, k)), _) if c == Some(k) => self.last_error = Some(format!("marker colour: {name} is already {}", colour_name(k))),
+                    (r, _, _) => self.last_error = Some(format!("marker colour: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
+                }
+            }
+            timeline_core::editor::MarkerStyle::Range => {
+                let before = self.state.timeline.marker_before(ph).map(|m| (m.name.clone(), m.at, m.len));
+                let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
+                match (r, before) {
+                    (Ok(()), Some((name, at, _))) if ph == at => self.note = Some(format!("marker {name} range cleared at {}", self.marker_tc(at))),
+                    (Ok(()), Some((name, at, _))) => self.note = Some(format!("marker {name} range {}..{}", self.marker_tc(at), self.marker_tc(ph))),
+                    (Err(EditError::Marker), None) => self.last_error = Some(format!("marker range: no marker at or before {}", self.marker_tc(ph))),
+                    (Err(EditError::Marker), Some((name, at, len))) => self.last_error = Some(format!("marker range: {name} already ends at {}", self.marker_tc(at + len))),
+                    (r, _) => self.last_error = Some(format!("marker range: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
+                }
+            }
         }
         Some(true)
     }
