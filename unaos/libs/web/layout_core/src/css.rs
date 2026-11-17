@@ -1427,7 +1427,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
+        "place-content" => apply_place::<H>("align-content", Some("justify-content"), value, style, cx), "place-items" => apply_place::<H>("align-items", None, value, style, cx), "place-self" => apply_place::<H>("align-self", None, value, style, cx), "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -4114,7 +4114,7 @@ pub const ALL_SKIPPED: &[&str] = &[
     // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
     "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
     // ALIAS spellings of a listed name (the same field, the same value grammar).
-    "grid-gap", "grid-row-gap", "grid-column-gap", "-webkit-text-combine", "-ms-text-combine-horizontal", "page-break-before", "page-break-after", "page-break-inside", "-webkit-column-break-before", "-webkit-column-break-after", "-webkit-column-break-inside", "-webkit-box-shadow", "word-wrap", "-webkit-mask", "-webkit-mask-image", "-webkit-mask-size", "-webkit-mask-position", "-webkit-mask-repeat",
+    "grid-gap", "grid-row-gap", "grid-column-gap", "-webkit-text-combine", "-ms-text-combine-horizontal", "page-break-before", "page-break-after", "page-break-inside", "-webkit-column-break-before", "-webkit-column-break-after", "-webkit-column-break-inside", "-webkit-box-shadow", "word-wrap", "-webkit-mask", "-webkit-mask-image", "-webkit-mask-size", "-webkit-mask-position", "-webkit-mask-repeat", "place-content", "place-items", "place-self", // SR1074
 ];
 
 /// AETHERCSSWIDEALL (SR1021): `all: inherit | initial | unset` applies the keyword to each of [`ALL_LONGHANDS`] through
@@ -5029,4 +5029,26 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
     }
     style.align_self = v;
     style.align_self_auto = v.is_none();
+}
+
+// ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-*: <align> <justify>?`, one or two [`alignment_words`] values (a
+/// `safe center` / `first baseline` pair is ONE), the second defaulting to the first, each applied through its
+/// longhand's arm (as `flex-flow` recurses). `justify` None (justify-items / justify-self have no arm: owed
+/// AETHER-CSS-JUSTIFY-SELF) records the dropped half (`place-justify-dropped:`); a value with no two valid halves is
+/// refused whole (`place-value:`) and nothing is written.
+fn apply_place<H: Host>(align: &str, justify: Option<&str>, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    let t: Vec<&str> = value.split_ascii_whitespace().collect();
+    let halves = (0..=2usize).find_map(|k| {
+        let (a, b) = if k == 0 { (t.join(" "), t.join(" ")) } else if k < t.len() { (t[..k].join(" "), t[k..].join(" ")) } else { return None };
+        (alignment_words(&a).is_some() && alignment_words(&b).is_some()).then_some((a, b))
+    });
+    let Some((a, b)) = halves else { return H::record_css(&format!("place-value:{}", clip(value))) };
+    apply_declaration(align, &a, style, cx);
+    match justify {
+        Some(j) => apply_declaration(j, &b, style, cx),
+        None if !is_neutral_keyword(&b) => H::record_css(&format!("place-justify-dropped:{}", clip(&b))),
+        None => {}
+    }
 }
