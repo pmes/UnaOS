@@ -397,7 +397,7 @@ pub enum EditError {
     /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
     Gain,
     /// EDITMAP (SR223): an edit-list segment at a rate <= 0 (a rate-0 dwell hold, or reverse); STRIACLIPSPEED (SR829): a clip
-    /// at rate 0, an M2 speed <= 0, or an op that would cut a rated clip off its frame grid; STRIASPEEDREVERSE (SR9067): an op a reversed clip does not support (a cut, a trim, a slide's follow, an outgoing handle).
+    /// at rate 0, an M2 speed <= 0, or an op that would cut a rated clip off its frame grid; STRIASPEEDREVERSE (SR9067): an op a reversed clip does not support (an outgoing handle; STRIAREVERSEEDIT (SR9094) lifted the cut, the trim and the slide's follow).
     Rate,
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
@@ -689,7 +689,7 @@ impl Timeline {
     pub fn trim_in(&self, track: usize, idx: usize, src_in: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let c = clip_mut(&mut tl, track, idx)?;
-        c.at = c.end() - Clip { src_in, ..*c }.len(); // STRIACLIPSPEED (SR829): the out edge stays at any rate (1x: at += src_in - old src_in)
+        c.at = trimmed_at(c, &Clip { src_in, ..*c }); // STRIACLIPSPEED (SR829): the out edge stays at any rate (1x: at += src_in - old src_in); STRIAREVERSEEDIT (SR9094): a reversed clip shows src_in at its END, so its start stays (file tail)
         c.src_in = src_in;
         tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
         Ok(tl)
@@ -698,7 +698,7 @@ impl Timeline {
     /// Move a clip's out point to source tick `src_out`; its timeline start stays.
     pub fn trim_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
-        clip_mut(&mut tl, track, idx)?.src_out = src_out;
+        let c = clip_mut(&mut tl, track, idx)?; c.at = trimmed_at(c, &Clip { src_out, ..*c }); c.src_out = src_out; // STRIAREVERSEEDIT (SR9094): a reversed clip shows src_out at its START, so its end stays (file tail)
         tl.retarget_transitions(self)?; tl.fit_trimmed(track, idx); tl.validate()?;
         Ok(tl)
     }
@@ -894,12 +894,12 @@ fn sort(t: &mut Track) {
 fn split_at(t: &mut Track, at: i64) {
     if let Some(i) = t.clips.iter().position(|c| c.at < at && at < c.end()) {
         let c = t.clips[i];
-        let cut = c.src_at(at); // STRIACLIPSPEED (SR829): the source tick tick `at` shows (1x: src_in + (at - c.at))
+        let (h, w) = cut_halves(&c, at); // STRIACLIPSPEED (SR829): the source tick tick `at` shows (1x: src_in + (at - c.at)); STRIAREVERSEEDIT (SR9094): THE cut, either direction (file tail)
         let head = &mut t.clips[i];
-        head.src_out = cut;
+        head.src_in = h.src_in; head.src_out = h.src_out; // STRIAREVERSEEDIT (SR9094)
         head.fade_in = c.fade_in.min(head.len());
         head.fade_out = 0;
-        let tail = Clip { src_in: cut, at, fade_in: 0, ..c };
+        let tail = Clip { fade_in: 0, ..w }; // STRIAREVERSEEDIT (SR9094): the tail half from `at` (forward: src_in = the cut)
         let tail = Clip { fade_out: c.fade_out.min(tail.len()), ..tail };
         t.clips.insert(i + 1, tail);
     }
@@ -1365,10 +1365,10 @@ fn moved_cut(bt: &Track, clips: &[Clip], at: i64) -> Result<i64, EditError> {
     let out = bt.clips.iter().find(|c| c.end() == at);
     clips
         .iter()
-        .filter(|i| i.src == inc.src && i.src_in == inc.src_in)
+        .filter(|i| i.src == inc.src && head_edge(i) == head_edge(inc)) // STRIAREVERSEEDIT (SR9094): the source tick the cut sees (a reversed incoming's src_out) (file tail)
         .map(|i| i.at)
         .filter(|&a| match (out, clips.iter().find(|c| c.end() == a)) {
-            (Some(p), Some(q)) => p.src == q.src && p.src_out == q.src_out,
+            (Some(p), Some(q)) => p.src == q.src && tail_edge(p) == tail_edge(q), // STRIAREVERSEEDIT (SR9094)
             (None, None) => true,
             _ => false,
         })
@@ -1506,11 +1506,11 @@ impl Timeline {
         if slide_follows_rated(&tl.tracks[track], idx, delta) { return Err(EditError::Rate); } let (cut_in, cut_out) = (c.at, c.end()); // STRIACLIPSPEED (SR829): a rated butted neighbour cannot follow tick for tick (file tail); STRIACLIPSPEEDMORE (SR951): only one that cannot land exactly
         let tr = &mut tl.tracks[track];
         if let Some(p) = idx.checked_sub(1).and_then(|i| tr.clips.get_mut(i)).filter(|p| p.end() == cut_in) {
-            p.src_out = follow_src(*p, cut_in, p.src_out, delta); // STRIACLIPSPEEDMORE (SR951): through src_at at a rate (1x: src_out + delta) (file tail)
+            if p.reverse { p.src_in = cut_halves(p, cut_in.saturating_add(delta)).0.src_in; } else { p.src_out = follow_src(*p, cut_in, p.src_out, delta); } // STRIAREVERSEEDIT (SR9094): a reversed p's end shows src_in (file tail); STRIACLIPSPEEDMORE (SR951): through src_at at a rate (1x: src_out + delta) (file tail)
         }
         if let Some(n) = tr.clips.get_mut(idx + 1).filter(|n| n.at == cut_out) {
             n.at = n.at.saturating_add(delta);
-            n.src_in = follow_src(Clip { at: cut_out, ..*n }, cut_out, n.src_in, delta); // STRIACLIPSPEEDMORE (SR951): the pre-move clip through src_at (1x: src_in + delta) (file tail)
+            if n.reverse { n.src_out = cut_halves(&Clip { at: cut_out, ..*n }, cut_out.saturating_add(delta)).1.src_out; } else { n.src_in = follow_src(Clip { at: cut_out, ..*n }, cut_out, n.src_in, delta); } // STRIAREVERSEEDIT (SR9094): a reversed n's start shows src_out (file tail); STRIACLIPSPEEDMORE (SR951): the pre-move clip through src_at (1x: src_in + delta) (file tail)
         }
         tr.clips[idx].at = cut_in.saturating_add(delta);
         for x in tr.transitions.iter_mut().filter(|x| x.at == cut_in || x.at == cut_out) {
@@ -1728,17 +1728,17 @@ impl Clip {
 /// STRIACLIPSPEED: whether cutting track `t` at tick `at` keeps a rated clip spanning it whole: the head `src_in..src_at(at)`
 /// ends at `at` and the tail from `at` ends where the clip ended (always true at 1x and for any integer rate >= 1).
 fn cut_clean(t: &Track, at: i64) -> bool {
-    t.clips.iter().filter(|c| c.at < at && at < c.end() && (c.rate_q16 != 0x1_0000 || c.reverse)).all(|c| !c.reverse && { // STRIASPEEDREVERSE (SR9067): a reversed clip is never cut (NLE-REVERSE-EDIT owed)
-        let cut = c.src_at(at);
-        Clip { src_out: cut, ..*c }.end() == at && Clip { src_in: cut, at, ..*c }.end() == c.end()
+    t.clips.iter().filter(|c| c.at < at && at < c.end() && (c.rate_q16 != 0x1_0000 || c.reverse)).all(|c| { // STRIAREVERSEEDIT (SR9094): a reversed clip cuts through cut_halves (SR9067's refusal lifted)
+        let (h, w) = cut_halves(c, at); // STRIAREVERSEEDIT (SR9094)
+        h.end() == at && w.end() == c.end() // STRIAREVERSEEDIT (SR9094)
     })
 }
 
 /// STRIACLIPSPEED: clip `idx` of `t` has a butted neighbour that `slide` would make follow and that neighbour is rated;
 /// STRIACLIPSPEEDMORE (SR951): and, followed by `delta` through `follow_src`, that neighbour does not land exactly.
 fn slide_follows_rated(t: &Track, idx: usize, delta: i64) -> bool {
-    let Some(c) = t.clips.get(idx) else { return false }; if reverse_butted(t, idx) { return true; } // STRIASPEEDREVERSE (SR9067): a reversed butted neighbour cannot follow (file tail)
-    let rated = |o: &Clip| o.rate_q16 != 0x1_0000;
+    let Some(c) = t.clips.get(idx) else { return false }; if reverse_butted(t, idx, delta) { return true; } // STRIASPEEDREVERSE (SR9067): a reversed butted neighbour cannot follow (file tail); STRIAREVERSEEDIT (SR9094): only one that cannot land exactly
+    let rated = |o: &Clip| o.rate_q16 != 0x1_0000 && !o.reverse; // STRIAREVERSEEDIT (SR9094): a reversed neighbour is judged by reverse_butted
     idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && rated(p) && Clip { src_out: follow_src(*p, c.at, p.src_out, delta), ..*p }.end() != c.at.saturating_add(delta))
         || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && rated(n) && Clip { src_in: follow_src(*n, n.at, n.src_in, delta), at: n.at.saturating_add(delta), ..*n }.end() != n.end())
 }
@@ -5030,11 +5030,13 @@ fn reverse_src_at(c: &Clip, t: i64) -> i64 {
 }
 
 /// STRIASPEEDREVERSE: clip `idx` of `t` has a butted neighbour (previous ending at its start, next starting at its end) that
-/// is reversed: `slide` would move that neighbour's source edge the wrong way.
-fn reverse_butted(t: &Track, idx: usize) -> bool {
+/// is reversed; STRIAREVERSEEDIT (SR9094): and, followed by `delta` through `cut_halves` (the previous one's END shows its
+/// `src_in`, the next one's START its `src_out`), that neighbour does not land exactly (never at 1x).
+fn reverse_butted(t: &Track, idx: usize, delta: i64) -> bool {
     let Some(c) = t.clips.get(idx) else { return false };
-    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && p.reverse)
-        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && n.reverse)
+    let (cin, cout) = (c.at.saturating_add(delta), c.end().saturating_add(delta));
+    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && p.reverse && cut_halves(p, cin).0.end() != cin)
+        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && n.reverse && cut_halves(n, cout).1.end() != n.end())
 }
 
 impl Clip {
@@ -5120,9 +5122,9 @@ mod striaspeedreverse_tests {
         assert!(x.set_reverse(0, 1, true).is_ok(), "a reversed INCOMING has no handle");
         let blk = tl(alloc::vec![a(0, 10, 0)]).add_transition_to_black(0, 10, TransitionKind::Dissolve, 2).unwrap();
         assert_eq!(blk.set_reverse(0, 0, true), Err(EditError::Rate), "a reversed outgoing to black");
-        assert_eq!(rev.split(0, 5), Err(EditError::Rate), "a reversed clip is not cut");
-        assert_eq!(rev.place(0, a(40, 42, 4), Mode::Overwrite), Err(EditError::Rate));
-        assert_eq!(rev.slide(0, 1, 1), Err(EditError::Rate), "a reversed butted neighbour cannot follow");
+        assert_eq!(rev.split(0, 5).map(|s| s.tracks[0].clips.len()), Ok(3), "a reversed clip cuts (STRIAREVERSEEDIT SR9094; was Err(Rate))");
+        assert!(rev.place(0, a(40, 42, 4), Mode::Overwrite).is_ok(), "STRIAREVERSEEDIT (SR9094): was Err(Rate)");
+        assert_eq!(rev.slide(0, 1, 1), Err(EditError::OutOfSource), "the reversed p would need src_in -1 (STRIAREVERSEEDIT SR9094; was Err(Rate))");
         assert_eq!(base.split(0, 5).map(|s| s.tracks[0].clips.len()), Ok(3), "a forward clip still cuts");
         assert_eq!(base.set_reverse(3, 0, true), Err(EditError::NoTrack));
         assert_eq!(base.set_reverse(0, 9, true), Err(EditError::NoClip));
@@ -5148,10 +5150,12 @@ mod striaspeedreverse_tests {
         st.select(0, 0).unwrap();
         assert_eq!(st.verb("reverse"), Some(Ok(())));
         assert_eq!((st.selected().map(|c| c.reverse), st.undo_depth()), (Some(true), 1));
-        assert_eq!(st.verb("["), Some(Err(EditError::Rate)), "a key trim on a reversed clip");
-        assert_eq!(st.trim(Edge::Out, -1), Err(EditError::Rate));
-        assert_eq!(st.ripple_trim(Edge::In, 1), Err(EditError::Rate));
+        assert_eq!(st.verb("["), Some(Err(EditError::Negative)), "STRIAREVERSEEDIT (SR9094): `[` grows the head to -1 (was Err(Rate))");
         assert_eq!(st.undo_depth(), 1, "refusals push nothing");
+        assert_eq!(st.trim(Edge::Out, -1), Ok(()), "STRIAREVERSEEDIT (SR9094): was Err(Rate)");
+        assert_eq!(st.ripple_trim(Edge::In, 1), Ok(()), "STRIAREVERSEEDIT (SR9094): was Err(Rate)");
+        assert_eq!(st.undo_depth(), 3);
+        assert!(st.undo() && st.undo(), "STRIAREVERSEEDIT (SR9094): back to the reversed timeline");
         assert_eq!(st.verb("reverse"), Some(Ok(())));
         assert_eq!((st.timeline.clone(), st.undo_depth()), (base.clone(), 2), "toggled back");
         assert!(st.undo());
@@ -5258,5 +5262,147 @@ mod striachaptersmkv_tests {
         assert_eq!(r.chapter_end(&r.markers[0], &(10..100)), Some(1_600_000_000));
         let p = tl.mark(20, "P").unwrap();
         assert_eq!(p.chapter_end(&p.markers[0], &(10..30)), None);
+    }
+}
+
+// ---- STRIAREVERSEEDIT (LEDGER SR9094): cut, trim and slide-follow work on a reversed clip (named tail block) ----
+// A reversed clip shows its `src_out` side at its timeline START and its `src_in` side at its END (SR9067's descending
+// `src_at`). THE cut `cut_halves` cuts either direction: the head keeps the high source ticks on a reversed clip (forward:
+// exactly the old `src_at(at)` halves), so `split_at`, `cut_clean` (`split`, `place`) and `slide`'s reversed follow all read
+// it. A trim moves one source edge and the timeline edge that SHOWS it (`trimmed_at`): forward `trim_in` keeps the end and
+// `trim_out` the start, as before; reversed, the anchors flip, so every untouched tick keeps its frame. `moved_cut` keys a
+// cut on the source tick it sees (`head_edge` / `tail_edge`). The editor names the TIMELINE edge on a reversed selection
+// (editor.rs tail `timeline_edge`). Still refused by name: a reversed OUTGOING of a handle (`validate_reverse`,
+// NLE-REVERSE-HANDLE owed), a cut or follow off a rated clip's frame grid (`Rate`).
+
+/// STRIAREVERSEEDIT: clip `c` cut at timeline tick `at` (head keeps `at`, the tail starts at `at`), either direction; `at`
+/// may lie past an edge (a slide's follow). `k = floor((at - c.at) * rate)` source ticks go to the head: forward the head
+/// is `src_in..src_in + k`, reversed `src_out - k..src_out`.
+fn cut_halves(c: &Clip, at: i64) -> (Clip, Clip) {
+    let k = scale_q16(at - c.at, eff_rate(c.rate_q16));
+    if c.reverse {
+        (Clip { src_in: c.src_out - k, ..*c }, Clip { src_out: c.src_out - k, at, ..*c })
+    } else {
+        (Clip { src_out: c.src_in + k, ..*c }, Clip { src_in: c.src_in + k, at, ..*c })
+    }
+}
+
+/// STRIAREVERSEEDIT: the start `c` has once trimmed to `now`'s window: when the source edge SHOWN at the clip's start moved
+/// (forward `src_in`, reversed `src_out`) the end stays, else the start stays.
+fn trimmed_at(c: &Clip, now: &Clip) -> i64 {
+    let head_moved = if c.reverse { now.src_out != c.src_out } else { now.src_in != c.src_in };
+    if head_moved { c.end() - now.len() } else { c.at }
+}
+
+/// STRIAREVERSEEDIT: the source edge a cut at `c`'s start sees (forward `src_in`, reversed `src_out`), with its direction.
+fn head_edge(c: &Clip) -> (bool, i64) {
+    (c.reverse, if c.reverse { c.src_out } else { c.src_in })
+}
+
+/// STRIAREVERSEEDIT: the source edge a cut at `c`'s end sees (forward `src_out`, reversed `src_in`), with its direction.
+fn tail_edge(c: &Clip) -> (bool, i64) {
+    (c.reverse, if c.reverse { c.src_in } else { c.src_out })
+}
+
+#[cfg(test)]
+mod striareverseedit_tests {
+    extern crate std;
+    use super::*;
+    use crate::editor::{Edge, EditorState};
+
+    /// V1 on source A (60): `clips` laid as given.
+    fn tl(clips: Vec<Clip>) -> Timeline {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 60);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = clips;
+        tl
+    }
+
+    fn a(src_in: i64, src_out: i64, at: i64) -> Clip {
+        Clip::new(SourceId(0), src_in, src_out, at)
+    }
+
+    fn r(src_in: i64, src_out: i64, at: i64) -> Clip {
+        a(src_in, src_out, at).reversed(true)
+    }
+
+    /// The source tick each timeline tick of `t0..t1` on track 0 shows (None: no clip).
+    fn shown(tl: &Timeline, t0: i64, t1: i64) -> Vec<Option<i64>> {
+        (t0..t1).map(|t| tl.tracks[0].clips.iter().find(|c| c.covers(t)).map(|c| c.src_at(t))).collect()
+    }
+
+    #[test]
+    fn striareverseedit_split_and_overwrite_cut_a_reversed_clip() {
+        let one = tl(alloc::vec![r(10, 20, 0)]);
+        let s = one.split(0, 4).unwrap();
+        assert_eq!(s.tracks[0].clips, alloc::vec![r(16, 20, 0), r(10, 16, 4)], "the head keeps the high ticks");
+        assert_eq!(shown(&s, 0, 10), shown(&one, 0, 10));
+        let two = tl(alloc::vec![r(10, 30, 0).at_rate(0x2_0000)]);
+        let s2 = two.split(0, 4).unwrap();
+        assert_eq!(s2.tracks[0].clips, alloc::vec![r(22, 30, 0).at_rate(0x2_0000), r(10, 22, 4).at_rate(0x2_0000)]);
+        assert_eq!(shown(&s2, 0, 10), shown(&two, 0, 10));
+        let odd = tl(alloc::vec![r(0, 9, 0).at_rate(0x1_8000)]);
+        assert_eq!(odd.split(0, 1), Err(EditError::Rate), "off a 1.5x frame grid stays refused by name");
+        let ow = tl(alloc::vec![r(10, 20, 0), a(30, 40, 10)]).place(0, a(40, 42, 4), Mode::Overwrite).unwrap();
+        assert_eq!(ow.tracks[0].clips, alloc::vec![r(16, 20, 0), a(40, 42, 4), r(10, 14, 6), a(30, 40, 10)]);
+        assert_eq!(shown(&ow, 6, 10), shown(&tl(alloc::vec![r(10, 20, 0)]), 6, 10), "the carved tail keeps its frames");
+        std::println!("striareverseedit: split R[10,20)@0 at 4 -> {:?}", s.tracks[0].clips);
+    }
+
+    #[test]
+    fn striareverseedit_trims_anchor_the_edge_showing_the_moved_source_edge() {
+        let one = tl(alloc::vec![r(10, 20, 0)]);
+        let out = one.trim_out(0, 0, 18).unwrap();
+        assert_eq!(out.tracks[0].clips[0], r(10, 18, 2), "src_out shows at the start: the end stays");
+        assert_eq!(shown(&out, 2, 10), shown(&one, 2, 10));
+        let inn = one.trim_in(0, 0, 12).unwrap();
+        assert_eq!(inn.tracks[0].clips[0], r(12, 20, 0), "src_in shows at the end: the start stays");
+        assert_eq!(shown(&inn, 0, 8), shown(&one, 0, 8));
+        let fwd = tl(alloc::vec![a(10, 20, 0)]);
+        assert_eq!(fwd.trim_in(0, 0, 12).unwrap().tracks[0].clips[0], a(12, 20, 2), "forward unchanged");
+        assert_eq!(fwd.trim_out(0, 0, 18).unwrap().tracks[0].clips[0], a(10, 18, 0), "forward unchanged");
+    }
+
+    #[test]
+    fn striareverseedit_slide_follows_a_reversed_neighbour() {
+        let base = tl(alloc::vec![r(10, 20, 0), a(30, 35, 10), r(40, 50, 15)]);
+        let s = base.slide(0, 1, 2).unwrap();
+        assert_eq!(s.tracks[0].clips, alloc::vec![r(8, 20, 0), a(30, 35, 12), r(40, 48, 17)]);
+        assert_eq!(shown(&s, 0, 10), shown(&base, 0, 10), "the reversed p keeps its frames");
+        assert_eq!(shown(&s, 17, 25), shown(&base, 17, 25), "the reversed n keeps its frames");
+        assert_eq!(base.slide(0, 1, 11), Err(EditError::OutOfSource), "p would need src_in -1");
+    }
+
+    #[test]
+    fn striareverseedit_transition_onto_a_reversed_incoming_survives_its_tail_trim() {
+        let x = tl(alloc::vec![a(0, 10, 0), a(30, 40, 10)]).add_transition(0, 10, TransitionKind::Dissolve, 2).unwrap();
+        let x = x.set_reverse(0, 1, true).unwrap();
+        let t = x.trim_in(0, 1, 32).unwrap();
+        assert_eq!((t.tracks[0].clips[1], t.tracks[0].transitions[0].at), (r(32, 40, 10), 10), "the cut at its head is kept");
+    }
+
+    #[test]
+    fn striareverseedit_editor_edges_name_the_timeline_edge() {
+        let mut st = EditorState::new(tl(alloc::vec![r(10, 20, 0)]));
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("]"), Some(Ok(())));
+        assert_eq!(st.selected(), Some(r(10, 19, 1)), "`]` moves the start right");
+        assert_eq!(st.verb("}"), Some(Ok(())));
+        assert_eq!(st.selected(), Some(r(9, 19, 1)), "`}` moves the end right");
+        st.seek(3);
+        assert_eq!(st.verb("mark-in"), Some(Ok(())));
+        assert_eq!(st.selected(), Some(r(9, 17, 3)), "mark-in: the start at the playhead, its frame kept");
+        st.seek(9);
+        assert_eq!(st.verb("mark-out"), Some(Ok(())));
+        assert_eq!(st.selected(), Some(r(11, 17, 3)), "mark-out: the end at the playhead");
+        assert_eq!(st.trim_by_ticks(Edge::In, -1), Ok(()));
+        assert_eq!(st.selected(), Some(r(11, 18, 2)), "the drag's in edge lands under the pointer");
+        assert_eq!(st.trim_by_ticks(Edge::Out, 1), Ok(()));
+        assert_eq!(st.selected(), Some(r(10, 18, 2)), "the drag's out edge lands under the pointer");
+        assert_eq!(st.verb("rtrim in 1"), Some(Ok(())));
+        assert_eq!(st.selected(), Some(r(10, 17, 2)), "rtrim in: the head shortens, the start stays");
+        assert_eq!(st.undo_depth(), 7, "one undo step each");
+        std::println!("striareverseedit: ] } mark-in mark-out drag drag rtrim on R[10,20)@0 -> {:?}", st.selected());
     }
 }
