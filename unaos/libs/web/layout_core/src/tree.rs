@@ -2099,7 +2099,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
         }
         run_pass(tree);
     }
-    // Row-spanning cells take the height of the rows they span.
+    let mut widths = widths; if blockwidth::auto_overflow(tree, &mut widths) { run_pass(tree); } // Row-spanning cells take the height of the rows they span. AETHERMARGINAUTOOVERFLOW (SR1065): the over-constrained auto margins zeroed first
     if has_tables && table::fix_rowspans(tree) {
         run_pass(tree);
     }
