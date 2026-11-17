@@ -1620,7 +1620,7 @@ fn computed_font_size<H: Host>(paint: Option<&PaintStyle<H>>, tag: &str, parent:
     match paint.and_then(|p| p.font_size_rel) {
         Some((0, f)) => parent * f,
         Some((1, f)) => root_fs * f,
-        _ => paint.and_then(|p| p.font_size).unwrap_or_else(|| {
+        _ if paint.is_some_and(|p| p.inherits(crate::paint::INHERIT_FONT_SIZE)) => parent, _ => paint.and_then(|p| p.font_size).unwrap_or_else(|| {
             if parent_absolute {
                 default_font_size(tag, parent)
             } else {
@@ -1858,7 +1858,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
             if let Some(tag) = dom_node.tag() {
                 let tag = tag.as_str();
                 let paint = tree.paint_map.get(&node_id);
-                let own_family = paint.and_then(|p| p.family).unwrap_or_else(|| default_family::<H>(tag, inherited.family));
+                let own_family = paint.and_then(|p| p.family).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_FAMILY, inherited.family, |f| default_family::<H>(tag, f)));
                 size.font_size = computed_font_size(paint, tag, inherited.font_size, inherited.family, own_family, inherited.fs_absolute, root_fs);
                 match paint.and_then(|p| p.font_size_rel) {
                     Some((0, _)) => {}
@@ -1896,12 +1896,12 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 if let Some(v) = paint.and_then(|p| p.word_spacing) {
                     size.mode.word_spacing = v;
                 }
-                size.family = paint.and_then(|p| p.family).unwrap_or_else(|| default_family::<H>(tag, inherited.family));
+                size.family = paint.and_then(|p| p.family).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_FAMILY, inherited.family, |f| default_family::<H>(tag, f)));
                 size.weight = paint
                     .and_then(|p| p.weight)
                     .map(|w| w.resolve(inherited.weight))
-                    .unwrap_or_else(|| default_weight(tag, inherited.weight));
-                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic)); size.caps = paint.map_or(inherited.caps, |p| p.caps(inherited.caps));
+                    .unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_WEIGHT, inherited.weight, |w| default_weight(tag, w)));
+                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_ITALIC, inherited.italic, |i| default_italic(tag, i))); size.caps = paint.map_or(inherited.caps, |p| p.caps(inherited.caps));
                 if let Some(st) = paint.and_then(|p| p.stretch) {
                     size.stretch = st;
                 }
@@ -1924,7 +1924,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     };
                     out.media.insert(node_id, (w, h, ratio));
                 }
-                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.and_then(|p| p.family).is_some() { size.family } else { 0 }, size.font_size)) {
+                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.is_some_and(|p| p.family.is_some() || p.inherits(crate::paint::INHERIT_FAMILY)) { size.family } else { 0 }, size.font_size)) {
                     out.imgs.insert(node_id, wh);
                 }
                 if tag == "img" || is_image_input(dom_node) { // AETHERIMAGEINPUTFETCH (SR461): an image input sizes as an img
