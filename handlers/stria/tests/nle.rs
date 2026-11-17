@@ -14846,3 +14846,78 @@ fn striastacktool_message_names_the_layers() {
     assert_eq!((face.state.undo_depth(), &face.state.timeline), (0, &tl), "view-only");
     println!("striastacktool: stack: 3 layers at tick 12");
 }
+
+// ---- STRIAGAINENVDRAG (LEDGER SR9082): the envelope drag on the face, a click on the line, the env chords (named tail block) ----
+use timeline_core::view::{gain_env_rows, gain_y};
+
+/// The press point over timeline tick `t` of the selected clip's envelope line on row `row`.
+fn striagainenvdrag_point(face: &Face, row: usize, t: i64) -> (f64, f64) {
+    let l = face.layout();
+    let c = face.state.selected().unwrap();
+    let (top, bottom) = gain_env_rows(&l, row);
+    (l.x_of(t) as f64 + 0.5, gain_y(c.gain_cdb + c.gain_env.at(c.src_tick(t)), top, bottom) as f64 + 0.5)
+}
+
+/// M3: on A1's A[13,23)@0 with points (18, -6 dB) and (22, 0 dB): a press on the first dot dragged 2 ticks right (y
+/// unchanged) is ONE commit landing at source tick 20 (one short of its neighbour would be 21) with the note; a click on the
+/// line at tick 2 adds a point at the line's value; the four chords each one commit with the env note; a Shift press on the
+/// line is not the envelope drag; undo restores.
+#[test]
+fn striagainenvdrag_face_drag_and_keys() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("env -6"));
+    face.state.seek(9);
+    assert!(face.verb("env 0"));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(18, -600), (22, 0)]);
+    let z = face.layout().zoom as f64;
+    let (x, y) = striagainenvdrag_point(&face, 1, 5);
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 2.0 * z, y, 0));
+    assert_eq!(face.state.undo_depth(), 2, "nothing committed during the drag");
+    face.on(&nle3eslipdrag_btn(false, x + 2.0 * z, y, 0));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(20, -600), (22, 0)]);
+    assert_eq!((face.state.undo_depth(), face.last_error.as_deref(), face.note.as_deref()), (3, None, Some("env: -6.0 dB at 7, 2 points")));
+    let (lx, ly) = striagainenvdrag_point(&face, 1, 2);
+    face.on(&nle3eslipdrag_btn(true, lx, ly, 0));
+    face.on(&nle3eslipdrag_btn(false, lx, ly, 0));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(15, -600), (20, -600), (22, 0)]);
+    assert_eq!((face.state.undo_depth(), face.note.as_deref()), (4, Some("env: -6.0 dB at 2, 3 points")));
+    face.state.seek(4);
+    for (k, note) in [("Alt+e", "env: -6.0 dB at 4, 4 points"), ("Alt+Up", "env: -5.0 dB at 4, 4 points"), ("Alt+Down", "env: -6.0 dB at 4, 4 points"), ("Alt+Shift+E", "env: -6.0 dB at 4, 3 points")] {
+        assert!(face.on(&bandy::SMessage::BrowserKey(k.into())), "{k}");
+        assert_eq!((face.last_error.as_deref(), face.note.as_deref()), (None, Some(note)), "{k}");
+    }
+    assert_eq!(face.state.undo_depth(), 8);
+    let (lx, ly) = striagainenvdrag_point(&face, 1, 2);
+    face.on(&nle3eslipdrag_btn(true, lx, ly, bandy::MOD_SHIFT));
+    assert_ne!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv), "Shift keeps its meaning");
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    for _ in 0..8 {
+        assert!(face.verb("undo"));
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("striagainenvdrag face: dot (18) +2 ticks -> 20, note; line click at 2 -> (15, -600); Alt+e / Alt+Up / Alt+Down / Alt+Shift+E one commit each");
+}
+
+/// The four chords: KEYS rows bound once, each a VERBS word with a HELP phrase named on its help row, none a single
+/// character (one character is one word on both faces) and none a sibling's chord.
+#[test]
+fn striagainenvdrag_keys_free() {
+    let chords = [("Alt+e", "env"), ("Alt+Shift+E", "env-del"), ("Alt+Down", "env-"), ("Alt+Up", "env+")];
+    let siblings = ["Alt+m", "Alt+s", "Alt+u", "Alt+i", "Alt+o", "Alt+Left", "Alt+Right"];
+    let rows = help_rows();
+    for (k, w) in chords {
+        assert!(KEYS.contains(&(k, w)), "{k} -> {w}");
+        assert_eq!(KEYS.iter().filter(|(n, _)| *n == k).count(), 1, "{k} bound once");
+        assert!(VERBS.contains(&w), "{w}: a VERBS word");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(HELP.iter().any(|(a, _)| *a == w) && row.1 != w, "{w}: a phrase");
+        assert!(k.chars().count() > 1 && !siblings.contains(&k), "{k} collides");
+    }
+    println!("striagainenvdrag: chords {:?}", chords);
+}
