@@ -1381,14 +1381,7 @@ impl Sources {
         let (mut first, mut last) = (u64::MAX, 0u64);
         for e in entries.flatten() {
             let Ok(name) = e.file_name().into_string() else { continue };
-            let Some(mid) = name.strip_prefix(stem).and_then(|m| m.strip_suffix(suffix)) else { continue };
-            if mid.is_empty() || !mid.bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let Ok(n) = mid.parse::<u64>() else { continue };
-            if format!("{n:0width$}") == mid {
-                (first, last) = (first.min(n), last.max(n));
-            }
+            let Some(n) = timeline_core::seq::number(stem, width, suffix, &name) else { continue }; (first, last) = (first.min(n), last.max(n)); // STRIAKSEQ (SR9065): the name rule is timeline_core's, the Player's too
         }
         if first == u64::MAX {
             return Err(refuse(String::from("no file matches")));
@@ -1437,7 +1430,7 @@ fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: Sourc
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
-    let mut img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; img.apply_orientation(); // STRIASEQTHREE (SR9022): turned upright by its EXIF orientation (file tail); STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
+    let img = timeline_core::seq::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; // STRIAKSEQ (SR9065): timeline_core's upright decode, the Player's too; STRIASEQTHREE (SR9022): turned upright by its EXIF orientation (file tail); STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
     Ok(Some(q.keep(n, img.width, img.height, seq_canvases(img.frames.take(), img.rgba), q.frame_in(src_t, n), tl.tb.to_ns(src_t), stamp))) // STRIASEQRATEEDL (SR9053): every canvas of an animated file kept, this tick's handed on (file tail); STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
 }
 
@@ -1644,12 +1637,7 @@ const SEQ_HEAD: u64 = 256 * 1024;
 /// its files must sniff as, and that format's name for the refusal (`<p>: not a <NAME> header`). `None`: not a sequence format
 /// (TIFF / raw, SVG and everything else are refused at the suffix).
 fn seq_format(suffix: &str) -> Option<(gneiss_pal::dsp::image::Format, &'static str)> {
-    use gneiss_pal::dsp::image::Format;
-    let s = suffix.to_ascii_lowercase();
-    [(".png", Format::Png, "PNG"), (".jpg", Format::Jpeg, "JPEG"), (".jpeg", Format::Jpeg, "JPEG"), (".gif", Format::Gif, "GIF"), (".bmp", Format::Bmp, "BMP"), (".qoi", Format::Qoi, "QOI"), (".webp", Format::WebP, "WebP")]
-        .into_iter()
-        .find(|e| s.ends_with(e.0))
-        .map(|e| (e.1, e.2))
+    timeline_core::seq::format(suffix) // STRIAKSEQ (SR9065): the table is timeline_core's, the Player's too
 }
 
 /// STRIASEQMORE: a sequence rate's text as `(n, d)` frames a second, reduced: `N` (d 1), `N/D` (D above 0) or `N.F` (F one to

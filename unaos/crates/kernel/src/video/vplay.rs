@@ -925,7 +925,7 @@ fn origin(d: &Demuxer, i: usize) -> i64 {
 struct Reels {
     tb: timeline_core::Timebase,
     reels: Vec<Reel>,
-    titles: Vec<(timeline_core::SourceId, String)>, // STRIAKTITLE (LEDGER SR9009): the generated title sources (no file), drawn by `title_card`
+    titles: Vec<(timeline_core::SourceId, String)>, // STRIAKTITLE (LEDGER SR9009): the generated title sources (no file), drawn by `title_card` seqs: Vec<SeqReel>, // STRIAKSEQ (LEDGER SR9065): the image-sequence reels (file tail)
 }
 
 impl Reels {
@@ -936,13 +936,13 @@ impl Reels {
 
 impl timeline_core::SourceIndex for Reels {
     fn duration(&self, src: timeline_core::SourceId) -> Option<i64> {
-        let r = self.get(src)?;
+        if let Some(q) = self.seq(src) { return Some(q.len()); } let r = self.get(src)?; // STRIAKSEQ (LEDGER SR9065): a sequence lasts one tick a file (file tail)
         let ns = [r.v.as_ref().map(|v| v.0), r.a.map(|a| a.0)].into_iter().flatten().map(|i| r.d.tracks()[i].duration_ns).max()?;
         // whole ticks only (1 µs of slack for a time base's rounding), stria::nle::Sources' arithmetic
         Some(((ns as i128 + 1_000) * self.tb.den as i128 / (self.tb.num.max(1) as i128 * 1_000_000_000)) as i64)
     }
     fn keyframe_ns(&self, src: timeline_core::SourceId, kind: timeline_core::Kind, t_ns: i64) -> Option<i64> {
-        let r = self.get(src)?;
+        if self.seq(src).is_some() { return Some(t_ns); } let r = self.get(src)?; // STRIAKSEQ (LEDGER SR9065): every file of a sequence is a keyframe (file tail)
         let (i, o) = match kind {
             timeline_core::Kind::Video => r.v.as_ref().map(|v| (v.0, v.2))?,
             timeline_core::Kind::Audio => r.a?,
@@ -1042,10 +1042,10 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
-    speed_note(tlrated_unheld but a video hold); let mut reels = Reels { tb: tl.tb, reels: Vec::new(), titles: Vec::new() }; // STRIAKSPEED (SR9012): a rated clip plays (video through src_at, audio at the effective rate); the SR829 refusal is gone; STRIAKFREEZE (SR9008): but a video hold (timeline_core `rated_unheld`) // STRIAKTITLE (LEDGER SR9009): the titles beside the reels
+    speed_note(tlrated_unheld but a video hold); let mut reels = Reels { tb: tl.tb, reels: Vec::new(), titles: Vec::new(), seqs: Vec::new() }; // STRIAKSPEED (SR9012): a rated clip plays (video through src_at, audio at the effective rate); the SR829 refusal is gone; STRIAKFREEZE (SR9008): but a video hold (timeline_core `rated_unheld`) // STRIAKTITLE (LEDGER SR9009): the titles beside the reels // STRIAKSEQ (LEDGER SR9065): none opened yet (file tail)
     for s in &tl.sources {
         if let Some(t) = &s.title { reels.titles.push((s.id, t.clone())); continue; } let Some(rp) = [".MP4", ".WEBM", ".MKV", ".WAV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else { // STRIAKTITLE (LEDGER SR9009): a title is no file: drawn by `title_card` (file tail)
-            return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV|.WAV)", s.reel, dir, s.reel))));
+            if seq_open(&mut reels, dir, s)? { continue; } return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV|.WAV)", s.reel, dir, s.reel)))); // STRIAKSEQ (LEDGER SR9065): no movie file, a reel directory of numbered frames (file tail)
         };
         let mut d = { let b = read_all(&rp).map_err(|e| ("read-refused", Some(e)))?; if demux_core::wav::is_wav(&b) { Demuxer::open_wav(b) } else { Demuxer::open(b) } }.map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?; // STRIAWAVVALIDBITSNEXT (SR982): a WAV reel by its own door, the host editor's Media::open rule (Demuxer::open stays WAV-blind); snd plays its PCM track
         open_colour(&mut d, true); let v = d.video_track().and_then(|t| d.track_index(t.id).map(|i| (i, t.clone()))).map(|(i, t)| (i, t, origin(&d, i)));
@@ -1068,7 +1068,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     }
     // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
     let first = steps.iter().filter(|s| s.kind == Kind::Video).filter_map(|s| s.src).find(|id| reels.titles.iter().all(|t| t.0 != *id)).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref()); // STRIAKTITLE (LEDGER SR9009): a title sizes no frame
-    let Some((fw, fh, codec)) = first.map(|v| (v.1.width, v.1.height, tok(&v.1.codec))).or_else(|| timeline_core::view::title_size(tl, &steps, |id| reels.get(id).and_then(|r| r.v.as_ref()).map(|v| (v.1.width, v.1.height)).filter(|&(w, h)| w > 0 && h > 0)).map(|(w, h)| (w, h, "title"))) else { // STRIAKTITLE (LEDGER SR9009): a title-only EDL sizes by timeline_core's `view::title_size`
+    let Some((fw, fh, codec)) = first.map(|v| (v.1.width, v.1.height, tok(&v.1.codec))).or_else(|| timeline_core::view::title_size(tl, &steps, |id| reels.get(id).and_then(|r| r.v.as_ref()).map(|v| (v.1.width, v.1.height)).filter(|&(w, h)| w > 0 && h > 0)).map(|(w, h)| (w, h, "title"))).or_else(|| seq_facts(&steps, &reels)) else { // STRIAKTITLE (LEDGER SR9009): a title-only EDL sizes by timeline_core's `view::title_size` // STRIAKSEQ (LEDGER SR9065): a sequence reel sizes the picture too (file tail)
         return Err(("no-video", Some(String::from("the EDL cuts no video"))));
     };
     let out_ms = |t: i64| (tl.tb.to_ns(t).max(0) as u64) / 1_000_000;
@@ -1145,7 +1145,7 @@ fn edl_frame(
     rep: &mut EdlReport,
     outgoing: bool,
 ) -> Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)> {
-    let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
+    if let Some(f) = seq_frame(reels, id, src_t, slot) { return f; } let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?; // STRIAKSEQ (LEDGER SR9065): a sequence step reads and decodes its one file (file tail)
     let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
         let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tb.to_ns(src_t)).collect();
@@ -4079,4 +4079,116 @@ fn edit_opacity_note(st: &timeline_core::editor::EditorState, verb: &str, at: i6
     }
     let Some(c) = st.selected() else { return };
     serial_println!("[nle] edit {} -> {}% at={}", verb, c.opacity, at);
+}
+
+// ---- STRIAKSEQ (LEDGER SR9065): the image-sequence reel (named tail block) ----
+// A reel with no movie file beside the EDL is an image sequence when `<dir>/<REEL>/` holds frames named `<digits><ext>`
+// (timeline_core::seq's `dir_shape`, the six pixel_core formats of `seq::format`): one file a timeline tick (the EDL
+// carries no rate yet: `SeqReel::file_at` takes it as an Option, None today), each step reads its ONE file (`read_all`) and
+// decodes it upright through `timeline_core::seq::decode` (Stria's `seq_frame` decode). A sequence has no sound (`snd`
+// builds its sources from `Reels::reels` only). Built once by `edl_run`, owned by the job's `Reels`: no lock. Wire:
+// `[nle] reel <R> path=<dir>/<R>/ codec=seq frames=<n> <w>x<h>`; refusals `seq-refused`, `seq-length`, `seq-frame-missing`.
+
+/// One sequence reel: its directory, the pattern `<width digits><suffix>`, the file numbers `first..=last` and the
+/// upright size of its first file.
+struct SeqReel {
+    id: timeline_core::SourceId,
+    dir: String,
+    width: usize,
+    suffix: String,
+    first: u64,
+    last: u64,
+    w: u32,
+    h: u32,
+}
+
+impl SeqReel {
+    /// The path of file number `n`.
+    fn path(&self, n: u64) -> String {
+        alloc::format!("{}/{:0w$}{}", self.dir, n, self.suffix, w = self.width)
+    }
+    /// The reel's length in ticks: one per file number `first..=last`.
+    fn len(&self) -> i64 {
+        (self.last - self.first + 1) as i64
+    }
+    /// The ONE tick-to-file rule: file `first + k` at one file a tick (`rate` None), else `(R, tick num, tick den)` maps
+    /// `first + floor(k * R * num / den)` (Stria's `Seq::file_at`; the EDL's sequence rate arrives with SR9053). `None` on
+    /// overflow.
+    fn file_at(&self, k: u64, rate: Option<(u64, u64, u64)>) -> Option<u64> {
+        let Some((r, num, den)) = rate else { return self.first.checked_add(k) };
+        let off = k as u128 * r as u128 * num as u128 / den.max(1) as u128;
+        self.first.checked_add(u64::try_from(off).ok()?)
+    }
+}
+
+impl Reels {
+    /// Source `id`'s sequence reel, when it is one.
+    fn seq(&self, id: timeline_core::SourceId) -> Option<&SeqReel> {
+        self.seqs.iter().find(|q| q.id == id)
+    }
+}
+
+/// Open source `s` as a sequence reel from `<dir>/<REEL>/`: `Ok(false)` when there is no such directory (the caller's
+/// `reel-missing` stands). Refused by name: no frame file, an EDL length past the files (`seq-length`), a first file that
+/// is not its suffix's format or does not decode.
+fn seq_open(reels: &mut Reels, dir: &str, s: &timeline_core::Source) -> Result<bool, (&'static str, Option<String>)> {
+    let sd = alloc::format!("{}/{}", dir, s.reel);
+    let mt = crate::shell::vfs_mount_table();
+    let Ok(ents) = mt.read_dir(&sd) else { return Ok(false) };
+    let names: Vec<&str> = ents.iter().filter(|e| matches!(e.kind, crate::fs::vfs::NodeKind::File)).map(|e| e.name.as_str()).collect();
+    let Some((width, suffix)) = timeline_core::seq::dir_shape(names.iter().copied()) else {
+        return Err(("seq-refused", Some(alloc::format!("reel {}: no frame file (<digits>.png|.jpg|.jpeg|.gif|.bmp|.qoi|.webp) in {}/", s.reel, sd))));
+    };
+    let (mut first, mut last) = (u64::MAX, 0u64);
+    for n in names.iter().filter_map(|name| timeline_core::seq::number("", width, &suffix, name)) {
+        (first, last) = (first.min(n), last.max(n));
+    }
+    if first == u64::MAX {
+        return Err(("seq-refused", Some(alloc::format!("reel {}: no frame file in {}/", s.reel, sd))));
+    }
+    let mut q = SeqReel { id: s.id, dir: sd, width, suffix, first, last, w: 0, h: 0 };
+    if s.duration > q.len() {
+        return Err(("seq-length", Some(alloc::format!("reel {}: the EDL says {} ticks, {}/ holds files {}..={} ({}; a sequence plays one file a tick)", s.reel, s.duration, q.dir, first, last, q.len()))));
+    }
+    let p = q.path(first);
+    let bytes = read_all(&p).map_err(|e| ("read-refused", Some(alloc::format!("{}: {}", p, e))))?;
+    let (fmt, name) = timeline_core::seq::format(&q.suffix).ok_or_else(|| ("seq-refused", Some(alloc::format!("{}: not a sequence frame format", p))))?;
+    if pixel_core::sniff(&bytes) != Some(fmt) {
+        return Err(("seq-refused", Some(alloc::format!("{}: not a {} file", p, name))));
+    }
+    let img = timeline_core::seq::decode(&bytes).map_err(|e| ("decode-refused", Some(alloc::format!("{}: {:?}", p, e))))?;
+    (q.w, q.h) = (img.width, img.height);
+    serial_println!("[nle] reel {} path={}/ codec=seq frames={} {}x{}", s.reel, q.dir, q.len(), q.w, q.h);
+    reels.seqs.push(q);
+    Ok(true)
+}
+
+/// The picture facts `(w, h, codec)` when the first scheduled video source is a sequence reel.
+fn seq_facts(steps: &[timeline_core::schedule::Step], reels: &Reels) -> Option<(u32, u32, &'static str)> {
+    let id = steps.iter().filter(|s| s.kind == timeline_core::Kind::Video).find_map(|s| s.src)?;
+    reels.seq(id).map(|q| (q.w, q.h, "seq"))
+}
+
+/// The frame of sequence source `id` at source tick `src_t` as `edl_frame` returns it (`None`: not a sequence): the run
+/// in `slot` is dropped (the next movie step opens by its seek, Stria's rule), file `first + src_t` is read and decoded
+/// upright, its RGBA packed to 0RGB. A tick past the last file is `reel-short`, a file gone `seq-frame-missing`.
+fn seq_frame(reels: &Reels, id: timeline_core::SourceId, src_t: i64, slot: &mut Option<EdlRun>) -> Option<Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)>> {
+    let q = reels.seq(id)?;
+    *slot = None;
+    let Some(n) = u64::try_from(src_t).ok().and_then(|k| q.file_at(k, None)).filter(|&n| n <= q.last) else {
+        return Some(Err(("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, src_t)))));
+    };
+    let p = q.path(n);
+    if crate::shell::vfs_mount_table().stat(&p).is_err() {
+        return Some(Err(("seq-frame-missing", Some(alloc::format!("reel {} frame {} missing ({})", id.0, n, p)))));
+    }
+    let bytes = match read_all(&p) {
+        Ok(b) => b,
+        Err(e) => return Some(Err(("read-refused", Some(alloc::format!("{}: {}", p, e))))),
+    };
+    let img = match timeline_core::seq::decode(&bytes) {
+        Ok(i) => i,
+        Err(e) => return Some(Err(("decode-refused", Some(alloc::format!("reel {} frame {} ({}): {:?}", id.0, n, p, e))))),
+    };
+    Some(Ok((img.width as usize, img.height as usize, Px::from(pack(&img.rgba)), None)))
 }
