@@ -14055,3 +14055,27 @@ fn striastack_three_layers_render_through_the_one_mix() {
     }
     println!("striastack: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
 }
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the face's placement ease words and the placement line (named tail block) ----
+/// STRIAXFORMKEYSEASE (SR9070): `pip ease` on a keyed clip steps its curve, one undo step, and the message row names it;
+/// an unknown curve name is refused by name on the message row with no undo step.
+#[test]
+fn striaxformkeysease_face_ease_note() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.playhead = 10;
+    assert!(face.verb("pip tl"));
+    assert!(face.verb("pip key"));
+    face.state.playhead = 19;
+    assert!(face.verb("pip br"));
+    assert!(face.verb("pip ease"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 725 y 725 scale 250 keys 2 ease in"));
+    assert_eq!(face.state.undo_depth(), 4);
+    assert!(face.verb("pip ease sideways"));
+    assert_eq!(face.last_error.take(), Some(format!("pip ease sideways: {}", timeline_core::EditError::XKey)));
+    assert_eq!(face.state.undo_depth(), 4);
+}
+

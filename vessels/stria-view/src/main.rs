@@ -199,14 +199,14 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey" | "prev" | "next")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey" | "prev" | "next" | "ease")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
         ["dur", t @ ..] if (2..=3).contains(&t.len()) => SMessage::Input { target: SURFACE.into(), text: format!("dur {}", t.join(":")) }, // STRIATRANSITIONNEXT (SR991): `dur:00:07`, `dur:00:00:07`
         ["track-gain", ch, db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {ch} {db}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain:A2:-6` the named track
         [w @ ("track-gain-" | "track-gain+"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain-:A2` / `track-gain+:V1`
-        ["env", db] => SMessage::Input { target: SURFACE.into(), text: format!("env {db}") }, // STRIAGAINENVELOPE (SR9047): `env:-6` a gain point at the playhead
+        ["env", db] => SMessage::Input { target: SURFACE.into(), text: format!("env {db}") }, // STRIAGAINENVELOPE (SR9047): `env:-6` a gain point at the playhead; STRIAXFORMKEYSEASE (SR9070): `pip:ease` cycles, `pip:ease:inout` sets (the x y arm)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
@@ -3434,3 +3434,30 @@ mod striaxformkeysnav_tests {
         assert_eq!(face.state.playhead, 18);
     }
 }
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the witness's placement ease tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformkeysease_tests {
+    use super::*;
+
+    /// STRIAXFORMKEYSEASE (SR9070): `pip:ease` steps the keyed clip's curve and `pip:ease:inout` sets it, one undo step
+    /// each; with the points gone `pip:ease` is refused by name and commits nothing.
+    #[test]
+    fn striaxformkeysease_witness_ease_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        face.state.playhead = 12;
+        let errors = drive(&mut face, "pip:tl,pip:key,pip:ease");
+        assert!(errors.is_empty(), "{errors:?}");
+        let ease = |face: &Face| face.state.selected().map(|c| c.xkeys.ease());
+        assert_eq!((face.state.undo_depth(), ease(&face)), (3, Some(timeline_core::Ease::In)));
+        assert!(drive(&mut face, "pip:ease:inout").is_empty());
+        assert_eq!((face.state.undo_depth(), ease(&face)), (4, Some(timeline_core::Ease::InOut)));
+        assert!(drive(&mut face, "pip:unkey").is_empty());
+        assert_eq!(ease(&face), Some(timeline_core::Ease::Linear));
+        assert_eq!(drive(&mut face, "pip:ease"), vec![format!("pip ease: {}", timeline_core::EditError::XKey)]);
+        assert_eq!(face.state.undo_depth(), 5);
+    }
+}
+
