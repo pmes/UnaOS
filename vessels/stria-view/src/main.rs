@@ -563,6 +563,7 @@ fn transport() -> TetraNode {
         button("insert-marked", "Insert Marks"), button("overwrite-marked", "Overwrite Marks"), // STRIAINSERTMARKS (SR905): the selected clip's source into the in / out marks, rippling / over its track
         button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
         button("xfade-curve", "Curve"), button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
+        button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal
     ])
 }
