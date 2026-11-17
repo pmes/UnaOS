@@ -1187,7 +1187,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(7);
             }
-            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right, 7 -webkit-left — start/end
+            // codes: 0 start, 1 center, 2 right, 3 end, 4 left, 5 -webkit-center, 6 -webkit-right, 7 -webkit-left, 8 justify — start/end
             // resolve against `direction` (css-text-3 §6.1) where lines are placed (layout::inline).
             "right" => {
                 style.justify = Some(taffy::style::JustifyContent::END);
@@ -1201,7 +1201,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(4);
             }
-            "start" | "justify" => {
+            "justify" => { style.justify = Some(taffy::style::JustifyContent::START); style.paint.text_align = Some(8); } "start" => { // AETHERTEXTALIGNJUSTIFY (SR1057): justify is its own code 8 (inline::justify_line)
                 style.justify = Some(taffy::style::JustifyContent::START);
                 style.paint.text_align = Some(0);
             }

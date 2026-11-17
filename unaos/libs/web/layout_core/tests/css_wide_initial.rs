@@ -1505,3 +1505,76 @@ fn background_layer_props_cascade() {
     let s = cascade(&[&[("background-repeat", "no-repeat, repeat-x")], imgs]);
     assert_eq!(bg_layer_props(&s).iter().map(|l| l.1).collect::<Vec<_>>(), vec![Some(1), Some(2)], "the repeat list survives a later image list");
 }
+
+
+// ---- AETHERTEXTALIGNJUSTIFY (LEDGER SR1057): css-text-3 §7.1 text-align: justify — the line-finish gap pass (named tail block) ----
+
+/// AETHERTEXTALIGNJUSTIFY (SR1057): lays `<p id=p style="font-size: 10px; width: 200px; {style}">{kids}</p>` with the
+/// fixed-advance fonts (a glyph is 5px) and returns each line's text frags as (x, right edge), in line order.
+fn justify_lines(style: &str, kids: Vec<Spec>) -> Vec<Vec<(f32, f32)>> {
+    let doc = page(vec![el("p", &[("id", "p"), ("style", &format!("margin: 0; font-size: 10px; width: 200px; {style}"))], kids)]);
+    let tree = lay(&doc, 600.0, 400.0);
+    let il = &tree.inline[&id_of(&tree, &doc.by_id("p"))];
+    il.lines
+        .iter()
+        .map(|l| {
+            il.frags
+                .iter()
+                .filter_map(|f| match f {
+                    layout_core::inline::Frag::Text { x, width, baseline, .. } if *baseline == l.2 => Some((*x, *x + *width)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn right_edge(line: &[(f32, f32)]) -> f32 {
+    line.iter().map(|f| f.1).fold(0.0, f32::max)
+}
+
+/// 15 six-letter words: five per 200px line (natural 170px), three lines.
+fn fifteen() -> Vec<Spec> {
+    vec![text(&["abcdef"; 15].join(" "))]
+}
+
+/// AETHERTEXTALIGNJUSTIFY (SR1057): lines 1-2 end flush at 200px, one frag per word; the last line is start (170);
+/// the start twin is ragged; a `<br>`-ended line and a one-word line are not stretched; rtl: the last line sits at
+/// the right.
+#[test]
+fn text_align_justify_lines() {
+    let j = justify_lines("text-align: justify", fifteen());
+    assert_eq!(j.len(), 3, "three lines: {j:?}");
+    for l in &j[..2] {
+        assert!((right_edge(l) - 200.0).abs() <= 0.5, "a justified line ends flush at 200: {l:?}");
+        assert_eq!(l.len(), 5, "one frag per word on a justified line: {l:?}");
+        assert_eq!(l[0].0, 0.0, "it starts at the line start: {l:?}");
+    }
+    assert!((right_edge(&j[2]) - 170.0).abs() <= 0.5, "the last line is start: {:?}", j[2]);
+    let s = justify_lines("text-align: start", fifteen());
+    assert!((right_edge(&s[0]) - 170.0).abs() <= 0.5, "the start twin is ragged: {:?}", s[0]);
+    assert_eq!(s[0].len(), 1, "the start twin keeps one frag per chunk: {:?}", s[0]);
+    let br = justify_lines("text-align: justify", vec![text("abcdef abcdef"), el("br", &[], vec![]), text(&["abcdef"; 10].join(" "))]);
+    assert!((right_edge(&br[0]) - 65.0).abs() <= 0.5, "a <br>-ended line is not stretched: {br:?}");
+    assert!((right_edge(&br[1]) - 200.0).abs() <= 0.5, "the next full line is: {br:?}");
+    let one = justify_lines("text-align: justify", vec![text(&format!("{} abcdef", "a".repeat(36)))]);
+    assert!((right_edge(&one[0]) - 180.0).abs() <= 0.5, "a one-word line is not stretched: {one:?}");
+    let rtl = justify_lines("direction: rtl; text-align: justify", fifteen());
+    assert!((right_edge(&rtl[0]) - 200.0).abs() <= 0.5 && rtl[0][0].0 == 0.0, "rtl: a justified line is flush both sides: {:?}", rtl[0]);
+    assert!((right_edge(&rtl[2]) - 200.0).abs() <= 0.5 && (rtl[2][0].0 - 30.0).abs() <= 0.5, "rtl: the last line is start (right): {:?}", rtl[2]);
+}
+
+/// AETHERTEXTALIGNJUSTIFY (SR1057): justify is start for the container: a 200px block child stays at x 0 (the
+/// -webkit-center twin centres it); the code reads back as its own value (8), not start.
+#[test]
+fn text_align_justify_container_start() {
+    let at = |ta: &str| {
+        let doc = page(vec![el("div", &[("style", &format!("text-align: {ta}"))], vec![el("div", &[("id", "d"), ("style", "width: 200px")], vec![text("ab")])])]);
+        let tree = lay(&doc, 600.0, 400.0);
+        box_of(&tree, &doc.by_id("d")).0
+    };
+    assert_eq!(at("justify"), 0.0, "justify leaves the narrow block at the start");
+    assert_eq!(at("-webkit-center"), 200.0, "the -webkit-center twin centres it");
+    assert_eq!(styled(&[("text-align", "justify")]).paint.text_align, Some(8), "justify is code 8");
+    assert_eq!(styled(&[("text-align", "start")]).paint.text_align, Some(0), "start stays 0");
+}
