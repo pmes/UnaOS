@@ -735,7 +735,7 @@ const NLE5DCLITABLE_BEFORE: [u64; 8] = [
     0x3a30_55bf_79db_7d59, // H264ENCPINTRA (SR759): was 0xb3c1_26d2_643f_7976
     0xd4a7_27d4_5b5d_78c5, // H264ENCPINTRA (SR759): was 0xd4a7_27d4_5b5d_78c5
     0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
-    0xa8c4_5a90_2fdd_d16e, // H264ENCPINTRA (SR759): was 0x7265_0fd7_6ad4_126c
+    0x12d0_3f9f_3155_d2fd /* was 0xa8c4_5a90_2fdd_d16e (SR771 fold) */, // H264ENCPINTRA (SR759): was 0x7265_0fd7_6ad4_126c
     0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
     0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
     0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb

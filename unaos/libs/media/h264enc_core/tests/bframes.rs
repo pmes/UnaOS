@@ -187,8 +187,8 @@ fn c_bframes_zero_through_push_keeps_the_pinned_bytes() {
     let (w, h) = (128usize, 96usize);
     let base = |qp: u8| Config { width: w as u32, height: h as u32, qp, gop: 30, bframes: 0, ..Default::default() };
     for (name, cfg, want) in [
-        ("qp26 gop30", base(26), 0x1fbc_56dc_6807_f2a8u64),
-        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0x1c1e_9579_5119_5ceb),
+        ("qp26 gop30", base(26), 0xd572_6ae5_9a9b_6d9cu64), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1fbc_56dc_6807_f2a8
+        ("qp30 gop10 deblock subpel2", Config { gop: 10, deblock: true, subpel: 2, ..base(30) }, 0xd7c3_16c6_beb0_6d49), // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 0x1c1e_9579_5119_5ceb
         ("qp36 gop1", Config { gop: 1, ..base(36) }, 0x7785_4898_5213_d0db),
     ] {
         let (aus, _, _) = encode_all(cfg, 60, &|t| scene(w, h, t));

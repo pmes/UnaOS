@@ -521,7 +521,7 @@ fn o_intra_counts_from_the_coder() {
         enc.push(&frame(&scene(t))).unwrap();
     }
     enc.flush().unwrap();
-    for (pics, want) in [(first_pass(60), 19u32), (enc.stats().to_vec(), 9)] {
+    for (pics, want) in [(first_pass(60), 8u32), (enc.stats().to_vec(), 7)] { // SR771 (H264ENCPINTRACHROMA: the intra / inter compare pays the chroma): was 19 / 9
         let counts: Vec<String> = pics.iter().map(|p| format!("{:?}:{}/{}", p.kind, p.intra_mbs, p.mbs)).collect();
         println!("twopassblurintra counts {}", counts.join(" ")); assert_eq!(pics.iter().filter(|p| p.kind != Pic::Idr).map(|p| p.intra_mbs).sum::<u32>(), want, "the P / B intra total");
         for p in &pics {
@@ -740,7 +740,7 @@ fn w_qpstep_zero_codes_the_pre_sr769_stream() {
 }
 
 /// rt_encode(RT_KBPS, rt_plan(1000, 10), qpstep 0, scene) captured on the tree BEFORE SR769 (bits, SliceQPY per picture).
-const W_PRE_BITS: [u64; 30] = [15104, 1440, 952, 952, 1240, 1040, 1248, 1208, 1272, 1168, 1008, 1192, 368, 2200, 1128, 1192, 1120, 976, 1256, 1208, 1160, 1152, 552, 640, 760, 512, 1176, 1360, 1328, 1376]; // re-pinned at the SR769 fold: SR759 (P intra) moved the coded bytes;
+const W_PRE_BITS: [u64; 30] = [15104, 1272, 952, 952, 1048, 1288, 1312, 1176, 1160, 1168, 1040, 1024, 368, 2168, 1248, 1296, 1008, 1056, 1320, 1024, 1248, 1256, 544, 616, 656, 632, 1360, 1416, 1104, 1488]; // re-pinned at the SR769 and SR771 folds: SR759 (P intra) and SR771 (chroma SAD) moved the coded bytes;
 const W_PRE_QPS: [i32; 30] = [29, 28, 28, 28, 28, 28, 28, 28, 28, 29, 29, 29, 37, 28, 29, 29, 29, 29, 29, 29, 29, 30, 38, 37, 36, 35, 33, 32, 32, 32]; // re-pinned at the SR769 fold: SR759 (P intra) moved two QPs
 
 // (x) the bucket wins, measured and named: scene() then dense noise from picture 15 under the scene's own first pass (the plan
