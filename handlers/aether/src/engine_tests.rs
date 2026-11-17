@@ -12506,6 +12506,28 @@ b</div>
         }
     }
 
+    #[test]
+    fn bounding_sticky_nested_probe_m1() {
+        let rows = |e: &mut crate::AetherEngine, tag: &str| {
+            let painted = sticky_outer_hold_row(e, (255, 0, 0));
+            let top = imgalt_rect(e, "sub").1;
+            let lk = imgalt_rect(e, "lk").1;
+            let ot = js_num(e, "document.getElementById('sub').offsetTop");
+            let op = e.js_engine.as_mut().unwrap().eval_string("String(document.getElementById('sub').offsetParent.id)").unwrap();
+            let p = painted.unwrap_or(0) as f64 + 5.0;
+            let efp: Vec<(f64, String, String)> = [p, p + 10.0, 5.0].iter().map(|&y| (y, bounding_sticky_from_point(e, 10.0, y), hit_sticky_origin_id(e, 10.0, y))).collect();
+            eprintln!("M1PROBE {tag}: painted={painted:?} sub.gBCR.top={top} lk.gBCR.top={lk} sub.offsetTop={ot} offsetParent={op} efp/shell={efp:?} scroll_y={}", e.scroll_y);
+        };
+        for (off, sc) in [(0, 0.0), (0, 300.0), (100, 300.0), (0, 450.0)] {
+            let mut e = sticky_outer_hold_page(off, sc);
+            rows(&mut e, &format!("page off={off} sc={sc}"));
+        }
+        for (off, dy) in [(0, 0.0), (0, 100.0), (0, 300.0), (100, 300.0)] {
+            let mut e = sticky_outer_hold_panel(off, dy);
+            rows(&mut e, &format!("panel off={off} dy={dy}"));
+        }
+    }
+
     // ---- AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (LEDGER SR1113): getComputedStyle textDecoration from the four report columns, the el.style expand and the textUnderlinePosition accessor (named tail block) ----
 
     /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `#w` a wavy red underline, `#t` the same with a 3px thickness, `#p` a plain
