@@ -6,8 +6,7 @@ shared-file seams stay inside one machine:
 
 - **Cloud seat:** Stria / NLE, h264enc_core, hevc_core, and the Aether chains already in flight (font-synthesis,
   font cache, fallback, the alt icon).
-- **Local:** the Aether arcs in this directory (layout_core / aether handler / text_host), one at a time per
-  executor, three at once at most.
+- **Local:** the Aether arcs in this directory (layout_core / aether handler / text_host), one executor per arc, UP TO NINE AT ONCE (Peter's order: burn credits; the local seat composes the seams at the fold).
 
 ## The order of one local arc
 
@@ -48,7 +47,7 @@ vocabulary touched, the blueprint line, the MEASURE line, owed proposals.
 
 ## Local pack 2 (Stria: the suite the local machine can carry)
 
-Four Stria arcs, measure-first like pack 1, cut from the trunk tip (SR827-SR830). Same order of one arc as above; the
+Nine Stria arcs, measure-first like pack 1, cut from the trunk tip (SR827-SR830, then SR835-SR839). Run ALL NINE at once; the only ordering is SR839 after SR827 (it extends SR827's lookup parameter), and the three lib.rs literal arcs (SR828 / SR829 / SR837) merge each other's landed branch before their commit. Same order of one arc as above; the
 EXCEPTION target dir is `$HOME/unaos-local-target-media` (text_host wants alsa's `PKG_CONFIG_PATH` only if the system
 lacks it). Row prefix for every pack-2 arc is `- NLE5b (SR204 owed)` (handlers.md L104, edited IN PLACE). The cloud seat
 stays out of nle.rs `render`, nle_face.rs `paint`, timeline_core `lib.rs` / `view.rs` / `edl.rs` while pack 2 is open;
@@ -60,6 +59,10 @@ the export-message chain (nle_face.rs `job_line` / `export_eta`, stria-view `exp
 | `striatitleclip` (SR828) | a title card as a generated Source (`* UNA TITLE` in the EDL; text_host renders the still once) | lib.rs `Source` gains ONE field: every literal gains `title: None` |
 | `striaclipspeed` (SR829) | per-clip rate (`rate_q16`; `Clip::len` / `src_at` the one road; CMX `M2` line; `lay_edit_list` stops refusing) | every `src_out - src_in` reader in timeline_core becomes `len()`: count them in the design |
 | `striaexportframe` (SR830) | `frame [<path>]`: the playhead frame as a PNG (preview road + the existing PNG encoder; a Frame button; `"frame"` on the witness) | stays out of `export_json`; `VERBS` 26 -> 27 |
+| `striamarkers` (SR835) | named markers on the ruler, `* UNA MARKER` in the EDL, `mark` / `unmark`, prev / next stop at them, `"markers"` on the witness | lib.rs `Timeline` gains ONE field; edl.rs quote helpers shared with SR828 |
+| `striasnapdrag` (SR836) | drags snap to clip edges / playhead / marks within 8 px (one pure `snap` in view.rs), alt disables, a guide line paints | nle_face.rs drag sites each ONE edit through `drag_tick` |
+| `striatrackmutesolo` (SR837) | per-track mute / solo (`Timeline::active_tracks` consulted by schedule and audio_runs), `* UNA MUTE` / `* UNA SOLO`, badges, half-alpha clips | lib.rs `Track` gains two fields: every literal |
+| `striaclipgainface` (SR838) | the face speaks the NLE4 gain / fades that the model and EDL already hold: `gain-` / `gain+` / `gain` / `fade-in` / `fade-out`, a gain line and fade ramps on the body | nle_face.rs VERBS +5; view.rs ONE call line |
+| `striathumbnails` (SR839) | video clip heads show the `src_in` frame, decoded once and cached, filled lazily per paint | EXTENDS SR827's lookup parameter: run after SR827 |
 
-Order: SR830 first (smallest, no model change), then SR827, then SR828 and SR829 (both touch lib.rs `Clip` / `Source`
-literals: run them one after the other, not side by side, or the second one's merge re-touches every literal line).
+Order: all nine at once. `VERBS` in nle_face.rs is appended by SR830 / SR835 / SR837 / SR838: each adds its words at the END of the one line and bumps the count; the local seat composes the union. The `* UNA <WORD>` EDL lines are one word per arc (TITLE / MARKER / MUTE / SOLO), own write line, own parse arm.
