@@ -209,7 +209,7 @@ fn css_wide_longhand_sets_its_bit() {
     let s = styled(&[("font-variant", "small-caps"), ("font-variant", "inherit")]);
     assert!(s.paint.inherits(INHERIT_SMALL_CAPS) && s.paint.small_caps.is_none(), "font-variant: inherit reaches its caps half");
     let s = styled(&[("color", "inherit")]);
-    assert_eq!(s.paint.inherit, 0, "color is not a font field (AETHER-CSS-WIDE-COLOR owed)");
+    assert_eq!(s.paint.inherit, layout_core::paint::INHERIT_COLOR, "color: inherit sets the colour bit (AETHERCSSWIDECOLOR SR823)");
 }
 
 /// AETHERCSSWIDELONGHANDS (SR815): across rules, a later rule's explicit inherit clears the earlier rule's value (the
@@ -271,4 +271,99 @@ fn font_inherit_replay_keeps_bit() {
     merge_paint(&mut s.paint, &spec.paint);
     assert!(s.paint.inherits(INHERIT_LINE_HEIGHT), "the replay keeps line-height inherited");
     assert_eq!(s.paint.line_height, None);
+}
+
+// ---- AETHERCSSWIDECOLOR (LEDGER SR823): the explicit inherit bit for color (named tail block) ----
+
+use layout_core::paint::INHERIT_COLOR;
+
+/// AETHERCSSWIDECOLOR (SR823): `color: inherit` / `unset` (any case) clears an earlier colour in the block and sets the
+/// colour bit (css-cascade-4 §7.3.3: color is inherited, so unset == inherit); a later value in the block beats it.
+#[test]
+fn css_wide_color_sets_its_bit() {
+    for kw in ["inherit", "unset", "INHERIT"] {
+        let s = styled(&[("color", "blue"), ("color", kw)]);
+        assert_eq!(s.paint.inherit, INHERIT_COLOR, "color: {kw} sets the colour bit");
+        assert_eq!(s.paint.color, None, "color: {kw} clears the earlier colour");
+        assert!(s.paint.inherits(INHERIT_COLOR), "color: {kw} inherits");
+    }
+    let s = styled(&[("color", "inherit"), ("color", "green")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "a later value beats the bit");
+    assert!(s.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSWIDECOLOR (SR823): across rules, a later `color: inherit` clears the earlier rule's colour and sets the bit;
+/// a still later rule's colour clears the bit again (merge_paint's `merge_inherit`).
+#[test]
+fn merge_paint_color_inherit_beats_earlier_rule() {
+    let mut dst = styled(&[("color", "blue")]);
+    assert!(dst.paint.color.is_some(), "the earlier rule's colour");
+    merge_paint(&mut dst.paint, &styled(&[("color", "inherit")]).paint);
+    assert_eq!(dst.paint.color, None, "the later inherit cleared the earlier colour");
+    assert!(dst.paint.inherits(INHERIT_COLOR), "the later inherit set the bit");
+    merge_paint(&mut dst.paint, &styled(&[("padding", "1px")]).paint);
+    assert!(dst.paint.inherits(INHERIT_COLOR), "an unrelated later rule keeps the bit");
+    merge_paint(&mut dst.paint, &styled(&[("color", "green")]).paint);
+    assert!(!dst.paint.inherits(INHERIT_COLOR), "a later colour clears the bit");
+    assert_eq!(dst.paint.inherit & INHERIT_COLOR, 0);
+    assert!(dst.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSWIDECOLOR (SR823): `font: inherit` reaches the seven font fields only: an earlier colour survives and the
+/// colour bit stays clear (INHERIT_FONT is 127).
+#[test]
+fn font_inherit_leaves_color() {
+    let mut dst = styled(&[("color", "blue")]);
+    merge_paint(&mut dst.paint, &styled(&[("font", "inherit")]).paint);
+    assert!(dst.paint.color.is_some(), "font: inherit keeps the colour");
+    assert!(!dst.paint.inherits(INHERIT_COLOR), "font: inherit does not set the colour bit");
+    assert_eq!(dst.paint.inherit, INHERIT_FONT);
+}
+
+// ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor writes the colour inherit bit (named tail block) ----
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2: `currentcolor` on `color` itself is `inherit`: in any case it
+/// clears an earlier colour in the block and sets the colour bit (the `is_neutral_keyword` drop kept the earlier colour);
+/// a later value in the block beats it.
+#[test]
+fn currentcolor_on_color_sets_inherit_bit() {
+    for kw in ["currentcolor", "currentColor", "CURRENTCOLOR"] {
+        let s = styled(&[("color", "blue"), ("color", kw)]);
+        assert_eq!(s.paint.inherit, INHERIT_COLOR, "color: {kw} sets the colour bit");
+        assert_eq!(s.paint.color, None, "color: {kw} clears the earlier colour");
+    }
+    let s = styled(&[("color", "currentcolor"), ("color", "green")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "a later value beats the bit");
+    assert!(s.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): `.a { color: blue } .a.b { color: currentcolor }`: the later rule clears the
+/// earlier rule's colour and sets the bit through merge_paint's `merge_inherit`.
+#[test]
+fn merge_paint_currentcolor_beats_earlier_rule() {
+    let mut dst = styled(&[("color", "blue")]);
+    assert!(dst.paint.color.is_some(), "the earlier rule's colour (armed)");
+    merge_paint(&mut dst.paint, &styled(&[("color", "currentcolor")]).paint);
+    assert_eq!(dst.paint.color, None, "the later currentcolor cleared the earlier colour");
+    assert!(dst.paint.inherits(INHERIT_COLOR), "the later currentcolor set the bit");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): the OTHER colour properties are pinned as measured, none of them touching the
+/// inherit bits: outline-color's `Some(None)` is THE currentColor marker (render's focusring `current_color` reads it);
+/// border has no marker and paints the arm's grey (128, 128, 128); background-color drops it, an earlier background
+/// stands (AETHER-CSS-CURRENTCOLOR-REST owed); a font longhand's `currentcolor` sets no bit.
+#[test]
+fn currentcolor_other_properties_pinned() {
+    let s = styled(&[("color", "red"), ("outline-color", "currentcolor")]);
+    assert_eq!(s.paint.outline_color, Some(None), "outline-color: currentcolor is the marker");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("border", "1px solid currentcolor")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, (128, 128, 128))); 4]), "border: currentcolor paints grey today (owed)");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("background-color", "blue"), ("background-color", "currentcolor")]);
+    assert_eq!(s.paint.background, styled(&[("background-color", "blue")]).paint.background, "the earlier background stands (owed)");
+    assert!(s.paint.background.is_some(), "armed: blue parsed");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("font-style", "italic"), ("font-style", "currentcolor")]);
+    assert_eq!(s.paint.inherit, 0, "font-style: currentcolor sets no bit");
 }
