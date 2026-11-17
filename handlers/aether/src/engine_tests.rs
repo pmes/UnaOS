@@ -7467,4 +7467,65 @@ mod tests {
             assert!(css_wide_color_ink(&mut e, "t", css_wide_controls_black) > 3, "{scheme}: black text");
         }
     }
+
+    // ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): `<meta name="color-scheme">` sets the root's scheme at the UA origin (named tail block) ----
+
+    /// AETHERCOLORSCHEMEMETA (SR1047): a page whose head holds `meta` (the tag's text, raw) and `style` (author CSS), a
+    /// button `#b0` and a paragraph `#t`, on a 400x600 viewport.
+    fn color_scheme_meta_engine(meta: &str, style: &str) -> crate::AetherEngine {
+        let html = format!(r##"<!doctype html><html><head>{meta}<style>{style} div {{ margin: 0 0 12px }}</style></head>
+            <body style="margin:0;font:20px serif"><div><button id="b0">Hello</button></div><p id="t">Text</p></body></html>"##);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCOLORSCHEMEMETA (SR1047): `<meta name="color-scheme" content="dark">` with no CSS paints the dark canvas
+    /// (#121212) and the dark button face, as `:root { color-scheme: dark }` does.
+    #[test]
+    fn color_scheme_meta_dark_paints_dark() {
+        let mut e = color_scheme_meta_engine(r#"<meta name="color-scheme" content="dark">"#, "");
+        assert_eq!(imgalt_px(&e, 395, 595), (18, 18, 18), "the meta's dark canvas");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_dark_face) > 20, "the dark face fills the button");
+        assert_eq!(css_wide_color_ink(&mut e, "b0", color_scheme_light_face), 0, "no light face");
+        let mut e = color_scheme_meta_engine(r#"<meta name="COLOR-SCHEME" content=" only dark ">"#, "");
+        assert_eq!(imgalt_px(&e, 395, 595), (18, 18, 18), "the name is ASCII case-insensitive; only is accepted");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_dark_face) > 20, "and the button is dark");
+    }
+
+    /// AETHERCOLORSCHEMEMETA (SR1047): the meta is a UA-origin declaration: an author `:root { color-scheme: light }`
+    /// beats it (the white canvas and the light face).
+    #[test]
+    fn color_scheme_meta_author_root_wins() {
+        let mut e = color_scheme_meta_engine(r#"<meta name="color-scheme" content="dark">"#, ":root { color-scheme: light }");
+        assert_eq!(imgalt_px(&e, 395, 595), (255, 255, 255), "the author's light canvas");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_light_face) > 20, "the light face");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_dark_face) <= 2, "no dark face (a label antialias pixel may hit it)");
+    }
+
+    /// AETHERCOLORSCHEMEMETA (SR1047): ARMED twins of the meta: `light dark` follows the host preference (light by
+    /// default: this test binary never records a dark preference), an invalid content (`dark;x`, `normal dark`) and a
+    /// meta outside the head are ignored, and no meta is today's light road.
+    #[test]
+    fn color_scheme_meta_light_twins() {
+        let cases: [(&str, &str); 4] = [
+            ("light dark", r#"<meta name="color-scheme" content="light dark">"#),
+            ("invalid", r#"<meta name="color-scheme" content="dark;x">"#),
+            ("normal beside", r#"<meta name="color-scheme" content="normal dark">"#),
+            ("none", ""),
+        ];
+        for (what, meta) in cases {
+            let mut e = color_scheme_meta_engine(meta, "");
+            assert_eq!(imgalt_px(&e, 395, 595), (255, 255, 255), "{what}: the white canvas");
+            assert!(css_wide_color_ink(&mut e, "b0", color_scheme_light_face) > 20, "{what}: the light face");
+        }
+        let html = r##"<!doctype html><html><head></head><body style="margin:0"><meta name="color-scheme" content="dark"><p>x</p></body></html>"##;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(imgalt_px(&e, 395, 595), (255, 255, 255), "a body meta is not the head's: the white canvas");
+    }
 }

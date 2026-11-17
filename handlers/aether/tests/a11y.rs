@@ -715,3 +715,39 @@ fn atspi_cache_shape_for_root_and_focus() {
     assert_eq!(atspi::answer(&e, "GetItems", ":app").lines().count(), all.len() + 1);
     assert!(atspi::answer(&e, "Bogus", ":app").starts_with("ERR"));
 }
+
+// ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): the host's preferred scheme drives prefers-color-scheme and `light dark` (named tail block) ----
+
+/// AETHERCOLORSCHEMEMETA (SR1047): the one test that flips the process-wide dark preference (css_core
+/// `UserPreferences::dark`), alone in this binary because `aether --lib` reads the default light answer. With dark
+/// recorded: `(prefers-color-scheme: dark)` applies, a `light dark` page paints the #121212 canvas, a page that does not
+/// opt in stays white, and an `A11yPrefs` apply keeps the bit; recorded light again: the `light dark` page is white and
+/// `(prefers-color-scheme: light)` applies.
+#[test]
+fn color_scheme_prefers_dark_follows_the_host() {
+    use css_core::media::{set_user_preferences, user_preferences, UserPreferences};
+    let scheme_page = r#"<head><meta name="color-scheme" content="light dark"><style>
+#q { color: rgb(0, 0, 0); } @media (prefers-color-scheme: dark) { #q { color: rgb(4, 4, 4); } }
+</style></head><body style="margin:0"><p id="q">q</p></body>"#;
+    let plain_page = r#"<body style="margin:0"><p>p</p></body>"#;
+    let color = |e: &AetherEngine, id: &str| {
+        let ins = devtools::elements::inspect(e, dom(e, id).id().0).unwrap();
+        ins.computed.iter().find(|(k, _)| *k == "color").map(|(_, v)| v.clone()).unwrap()
+    };
+    let canvas = |html: &str| {
+        let mut e = page(html);
+        e.render_frame();
+        pixel(&e, 395, 295)
+    };
+    set_user_preferences(UserPreferences { dark: true, ..user_preferences() });
+    let e = page(scheme_page);
+    assert_eq!(color(&e, "q"), "rgb(4, 4, 4)", "prefers-color-scheme: dark matches");
+    assert_eq!(canvas(scheme_page), (18, 18, 18), "light dark under a dark host: the dark canvas");
+    assert_eq!(canvas(plain_page), (255, 255, 255), "a page that does not opt in stays white");
+    A11yPrefs::current().apply(None);
+    assert!(user_preferences().dark, "an a11y apply keeps the recorded scheme");
+    set_user_preferences(UserPreferences { dark: false, ..user_preferences() });
+    let e = page(scheme_page);
+    assert_eq!(color(&e, "q"), "rgb(0, 0, 0)", "prefers-color-scheme: light again");
+    assert_eq!(canvas(scheme_page), (255, 255, 255), "light dark under a light host: the white canvas");
+}

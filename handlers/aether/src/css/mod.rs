@@ -742,7 +742,7 @@ fn apply_stylesheets_with(
     let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
     // AETHERAPIS (SR145): the user-agent rules of the top layer (HTML §15.5.x rendering: a dialog without `open`
     // has no box), at the UA origin so an author rule still wins.
-    let ua = css_core::stylesheet::parse_stylesheet(UA_SHEET);
+    let ua = css_core::stylesheet::parse_stylesheet(&ua_sheet_meta(layout_tree));
     let mut rules = css_core::cascade::RuleSet::new();
     rules.add_sheet(&ua, css_core::cascade::Origin::UserAgent, &cond);
     for s in &parsed {
@@ -1776,4 +1776,40 @@ fn list_style_word(c: u8) -> &'static str {
         10 => "lower-greek",
         _ => "disc",
     }
+}
+
+// ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): `<meta name="color-scheme">` as a UA-origin root declaration (named tail block) ----
+
+/// AETHERCOLORSCHEMEMETA (SR1047): the UA sheet of one cascade: [`UA_SHEET`], plus `:root { color-scheme: <v> }` when the
+/// document's head carries a valid `<meta name="color-scheme">` (HTML §4.2.5.5; css-color-adjust-1 §3.1). The rule sits at
+/// the UA origin, so an author `color-scheme` on the root still wins. `<v>` is rebuilt from the parsed bits, never the
+/// page's text, so the content cannot inject a rule.
+fn ua_sheet_meta(layout_tree: &LayoutTree) -> std::borrow::Cow<'static, str> {
+    let Some(bits) = meta_color_scheme(layout_tree) else { return std::borrow::Cow::Borrowed(UA_SHEET) };
+    let v = match bits & 3 {
+        0 => "normal",
+        1 => "light",
+        2 => "dark",
+        _ => "light dark",
+    };
+    std::borrow::Cow::Owned(format!("{UA_SHEET}\n:root {{ color-scheme: {v} }}\n"))
+}
+
+/// AETHERCOLORSCHEMEMETA (SR1047): the page's supported colour schemes: the first `<meta>` child of the document's
+/// `<head>` whose `name` is `color-scheme` (ASCII case-insensitive) and whose `content` SR1031's `parse_color_scheme`
+/// accepts, as its bits; read from the DOM at each cascade (no stored copy to go stale).
+fn meta_color_scheme(layout_tree: &LayoutTree) -> Option<u8> {
+    let (_, any) = layout_tree.node_map.iter().next()?;
+    any.with_doc(|d, _| {
+        let root = html_core::Document::ROOT;
+        let html = d.children(root).find(|c| d.element(*c).is_some_and(|e| e.is_html("html")))?;
+        let head = d.children(html).find(|c| d.element(*c).is_some_and(|e| e.is_html("head")))?;
+        d.children(head).find_map(|c| {
+            let e = d.element(c).filter(|e| e.is_html("meta"))?;
+            if !e.attr("name").is_some_and(|n| n.trim().eq_ignore_ascii_case("color-scheme")) {
+                return None;
+            }
+            layout_core::css::parse_color_scheme(e.attr("content")?)
+        })
+    })
 }

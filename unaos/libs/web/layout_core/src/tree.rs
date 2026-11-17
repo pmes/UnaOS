@@ -3909,12 +3909,21 @@ pub const UA_DARK: UaColours = UaColours {
 
 /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): an element's resolved `color-scheme` (PaintStyle::color_scheme bits, None or
 /// `normal` Some(0) the light default) uses the dark row only when it has dark and not light: `light dark` is light,
-/// the host preferring light (prefers-color-scheme answers light; AETHER-COLOR-SCHEME-PREFERS owed).
+/// unless the host prefers dark (css_core `UserPreferences::dark`, [`scheme_dark_for`]; AETHERCOLORSCHEMEMETA SR1047).
 pub fn scheme_dark(scheme: Option<u8>) -> bool {
-    scheme.is_some_and(|b| b & 2 != 0 && b & 1 == 0)
+    scheme_dark_for(scheme, css_core::media::user_preferences().dark)
 }
 
 /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the UA colour row of a resolved scheme ([`scheme_dark`]).
 pub fn ua_colours(scheme: Option<u8>) -> &'static UaColours {
     if scheme_dark(scheme) { &UA_DARK } else { &UA_LIGHT }
+}
+
+// ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): `light dark` follows the host's preferred scheme (named tail block) ----
+
+/// AETHERCOLORSCHEMEMETA (SR1047): css-color-adjust-1 §2.1 with the user's preference explicit: a scheme with dark and
+/// not light is dark; `light dark` is dark iff the host prefers dark (the `prefers-color-scheme` answer); light alone,
+/// `normal` (Some(0)) and None stay light. [`scheme_dark`] passes css_core's recorded preference.
+pub fn scheme_dark_for(scheme: Option<u8>, prefers_dark: bool) -> bool {
+    scheme.is_some_and(|b| b & 2 != 0 && (b & 1 == 0 || prefers_dark))
 }
