@@ -6408,7 +6408,7 @@ impl Face {
     /// The four insert words: timeline_core's dispatch, then the laid line (`Some(true)`); `None` for any other word.
     fn laid_verb(&mut self, v: &str) -> Option<bool> {
         let w = v.split_ascii_whitespace().next()?;
-        if !matches!(w, "insert" | "overwrite" | "insert-marked" | "overwrite-marked" | "insert-all" | "insert-marked-all") { // STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks words
+        if !timeline_core::editor::lays(w) { // STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks words; STRIAKINSERT (SR9062): the laying words held once in timeline_core (the kernel Player reads them too)
             return None;
         }
         match self.state.verb(v)? {

@@ -5005,3 +5005,89 @@ mod striakmarkerjump_tests {
         assert!(!st.undo(), "a jump key is not an undo step");
     }
 }
+
+// ---- STRIAKINSERT (LEDGER SR9062): the laying words, held once for both faces (named tail block) ----
+// The six words that LAY a clip (SR852 `insert` / `overwrite`, SR905 `insert-marked` / `overwrite-marked`, SR985
+// `insert-all` / `insert-marked-all`): after `Some(Ok(()))` from one of them the editor's playhead sits at the laid clip's
+// end (`place_at_playhead`), so a repeat appends. The host face's laid line (stria nle_face `laid_verb`) and the kernel
+// Player's restart (vplay.rs `edit_key`, its `w` / `d` / `W` / `D` keys) both read this list; neither keeps a copy.
+
+/// `v`'s first word is a laying word (the six insert / overwrite words), with or without arguments.
+pub fn lays(v: &str) -> bool {
+    matches!(v.split_ascii_whitespace().next(), Some("insert" | "overwrite" | "insert-marked" | "overwrite-marked" | "insert-all" | "insert-marked-all"))
+}
+
+#[cfg(test)]
+mod striakinsert_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// SR852's cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and A1.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// The kernel Player's `edit_key` by hand: the playhead at `t`, the shown clip (V1 here) selected, then the word.
+    fn key(st: &mut EditorState, t: i64, word: &str) -> Option<Result<(), EditError>> {
+        st.seek(t);
+        match st.timeline.clip_at(0, t) {
+            Some(i) => st.select(0, i).unwrap(),
+            None => st.deselect(),
+        }
+        st.verb(word)
+    }
+
+    #[test]
+    fn striakinsert_lays_the_six_words() {
+        for v in ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "insert B 0 10", "overwrite-marked x"] {
+            assert!(lays(v), "{v}");
+        }
+        for v in ["split", "target", "target V2", "insertx", "inserts", "", "help"] {
+            assert!(!lays(v), "{v}");
+        }
+    }
+
+    /// `w` at 15 inserts the shown clip's source at 15 and lands at 25 (the restart); a second `w` there lays the clip shown at
+    /// 25 at 25: nothing is split, the first laid clip stands.
+    #[test]
+    fn striakinsert_player_sequence_w_then_w_appends() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(key(&mut st, 15, "insert"), Some(Ok(())));
+        let tl1 = tl0.place(0, Clip::new(SourceId(1), 0, 10, 15), Mode::Insert).unwrap();
+        assert_eq!(st.timeline, tl1);
+        assert!(lays("insert"));
+        assert_eq!(st.playhead, 25, "the Player restarts at the laid end");
+        assert_eq!(key(&mut st, st.playhead, "insert"), Some(Ok(())));
+        assert_eq!(st.timeline, tl1.place(0, Clip::new(SourceId(1), 5, 10, 25), Mode::Insert).unwrap());
+        assert_eq!(st.timeline.tracks[0].clips.iter().filter(|c| c.src == SourceId(1) && c.src_in == 0 && c.src_out == 10).count(), 1, "the first laid clip is not split");
+        assert_eq!(st.playhead, 30);
+        assert_eq!(st.undo_depth(), 2);
+    }
+
+    /// `W` with marks 5..9 lays the shown clip's source from its in point for 4 ticks at 5 and lands at 9; `D` with a mark
+    /// unset is refused by name and leaves the timeline and the playhead.
+    #[test]
+    fn striakinsert_player_sequence_marked() {
+        let mut st = state();
+        st.timeline.marks = (Some(5), Some(9));
+        let tl0 = st.timeline.clone();
+        assert_eq!(key(&mut st, 5, "insert-marked"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(0), 13, 17, 5), Mode::Insert).unwrap());
+        assert_eq!(st.playhead, 9);
+        let mut st = state();
+        st.timeline.marks = (Some(5), None);
+        let tl0 = st.timeline.clone();
+        assert_eq!(key(&mut st, 12, "overwrite-marked"), Some(Err(EditError::NoMarks)));
+        assert_eq!(st.timeline, tl0);
+        assert_eq!(st.playhead, 12);
+    }
+}
