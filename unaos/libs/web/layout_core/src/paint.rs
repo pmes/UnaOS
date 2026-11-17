@@ -155,7 +155,7 @@ pub struct PaintStyle<H: Host> {
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
     /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>,
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>, pub inherit: u32,
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -313,7 +313,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None,
+            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None, inherit: 0,
             word_spacing: None,
             rtl: None,
             text_shadows: None,
@@ -853,5 +853,123 @@ impl Caps {
             Caps::AllSmallCaps | Caps::AllPetiteCaps => CAPS_SMALL | CAPS_ALL,
             Caps::Normal | Caps::Unicase | Caps::TitlingCaps => 0,
         }
+    }
+}
+
+// ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): the explicit inherit of the font longhands, one bit per field (named tail block) ----
+
+/// AETHERCSSWIDELONGHANDS (SR815): css-cascade-4 §7.3.1 `inherit` (and §7.3.3 `unset` on an inherited property) is a
+/// VALUE: the field takes its parent's computed value, beating an earlier rule and the tag's UA default, where a None
+/// field means "unspecified: the tag's default". `PaintStyle::inherit` holds one bit per font field; a value beats the
+/// bit (`inherits` is false while the field holds one), so a later longhand in the same block wins without its arm
+/// knowing, and `merge_paint` carries "later wins" both ways (`merge_inherit`).
+pub const INHERIT_ITALIC: u32 = 1;
+pub const INHERIT_WEIGHT: u32 = 2;
+pub const INHERIT_STRETCH: u32 = 4;
+pub const INHERIT_SMALL_CAPS: u32 = 8;
+pub const INHERIT_FONT_SIZE: u32 = 16;
+pub const INHERIT_LINE_HEIGHT: u32 = 32;
+pub const INHERIT_FAMILY: u32 = 64;
+/// AETHERCSSWIDECOLOR (SR823): `color` (inherited; its tag road is the `a` element's UA link blue). Not in INHERIT_FONT.
+pub const INHERIT_COLOR: u32 = 128;
+/// AETHERCSSWIDEINHERITEDREST (SR831): `white-space` (inherited; its tag road is `default_white_space`: pre / nobr / textarea).
+pub const INHERIT_WHITE_SPACE: u32 = 256;
+/// AETHERCSSWIDEINHERITEDREST (SR831): `direction` (inherited; its tag road is `default_rtl`: the `dir` attribute).
+pub const INHERIT_DIRECTION: u32 = 512;
+/// AETHERCSSWIDEINHERITEDREST (SR831): `list-style-type` (inherited; its tag road is the ul / menu / dir depth and ol match).
+pub const INHERIT_LIST_STYLE: u32 = 1024;
+/// AETHERCSSWIDELONGHANDS (SR815): every font field `font: inherit` / `font: unset` reaches.
+pub const INHERIT_FONT: u32 = 127;
+
+/// AETHERCSSWIDELONGHANDS (SR815): the inherit bit of a font longhand (`font-variant`: its caps half), else 0.
+pub fn inherit_bit(prop: &str) -> u32 {
+    match prop {
+        "font-style" => INHERIT_ITALIC,
+        "font-weight" => INHERIT_WEIGHT,
+        "font-stretch" => INHERIT_STRETCH,
+        "font-variant" | "font-variant-caps" => INHERIT_SMALL_CAPS,
+        "font-size" => INHERIT_FONT_SIZE,
+        "line-height" => INHERIT_LINE_HEIGHT,
+        "font-family" => INHERIT_FAMILY,
+        "color" => INHERIT_COLOR,
+        "white-space" | "white-space-collapse" => INHERIT_WHITE_SPACE,
+        "direction" => INHERIT_DIRECTION,
+        "list-style-type" | "list-style" => INHERIT_LIST_STYLE,
+        _ => 0,
+    }
+}
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERCSSWIDELONGHANDS (SR815): the inherit bits whose field holds a value here (the size: `font_size` or its
+    /// relative mark `font_size_rel`).
+    pub fn valued(&self) -> u32 {
+        let on = |v: bool, bit: u32| if v { bit } else { 0 };
+        on(self.italic.is_some(), INHERIT_ITALIC)
+            | on(self.weight.is_some(), INHERIT_WEIGHT)
+            | on(self.stretch.is_some(), INHERIT_STRETCH)
+            | on(self.small_caps.is_some(), INHERIT_SMALL_CAPS)
+            | on(self.font_size.is_some() || self.font_size_rel.is_some(), INHERIT_FONT_SIZE)
+            | on(self.line_height.is_some(), INHERIT_LINE_HEIGHT)
+            | on(self.family.is_some(), INHERIT_FAMILY)
+            | on(self.color.is_some(), INHERIT_COLOR)
+            | on(self.white_space.is_some(), INHERIT_WHITE_SPACE)
+            | on(self.rtl.is_some(), INHERIT_DIRECTION)
+            | on(self.list_style.is_some(), INHERIT_LIST_STYLE)
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
+    /// value replaced it): the walkers take the parent's computed value, not the tag default.
+    pub fn inherits(&self, bit: u32) -> bool {
+        (self.inherit & bit & !self.valued()) != 0
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): writes the explicit inherit of `bits`: their fields lose any earlier value.
+    pub fn set_inherit(&mut self, bits: u32) {
+        if bits & INHERIT_ITALIC != 0 {
+            self.italic = None;
+        }
+        if bits & INHERIT_WEIGHT != 0 {
+            self.weight = None;
+        }
+        if bits & INHERIT_STRETCH != 0 {
+            self.stretch = None;
+        }
+        if bits & INHERIT_SMALL_CAPS != 0 {
+            self.small_caps = None;
+        }
+        if bits & INHERIT_FONT_SIZE != 0 {
+            self.font_size = None;
+            self.font_size_rel = None;
+        }
+        if bits & INHERIT_LINE_HEIGHT != 0 {
+            self.line_height = None;
+        }
+        if bits & INHERIT_FAMILY != 0 {
+            self.family = None;
+        }
+        if bits & INHERIT_COLOR != 0 { self.color = None; }
+        if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
+        if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
+        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; }
+        self.inherit |= bits;
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `merge_paint`'s half for the bits, after its Somes are copied: `src` is the later
+    /// declaration, so a value it gives clears this style's bit, and an explicit inherit it gives clears this style's
+    /// earlier value and sets the bit.
+    pub fn merge_inherit(&mut self, src: &Self) {
+        let valued = src.valued();
+        self.inherit &= !valued;
+        self.set_inherit(src.inherit & !valued);
+    }
+}
+
+/// AETHERCSSWIDELONGHANDS (SR815): a tag-default road (`default_family` / `default_weight` / `default_italic` / the UA
+/// font size) unless the paint explicitly inherits that field: then the parent's computed value as is.
+pub fn or_tag<H: Host, T>(paint: Option<&PaintStyle<H>>, bit: u32, inherited: T, tag_default: impl FnOnce(T) -> T) -> T {
+    if paint.is_some_and(|p| p.inherits(bit)) {
+        inherited
+    } else {
+        tag_default(inherited)
     }
 }
