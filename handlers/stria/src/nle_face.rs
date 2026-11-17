@@ -3297,15 +3297,8 @@ impl view::PeakSource for WavePeaks {
 impl Face {
     /// STRIAWAVEFORM (SR827): scan every audio-track source not scanned yet (once per source for the face's life).
     fn wave_fill(&mut self) {
-        let mut want: Vec<timeline_core::SourceId> = Vec::new(); self.peaks.drain_bg(false); // STRIATHUMBNAILSNEXT (SR997): the worker's finished heads and tables land first (file tail)
-        for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
-            for c in &tr.clips {
-                if !self.peaks.wantc.src) && !want.contains(&c.src { // STRIATHUMBNAILSTHREE (SR9044): marked wanted, then the same keyed test (file tail)
-                    want.push(c.src);
-                }
-            }
-        }
-        for id in want { if self.peaks.thumbs.ask_scan(id) { self.peaks.map.insert(id, None); continue; } // STRIATHUMBNAILSNEXT (SR997): a served face queues the scan, the placeholder keeps the body flat (file tail)
+        self.peaks.drain_bg(false); // STRIATHUMBNAILSNEXT (SR997): the worker's finished heads and tables land first (file tail)
+        loop { let Some(id) = view::peaks_want(&self.state.timeline, &|s| self.peaks.wantcs)) else { // STRIATHUMBNAILSTHREE (SR9044): marked wanted, then the same keyed test (file tail) break }; if self.peaks.thumbs.ask_scan(id) { self.peaks.map.insert(id, None); continue; } // STRIAKWAVEFORM (LEDGER SR9059): the next source by timeline_core's ONE want rule `view::peaks_want` (view.rs tail). STRIATHUMBNAILSNEXT (SR997): a served face queues the scan, the placeholder keeps the body flat (file tail)
             let p = match crate::nle::scan_peaks(&self.sources, id, view::PEAKS_PER_SEC) {
                 Ok(p) => p,
                 Err(e) => {
