@@ -433,6 +433,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("v", "gain-"), ("V", "gain+"), (":", "track-gain-"), ("\"", "track-gain+"), ("Q", "mute"), ("S", "solo"), // STRIATRACKGAINKEYS (SR926): text keys for the audio words (Face::verb: the buttons' commit and message line; the natural - / = / m / s are taken)
     ("h", "history"), ("Ctrl+i", "info"), // STRIASOURCEINFOKEY (SR942): Ctrl / Cmd+I (the platform's Get Info chord) stands the selected clip's reel line (`i` / `I` are the marks)
     ("Meta+i", "info"),
+    ("n", "snap"), // STRIASNAPMORE (SR952): n flips the drag snap default through the snap word (text key)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
@@ -2670,6 +2671,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("xfade-curve", "switch the crossfade's curve linear / equal"),
     ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
     ("history", "list the last undo steps"), ("info", "name the selected clip's source for 5 seconds"), // STRIASOURCEINFOKEY (SR942): the Ctrl+i / Meta+i row
+    ("snap", "drag snap on / off (Alt: this drag only)"), // STRIASNAPMORE (SR952)
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];

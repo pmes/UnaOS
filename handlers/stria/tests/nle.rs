@@ -9988,3 +9988,43 @@ fn striaexportpresetsmore_explicit_words_win() {
     assert!(face.last_error.take().is_some_and(|l| l.contains(" png + wav in ")), "an explicit --preset beats the pick");
     assert_eq!(face.export_preset().map(|p| p.name), Some("web"), "an export leaves the pick");
 }
+
+// ---- STRIASNAPMORE (LEDGER SR952): the `n` key flips the drag snap default; the help names it (named tail block) ----
+
+/// `n` is a KEYS row onto SR892's `snap` word: a one-char BrowserKey alone is not taken; the text key flips the default off
+/// (named on the message line), view-only (no undo step, not dirty, the timeline unchanged); again turns it back on.
+#[test]
+fn striasnapmore_n_key_flips_the_default_view_only() {
+    assert!(KEYS.contains(&("n", "snap")));
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let tl = f.state.timeline.clone();
+    assert!(f.snap_on());
+    assert!(!f.on(&bandy::SMessage::BrowserKey("n".into())), "a one-char BrowserKey alone is not taken");
+    assert!(f.snap_on());
+    assert!(f.on(&bandy::SMessage::BrowserText("n".into())));
+    assert!(!f.snap_on());
+    assert_eq!(f.last_error.take().as_deref(), Some("snap: off"));
+    assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+    assert_eq!(f.state.timeline, tl);
+    assert!(f.on(&bandy::SMessage::BrowserText("n".into())));
+    assert!(f.snap_on());
+    assert_eq!(f.last_error.take().as_deref(), Some("snap: on"));
+    println!("striasnapmore: n -> snap: off, n -> snap: on, undo 0, clean");
+}
+
+/// The keys help has a row naming `n` with the snap word's phrase (not the bare word); while the help shows, `n` only
+/// dismisses it and the snap default stays on.
+#[test]
+fn striasnapmore_help_names_the_key_and_n_under_help_only_dismisses() {
+    let rows = help_rows();
+    let row = rows.iter().find(|r| r.0.split(" / ").any(|k| k == "n")).expect("a help row for n");
+    assert_eq!(row.1, help_phrase("snap"));
+    assert!(!row.1.is_empty() && row.1 != "snap", "{:?}", row);
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help") && f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserText("n".into())));
+    assert!(!f.help_shown());
+    assert!(f.snap_on(), "a key under the help is not applied");
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    println!("striasnapmore: help row {:?}; n under the help only dismisses", row);
+}
