@@ -982,3 +982,19 @@ fn color_scheme_ua_colours_rows() {
     assert_eq!(UA_LIGHT.face, (239, 239, 239));
     assert_eq!((UA_DARK.face, UA_DARK.field, UA_DARK.canvas, UA_DARK.ink), ((107, 107, 107), (59, 59, 59), (18, 18, 18), (255, 255, 255)));
 }
+
+// ---- AETHERCOLORSCHEMEMETA (LEDGER SR1047): `light dark` follows the host's preferred scheme (named tail block) ----
+
+/// AETHERCOLORSCHEMEMETA (SR1047): the pure answer with the preference explicit (no process-wide flip in this binary:
+/// SR1031's `color_scheme_ua_colours_rows` reads the default light preference).
+#[test]
+fn color_scheme_prefers_for_table() {
+    use layout_core::scheme_dark_for;
+    assert!(!scheme_dark_for(Some(3), false), "light dark, host light: light");
+    assert!(scheme_dark_for(Some(3), true), "light dark, host dark: dark");
+    assert!(!scheme_dark_for(Some(1), true), "light alone stays light");
+    assert!(scheme_dark_for(Some(2), false), "dark alone is dark whatever the host");
+    for s in [None, Some(0)] {
+        assert!(!scheme_dark_for(s, true), "{s:?} (unspecified / normal) stays light under a dark host");
+    }
+}
