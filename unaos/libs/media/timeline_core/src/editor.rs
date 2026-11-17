@@ -12,6 +12,7 @@
 //! returned values; there are no inverse ops). A refused edit leaves the state unchanged. No painter lives here.
 
 use alloc::vec::Vec;
+use alloc::{format, string::{String, ToString}}; // the fold: the text helpers several arcs' tail blocks use (no_std)
 
 use crate::{Clip, EditError, Timeline, Transition, edl};
 
@@ -846,7 +847,10 @@ impl EditorState {
     /// Toggle the selected clip's track's mute flag (one commit).
     pub fn toggle_mute(&mut self) -> Result<(), EditError> {
         let (track, _) = self.selection.ok_or(EditError::NoTrack)?;
-        self.set_track_gain_atset_track_flags(track, !t.muted, t.solo) // STRIATRACKGAINTHREE (SR9024): the one mechanism (file tail)
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let tl = self.timeline.set_track_flags(track, !t.muted, t.solo)?;
+        self.commit(tl);
+        Ok(())
     }
     /// Toggle the selected clip's track's solo flag (one commit).
     pub fn toggle_solo(&mut self) -> Result<(), EditError> {
@@ -859,8 +863,8 @@ impl EditorState {
     /// The `mute` / `solo` words of [`EditorState::verb`]; `None` for any other word.
     fn track_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         match v {
-            "mute" => Some(self.toggle_mute()), "link-av" => Some(self.link_av_all()), // STRIALINKAUTOFUZZ (SR928): link_av over the whole timeline, one commit (file tail)
-            "solo" => Some(self.toggle_solo()), "unlink-all" => Some(self.unlink_all()), // STRIALINKAUTO (SR911): every link in the timeline parted, one commit (file tail)
+            "mute" => Some(self.toggle_mute()),
+            "solo" => Some(self.toggle_solo()),
             _ => None,
         }
     }
@@ -944,7 +948,7 @@ impl EditorState {
 impl EditorState {
     /// Roll the cut at the selected clip's out edge by `d` ticks (`Timeline::roll`).
     pub fn roll_selected(&mut self, d: i64) -> Result<(), EditError> {
-        if let Some(r) = self.xkey_set(xf) { return r; } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAXFORMKEYS (SR9049): a keyed clip's placement word edits the point at the playhead (file tail)
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.roll(track, idx, d)?;
         self.commit(tl);
         Ok(())
@@ -1600,13 +1604,7 @@ impl EditorState {
     /// commits nothing).
     pub fn set_selected_track_gain(&mut self, cdb: i32) -> Result<(), EditError> {
         let (track, _) = self.selection.ok_or(EditError::NoTrack)?;
-        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
-        if t.gain_cdb == cdb {
-            return Ok(());
-        }
-        let tl = self.timeline.set_track_gain(track, cdb)?;
-        self.commit(tl);
-        Ok(())
+        self.set_track_gain_at(track, cdb) // STRIATRACKGAINTHREE (SR9024): the one mechanism (file tail)
     }
     /// The `track-gain` word of [`EditorState::verb`]; `None` for any other word.
     fn track_gain_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
@@ -1782,8 +1780,8 @@ impl EditorState {
     /// The `link` / `unlink` words of [`EditorState::verb`]; `None` for any other word.
     fn link_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         match v {
-            "link" => Some(self.link_selected()),
-            "unlink" => Some(self.unlink_selected()),
+            "link" => Some(self.link_selected()), "link-av" => Some(self.link_av_all()), // STRIALINKAUTOFUZZ (SR928): link_av over the whole timeline, one commit (file tail)
+            "unlink" => Some(self.unlink_selected()), "unlink-all" => Some(self.unlink_all()), // STRIALINKAUTO (SR911): every link in the timeline parted, one commit (file tail)
             _ => None,
         }
     }
@@ -2421,7 +2419,7 @@ mod striacropface_tests {
 impl EditorState {
     /// The selected clip placed by `xf` (one commit; the same placement again commits nothing).
     pub fn set_xform(&mut self, xf: crate::Xform) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if let Some(r) = self.xkey_set(xf) { return r; } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAXFORMKEYS (SR9049): a keyed clip's placement word edits the point at the playhead (file tail)
         let tl = self.timeline.set_xform(track, idx, xf)?;
         if tl == self.timeline {
             return Ok(());
@@ -3911,7 +3909,7 @@ pub fn slipslide_word(v: &str) -> Option<alloc::string::String> {
 // a redo (`history(1)`); an unnamed step reads `(unnamed)`. Any other count is refused by name and nothing moves.
 impl EditorState {
     /// `undo <n>` / `redo <n>`: the steps and the landing line, or the refusal line; `None` for any other word.
-    pub fn jump(&mut self, v: &str) -> Option<alloc::string::String> {
+    pub fn undo_jump_word(&mut self, v: &str) -> Option<alloc::string::String> { // the fold: renamed from `jump` (SR894's `jump(Jump, bool)` keeps the name)
         let (back, arg) = match (v.strip_prefix("undo "), v.strip_prefix("redo ")) {
             (Some(a), _) => (true, a.trim()),
             (_, Some(a)) => (false, a.trim()),
@@ -4965,7 +4963,7 @@ pub const JUMP_KEYS: [(u8, &str); 2] = [(b';', "marker-"), (b'\'', "marker+")];
 
 /// STRIAKMARKERJUMP (SR9064): the jump word a key byte names ([`JUMP_KEYS`]); `None` for any other byte.
 pub fn jump_key(b: u8) -> Option<&'static str> {
-    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| cut_jump_key(b)).or_else(|| end_jump_key(b)) // STRIAKCUTJUMP (LEDGER SR9091): Up / Down the cut jumps (file tail)
+    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| cut_jump_key(b)).or_else(|| end_jump_key(b)) // STRIAKCUTJUMP (LEDGER SR9091): Up / Down the cut jumps (file tail); STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End (file tail)
 }
 
 #[cfg(test)]
@@ -5435,7 +5433,7 @@ impl EditorState {
         }
         let now = match self.selected_title_style() { Ok(s) => s, Err(e) => return Some(Err(e)) };
         Some(title_step(now, v).ok_or(EditError::Style).and_then(|s| self.title_style(s)))
-    }; STRIAKCUTJUMPMORE (LEDGER SR9108): Home / End (file tail)
+    }
 }
 
 #[cfg(test)]

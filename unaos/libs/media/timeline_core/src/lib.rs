@@ -85,7 +85,8 @@ pub struct Source {
     /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
     pub size_policy: SizePolicy,
     /// STRIATITLECLIP (SR828): a generated title card's text (`None`: a media reel; an LF is a line break, STRIAFREEZETHREE SR9029); `edl` keeps it as `* UNA TITLE`.
-    pub title: Option<String>, pub title_style: TitleStyle, // STRIAFREEZETHREE (SR9029): the title's size / alignment / ink (DEFAULT: today's look; `* UNA TITLESTYLE`) pub seq_rate: Option<(u64, u64)>, // STRIASEQRATEEDL (SR9053): an image-sequence reel's own frames a second as reduced (n, d) (`None`: unset); `edl` keeps it as `* UNA SEQRATE`
+    pub title: Option<String>, pub title_style: TitleStyle, // STRIAFREEZETHREE (SR9029): the title's size / alignment / ink (DEFAULT: today's look; `* UNA TITLESTYLE`)
+    pub seq_rate: Option<(u64, u64)>, // STRIASEQRATEEDL (SR9053): an image-sequence reel's own frames a second as reduced (n, d) (`None`: unset); `edl` keeps it as `* UNA SEQRATE`
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -402,7 +403,7 @@ pub enum EditError {
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
-    Marks, /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold,
+    Marks, /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold, /** STRIAFREEZETHREE (SR9029): a `title-style` word naming no title style. */ Style,
     /// STRIAMARKERS (SR835): a marker already at that tick (or none there to remove; or markers out of tick order).
     Marker,
     /// STRIATRACKADDREMOVE (SR856): a tenth track of one kind (CMX channels run V..V9 and A..A9).
@@ -416,7 +417,7 @@ pub enum EditError {
     Xform,
     NoMarks, // STRIAINSERTMARKS (SR905): `insert-marked` / `overwrite-marked` with an export mark unset
     InsertForm, // STRIAINSERTMARKS (SR905): an `insert` / `overwrite` word in a shape other than bare or `<reel> <in> <out>`
-    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold, /** STRIAFREEZETHREE (SR9029): a `title-style` word naming no title style. */ Style,
+    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies
     /// STRIAXFORMKEYS (SR9049): a placement key word with the playhead off the selected clip, a ninth point, or no point to remove.
     XKey,
     /// STRIAOPACITYKEYS (SR9048): no selected video clip under the playhead, a clip already at the most opacity points, or no point to clear there.
@@ -451,7 +452,7 @@ impl core::fmt::Display for EditError {
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
             EditError::NoMarks => "no in / out marks set", // STRIAINSERTMARKS (SR905)
             EditError::InsertForm => "insert / overwrite take nothing or <reel> <in> <out>", // STRIAINSERTMARKS (SR905)
-            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916), STRIAFREEZETHREE (SR9029)
+            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies",
             EditError::XKey => "a placement key needs the playhead on the selected clip, at most 8 points, and a point there to remove, and a keyed clip for an ease (linear|in|out|inout)",
             EditError::OpacityKey => "no opacity key here: a selected video clip under the playhead, at most 8 keys",
             EditError::PanKey => "pan points full, or no pan point there",
@@ -3593,11 +3594,7 @@ impl Xform {
 // [`Timeline::track_name`] is THE spelling (the face's message lines read it). [`Timeline::track_named`] is its inverse
 // over the EDL's channel parser (`V` / `V1`..`V9`, `A` / `A1`..`A9`, uppercase only): the nth track of that kind.
 impl Timeline {
-    /// Track `ti`'s name (`V1`, `A2`); `None` for no such track.
-    pub fn track_name(&self, ti: usize) -> Option<String> {
-        let k = if self.tracks.get(ti)?.kind == Kind::Video { "V" } else { "A" };
-        Some(alloc::format!("{k}{}", self.track_number(ti)?))
-    }
+    // (`Timeline::track_name` stands once, in SR922's block: the fold kept one)
     /// The index of the track a channel word names; `None` for a word that is not a channel or names no track.
     pub fn track_named(&self, word: &str) -> Option<usize> {
         let (kind, num) = edl::channel(word)?;
@@ -4868,12 +4865,7 @@ impl GainEnv {
     }
 }
 
-impl Clip {
-    /// STRIAGAINENVELOPE (SR9047): the source tick heard at timeline tick (edge) `t` (past the ends too).
-    pub fn src_tick(&self, t: i64) -> i64 {
-        self.src_in + (t - self.at)
-    }
-}
+// (`Clip::src_tick` stands once, in SR9049's block: the fold kept one)
 
 impl Timeline {
     /// STRIAGAINENVELOPE (SR9047): set a clip's gain envelope.
@@ -5412,16 +5404,7 @@ mod striareverseedit_tests {
 // mix fit in vplay.rs `edl_mix`), so the Adopt-in-a-mix rule lives once. Sibling SR9010 lifts the same fn under the
 // same name and body: the fold keeps one.
 
-impl Timeline {
-    /// Source `src`'s size policy as a step places its frame (absent: Letterbox). `alone` is false inside a transition:
-    /// the mix is one size, so Adopt mixes as Letterbox there.
-    pub fn reel_fit(&self, src: SourceId, alone: bool) -> SizePolicy {
-        match self.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
-            SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
-            p => p,
-        }
-    }
-}
+// (the fn itself stands once, in SR9010's block above: the fold kept one)
 
 // ---- STRIACHAPTERSRANGE (LEDGER SR9121): a read-back chapter end as a ranged marker (named tail block) ----
 // NLE-CHAPTERS-RANGE-PROBE: a chapter read back with an end (Matroska ChapterTimeEnd, demux_core `facts::chapters_of`)

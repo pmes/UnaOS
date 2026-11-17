@@ -47,6 +47,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use alloc::{format, string::{String, ToString}}; // the fold: `stack_line` / `mix_entry` text (no_std)
 use core::ops::Range;
 
 use crate::{EditError, Kind, SourceId, SourceIndex, Timeline, TransitionKind};
@@ -123,7 +124,7 @@ impl core::fmt::Display for ScheduleError {
 }
 
 /// The winner at tick `t` for `kind`: (track index, clip index).
-pub(crate) pub pub fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> { // STRIAFREEZEFRAME (SR880): pub(crate), `Timeline::freeze` reads the same winner // STRIAKMUTE (SR9017): pub, the kernel Player's shown clip (vplay.rs `shown_clip`)
+pub fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> { // STRIAFREEZEFRAME (SR880): pub(crate), `Timeline::freeze` reads the same winner // STRIAKMUTE (SR9017): pub, the kernel Player's shown clip (vplay.rs `shown_clip`)
     tl.active_tracks().rev().filter(|&i| tl.tracks[i].kind == kind).find_map(|i| tl.clip_at(i, t).map(|c| (i, c))) // STRIATRACKMUTESOLO (SR837): a muted / unsoloed track never wins
 }
 
@@ -387,7 +388,7 @@ fn under_layer(
     *xnext = Some((o.src, o.src_at(end))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + (end - t))
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_at(t), pan_to: o.pan_at(end + o.gain_env.peak()), env: genv_scale(o, t, end, [fall(t), fall(end)]) }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb + o.gain_env.peak()), pan_cq8: o.pan_at(t), pan_to: o.pan_at(end), env: genv_scale(o, t, end, [fall(t), fall(end)]) }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
@@ -553,7 +554,7 @@ fn opacity_mix(
         return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
     };
     let lc = tl.tracks[li].clips[lci];
-    ifplaced() { return Err(ScheduleError::Xform(c.src)); } if lc.opacity_at(t) tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+    if lc.placed() { return Err(ScheduleError::Xform(c.src)); } if tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
         return Err(ScheduleError::Opacity(c.src));
     }
     let src_t = lc.src_in + (t - lc.at);

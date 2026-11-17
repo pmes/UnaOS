@@ -312,7 +312,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         if ruler_second(tl, t, fps) { // STRIATCTHREE (SR9030): a drop-frame base marks where the label's second changes (file tail)
             c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
             if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60 * l.squeeze.max(1) as i64) {
-                text.text(&mut c, ruler_tctimecode_in(tl, &mut tc, t, fps), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32)); // STRIATCTHREE (SR9030): drop-frame labels on a drop-frame base (file tail)
+                text.text(&mut c, &ruler_tc(tl, t, fps), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32)); // STRIATCTHREE (SR9030): drop-frame labels on a drop-frame base (file tail)
             }
         } else if l.zoom >= 4 {
             c.rect(x, ty - 3, x + 1, ty, TICK);
@@ -350,7 +350,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
         c.frame(x0, y0, x1, y1, SELECT);
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
-        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE); pan_curve(&mut c, &l, st, row, clip); // STRIAPANAUTOWRITE (SR9084): the selected keyed audio clip's pan curve, nothing unkeyed (file tail) paint_opacity_keys(&mut c, l, &clip, y0, y1); // STRIAOPACITYKEYSFACE (SR9085): the primary's opacity curve and points (file tail)
+        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE); pan_curve(&mut c, &l, st, row, clip); paint_opacity_keys(&mut c, l, &clip, y0, y1); // STRIAPANAUTOWRITE (SR9084): the selected keyed audio clip's pan curve, nothing unkeyed (file tail); STRIAOPACITYKEYSFACE (SR9085): the primary's opacity curve and points (file tail)
     }
     paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_xkeys(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail) paint_headers(&mut c, l, st, labels.as_deref_mut()); // STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail) // STRIAXFORMKEYSNAV (SR9069): a keyed clip's point marks (file tail) paint_reverse_badges(&mut c, l, st); // STRIAREVERSEEDIT (SR9094): a reversed body's badge, nothing when none is reversed (file tail)
     // The playhead, through the ruler and the tracks.
@@ -594,7 +594,7 @@ pub enum DragKind {
     /// NLE3ESLIPDRAG (SR760): the slip modifier on a clip body (`EditorState::slip_selected`: the source window moves).
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
-    Slide,
+    Slide, XfadeIn, XfadeOut, Source, // STRIAXFADETHREE (SR9023): the explicit audio crossfade bracket's left / right edge; STRIASOURCEDRAG (SR9081): a press on the loaded source's preview dropped on a track (file tails)
     Pan, PanPoint, // STRIAPANDRAGPT (SR9112): a pan point of the selected keyed AUDIO clip (`EditorState::move_pan_key`; `delta` is the source-tick change, the pan change is the pointer's y travel) (file tail); STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail) XfadeIn, XfadeOut, // STRIAXFADETHREE (SR9023): the explicit audio crossfade bracket's left / right edge (file tail) Source, // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview dropped on a track (`Drag::begin_source`, file tail)
     GainEnv, // STRIAGAINENVDRAG (SR9082): a point of the selected audio clip's gain envelope (Drag::begin_gain_env, file tail)
 }
@@ -625,7 +625,8 @@ pub struct Drag {
     pub guide: Option<i64>,
     /// STRIARIPPLETRIM (SR850): a trim begun with shift on the primary's handle ripples (`EditorState::ripple_trim`).
     pub ripple: bool,
-    pub roll: bool, // STRIAROLLMORE (SR954): the face's roll tool turned this trim into a roll of its handle's cut (`EditorState::roll_selected`; set by [`Drag::rolled`]) pub ripple_all: bool, // STRIARIPPLETHREE (SR9034): a ripple begun with the face's ripple-all tool on runs on every track (`EditorState::ripple_trim_all`, file tail)
+    pub roll: bool, // STRIAROLLMORE (SR954): the face's roll tool turned this trim into a roll of its handle's cut (`EditorState::roll_selected`; set by [`Drag::rolled`]); STRIARIPPLETHREE (SR9034): a ripple begun with the face's ripple-all tool on runs on every track (`EditorState::ripple_trim_all`, file tail)
+    pub ripple_all: bool,
 }
 
 impl Drag {
@@ -652,7 +653,7 @@ impl Drag {
             snap: !nosnap,
             additive: shift, toggle: false,
             guide: None,
-            ripple: false, roll: false, // STRIAROLLMORE (SR954) ripple_all: false,
+            ripple: false, roll: false, ripple_all: false, // STRIAROLLMORE (SR954)
         };
         if let Some((t, i)) = pan_point_grip(st, &l, x, y, shift, slip) { return Some(mk(DragKind::PanPoint, t, i)); } if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) { // STRIAPANDRAGPT (SR9112): a press on a pan point drags it, before the trim handles (file tail)
             let y0 = l.row_y(track) as f64;
@@ -721,7 +722,7 @@ impl Drag {
                 st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
                 return Ok(());
             }
-            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st), DragKind::XfadeIn | DragKind::XfadeOut => return self.finish_xfade(st), DragKind::Source => return self.finish_source(st), // STRIASOURCEDRAG (SR9081): the drop is one place (file tail) DragKind::GainEnv => return self.finish_gain_env(st), // STRIAGAINENVDRAG (SR9082): the envelope's ONE commit (file tail)
+            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st), DragKind::XfadeIn | DragKind::XfadeOut => return self.finish_xfade(st), DragKind::Source => return self.finish_source(st), DragKind::GainEnv => return self.finish_gain_env(st), // STRIASOURCEDRAG (SR9081): the drop is one place (file tail); STRIAGAINENVDRAG (SR9082): the envelope's ONE commit (file tail)
             _ => {}
         }
         if self.toggle { st.select_add(self.track, self.idx)?; } else if st.selection != Some((self.track, self.idx)) { // STRIAMULTISELECTNEXT (SR998): a shift-pressed member becomes primary only now, the set kept
@@ -750,7 +751,7 @@ impl Drag {
         s.selection = st.selection;
         s.set = st.set.clone();
         s.playhead = st.playhead;
-        s.zoom = st.zoom; s.squeeze = st.squeeze; // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail) if self.kind == DragKind::Source { s.source = st.source.clone(); } // STRIASOURCEDRAG (SR9081): the drop's preview needs the loaded source (file tail)
+        s.zoom = st.zoom; s.squeeze = st.squeeze; if self.kind == DragKind::Source { s.source = st.source.clone(); } // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail); STRIASOURCEDRAG (SR9081): the drop's preview needs the loaded source (file tail)
         self.finish(&mut s).ok()?;
         Some(s)
     }
@@ -804,7 +805,7 @@ impl Drag {
         let one = [(self.track, self.idx)];
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee | DragKind::Slip | DragKind::Pan | DragKind::PanPoint => return, DragKind::GainEnv => return self.snap_gain_env(st, x), DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail) DragKind::XfadeIn | DragKind::XfadeOut => return self.snap_xfade(st, x), // STRIAGAINENVDEL (SR9110): an envelope point snaps to the playhead (file tail) // STRIAPANDRAGPT (SR9112): pan and pan-point drags never snap (`update` returns before this; the match is exhaustive)
+            DragKind::Marquee | DragKind::Slip | DragKind::Pan | DragKind::PanPoint => return, DragKind::GainEnv => return self.snap_gain_env(st, x), DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), DragKind::XfadeIn | DragKind::XfadeOut => return self.snap_xfade(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail); STRIAGAINENVDEL (SR9110): an envelope point snaps to the playhead (file tail); STRIAPANDRAGPT (SR9112): pan and pan-point drags never snap (`update` returns before this; the match is exhaustive)
             DragKind::Scrub | DragKind::Source => { // STRIASOURCEDRAG (SR9081): the drop tick snaps as the scrub's pointer does
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -1010,7 +1011,7 @@ impl Drag {
             at: (x, y),
             snap: !nosnap,
             additive: false, toggle: false,
-            guide: None,
+            guide: None, ripple_all: false, // the fold: every Drag literal names every field
             ripple: false, roll: false, // STRIAROLLMORE (SR954)
         })
     }
@@ -2835,6 +2836,8 @@ impl DragKind {
             DragKind::Move => Some("drag move"),
             DragKind::Slip => Some("drag slip"),
             DragKind::Slide => Some("drag slide"),
+            DragKind::XfadeIn => Some("drag xfade in"), DragKind::XfadeOut => Some("drag xfade out"), DragKind::Source => Some("drag source"), // the fold: the later drag kinds name their undo entries too
+            DragKind::Pan => Some("drag pan"), DragKind::PanPoint => Some("drag pan point"), DragKind::GainEnv => Some("drag gain env"),
             DragKind::Marquee | DragKind::Scrub => None,
         }
     }
@@ -3646,8 +3649,8 @@ impl CropDrag {
     /// Each side's change since the press, 1/1000 of the picture: `[l, t, r, b]` (0 for a side not grabbed).
     pub fn deltas(&self) -> [i32; 4] {
         let (dx, dy) = (self.at.0 - self.origin.0, self.at.1 - self.origin.1);
-        let fx = (dx * 1000.0 / self.q.w.max(1) as f64).round() as i32;
-        let fy = (dy * 1000.0 / self.q.h.max(1) as f64).round() as i32;
+        let fx = libm::round(dx * 1000.0 / self.q.w.max(1) as f64) as i32;
+        let fy = libm::round(dy * 1000.0 / self.q.h.max(1) as f64) as i32;
         let (fx, fy) = self.move_clamp(fx, fy); let on = |b: u8| self.sides & b != 0; // STRIACROPTHREE (SR9032): a move keeps the rect's size (file tail)
         [if on(1) { fx } else { 0 }, if on(2) { fy } else { 0 }, if on(4) { -fx } else { 0 }, if on(8) { -fy } else { 0 }]
     }
@@ -4560,8 +4563,8 @@ impl Drag {
             origin: (x, y),
             at: (x, y),
             snap: !nosnap,
-            additive: false,
-            guide: None,
+            additive: false, toggle: false,
+            guide: None, ripple: false, roll: false, ripple_all: false, // the fold: every Drag literal names every field
         })
     }
     /// The record on the head cut of clip `(track, idx)`.
@@ -6458,8 +6461,8 @@ impl Drag {
             origin: (x, y),
             at: (x, y),
             snap: !nosnap,
-            additive: insert,
-            guide: None,
+            additive: insert, toggle: false,
+            guide: None, ripple: false, roll: false, ripple_all: false, // the fold: every Drag literal names every field
         })
     }
     /// The rest of [`Drag::update`] for a source drag: the drop tick snapped, the row under the pointer when its kind is
@@ -6723,8 +6726,8 @@ impl Drag {
             origin: (x, y),
             at: (x, y),
             snap: false,
-            additive: false,
-            guide: None,
+            additive: false, toggle: false,
+            guide: None, ripple: false, roll: false, ripple_all: false, // the fold: every Drag literal names every field
         })
     }
     /// STRIAGAINENVDRAG (SR9082): the envelope the release commits and where its point lands: `(envelope, source tick,
