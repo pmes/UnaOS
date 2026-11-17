@@ -12085,4 +12085,45 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
         assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "49"); // SR1124: four outline columns, 49
     }
+
+    // ---- AETHERTEXTALIGNLASTWIDE (LEDGER SR1168): text-align-last inherit through the explicit-inherit bit; @supports reads the parse road (named tail block) ----
+
+    /// AETHERTEXTALIGNLASTWIDE (SR1168): `.a { text-align-last: center } .a.b { text-align-last: inherit }` under a
+    /// `justify` parent reads back the parent's `justify`; an own `center` (`#c`) reads `center` (the control). PINNED,
+    /// not armed: cssom's cascaded road (`computed_value`) already resolved `inherit` itself; the layout half SR1168
+    /// fixes is armed in layout_core's `text_align_last_wide_*`.
+    #[test]
+    fn text_align_last_wide_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .a { text-align-last: center } .a.b { text-align-last: inherit }
+            </style></head><body style="margin:0">
+            <div style="text-align-last: justify"><p id="i" class="a b">a b</p><p id="c" class="a">a b</p></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "c", "textAlignLast"), "center", "the control: an own center");
+        assert_eq!(font_shorthand_cs(&mut e, "i", "textAlignLast"), "justify", "a later inherit reads the parent's justify");
+    }
+
+    /// AETHERTEXTALIGNLASTWIDE (SR1168): `@supports (text-align-last: justify)` applies its block and
+    /// `@supports (text-align-last: bogus)` does not, through `declaration_supported` (ALL_LONGHANDS + the parse road).
+    /// PINNED: true already at the cut (b4dc8877c); `CSS.supports` has no binding (AETHER-CSSOM-CSS-SUPPORTS owed).
+    #[test]
+    fn text_align_last_supports() {
+        let html = r#"<!doctype html><html><head><style>
+            @supports (text-align-last: justify) { #s { color: rgb(255, 0, 0) } }
+            @supports (text-align-last: bogus) { #g { color: rgb(255, 0, 0) } }
+            </style></head><body style="margin:0;font:20px serif">
+            <div id="s">Hello</div>
+            <div id="g">Hello</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "s", "color"), "rgb(255, 0, 0)", "@supports (text-align-last: justify) applies");
+        assert_eq!(font_shorthand_cs(&mut e, "g", "color"), "rgb(0, 0, 0)", "@supports (text-align-last: bogus) does not");
+    }
 }

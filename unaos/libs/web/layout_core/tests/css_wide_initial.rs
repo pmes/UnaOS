@@ -1819,7 +1819,8 @@ fn text_align_last_inherits() {
 }
 
 /// AETHERTEXTALIGNLAST (SR1062): the parse codes (the text-align table, 255 auto), merge_paint carries the field
-/// across rules, and the arm's name is in ALL_LONGHANDS.
+/// across rules, and the arm's name is in ALL_LONGHANDS. `inherit` is still None after SR1168: css_wide clears the
+/// field and sets `INHERIT_TEXT_ALIGN_LAST` instead of the arm dropping it (the bit is pinned in `text_align_last_wide_*`).
 #[test]
 fn text_align_last_codes() {
     let code = |v: &str| styled(&[("text-align-last", v)]).paint.text_align_last;
@@ -2889,4 +2890,79 @@ fn outline_style_word_round_trip() {
     assert_eq!(outline_style_code("hidden").map(outline_style_word), Some("none"));
     assert_eq!(outline_style_word(layout_core::paint::OUTLINE_AUTO), "auto");
     assert_eq!(outline_style_word(6), "none", "out of range");
+}
+
+// ---- AETHERTEXTALIGNLASTWIDE (LEDGER SR1168): text-align-last inherit / unset / initial / revert through the explicit-inherit bit (named tail block) ----
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): a later `inherit` clears an earlier `center` and sets the bit, alone and as a later
+/// rule (armed: before SR1168 the arm dropped it and `center` stood); laid out under a `right` parent the last line
+/// takes the parent's right (x0 30, right 200), not the stale centre (x0 15).
+#[test]
+fn text_align_last_wide_inherit_after_center() {
+    use layout_core::paint::INHERIT_TEXT_ALIGN_LAST;
+    let s = cascade(&[&[("text-align-last", "center")], &[("text-align-last", "inherit")]]);
+    assert_eq!(s.paint.text_align_last, None, "inherit clears the earlier center");
+    assert!(s.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "inherit writes the bit");
+    let c = align_last_lines("text-align-last: right", "text-align: justify; text-align-last: center", fifteen());
+    assert!((left_edge(&c[2]) - 15.0).abs() <= 0.5, "armed: an own center wins over the parent: {:?}", c[2]);
+    let i = align_last_lines("text-align-last: right", "text-align: justify; text-align-last: center; text-align-last: inherit", fifteen());
+    assert!((left_edge(&i[2]) - 30.0).abs() <= 0.5 && (right_edge(&i[2]) - 200.0).abs() <= 0.5, "inherit takes the parent's right: {:?}", i[2]);
+}
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): `unset` on an inherited property is `inherit` (css-cascade-4 §7.3.3), alone and
+/// through `all: unset`; laid out it takes the parent's value.
+#[test]
+fn text_align_last_wide_unset_is_inherit() {
+    use layout_core::paint::INHERIT_TEXT_ALIGN_LAST;
+    for later in [&[("text-align-last", "unset")][..], &[("all", "unset")][..]] {
+        let s = cascade(&[&[("text-align-last", "center")], later]);
+        assert_eq!(s.paint.text_align_last, None, "{later:?} clears the earlier center");
+        assert!(s.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "{later:?} writes the bit");
+    }
+    let u = align_last_lines("text-align-last: right", "text-align: justify; text-align-last: center; text-align-last: unset", fifteen());
+    assert!((left_edge(&u[2]) - 30.0).abs() <= 0.5, "unset takes the parent's right: {:?}", u[2]);
+}
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): `initial` is `auto` (255), no bit, so it beats both an earlier value and the
+/// parent's (the last line stays at the start: right edge 170).
+#[test]
+fn text_align_last_wide_initial_is_auto() {
+    use layout_core::paint::INHERIT_TEXT_ALIGN_LAST;
+    let s = cascade(&[&[("text-align-last", "center")], &[("text-align-last", "initial")]]);
+    assert_eq!(s.paint.text_align_last, Some(255), "initial is auto");
+    assert!(!s.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "no inherit bit");
+    let a = align_last_lines("text-align-last: right", "text-align: justify; text-align-last: center; text-align-last: initial", fifteen());
+    assert!(left_edge(&a[2]).abs() <= 0.5 && (right_edge(&a[2]) - 170.0).abs() <= 0.5, "initial: auto, not the parent's: {:?}", a[2]);
+}
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): `revert` (no UA rule for text-align-last) erases the earlier value through
+/// `set_revert`: the field None, the revert mark, no inherit bit; the walk then carries the parent's value.
+#[test]
+fn text_align_last_wide_revert_parent() {
+    use layout_core::paint::INHERIT_TEXT_ALIGN_LAST;
+    let s = cascade(&[&[("text-align-last", "center")], &[("text-align-last", "revert")]]);
+    assert_eq!(s.paint.text_align_last, None, "revert clears the earlier center");
+    assert!(!s.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "no inherit bit");
+    assert_eq!(s.paint.revert & INHERIT_TEXT_ALIGN_LAST, INHERIT_TEXT_ALIGN_LAST, "the revert mark");
+    let r = align_last_lines("text-align-last: right", "text-align: justify; text-align-last: center; text-align-last: revert", fifteen());
+    assert!((left_edge(&r[2]) - 30.0).abs() <= 0.5, "revert takes the parent's right: {:?}", r[2]);
+}
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): the bit is 32768 (the next free after SR1116's 16384), `inherit_bit` maps the
+/// property to it, `valued` carries it while the field holds a value, `set_inherit` clears the field, and a later value
+/// clears the bit across the merge.
+#[test]
+fn text_align_last_wide_bit() {
+    use layout_core::paint::{inherit_bit, INHERIT_TEXT_ALIGN_LAST, INHERIT_UNDERLINE_OFFSET};
+    assert_eq!(INHERIT_TEXT_ALIGN_LAST, 32768);
+    assert_eq!(INHERIT_TEXT_ALIGN_LAST, INHERIT_UNDERLINE_OFFSET << 1, "the next free bit");
+    assert_eq!(inherit_bit("text-align-last"), INHERIT_TEXT_ALIGN_LAST);
+    let mut s = styled(&[("text-align-last", "justify")]);
+    assert_ne!(s.paint.valued() & INHERIT_TEXT_ALIGN_LAST, 0, "a value is valued");
+    s.paint.set_inherit(INHERIT_TEXT_ALIGN_LAST);
+    assert_eq!(s.paint.text_align_last, None, "set_inherit clears the field");
+    assert!(s.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "and sets the bit");
+    let m = cascade(&[&[("text-align-last", "inherit")], &[("text-align-last", "left")]]);
+    assert_eq!(m.paint.text_align_last, Some(4), "the later value stands");
+    assert!(!m.paint.inherits(INHERIT_TEXT_ALIGN_LAST), "and clears the bit");
 }

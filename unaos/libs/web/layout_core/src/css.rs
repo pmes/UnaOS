@@ -4801,8 +4801,8 @@ fn bg_shorthand_layer_props<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
 
 /// AETHERTEXTALIGNLAST (SR1062): css-text-3 §7.2 `text-align-last` to its code (the `text-align` table: 0 start,
 /// 1 center, 2 right, 3 end, 4 left, 8 justify; 255 = `auto`, which `initial` also writes, so an explicit auto overrides
-/// an inherited value). `inherit` / `unset` / `revert` are dropped as the `text-align` arm drops them (the field stays
-/// unspecified and inherits: AETHER-TEXT-ALIGN-LAST-WIDE owed); anything else is recorded and dropped.
+/// an inherited value). `inherit` / `unset` / `revert` never reach this fn since SR1168: `css_wide` takes them first
+/// through `paint::INHERIT_TEXT_ALIGN_LAST`; `revert-layer` is dropped here; anything else is recorded and dropped.
 fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" | "initial" => Some(255),
@@ -4812,7 +4812,7 @@ fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
         "end" => Some(3),
         "left" => Some(4),
         "justify" => Some(8),
-        "inherit" | "unset" | "revert" | "revert-layer" => None,
+        "inherit" | "unset" | "revert" | "revert-layer" => None, // SR1168: only revert-layer arrives (AETHER-CSS-WIDE-REVERT-LAYER owed); the rest take css_wide's bit
         other => {
             H::record_css(&format!("text-align-last:{}", clip(other)));
             None

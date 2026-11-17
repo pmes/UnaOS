@@ -940,7 +940,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "color" => INHERIT_COLOR,
         "white-space" | "white-space-collapse" | "text-wrap-mode" | "text-wrap" => INHERIT_WHITE_SPACE,
         "direction" => INHERIT_DIRECTION,
-        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "color-scheme" => INHERIT_COLOR_SCHEME, "text-underline-position" => INHERIT_UNDERLINE_POSITION, "caret-color" => INHERIT_CARET_COLOR, "text-underline-offset" => INHERIT_UNDERLINE_OFFSET,
+        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "color-scheme" => INHERIT_COLOR_SCHEME, "text-underline-position" => INHERIT_UNDERLINE_POSITION, "caret-color" => INHERIT_CARET_COLOR, "text-underline-offset" => INHERIT_UNDERLINE_OFFSET, "text-align-last" => INHERIT_TEXT_ALIGN_LAST,
         _ => 0,
     }
 }
@@ -960,7 +960,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.color.is_some(), INHERIT_COLOR)
             | on(self.white_space.is_some() || self.ws_collapse.is_some() || self.ws_wrap.is_some(), INHERIT_WHITE_SPACE)
             | on(self.rtl.is_some(), INHERIT_DIRECTION)
-            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.color_scheme.is_some(), INHERIT_COLOR_SCHEME) | on(self.underline_position.is_some(), INHERIT_UNDERLINE_POSITION) | on(self.caret_color.is_some(), INHERIT_CARET_COLOR) | on(self.underline_offset.is_some(), INHERIT_UNDERLINE_OFFSET)
+            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.color_scheme.is_some(), INHERIT_COLOR_SCHEME) | on(self.underline_position.is_some(), INHERIT_UNDERLINE_POSITION) | on(self.caret_color.is_some(), INHERIT_CARET_COLOR) | on(self.underline_offset.is_some(), INHERIT_UNDERLINE_OFFSET) | on(self.text_align_last.is_some(), INHERIT_TEXT_ALIGN_LAST)
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
@@ -996,7 +996,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_COLOR != 0 { self.color = None; self.color_alpha = None; }
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; self.ws_collapse = None; self.ws_wrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
-        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; } if bits & INHERIT_UNDERLINE_POSITION != 0 { self.underline_position = None; } if bits & INHERIT_CARET_COLOR != 0 { self.caret_color = None; } if bits & INHERIT_UNDERLINE_OFFSET != 0 { self.underline_offset = None; }
+        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_COLOR_SCHEME != 0 { self.color_scheme = None; } if bits & INHERIT_UNDERLINE_POSITION != 0 { self.underline_position = None; } if bits & INHERIT_CARET_COLOR != 0 { self.caret_color = None; } if bits & INHERIT_UNDERLINE_OFFSET != 0 { self.underline_offset = None; } if bits & INHERIT_TEXT_ALIGN_LAST != 0 { self.text_align_last = None; }
         self.inherit |= bits; self.revert &= !bits; // SR1028: a later inherit beats an earlier revert
     }
 
@@ -1241,3 +1241,10 @@ pub const INHERIT_UNDERLINE_OFFSET: u32 = 16384;
 /// [`OUTLINE_MEDIUM`] alias) and by css.rs `border_medium`. Before SR1084 the 3.0 lived as `OUTLINE_MEDIUM` and as
 /// border_medium's parse of the SR832 `"3px"` row.
 pub const LINE_WIDTH_MEDIUM: f32 = 3.0;
+
+// ---- AETHERTEXTALIGNLASTWIDE (LEDGER SR1168): the explicit inherit of text-align-last (named tail block) ----
+
+/// AETHERTEXTALIGNLASTWIDE (SR1168): `text-align-last` is inherited (css-text-3 §7.2; no tag road: tree.rs takes the
+/// parent's value for a None field), so `inherit` / `unset` / `revert` clear an earlier value through css.rs `css_wide`
+/// and `set_inherit` / `set_revert` in SR1116's [`INHERIT_UNDERLINE_OFFSET`] shape (the next free bit after its 16384).
+pub const INHERIT_TEXT_ALIGN_LAST: u32 = 32768;
