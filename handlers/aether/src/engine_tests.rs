@@ -6610,7 +6610,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 21);
+        assert_eq!(crate::css::REPORT_COLS, 24); // SR1036: three columns appended after direction
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7259,5 +7259,85 @@ mod tests {
         assert!(text_decoration_ink(&mut e, "tg", css_wide_green) > 40, "#tg paints green");
         assert_eq!(text_decoration_ink(&mut e, "tg", css_wide_red), 0, "#tg paints no red");
         assert_eq!(text_decoration_ink(&mut e, "tg", text_decoration_black), 0, "#tg paints no black");
+    }
+
+    // ---- AETHERCSSOMCOLUMNSREST (LEDGER SR1036): white-space's longhands and text-decoration-color as report columns (named tail block) ----
+
+    /// AETHERCSSOMCOLUMNSREST (SR1036): one div per white-space value (and a child of the pre div), and one div per
+    /// text-decoration-color case: an author red, unset on green text, `currentcolor` on green text, the
+    /// `text-decoration` shorthand's reset on green text, and a `color: inherit` child of a blue parent.
+    fn cssom_columns_rest_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            #dg, #dc, #ds { color: green }
+            #dc { text-decoration-color: currentcolor }
+            #ds { text-decoration: underline }
+            </style></head><body style="margin:0;font:16px serif">
+            <div id="wn">a</div>
+            <div id="wp" style="white-space:pre"><div id="wpc">a</div></div>
+            <div id="ww" style="white-space:nowrap">a</div>
+            <div id="wr" style="white-space:pre-wrap">a</div>
+            <div id="wl" style="white-space:pre-line">a</div>
+            <div id="wb" style="white-space:break-spaces">a</div>
+            <div id="dr" style="text-decoration-color:red">a</div>
+            <div id="dg">a</div>
+            <div id="dc">a</div>
+            <div id="ds">a</div>
+            <div style="color:blue"><div id="di" style="color:inherit">a</div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMCOLUMNSREST (SR1036): white-space-collapse / text-wrap-mode read the css-text-4 pair of the one
+    /// white-space code (Chromium: normal is collapse / wrap); the pre div's child inherits preserve / nowrap.
+    #[test]
+    fn cssom_columns_rest_white_space_longhands() {
+        let mut e = cssom_columns_rest_engine();
+        for (id, collapse, wrap) in [
+            ("wn", "collapse", "wrap"),
+            ("wp", "preserve", "nowrap"),
+            ("wpc", "preserve", "nowrap"),
+            ("ww", "collapse", "nowrap"),
+            ("wr", "preserve", "wrap"),
+            ("wl", "preserve-breaks", "wrap"),
+            ("wb", "break-spaces", "wrap"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('white-space-collapse')"), collapse, "#{id}: white-space-collapse");
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('text-wrap-mode')"), wrap, "#{id}: text-wrap-mode");
+        }
+    }
+
+    /// AETHERCSSOMCOLUMNSREST (SR1036): text-decoration-color reads SR1018's field, currentcolor (and unset) resolved
+    /// to the element's colour as Chromium reports it.
+    #[test]
+    fn cssom_columns_rest_decoration_color() {
+        let mut e = cssom_columns_rest_engine();
+        for (id, want) in [
+            ("dr", "rgb(255, 0, 0)"),
+            ("dg", "rgb(0, 128, 0)"),
+            ("dc", "rgb(0, 128, 0)"),
+            ("ds", "rgb(0, 128, 0)"),
+            ("di", "rgb(0, 0, 255)"),
+            ("wn", "rgb(0, 0, 0)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "getPropertyValue('text-decoration-color')"), want, "#{id}: text-decoration-color");
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecorationColor"), want, "#{id}: textDecorationColor");
+        }
+    }
+
+    /// AETHERCSSOMCOLUMNSREST (SR1036): the three columns sit after direction (no earlier index moves) and the
+    /// computed declaration enumerates all 24.
+    #[test]
+    fn cssom_columns_rest_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 24);
+        assert_eq!(crate::css::REPORT_PROPS[20], "direction");
+        assert_eq!(&crate::css::REPORT_PROPS[21..], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]);
+        let mut e = cssom_columns_rest_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "24");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(23)"), "text-decoration-color");
     }
 }
