@@ -1558,7 +1558,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "text-decoration-color" => {
             if let Some(c) = deco_color_value::<H>(value) {
-                style.paint.decoration_color = Some(c);
+                style.paint.decoration_color = Some(c); style.paint.deco_alpha = deco_alpha_of::<H>(Some(c), value);
             }
         }
         "text-decoration-style" => {
@@ -2499,7 +2499,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     macro_rules! clone {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
-    merge_border_pending(dst, src); merge_border_alpha(dst, src); if src.color.is_some() { dst.color_alpha = src.color_alpha; } copy!(
+    merge_border_pending(dst, src); merge_border_alpha(dst, src); if src.color.is_some() { dst.color_alpha = src.color_alpha; } if src.decoration_color.is_some() { dst.deco_alpha = src.deco_alpha; } copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
@@ -3777,13 +3777,13 @@ fn side_color_of<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
 
 /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a `text-decoration-color` value in the [`PaintStyle::decoration_color`] marker
 /// shape: `currentcolor`, `initial` and `unset` (not inherited: unset == initial, css-cascade-4 §7.3.3) are `Some(None)`;
-/// a colour [`parse_color_str`] reads is `Some(Some(c))`; anything else (inherit, transparent, an invalid value) None.
+/// a colour [`border_rgb`] reads is `Some(Some(c))` (SR1148: `transparent` and alpha-0 colours too, their alpha in `deco_alpha`); anything else (inherit, an invalid value) None.
 fn deco_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8)>> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
         return Some(None);
     }
-    parse_color_str::<H>(v).map(Some)
+    border_rgb::<H>(v).map(Some)
 }
 
 /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the `text-decoration` shorthand (css-text-decor-3 §2.4) sets its colour
@@ -3796,7 +3796,7 @@ fn deco_shorthand_rest<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>, 
     if prop != "text-decoration" || v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("revert") {
         return;
     }
-    let (mut c, mut style, mut thick) = (None, None, None);
+    let (mut c, mut style, mut thick, mut a) = (None, None, None, None);
     for p in split_top_level(v) {
         if style.is_none() && !p.eq_ignore_ascii_case("initial") && !p.eq_ignore_ascii_case("unset") {
             if let Some(k) = deco_style_code(p) {
@@ -3811,10 +3811,10 @@ fn deco_shorthand_rest<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>, 
             }
         }
         if c.is_none() {
-            c = deco_color_value::<H>(p);
+            c = deco_color_value::<H>(p); a = deco_alpha_of::<H>(c, p);
         }
     }
-    paint.decoration_color = Some(c.unwrap_or(None));
+    paint.decoration_color = Some(c.unwrap_or(None)); paint.deco_alpha = a;
     paint.decoration_style = Some(style.unwrap_or(0));
     paint.decoration_thickness = Some(thick.unwrap_or(None));
 }
@@ -5159,4 +5159,28 @@ pub fn border_side_alpha_ink<H: Host>(paint: &PaintStyle<H>, i: usize, ink_alpha
 pub fn bg_alpha_ink<H: Host>(paint: &PaintStyle<H>, ink_alpha: f32) -> f32 {
     let a = paint.bg_alpha.unwrap_or(1.0);
     if paint.currentcolor & crate::paint::CC_BG != 0 { a * ink_alpha.clamp(0.0, 1.0) } else { a }
+}
+
+// ---- AETHERCSSOMALIGNWORDSONE (LEDGER SR1102): the per-property css-align-3 grammar over alignment_words (named tail block) ----
+
+/// AETHERCSSOMALIGNWORDSONE (SR1102): is `value` (lowercase) a valid css-align-3 value of alignment longhand `prop`
+/// (align- / justify- content / items / self)? The multi-word forms are [`alignment_words`]' (THE grammar); this adds
+/// only the per-property word set (§4.1 / §5.1 / §6.1-6.3): a superset of every arm's words (the justify-content arm,
+/// [`apply_align_content`], [`self_alignment`]), so aether's CSSOM, which validates through it, never refuses a value
+/// the arms accept. The words an arm leaves out (left / right, self-start / self-end, ...) are AETHER-CSS-ALIGN-SPEC-WORDS.
+pub fn alignment_valid(prop: &str, value: &str) -> bool {
+    let (Some((w, _, _)), content, justify) = (alignment_words(value), prop.ends_with("-content"), prop.starts_with("justify")) else { return false };
+    matches!(w, "normal" | "center" | "start" | "end" | "flex-start" | "flex-end" | "stretch")
+        || (justify && matches!(w, "left" | "right"))
+        || (w == "baseline" && !(content && justify))
+        || (if content { matches!(w, "space-between" | "space-around" | "space-evenly") } else { matches!(w, "self-start" | "self-end") })
+        || (w == "auto" && prop.ends_with("-self"))
+}
+
+// ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration colour keeps its alpha (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the [`PaintStyle::deco_alpha`] of a decoration colour `c` read from `v`:
+/// a declared colour's alpha through [`color_alpha`] (`transparent` 0), None when opaque or currentcolor (SR1126's shape).
+fn deco_alpha_of<H: Host>(c: Option<Option<(u8, u8, u8)>>, v: &str) -> Option<f32> {
+    c.flatten().and(Some(color_alpha::<H>(v)).filter(|a| *a < 1.0))
 }

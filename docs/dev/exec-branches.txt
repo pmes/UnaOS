@@ -1898,3 +1898,6 @@ exec-rmbp-aetherscrolldamageunboundedholder|2e75ae890|cut137h
 exec-rmbp-aethercssinlineborderalphabycolour|2e75ae890|cut137h
 exec-rmbp-aethercssbordercornerdiagonal|3e9149d22|cut138h
 exec-rmbp-aethercsstextdecorationcoloralpha|3e9149d22|cut138h
+exec-rmbp-aethercssomoffsettopsticky|e61d34c61|cut139h
+exec-rmbp-aetherpaintindextextshadow|e61d34c61|cut139h
+exec-rmbp-aetherboxpaintsidealpha|c739c5016|cut140h

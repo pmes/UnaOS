@@ -10417,15 +10417,19 @@ b</div>
         }
     }
 
-    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): an opaque two-colour frame keeps its corner owner: the left / right
-    /// sides paint after the top / bottom (render's order top, bottom, left, right), so all four corners were and stay
-    /// blue; the top edge is red. Pinned: the horizontal rects are the ones inset.
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): an opaque two-colour frame's corner owner. FLIPPED by
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): adjacent sides of different colours now take boxpaint's diagonal, so the
+    /// top-left corner square splits: (l+2, t) is the top's red, (l, t+2) the left's blue (before SR1147 the whole
+    /// square was the vertical side's blue). Sampled off the diagonal: an exact-diagonal pixel is a tie.
     #[test]
     fn border_alpha_corner_opaque_owner() {
         let mut e = border_alpha_corner_engine();
-        let (corners, edge) = border_alpha_corner_px(&mut e, "oc");
+        let (_, edge) = border_alpha_corner_px(&mut e, "oc");
         assert_eq!(edge, (255, 0, 0), "the top edge is red");
-        assert_eq!(corners, [(0, 0, 255); 4], "every corner stays the vertical side's blue");
+        let (l, t, _, _) = imgalt_rect(&mut e, "oc");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert_eq!(imgalt_px(&e, l + 2, t), (255, 0, 0), "armed (SR1147): the corner's top half is the top's red");
+        assert_eq!(imgalt_px(&e, l, t + 2), (0, 0, 255), "the corner's left half is the left's blue");
     }
 
     /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): SR1134's currentcolor frame under half-alpha text (`#hb`): the corner
@@ -10623,6 +10627,272 @@ b</div>
             assert_eq!(bounding_sticky_from_point(&mut e, x, y), shell, "shell hit test and elementFromPoint agree at ({x}, {y})");
         }
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "the sample at #d's painted rows is #d");
+    }
+
+    // ---- AETHERCSSINLINEBORDERALPHABYCOLOUR (LEDGER SR1146): the inline road's fills carry their alpha, not a colour comparison (named tail block) ----
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): on white, three inline spans (`padding: 0 12px`, white text) and
+    /// their block-road twins (40x20 divs, 48x28 with the frame), under a 12px top padding (the first span's frame
+    /// rises above its line, so it would start above the viewport): `#sa` / `#da` `background: rgba(255, 0, 0, 0.2);
+    /// border: 4px solid red`, `#sb` / `#db` the same background under `4px solid rgba(255, 0, 0, 0.5)`, `#sc` / `#dc`
+    /// `background: red; border: 4px solid rgba(0, 0, 255, 0.5)`.
+    fn inline_border_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; padding: 12px 0 0; background: #fff }
+            div { width: 40px; height: 20px; margin: 0 0 12px }
+            p { margin: 0 0 12px; padding: 0 8px; font: 16px sans-serif }
+            span { padding: 0 12px; color: #fff }
+            .a { background: rgba(255, 0, 0, 0.2); border: 4px solid red }
+            .b { background: rgba(255, 0, 0, 0.2); border: 4px solid rgba(255, 0, 0, 0.5) }
+            .c { background: red; border: 4px solid rgba(0, 0, 255, 0.5) }
+            </style></head><body>
+            <p><span id="sa" class="a">x</span></p>
+            <p><span id="sb" class="b">x</span></p>
+            <p><span id="sc" class="c">x</span></p>
+            <div id="da" class="a"></div>
+            <div id="db" class="b"></div>
+            <div id="dc" class="c"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// (top-border pixel, interior pixel) of `id`, both 7px in from the left edge: inside the left padding of a span
+    /// (clear of the text), on the top side (past the 4px left side) and at the vertical middle.
+    fn inline_border_alpha_px(e: &mut crate::AetherEngine, id: &str) -> ((u8, u8, u8), (u8, u8, u8)) {
+        let (l, t, _, h) = imgalt_rect(e, id);
+        let (x, t, h) = (l.round() as usize + 7, t.round() as usize, h.round() as usize);
+        (imgalt_px(e, x, t + 1), imgalt_px(e, x, t + h / 2))
+    }
+
+    fn inline_border_alpha_near(c: (u8, u8, u8), want: (u8, u8, u8)) -> bool {
+        [(c.0, want.0), (c.1, want.1), (c.2, want.2)].iter().all(|&(a, b)| a.abs_diff(b) <= 2)
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): an opaque red frame over a 0.2 red background paints opaque red on
+    /// the span, as on the div. Before SR1146 the inline road gave every pixel whose RGB equalled the background's the
+    /// background's alpha: the border composited at 0.2 over the fill (~(255, 163, 163)).
+    #[test]
+    fn inline_border_alpha_opaque_frame_over_translucent_fill() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sa");
+        assert_eq!(border, (255, 0, 0), "armed: the span's opaque red frame paints at its own alpha 1.0");
+        assert!(inline_border_alpha_near(interior, (255, 204, 204)), "the 0.2 fill: {interior:?}");
+        assert_eq!(inline_border_alpha_px(&mut e, "da"), (border, interior), "the block road paints the same pixels");
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): a 0.5 red frame over a 0.2 red background composites at 0.5 over
+    /// the fill (~(255, 101, 101)), on the span as on the div. Before SR1146 the span's frame took the fill's 0.2
+    /// (~(255, 163, 163)).
+    #[test]
+    fn inline_border_alpha_translucent_same_rgb() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sb");
+        assert!(inline_border_alpha_near(border, (255, 101, 101)), "armed: the frame composites at 0.5: {border:?}");
+        assert!(inline_border_alpha_near(interior, (255, 204, 204)), "the 0.2 fill: {interior:?}");
+        assert_eq!(inline_border_alpha_px(&mut e, "db"), (border, interior), "the block road paints the same pixels");
+    }
+
+    /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): a 0.5 blue frame over an opaque red background (different RGBs: never
+    /// aliased) is unchanged: ~(127, 0, 128) on the frame, red inside, on the span as on the div.
+    #[test]
+    fn inline_border_alpha_distinct_colours_unchanged() {
+        let mut e = inline_border_alpha_engine();
+        let (border, interior) = inline_border_alpha_px(&mut e, "sc");
+        assert!(inline_border_alpha_near(border, (127, 0, 128)), "the blue 0.5 frame over red: {border:?}");
+        assert_eq!(interior, (255, 0, 0), "the opaque red fill");
+        assert_eq!(inline_border_alpha_px(&mut e, "dc"), (border, interior), "the block road paints the same pixels");
+    }
+
+    // ---- AETHERCSSBORDERCORNERDIAGONAL (LEDGER SR1147): two-colour frames take the shape painter's diagonal corners (named tail block) ----
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): one engine, white page, each box absolutely placed: `#tc` a 40x40 box
+    /// (20x20 + 10px sides) red top / bottom, blue left / right at (0,0); `#oc` the same box all red at (100,0); `#tr`
+    /// the CSS triangle (0x0, 20px transparent sides, red top) at (0,100); `#gb` a 40x40 box whose BACKGROUND is
+    /// rgb(1, 2, 3) (the first ghost candidate) under the triangle's frame at (100,100); a `<p>` at y 200 holding `#is`,
+    /// an inline span with a 4px red / blue frame.
+    fn border_corner_diagonal_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            .a { position: absolute }
+            p { position: absolute; left: 0; top: 200px; margin: 0; padding: 0 8px; font: 16px sans-serif }
+            </style></head><body>
+            <div id="tc" class="a" style="left:0;top:0;width:20px;height:20px;border:10px solid;border-color:red blue"></div>
+            <div id="oc" class="a" style="left:100px;top:0;width:20px;height:20px;border:10px solid red"></div>
+            <div id="tr" class="a" style="left:0;top:100px;width:0;height:0;border:20px solid transparent;border-top-color:red"></div>
+            <div id="gb" class="a" style="left:100px;top:100px;width:0;height:0;border:20px solid transparent;border-top-color:red;background:rgb(1, 2, 3)"></div>
+            <p><span id="is" style="border:4px solid;border-color:red blue">x</span></p>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    const BCD_RED: (u8, u8, u8) = (255, 0, 0);
+    const BCD_BLUE: (u8, u8, u8) = (0, 0, 255);
+    const BCD_WHITE: (u8, u8, u8) = (255, 255, 255);
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): `border-color: red blue` splits each corner on its diagonal, as Chromium:
+    /// the pixel on the horizontal side of the diagonal is red, on the vertical side blue, at all four corners. Before
+    /// SR1147 the plain rects gave every corner square to the vertical side (all eight samples' red ones read blue).
+    #[test]
+    fn border_corner_diagonal_two_colour() {
+        let e = border_corner_diagonal_engine();
+        for (x, y, c, what) in [
+            (8, 2, BCD_RED, "TL top half (armed: blue before)"),
+            (2, 8, BCD_BLUE, "TL left half"),
+            (31, 2, BCD_RED, "TR top half (armed)"),
+            (37, 8, BCD_BLUE, "TR right half"),
+            (8, 37, BCD_RED, "BL bottom half (armed)"),
+            (2, 31, BCD_BLUE, "BL left half"),
+            (31, 37, BCD_RED, "BR bottom half (armed)"),
+            (37, 31, BCD_BLUE, "BR right half"),
+        ] {
+            assert_eq!(imgalt_px(&e, x, y), c, "#tc ({x},{y}): {what}");
+        }
+        assert_eq!(imgalt_px(&e, 20, 20), BCD_WHITE, "#tc: the content box is unpainted");
+    }
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): a one-colour frame keeps the plain rects (sides_differ false): every pixel
+    /// of `#oc`'s 40x40 border box is red in the 10px ring, white inside, and the pixels just outside are white.
+    #[test]
+    fn border_corner_diagonal_one_colour_unchanged() {
+        let e = border_corner_diagonal_engine();
+        for y in 0..41usize {
+            for x in 99..141usize {
+                let (lx, ly) = (x as i32 - 100, y as i32);
+                let in_box = (0..40).contains(&lx) && (0..40).contains(&ly);
+                let in_ring = in_box && !((10..30).contains(&lx) && (10..30).contains(&ly));
+                let want = if in_ring { BCD_RED } else { BCD_WHITE };
+                assert_eq!(imgalt_px(&e, x, y), want, "#oc ({x},{y})");
+            }
+        }
+    }
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): the CSS triangle (`border: 20px solid transparent; border-top-color: red`
+    /// on a 0x0 box) is a downward red triangle: the spine (20,5) / (20,15) red, the left / right ghosts' halves (3,15) /
+    /// (36,15) and the bottom (20,30) the white page. Before SR1147 the transparent sides were dropped and the top took
+    /// a whole 40x20 band ((3,15) and (36,15) red).
+    #[test]
+    fn border_corner_diagonal_triangle() {
+        let e = border_corner_diagonal_engine();
+        let (ox, oy) = (0usize, 100usize);
+        assert_eq!(imgalt_px(&e, ox + 20, oy + 5), BCD_RED, "#tr: the top of the spine");
+        assert_eq!(imgalt_px(&e, ox + 20, oy + 15), BCD_RED, "#tr: the spine near the apex");
+        assert_eq!(imgalt_px(&e, ox + 3, oy + 15), BCD_WHITE, "armed: #tr left half is the transparent left side's");
+        assert_eq!(imgalt_px(&e, ox + 36, oy + 15), BCD_WHITE, "armed: #tr right half is the transparent right side's");
+        assert_eq!(imgalt_px(&e, ox + 20, oy + 30), BCD_WHITE, "#tr: the transparent bottom side");
+    }
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): the ghost RGB is contained to the sides-only boxpaint call: `#gb`'s
+    /// background IS the first ghost candidate rgb(1, 2, 3) and still paints its whole border box (under the
+    /// transparent sides too, background-clip: border-box), with the red triangle over it.
+    #[test]
+    fn border_corner_diagonal_ghost_background_paints() {
+        let e = border_corner_diagonal_engine();
+        let (ox, oy) = (100usize, 100usize);
+        for (x, y) in [(3, 15), (36, 15), (20, 30), (2, 37), (37, 37)] {
+            assert_eq!(imgalt_px(&e, ox + x, oy + y), (1, 2, 3), "#gb ({x},{y}): the ghost-coloured background paints");
+        }
+        assert_eq!(imgalt_px(&e, ox + 20, oy + 5), BCD_RED, "#gb: the red top side over it");
+    }
+
+    /// AETHERCSSBORDERCORNERDIAGONAL (SR1147): the inline road takes the same split: `#is`'s top-left corner is red on
+    /// the top side of the diagonal and blue on the left side (before SR1147 the pixel-snapped fills gave both to blue).
+    #[test]
+    fn border_corner_diagonal_inline() {
+        let mut e = border_corner_diagonal_engine();
+        let (l, t, _, _) = imgalt_rect(&mut e, "is");
+        let (l, t) = (l.round() as usize, t.round() as usize);
+        assert!(css_wide_red(imgalt_px(&e, l + 3, t + 1)), "armed: #is corner's top half is red: {:?}", imgalt_px(&e, l + 3, t + 1));
+        assert!(css_wide_blue(imgalt_px(&e, l + 1, t + 3)), "#is corner's left half is blue: {:?}", imgalt_px(&e, l + 1, t + 3));
+    }
+
+    // ---- AETHERCSSTEXTDECORATIONCOLORALPHA (LEDGER SR1148): the decoration line composites at its colour's alpha (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): one 20px sans-serif row per probe on white, MMMM (no descenders, so the
+    /// underline row holds only line pixels): `#ua` a `<u>` with `color: rgba(0, 0, 0, 0.5)`; `#ut` `color: transparent;
+    /// text-decoration: underline`; `#ur` black text with `text-decoration: underline rgba(255, 0, 0, 0.5)`; `#pc` an opaque
+    /// black span inside a half-alpha underlined div; `#un` a plain opaque `text-decoration: underline` (the control).
+    fn text_decoration_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { margin: 0 0 12px; font: 20px sans-serif; color: #000 }
+            </style></head><body>
+            <div><u id="ua" style="color:rgba(0, 0, 0, 0.5)">MMMM</u></div>
+            <div><span id="ut" style="color:transparent;text-decoration:underline">MMMM</span></div>
+            <div><span id="ur" style="text-decoration:underline rgba(255, 0, 0, 0.5)">MMMM</span></div>
+            <div style="text-decoration:underline;color:rgba(0, 0, 0, 0.5)"><span id="pc" style="color:#000">MMMM</span></div>
+            <div><span id="un" style="text-decoration:underline">MMMM</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): the underline's pixel under element `id`: the row of its rect (extended
+    /// 4px down, as `text_decoration_ink`) with the most non-white pixels, read at the rect's mid x; and the rect's total
+    /// non-white count.
+    fn text_decoration_alpha_line(e: &mut crate::AetherEngine, id: &str) -> ((u8, u8, u8), usize) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 4).min(sh));
+        let (mut best, mut best_n, mut total) = (y0, 0usize, 0usize);
+        for y in y0..y1 {
+            let n = (x0..x1).filter(|&x| imgalt_px(e, x, y) != (255, 255, 255)).count();
+            total += n;
+            if n > best_n {
+                (best, best_n) = (y, n);
+            }
+        }
+        (imgalt_px(e, (l + w / 2.0) as usize, best), total)
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): a `<u>` in half-alpha black paints its underline at half ink (~127; before
+    /// SR1148 the line was opaque black over half-alpha glyphs), and the plain opaque underline stays black (the pin).
+    #[test]
+    fn text_decoration_alpha_currentcolor_half() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "ua");
+        assert!([r, g, b].iter().all(|c| (110..=150).contains(c)), "armed: the half-alpha text's underline is half ink: {:?}", (r, g, b));
+        let ((r, g, b), n) = text_decoration_alpha_line(&mut e, "un");
+        assert!(n > 20 && r < 30 && g < 30 && b < 30, "the opaque underline stays black: {:?}, {n} px", (r, g, b));
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `color: transparent; text-decoration: underline` paints nothing: no
+    /// glyphs and no line (before SR1148 a bare opaque underline was left).
+    #[test]
+    fn text_decoration_alpha_transparent_no_line() {
+        let mut e = text_decoration_alpha_engine();
+        assert_eq!(text_decoration_alpha_line(&mut e, "ut").1, 0, "armed: transparent text keeps no underline");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): `text-decoration: underline rgba(255, 0, 0, 0.5)` on black text paints a
+    /// half-red line (~(255, 127, 127) on white; before SR1148 opaque red) while the glyphs stay black.
+    #[test]
+    fn text_decoration_alpha_declared_half_red() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "ur");
+        assert!(r >= 245 && (110..=150).contains(&g) && (110..=150).contains(&b), "armed: the line is half red: {:?}", (r, g, b));
+        assert!(color_alpha_ink(&mut e, "ur").0 < 30, "the glyphs stay black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLORALPHA (SR1148): an opaque black span inside a half-alpha underlined div paints its glyphs
+    /// opaque and the div's propagated line at the div's half alpha (the line is the decorating box's, not the run's ink).
+    #[test]
+    fn text_decoration_alpha_propagated_keeps_parent() {
+        let mut e = text_decoration_alpha_engine();
+        let ((r, g, b), _) = text_decoration_alpha_line(&mut e, "pc");
+        assert!([r, g, b].iter().all(|c| (110..=150).contains(c)), "armed: the parent's line under the child is half ink: {:?}", (r, g, b));
+        assert!(color_alpha_ink(&mut e, "pc").0 < 30, "the child's glyphs are opaque black");
     }
 
     // ---- AETHERPAINTINDEXTEXTSHADOW (LEDGER SR1150): a text shadow's ink is the mask rect its painter allocates, not unbounded (named tail block) ----
