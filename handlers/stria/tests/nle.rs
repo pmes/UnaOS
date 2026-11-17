@@ -4004,3 +4004,36 @@ fn striamarkerjumpkeysnext_face_colour_range_note_and_refusals() {
     assert_eq!(f.state.timeline.marker_at(12).map(|m| m.len), Some(8));
     println!("striamarkerjumpkeysnext: M1 red -> blue, range 12..20, cleared, undone; EDL {}", text.lines().filter(|l| l.starts_with("* UNA M")).count());
 }
+
+// ---- STRIAMARKERCHAPTERS (LEDGER SR9046): an export writes its range's markers as a chapters sidecar (named tail block) ----
+
+/// Markers inside the marked range become `chapters.txt` beside the export (ffmetadata, ns from the range start; the
+/// point marker ends at the next, the ranged one at its end clipped to the out mark), named on the done line; the marker
+/// before the in mark is left out. No marker in the range: no clause, no file.
+#[test]
+fn striamarkerchapters_export_writes_the_sidecar() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.timeline = face.state.timeline.mark(5, "Intro").unwrap().mark(12, "Act 1").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap();
+    face.state.set_marks((Some(10), Some(30))).unwrap();
+    let dir = nlefaceexport_dir("striamarkerchapters");
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the done line");
+    assert!(line.starts_with("export: 20 frames ticks 10..30, ") && line.ends_with(&format!(" -> {}, chapters.txt 2 chapters", dir.display())), "{line}");
+    let text = std::fs::read_to_string(dir.join(stria::nle_face::CHAPTERS_FILE)).unwrap();
+    assert_eq!(
+        text,
+        ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=80000000\nEND=400000000\ntitle=Act 1\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=400000000\nEND=800000000\ntitle=End\n"
+    );
+
+    let none = nlefaceexport_dir("striamarkerchapters-none");
+    face.state.timeline.markers.clear();
+    assert!(face.verb(&format!("export {} png", none.display())));
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the done line");
+    assert!(line.ends_with(&format!(" -> {}", none.display())), "{line}");
+    assert!(!none.join(stria::nle_face::CHAPTERS_FILE).exists(), "no markers, no file");
+    println!("striamarkerchapters: {line}; sidecar {} bytes, 2 chapters", text.len());
+}
