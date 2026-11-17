@@ -2325,3 +2325,134 @@ fn conceal_weighted_slices_distance_scales_per_table() {
     assert_frame(by_poc(&f, 4), &slices_halves(&shifted(&p2, 4, 2), |v| v, slices_weighted(45, 5)), "top: identity; bottom: (32, 10) scaled by 1/2 to (45, 5)");
     assert_ne!(img_of(by_poc(&f, 4)).y, slices_halves(&shifted(&p2, 4, 2), |v| v, slices_weighted(32, 10)).y, "not the bottom table unscaled");
 }
+
+// ---- HEVCCONCEALFORWARDDEPTH (LEDGER SR1073): a concealed picture refined by up to two referencers (named tail block) ----
+
+/// Decode `s` and flush: the frames, the generated POCs and the concealment notes.
+fn depth_decode(s: &[u8]) -> (Vec<Frame>, Vec<i32>, Vec<hevc_core::dpb::Concealed>) {
+    let mut d = Decoder::new();
+    d.decode_annexb(s).expect("decode past the lost picture");
+    d.flush();
+    (d.take_frames(), d.take_generated_refs(), d.take_concealed())
+}
+
+/// Luma rows 0-15 and chroma rows 0-7 (CTBs 0-1) of `top`, the rest of `bottom`.
+fn depth_halves(top: &Img, bottom: &Img) -> Img {
+    let pick = |t: &[u16], b: &[u16], n: usize| t.iter().zip(b).enumerate().map(|(i, (&t, &b))| if i / n < n / 2 { t } else { b }).collect::<Vec<u16>>();
+    Img { y: pick(&top.y, &bottom.y, W), cb: pick(&top.cb, &bottom.cb, W / 2), cr: pick(&top.cr, &bottom.cr, W / 2) }
+}
+
+/// The equal-weight average (a + b + 1) >> 1 of `a` and `b`, sample by sample on every plane.
+fn depth_avg(a: &Img, b: &Img) -> Img {
+    let avg = |p: &[u16], q: &[u16]| p.iter().zip(q).map(|(&p, &q)| (p + q + 1) >> 1).collect::<Vec<u16>>();
+    Img { y: avg(&a.y, &b.y), cb: avg(&a.cb, &b.cb), cr: avg(&a.cr, &b.cr) }
+}
+
+/// The PPS carries lists_modification_present_flag. IDR0 (the gradient), P2 (references POC 0 with mv (6, 2)), C1 = P4 and
+/// C2 = P5 coded as TWO independent slice segments (the kit's `two_segments`) over StCurrBefore {POC 3 lost, the other}:
+/// C1's top segment (CTBs 0-1) takes L0 = [POC 3], its bottom L0 = [POC 2] (list_entry_l0 1), both at mvd (32, 16); C2's top
+/// L0 = [POC 4], its bottom L0 = [POC 3], both at mvd (-16, 8); P6 (skip-only, references POC 3 alone: its copy, and a
+/// referencer at mv 0 whose refinement is idempotent). POC 3 is concealed from POC 2 (S projection: P2 at (3, 1)); C1 refines
+/// its top half at -mv = (-8, -4) samples, C2 its bottom half at (4, -2): every block is refined once. Before SR1073 the
+/// drained `forward` let C2 do nothing, so P6's bottom half stayed the S projection `hand_mc(P2, [3, 1])` (refused below).
+#[test]
+fn conceal_forward_depth_second_referencer_fills_the_uncovered_half() {
+    let mut s = headers(false, true, &PpsInter { lists_modification: true, ..Default::default() });
+    s.extend(idr(&gradient(), true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    let half = |poc: u32, top: u32, bottom: u32, mvd: [i32; 2]| {
+        let neg = vec![(-1, true), (-2, true)];
+        let cfg = |e: u32| SliceCfg { lists_mod: true, list_entry_l0: Some(vec![e]), ..p_slice(poc, neg.clone()) };
+        two_segments(&cfg(top), &cfg(bottom), None, mvd)
+    };
+    s.extend(half(4, 0, 1, [32, 16]));
+    s.extend(half(5, 0, 1, [-16, 8]));
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    let (f, generated, concealed) = depth_decode(&s);
+    assert_eq!(generated, vec![3]);
+    assert_eq!(concealed, vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "C1's 8 blocks and C2's 8");
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5, 6]);
+    let (p2, p4, p5) = (img_of(by_poc(&f, 2)), img_of(by_poc(&f, 4)), img_of(by_poc(&f, 5)));
+    let want = depth_halves(&shifted(&p4, -8, -4), &shifted(&p5, 4, -2));
+    assert_frame(by_poc(&f, 6), &want, "top refined from C1 at -mv, bottom from C2 at -mv");
+    let before = depth_halves(&shifted(&p4, -8, -4), &hand_mc(&p2, [3, 1]));
+    assert_ne!(img_of(by_poc(&f, 6)).y, before.y, "not the pre-SR1073 bottom half (the S projection)");
+}
+
+/// IDR0, P2 (mv (6, 2) to POC 0), C1 = P4 (references the lost POC 3 at mvd (32, 16), keeps POC 2 unused), C2 = P5
+/// (references POC 3 alone at mvd (-16, 8), keeps POC 4 unused), when `third` C3 = P6 (references POC 3 alone at mvd (8, -24),
+/// keeps 4 / 5 unused), P7 (skip-only copy of POC 3, keeps 4 / 5 unused), B8 (L0 = L1 = [POC 5, POC 4]; PRED_BI L0 ref_idx 1
+/// = P4 at (-32, -16), L1 ref_idx 0 = P5 at (16, -8)). Every block of POC 3 is refined by C1 (outright) then C2 (averaged):
+/// (P4(x - (8, 4)) + P5(x + (4, -2)) + 1) >> 1 on every plane, which is exactly B8 (integer vectors: 8-262 on the 14-bit
+/// intermediates is (a + b + 1) >> 1); C3 finds every count at CONCEAL_FORWARD_DEPTH and changes nothing.
+fn depth_three(third: bool) -> (Vec<Frame>, Vec<i32>, Vec<hevc_core::dpb::Concealed>) {
+    let mut s = headers(false, true, &PpsInter::default());
+    s.extend(idr(&gradient(), true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&p_slice(4, vec![(-1, true), (-2, false)]), |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(5, vec![(-1, false), (-2, true)]), |e| amvp_then_merge(e, [-16, 8])));
+    if third {
+        s.extend(picture(&p_slice(6, vec![(-1, false), (-2, false), (-3, true)]), |e| amvp_then_merge(e, [8, -24])));
+    }
+    s.extend(picture(&p_slice(7, vec![(-2, false), (-3, false), (-4, true)]), skip_picture));
+    let b8 = SliceCfg { nal_type: 1, slice_type: 0, poc_lsb: 8, neg: vec![(-3, true), (-4, true)], num_ref: Some((2, 2)), five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
+    s.extend(picture(&b8, |e| bi_ref_body(e, 2, [1, 0], [-32, -16], [16, -8])));
+    depth_decode(&s)
+}
+
+#[test]
+fn conceal_forward_depth_both_referencers_average_and_a_third_does_nothing() {
+    let (f, generated, concealed) = depth_three(true);
+    assert_eq!(generated, vec![3]);
+    assert_eq!(concealed, vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5, 6, 7, 8]);
+    let (p4, p5) = (img_of(by_poc(&f, 4)), img_of(by_poc(&f, 5)));
+    let want = depth_avg(&shifted(&p4, -8, -4), &shifted(&p5, 4, -2));
+    assert_frame(by_poc(&f, 7), &want, "C1's and C2's projections averaged per sample");
+    assert_frame(by_poc(&f, 8), &want, "the decoder's own bi-prediction of P4 / P5 at the same vectors");
+    assert_ne!(img_of(by_poc(&f, 7)).y, shifted(&p4, -8, -4).y, "not C1's projection alone (pre-SR1073)");
+    let (g, _, c) = depth_three(false);
+    assert_eq!(c, concealed);
+    assert_eq!(by_poc(&g, 7).planes, by_poc(&f, 7).planes, "a third referencer (count 2 = depth) changes nothing");
+}
+
+/// The PPS carries weighted_pred_flag; every P slice a table (denom 6; one entry): P2 and P7 the default (a copy), C1 = P4
+/// (48, 5), C2 = P5 (80, -8); the stream of [`depth_three`] without C3 and B8. Each referencer's projection is inverted by its
+/// OWN weights (SR778 `uni_explicit_inv`: p' = round half away (4096 (q - o) / w), (p' + 32) >> 6, clipped) before the equal
+/// average; chroma (default weights) averages the copies.
+#[test]
+fn conceal_forward_depth_weighted_referencers_each_invert_their_own() {
+    let mut s = headers(false, true, &PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(idr(&gradient(), true));
+    let id = Some((6, vec![None]));
+    s.extend(picture(&SliceCfg { weights: id.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&SliceCfg { weights: slices_wp(-16, 5), ..p_slice(4, vec![(-1, true), (-2, false)]) }, |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&SliceCfg { weights: slices_wp(16, -8), ..p_slice(5, vec![(-1, false), (-2, true)]) }, |e| amvp_then_merge(e, [-16, 8])));
+    s.extend(picture(&SliceCfg { weights: id, ..p_slice(7, vec![(-4, true)]) }, skip_picture));
+    let (f, generated, _) = depth_decode(&s);
+    assert_eq!(generated, vec![3]);
+    let inv = |r: &Img, (w, o): (i64, i64)| Img { y: r.y.iter().map(|&q| ((round_half_away(4096 * (q as i64 - o), w) + 32) >> 6).clamp(0, 255) as u16).collect(), cb: r.cb.clone(), cr: r.cr.clone() };
+    let (p4, p5) = (img_of(by_poc(&f, 4)), img_of(by_poc(&f, 5)));
+    let want = depth_avg(&inv(&shifted(&p4, -8, -4), (48, 5)), &inv(&shifted(&p5, 4, -2), (80, -8)));
+    assert_frame(by_poc(&f, 7), &want, "each referencer inverted by its own weights, then averaged");
+}
+
+/// The named SR1073 behaviour change: the PPS carries lists_modification_present_flag; P4 holds the lost POC 3 in StCurrBefore
+/// (so it is generated and concealed from POC 2) but its L0 is [POC 2] alone (list_entry_l0 1, mvd (32, 16)): no block of P4
+/// references POC 3. P5 references POC 3 alone at mvd (-16, 8); P6 is its skip copy. Before SR1073 P4's end drained POC 3
+/// unrefined, so P6 was the S projection `hand_mc(P2, [3, 1])`; now POC 3 waits for its first real referencer, P5.
+#[test]
+fn conceal_forward_depth_waits_for_the_first_real_referencer() {
+    let mut s = headers(false, true, &PpsInter { lists_modification: true, ..Default::default() });
+    s.extend(idr(&gradient(), true));
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&SliceCfg { lists_mod: true, list_entry_l0: Some(vec![1]), ..p_slice(4, vec![(-1, true), (-2, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+    s.extend(picture(&p_slice(5, vec![(-1, false), (-2, true)]), |e| amvp_then_merge(e, [-16, 8])));
+    s.extend(picture(&p_slice(6, vec![(-3, true)]), skip_picture));
+    let (f, generated, concealed) = depth_decode(&s);
+    assert_eq!(generated, vec![3]);
+    assert_eq!(concealed, vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "refined by P5, not dropped at P4's end");
+    let (p2, p5) = (img_of(by_poc(&f, 2)), img_of(by_poc(&f, 5)));
+    assert_frame(by_poc(&f, 6), &shifted(&p5, 4, -2), "refined from P5, the first picture that references POC 3");
+    assert_ne!(img_of(by_poc(&f, 6)).y, hand_mc(&p2, [3, 1]).y, "not the pre-SR1073 S projection");
+}
