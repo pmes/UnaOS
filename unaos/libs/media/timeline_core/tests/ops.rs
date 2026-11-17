@@ -3089,3 +3089,57 @@ fn striakgaps_player_keys_route() {
     assert_eq!(key(&mut st, 2, "close-gaps sync"), Some(Ok(())));
     assert_eq!(st.timeline, tl.close_gaps_sync().unwrap());
 }
+
+// ---- STRIAKUNDOHIST (LEDGER SR9004): the count jump lifted into the editor state (named tail block) ----
+
+/// Three named steps; `undo 2` names the oldest it undid and lands two back; `redo 2` returns exactly and names the newest
+/// it redid; `undo 3` lands on the opened timeline. Each step stays its own entry.
+#[test]
+fn striakundohist_jump_lands_and_returns() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    st.seek(15);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    let after_split = st.timeline.clone();
+    assert_eq!(st.verb("]"), Some(Ok(())));
+    assert_eq!(st.verb("mark in"), Some(Ok(())));
+    let top = st.timeline.clone();
+    assert_eq!(st.jump("undo 2").as_deref(), Some("undo 2: back to before \"]\""));
+    assert_eq!((&st.timeline, st.undo_depth(), st.redo_depth()), (&after_split, 1, 2));
+    assert_eq!(st.jump("redo 2").as_deref(), Some("redo 2: forward to after \"mark in\""));
+    assert_eq!((&st.timeline, st.undo_depth(), st.redo_depth()), (&top, 3, 0));
+    assert_eq!(st.jump("undo 3").as_deref(), Some("undo 3: back to before \"split\""));
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+}
+
+/// A count outside 1..=depth, a non-number, or an empty stack is refused by name and nothing moves.
+#[test]
+fn striakundohist_jump_refuses_by_name() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl);
+    assert_eq!(st.jump("undo 1").as_deref(), Some("undo: nothing to undo"));
+    assert_eq!(st.jump("redo 1").as_deref(), Some("redo: nothing to redo"));
+    st.select(0, 1).unwrap();
+    st.seek(15);
+    assert_eq!(st.verb("split"), Some(Ok(())));
+    let before = st.timeline.clone();
+    for (w, line) in [("undo 0", "undo: \"0\" is not a count 1..=1"), ("undo 2", "undo: \"2\" is not a count 1..=1"), ("undo x", "undo: \"x\" is not a count 1..=1")] {
+        assert_eq!(st.jump(w).as_deref(), Some(line), "{w}");
+        assert_eq!((&st.timeline, st.undo_depth(), st.redo_depth()), (&before, 1, 0), "{w}");
+    }
+}
+
+/// Plain `undo` / `redo` and every other word are not the jump's (`None`) and change nothing.
+#[test]
+fn striakundohist_jump_ignores_other_words() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    for w in ["undo", "redo", "history", "split", "undo3", ""] {
+        assert_eq!(st.jump(w), None, "{w}");
+    }
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+}

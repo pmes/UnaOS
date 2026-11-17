@@ -1848,7 +1848,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 202120] = [
+const EDIT_KEYS: [(u8, &str); 20212019] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1873,6 +1873,7 @@ const EDIT_KEYS: [(u8, &str); 202120] = [
     (b'm', "mark"), (b'M', "unmark"), // STRIAKMARKERS (SR9001): a marker at / off the playhead (file tail)
     (b'r', "roll-tool"), (b'(', "roll-"), (b')', "roll+"), // STRIAKROLL (LEDGER SR9003): r the roll tool on / off, ( / ) roll the shown clip's out cut one frame (the host KEYS words; file tail)
     (b'g', "gap"), (b'G', "close-gaps sync"), // STRIAKGAPS (LEDGER SR9005): g opens one second of gap at the playhead on the shown clip's track, G closes the spans empty on every track, every track moving alike (timeline_core gap_verb; one undo step each)
+    (b'H', "history"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1897,7 +1898,7 @@ pub fn edit_live(path: &str) -> bool {
 
 /// The editor verb a key byte names ([`EDIT_KEYS`]).
 pub fn edit_verb(b: u8) -> Option<&'static str> {
-    EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
+    if let Some(v) = jump_key(b) { return Some(v); } EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
 }
 
 /// The output tick shown at `ms` (the inverse of the job's `out_ms`).
@@ -1909,7 +1910,7 @@ fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
 /// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
 /// unchanged, or no EDL open at `path`.
 pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
-    let verb = edit_verb(b)?; if verb == "roll-tool" { return edit_roll_tool(path); } // STRIAKROLL (LEDGER SR9003): the roll tool is face state, not an editor word (file tail)
+    let verb = edit_verb(b)?; if verb == "roll-tool" { return edit_roll_tool(path); } // STRIAKROLL (LEDGER SR9003): the roll tool is face state, not an editor word (file tail) HIST_ARMED.store(false, Ordering::Release);
     let (at, tl, clips, undo, back) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
@@ -1917,7 +1918,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
@@ -1927,7 +1928,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
             }
         }
         let before = st.timeline.clone();
-        match st.verb(verb) {
+        match edit_verb_or_jump(st, verb) {
             Some(Ok(())) if st.timeline != before => edit_size_note(st, verb, at), // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
@@ -1954,7 +1955,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2800,4 +2801,57 @@ fn mix_what(tl: &timeline_core::Timeline, s: &timeline_core::schedule::Step) -> 
 /// STRIAOPACITYNEXT: the refusal line's subject and tail for [`EdlReport::mix_what`].
 fn refuse_words(what: &str) -> (&'static str, &'static str) {
     if what == "opacity" { ("opacity", "; the top clip shows opaque") } else { ("transition", "") }
+}
+
+// ---- STRIAKUNDOHIST (LEDGER SR9004): the Player's history line and its count jump (named tail block) ----
+// `H` ([`EDIT_KEYS`]) prints timeline_core's history line (`EditorState::history_line`, SR876: the top `HISTORY_N` undo
+// entries, newest first, numbered by stack position, the host face's line) on the wire, the Player's message, and arms
+// [`HIST_ARMED`]; it commits, saves and seeks nothing. While armed, the NEXT editing key, a digit `d` in 1..=9, names
+// `undo d` ([`jump_key`]): timeline_core's ONE count jump (`EditorState::jump`, lifted from the host face's SR934 word),
+// back `d` steps to before the `d`-th listed entry, then `edit_key`'s existing arms (the ONE save, the seek door; or
+// `unchanged` after a refusal). Any other editing key disarms (`edit_key`'s first line) and runs as before; Space and the
+// arrows are the Player's transport and keep the arm; the Player's close disarms. Wire: `[nle] history: 3 split | 2 [ |
+// 1 size`, `[nle] undo 2: back to before "["` then `[nle] edit undo 2 at= clips= undo= saved=`, or `[nle] undo: "5" is
+// not a count 1..=2` then `[nle] edit undo 5 at= unchanged`. Unexercised on the Player (owed NLE-UNDO-HISTORY-KERNEL-WITNESS).
+
+/// `H` printed the history line: the next editing key may be a count digit. Set and cleared on the pass (`edit_key`),
+/// read at router depth (`edit_post` -> [`edit_verb`]).
+static HIST_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// The count words a digit names while armed (`1` -> `undo 1` .. `9` -> `undo 9`).
+const JUMP_WORDS: [&str; 9] = ["undo 1", "undo 2", "undo 3", "undo 4", "undo 5", "undo 6", "undo 7", "undo 8", "undo 9"];
+
+/// The count word a digit names while [`HIST_ARMED`]; `None` otherwise (the digit is no editing key).
+fn jump_key(b: u8) -> Option<&'static str> {
+    if !HIST_ARMED.load(Ordering::Acquire) || !(b'1'..=b'9').contains(&b) {
+        return None;
+    }
+    Some(JUMP_WORDS[(b - b'1') as usize])
+}
+
+/// `history`: the line on the wire, armed; `Some(None)`: view-only, nothing to save or seek. `None` for any other word.
+fn edit_history(st: &timeline_core::editor::EditorState, verb: &str) -> Option<Option<u64>> {
+    if verb != "history" {
+        return None;
+    }
+    serial_println!("[nle] {}", st.history_line(timeline_core::editor::HISTORY_N));
+    HIST_ARMED.store(true, Ordering::Release);
+    Some(None)
+}
+
+/// An undo-stack word (`undo` / `redo` and their counts): it keeps the selection, as plain undo always has.
+fn edit_undo_word(v: &str) -> bool {
+    v == "undo" || v == "redo" || v.starts_with("undo ") || v.starts_with("redo ")
+}
+
+/// The count jump (its landing or refusal line on the wire, then `Some(Ok(()))` so `edit_key`'s arms save or say
+/// `unchanged`), else timeline_core's ONE verb dispatch.
+fn edit_verb_or_jump(st: &mut timeline_core::editor::EditorState, verb: &str) -> Option<Result<(), timeline_core::EditError>> {
+    match st.jump(verb) {
+        Some(line) => {
+            serial_println!("[nle] {}", line);
+            Some(Ok(()))
+        }
+        None => st.verb(verb),
+    }
 }

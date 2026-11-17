@@ -6638,38 +6638,7 @@ impl Face {
 impl Face {
     /// `undo <n>` / `redo <n>`: the steps and the landing line, or the refusal; `None` for any other word.
     fn undo_jump_verb(&mut self, v: &str) -> Option<bool> {
-        let (back, arg) = match (v.strip_prefix("undo "), v.strip_prefix("redo ")) {
-            (Some(a), _) => (true, a.trim()),
-            (_, Some(a)) => (false, a.trim()),
-            _ => return None,
-        };
-        let (word, depth) = if back { ("undo", self.state.undo_depth()) } else { ("redo", self.state.redo_depth()) };
-        let n = match arg.parse::<usize>() {
-            Ok(n) if depth > 0 && (1..=depth).contains(&n) => n,
-            _ if depth == 0 => {
-                self.last_error = Some(format!("{word}: nothing to {word}"));
-                return Some(true);
-            }
-            _ => {
-                self.last_error = Some(format!("{word}: {arg:?} is not a count 1..={depth}"));
-                return Some(true);
-            }
-        };
-        let name = |w: Option<&str>| w.map_or_else(|| "(unnamed)".to_string(), |w| format!("{w:?}"));
-        let line = if back {
-            let at = name(self.state.history(n).last().and_then(|&(_, w)| w));
-            for _ in 0..n {
-                self.state.undo();
-            }
-            format!("undo {n}: back to before {at}")
-        } else {
-            for _ in 0..n {
-                self.state.redo();
-            }
-            let at = name(self.state.history(1).first().and_then(|&(_, w)| w));
-            format!("redo {n}: forward to after {at}")
-        };
-        self.last_error = Some(line);
+        self.last_error = Some(self.state.jump(v)?); // STRIAKUNDOHIST (SR9004): the rule lives in timeline_core `EditorState::jump`, the kernel Player's too
         Some(true)
     }
 }
