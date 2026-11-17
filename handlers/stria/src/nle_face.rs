@@ -2090,7 +2090,7 @@ pub struct ExportJob {
     /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), passes: u8, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2164,7 +2164,7 @@ impl Face {
                 let video = face_video(&fmt, &tl, span.clone(), &sources, &path, plan, &mut progress)?; export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut |n, of| progress(n + (passes - 1) * of, passes * of)) // H264ENCTWOPASSFACEPROGRESS (SR1093): pass 1 inside the one closure; pass 2 reads frames + n of 2 x frames
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0), passes: passes as u8 });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2955,7 +2955,7 @@ pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
 /// A stall past [`STALL_AFTER`] trades the eta word for [`stall_words`] (`export: 3 / 35 stalled 7 s`, NLE5DEXPORTMESSAGEETASTALLWORD SR817).
 fn job_line(j: &ExportJob) -> String {
     let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
-    export_line(d, t, finishing_words(d, t).or_else(|| stall_words(j.rate_at.0.elapsed(), j.rate_ema)).or_else(|| job_eta(j, d, t).map(eta_words_of)))
+    export_line_passes(d, t, j.passes, finishing_words(d, t).or_else(|| stall_words(j.rate_at.0.elapsed(), j.rate_ema)).or_else(|| job_eta(j, d, t).map(eta_words_of)))
 }
 
 // ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
@@ -3230,4 +3230,22 @@ impl Face {
     pub fn export_paused_plan(&mut self, dir: &std::path::Path, fmt: &str, k: u64, plan: ExportPlan) -> Result<(), String> {
         self.start_export(dir, fmt, Some(k), self.export_range(), AudioOut::Wav, plan)
     }
+}
+
+// ---- NLEFACEEXPORTPASSWORD (LEDGER SR1095): the pass word on the export message row (named tail block) ----
+// SR1093 made a two-pass export's reading monotone over passes x frames, so the row read `export: 40 / 70` with no word of
+// the pass. `ExportJob.passes` (set once in `start_export`) reaches `job_line` through `export_line_passes`, which composes ON
+// `export_line` (its text and pins unchanged): the band, `export_progress` and the cancel line keep the combined reading.
+// Owed: NLE-FACE-EXPORT-PASS-JSON (stria-view's `"export"` object gains the pass).
+
+/// [`export_line`] with the pass: under `passes > 1` the per-pass numbers and the pass word, the finishing / stall / eta word
+/// after it (`export: 15 / 35 (pass 2/2) ~12 s`); pass k = ceil(done / frames), so the last pass-1 frame reads `35 / 35 (pass 1/2)`.
+/// One pass (or no frames) is [`export_line`] byte for byte.
+pub fn export_line_passes(done: u64, total: u64, passes: u8, eta: Option<String>) -> String {
+    let n = u64::from(passes);
+    if n <= 1 || total == 0 {
+        return export_line(done, total, eta);
+    }
+    let f = total / n; let k = (done.saturating_sub(1) / f.max(1) + 1).min(n); let pass = format!("(pass {k}/{n})");
+    export_line(done - (k - 1) * f, f, Some(eta.map_or(pass.clone(), |e| format!("{pass} {e}"))))
 }

@@ -3849,3 +3849,64 @@ fn face_export_twopass_progress_single_pass_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("face_export_twopass_progress: single pass {line}");
 }
+
+// ---- NLEFACEEXPORTPASSWORD (LEDGER SR1095): the pass word on the export message row (named tail block) ----
+
+#[test]
+fn face_export_pass_word_unit() {
+    use stria::nle_face::{export_line, export_line_passes, finishing_words};
+    let rows: [(u64, u64, u8, Option<&str>, &str); 9] = [
+        (10, 70, 2, None, "export: 10 / 35 (pass 1/2)"),
+        (50, 70, 2, None, "export: 15 / 35 (pass 2/2)"),
+        (35, 70, 2, None, "export: 35 / 35 (pass 1/2)"),
+        (36, 70, 2, None, "export: 1 / 35 (pass 2/2)"),
+        (0, 70, 2, None, "export: 0 / 35 (pass 1/2)"),
+        (10, 70, 2, Some("~12 s"), "export: 10 / 35 (pass 1/2) ~12 s"),
+        (50, 70, 2, Some("stalled 7 s"), "export: 15 / 35 (pass 2/2) stalled 7 s"),
+        (0, 0, 2, None, "export: starting"),
+        (10, 35, 1, Some("~12 s"), "export: 10 / 35 ~12 s"),
+    ];
+    for (d, t, n, e, want) in rows {
+        assert_eq!(export_line_passes(d, t, n, e.map(String::from)), want, "export_line_passes({d}, {t}, {n}, {e:?})");
+    }
+    assert_eq!(export_line_passes(70, 70, 2, finishing_words(70, 70)), "export: 35 / 35 (pass 2/2) finishing", "the finishing word after the pass word");
+    for e in [None, Some("~12 s"), Some("stalled 7 s")] {
+        assert_eq!(export_line_passes(10, 35, 1, e.map(String::from)), export_line(10, 35, e.map(String::from)), "one pass is export_line byte for byte ({e:?})");
+    }
+    println!("face_export_pass_word: {} KAT rows + finishing + 3 single-pass identities", rows.len());
+}
+
+/// The held job's message row after `want` (the combined reading), its per-pass head checked against `head` and its tail
+/// (empty, the eta, or the stall word) after the pass word; then Esc and the cancel line (the combined numbers).
+fn password_hold(name: &str, k: u64, plan: stria::nle_face::ExportPlan, want: (u64, u64), head: &str) -> String {
+    let dir = nlefaceexport_dir(name);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_plan(&dir, "h264", k, plan).unwrap();
+    nlefaceexport_until(&face, want);
+    let line = face.message_text().expect("the running export's line");
+    let tail = line.strip_prefix(head).unwrap_or_else(|| panic!("{line}: want the head {head:?}"));
+    assert!(tail.is_empty() || tail.strip_prefix(" ~").is_some_and(nle5dexportmessageetaband_eta_shaped) || tail.starts_with(" stalled "), "{line}: the eta / stall word follows the head");
+    assert_eq!(face.export_progress(), Some(want), "the band keeps the combined reading");
+    assert!(face.cancel_export() && face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at {}/{} frames; partial files left in {}", want.0, want.1, dir.display()), "the cancel line keeps the combined numbers");
+    let _ = std::fs::remove_dir_all(&dir);
+    line
+}
+
+#[test]
+fn face_export_pass_word_twopass_held_reads_the_pass() {
+    use stria::nle_face::export_plan_of;
+    for (k, head) in [(10u64, "export: 10 / 35 (pass 1/2)"), (50, "export: 15 / 35 (pass 2/2)")] {
+        let line = password_hold(&format!("password-{k}"), k, export_plan_of("bitrate 400 two-pass").unwrap(), (k, 70), head);
+        println!("face_export_pass_word: held at {k}/70 reads {line}");
+    }
+}
+
+#[test]
+fn face_export_pass_word_single_pass_unchanged() {
+    let line = password_hold("password-single", 10, stria::nle_face::ExportPlan::default(), (10, 35), "export: 10 / 35");
+    assert!(!line.contains("(pass"), "{line}: no pass word on a single pass");
+    println!("face_export_pass_word: single pass reads {line}");
+}
