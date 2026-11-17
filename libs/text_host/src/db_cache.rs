@@ -2,7 +2,7 @@
 //! [`crate::db::FontDb::discover`], so an unchanged font set is not re-indexed at every process start.
 //!
 //! The index lives in the caller's directory ([`crate::fontconfig::Config::cache_dir`]; Aether's data dir /fonts) as
-//! one text file, [`INDEX_FILE`]: a header (magic and format version), the scanned directory list, then per walked
+//! one text file, [`index_file`]: a header (magic and format version), the scanned directory list, then per walked
 //! file `F path size mtime_ns` and one `A` line per face (index, weight, slant, stretch, the family count, the
 //! families, the full names), closed by an `end` trailer carrying the counts; after it, AETHERFONTDBCACHECMAP
 //! (SR697) appends one `C` line per face whose cmap a process read (see the named tail block). Fields are
@@ -23,7 +23,7 @@ use crate::fontconfig::Config;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// The index file's name inside the cache directory.
+/// The index file's name PREFIX inside the cache directory; the file is `<prefix>-<16 hex>`, keyed by the directory list ([`index_file`]).
 pub const INDEX_FILE: &str = "fontdb-index.v2";
 const MAGIC: &str = "fontdb-index";
 const VERSION: &str = "2";
@@ -216,7 +216,7 @@ fn parse(text: &str, dirs: &[PathBuf]) -> Option<(Vec<PathBuf>, HashMap<PathBuf,
 /// The index's answer for the walked `files` of `config` (see the module comment).
 pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State) {
     let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off) };
-    let parsed = std::fs::read_to_string(dir.join(INDEX_FILE)).ok().and_then(|t| parse(&t, &config.dirs));
+    let parsed = std::fs::read_to_string(dir.join(index_file(&config.dirs))).ok().and_then(|t| parse(&t, &config.dirs));
     let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss) };
     let live: HashSet<&PathBuf> = files.iter().collect();
     for p in &order {
@@ -238,21 +238,21 @@ pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>
 }
 
 /// Rewrites the index after a miss or a stale answer (a no-op for Off and Hit); a failure leaves no index change.
-pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) {
+pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) -> usize {
     if !matches!(state, State::Miss | State::Stale) {
-        return;
+        return 0;
     }
-    let Some(dir) = config.cache_dir.as_deref() else { return };
-    let Some(text) = render(&config.dirs, files, faces) else { return };
-    let _ = write_atomic(dir, &text);
+    let Some(dir) = config.cache_dir.as_deref() else { return 0 };
+    let Some(text) = render(&config.dirs, files, faces) else { return 0 };
+    write_atomic(dir, &index_file(&config.dirs), &text).map_or(0, |()| sweep(dir, &index_file(&config.dirs))) // AETHERFONTDBCACHESWEEP (SR770): the sweep rides the write
 }
 
 /// Writes the index through a per-process temp file in the same directory and a rename.
-fn write_atomic(dir: &Path, text: &str) -> std::io::Result<()> {
+fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)?;
-    let r = std::fs::rename(&tmp, dir.join(INDEX_FILE));
+    let r = std::fs::rename(&tmp, dir.join(name));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -287,7 +287,7 @@ mod tests {
             Config { cache_dir: None, ..self.cfg() }
         }
         fn index(&self) -> PathBuf {
-            self.0.join("cache").join(INDEX_FILE)
+            self.0.join("cache").join(index_file(&self.cfg().dirs))
         }
         fn copy_in(&self, rel: &str) -> PathBuf {
             let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts").join(rel);
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
         assert!(same(&a.faces, &b.faces), "{:?} vs {:?}", a.faces, b.faces);
         let left: Vec<_> = fs::read_dir(t.0.join("cache")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-        assert_eq!(left, vec![std::ffi::OsString::from(INDEX_FILE)], "only the index remains");
+        assert_eq!(left, vec![std::ffi::OsString::from(index_file(&t.cfg().dirs))], "only the index remains");
     }
 
     /// A changed mtime makes the index stale: re-discovered, the same records, then a hit again.
@@ -599,6 +599,161 @@ mod tests {
         let (_, map) = parse(&(body + &other), &dirs).expect("an unmatched stamp or face is ignored");
         assert_eq!(map[&file].covs, vec![None]);
     }
+
+    /// AETHERFONTDBCACHEKEYED (SR767): the FNV-1a 64 vectors and two fixed index names, so the name is stable across
+    /// builds.
+    #[test]
+    fn fontdb_cache_fnv_kat() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(index_file(&[PathBuf::from("/usr/share/fonts")]), "fontdb-index.v2-afbe62a5d6c7305c");
+        assert_eq!(
+            index_file(&[PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")]),
+            "fontdb-index.v2-63b0aea28512e7b7"
+        );
+    }
+
+    /// The name is the prefix and 16 lowercase hex digits of the `dirs` header line: one list one name, another order
+    /// or another set another name (the order is the one `parse` compares).
+    #[test]
+    fn fontdb_cache_index_file_keyed() {
+        let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+        let ab = index_file(&[a.clone(), b.clone()]);
+        let hex = ab.strip_prefix("fontdb-index.v2-").expect("the prefix");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "{hex}");
+        assert_eq!(ab, index_file(&[a.clone(), b.clone()]), "one list, one name");
+        assert_ne!(ab, index_file(&[b.clone(), a.clone()]), "another order is another index");
+        assert_ne!(ab, index_file(&[a.clone()]), "another set is another index");
+    }
+
+    /// Two roots with different directory lists share one cache dir without sharing a file: each misses once, then
+    /// each hits; the dir holds exactly the two keyed files and no unkeyed one.
+    #[test]
+    fn fontdb_cache_keyed_two_roots_hit_kat() {
+        let t = Tmp::new("keyed");
+        t.copy_in(INTER);
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts").join(NOTO);
+        fs::create_dir_all(t.0.join("fonts2")).unwrap();
+        fs::copy(&src, t.0.join("fonts2").join(src.file_name().unwrap())).expect("fixture font");
+        let root_b = || Config { dirs: vec![t.0.join("fonts"), t.0.join("fonts2")], ..t.cfg() };
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss", "root A, first start");
+        assert_eq!(FontDb::discover(root_b()).discover_cache(), "miss", "root B, first start");
+        let a = FontDb::discover(t.cfg());
+        assert_eq!(a.discover_cache(), "hit", "root A is not thrashed by B");
+        assert_eq!(a.discover_bytes(), 0);
+        let b = FontDb::discover(root_b());
+        assert_eq!(b.discover_cache(), "hit", "root B is not thrashed by A");
+        assert!(b.faces.len() > a.faces.len());
+        let mut left: Vec<String> = fs::read_dir(t.0.join("cache"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![index_file(&t.cfg().dirs), index_file(&root_b().dirs)];
+        want.sort();
+        assert_eq!(left, want, "exactly the two keyed files");
+        assert!(!t.0.join("cache").join(INDEX_FILE).exists(), "no unkeyed index");
+    }
+
+    /// AETHERFONTDBCACHESWEEP (SR770): sets `p`'s mtime `secs` seconds into the past (the stale KAT's `set_modified` road).
+    fn age(p: &Path, secs: u64) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::File::options().write(true).open(p).unwrap().set_modified(then).unwrap();
+    }
+
+    /// The cache dir's file names, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// A store sweeps the unkeyed index and a foreign keyed index past `SWEEP_AGE` and a writer's tmp past an hour;
+    /// the file just written, a younger foreign index and a file outside the prefix stay; the count is 3.
+    #[test]
+    fn fontdb_cache_sweep_kat() {
+        let t = Tmp::new("sweep");
+        t.copy_in(INTER);
+        let cache = t.0.join("cache");
+        let seed = [
+            (INDEX_FILE.to_string(), 31 * DAY),
+            (format!("{INDEX_FILE}-0123456789abcdef"), 31 * DAY),
+            (format!("{INDEX_FILE}-fedcba9876543210"), DAY),
+            (format!("{INDEX_FILE}-0123456789abcdef.4242.tmp"), 2 * 60 * 60),
+            ("other.txt".to_string(), 31 * DAY),
+        ];
+        for (n, secs) in &seed {
+            fs::write(cache.join(n), b"x").unwrap();
+            age(&cache.join(n), *secs);
+        }
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        let faces = FontDb::discover(t.off()).faces;
+        let swept = store(&t.cfg(), &files, &faces, State::Miss);
+        assert_eq!(swept, 3);
+        let mut want = vec![index_file(&t.cfg().dirs), format!("{INDEX_FILE}-fedcba9876543210"), "other.txt".to_string()];
+        want.sort();
+        assert_eq!(names(&cache), want);
+        assert_eq!(cache_word(State::Miss, swept), "miss swept=3");
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "hit", "the fresh index answers");
+    }
+
+    /// A store with nothing old to sweep leaves the dir as it was and the log word as today's.
+    #[test]
+    fn fontdb_cache_sweep_nothing_kat() {
+        let t = Tmp::new("sweepnone");
+        t.copy_in(INTER);
+        let cache = t.0.join("cache");
+        fs::write(cache.join(format!("{INDEX_FILE}-fedcba9876543210")), b"x").unwrap();
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let before = names(&cache);
+        assert_eq!(before.len(), 2);
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        let faces = FontDb::discover(t.off()).faces;
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale), 0);
+        assert_eq!(names(&cache), before);
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit), 0, "a hit never writes or sweeps");
+        assert_eq!(cache_word(State::Miss, 0), "miss");
+        assert_eq!(cache_word(State::Hit, 0), "hit");
+    }
+
+    /// The sweep's name grammar: the index names and their tmps only, never the file kept.
+    #[test]
+    fn fontdb_cache_sweep_names_kat() {
+        let keep = "fontdb-index.v2-0000000000000001";
+        assert_eq!(sweep_age(keep, keep), None, "the file just written");
+        assert_eq!(sweep_age("fontdb-index.v2", keep), Some(SWEEP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef", keep), Some(SWEEP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef.77.tmp", keep), Some(SWEEP_TMP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2.77.tmp", keep), Some(SWEEP_TMP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0000000000000001.77.tmp", keep), Some(SWEEP_TMP_AGE), "the kept name's tmp");
+        assert_eq!(sweep_age("fontdb-index.v20", keep), None);
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789ABCDEF", keep), None, "upper hex");
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcde", keep), None, "15 hex");
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef0", keep), None, "17 hex");
+        assert_eq!(sweep_age("fontdb-index.v2.tmp", keep), None, "no pid");
+        assert_eq!(sweep_age("fontdb-index.v2.x7.tmp", keep), None, "not a pid");
+        assert_eq!(sweep_age("other.txt", keep), None);
+        assert_eq!(SWEEP_AGE, std::time::Duration::from_secs(30 * DAY));
+    }
+
+    /// `append` (SR697) opens without `create`: a C line for a swept index errs and the file stays absent.
+    #[test]
+    fn fontdb_cache_append_no_resurrect_kat() {
+        let t = Tmp::new("sweepappend");
+        let cache = t.0.join("cache");
+        let name = format!("{INDEX_FILE}-0123456789abcdef");
+        fs::write(cache.join(&name), b"x").unwrap();
+        age(&cache.join(&name), 31 * DAY);
+        assert_eq!(sweep(&cache, "fontdb-index.v2-0000000000000001"), 1);
+        assert!(append(&cache, &name, "C\tx\n").is_err());
+        assert!(!cache.join(&name).exists(), "append never recreates a swept index");
+    }
 }
 
 // ---- AETHERFONTDBCACHECMAP (LEDGER SR697): the persisted cmap coverage (named tail block) ----
@@ -695,15 +850,15 @@ pub(crate) fn read_coverage(config: &Config, state: State, f: &FaceInfo) -> Opti
     if let (false, Some(dir), Some((size, mtime)), Some(p)) =
         (state == State::Off, config.cache_dir.as_deref(), before, f.path.to_str())
     {
-        let _ = append(dir, &c_line(p, f.index, size, mtime, &cov));
+        let _ = append(dir, &index_file(&config.dirs), &c_line(p, f.index, size, mtime, &cov));
     }
     Some((cov, n))
 }
 
 /// Appends `line` to an existing index in one write; never creates the file.
-fn append(dir: &Path, line: &str) -> std::io::Result<()> {
+fn append(dir: &Path, name: &str, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::OpenOptions::new().append(true).open(dir.join(INDEX_FILE))?.write_all(line.as_bytes())
+    std::fs::OpenOptions::new().append(true).open(dir.join(name))?.write_all(line.as_bytes())
 }
 
 /// The per-face coverage cells of a discovery: pre-filled from `seeds` (aligned to the faces), else empty.
@@ -714,4 +869,82 @@ pub(crate) fn seed(n: usize, mut seeds: Vec<Option<Coverage>>) -> Vec<std::sync:
             None => std::sync::OnceLock::new(),
         })
         .collect()
+}
+
+// ---- AETHERFONTDBCACHEKEYED (LEDGER SR767): the index file keyed by its directory list (named tail block) ----
+// SR738 / SR746 share one cache dir between roots whose directory lists differ (Aether's system dirs, quartzite's, a
+// test's fixture dir); with one file per dir, `parse`'s `dirs` guard rejected the other root's index and each rewrote
+// it (miss, miss, ...). Each distinct list now owns `<INDEX_FILE>-<16 hex>`: the FNV-1a 64 of EXACTLY the `dirs`
+// header line `render` writes (Config order, escaped), so two lists share a file iff `parse` would accept one's index
+// for the other; the guard stays (belt, and a collision guard). The old unkeyed file is never read or removed.
+
+/// The index file's name for `dirs`: [`INDEX_FILE`], `-`, and the FNV-1a 64 of the `dirs` header line in hex.
+pub fn index_file(dirs: &[PathBuf]) -> String {
+    let mut key = String::from("dirs");
+    for d in dirs {
+        key.push('\t');
+        key.push_str(&escape(&d.to_string_lossy()));
+    }
+    format!("{INDEX_FILE}-{:016x}", fnv1a64(key.as_bytes()))
+}
+
+/// FNV-1a 64 (stable across builds and Rust versions, unlike `DefaultHasher`).
+fn fnv1a64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+// ---- AETHERFONTDBCACHESWEEP (LEDGER SR770): stale index files swept at store time (named tail block) ----
+// SR767 keys the index by its directory list, so a shared cache dir accumulates the old unkeyed `fontdb-index.v2`
+// and one file per list ever discovered (a test fixture dir, a removed user dir), each with its C lines; nothing read
+// or removed them. `store` (the one writer) now sweeps the dir after its rename: an index name other than the one just
+// written older than `SWEEP_AGE`, and a crashed `write_atomic` tmp older than an hour, are removed; errors are
+// ignored (a sweep never fails a store); nothing outside the `INDEX_FILE` names is touched. A hit never sweeps.
+
+/// The age past which an index file the store did not just write is removed (one const; a Config knob is owed).
+pub const SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// The age past which a `write_atomic` tmp (a crashed writer's) is removed.
+const SWEEP_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The age past which `name` is swept; None when the sweep never touches it (`keep`, or not an index name or tmp).
+fn sweep_age(name: &str, keep: &str) -> Option<std::time::Duration> {
+    if name == keep {
+        return None;
+    }
+    let rest = name.strip_prefix(INDEX_FILE)?;
+    let rest = match rest.strip_prefix('-') {
+        Some(r) if r.len() >= 16 && r.as_bytes()[..16].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) => &r[16..],
+        Some(_) => return None,
+        None => rest,
+    };
+    if rest.is_empty() {
+        return Some(SWEEP_AGE);
+    }
+    let pid = rest.strip_prefix('.')?.strip_suffix(".tmp")?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(SWEEP_TMP_AGE)
+}
+
+/// Removes the stale index files and tmps of `dir` (see the block comment), never `keep`; returns how many it removed.
+fn sweep(dir: &Path, keep: &str) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut n = 0;
+    for e in rd.flatten() {
+        let Some(age) = e.file_name().to_str().and_then(|name| sweep_age(name, keep)) else { continue };
+        let old = e
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|d| d > age);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The `cache=` word of the `[fonts] discover` line: the state, and ` swept=<n>` only when a store removed files.
+pub(crate) fn cache_word(state: State, swept: usize) -> String {
+    if swept > 0 { format!("{} swept={swept}", state.as_str()) } else { state.as_str().to_string() }
 }
