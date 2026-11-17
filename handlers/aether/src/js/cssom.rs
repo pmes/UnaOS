@@ -951,6 +951,9 @@ struct Flushed {
     /// root and the root's parent document origin — the root's hold for the current scroll is applied at read time
     /// ([`client_rect`] through `render::placed_origin`), like `pinned`.
     held: HashMap<NodeId, (taffy::NodeId, (f32, f32))>,
+    /// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): every element inside a scroll container, with its scroll-container ancestor
+    /// elements (outermost first) — their CURRENT offsets are subtracted at read time ([`client_rect`]), like `pinned`.
+    scrolled: HashMap<NodeId, Vec<NodeId>>,
 }
 
 thread_local! {
@@ -975,8 +978,8 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
             let mut tree = crate::layout::build_tree(&doc, w, h);
             crate::css::apply_stylesheets(&mut tree, &sheets);
             let report = crate::css::computed_report(&tree);
-            let (boxes, pinned, held) = element_boxes(&tree);
-            Flushed { version, tree, report, boxes, pinned, held }
+            let (boxes, pinned, held, scrolled) = element_boxes(&tree);
+            Flushed { version, tree, report, boxes, pinned, held, scrolled }
         }
     };
     let r = f(&flushed);
@@ -989,11 +992,11 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
 /// fixed box takes its origin from `LayoutTree::fixed_at` (the one viewport-origin map the painter reads) on each
 /// pinned axis, and its subtree inherits the pin.
 #[allow(clippy::type_complexity)]
-fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>, HashMap<NodeId, (taffy::NodeId, (f32, f32))>) {
+fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>, HashMap<NodeId, (taffy::NodeId, (f32, f32))>, HashMap<NodeId, Vec<NodeId>>) {
     use crate::layout::inline::Frag;
     let mut out: HashMap<NodeId, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut pinned: HashMap<NodeId, (bool, bool)> = HashMap::new();
-    let (mut held, mut hold_of) = (HashMap::new(), HashMap::new()); // AETHERCSSOMBOUNDINGSTICKY (SR1144)
+    let (mut held, mut hold_of) = (HashMap::new(), HashMap::new()); let (mut scrolled, mut chain_of) = (HashMap::new(), HashMap::new()); // AETHERCSSOMBOUNDINGSTICKY (SR1144)
     let mut work: Vec<(taffy::NodeId, f32, f32, (bool, bool))> = vec![(tree.root_node, 0.0, 0.0, (false, false))];
     let elem_of = |t: taffy::NodeId| tree.node_map.get(&t).filter(|n| n.is_element()).map(|n| n.id());
     // The root's own location.
@@ -1002,7 +1005,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
     }
     while let Some((t, mut x, mut y, mut pin)) = work.pop() {
         let Ok(l) = tree.taffy.layout(t) else { continue };
-        let hold = sticky_hold(tree, t, x, y, l, pin, tree.fixed_at.contains_key(&t), &mut hold_of); // AETHERCSSOMBOUNDINGSTICKY (SR1144): before the fixed origin replaces (x, y)
+        let hold = sticky_hold(tree, t, x, y, l, pin, tree.fixed_at.contains_key(&t), &mut hold_of); let chain = scroller_chain(tree, t, tree.fixed_at.contains_key(&t), &mut chain_of); // AETHERCSSOMBOUNDINGSTICKY (SR1144): before the fixed origin replaces (x, y)
         if let Some(&(fx, fy)) = tree.fixed_at.get(&t) {
             if let Some(fx) = fx {
                 x = fx;
@@ -1015,7 +1018,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
         }
         if let Some(id) = elem_of(t) {
             out.entry(id).or_default().push((x, y, l.size.width, l.size.height));
-            if let Some(hd) = hold { held.insert(id, hd); }
+            if let Some(hd) = hold { held.insert(id, hd); } if !chain.is_empty() { scrolled.insert(id, chain.clone()); }
             if pin != (false, false) {
                 pinned.insert(id, pin);
             }
@@ -1028,7 +1031,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
                     Frag::Box { node, x: fx, y: fy, w, h, .. } => {
                         if let Some(id) = elem_of(*node) {
                             out.entry(id).or_default().push((cx + fx, cy + fy, *w, *h));
-                            if let Some(hd) = hold { held.insert(id, hd); }
+                            if let Some(hd) = hold { held.insert(id, hd); } if let Some(c) = chain_of.get(&t) { scrolled.insert(id, c.clone()); }
                             if pin != (false, false) {
                                 pinned.insert(id, pin);
                             }
@@ -1054,7 +1057,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
             }
         }
     }
-    (out, pinned, held)
+    (out, pinned, held, scrolled)
 }
 
 /// AETHERFIT2 (SR191): a document-space rect of element `id` in viewport coordinates — the scroll is subtracted
@@ -1063,7 +1066,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
 fn client_rect(f: &Flushed, id: NodeId, r: (f32, f32, f32, f32), scroll: (f64, f64)) -> (f64, f64, f64, f64) {
     let (px, py) = f.pinned.get(&id).copied().unwrap_or((false, false));
     let (x, y, w, h) = r;
-    let (x, y) = sticky_held_at(f, id, x, y, scroll);
+    let (x, y) = scroller_shifted(f, id, sticky_held_at(f, id, x, y, scroll));
     (x as f64 - if px { 0.0 } else { scroll.0 }, y as f64 - if py { 0.0 } else { scroll.1 }, w as f64, h as f64)
 }
 
@@ -1554,7 +1557,7 @@ fn hit_test(x: f64, y: f64) -> Vec<usize> {
             .iter()
             .enumerate()
             .filter(|(_, id)| {
-                f.boxes.get(&NodeId(**id)).is_some_and(|rs| {
+                inside_scrollers(f, NodeId(**id), x, y, scroll) && f.boxes.get(&NodeId(**id)).is_some_and(|rs| {
                     rs.iter().any(|r| {
                         let (bx, by, bw, bh) = client_rect(f, NodeId(**id), *r, scroll);
                         x >= bx && x < bx + bw && y >= by && y < by + bh
@@ -3209,4 +3212,50 @@ mod shorthand_computed_tests {
         // report column, so the other sides compose at their initial 0px (Chromium reads `8px`).
         assert_eq!(read("document.body", "margin"), "8px 0px 0px", "body: computed margin");
     }
+}
+
+// ---- AETHERCSSOMNESTEDSCROLLERRECTS (LEDGER SR1154): CSSOM rects inside a scrolled panel read where the painter places them (named tail block) ----
+
+/// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): box `t`'s own scroll-container chain (the scroller ELEMENTS whose content shift
+/// moves it, outermost first: its taffy parent's kids chain, as the painter adds `content_shift` to every child of a scroll
+/// container), and records `t`'s kids chain in `chain_of` (its own plus itself when `t` is a scroll container, by
+/// layout_core's `is_scroll_container`, the predicate `content_shift` gates on). A fixed box (`fixed`: in `fixed_at`)
+/// starts empty: the painter places it against the viewport, ignoring the ancestors' shifts (a one-axis inset keeps the
+/// other axis's shift: owed AETHER-CSSOM-NESTED-SCROLLER-FIXED-AXIS). The walk pops a parent before its children.
+fn scroller_chain(tree: &crate::layout::LayoutTree, t: taffy::NodeId, fixed: bool, chain_of: &mut HashMap<taffy::NodeId, Vec<NodeId>>) -> Vec<NodeId> {
+    let own: Vec<NodeId> = if fixed { Vec::new() } else { tree.taffy.parent(t).and_then(|p| chain_of.get(&p).cloned()).unwrap_or_default() };
+    let mut kids = own.clone();
+    if layout_core::scroll::is_scroll_container(tree, t) {
+        if let Some(n) = tree.node_map.get(&t).filter(|n| n.is_element()) {
+            kids.push(n.id());
+        }
+    }
+    if !kids.is_empty() {
+        chain_of.insert(t, kids);
+    }
+    own
+}
+
+/// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): element `id`'s document-space origin (`x`, `y`) minus the CURRENT offset of every
+/// scroll container in its chain — read live from the page's scroll record (`layout::element_scroll_offset`, the
+/// scrollTop getter's road, refreshed by `remember_scroll` after a wheel, a thumb drag or a script scroll's frame), since
+/// this cache is keyed by DOM version and a panel scroll does not bump it. Unchanged outside every scroll container.
+fn scroller_shifted(f: &Flushed, id: NodeId, (x, y): (f32, f32)) -> (f32, f32) {
+    let Some(chain) = f.scrolled.get(&id) else { return (x, y) };
+    chain.iter().map(|s| crate::layout::element_scroll_offset(*s)).fold((x, y), |(x, y), (ox, oy)| (x - ox, y - oy))
+}
+
+/// AETHERCSSOMNESTEDSCROLLERRECTS (SR1154): AETHER-CSSOM-HIT-SCROLLER-CLIP for the chain case — the viewport point (`x`, `y`)
+/// lies inside the padding box of every scroll container in element `id`'s chain (each scroller's first rect through the
+/// same [`client_rect`], minus its borders), so a row scrolled out of its panel is not hit where its shifted rect lands
+/// outside the panel. True for an element in no scroll container (overflow-visible content is untouched).
+fn inside_scrollers(f: &Flushed, id: NodeId, x: f64, y: f64, scroll: (f64, f64)) -> bool {
+    f.scrolled.get(&id).is_none_or(|chain| {
+        chain.iter().all(|&s| {
+            let Some(r) = f.boxes.get(&s).and_then(|v| v.first().copied()) else { return true };
+            let (bx, by, bw, bh) = client_rect(f, s, r, scroll);
+            let b = f.tree.node_map.iter().find(|(_, n)| n.id() == s).and_then(|(t, _)| f.tree.taffy.layout(*t).ok()).map(|l| (l.border.left, l.border.top, l.border.right, l.border.bottom)).unwrap_or_default();
+            x >= bx + b.0 as f64 && x < bx + bw - b.2 as f64 && y >= by + b.1 as f64 && y < by + bh - b.3 as f64
+        })
+    })
 }
