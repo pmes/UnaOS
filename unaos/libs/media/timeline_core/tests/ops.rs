@@ -445,3 +445,69 @@ fn strialinkauto_unlink_all_keeps_selection() {
     st.select(0, 1).unwrap();
     assert_eq!(st.set, vec![(0, 1)], "unlinked: the clip alone");
 }
+
+// ---- STRIALINKAUTOFUZZ (LEDGER SR928): link_av's near pass and the `link-av` word (named tail block) ----
+
+/// V1 / A1 of one source `S` (100 ticks) holding the given clips (src_in, src_out, at).
+fn strialinkautofuzz_tl(v: &[(i64, i64, i64)], a: &[(i64, i64, i64)]) -> Timeline {
+    let mut tl = Timeline::new(25);
+    let s = tl.add_source("S", 100);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = v.iter().map(|&(i, o, at)| Clip::new(s, i, o, at)).collect();
+    tl.tracks[1].clips = a.iter().map(|&(i, o, at)| Clip::new(s, i, o, at)).collect();
+    tl.validate().unwrap();
+    tl
+}
+
+fn strialinkautofuzz_groups(t: &Timeline) -> Vec<Vec<u32>> {
+    t.tracks.iter().map(|tr| tr.clips.iter().map(|c| c.group).collect()).collect()
+}
+
+#[test]
+fn strialinkautofuzz_near_pairs_link() {
+    let (_, a, b) = base();
+    // A1's second clip one tick later and one tick shorter than V1's: a rounding twin, linked with its own id.
+    let mut tl = striacliplink_base();
+    tl.tracks[1].clips[1] = Clip::new(b, 20, 29, 11);
+    tl.validate().unwrap();
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 2], vec![1, 2]], "exact pair 1, near pair 2");
+    assert_eq!(tl.link_av().mates(0, 1), vec![(0, 1), (1, 1)]);
+    // Two ticks shorter: not a twin.
+    tl.tracks[1].clips[1] = Clip::new(b, 20, 28, 11);
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 0], vec![1, 0]]);
+    // Another source within one tick: not a twin either.
+    tl.tracks[1].clips[1] = Clip::new(a, 20, 29, 11);
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 0], vec![1, 0]]);
+}
+
+#[test]
+fn strialinkautofuzz_ambiguous_left_unlinked() {
+    // A length-2 video clip over two length-1 audio clips at its tick and the next: both near, neither exact.
+    let tl = strialinkautofuzz_tl(&[(0, 2, 0)], &[(0, 1, 0), (1, 2, 1)]);
+    assert_eq!(tl.link_av(), tl, "two audio candidates: nothing linked");
+    // Two video clips near one audio clip.
+    let tl = strialinkautofuzz_tl(&[(0, 1, 0), (1, 2, 1)], &[(0, 2, 0)]);
+    assert_eq!(tl.link_av(), tl, "two video candidates: nothing linked");
+}
+
+#[test]
+fn strialinkautofuzz_exact_wins_over_near() {
+    let tl = strialinkautofuzz_tl(&[(0, 1, 0)], &[(0, 1, 0), (1, 2, 1)]);
+    assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1], vec![1, 0]], "the exact pair links; the near one stays free");
+}
+
+#[test]
+fn strialinkautofuzz_link_av_word() {
+    let tl = striacliplink_base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1)], "unlinked: the clip alone");
+    assert_eq!(st.verb("link-av"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.link_av(), 1), "both pairs linked, one commit");
+    assert_eq!(st.set, vec![(0, 1), (1, 1)], "the selected clip brings its new mate");
+    assert_eq!(st.verb("link-av"), Some(Ok(())), "nothing new to link");
+    assert_eq!(st.undo_depth(), 1, "nothing new linked: no commit");
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl, "one undo step parts both pairs");
+}

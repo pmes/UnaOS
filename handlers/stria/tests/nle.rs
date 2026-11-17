@@ -3702,9 +3702,33 @@ fn strialinkauto_face_unlink_all_word() {
     let (tl, src) = synth_fixture();
     let tl0 = tl.clone();
     let mut face = nlefaceexport_face(tl.link_av(), src);
-    assert_eq!(&VERBS[VERBS.len() - 2..], ["unlink-all", "help"], "unlink-all just before help");
+    assert_eq!(&VERBS[VERBS.len() - 3..], ["unlink-all", "link-av", "help"], "unlink-all, then link-av, just before help"); // STRIALINKAUTOFUZZ (SR928): `link-av` before help
     assert!(face.verb("unlink-all"));
     assert_eq!(face.last_error.take(), None);
     assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl0, 1), "every pair parted, one step");
     println!("strialinkauto: VERBS[{}] unlink-all", VERBS.len() - 2);
+}
+
+// ---- STRIALINKAUTOFUZZ (LEDGER SR928): the `link-av` word on the face and on a document opened from an EDL (named tail block) ----
+#[test]
+fn strialinkautofuzz_face_link_av_word() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert_eq!(&VERBS[VERBS.len() - 2..], ["link-av", "help"], "link-av just before help");
+    assert!(face.verb("link-av"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl.link_av(), 1), "every pair linked, one step");
+    println!("strialinkautofuzz: VERBS[{}] link-av", VERBS.len() - 2);
+}
+
+#[test]
+fn strialinkautofuzz_edl_document_links_by_word() {
+    let (tl, _) = synth_fixture();
+    let text = edl::write(&tl, "FUZZ").unwrap();
+    let back = edl::parse(&text, 25).unwrap();
+    assert!(back.tracks.iter().all(|tr| tr.clips.iter().all(|c| c.group == 0)), "an EDL opens with no auto-link");
+    let mut st = EditorState::new(back.clone());
+    assert_eq!(st.verb("link-av"), Some(Ok(())));
+    assert_ne!(st.timeline, back, "the word linked the V1 / A1 pairs");
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (back.link_av(), 1), "one commit");
 }
