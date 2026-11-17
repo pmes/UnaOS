@@ -771,3 +771,17 @@ fn striagotomore_tc_delta_signs() {
     assert_eq!(edl::tc_delta("--5", &pal), Err(String::from("-5 is not HH:MM:SS:FF or a frame count")));
     assert!(edl::tc_delta("-00:01:00;00", &df).unwrap_err().starts_with("00:01:00;00 is a dropped drop-frame number"));
 }
+
+// ---- STRIAHANDLEFIT (LEDGER SR9117): the lifted reel fit (named tail block) ----
+#[test]
+fn striahandlefit_reel_fit_is_the_policy_and_adopt_mixes_letterbox() {
+    use timeline_core::{SizePolicy, SourceId};
+    assert_eq!(cut().reel_fit(SourceId(9), true), SizePolicy::Letterbox, "absent source");
+    assert_eq!(cut().reel_fit(SourceId(1), false), SizePolicy::Letterbox, "the default");
+    for p in SizePolicy::ALL {
+        let tl = cut().set_size_policy(SourceId(1), p).unwrap();
+        assert_eq!(tl.reel_fit(SourceId(1), true), p, "alone: the reel's own policy");
+        let mixed = if p == SizePolicy::Adopt { SizePolicy::Letterbox } else { p };
+        assert_eq!(tl.reel_fit(SourceId(1), false), mixed, "in a mix: Adopt places as Letterbox");
+    }
+}

@@ -5406,3 +5406,19 @@ mod striareverseedit_tests {
         std::println!("striareverseedit: ] } mark-in mark-out drag drag rtrim on R[10,20)@0 -> {:?}", st.selected());
     }
 }
+
+// ---- STRIAHANDLEFIT (LEDGER SR9117): a step's reel fit, lifted from stria nle.rs (named tail block) ----
+// The size policy a video step places its frame by: both faces call it (stria nle.rs `reel_fit`, the kernel Player's
+// mix fit in vplay.rs `edl_mix`), so the Adopt-in-a-mix rule lives once. Sibling SR9010 lifts the same fn under the
+// same name and body: the fold keeps one.
+
+impl Timeline {
+    /// Source `src`'s size policy as a step places its frame (absent: Letterbox). `alone` is false inside a transition:
+    /// the mix is one size, so Adopt mixes as Letterbox there.
+    pub fn reel_fit(&self, src: SourceId, alone: bool) -> SizePolicy {
+        match self.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
+            SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
+            p => p,
+        }
+    }
+}
