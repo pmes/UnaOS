@@ -99,6 +99,8 @@ pub struct Clip {
     pub fade_in: i64,
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
+    /// STRIAOPACITY (SR868): the video clip's opacity, percent 0..=[`OPAQUE`] (opaque, the default); below it the track underneath shows through.
+    pub opacity: u8,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -107,7 +109,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, opacity: OPAQUE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -376,6 +378,8 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    /// STRIAOPACITY (SR868): an opacity above [`OPAQUE`] percent, or a non-opaque clip on an audio track.
+    Opacity,
 }
 
 impl core::fmt::Display for EditError {
@@ -396,6 +400,7 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::Opacity => "opacity is a percent 0..=100, and video only",
         })
     }
 }
@@ -456,7 +461,7 @@ impl Timeline {
             let mut prev: Option<&Clip> = None;
             for c in &t.clips {
                 let s = self.source(c.src).ok_or(EditError::NoSource)?;
-                if c.at < 0 || c.src_in < 0 {
+                opacity_ok(t.kind, c)?; if c.at < 0 || c.src_in < 0 {
                     return Err(EditError::Negative);
                 }
                 if c.src_in >= c.src_out {
@@ -1525,6 +1530,42 @@ impl Timeline {
         }
         let mut tl = self.clone();
         tl.marks = m;
+        Ok(tl)
+    }
+}
+
+// ---- STRIAOPACITY (LEDGER SR868): per-clip opacity, the model and its one op (named tail block) ----
+// A video clip's `opacity` (percent) below [`OPAQUE`] lets the highest video track under it show through: the schedule
+// gives that step a Dissolve `VideoMix` of the track below at `opacity / 100` (`schedule::opacity_mix`), the one mix both
+// renderers already run. `* UNA ALPHA <pct>` in the EDL; the editor's `opacity <pct>` word.
+
+/// STRIAOPACITY: full opacity (percent), every clip's default.
+pub const OPAQUE: u8 = 100;
+
+/// STRIAOPACITY: `validate`'s rule: an opacity is at most [`OPAQUE`], and only a video clip is ever below it.
+fn opacity_ok(kind: Kind, c: &Clip) -> Result<(), EditError> {
+    if c.opacity > OPAQUE || (c.opacity != OPAQUE && kind == Kind::Audio) {
+        return Err(EditError::Opacity);
+    }
+    Ok(())
+}
+
+impl Clip {
+    /// STRIAOPACITY: the same clip at opacity `pct` (percent).
+    pub fn with_opacity(self, pct: u8) -> Clip {
+        Clip { opacity: pct, ..self }
+    }
+}
+
+impl Timeline {
+    /// STRIAOPACITY: every clip in `picks` (`(track, index)`) set to opacity `pct` (percent) as ONE edit; refused by name
+    /// (`EditError::Opacity`) above [`OPAQUE`] or on an audio clip.
+    pub fn set_opacity(&self, picks: &[(usize, usize)], pct: u8) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for &(track, idx) in picks {
+            clip_mut(&mut tl, track, idx)?.opacity = pct;
+        }
+        tl.validate()?;
         Ok(tl)
     }
 }

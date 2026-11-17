@@ -216,7 +216,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            if l.starts_with("* UNA XFADE") {
+            alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -444,7 +444,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if c.fade_in != 0 || c.fade_out != 0 {
             s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
         }
-        s.push_str(xfade_line(tl, *ti, c.at)); // NLEXFADEPOWER (SR678)
+        s.push_str(xfade_line(tl, *ti, c.at)); s.push_str(&alpha_line(c)); // NLEXFADEPOWER (SR678); STRIAOPACITY (SR868): `* UNA ALPHA` (file tail)
     }
     Ok(s)
 }
@@ -624,4 +624,23 @@ fn mark_line(tl: &Timeline) -> String {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
+}
+
+// ---- STRIAOPACITY (LEDGER SR868): the `* UNA ALPHA` line (named tail block) ----
+// `* UNA ALPHA <pct>` is the event line just above's opacity ([`crate::Clip::opacity`], percent 0..=100), written after
+// its GAIN / FADE / XFADE lines and only when not opaque (an opaque timeline writes what it always wrote). One with no
+// event above it (or under a `BL` event), or a word that is not 0..=100, is a syntax error; on an audio event `validate`
+// refuses it (`EditError::Opacity`).
+
+/// STRIAOPACITY: a `* UNA ALPHA <pct>` line applied to the event above (`None`: no event); any other line is left alone.
+fn alpha_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA ALPHA ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    c.opacity = r.trim().parse::<u8>().ok().filter(|&p| p <= crate::OPAQUE).ok_or(EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAOPACITY: the event's `* UNA ALPHA` line (empty for an opaque clip).
+fn alpha_line(c: &Clip) -> String {
+    if c.opacity == crate::OPAQUE { String::new() } else { format!("* UNA ALPHA {}\n", c.opacity) }
 }
