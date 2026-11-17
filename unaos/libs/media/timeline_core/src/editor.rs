@@ -696,19 +696,52 @@ impl EditorState {
 
 // ---- STRIAFREEZEFRAME (LEDGER SR880): `freeze` holds the playhead's frame for FREEZE_SECS as ONE commit (named tail block) ----
 impl EditorState {
-    /// Hold the frame the preview shows at the playhead for `FREEZE_SECS * fps` ticks through `Timeline::freeze` (a rated
-    /// one-tick clip laid by `place` Insert): ONE commit, so undo restores the whole pre-op timeline; the hold is selected.
-    /// Refused by name: a time base that is not `1/fps` `EditError::Rate`; the op's own refusals leave the state.
-    pub fn freeze(&mut self) -> Result<(), EditError> {
-        let fps = self.timeline.fps().ok_or(EditError::Rate)?;
+    /// Hold the frame the preview shows at the playhead for `ticks` ticks through `Timeline::freeze` (a rated one-tick clip
+    /// laid by `place` Insert; STRIAFREEZELEN (SR916): `all` lays it through `Timeline::freeze_all`, every other track
+    /// rippled by the same length): ONE commit, so undo restores the whole pre-op timeline; the hold is selected. The op's
+    /// refusals (`Empty`, `NoClip`, `Rate`, `Hold`, `Transition`, ...) leave the state.
+    pub fn freeze(&mut self, ticks: i64, all: bool) -> Result<(), EditError> {
         let ph = self.playhead;
-        let (tl, track) = self.timeline.freeze(ph, crate::FREEZE_SECS * fps as i64)?;
+        let (tl, track) = if all { self.timeline.freeze_all(ph, ticks)? } else { self.timeline.freeze(ph, ticks)? };
         self.commit(tl);
         let _ = self.select_at(track, ph);
         Ok(())
     }
-    /// STRIAFREEZEFRAME: the `freeze` word (`None` for any other word).
+    /// STRIAFREEZEFRAME: the `freeze` word (`None` for any other word); STRIAFREEZELEN (SR916): and `freeze-all`, each with an
+    /// optional length ([`freeze_words`]).
     fn freeze_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        (v == "freeze").then(|| self.freeze())
+        freeze_words(v, self.timeline.fps()).map(|w| w.and_then(|(n, all)| self.freeze(n, all)))
     }
+}
+
+// ---- STRIAFREEZELEN (LEDGER SR916): the `freeze` / `freeze-all` words and their length (named tail block) ----
+/// STRIAFREEZELEN: a `freeze [<len>]` or `freeze-all [<len>]` word read at `fps` (the timeline's `Timeline::fps`) as `(ticks,
+/// all)`; `None`: not this word. No length is `FREEZE_SECS`; `<len>` is read by [`hold_ticks`]. Refused by name: a time base
+/// that is not `1/fps` `Rate`; more words, or a length neither reader reads, `Hold`. A 0-tick length is left to the op (`Empty`).
+pub fn freeze_words(v: &str, fps: Option<u32>) -> Option<Result<(i64, bool), EditError>> {
+    let mut w = v.split_ascii_whitespace();
+    let all = match w.next()? {
+        "freeze" => false,
+        "freeze-all" => true,
+        _ => return None,
+    };
+    let Some(fps) = fps else { return Some(Err(EditError::Rate)) };
+    let len = w.next();
+    if w.next().is_some() {
+        return Some(Err(EditError::Hold));
+    }
+    Some(match len {
+        None => Ok((crate::FREEZE_SECS * fps as i64, all)),
+        Some(s) => hold_ticks(s, fps).map(|n| (n, all)).ok_or(EditError::Hold),
+    })
+}
+
+/// STRIAFREEZELEN: a hold length in ticks at `fps`: with a `:` the EDL's timecode `HH:MM:SS:FF` (`edl::parse_tc`), else decimal
+/// seconds (THE decimal reader `speed_q16` with `per` = 1) rounded half up to a whole tick. `None`: neither reads it.
+pub fn hold_ticks(s: &str, fps: u32) -> Option<i64> {
+    if s.contains(':') {
+        return edl::parse_tc(s, fps, 0).ok();
+    }
+    let q = crate::speed_q16(s, 1)?;
+    Some(((q as i128 * fps as i128 + 0x8000) >> 16) as i64)
 }
