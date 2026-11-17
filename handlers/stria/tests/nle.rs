@@ -3910,3 +3910,38 @@ fn face_export_pass_word_single_pass_unchanged() {
     assert!(!line.contains("(pass"), "{line}: no pass word on a single pass");
     println!("face_export_pass_word: single pass reads {line}");
 }
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the pass on the witness's export object (named tail block) ----
+
+#[test]
+fn face_export_pass_json_pass_of() {
+    use stria::nle_face::{export_line_passes, pass_of};
+    for ((d, t, n), want) in [((10u64, 70u64, 2u8), (1u64, 2u64)), ((35, 70, 2), (1, 2)), ((36, 70, 2), (2, 2)), ((70, 70, 2), (2, 2)), ((10, 35, 1), (1, 1))] {
+        assert_eq!(pass_of(d, t, n), want, "pass_of({d}, {t}, {n})");
+    }
+    for d in 0..=70u64 {
+        let (k, n) = pass_of(d, 70, 2);
+        let line = export_line_passes(d, 70, 2, None);
+        assert!(line.ends_with(&format!("(pass {k}/{n})")), "{line}: the row's pass word is pass_of's ({k}/{n}) at {d}");
+    }
+    println!("face_export_pass_json: 5 pass_of KAT rows + the row agrees over 0..=70");
+}
+
+#[test]
+fn face_export_pass_json_accessor() {
+    use stria::nle_face::export_plan_of;
+    let (tl, src) = synth_fixture();
+    assert_eq!(nlefaceexport_face(tl, src).export_pass(), None, "no job");
+    for (name, k, plan, want, pass) in [("passjson-two", 50u64, export_plan_of("bitrate 400 two-pass").unwrap(), (50u64, 70u64), Some((2u8, 2u8))), ("passjson-single", 10, stria::nle_face::ExportPlan::default(), (10, 35), None)] {
+        let dir = nlefaceexport_dir(name);
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl, src);
+        face.export_paused_plan(&dir, "h264", k, plan).unwrap();
+        nlefaceexport_until(&face, want);
+        assert_eq!(face.export_pass(), pass, "{name} held at {want:?}");
+        assert!(face.cancel_export() && face.wait_export());
+        assert_eq!(face.export_pass(), None, "{name}: no job after the cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("face_export_pass_json: {name} held at {want:?} -> {pass:?}");
+    }
+}

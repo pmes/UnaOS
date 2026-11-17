@@ -3246,6 +3246,30 @@ pub fn export_line_passes(done: u64, total: u64, passes: u8, eta: Option<String>
     if n <= 1 || total == 0 {
         return export_line(done, total, eta);
     }
-    let f = total / n; let k = (done.saturating_sub(1) / f.max(1) + 1).min(n); let pass = format!("(pass {k}/{n})");
+    let f = total / n; let (k, _) = pass_of(done, total, passes); let pass = format!("(pass {k}/{n})");
     export_line(done - (k - 1) * f, f, Some(eta.map_or(pass.clone(), |e| format!("{pass} {e}"))))
+}
+
+// ---- NLEFACEEXPORTPASSJSON (LEDGER SR1097): the pass on the witness's export object (named tail block) ----
+// SR1095 gave the message row the pass word; the witness JSON (stria-view's `export_json`) still carried the combined reading
+// only. ONE rule for the pass, `pass_of` (lifted from `export_line_passes`, which reads it), and ONE accessor over it,
+// `Face::export_pass`, so the row and the JSON cannot disagree. Owed: NLE-FACE-EXPORT-JSON-SCHEMA (the export object's fields
+// listed once for the bench).
+
+/// The pass `(k, n)` a combined reading `done` of `total` (= n x frames) is in: k = ceil(done / frames), clamped to 1..=n, so
+/// the last pass-1 frame is pass 1 and the reading 0 is pass 1. The rule [`export_line_passes`] and [`Face::export_pass`] share.
+pub fn pass_of(done: u64, total: u64, passes: u8) -> (u64, u64) {
+    let n = u64::from(passes).max(1);
+    let f = total / n;
+    ((done.saturating_sub(1) / f.max(1) + 1).min(n), n)
+}
+
+impl Face {
+    /// The running export's pass `(k, n)` ([`pass_of`] over the job's combined reading), `Some` only while a job with more
+    /// than one pass runs (the witness's `"pass"` / `"passes"` fields).
+    pub fn export_pass(&self) -> Option<(u8, u8)> {
+        let j = self.export.as_ref().filter(|j| j.passes > 1)?;
+        let (k, n) = pass_of(j.done.load(Relaxed), j.total.load(Relaxed), j.passes);
+        Some((k as u8, n as u8))
+    }
 }
