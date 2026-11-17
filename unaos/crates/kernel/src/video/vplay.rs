@@ -453,7 +453,7 @@ pub fn start_at(path: &str, ms: u64) -> u32 {
     let jid = GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     *JOB.lock() = Some(Job { jid, path: String::from(path), facts: None, queue: VecDeque::new(), decoded: 0, err: None, eos: false, sound: None, seek_ms: ms });
     let t = now();
-    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() }; knobs_latch(); // KERNELSCALEONEARM (rmbp-ledger B980): the `vid` queue depth and filter apply from this job start (file tail)
+    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() }; knobs_latch(); shuttle_latch(path); // STRIAKSHUTTLE (SR9061): the shuttle rate this job plays at (file tail). KERNELSCALEONEARM (rmbp-ledger B980): the `vid` queue depth and filter apply from this job start (file tail)
     PAUSED.store(false, Ordering::Release);
     SPAWN_MS.store(t, Ordering::Release);
     DRAIN_MS.store(t, Ordering::Release);
@@ -524,7 +524,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             } else if p.audio_expected && !p.audio_seen && t.saturating_sub(p.open_ms) < AUDIO_WAIT_MS {
                 // the ring is arming: the picture holds its first frame
             } else {
-                p.media_ms += dt;
+                p.media_ms += dt * shuttle_mul(); // STRIAKSHUTTLE (SR9061): an EDL restarted by L runs its wall clock at 2x / 4x (file tail)
             }
         }
         p.media_ms
@@ -1058,7 +1058,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     rep.steps = steps.len();
     serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);
     let audio = steps.iter().filter(|s| s.kind == Kind::Audio).count();
-    if audio > 0 {
+    if audio > 0 && shuttle_sound(jid) { // STRIAKSHUTTLE (SR9061): Nx sound refused by name, the snd has no stretch (file tail)
         super::export::arm_audio(jid); snd::open(&reels, tl, seek_ms); // NLE6EXPORT (rmbp-ledger B959): an Encode job's sound into the export's offline capture (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound, one mixer source per audio track, the crossfade's second (file tail)
     }
     // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
@@ -1842,7 +1842,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 21] = [ // STRIAKSHUTTLE (SR9061): + j / k / l, the host KEYS words
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1861,9 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'j', "shuttle-"),
+    (b'k', "stop"),
+    (b'l', "shuttle+"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1874,7 +1877,7 @@ fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> ti
         return timeline_core::editor::EditorState::new(e.st.timeline.clone());
     }
     let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
-    *g = Some(Edit { path: String::from(path), st, said: false });
+    *g = Some(Edit { path: String::from(path), st, said: false }); shuttle_close(); // STRIAKSHUTTLE (SR9061): a fresh EDL opens at 1x (file tail)
     fresh
 }
 
@@ -1897,7 +1900,7 @@ fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
 /// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
 /// unchanged, or no EDL open at `path`.
 pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
-    let verb = edit_verb(b)?;
+    let verb = edit_verb(b)?; if verb.starts_with("shuttle") || verb == "stop" { return shuttle_key(path, verb, ms); } // STRIAKSHUTTLE (SR9061): J / K / L are transport, not an edit (file tail)
     let (at, tl, clips, undo, back) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
@@ -1942,7 +1945,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); shuttle_close(); // STRIAKSHUTTLE (SR9061): the Player closed, 1x (file tail). NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2664,4 +2667,94 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKSHUTTLE (LEDGER SR9061): J / K / L on the Player's EDL, through timeline_core's ONE ladder (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SHUTTLE-KERNEL. `j` / `k` / `l` in [`EDIT_KEYS`] name the host KEYS words `shuttle-` / `stop` /
+// `shuttle+`; [`edit_key`] hands them to [`shuttle_key`], which takes the new rate from `timeline_core::editor::shuttle_rate`
+// (the host face's ladder) with the Player's ceiling [`KSHUTTLE_MAX`] and stores it for the EDL's path; `Some(ms)` sends
+// the change through the seek door (player.rs `edit_pass` -> `vid::seek` -> [`start_at`]), whose [`shuttle_latch`] fixes
+// the job's rate: [`present`]'s wall clock runs at that rate ([`shuttle_mul`]; frames the job cannot decode in time are
+// passed over and counted as dropped), and at a rate other than 1 `edl_run` opens no sound ([`shuttle_sound`]: the snd
+// writes its runs at 1x and has no stretch). The job decodes forward only, so `shuttle-` is refused by name. An Encode job
+// is never touched. Until player.rs `edit_pass` asks [`shuttle_play`] (owed NLE-SHUTTLE-KERNEL-PASS, the line
+// `if !playing {` -> `if !crate::video::vplay::shuttle_play(playing) {`) the seek door keeps the Player's play state:
+// `k` sets 1x without pausing and `l` changes the rate only while playing (a paused `l` is `unchanged`).
+// Wire: `[nle] shuttle <word> rate=<n>x at_ms=<ms> play=<0|1>`, `[nle] shuttle <word> unchanged rate=<n>x`,
+// `[nle] shuttle- refused (the Player's job decodes forward only)`, `[nle] audio refused (shuttle <n>x: the Player's
+// sound has no stretch)`.
+
+/// The Player's fastest shuttle (the host goes to 8x; the Player's decode at 8x is unmeasured: NLE-SHUTTLE-K8X).
+const KSHUTTLE_MAX: i64 = 4;
+
+/// The wanted rate and the EDL it belongs to (set by [`shuttle_key`], cleared by [`shuttle_close`]).
+static SHUTTLE: crate::sync::Mutex<Option<(String, i64)>> = crate::sync::Mutex::new(None);
+/// The rate the live job plays at (latched at [`start_at`]; 1 for every other job).
+static SHUTTLE_RUN: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+/// The play state the last shuttle key asks of the Player: 0 keep, 1 play, 2 pause (taken by [`shuttle_play`]).
+static SHUTTLE_PLAY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// A shuttle key (`shuttle+` / `shuttle-` / `stop`) on the Player's EDL at `path`, shown at `ms`: `Some(ms)` restarts the
+/// job there at the new rate (the seek door); `None`: refused, unchanged, or no editor state for `path`.
+fn shuttle_key(path: &str, verb: &str, ms: u64) -> Option<u64> {
+    if !EDIT.lock().as_ref().is_some_and(|e| e.path == path) {
+        return None;
+    }
+    if verb == "shuttle-" {
+        serial_println!("[nle] shuttle- refused (the Player's job decodes forward only)");
+        return None;
+    }
+    let playing = !PAUSED.load(Ordering::Acquire);
+    let rate = SHUTTLE.lock().as_ref().filter(|s| s.0 == path).map_or(1, |s| s.1);
+    let next = timeline_core::editor::shuttle_rate(verb, playing, rate, KSHUTTLE_MAX);
+    let play = verb != "stop";
+    if next == rate || (play && !playing) {
+        serial_println!("[nle] shuttle {} unchanged rate={}x", verb, rate);
+        return None;
+    }
+    *SHUTTLE.lock() = Some((String::from(path), next));
+    SHUTTLE_PLAY.store(if play { 1 } else { 2 }, Ordering::Release);
+    serial_println!("[nle] shuttle {} rate={}x at_ms={} play={}", verb, next, ms, play as u8);
+    Some(ms)
+}
+
+/// A job starts at `path`: its rate is the shuttle's for that EDL, else 1.
+fn shuttle_latch(path: &str) {
+    let r = SHUTTLE.lock().as_ref().filter(|s| s.0 == path).map_or(1, |s| s.1);
+    SHUTTLE_RUN.store(r.max(1), Ordering::Release);
+}
+
+/// The live job's clock multiplier (1 unless an EDL was restarted at 2x / 4x).
+fn shuttle_mul() -> u64 {
+    SHUTTLE_RUN.load(Ordering::Acquire).max(1) as u64
+}
+
+/// The EDL job `jid` opens its sound: always for an Encode job and at 1x; refused by name at any other rate.
+fn shuttle_sound(jid: u32) -> bool {
+    if let super::export::Sink::Encode = super::export::sink(jid) {
+        return true;
+    }
+    let r = SHUTTLE_RUN.load(Ordering::Acquire);
+    if r == 1 {
+        return true;
+    }
+    serial_println!("[nle] audio refused (shuttle {}x: the Player's sound has no stretch)", r);
+    false
+}
+
+/// The Player's play state after an editing key's seek door: what the last shuttle key asked (`l` plays, `k` pauses),
+/// else `playing` unchanged. For player.rs `edit_pass` (owed NLE-SHUTTLE-KERNEL-PASS).
+pub fn shuttle_play(playing: bool) -> bool {
+    match SHUTTLE_PLAY.swap(0, Ordering::AcqRel) {
+        1 => true,
+        2 => false,
+        _ => playing,
+    }
+}
+
+/// The Player closed or a fresh EDL opened: back to 1x.
+fn shuttle_close() {
+    *SHUTTLE.lock() = None;
+    SHUTTLE_RUN.store(1, Ordering::Release);
+    SHUTTLE_PLAY.store(0, Ordering::Release);
 }
