@@ -12505,4 +12505,62 @@ b</div>
             assert_eq!(painted, held + hold - e.scroll_y as f32, "painter and layout_core agree (page {}, held {held}, hold {hold})", e.scroll_y);
         }
     }
+
+    // ---- AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (LEDGER SR1113): getComputedStyle textDecoration from the four report columns, the el.style expand and the textUnderlinePosition accessor (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `#w` a wavy red underline, `#t` the same with a 3px thickness, `#p` a plain
+    /// div, `#b` a plain blue div, `#s` / `#u` plain divs the script writes.
+    fn text_decoration_shorthand_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="w" style="text-decoration: underline wavy red">a</div>
+            <div id="t" style="text-decoration: underline wavy red; text-decoration-thickness: 3px">b</div>
+            <div id="p">c</div>
+            <div id="b" style="color: blue">d</div>
+            <div id="s">e</div>
+            <div id="u">f</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): textDecoration composes `<line> <style> <color> [<thickness>]` from the
+    /// report columns as Chromium reads it (before SR1113: the cascaded `underline wavy red`, and "" for an undecorated div).
+    #[test]
+    fn text_decoration_shorthand_computed() {
+        let mut e = text_decoration_shorthand_engine();
+        for (id, want) in [
+            ("w", "underline wavy rgb(255, 0, 0)"),
+            ("t", "underline wavy rgb(255, 0, 0) 3px"),
+            ("p", "none solid rgb(0, 0, 0)"),
+            ("b", "none solid rgb(0, 0, 255)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecoration"), want, "#{id} textDecoration");
+        }
+        assert_eq!(text_decoration_pv(&mut e, "w", "text-decoration"), "underline wavy rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `textDecoration = 'underline red'` expands into the longhands (before
+    /// SR1113 it was stored whole and textDecorationLine read ""), cssText recomposes the shorthand, and the computed road reads it.
+    #[test]
+    fn text_decoration_shorthand_style_expands() {
+        let mut e = text_decoration_shorthand_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('s').style; s.textDecoration = 'underline red'; [s.textDecorationLine, s.textDecorationColor, s.textDecorationStyle, s.textDecoration, s.cssText].join('|')");
+        assert_eq!(got, "underline|red|solid|underline red|text-decoration: underline red;");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "s", "textDecoration"), "underline solid rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): text-underline-position is a PROPERTIES name, so the camel accessor
+    /// writes the declaration and getComputedStyle reads SR1108's column (before SR1113: undefined).
+    #[test]
+    fn text_decoration_shorthand_underline_position_accessor() {
+        let mut e = text_decoration_shorthand_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('u').style; s.textUnderlinePosition = 'under'; [s.textUnderlinePosition, s.getPropertyValue('text-underline-position')].join('|')");
+        assert_eq!(got, "under|under");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "u", "textUnderlinePosition"), "under");
+    }
 }
