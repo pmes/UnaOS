@@ -155,7 +155,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 60] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail)
+pub const VERBS: [&str; 61] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -244,7 +244,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.meter_reset_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.info_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -4659,5 +4659,75 @@ impl Face {
         let Some(j) = self.export.as_ref() else { return false };
         j.cancel.store(true, Relaxed);
         true
+    }
+}
+
+// ---- STRIAMETERCLIPVERB (LEDGER SR902): the meters-reset word (named tail block) ----
+
+impl MeterHold {
+    /// Drop every peak hold and every clip latch (the `meters-reset` word).
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.clipped.clear();
+    }
+}
+
+impl Face {
+    /// `meters-reset`: clear every clip latch and peak hold (`Some(true)`, a repaint; a view word: no undo step, the
+    /// document not dirtied); `None` for any other word.
+    fn meter_reset_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "meters-reset" {
+            return None;
+        }
+        self.meter_hold.clear();
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striameterclipverb_tests {
+    use super::*;
+
+    fn clipping_face() -> Face {
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// M3: +24 dB latches track 1 and the master and sets holds; `meters-reset` clears both, pushes no undo step,
+    /// does not dirty the document or move the timeline, and the stopped paint is a never-latched face's.
+    #[test]
+    fn striameterclipverb_reset_clears_latches_and_holds() {
+        let mut face = clipping_face();
+        let mut never = clipping_face();
+        face.verb("play");
+        face.tick();
+        face.tick();
+        face.verb("play");
+        assert!(!face.playing);
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        assert!(face.meter_hold_pending());
+        let (undo, dirty, tl, ph) = (face.state.undo_depth(), face.dirty(), face.state.timeline.clone(), face.state.playhead);
+        assert!(face.verb("meters-reset"));
+        assert!(face.meter_clipped().is_empty());
+        assert!(!face.meter_hold_pending());
+        assert_eq!((face.state.undo_depth(), face.dirty(), &face.state.timeline), (undo, dirty, &tl));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        never.state.seek(ph);
+        assert_eq!(face.paint(), never.paint(), "a reset strip paints as one that never latched");
+    }
+
+    /// M3: the word sits immediately before `help` (help last); with no latch it is taken and changes no pixel.
+    #[test]
+    fn striameterclipverb_word_sits_before_help() {
+        assert_eq!(VERBS[VERBS.len() - 2], "meters-reset");
+        assert_eq!(VERBS.last(), Some(&"help"));
+        let (tl, src) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let before = face.paint();
+        assert!(face.verb("meters-reset"));
+        assert_eq!(face.paint(), before);
+        assert_eq!(face.state.undo_depth(), 0);
+        assert!(!face.dirty());
     }
 }
