@@ -56,12 +56,13 @@ struct Cli {
     two: bool,
     split: bool,
     mute: bool,
+    peak_cache: bool, // STRIAWAVEMULTI (SR9071): `--peak-cache` keeps each reel's peak table beside its media (file tail)
 }
 
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--peak-cache]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -69,7 +70,7 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false, peak_cache: false };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -78,6 +79,7 @@ fn cli() -> Cli {
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
             "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
+            "--peak-cache" => c.peak_cache = true, // STRIAWAVEMULTI (SR9071): the peak table cached beside each reel's media (opt-in)
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -114,7 +116,7 @@ fn load(c: &Cli) -> (Timeline, Sources) {
     for s in &tl.sources {
         let Some((_, p)) = c.srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
         let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
-        sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{p}: {e}")));
+        sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{p}: {e}"))); if c.peak_cache { sources.note_path(s.id, std::path::Path::new(p)); } // STRIAWAVEMULTI (SR9071): opt-in peak cache beside the media (nle.rs file tail)
     }
     (tl, sources)
 }
@@ -422,7 +424,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
         assert_eq!(presses, vec![(0, false), (1, true)]);
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false, mute: false, peak_cache: false };
         assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
         assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
     }
@@ -569,7 +571,7 @@ mod split_tests {
         let TetraNode::VStack(top) = split_tree() else { panic!("not a VStack") };
         let TetraNode::VStack(one) = editor_tree() else { panic!("not a VStack") };
         assert_eq!(format!("{:?}", top[1]), format!("{:?}", one[1]), "the one transport row");
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, peak_cache: false };
         let (tl, src) = nle_face::synth_fixture();
         let tl0 = tl.clone();
         let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));

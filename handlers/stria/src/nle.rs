@@ -195,11 +195,12 @@ pub struct Sources {
     /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
     stand_in: std::sync::Mutex<Vec<SourceId>>,
+    peak_paths: Vec<(SourceId, std::path::PathBuf)>, // STRIAWAVEMULTI (SR9071): the media file of each source opened from a path with the peak cache on (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), peak_paths: Vec::new() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -997,7 +998,7 @@ impl Sources {
 /// is silence), so a source is never held whole in memory. `Ok(None)`: the source has no audio stream. The face calls it
 /// once per source (nle_face.rs `Face::wave_fill`), on its own thread (owed NLE-WAVEFORM-SCAN-THREAD).
 pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Option<timeline_core::view::Peaks>, RenderError> {
-    let m = sources.get(id)?;
+    let m = sources.get(id)?; if let Some(p) = sources.peak_file_read(id, per_sec) { return Ok(Some(p)); } // STRIAWAVEMULTI (SR9071): a cache file beside the media whose stamp matches answers without a decode (file tail)
     let Some(i) = m.audio else { return Ok(None) };
     let ch = m.demux.tracks()[i].channels.max(1);
     let mut a = Aud::open(m, id, 0, ch)?;
@@ -1012,5 +1013,112 @@ pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Optio
         }
         p.append(timeline_core::view::peaks_of(rate, ch, &pcm, per_sec)); // STRIAWAVEFORMSTEREO (SR9051): a stereo source keeps its L / R tables (file tail)
     }
-    p.finish(); Ok(Some(p)) // STRIAWAVEFORMSTEREO (SR9051): the max pyramid of the whole table (file tail)
+    p.finish(); sources.peak_file_write(id, &p); Ok(Some(p)) // STRIAWAVEFORMSTEREO (SR9051): the max pyramid of the whole table (file tail); STRIAWAVEMULTI (SR9071): the table written beside the media (file tail)
+}
+
+// ---- STRIAWAVEMULTI (LEDGER SR9071): the peak table cached beside the media (named tail block) ----
+// Stria keeps no on-disk cache anywhere else: the face's tables live in memory (nle_face.rs `WavePeaks.map`), filled by
+// `wave_fill` and the SR997 worker, BOTH through [`scan_peaks`]; so the cache file sits inside that one road. OPT-IN: a
+// source is cached only after [`Sources::note_path`] names its media file (stria-view's `--peak-cache`); `from_media`,
+// the synth fixture, the export thread and every test open bytes without a path and never read or write a file. The file
+// is `<media>.una-peaks` beside the media, stamped with the media's byte length and mtime (ns since the epoch): a stamp
+// or `per_sec` that does not match, or a length that is not exact, is a miss (rescan, overwrite). The pyramid is never
+// stored (`Peaks::finish` rebuilds it on read). A write that fails (a read-only dir) is logged at debug and ignored. No
+// lock: `peak_paths` is filled before the face wraps `Sources` in its `Arc` and only read after; a proxy attached in place
+// (`set_proxy`) keeps it. Owed: NLE-WAVEFORM-CACHE-DIR (a per-user cache dir for a read-only media dir),
+// NLE-WAVEFORM-CACHE-PATHS (tools/nle and `from_media` name no path), NLE-WAVEFORM-CACHE-PREF (a saved preference instead
+// of stria-view's flag).
+
+/// STRIAWAVEMULTI (SR9071): the peak cache file's magic and format version.
+pub const PEAK_FILE_MAGIC: &[u8; 8] = b"UNAPEAKS";
+pub const PEAK_FILE_VERSION: u32 = 1;
+
+impl Sources {
+    /// STRIAWAVEMULTI (SR9071): source `id`'s media file is `path`: its peak table is read from and written to
+    /// `<path>.una-peaks` from now on (a re-noted `id` forgets its old path, as [`Sources::add`] does).
+    pub fn note_path(&mut self, id: SourceId, path: &std::path::Path) {
+        self.peak_paths.retain(|(s, _)| *s != id);
+        self.peak_paths.push((id, path.to_path_buf()));
+    }
+    /// STRIAWAVEMULTI (SR9071): source `id`'s cache file and its media's stamp (`None`: no path noted, or the media's
+    /// length / mtime unreadable).
+    fn peak_stamp(&self, id: SourceId) -> Option<(std::path::PathBuf, u64, u64)> {
+        let media = &self.peak_paths.iter().find(|(s, _)| *s == id)?.1;
+        let md = std::fs::metadata(media).ok()?;
+        let mtime = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64;
+        let mut file = media.clone().into_os_string();
+        file.push(".una-peaks");
+        Some((std::path::PathBuf::from(file), md.len(), mtime))
+    }
+    /// STRIAWAVEMULTI (SR9071): source `id`'s cached table when the file's stamp and `per_sec` match (its pyramid rebuilt).
+    fn peak_file_read(&self, id: SourceId, per_sec: u32) -> Option<timeline_core::view::Peaks> {
+        let (file, size, mtime) = self.peak_stamp(id)?;
+        let bytes = std::fs::read(&file).ok()?;
+        let p = peak_file_parse(&bytes, size, mtime, per_sec);
+        if p.is_some() {
+            log::debug!("[nle] peak cache hit {}", file.display());
+        }
+        p
+    }
+    /// STRIAWAVEMULTI (SR9071): write source `id`'s table beside its media (no path noted: nothing).
+    fn peak_file_write(&self, id: SourceId, p: &timeline_core::view::Peaks) {
+        let Some((file, size, mtime)) = self.peak_stamp(id) else { return };
+        if let Err(e) = std::fs::write(&file, peak_file_bytes(p, size, mtime)) {
+            log::debug!("[nle] peak cache {}: {e}", file.display());
+        }
+    }
+}
+
+/// STRIAWAVEMULTI (SR9071): `p` as a cache file stamped `size` / `mtime_ns` (little-endian): magic, version, size,
+/// mtime, `per_sec`, the lane count, the folded table (u32 length + bytes), then each lane (u32 length + bytes).
+pub fn peak_file_bytes(p: &timeline_core::view::Peaks, size: u64, mtime_ns: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(34 + p.buckets.len() * (1 + p.chans.len()) + 4 * p.chans.len());
+    out.extend_from_slice(PEAK_FILE_MAGIC);
+    out.extend_from_slice(&PEAK_FILE_VERSION.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&mtime_ns.to_le_bytes());
+    out.extend_from_slice(&p.per_sec.to_le_bytes());
+    out.extend_from_slice(&(p.chans.len() as u16).to_le_bytes());
+    for t in core::iter::once(&p.buckets).chain(p.chans.iter().map(|c| &c.buckets)) {
+        out.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        out.extend_from_slice(t);
+    }
+    out
+}
+
+/// STRIAWAVEMULTI (SR9071): the table a cache file holds, when its magic, version, stamp and `per_sec` match and its
+/// length is exact; the pyramid of it and of each lane rebuilt (`Peaks::finish`). Anything else: `None`.
+pub fn peak_file_parse(bytes: &[u8], size: u64, mtime_ns: u64, per_sec: u32) -> Option<timeline_core::view::Peaks> {
+    let mut at = 0usize;
+    if peak_take(bytes, &mut at, 8)? != PEAK_FILE_MAGIC {
+        return None;
+    }
+    let u32_of = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let u64_of = |b: &[u8]| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    if u32_of(peak_take(bytes, &mut at, 4)?) != PEAK_FILE_VERSION || u64_of(peak_take(bytes, &mut at, 8)?) != size || u64_of(peak_take(bytes, &mut at, 8)?) != mtime_ns || u32_of(peak_take(bytes, &mut at, 4)?) != per_sec {
+        return None;
+    }
+    let l = peak_take(bytes, &mut at, 2)?;
+    let lanes = u16::from_le_bytes([l[0], l[1]]) as usize;
+    let mut tables: Vec<Vec<u8>> = Vec::with_capacity(lanes + 1);
+    for _ in 0..=lanes {
+        let n = u32_of(peak_take(bytes, &mut at, 4)?) as usize;
+        tables.push(peak_take(bytes, &mut at, n)?.to_vec());
+    }
+    if at != bytes.len() {
+        return None;
+    }
+    let mut it = tables.into_iter();
+    let buckets = it.next()?;
+    let chans = it.map(|b| timeline_core::view::Peaks { per_sec, buckets: b, chans: Vec::new(), lod: Vec::new() }).collect();
+    let mut p = timeline_core::view::Peaks { per_sec, buckets, chans, lod: Vec::new() };
+    p.finish();
+    Some(p)
+}
+
+/// STRIAWAVEMULTI (SR9071): the next `n` bytes of `b` from `*at` (advanced past them); `None` past the end.
+fn peak_take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Option<&'a [u8]> {
+    let s = b.get(*at..at.checked_add(n)?)?;
+    *at += n;
+    Some(s)
 }

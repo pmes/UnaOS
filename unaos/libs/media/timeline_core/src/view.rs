@@ -1254,7 +1254,7 @@ pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> 
 /// fade envelope at the column's tick (`schedule::env_q16`, the mix's), half-height `round(v * (body_h / 2) / 255)`,
 /// inked in the audio clip colour + [`WAVE_LIFT`]. No table for the clip's source (or an empty one): nothing painted.
 pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource) {
-    let Some(p) = src.peaks(clip.src) else { return }; if p.chans.len() == 2 { return paint_sides(c, l, body, clip, tb, src, p); } // STRIAWAVEFORMSTEREO (SR9051): a stereo table paints L over R, each in half the body (file tail)
+    let Some(p) = src.peaks(clip.src) else { return }; if p.chans.len() >= 2 { return paint_sides(c, l, body, clip, tb, src, p); } // STRIAWAVEFORMSTEREO (SR9051): a stereo table paints L over R, each in half the body (file tail); STRIAWAVEMULTI (SR9071): a lane per channel up to WAVE_LANES (file tail)
     if p.buckets.is_empty() || p.per_sec == 0 {
         return;
     }
@@ -1783,18 +1783,27 @@ mod strip_tests {
 // squeezed zoom (many ticks per pixel) reads a bounded number of bytes per column. No pyramid (a literal, a bare
 // `peaks_of`): the linear max. Owed: NLE-WAVEFORM-MULTICHANNEL (more than two channels stay folded).
 
-/// STRIAWAVEFORMSTEREO (SR9051): the per-channel tables of a 2-channel `interleaved` (empty for any other count), each
-/// through THE ONE [`peaks_of`] (`channels` 1, so its own `chans` is empty).
+/// STRIAWAVEFORMSTEREO (SR9051): the per-channel tables of a multi-channel `interleaved` (empty for mono), each through
+/// THE ONE [`peaks_of`] (`channels` 1, so its own `chans` is empty). STRIAWAVEMULTI (SR9071): one lane per channel up to
+/// [`WAVE_LANES`]; past the cap the LAST lane folds the remaining channels (per frame the sample of largest |x|, the
+/// value `peaks_of`'s max |x| folds). Two channels: [L, R], as before.
 fn sides_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> Vec<Peaks> {
-    if channels != 2 {
+    let ch = channels as usize;
+    if ch < 2 {
         return Vec::new();
     }
-    let (mut lt, mut rt) = (Vec::with_capacity(interleaved.len() / 2), Vec::with_capacity(interleaved.len() / 2));
-    for f in interleaved.chunks_exact(2) {
-        lt.push(f[0]);
-        rt.push(f[1]);
+    let lanes = ch.min(WAVE_LANES);
+    let frames = interleaved.len() / ch;
+    let mut cols: Vec<Vec<f32>> = (0..lanes).map(|_| Vec::with_capacity(frames)).collect();
+    for f in interleaved.chunks_exact(ch) {
+        for k in 0..lanes - 1 {
+            cols[k].push(f[k]);
+        }
+        let mag = |x: f32| if x < 0.0 { -x } else { x };
+        let rest = f[lanes - 1..].iter().copied().fold(0.0f32, |m, x| if mag(x) > mag(m) { x } else { m });
+        cols[lanes - 1].push(rest);
     }
-    vec![peaks_of(rate, 1, &lt, per_sec), peaks_of(rate, 1, &rt, per_sec)]
+    cols.iter().map(|c| peaks_of(rate, 1, c, per_sec)).collect()
 }
 
 impl Peaks {
@@ -1883,12 +1892,15 @@ impl PeakSource for Side<'_> {
 }
 
 /// STRIAWAVEFORMSTEREO (SR9051): a stereo table's two envelopes: `body` split at `y0 + (y1 - y0) / 2`, L painted by THE
-/// ONE [`paint_peaks`] in the upper half, R in the lower half.
+/// ONE [`paint_peaks`] in the upper half, R in the lower half. STRIAWAVEMULTI (SR9071): `n` lanes, lane `i` in
+/// `y0 + h * i / n .. y0 + h * (i + 1) / n` (`h` the body height; `n` 2 is the split above, byte-identical).
 fn paint_sides(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource, p: &Peaks) {
     let (x0, y0, x1, y1) = body;
-    let ym = y0 + (y1 - y0) / 2;
-    paint_peaks(c, l, (x0, y0, x1, ym), clip, tb, &Side(src, &p.chans[0]));
-    paint_peaks(c, l, (x0, ym, x1, y1), clip, tb, &Side(src, &p.chans[1]));
+    let (h, n) = (y1 - y0, p.chans.len() as i64);
+    for (i, lane) in p.chans.iter().enumerate() {
+        let i = i as i64;
+        paint_peaks(c, l, (x0, y0 + h * i / n, x1, y0 + h * (i + 1) / n), clip, tb, &Side(src, lane));
+    }
 }
 
 #[cfg(test)]
@@ -1946,7 +1958,7 @@ mod striawaveformstereo_tests {
         assert!(p.chans.iter().all(|c| c.chans.is_empty()));
         let mono = alloc::vec![0.5f32; 4_800];
         assert!(peaks_of(48_000, 1, &mono, PEAKS_PER_SEC).chans.is_empty(), "mono: no channel tables");
-        assert!(peaks_of(48_000, 6, &mono, PEAKS_PER_SEC).chans.is_empty(), "more than two channels stay folded");
+        assert_eq!(peaks_of(48_000, 6, &mono, PEAKS_PER_SEC).chans.len(), 6, "STRIAWAVEMULTI (SR9071): six channels, six lanes");
         // two one-second stretches appended == one call
         let two: Vec<f32> = (0..2 * 2 * 48_000).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 * if i % 2 == 0 { 1.0 } else { -0.5 }).collect();
         let mut fed = peaks_of(48_000, 2, &two[..2 * 48_000], PEAKS_PER_SEC);
@@ -2017,5 +2029,101 @@ mod striawaveformstereo_tests {
         stale.append(table(alloc::vec![9]));
         assert!(stale.lod.is_empty(), "append drops a pyramid built before");
         assert_eq!(stale.range_max(0, 5), 9);
+    }
+}
+
+// ---- STRIAWAVEMULTI (LEDGER SR9071): a lane per channel up to WAVE_LANES (named tail block) ----
+// A source of more than two channels keeps one table per channel in `Peaks.chans` (STRIAWAVEFORMSTEREO's [`sides_of`],
+// generalised) up to [`WAVE_LANES`], the rest folded into the last lane; [`paint_sides`] paints lane `i` in the `i`-th
+// strip of the body. The cap is the room: `ROW_H` 40 leaves a 36 px body, six lanes of 6 px (half-height 3 px), which is
+// 5.1 exactly. Owed: NLE-WAVEFORM-LANE-ROOM (a seventh channel and on fold into the sixth lane).
+
+/// STRIAWAVEMULTI (SR9071): the most envelopes one audio clip body shows (36 px body / 6 px per lane).
+pub const WAVE_LANES: usize = 6;
+
+#[cfg(test)]
+mod striawavemulti_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    struct Fixed(Peaks);
+    impl PeakSource for Fixed {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, _cdb: i32) -> i64 {
+            65536
+        }
+    }
+
+    fn table(buckets: Vec<u8>) -> Peaks {
+        Peaks { per_sec: PEAKS_PER_SEC, buckets, chans: Vec::new(), lod: Vec::new() }
+    }
+
+    fn lanes(v: &[u8]) -> Peaks {
+        Peaks { chans: v.iter().map(|&b| table(alloc::vec![b; 200])).collect(), ..table(alloc::vec![v.iter().copied().max().unwrap_or(0); 200]) }
+    }
+
+    fn one_clip(clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    /// The inked pixels of column `x` in rows `ya..yb` (STRIAWAVEFORMSTEREO's reading).
+    fn inked(buf: &[u8], l: &Layout, x: i64, ya: i64, yb: i64) -> i64 {
+        let b = clip_colour(0, Kind::Audio);
+        let ink = [b[0] + WAVE_LIFT, b[1] + WAVE_LIFT, b[2] + WAVE_LIFT, 255];
+        (ya..yb)
+            .filter(|&y| {
+                let i = (y as usize * l.w as usize + x as usize) * 4;
+                buf[i..i + 4] == ink
+            })
+            .count() as i64
+    }
+
+    #[test]
+    fn striawavemulti_six_lanes_and_fold() {
+        let ch8: Vec<f32> = (0..4_800 * 8).map(|i| 0.1 * ((i % 8) + 1) as f32).collect();
+        let p = peaks_of(48_000, 8, &ch8, PEAKS_PER_SEC);
+        assert_eq!(p.chans.len(), WAVE_LANES, "eight channels show six lanes");
+        let want = |v: f32| (v * 255.0 + 0.5) as u8;
+        for k in 0..5 {
+            assert!(p.chans[k].buckets.iter().all(|&b| b == want(0.1 * (k + 1) as f32)), "lane {k} is channel {k}");
+        }
+        assert!(p.chans[5].buckets.iter().all(|&b| b == want(0.1 * 8.0)), "the last lane folds channels 5..8 by max |x|");
+        assert!(p.buckets.iter().all(|&b| b == want(0.1 * 8.0)), "the folded table unchanged");
+        assert!(p.chans.iter().all(|c| c.chans.is_empty() && c.buckets.len() == p.buckets.len()));
+        let neg: Vec<f32> = (0..4_800 * 8).map(|i| if i % 8 == 7 { -0.9 } else { 0.1 }).collect();
+        assert!(peaks_of(48_000, 8, &neg, PEAKS_PER_SEC).chans[5].buckets.iter().all(|&b| b == want(0.9)), "a negative sample folds by |x|");
+        let ch6: Vec<f32> = alloc::vec![0.5; 4_800 * 6];
+        assert_eq!(peaks_of(48_000, 6, &ch6, PEAKS_PER_SEC).chans.len(), 6);
+        let ch3: Vec<f32> = alloc::vec![0.5; 4_800 * 3];
+        assert_eq!(peaks_of(48_000, 3, &ch3, PEAKS_PER_SEC).chans.len(), 3);
+        std::println!("striawavemulti: 8 ch -> {} lanes, lane 5 = {}", p.chans.len(), p.chans[5].buckets[0]);
+    }
+
+    #[test]
+    fn striawavemulti_lanes_paint_in_their_strips() {
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let y0 = l.row_y(0) + 2;
+        let y1 = l.row_y(0) + ROW_H as i64 - 2;
+        let h = y1 - y0;
+        let paint = |p: Peaks| paint_in(&st, l, Order::Rgba, None, None, Some(&Fixed(p)));
+        let buf = paint(lanes(&[0, 0, 255, 0, 0, 0]));
+        let (s0, s1) = (y0 + h * 2 / 6, y0 + h * 3 / 6);
+        let inside = inked(&buf, &l, 160, s0, s1);
+        assert!(inside > 0, "lane 2 inks its strip");
+        assert_eq!(inked(&buf, &l, 160, y0, s0) + inked(&buf, &l, 160, s1, y1), 0, "nothing outside lane 2's strip");
+        // a two-lane table paints as SR9051's split: L upper half, R lower half
+        let ym = y0 + h / 2;
+        let lr = paint(lanes(&[255, 0]));
+        assert_eq!((inked(&lr, &l, 160, y0, ym), inked(&lr, &l, 160, ym, y1)), (h / 2, 0));
+        assert_eq!(paint(lanes(&[0, 0, 0, 0, 0, 0])), paint_in(&st, l, Order::Rgba, None, None, None), "silent lanes: the flat body");
+        std::println!("striawavemulti: lane 2 strip {s0}..{s1} inked={inside} body={h}");
     }
 }
