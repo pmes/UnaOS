@@ -61,7 +61,7 @@ impl Default for Easing {
     }
 }
 
-fn split_commas(v: &str) -> Vec<&str> {
+pub(crate) fn split_commas(v: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0;

@@ -1238,3 +1238,58 @@ fn caret_color_css_wide() {
     assert_eq!(s.paint.caret_color, Some(Some((255, 0, 0, 255))), "a later red wins");
     assert!(!s.paint.inherits(INHERIT_CARET_COLOR), "a later red clears the bit");
 }
+
+// ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `bg_more`'s urls in list order (the test host parses no gradient).
+fn bg_more_urls(s: &SpecifiedStyle<TH>) -> Option<Vec<String>> {
+    s.paint.bg_more.as_ref().map(|v| {
+        v.iter()
+            .map(|l| match l {
+                layout_core::paint::BgLayer::Url(u) => u.clone(),
+                layout_core::paint::BgLayer::Gradient(_) => "<gradient>".to_string(),
+            })
+            .collect()
+    })
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `url(a), url(b)` is two layers, the first in `bg_image` (the one-url value
+/// is one layer: `bg_more` empty, armed); a `,` inside `url()` / a data: url / `rgb()` does not split.
+#[test]
+fn background_multi_layer_two_urls_in_order() {
+    let one = styled(&[("background-image", "url(a.png)")]);
+    assert_eq!((one.paint.bg_image.as_deref(), bg_more_urls(&one)), (Some("a.png"), Some(vec![])), "one layer (armed)");
+    let s = styled(&[("background-image", "url(a.png), url(b.png)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "the first layer is the top one");
+    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "the second layer");
+    let s = styled(&[("background-image", "url(\"a,b.png\"), url(data:image/png;base64,AA,BB)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a,b.png"), "a comma inside url() stays");
+    assert_eq!(bg_more_urls(&s), Some(vec!["data:image/png;base64,AA,BB".to_string()]), "a data: url stays whole");
+    let s = styled(&[("background", "url(a.png), url(b.png) rgb(0, 160, 0)")]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (Some("a.png"), Some(vec!["b.png".to_string()])), "shorthand: two layers");
+    assert_eq!(s.paint.background, Some((0, 160, 0)), "shorthand: the final layer's colour (rgb() not split)");
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): a url written before a gradient is the first layer (the test host reads no
+/// gradient, so the list is the url alone and the gradient field is cleared).
+#[test]
+fn background_multi_layer_url_before_gradient() {
+    let s = styled(&[("background-image", "url(a.png), linear-gradient(red, blue)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "the url layer survives the gradient arm");
+    assert!(matches!(s.paint.bg_gradient, Some(None)), "one property: the gradient field is this list's");
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): a later `background-image: url(c)` replaces the whole earlier list, and
+/// `none` clears it (SR1015's road).
+#[test]
+fn background_multi_layer_later_rule_replaces_list() {
+    let ab: &[(&str, &str)] = &[("background-image", "url(a.png), url(b.png)")];
+    let s = cascade(&[ab]);
+    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "the earlier list (armed)");
+    let s = cascade(&[ab, &[("background-image", "url(c.png)")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (Some("c.png"), Some(vec![])), "url(c) replaces [a, b]");
+    let s = cascade(&[ab, &[("background-image", "none")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "none clears every layer");
+    let s = cascade(&[ab, &[("background", "red")]]);
+    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "background: red keeps the list (pinned, SHORTHAND-RESET owed)");
+}
