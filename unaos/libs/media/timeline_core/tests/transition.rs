@@ -967,3 +967,46 @@ fn striatransitionnext_dur_short_timecode() {
     st.select_transition(0, 0).unwrap();
     assert_eq!(st.verb("dur 00:07"), Some(Err(EditError::Transition)));
 }
+
+// ---- STRIAKSLIP (LEDGER SR9002): THE dispatch takes the faces' slip / slide step words (named tail block) ----
+// The kernel Player's `,` / `.` keys name `slip-` / `slip+` and hand them to `EditorState::verb` as the host face does:
+// each word is its `slip <d>` / `slide <d>` twin (same result, same timeline, same undo depth); any other count is not a
+// word. The Player side itself is unexercised here (NLE3E-SLIP-KERNEL-WITNESS).
+
+#[test]
+fn striakslip_the_dispatch_takes_the_face_step_words() {
+    use timeline_core::editor::EditorState;
+    let fresh = || {
+        let mut st = EditorState::new(three());
+        st.select(0, 1).unwrap();
+        st
+    };
+    for (word, twin) in [("slip+", "slip 1"), ("slip-", "slip -1"), ("slide+", "slide 1"), ("slide-", "slide -1"), ("slip+10", "slip 10"), ("slip-10", "slip -10"), ("slide+10", "slide 10"), ("slide-10", "slide -10")] {
+        let (mut a, mut b) = (fresh(), fresh());
+        let r = a.verb(word);
+        assert!(r.is_some(), "{word} is a word of THE dispatch");
+        assert_eq!(r, b.verb(twin), "{word} answers as {twin}");
+        assert_eq!((a.timeline.clone(), a.undo_depth()), (b.timeline.clone(), b.undo_depth()), "{word} edits as {twin}");
+        assert!(a.undo_depth() <= 1, "{word}: at most one undo step");
+    }
+    let mut st = fresh();
+    for v in ["slip+7", "slip+10x", "slide-010x", "slip10", "slip", "slide*"] {
+        assert_eq!(st.verb(v), None, "{v} is not a word");
+    }
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (three(), 0));
+    st.deselect();
+    assert_eq!(st.verb("slip+"), Some(Err(EditError::NoClip)));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (three(), 0));
+}
+
+#[test]
+fn striakslip_slipslide_word_maps_the_words() {
+    use timeline_core::editor::{SLIP_STEP, slipslide_word};
+    assert_eq!(SLIP_STEP, 10);
+    for (w, want) in [("slip-", "slip -1"), ("slip+", "slip 1"), ("slide-", "slide -1"), ("slide+", "slide 1"), ("slip-10", "slip -10"), ("slide+10", "slide 10")] {
+        assert_eq!(slipslide_word(w).as_deref(), Some(want), "{w}");
+    }
+    for w in ["slip", "slip 1", "slip+7", "slide-010x", "slipx", "nudge+"] {
+        assert_eq!(slipslide_word(w), None, "{w}");
+    }
+}

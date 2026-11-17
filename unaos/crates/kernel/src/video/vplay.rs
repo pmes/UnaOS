@@ -1867,6 +1867,7 @@ const EDIT_KEYS: [(u8, &str); 20] = [
     (b'f', "size"),
     (b'\\', "zoom-fit"), (b'|', "zoom-sel"), // STRIAZOOMFITMORE (SR965): the host's `\` / `|` fit the timeline / the selection (file tail)
     (b'(', "nudge-"), (b')', "nudge+"), // STRIANUDGENEXT (LEDGER SR986): `(` / `)` (Shift+9 / Shift+0) nudge the shown clip one frame (STRIANUDGE SR855's words, `EditorState::move_set`, one undo step); `<` / `>` are the host face's slide keys
+    (b',', "slip-"), (b'.', "slip+"), // STRIAKSLIP (LEDGER SR9002): `,` / `.` slip the shown clip one frame back / on (timeline_core's step words, the host KEYS' bytes)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
