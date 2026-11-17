@@ -401,9 +401,9 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
 // ---- NLECLIDIDYOUMEAN (LEDGER SR816): the nearest arm / verb of an unknown word (named tail block) ----
 /// NLECLIDIDYOUMEAN (SR816): THE list of the option loop's arm words, in arm order (a tie names the first). SR799's
 /// `cli_usage_lists_every_flag` pins it equal to the arms its source scan finds, so a new arm without its word here reds.
-const FLAGS: [&str; 23] = [
+const FLAGS: [&str; 24] = [
     "--fps", "--out", "--video", "--audio", "--aac", "--png", "--qp", "--gop", "--bitrate", "--mkv", "--crf", "--scenecut",
-    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--src",
+    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--src",
 ];
 
 /// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order.
