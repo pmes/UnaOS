@@ -5397,7 +5397,7 @@ mod tests {
             <div style="font:italic 20px serif"><span id="uns" style="font-size:12px;font:unset">Hello</span></div>
             <div style="font:italic 20px serif"><span id="ini" style="font:initial">Hello</span></div>
             <div style="font:italic 20px serif"><button id="btn" style="font:inherit">Go</button></div>
-            <div style="font:italic 20px serif"><button id="pbtn" style="font-size:20px">Go</button></div>
+            <div style="font:italic 20px serif"><button id="pbtn" style="font:italic 20px serif">Go</button></div>
             <div style="font:italic 20px serif"><button id="ubtn">Go</button></div>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
@@ -5434,9 +5434,8 @@ mod tests {
     }
 
     /// AETHERFONTSHORTHANDINHERIT (SR810): `button { font: inherit }` (every reset sheet's line) takes the parent's
-    /// 20px: its box is the `font-size: 20px` twin's, not the 13.333px control default's (armed by the plain button).
-    /// The family stays the control family and cssom reads the raw size (AETHER-CSS-WIDE-LONGHANDS,
-    /// AETHER-CSSOM-FONT-SIZE-REL owed), so the box is the pin.
+    /// 20px: its box is the `font: italic 20px serif` twin's, not the 13.333px control default's (armed by the plain
+    /// button). AETHERCSSWIDELONGHANDS (SR815) re-pinned the twin: the inherit button now takes the parent's family too.
     #[test]
     fn font_inherit_button_takes_parent_size() {
         let mut e = font_wide_engine();
@@ -5445,5 +5444,95 @@ mod tests {
         let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
         assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
         assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+    }
+
+    // ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): an explicit inherit beats an earlier rule and the tag default (named tail block) ----
+
+    /// AETHERCSSWIDELONGHANDS (SR815): one line per probe under a 20px serif upright body, the rules in a sheet: an
+    /// upright reference, `p { font-style: italic }` and its `p.x { font-style: inherit }` twin, `em` with
+    /// `font-style: inherit` / `unset` beside a plain (tag-default italic) em, an italic parent's plain child and its
+    /// same-block `font-style: normal; font-style: inherit` twin, and three buttons under `button { font-size: 13px }`:
+    /// `button.i { font: inherit }`, `button.t { font: 20px serif }` and a plain one. Rows 12px apart, so one probe's
+    /// ink window (its rect +- 2px) does not take a neighbour's glyph edge.
+    fn css_wide_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div, p { margin: 0 0 12px }
+            p { font-style: italic }
+            p.x { font-style: inherit }
+            em.n { font-style: inherit }
+            em.u { font-style: unset }
+            button { font-size: 13px }
+            button.i { font: inherit }
+            button.t { font: 20px serif }
+            </style></head><body style="margin:0;font:20px serif">
+            <div><span id="plain">Hello</span></div>
+            <p id="itp">Hello</p>
+            <p id="px" class="x">Hello</p>
+            <div><em id="emref">Hello</em></div>
+            <div><em id="emn" class="n">Hello</em></div>
+            <div><em id="emu" class="u">Hello</em></div>
+            <div style="font-style:italic"><span id="itkid">Hello</span></div>
+            <div style="font-style:italic"><span id="inhkid" style="font-style:normal;font-style:inherit">Hello</span></div>
+            <div><button id="bi" class="i">Go</button></div>
+            <div><button id="bt" class="t">Go</button></div>
+            <div><button id="bp">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `p.x { font-style: inherit }` after `p { font-style: italic }` under an upright
+    /// parent paints upright (the plain reference's ink; the italic p does not, armed) and cssom reads `normal`.
+    #[test]
+    fn css_wide_cross_rule_upright() {
+        let mut e = css_wide_engine();
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert!(plain.iter().sum::<usize>() > 20, "the reference run paints");
+        assert_ne!(small_caps_ink_columns(&mut e, "itp"), plain, "the italic p is not the upright ink (armed)");
+        assert_eq!(small_caps_ink_columns(&mut e, "px"), plain, "p.x inherits the upright parent past the earlier rule");
+        assert_eq!(font_shorthand_cs(&mut e, "itp", "fontStyle"), "italic");
+        assert_eq!(font_shorthand_cs(&mut e, "px", "fontStyle"), "normal", "cssom reads the parent's style");
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `em { font-style: inherit }` beats the tag's UA italic, and `unset` is inherit for
+    /// an inherited property (css-cascade-4 §7.3.3): both paint the upright reference's ink; the plain em does not.
+    #[test]
+    fn css_wide_tag_default_beaten() {
+        let mut e = css_wide_engine();
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert_ne!(small_caps_ink_columns(&mut e, "emref"), plain, "a plain em is italic by the tag default (armed)");
+        for id in ["emn", "emu"] {
+            assert_eq!(small_caps_ink_columns(&mut e, id), plain, "#{id}: upright, the parent's style");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "normal", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `font-style: normal; font-style: inherit` on a child of an italic parent (the later
+    /// declaration wins) paints the parent's italic: the italic parent's plain child's ink, not the upright reference's.
+    #[test]
+    fn css_wide_child_takes_italic_parent() {
+        let mut e = css_wide_engine();
+        let italic_kid = small_caps_ink_columns(&mut e, "itkid");
+        assert_ne!(italic_kid, small_caps_ink_columns(&mut e, "plain"), "the italic parent's child is italic (armed)");
+        assert_eq!(small_caps_ink_columns(&mut e, "inhkid"), italic_kid, "the same-block inherit takes the parent's italic");
+        assert_eq!(font_shorthand_cs(&mut e, "inhkid", "fontStyle"), "italic");
+    }
+
+    /// AETHERCSSWIDELONGHANDS (SR815): `button.i { font: inherit }` after `button { font-size: 13px }` under a 20px serif
+    /// parent takes 20px serif: its box is the `font: 20px serif` button's, not the plain 13px button's (armed), and
+    /// cssom reads `20px`.
+    #[test]
+    fn css_wide_control_font_inherit() {
+        let mut e = css_wide_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "bi");
+        let (_, _, tw, th) = imgalt_rect(&mut e, "bt");
+        let (_, _, pw, ph) = imgalt_rect(&mut e, "bp");
+        assert!((w - tw).abs() <= 0.5 && (h - th).abs() <= 0.5, "bi {w}x{h} is the 20px serif button's {tw}x{th}");
+        assert!((h - ph).abs() > 0.5 || (w - pw).abs() > 0.5, "the plain 13px button {pw}x{ph} differs (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "fontSize"), "20px", "cssom reads the parent's size");
+        assert_ne!(font_shorthand_cs(&mut e, "bp", "fontSize"), "20px", "the plain button keeps the earlier rule (armed)");
     }
 }
