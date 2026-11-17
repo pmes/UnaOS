@@ -1447,7 +1447,7 @@ fn nlefaceexport_busy_then_esc_cancels_with_the_partial_files_named() {
     face.export_paused_at(&dir, "png", 3).unwrap();
     nlefaceexport_until(&face, (3, 35));
     assert!(face.verb(&format!("export {} png", other.display())));
-    assert_eq!(face.last_error.take().as_deref(), Some("export: busy (3/35)"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)")); // STRIAEXPORTQUEUE (SR881): a running export queues the request; Esc below drops it
     assert!(!other.exists(), "a busy refusal makes nothing");
     assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running export");
     assert!(face.wait_export());
@@ -3647,4 +3647,129 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     assert_eq!(face.export_stall(), None, "no job: no stall");
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
+}
+
+// ---- STRIAEXPORTQUEUE (LEDGER SR881): queued export requests run in order from export_tick (named tail block) ----
+
+/// A paused whole-timeline png job into `a` (holding after frame 3 of 35), the face that runs it.
+fn striaexportqueue_paused(a: &std::path::Path) -> Face {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(a, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    face
+}
+
+#[test]
+fn striaexportqueue_runs_in_order_with_their_own_ranges() {
+    let (a, b, c) = (nlefaceexport_dir("queue-a"), nlefaceexport_dir("queue-b"), nlefaceexport_dir("queue-c"));
+    let mut face = striaexportqueue_paused(&a);
+    face.state.seek(5);
+    assert!(face.verb("in"));
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.verb(&format!("export --all {} png", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    assert_eq!(face.export_queued(), 2);
+    assert!(!b.exists() && !c.exists(), "a queued request makes nothing until it starts");
+    assert!(face.export_skip(), "the running job is cancelled, the queue kept");
+    assert_eq!(face.wait_exports(), 3);
+    assert!(!face.exporting() && face.export_queued() == 0);
+    let line = face.last_error.take().expect("the last job's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", c.display())), "{line}");
+    assert!(a.join("000002.png").is_file() && !a.join("000003.png").exists(), "A cancelled after frame 3");
+    assert!(b.join("000009.png").is_file() && !b.join("000010.png").exists(), "B took its marked range 5..15");
+    assert!(c.join("000034.png").is_file(), "C took the whole timeline (--all)");
+    assert!(!face.export_skip(), "nothing runs: nothing to skip");
+    for d in [&a, &b, &c] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueue: three jobs in order, last line \"{line}\"");
+}
+
+#[test]
+fn striaexportqueue_starts_next_from_export_tick() {
+    let (a, b) = (nlefaceexport_dir("tick-a"), nlefaceexport_dir("tick-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.export_skip());
+    let t0 = std::time::Instant::now();
+    while face.exporting() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(120), "the queue never drained");
+        face.export_tick();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(face.export_queued(), 0);
+    let line = face.last_error.take().expect("B's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", b.display())), "{line}");
+    assert!(b.join("000034.png").is_file(), "B ran to the end, started by export_tick");
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueue: export_tick started the queued job: \"{line}\"");
+}
+
+#[test]
+fn striaexportqueue_refuses_unknown_format_and_empty_range_at_once() {
+    let (a, x, p) = (nlefaceexport_dir("refuse-a"), nlefaceexport_dir("refuse-x"), nlefaceexport_dir("refuse-p"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} bogus", x.display())));
+    let line = face.last_error.take().expect("the format refusal");
+    assert!(line.starts_with("export: unknown format bogus ("), "{line}");
+    assert_eq!(face.export_queued(), 0, "a refused request is not queued");
+    face.state.seek(12);
+    assert!(face.verb("in"));
+    face.state.seek(15);
+    assert!(face.verb("out"));
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1); // A[13,23)@0: the timeline now ends at 10, the marks past it
+    }
+    face.last_error = None;
+    assert!(face.verb(&format!("export {} png", p.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: the marks 12..15 are past the timeline's end 10"));
+    assert_eq!(face.export_queued(), 0);
+    assert!(!x.exists() && !p.exists(), "a refusal makes nothing");
+    assert!(face.cancel_export() && face.wait_export());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueue: format and range refused at queue time");
+}
+
+#[test]
+fn striaexportqueue_esc_drops_the_queue() {
+    let (a, b, c) = (nlefaceexport_dir("esc-a"), nlefaceexport_dir("esc-b"), nlefaceexport_dir("esc-c"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert!(face.verb(&format!("export {} png", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running export");
+    assert_eq!(face.export_queued(), 0, "Esc drops the waiting requests");
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the cancel line");
+    assert_eq!(line, format!("export: cancelled at 3/35 frames; partial files left in {}", a.display()));
+    assert!(!face.exporting() && !face.export_tick(), "nothing starts after Esc");
+    assert!(!b.exists() && !c.exists(), "the dropped requests made nothing");
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueue: Esc dropped 2 queued");
+}
+
+#[test]
+fn striaexportqueue_full_queue_is_busy() {
+    let a = nlefaceexport_dir("full-a");
+    let mut face = striaexportqueue_paused(&a);
+    for n in 0..stria::nle_face::EXPORT_QUEUE_MAX {
+        assert!(face.verb(&format!("export {} png", nlefaceexport_dir(&format!("full-{n}")).display())));
+        assert_eq!(face.last_error.take(), Some(format!("export: queued ({} waiting)", n + 1)));
+    }
+    let over = nlefaceexport_dir("full-over");
+    assert!(face.verb(&format!("export {} png", over.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: busy (3/35)"));
+    assert_eq!(face.export_queued(), stria::nle_face::EXPORT_QUEUE_MAX);
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(!over.exists() && !nlefaceexport_dir("full-0").exists(), "nothing queued ran");
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueue: {} queued, one more busy", stria::nle_face::EXPORT_QUEUE_MAX);
 }

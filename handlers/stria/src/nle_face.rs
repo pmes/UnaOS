@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    export_queue: std::collections::VecDeque<ExportRequest>, // STRIAEXPORTQUEUE (SR881): export requests waiting behind the running job, started in order from export_tick (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, export_queue: std::collections::VecDeque::new() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -2104,7 +2105,7 @@ impl Face {
             return None;
         }
         let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, audio) = export_audio_word(args);
-        if let Some((d, t)) = self.export_progress() {
+        if let Some((d, t)) = self.export_progress().filter(|_| self.export_queue.len() >= EXPORT_QUEUE_MAX) { // STRIAEXPORTQUEUE (SR881): busy = running and the queue full
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
         }
@@ -2126,7 +2127,7 @@ impl Face {
                 return Some(true);
             }
         };
-        if let Err(e) = audio.and_then(|a| self.start_export(&dir, fmt, None, if all { None } else { self.export_range() }, a)) {
+        if let Err(e) = audio.and_then(|a| self.export_or_queue(&dir, fmt, if all { None } else { self.export_range() }, a)) { // STRIAEXPORTQUEUE (SR881): a running job queues the request (file tail)
             self.last_error = Some(format!("export: {e}"));
         }
         Some(true)
@@ -2197,7 +2198,7 @@ impl Face {
     pub fn export_tick(&mut self) -> bool {
         let Some(j) = self.export.as_mut() else { return false };
         if j.handle.as_ref().is_some_and(|h| h.is_finished()) {
-            self.finish_export();
+            self.finish_export(); self.start_queued(); // STRIAEXPORTQUEUE (SR881): the next queued request starts as this one is reported (file tail)
             return true;
         }
         eta_sample(j, std::time::Instant::now()); let d = fnv1a(job_line(j).as_bytes());
@@ -2208,7 +2209,7 @@ impl Face {
     /// Esc's export arm: ask the running job to stop (its next frame refuses); false when none runs.
     pub fn cancel_export(&mut self) -> bool {
         let Some(j) = self.export.as_ref() else { return false };
-        j.cancel.store(true, Relaxed);
+        j.cancel.store(true, Relaxed); self.export_queue.clear(); // STRIAEXPORTQUEUE (SR881): Esc drops the waiting requests too
         true
     }
     /// Block until the running export ends and report it as [`Face::export_tick`] would; false when none runs.
@@ -3095,5 +3096,81 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAEXPORTQUEUE (LEDGER SR881): queued export requests run in order from export_tick (named tail block) ----
+// A second `export` while one runs no longer refuses `busy`: `export_verb`'s parsed request (dir, format word, range, audio)
+// waits in `Face.export_queue` (face thread only: the export thread never sees it, no lock) and `export_tick` starts the
+// next one through the unchanged `start_export` the moment the running job is reported, so `exporting()` never drops
+// between jobs and serve's clock needs no new condition. The running job (`ExportJob`) and its line (`job_line`) are
+// unchanged. `export: busy (d/t)` now means running AND `EXPORT_QUEUE_MAX` waiting. Esc (`cancel_export`) cancels the
+// running job and drops the queue; `Face::export_skip` cancels the running job only. A queued job exports the timeline
+// as it stands when it STARTS (`start_export`'s clone); its range is the one the verb resolved. SR871 (presets) joins as
+// ONE more `ExportRequest` field `opts: H264Opts`, set from `export_or_queue`'s new last parameter and passed as
+// `start_export`'s last argument in both calls below. Owed: NLE5D-EXPORT-QUEUE-SNAPSHOT, NLE5D-EXPORT-QUEUE-SKIP,
+// NLE5D-EXPORT-QUEUE-WITNESS, NLE5D-EXPORT-QUEUE-LINE.
+
+/// STRIAEXPORTQUEUE (SR881): the most export requests that wait behind a running job; one more is refused `export: busy (d/t)`.
+pub const EXPORT_QUEUE_MAX: usize = 16;
+
+/// STRIAEXPORTQUEUE (SR881): one parsed `export` request waiting its turn: exactly [`Face::start_export`]'s arguments
+/// but the test hold (`pause_at`), as `export_verb` resolved them (the range captured at the verb, `--all` as `None`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportRequest {
+    dir: std::path::PathBuf,
+    fmt: String,
+    range: Option<std::ops::Range<i64>>,
+    audio: AudioOut,
+}
+
+impl Face {
+    /// The verb's start: with no job running, [`Face::start_export`] as before; with one running, the request is checked
+    /// at once (the format word and [`Face::range_check`], refused by the same words) and queued, the message line
+    /// `export: queued (<n> waiting)`.
+    fn export_or_queue(&mut self, dir: &std::path::Path, fmt: &str, range: Option<std::ops::Range<i64>>, audio: AudioOut) -> Result<(), String> {
+        if self.export.is_none() {
+            return self.start_export(dir, fmt, None, range, audio);
+        }
+        if !VIDEO_NAMES.contains(&fmt) {
+            return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
+        }
+        self.range_check(&range)?;
+        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio });
+        self.last_error = Some(format!("export: queued ({} waiting)", self.export_queue.len()));
+        Ok(())
+    }
+    /// Start the next queued request through [`Face::start_export`] (no job runs: called after `finish_export`). A request
+    /// that no longer starts (its directory, its range after an edit) is named after the finished job's line
+    /// (`; queued <dir>: <e>`) and the next one is tried, until one starts or the queue is empty.
+    fn start_queued(&mut self) {
+        while self.export.is_none() {
+            let Some(r) = self.export_queue.pop_front() else { return };
+            if let Err(e) = self.start_export(&r.dir, &r.fmt, None, r.range, r.audio) {
+                let prev = self.last_error.take().map(|l| format!("{l}; ")).unwrap_or_else(|| "export: ".to_string());
+                self.last_error = Some(format!("{prev}queued {}: {e}", r.dir.display()));
+            }
+        }
+    }
+    /// The test seam over the whole queue: [`Face::wait_export`] the running job, start the next queued request, until
+    /// none is left; the number of jobs reported (each one's line on `last_error` in turn, the last one standing).
+    pub fn wait_exports(&mut self) -> usize {
+        let mut n = 0;
+        while self.wait_export() {
+            n += 1;
+            self.start_queued();
+        }
+        n
+    }
+    /// The number of export requests waiting behind the running job.
+    pub fn export_queued(&self) -> usize {
+        self.export_queue.len()
+    }
+    /// Cancel the running export only (its next frame refuses, as Esc's [`Face::cancel_export`]), the queue kept: the
+    /// next request starts when this one is reported. False when none runs. (NLE5D-EXPORT-QUEUE-SKIP owes its key / word.)
+    pub fn export_skip(&mut self) -> bool {
+        let Some(j) = self.export.as_ref() else { return false };
+        j.cancel.store(true, Relaxed);
+        true
     }
 }
