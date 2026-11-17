@@ -1893,3 +1893,6 @@ exec-rmbp-aethercsscontainsizeminheight|c0be8b5ef|cut135h
 exec-rmbp-aetherhitstickyorigin|080a58662|cut136h
 exec-rmbp-aetherfontunitsonefn|080a58662|cut136h
 exec-rmbp-aethercssborderalphacorneroverlap|080a58662|cut136h
+exec-rmbp-aethercssomboundingsticky|2e75ae890|cut137h
+exec-rmbp-aetherscrolldamageunboundedholder|2e75ae890|cut137h
+exec-rmbp-aethercssinlineborderalphabycolour|2e75ae890|cut137h

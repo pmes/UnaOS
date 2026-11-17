@@ -9827,6 +9827,104 @@ b</div>
         assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
     }
 
+    // ---- AETHERCSSSTICKYSCROLLDAMAGERECTS (LEDGER SR1139): a blitted scroll damages each fixed / sticky box's old and new place (named tail block) ----
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a 400x300 page of `body` (margin 0) with the paint index armed the way
+    /// the host runs it (`perf::scoped()`, on unless AETHER_NO_SCOPE=1) by one first frame.
+    fn damage_rects_engine(body: &str) -> crate::AetherEngine {
+        let html = format!(r#"<!doctype html><html><body style="margin:0">{body}</body></html>"#);
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    const DAMAGE_RECTS_FIXED: &str = r#"<div style="position:fixed;top:0;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0)"></div>
+        <div style="height:2000px"></div>"#;
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): one unstuck 300x20 sticky box (`top: 30px`, flow y 120): a 50px scroll
+    /// keeps the blit and damages the strip plus ONE hull of its ink (y 118..142, x -2..302) and that ink moved up 50
+    /// (y 68..92), clipped: (0, 68, 302, 74) — not the viewport (armed: SR1135 damaged the viewport).
+    #[test]
+    fn sticky_scroll_damage_rects_one_sticky() {
+        let mut e = damage_rects_engine(
+            r#"<div style="height:120px"></div><div style="position:sticky;top:30px;width:300px;height:20px;background-color:rgb(0, 128, 0)"></div><div style="height:2000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 68, 302, 74)], "the strip and the sticky box's hull (armed)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a fixed 100x20 header at the top: a +50 scroll damages the strip and the
+    /// header's rect (its ghost moved off-screen); at 100 a -50 scroll damages the strip, the header and its ghost 50 rows
+    /// lower (apart: two rects); each total under a quarter of the viewport (armed: SR1135 damaged the viewport).
+    #[test]
+    fn sticky_scroll_damage_rects_fixed_header() {
+        let mut e = damage_rects_engine(DAMAGE_RECTS_FIXED);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 102, 22)], "+50: the strip and the header (armed)");
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 50), (0, 0, 102, 22), (0, 48, 102, 24)], "-50: the strip, the header, its ghost");
+        let area: u32 = e.damage_rects.iter().map(|r| r.2 * r.3).sum();
+        assert!(area * 4 < 400 * 300, "the damage is under a quarter of the viewport ({area})");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): THE correctness pin: a translucent fixed header, a sticky bar and coloured
+    /// rows; +50 (the bar unstuck), +50 (it sticks at 30), -30 (it unsticks): after each blitted frame the whole surface
+    /// equals a control engine scrolled to the same offset and repainted whole, and the damage was not the viewport.
+    #[test]
+    fn sticky_scroll_damage_rects_pixels_match_full_repaint() {
+        let mut body = String::from(
+            r#"<div style="position:fixed;top:0;left:0;width:200px;height:20px;background-color:rgba(0, 0, 255, 0.5)"></div>
+            <div style="height:120px;background-color:rgb(250, 200, 0)"></div>
+            <div style="position:sticky;top:30px;width:300px;height:20px;background-color:rgb(0, 128, 0)"></div>"#,
+        );
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a fixed box over 80% of the viewport: the holders' damage would pass half
+    /// of it, so the viewport is damaged (SR1135's net).
+    #[test]
+    fn sticky_scroll_damage_rects_big_holder_falls_back() {
+        let mut e = damage_rects_engine(
+            r#"<div style="position:fixed;top:0;left:0;width:400px;height:240px;background-color:rgb(255, 0, 0)"></div><div style="height:2000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (SR1135's damage)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): the holders are walked once per layout, pinned by the cache field: after
+    /// the first scroll it holds this epoch and the header; with its list emptied (the epoch kept) the second scroll's
+    /// damage is the strip alone, so that event read the cache and walked no paint map.
+    #[test]
+    fn sticky_scroll_damage_rects_cache_walks_once() {
+        let mut e = damage_rects_engine(DAMAGE_RECTS_FIXED);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.holders.0, e.layout_epoch, "the cache holds this layout's epoch");
+        assert_eq!(e.holders.1.len(), 1, "one holder: the header");
+        e.render_frame();
+        e.holders.1.clear();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "the cached (emptied) list: no walk, the strip only");
+    }
+
     // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
 
     /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
@@ -10170,6 +10268,100 @@ b</div>
         assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 10.0), "f", "#f stays at the viewport's top-left");
         assert_ne!(hit_sticky_origin_id(&e, 10.0, 50.0), "f", "below #f's 30px");
+    }
+
+    // ---- AETHERCSSBORDERALPHACORNEROVERLAP (LEDGER SR1143): each plain border pixel composites once, the corners stay the vertical side's (named tail block) ----
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): 40x20 boxes (48x28 with the frame) on white, rows 12px apart: `#ha` a
+    /// `4px solid rgba(0, 0, 0, 0.5)` frame, `#oc` an opaque frame with red top / bottom and blue left / right, `#cl` a
+    /// `box-sizing: border-box` 6px box under the same half-alpha frame (8x8: the borders floor the box), and a `<p>`
+    /// holding `#is`, an inline span with the half-alpha frame and white text.
+    fn border_alpha_corner_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { width: 40px; height: 20px; margin: 0 0 12px }
+            p { margin: 0 0 12px; padding: 0 8px; font: 16px sans-serif }
+            </style></head><body>
+            <div id="ha" style="border:4px solid rgba(0, 0, 0, 0.5)"></div>
+            <div id="oc" style="border:4px solid red;border-left-color:blue;border-right-color:blue"></div>
+            <div id="cl" style="box-sizing:border-box;width:6px;height:6px;border:4px solid rgba(0, 0, 0, 0.5)"></div>
+            <p><span id="is" style="border:4px solid rgba(0, 0, 0, 0.5);color:#fff">x</span></p>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// The four corner pixels (one pixel in from each corner of the border box) and the top edge's mid pixel.
+    fn border_alpha_corner_px(e: &mut crate::AetherEngine, id: &str) -> ([(u8, u8, u8); 4], (u8, u8, u8)) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        let c = [imgalt_px(e, l + 1, t + 1), imgalt_px(e, l + w - 2, t + 1), imgalt_px(e, l + 1, t + h - 2), imgalt_px(e, l + w - 2, t + h - 2)];
+        (c, imgalt_px(e, l + w / 2, t + 1))
+    }
+
+    fn border_alpha_half_grey(c: (u8, u8, u8)) -> bool {
+        [c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v))
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): a half-alpha frame's four corner pixels equal its top edge (~127 grey on
+    /// white). Before SR1143 the top / bottom and left / right rects both covered each corner square: 63 grey (0.75).
+    #[test]
+    fn border_alpha_corner_half() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "ha");
+        assert!(border_alpha_half_grey(edge), "the top edge is half-alpha grey: {edge:?}");
+        for (i, c) in corners.iter().enumerate() {
+            assert_eq!(*c, edge, "armed: corner {i} composites once, like the edge (before: 63 grey)");
+        }
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): an opaque two-colour frame keeps its corner owner: the left / right
+    /// sides paint after the top / bottom (render's order top, bottom, left, right), so all four corners were and stay
+    /// blue; the top edge is red. Pinned: the horizontal rects are the ones inset.
+    #[test]
+    fn border_alpha_corner_opaque_owner() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "oc");
+        assert_eq!(edge, (255, 0, 0), "the top edge is red");
+        assert_eq!(corners, [(0, 0, 255); 4], "every corner stays the vertical side's blue");
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): SR1134's currentcolor frame under half-alpha text (`#hb`): the corner
+    /// equals the top edge (SR1134 sampled mid-x because the corner read 63).
+    #[test]
+    fn border_alpha_corner_currentcolor() {
+        let mut e = currentcolor_alpha_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "hb");
+        assert!(border_alpha_half_grey(edge), "the currentcolor top edge is half-alpha grey: {edge:?}");
+        assert_eq!(corners, [edge; 4], "armed: every corner composites once");
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): a box no wider than its side borders (8x8 under 4px sides): the inset
+    /// top / bottom rects are empty (no underflow, no panic) and the left / right rects tile the box, every pixel once.
+    #[test]
+    fn border_alpha_corner_collapse() {
+        let mut e = border_alpha_corner_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "cl");
+        assert_eq!((w, h), (8.0, 8.0), "the 4px sides floor the border-box 6px box at 8x8");
+        for y in t as usize..(t + h) as usize {
+            for x in l as usize..(l + w) as usize {
+                let c = imgalt_px(&e, x, y);
+                assert!(border_alpha_half_grey(c), "({x},{y}) composites once: {c:?}");
+            }
+        }
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): the inline road (a square solid span frame) has the same four-rect shape:
+    /// its corner pixel equals its top edge.
+    #[test]
+    fn border_alpha_corner_inline() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "is");
+        assert!(border_alpha_half_grey(edge), "the span's top edge is half-alpha grey: {edge:?}");
+        assert_eq!(corners[0], edge, "armed: the inline frame's top-left corner composites once");
     }
 
     // ---- AETHERCSSOMBOUNDINGSTICKY (LEDGER SR1144): a stuck sticky box's CSSOM rects read at its held place (named tail block) ----
