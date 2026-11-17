@@ -254,7 +254,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -528,7 +528,8 @@ fn transport() -> TetraNode {
         button("roll-", "Roll -"), button("roll+", "Roll +"), // STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge
         button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
         button("zoom-fit", "Fit"), button("zoom-sel", "Fit Sel"), // STRIAZOOMTOFIT (SR859): fit the timeline / the selection in the window
-        button("xfade", "Xfade"), button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
+        button("xfade", "Xfade"), button("tc", "TC"), // STRIATIMECODEDISPLAY (SR872): the playhead readout off / timecode / frames / seconds
+        button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
 
@@ -1058,5 +1059,39 @@ mod striatransitionlength_tests {
         let before = face.state.clone();
         assert_eq!(drive(&mut face, "dur:99"), vec![format!("dur 99: {}", timeline_core::EditError::Handle)]);
         assert_eq!(face.state, before);
+    }
+}
+
+// ---- STRIATIMECODEDISPLAY (LEDGER SR872): the TC button and the witness's `"tc"` reading (named tail block) ----
+/// The witness's `"tc"` field: the playhead readout's unit while it is on (`Face::tc_unit`); the default line is unchanged.
+fn tc_json(face: &Face) -> String {
+    face.tc_unit().map(|u| format!(",\"tc\":\"{}\"", u.word())).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striatimecodedisplay_tests {
+    use super::*;
+
+    /// The second-to-last button is `tc` labelled `TC` firing the face's word; `--do tc` carries `"tc":"timecode"`, the next
+    /// presses `frames` / `seconds`, the fourth clears the field (the default line has none).
+    #[test]
+    fn striatimecodedisplay_button_and_json() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button") };
+        assert_eq!((id.as_str(), label.as_str()), ("tc", "TC"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "tc"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(tc_json(&f), "");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let errors = drive(&mut f, text);
+            assert!(errors.is_empty(), "{errors:?}");
+            seen.push(tc_json(&f));
+        }
+        assert_eq!(seen, [",\"tc\":\"timecode\"", ",\"tc\":\"frames\"", ",\"tc\":\"seconds\"", ""]);
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+        println!("striatimecodedisplay witness: tc x4 -> {seen:?}");
     }
 }

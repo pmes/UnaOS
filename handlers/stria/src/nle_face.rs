@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 45] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail)
+pub const VERBS: [&str; 46] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -196,13 +196,14 @@ pub struct Face {
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
+    tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -237,7 +238,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2374,9 +2375,9 @@ impl Face {
         if role == Role::Tracks || l.message_h < MESSAGE_H {
             return px;
         }
-        let Some(text) = self.message_text() else { return px };
+        let px = self.paint_tc(px, l); let Some(text) = self.message_text() else { return px }; // STRIATIMECODEDISPLAY (SR872): the readout on the row's left half first (file tail)
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
-        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, l.w as i32));
+        view::Text::text(&mut Labels(style), &mut c, &text, (self.tc_split(l) + 4) as f32, (l.message_y + l.message_h) as f32 - 4.0, (self.tc_split(l) as i32, l.w as i32)); // STRIATIMECODEDISPLAY (SR872): the right half while the readout shows (x 4, the whole row, off)
         c.px
     }
 }
@@ -3521,5 +3522,101 @@ impl Face {
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
         Some(true)
+    }
+}
+
+// ---- STRIATIMECODEDISPLAY (LEDGER SR872): the playhead readout on the message row's left half (named tail block) ----
+// `tc` (a view word: no undo step, no dirty) cycles off -> timecode -> frames -> seconds -> off; off is the default, so every
+// paint is today's (an existing pin holds the labels-on row all BG with no message). On, the readout paints inside
+// `paint_message` through the one `Labels` hook at x 4 clipped to the row's left half and the message moves to the right half;
+// the row exists only with labels on, as the message's. Timecode is `edl::timecode`; fps is the ruler's (`fps()` else 25).
+// Owed: NLE-TC-KERNEL (the kernel Player's message row), NLE-TC-KEY, NLE-TC-SET (`tc <unit>`), NLE-TC-DROPFRAME.
+
+/// STRIATIMECODEDISPLAY (SR872): the playhead readout's unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcUnit {
+    Timecode,
+    Frames,
+    Seconds,
+}
+
+impl TcUnit {
+    /// The unit's word (the witness's `"tc"` value).
+    pub fn word(self) -> &'static str {
+        match self {
+            TcUnit::Timecode => "timecode",
+            TcUnit::Frames => "frames",
+            TcUnit::Seconds => "seconds",
+        }
+    }
+}
+
+/// STRIATIMECODEDISPLAY (SR872): tick `t` at `fps` in `unit`: `HH:MM:SS:FF` ([`timeline_core::edl::timecode`]), the tick count,
+/// or `S.CC s` (integer hundredths); a negative tick reads as 0.
+pub fn tc_text(t: i64, fps: u32, unit: TcUnit) -> String {
+    let (t, fps) = (t.max(0), fps.max(1) as i64);
+    match unit {
+        TcUnit::Timecode => timeline_core::edl::timecode(t, fps as u32),
+        TcUnit::Frames => t.to_string(),
+        TcUnit::Seconds => {
+            let cs = t * 100 / fps;
+            format!("{}.{:02} s", cs / 100, cs % 100)
+        }
+    }
+}
+
+impl Face {
+    /// The `tc` word: the next unit in the cycle (off first); `None` for any other word.
+    fn tc_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "tc" {
+            return None;
+        }
+        self.tc = match self.tc {
+            None => Some(TcUnit::Timecode),
+            Some(TcUnit::Timecode) => Some(TcUnit::Frames),
+            Some(TcUnit::Frames) => Some(TcUnit::Seconds),
+            Some(TcUnit::Seconds) => None,
+        };
+        Some(true)
+    }
+    /// The readout's unit (`None`: off).
+    pub fn tc_unit(&self) -> Option<TcUnit> {
+        self.tc
+    }
+    /// The playhead in the readout's unit while it is on.
+    pub fn tc_readout(&self) -> Option<String> {
+        let fps = self.state.timeline.fps().unwrap_or(25).max(1);
+        self.tc.map(|u| tc_text(self.state.playhead, fps, u))
+    }
+    /// The message's left edge: 0 with the readout off, the row's middle with it on.
+    fn tc_split(&self, l: Layout) -> u32 {
+        if self.tc.is_some() { l.w / 2 } else { 0 }
+    }
+    /// The readout over the message row's left half (called by `paint_message` once the row is known to show); unchanged off.
+    fn paint_tc(&self, px: Vec<u8>, l: Layout) -> Vec<u8> {
+        let (Some(style), Some(text)) = (self.labels.as_ref(), self.tc_readout()) else { return px };
+        let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
+        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, (l.w / 2) as i32));
+        c.px
+    }
+}
+
+#[cfg(test)]
+mod striatimecodedisplay_tests {
+    use super::*;
+
+    /// The three units at 312 @ 25 fps, tick 0, 30 fps, and a negative tick (read as 0).
+    #[test]
+    fn striatimecodedisplay_tc_text_units() {
+        assert_eq!(tc_text(312, 25, TcUnit::Timecode), "00:00:12:12");
+        assert_eq!(tc_text(312, 25, TcUnit::Frames), "312");
+        assert_eq!(tc_text(312, 25, TcUnit::Seconds), "12.48 s");
+        assert_eq!(tc_text(0, 25, TcUnit::Seconds), "0.00 s");
+        assert_eq!(tc_text(45, 30, TcUnit::Timecode), "00:00:01:15");
+        assert_eq!(tc_text(45, 30, TcUnit::Seconds), "1.50 s");
+        assert_eq!(tc_text(-3, 25, TcUnit::Timecode), "00:00:00:00");
+        assert_eq!(tc_text(-3, 25, TcUnit::Frames), "0");
+        assert_eq!(tc_text(-3, 25, TcUnit::Seconds), "0.00 s");
+        assert_eq!([TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds].map(TcUnit::word), ["timecode", "frames", "seconds"]);
     }
 }
