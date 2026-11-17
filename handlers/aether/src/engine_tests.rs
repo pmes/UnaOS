@@ -5028,4 +5028,78 @@ mod tests {
         assert!(!o.synth_bold && o.synth_oblique && text_host::is_installed(o));
         assert!(std::ptr::eq(o, crate::fonts::load_face_synth(&info, false, true).unwrap()), "the cache's oblique-only object");
     }
+
+    // ---- AETHERFONTSYNTHESISCSSOM (LEDGER SR764): the font-synthesis shorthand expands and serializes canonically (named tail block) ----
+
+    /// AETHERFONTSYNTHESISCSSOM (SR764): a page for the CSSOM checks (no font needed: nothing here reads pixels).
+    fn font_synth_cssom_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+              <div id="a"></div>
+              <div id="lw" style="font-synthesis-weight:none"></div>
+              <div id="ls" style="font-synthesis-style:none"></div>
+              <div id="sw" style="font-synthesis:style weight"></div>
+              <section style="font-synthesis-weight:none"><div id="kid" style="font-synthesis-style:none"></div><div id="kid2"></div></section>
+            </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn font_synth_eval(engine: &mut crate::AetherEngine, expr: &str) -> String {
+        engine.js_engine.as_mut().unwrap().eval_string(expr).unwrap()
+    }
+
+    /// AETHERFONTSYNTHESISCSSOM (SR764): `el.style.fontSynthesis` expands into its two longhands and serializes from
+    /// them in css-fonts-4 / Chromium canonical order; `small-caps` is parsed and dropped; an invalid value leaves the
+    /// declaration; a CSS-wide keyword reaches both longhands; cssText recomposes the shorthand.
+    #[test]
+    fn font_synthesis_cssom_expands_and_serializes() {
+        let mut e = font_synth_cssom_engine();
+        let set = |e: &mut crate::AetherEngine, v: &str| {
+            font_synth_eval(e, &format!("var s = document.getElementById('a').style; s.fontSynthesis = '{v}'; [s.fontSynthesis, s.fontSynthesisWeight, s.fontSynthesisStyle].join('|')"))
+        };
+        assert_eq!(set(&mut e, "style weight"), "weight style|auto|auto");
+        assert_eq!(set(&mut e, "weight style"), "weight style|auto|auto");
+        assert_eq!(set(&mut e, "none"), "none|none|none");
+        assert_eq!(set(&mut e, "weight"), "weight|auto|none");
+        assert_eq!(set(&mut e, "style"), "style|none|auto");
+        assert_eq!(set(&mut e, "small-caps"), "none|none|none", "small-caps parsed and dropped (AETHER-FONT-SYNTHESIS-SMALLCAPS owed)");
+        assert_eq!(set(&mut e, "weight small-caps"), "weight|auto|none");
+        assert_eq!(set(&mut e, "bold"), "weight|auto|none", "an invalid value leaves the declaration");
+        assert_eq!(set(&mut e, "weight weight"), "weight|auto|none", "a repeated keyword is invalid");
+        assert_eq!(set(&mut e, "inherit"), "inherit|inherit|inherit");
+        let r = font_synth_eval(
+            &mut e,
+            "var s = document.getElementById('a').style; s.fontSynthesis = 'style weight'; s.fontSynthesisStyle = 'none'; \
+             var a = [s.fontSynthesis, s.cssText]; s.fontSynthesisWeight = 'bogus'; a.push(s.fontSynthesisWeight); \
+             s.setProperty('font-synthesis-weight', 'none'); a.push(s.getPropertyValue('font-synthesis')); \
+             s.removeProperty('font-synthesis'); a.push(s.fontSynthesisWeight + '/' + s.cssText); a.join('|')",
+        );
+        assert_eq!(r, "weight|font-synthesis: weight;|auto|none|/");
+    }
+
+    /// AETHERFONTSYNTHESISCSSOM (SR764): getComputedStyle recomposes `font-synthesis` from its longhands' computed
+    /// values: the initial `weight style`, a shorthand set in reversed order, a longhand alone (`style` / `weight`, not
+    /// the parent's shorthand), each longhand inherited on its own, and a value set through `el.style`.
+    #[test]
+    fn font_synthesis_cssom_computed_style() {
+        let mut e = font_synth_cssom_engine();
+        let cs = |e: &mut crate::AetherEngine, id: &str, p: &str| {
+            font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{p}')"))
+        };
+        for (id, want) in [("a", "weight style"), ("sw", "weight style"), ("lw", "style"), ("ls", "weight"), ("kid", "none"), ("kid2", "style")] {
+            assert_eq!(cs(&mut e, id, "font-synthesis"), want, "#{id}: computed font-synthesis");
+        }
+        assert_eq!(cs(&mut e, "lw", "font-synthesis-weight"), "none");
+        assert_eq!(cs(&mut e, "lw", "font-synthesis-style"), "auto");
+        assert_eq!(cs(&mut e, "kid2", "font-synthesis-weight"), "none", "the longhand inherits");
+        font_synth_eval(&mut e, "document.getElementById('a').style.fontSynthesis = 'none'; ''");
+        assert_eq!(cs(&mut e, "a", "font-synthesis"), "none");
+        font_synth_eval(&mut e, "document.getElementById('a').style.fontSynthesisWeight = 'auto'; ''");
+        assert_eq!(cs(&mut e, "a", "font-synthesis"), "weight");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('sw')).fontSynthesis"), "weight style");
+    }
+
 }
