@@ -22,8 +22,9 @@
 //!   fullness (1/8 of it) and caps it at the bucket's room; VBR scales it by the picture's complexity
 //!   against its type's running mean (x1/2 ..x4: a complex picture spends more), corrects 1/32 of
 //!   the long-term error and caps it at the max bucket's room.
-//! - the picture QP: the smallest q in [ref - 6, ref + 6] (ref the last QP of the type) and in
-//!   [16, 51] whose predicted bits meet the target, written as slice_qp_delta; within the picture
+//! - the picture QP (`Rc::picture`): a coded type the smallest q in [refq - [`PIC_STEP`], refq + [`PIC_STEP`]] and in [floor, 51] whose predicted bits meet the
+//!   target, an uncoded type refq; refq = the type's last QP, the first P after an IDR the I QP + [`IP_QP_OFFSET`] (SR844, pinned by `firstp_ipoffset_steady_scene_idr`),
+//!   an uncoded type the last picture's (+ [`B_QP_OFFSET`] for a B); a two-pass plan replaces it (`pass2_pick`, [`qpstep_clamp`] SR769), written as slice_qp_delta; within the picture
 //!   each macroblock row's QP moves by up to +-3 from it by the running bits against the row's share
 //!   of the target (the rows' SAD), written as mb_qp_delta (lib.rs `write_mb`, QPY,pred tracked as
 //!   h264_core's `mb.rs` does).
@@ -52,7 +53,7 @@ use crate::{Encoder, Error, Pic, Result, B_QP_OFFSET};
 pub const QP_MIN: i32 = 16;
 /// The highest QP the rate controller picks (the Recommendation's QPY limit).
 pub const QP_MAX: i32 = 51;
-/// The largest change of a picture's QP from the last picture of its type.
+/// The half-width of a picture's QP window around its refq (`Rc::picture`, the module doc's rule).
 pub const PIC_STEP: i32 = 6;
 /// The largest offset of a macroblock row's QP from its picture's QP.
 pub const ROW_STEP: i32 = 3;
