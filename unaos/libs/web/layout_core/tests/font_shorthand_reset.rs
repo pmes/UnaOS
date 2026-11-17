@@ -408,6 +408,54 @@ fn font_inherit_leaves_inherited_rest() {
     assert_eq!(INHERIT_FONT & (INHERIT_WHITE_SPACE | INHERIT_DIRECTION | INHERIT_LIST_STYLE), 0);
 }
 
+// ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor writes the colour inherit bit (named tail block) ----
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2: `currentcolor` on `color` itself is `inherit`: in any case it
+/// clears an earlier colour in the block and sets the colour bit (the `is_neutral_keyword` drop kept the earlier colour);
+/// a later value in the block beats it.
+#[test]
+fn currentcolor_on_color_sets_inherit_bit() {
+    for kw in ["currentcolor", "currentColor", "CURRENTCOLOR"] {
+        let s = styled(&[("color", "blue"), ("color", kw)]);
+        assert_eq!(s.paint.inherit, INHERIT_COLOR, "color: {kw} sets the colour bit");
+        assert_eq!(s.paint.color, None, "color: {kw} clears the earlier colour");
+    }
+    let s = styled(&[("color", "currentcolor"), ("color", "green")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "a later value beats the bit");
+    assert!(s.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): `.a { color: blue } .a.b { color: currentcolor }`: the later rule clears the
+/// earlier rule's colour and sets the bit through merge_paint's `merge_inherit`.
+#[test]
+fn merge_paint_currentcolor_beats_earlier_rule() {
+    let mut dst = styled(&[("color", "blue")]);
+    assert!(dst.paint.color.is_some(), "the earlier rule's colour (armed)");
+    merge_paint(&mut dst.paint, &styled(&[("color", "currentcolor")]).paint);
+    assert_eq!(dst.paint.color, None, "the later currentcolor cleared the earlier colour");
+    assert!(dst.paint.inherits(INHERIT_COLOR), "the later currentcolor set the bit");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): the OTHER colour properties are pinned as measured, none of them touching the
+/// inherit bits: outline-color's `Some(None)` is THE currentColor marker (render's focusring `current_color` reads it);
+/// border has no marker and paints the arm's grey (128, 128, 128); background-color drops it, an earlier background
+/// stands (AETHER-CSS-CURRENTCOLOR-REST owed); a font longhand's `currentcolor` sets no bit.
+#[test]
+fn currentcolor_other_properties_pinned() {
+    let s = styled(&[("color", "red"), ("outline-color", "currentcolor")]);
+    assert_eq!(s.paint.outline_color, Some(None), "outline-color: currentcolor is the marker");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("border", "1px solid currentcolor")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, (128, 128, 128))); 4]), "border: currentcolor paints grey today (owed)");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("background-color", "blue"), ("background-color", "currentcolor")]);
+    assert_eq!(s.paint.background, styled(&[("background-color", "blue")]).paint.background, "the earlier background stands (owed)");
+    assert!(s.paint.background.is_some(), "armed: blue parsed");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("font-style", "italic"), ("font-style", "currentcolor")]);
+    assert_eq!(s.paint.inherit, 0, "font-style: currentcolor sets no bit");
+}
+
 // ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): the six system-font keywords of font (named tail block) ----
 
 /// AETHERFONTSHORTHANDSYSTEM (SR1022): css-fonts-4 §4.3.1's six system-font keywords.

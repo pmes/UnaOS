@@ -3653,7 +3653,7 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
 /// inherited, so `unset` == `inherit` (css-cascade-4 §7.3.3).
 fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool {
     let bit = crate::paint::inherit_bit(prop);
-    if bit == 0 || !(value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset")) {
+    if bit == 0 || !(value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") || (bit == crate::paint::INHERIT_COLOR && value.eq_ignore_ascii_case("currentcolor"))) { // AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2 color: currentcolor == inherit
         return false;
     }
     paint.set_inherit(bit);

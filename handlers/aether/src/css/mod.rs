@@ -1280,10 +1280,10 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_PROPS: [&str; 20] = [
+pub const REPORT_COLS: usize = 21; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
-    "border-left-color", "padding-top", "margin-top", "flex-direction",
+    "border-left-color", "padding-top", "margin-top", "flex-direction", "direction",
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1293,7 +1293,7 @@ pub const REPORT_PROPS: [&str; 20] = [
 /// propagation); box properties come from the taffy style; the values Aether does not model are
 /// reported as what it effectively uses (sans/serif/monospace classes, solid borders, no list markers,
 /// static for every non-absolute position). An element without a box reports `display: none`.
-pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core::NodeId, [String; 20]> {
+pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core::NodeId, [String; REPORT_COLS]> {
     use std::collections::HashMap;
     #[derive(Clone)]
     struct Inh {
@@ -1305,7 +1305,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         line_height: f32,
         text_align: u8,
         underline: bool,
-        nowrap: bool, white_space: u8, list_style: u8,
+        nowrap: bool, white_space: u8, list_style: u8, rtl: bool,
         hidden: bool,
     }
     fn num(v: f32) -> String {
@@ -1345,7 +1345,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1378,7 +1378,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(nw) = paint.nowrap {
                 me.nowrap = nw;
             }
-            me.white_space = paint.white_space.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WHITE_SPACE, parent.white_space, |w| crate::layout::default_white_space(tag, w))); me.list_style = crate::render::list_style_of(tag, parent.list_style, &paint, &any.node_at(id));
+            me.white_space = paint.white_space.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WHITE_SPACE, parent.white_space, |w| crate::layout::default_white_space(tag, w))); me.list_style = crate::render::list_style_of(tag, parent.list_style, &paint, &any.node_at(id)); me.rtl = paint.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_DIRECTION, parent.rtl, |r| crate::layout::default_rtl(&any.node_at(id), r)));
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
@@ -1432,7 +1432,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
                 st.as_ref().map(|s| lp(s.padding.top)).unwrap_or_else(|| px(0.0)),
                 st.as_ref().map(|s| lpa_s(s.margin.top)).unwrap_or_else(|| px(0.0)),
-                flex_direction.to_string(),
+                flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(),
             ];
             out.insert(id, values);
             inh.insert(id, me);
