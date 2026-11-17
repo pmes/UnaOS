@@ -5537,4 +5537,66 @@ mod tests {
         assert_eq!(cs(&mut e, "fsh", "fontVariantCaps"), "normal", "the invalid shorthand sets no caps");
         assert_eq!(cs(&mut e, "fsh", "fontSize"), "16px", "the invalid shorthand sets no size");
     }
+
+    // ---- AETHERFONTSHORTHANDINHERIT (LEDGER SR810): font: inherit / unset / initial reach the longhands (named tail block) ----
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): one line per probe under a `font: italic 20px serif` parent: a plain child
+    /// (the reference), `font: inherit` and `font: unset` after same-block longhands, `font: initial`, and three buttons
+    /// (`font: inherit`, a `font-size: 20px` twin, and a plain one at the control default).
+    fn font_wide_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font:italic 20px serif"><span id="ref">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="inh" style="font-style:normal;font-size:12px;font:inherit">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="uns" style="font-size:12px;font:unset">Hello</span></div>
+            <div style="font:italic 20px serif"><span id="ini" style="font:initial">Hello</span></div>
+            <div style="font:italic 20px serif"><button id="btn" style="font:inherit">Go</button></div>
+            <div style="font:italic 20px serif"><button id="pbtn" style="font-size:20px">Go</button></div>
+            <div style="font:italic 20px serif"><button id="ubtn">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): getComputedStyle: the `font: inherit` / `font: unset` children read the
+    /// parent's italic 20px past their own earlier longhands; the `font: initial` child reads upright 16px.
+    #[test]
+    fn font_inherit_cssom() {
+        let mut e = font_wide_engine();
+        for id in ["inh", "uns"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "italic", "#{id} inherits the parent's style");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontSize"), "20px", "#{id} inherits the parent's size");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "ini", "fontStyle"), "normal", "font: initial is upright");
+        assert_eq!(font_shorthand_cs(&mut e, "ini", "fontSize"), "16px", "font: initial is medium");
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): the inherit reaches layout and paint: the `font: inherit` and `font: unset`
+    /// runs paint the reference run's ink column for column; the `font: initial` run does not (armed).
+    #[test]
+    fn font_inherit_ink() {
+        let mut e = font_wide_engine();
+        let reference = small_caps_ink_columns(&mut e, "ref");
+        assert!(reference.iter().sum::<usize>() > 20, "the reference run paints");
+        for id in ["inh", "uns"] {
+            assert_eq!(small_caps_ink_columns(&mut e, id), reference, "#{id}: the parent's italic 20px ink");
+        }
+        assert_ne!(small_caps_ink_columns(&mut e, "ini"), reference, "font: initial is not the parent's font (armed)");
+    }
+
+    /// AETHERFONTSHORTHANDINHERIT (SR810): `button { font: inherit }` (every reset sheet's line) takes the parent's
+    /// 20px: its box is the `font-size: 20px` twin's, not the 13.333px control default's (armed by the plain button).
+    /// The family stays the control family and cssom reads the raw size (AETHER-CSS-WIDE-LONGHANDS,
+    /// AETHER-CSSOM-FONT-SIZE-REL owed), so the box is the pin.
+    #[test]
+    fn font_inherit_button_takes_parent_size() {
+        let mut e = font_wide_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "btn");
+        let (_, _, pw, ph) = imgalt_rect(&mut e, "pbtn");
+        let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
+        assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
+        assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+    }
 }
