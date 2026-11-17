@@ -146,3 +146,35 @@ fn nlexfadepower_xfade_weight_tracks_sine_and_cosine() {
     // clamped past the end; linear the identity
     assert_eq!((xfade_weight(Curve::EqualPower, ENV_ONE + 9), xfade_weight(Curve::Linear, ENV_ONE + 9)), (ENV_ONE, ENV_ONE));
 }
+
+// ---- STRIAKSPEED (SR9012): the speed a layer plays at and its effective rate, lifted from Stria's render for the kernel Player.
+
+#[test]
+fn striakspeed_layer_rate_rated_under_and_handle() {
+    use timeline_core::schedule::{AudioRun, ENV_ONE, Layer, audio_runs};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0).at_rate(0x2_0000), Clip::new(a, 30, 40, 10)];
+    let runs = audio_runs(&tl, 0..20, &Gop { dur: 50 }).unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!((runs[0].out_t, runs[0].len, runs[0].layer_rate(&tl, 0)), (0, 10, 0x2_0000), "the 2x clip's layer plays at 2x");
+    assert_eq!((runs[1].out_t, runs[1].layer_rate(&tl, 0)), (10, 0x1_0000), "a 1x clip's layer plays at 1x");
+    assert_eq!(runs[0].layer_rate(&tl, 7), 0x1_0000, "no such layer: 1x");
+    // a crossfade's under layer (the next layer is of the same track) plays its handle at 1x
+    let l = Layer { track: 0, src: a, src_t: 0, seek: None, gain_cdb: 0, env: [ENV_ONE, ENV_ONE] };
+    let run = AudioRun { out_t: 0, len: 4, layers: vec![l, l] };
+    assert_eq!((run.layer_rate(&tl, 0), run.layer_rate(&tl, 1)), (0x1_0000, 0x2_0000));
+    // a layer no clip of its source covers at the run's first tick (a handle past the clip's end) plays 1x
+    let past = AudioRun { out_t: 25, len: 2, layers: vec![l] };
+    assert_eq!(past.layer_rate(&tl, 0), 0x1_0000);
+}
+
+#[test]
+fn striakspeed_rated_hz_rounds_and_1x_is_identity() {
+    use timeline_core::schedule::rated_hz;
+    assert_eq!((rated_hz(48_000, 0x1_0000), rated_hz(48_000, 0)), (48_000, 48_000), "1x and the unset rate are the rate");
+    assert_eq!((rated_hz(48_000, 0x2_0000), rated_hz(48_000, 0x8000), rated_hz(44_100, 0x3_0000)), (24_000, 96_000, 14_700));
+    assert_eq!(rated_hz(3, 0x2_0000), 2, "1.5 rounds half up");
+    assert_eq!(rated_hz(1, 0x10_0000), 1, "never below 1 Hz");
+}
