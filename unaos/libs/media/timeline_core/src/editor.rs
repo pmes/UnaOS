@@ -2204,7 +2204,7 @@ impl EditorState {
     /// STRIAFREEZEFRAME: the `freeze` word (`None` for any other word); STRIAFREEZELEN (SR916): and `freeze-all`, each with an
     /// optional length ([`freeze_words`]).
     fn freeze_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        freeze_words(v, self.timeline.fps()).map(|w| w.and_then(|(n, all)| self.freeze(n, all))
+        freeze_words(v, self.timeline.fps()).map(|w| w.and_then(|(n, all)| self.freeze(n, all)))
     }
 }
 
