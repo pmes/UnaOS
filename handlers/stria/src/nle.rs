@@ -537,7 +537,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
-                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; let rgba = cropped(tl, s.track, s.out_t, false, rgba, fw, fh, reel_fit(tl, src, s.vmix.is_none())); // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
                 sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
@@ -721,7 +721,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            cropped(tl, s.track, s.out_t, true, reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0, w, h, reel_fit(tl, src, false)) // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -987,4 +987,18 @@ impl Sources {
         let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
+}
+
+// ---- STRIACROP (LEDGER SR867): a step's frame through the clip's crop (named tail block) ----
+/// The RGBA `rgba` (`w x h`) a video step on `track` at `out_t` holds, through its clip's crop (`outgoing`: a transition's
+/// outgoing clip, `Timeline::crop_at`) by timeline_core's ONE crop pass `crop_frame`, placed by the reel's policy `fit` over
+/// the preview band's black `FIELD`. No crop (or no track): `rgba` as it came, byte for byte.
+#[allow(clippy::too_many_arguments)]
+fn cropped(tl: &Timeline, track: Option<usize>, out_t: i64, outgoing: bool, rgba: Vec<u8>, w: u32, h: u32, fit: SizePolicy) -> Vec<u8> {
+    let crop = track.map_or(timeline_core::Crop::NONE, |ti| tl.crop_at(ti, out_t, outgoing));
+    if crop == timeline_core::Crop::NONE {
+        return rgba;
+    }
+    let (px, _) = rgba.as_chunks::<4>();
+    timeline_core::crop_frame(px, w as usize, h as usize, crop, fit, timeline_core::view::FIELD).into_flattened()
 }

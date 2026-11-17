@@ -1052,6 +1052,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         );
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
+    if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.crop != timeline_core::Crop::NONE)) { return Err(("crop-unsupported", Some(String::from("the EDL crops a clip (* UNA CROP): the Player's frame road has no crop pass")))); } // NLE-CROP-KERNEL (SR867): a cropped clip refused by name, not shown uncropped (STRIACROP, LEDGER SR867)
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?;
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();

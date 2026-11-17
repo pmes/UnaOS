@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+            crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             if l.starts_with("* UNA XFADE") {
@@ -438,7 +438,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.end(), fps)
         ));
         s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
-        if c.gain_cdb != 0 {
+        s.push_str(&crop_line(c)); if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
         if c.fade_in != 0 || c.fade_out != 0 {
@@ -624,4 +624,34 @@ fn mark_line(tl: &Timeline) -> String {
         (None, None) => String::new(),
         (a, b) => format!("* UNA MARK {} {}\n", word(a), word(b)),
     }
+}
+
+// ---- STRIACROP (LEDGER SR867): the clip's `* UNA CROP` line (named tail block) ----
+// `* UNA CROP <l> <t> <r> <b>` belongs to the VIDEO event line just above it (the per-clip comment shape of `* UNA GAIN`),
+// four integers in 1/1000 of the frame ([`crate::Crop`]), written only when the clip has a crop, so an EDL with no crop
+// writes as before. One with no video event above it (none, a `BL` event, an audio event), not four integers, a crop
+// keeping no picture, or a second CROP for one event is a syntax error.
+
+/// STRIACROP: apply a `* UNA CROP` line to the video event above it (`None`: none there); any other line is not this one.
+fn crop_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA CROP ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let n: Vec<Option<u16>> = r.split_whitespace().map(|x| x.parse().ok()).collect();
+    let crop = match n.as_slice() {
+        [Some(l), Some(t), Some(r), Some(b)] => crate::Crop { l: *l, t: *t, r: *r, b: *b },
+        _ => return Err(EdlError::Syntax { line }),
+    };
+    if !crop.ok() || crop == crate::Crop::NONE || c.crop != crate::Crop::NONE {
+        return Err(EdlError::Syntax { line });
+    }
+    c.crop = crop;
+    Ok(())
+}
+
+/// STRIACROP: the clip's `* UNA CROP` line, or nothing when it has no crop.
+fn crop_line(c: &Clip) -> String {
+    if c.crop == crate::Crop::NONE {
+        return String::new();
+    }
+    format!("* UNA CROP {} {} {} {}\n", c.crop.l, c.crop.t, c.crop.r, c.crop.b)
 }

@@ -186,6 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -856,5 +857,26 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIACROP (LEDGER SR867): the witness's crop token (named tail block) ----
+#[cfg(test)]
+mod striacrop_tests {
+    use super::*;
+
+    /// STRIACROP (SR867): `crop:L:T:R:B` is timeline_core's `crop L T R B` on the selected clip (one undo step, the clip
+    /// carries it); a short token is a bad token; a crop keeping no picture is refused by name on the message row.
+    #[test]
+    fn striacrop_witness_crop_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,crop:250:0:250:0");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.undo_depth(), 1);
+        assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 250, t: 0, r: 250, b: 0 }));
+        assert_eq!(drive(&mut face, "crop:1:2"), vec!["bad token crop:1:2".to_string()]);
+        assert_eq!(drive(&mut face, "crop:900:0:200:0"), vec![format!("crop 900 0 200 0: {}", timeline_core::EditError::Crop)]);
+        assert_eq!(face.state.undo_depth(), 1);
     }
 }
