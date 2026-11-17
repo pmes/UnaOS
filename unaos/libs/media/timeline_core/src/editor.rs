@@ -667,7 +667,7 @@ impl EditorState {
 // [`EditorState::move_set`], the same op and ONE commit `nudge-` / `nudge+` take; a refusal leaves the state unchanged.
 
 /// `nudge <d>` (signed, nonzero ticks) -> `d`; any other shape (`nudge 0`, `nudge x`, `nudge 1 2`) is not this verb.
-fn nudge_words(v: &str) -> Option<i64> {
+pub fn nudge_words(v: &str) -> Option<i64> {
     let mut w = v.split_ascii_whitespace();
     if w.next() != Some("nudge") {
         return None;

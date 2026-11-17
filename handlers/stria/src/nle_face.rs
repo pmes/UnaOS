@@ -3078,7 +3078,7 @@ impl Face {
         if !v.starts_with("nudge") {
             return None;
         }
-        let w = slipslide_word(v)?;
+        let w = slipslide_word(v).or_else(|| timeline_core::editor::nudge_words(v).map(|d| format!("nudge {d}")))?; // STRIANUDGEMORE (SR944): and a free `nudge <d>` (its message line too)
         let r = self.state.verb(&w).unwrap_or(Err(EditError::NoClip));
         self.last_error = match r {
             Ok(()) => self.nudge_line(),

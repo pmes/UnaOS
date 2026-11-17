@@ -3612,3 +3612,25 @@ fn strianudge_keys_help_and_the_collisions() {
     assert_eq!(f.state.timeline, tl1);
     println!("strianudge: help rows={} keys={}; Right one frame, a set of two says its count", rows.len(), KEYS.len());
 }
+
+// ---- STRIANUDGEMORE (LEDGER SR944): a free `nudge <d>` rides the face's nudge fn and its message line (named tail block) ----
+
+/// `Face::verb("nudge 5")` moves the selected clip five frames as ONE commit and the message line reads its new `at`, as
+/// the KEYS words do; a refusal reads `nudge: <why>` with the state kept; SR855's `nudge+7` is still not a face word.
+#[test]
+fn strianudgemore_free_count_reads_the_at() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let tl0 = f.state.timeline.clone();
+    f.state.select(0, 2).unwrap();
+    assert!(f.verb("nudge 5"));
+    assert_eq!(f.state.timeline, tl0.move_many(&[(0, 2)], 5).unwrap());
+    assert_eq!(f.state.undo_depth(), 1);
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: at 30 (00:00:01:05)"));
+    let tl1 = f.state.timeline.clone();
+    assert!(f.verb("nudge -1000"));
+    assert_eq!(f.last_error.take().as_deref(), Some("nudge: negative time"));
+    assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl1, 1));
+    assert!(!f.verb("nudge+7"), "nudge+7 is not a face word");
+    assert_eq!(f.state.timeline, tl1);
+    println!("strianudgemore: nudge 5 25 -> 30 in one commit, nudge -1000 refused by name");
+}

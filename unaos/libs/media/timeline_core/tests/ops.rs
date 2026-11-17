@@ -274,3 +274,18 @@ fn strianudge_verb_moves_the_set_by_a_count() {
     assert_eq!(st.verb("nudge 1"), Some(Err(EditError::NoClip)));
     println!("strianudge: nudge 10 / nudge 5 over a set of two, one commit each; -50 Negative, +3 Overlap, deselected NoClip");
 }
+
+// ---- STRIANUDGEMORE (LEDGER SR944): `nudge_words` is the one parser of the free count (named tail block) ----
+
+/// The faces and the witness call `editor::nudge_words` for `nudge <d>` instead of re-parsing it: a signed nonzero count
+/// is taken, any other shape is not the verb.
+#[test]
+fn strianudgemore_nudge_words_is_the_one_parser() {
+    use timeline_core::editor::nudge_words;
+    assert_eq!(nudge_words("nudge -5"), Some(-5));
+    assert_eq!(nudge_words("nudge 10"), Some(10));
+    for v in ["nudge 0", "nudge+", "nudge-10", "nudge 1 2", "nudge x", "nudge", "slip 3"] {
+        assert_eq!(nudge_words(v), None, "{v}");
+    }
+    println!("strianudgemore: nudge_words takes `nudge <d>` only");
+}
