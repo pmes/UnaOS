@@ -7070,3 +7070,120 @@ mod striaksnapshow_tests {
         assert!(!snap_badge_hit(&l, 10.0, y0 as f64));
     }
 }
+
+// ---- STRIAKWAVEPARTIAL (LEDGER SR9102): the painted peak sources (named tail block) ----
+// WHICH audio sources the painted layout shows: every clip on an AUDIO row that is on the canvas, whose body
+// (`x_of(at) + 1 .. x_of(end) - 1`, [`paint_in`]'s body) overlaps `0..w` ([`thumb_want`]'s row and body test). The kernel
+// Player (vplay.rs `peaks_step`) reads it twice: its want asks these sources first (then [`peaks_want`]'s full rule), and
+// it stamps them as painted so a table past its byte cap is evicted least-recently-seen, never one on screen. A table
+// still being scanned is a SHORT table: [`paint_peaks`] paints its scanned columns and leaves the rest of the body flat.
+
+/// The sources of the audio clips layout `l` shows on the canvas (the block's head), rows in order then clips in order,
+/// repeats kept.
+pub fn peaks_seen<'a>(tl: &'a Timeline, l: &'a Layout) -> impl Iterator<Item = crate::SourceId> + 'a {
+    let w = l.w as i64;
+    tl.tracks
+        .iter()
+        .enumerate()
+        .filter(move |(row, tr)| {
+            let y = l.row_y(*row);
+            tr.kind == Kind::Audio && y < l.h as i64 && y + ROW_H as i64 > 0
+        })
+        .flat_map(move |(_, tr)| {
+            tr.clips
+                .iter()
+                .filter(move |c| {
+                    let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+                    x1 > 0 && x0 < w && x1 > x0
+                })
+                .map(|c| c.src)
+        })
+}
+
+#[cfg(test)]
+mod striakwavepartial_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// Sources A..D (A=0); track 0 video (D), track 1 audio (A on screen, B far off), track 2 audio (C then A on screen).
+    fn st() -> EditorState {
+        let mut tl = Timeline::new(25);
+        for n in ["A", "B", "C", "D"] {
+            tl.add_source(n, 100_000);
+        }
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(SourceId(3), 0, 50, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(SourceId(0), 0, 20, 0), Clip::new(SourceId(1), 0, 20, 90_000)];
+        tl.tracks[2].clips = alloc::vec![Clip::new(SourceId(2), 0, 20, 5), Clip::new(SourceId(0), 0, 20, 30)];
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striakwavepartial_peaks_seen_audio_on_canvas_only() {
+        let st = st();
+        let l = Layout::of(480, 200, &st);
+        let seen: Vec<SourceId> = peaks_seen(&st.timeline, &l).collect();
+        assert_eq!(seen, alloc::vec![SourceId(0), SourceId(2), SourceId(0)], "audio rows, clips on the canvas, in order; the video row and the far clip never");
+        let mut short = l;
+        short.h = l.row_y(2) as u32;
+        let seen: Vec<SourceId> = peaks_seen(&st.timeline, &short).collect();
+        assert_eq!(seen, alloc::vec![SourceId(0)], "a row below the canvas shows nothing");
+        std::println!("striakwavepartial: seen {seen:?}");
+    }
+
+    #[test]
+    fn striakwavepartial_visible_first_then_the_full_rule() {
+        let mut st = st();
+        st.timeline.tracks[1].clips = alloc::vec![Clip::new(SourceId(1), 0, 20, 90_000)];
+        st.timeline.tracks[2].clips = alloc::vec![Clip::new(SourceId(2), 0, 20, 5)];
+        let l = Layout::of(480, 200, &st);
+        let tl = &st.timeline;
+        let want = |have: &dyn Fn(SourceId) -> bool| peaks_seen(tl, &l).find(|s| !have(*s)).or_else(|| peaks_want(tl, have));
+        assert_eq!(peaks_want(tl, &|_| false), Some(SourceId(1)), "the full rule asks the earlier, off-canvas source");
+        assert_eq!(want(&|_| false), Some(SourceId(2)), "the painted source first");
+        assert_eq!(want(&|s| s == SourceId(2)), Some(SourceId(1)), "then the full rule");
+        assert_eq!(want(&|_| true), None);
+    }
+
+    /// A hook holding one table for every source, unit gain.
+    struct One(Peaks);
+    impl PeakSource for One {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, _cdb: i32) -> i64 {
+            65536
+        }
+    }
+
+    /// The first second of a 2-s table (a scan in progress) paints the full table's columns up to tick 25 (bucket 100) and
+    /// the flat body from there on.
+    #[test]
+    fn striakwavepartial_short_table_paints_the_scanned_part() {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(SourceId(0), 0, 50, 0)];
+        let st = EditorState::new(tl);
+        let l = Layout::of(480, 160, &st);
+        let buckets: Vec<u8> = (0..200u32).map(|i| (i * 37 % 256) as u8).collect();
+        let full = paint_in(&st, l, Order::Rgba, None, None, Some(&One(Peaks { per_sec: PEAKS_PER_SEC, buckets: buckets.clone() })));
+        let half = paint_in(&st, l, Order::Rgba, None, None, Some(&One(Peaks { per_sec: PEAKS_PER_SEC, buckets: buckets[..100].to_vec() })));
+        let flat = paint_in(&st, l, Order::Rgba, None, None, None);
+        let col = |buf: &[u8], x: i64| -> Vec<u8> { (0..l.h as usize).flat_map(|y| { let i = (y * l.w as usize + x as usize) * 4; buf[i..i + 4].to_vec() }).collect() };
+        let edge = l.x_of(25);
+        assert!(edge > 2 && edge < l.w as i64, "the scanned edge is on the canvas");
+        for x in 1..l.w as i64 {
+            if x + 1 <= edge {
+                assert_eq!(col(&half, x), col(&full, x), "column {x}: scanned, painted as the full table");
+            } else {
+                assert_eq!(col(&half, x), col(&flat, x), "column {x}: not scanned yet, the flat body");
+            }
+        }
+        assert_ne!(half, flat, "the scanned part paints");
+        assert_ne!(half, full, "the unscanned part does not");
+    }
+}

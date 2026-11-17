@@ -3384,35 +3384,41 @@ fn thumbs_close() {
 // bucket-aligned, so the table is the one-call table), decoded through audio_core's ONE door (`container::open_demuxed`
 // over the reel's demuxer share, snd's door, from the stream top; no mixer, so the silent-twin image paints it too) and
 // reduced by THE ONE `view::peaks_of`; the decode never holds THUMBS (the paint's `try_lock` keeps its stills). A finished
-// table lands in the map and marks [`BAND_DIRTY`]. RULES: a reel with no audio track caches `None`; one audio_core does
-// not play, or its door refuses, caches `None` and counts refused; REFUSED BY SIZE: a table over KPEAK_MAX buckets (one
+// table lands in the map and marks [`BAND_DIRTY`] (STRIAKWAVEPARTIAL SR9102: the table is published as it grows; the
+// want asks the painted sources first and evicts least-recently-seen tables for them; see that block).
+// RULES: a reel with no audio track caches `None`; one audio_core does not play, or its door refuses, caches `None` and counts refused; REFUSED BY SIZE: a table over KPEAK_MAX buckets (one
 // hour) or past KPEAK_BYTES across the held tables (by the track's stated duration first, then by the buckets made)
-// caches `None`. No eviction (the want is every audio clip, not the visible ones: evicting would rescan forever). The
+// caches `None` (SR9102: a painted source evicts off-canvas tables first; an off-canvas one is deferred, not cached). The
 // tables go with the EDL path (`KThumbs` is per path) and with the Player ([`thumbs_close`]). The scan's table may differ
 // from the host face's by its origin (the host decodes from the stream's first presentation time).
-// Wire: `[nle] peaks edl=<path> scans=<n> held=<n> refused=<n> bytes=<n> ms_max=<n>` each time the want runs dry after a scan.
-// Owed: NLE-WAVEFORM-KERNEL-WITNESS, NLE-WAVEFORM-KERNEL-EVICT, NLE-WAVEFORM-KERNEL-PARTIAL (a long scan paints nothing until
-// done), NLE-WAVEFORM-KERNEL-ORIGIN.
+// Wire: `[nle] peaks edl=<path> scans=<n> held=<n> refused=<n> evicted=<n> deferred=<n> bytes=<n> ms_max=<n>` each time the
+// want runs dry after a scan.
+// Owed: NLE-WAVEFORM-KERNEL-WITNESS, NLE-WAVEFORM-KERNEL-ORIGIN (EVICT and PARTIAL BUILT by SR9102).
 
 /// STRIAKWAVEFORM (SR9059): one table's most buckets (an hour at `PEAKS_PER_SEC`).
 const KPEAK_MAX: u64 = 360_000;
 /// STRIAKWAVEFORM (SR9059): the most bytes every held table takes together.
 const KPEAK_BYTES: u64 = 2 * 1024 * 1024;
 
-/// STRIAKWAVEFORM (SR9059): the scan in progress: source `src` through its decoder, the table so far, the buckets it may
-/// reach (`cap`), the decode's reused buffer and time.
+/// STRIAKWAVEFORM (SR9059): the scan in progress: source `src` through its decoder, the buckets it may reach (`cap`), the
+/// buckets its stated duration asks (`want`), the buckets published so far (`n`: STRIAKWAVEPARTIAL SR9102, the table
+/// itself is `KThumbs.peaks[src]`, grown each step), the decode's reused buffer and time, the last band mark (`dirty`, ms).
 struct KScanRun {
     src: timeline_core::SourceId,
     dec: audio_core::Decoder,
     rate: u32,
     ch: u16,
     cap: u64,
+    want: u64,
+    n: u64,
     buf: Vec<f32>,
-    p: timeline_core::view::Peaks,
     ms: u64,
+    dirty: u64,
 }
 
-/// STRIAKWAVEFORM (SR9059): the job's scan state for the EDL at `path` and its counters for the wire.
+/// STRIAKWAVEFORM (SR9059): the job's scan state for the EDL at `path` and its counters for the wire. STRIAKWAVEPARTIAL
+/// (SR9102): the want count `stamp`, each painted source's last want (`seen`), the off-canvas sources refused by size
+/// (`deferred`: asked again once painted), the tables evicted.
 struct KScan {
     path: String,
     run: Option<KScanRun>,
@@ -3420,6 +3426,10 @@ struct KScan {
     refused: u64,
     ms_max: u64,
     said: bool,
+    stamp: u64,
+    seen: alloc::collections::BTreeMap<timeline_core::SourceId, u64>,
+    deferred: alloc::collections::BTreeSet<timeline_core::SourceId>,
+    evicted: u64,
 }
 
 static KSCAN: crate::sync::Mutex<Option<KScan>> = crate::sync::Mutex::new(None);
@@ -3435,16 +3445,18 @@ fn kpeaks_extend(p: &mut timeline_core::view::Peaks, more: timeline_core::view::
 }
 
 /// STRIAKWAVEFORM (SR9059): one step of the peak scan for the job `jid` of the EDL at `path` (the block's rules). True: a
-/// step was taken (the caller loops); false: nothing to scan (the caller waits).
+/// step was taken (the caller loops); false: nothing to scan (the caller waits). STRIAKWAVEPARTIAL (SR9102): each step's
+/// buckets are appended to the published table under a short THUMBS lock (the decode outside it), the band marked at most
+/// every KPEAK_PAINT_MS; the want stamps the painted sources, asks them first, then the full rule (deferred skipped).
 fn peaks_step(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline) -> bool {
     use audio_core::AudioDecoder as _;
-    use timeline_core::view::{peaks_of, peaks_want, PEAKS_PER_SEC};
+    use timeline_core::view::{peaks_of, peaks_seen, peaks_want, PEAKS_PER_SEC};
     if GEN.load(Ordering::Acquire) != jid {
         return false;
     }
     let mut g = KSCAN.lock();
     if g.as_ref().is_none_or(|k| k.path != path) {
-        *g = Some(KScan { path: String::from(path), run: None, scans: 0, refused: 0, ms_max: 0, said: false });
+        *g = Some(KScan { path: String::from(path), run: None, scans: 0, refused: 0, ms_max: 0, said: false, stamp: 0, seen: alloc::collections::BTreeMap::new(), deferred: alloc::collections::BTreeSet::new(), evicted: 0 });
     }
     let Some(k) = g.as_mut() else { return false };
     if let Some(r) = k.run.as_mut() {
@@ -3453,45 +3465,85 @@ fn peaks_step(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline)
         let ch = r.ch.max(1) as usize;
         r.buf.resize(step * ch, 0.0);
         let got = r.dec.next(&mut r.buf).unwrap_or(0); // a decode error ends the table where it stands
-        if got > 0 {
-            kpeaks_extend(&mut r.p, peaks_of(r.rate, r.ch, &r.buf[..got * ch], PEAKS_PER_SEC));
-        }
+        let more = if got > 0 { Some(peaks_of(r.rate, r.ch, &r.buf[..got * ch], PEAKS_PER_SEC)) } else { None };
         r.ms += now().saturating_sub(t0);
-        let over = r.p.buckets.len() as u64 > r.cap;
-        if got == step && !over {
+        r.n += more.as_ref().map_or(0, |m| m.buckets.len() as u64);
+        let over = r.n > r.cap;
+        let done = got != step || over;
+        let live = {
+            let mut tg = THUMBS.lock();
+            match tg.as_mut().filter(|t| t.path == path).and_then(|t| t.peaks.get_mut(&r.src)) {
+                Some(e) => {
+                    if over {
+                        *e = None;
+                    } else if let (Some(p), Some(m)) = (e.as_mut(), more) {
+                        kpeaks_extend(p, m);
+                    }
+                    true
+                }
+                None => false, // the EDL's tables went (another EDL, the Player closed): the run ends
+            }
+        };
+        let t1 = now();
+        if live && (done || t1.saturating_sub(r.dirty) >= KPEAK_PAINT_MS) {
+            r.dirty = t1;
+            BAND_DIRTY.store(true, Ordering::Release);
+        }
+        if live && !done {
             return true;
         }
         let Some(r) = k.run.take() else { return true };
         if over {
             k.refused += 1;
-        } else {
+        } else if live {
             k.scans += 1;
         }
         k.ms_max = k.ms_max.max(r.ms);
-        if let Some(t) = THUMBS.lock().as_mut().filter(|t| t.path == path) {
-            t.peaks.insert(r.src, if over { None } else { Some(r.p) });
-        }
-        BAND_DIRTY.store(true, Ordering::Release);
         return true;
     }
     let mut tg = THUMBS.lock();
     let Some(t) = tg.as_mut().filter(|t| t.path == path) else { return false };
-    let bytes: u64 = t.peaks.values().flatten().map(|p| p.buckets.len() as u64).sum();
-    let Some(src) = peaks_want(tl, &|s| t.peaks.contains_key(&s)) else {
-        if !k.said {
-            k.said = true;
-            let held = t.peaks.values().filter(|p| p.is_some()).count();
-            serial_println!("[nle] peaks edl={} scans={} held={} refused={} bytes={} ms_max={}", path, k.scans, held, k.refused, bytes, k.ms_max);
+    k.stamp += 1;
+    let stamp = k.stamp;
+    if let Some(l) = t.l {
+        for s in peaks_seen(tl, &l) {
+            k.seen.insert(s, stamp);
         }
-        return false;
+    }
+    let bytes: u64 = t.peaks.values().flatten().map(kpeaks_bytes).sum();
+    let visible = t.l.and_then(|l| peaks_seen(tl, &l).find(|s| !t.peaks.contains_key(s)));
+    let rest = if visible.is_none() { peaks_want(tl, &|s| t.peaks.contains_key(&s) || k.deferred.contains(&s)) } else { None };
+    let (src, seen) = match (visible, rest) {
+        (Some(s), _) => (s, true),
+        (None, Some(s)) => (s, false),
+        (None, None) => {
+            if !k.said {
+                k.said = true;
+                let held = t.peaks.values().filter(|p| p.is_some()).count();
+                serial_println!("[nle] peaks edl={} scans={} held={} refused={} evicted={} deferred={} bytes={} ms_max={}", path, k.scans, held, k.refused, k.evicted, k.deferred.len(), bytes, k.ms_max);
+            }
+            return false;
+        }
     };
     k.said = false;
-    match peaks_open(reels, src, bytes) {
-        Ok(Some(run)) => k.run = Some(run),
+    k.deferred.remove(&src);
+    let evictable: u64 = if seen { t.peaks.iter().filter(|(s, _)| k.seen.get(*s) != Some(&stamp)).filter_map(|(_, p)| p.as_ref()).map(kpeaks_bytes).sum() } else { 0 };
+    match peaks_open(reels, src, KPEAK_BYTES.saturating_sub(bytes - evictable)) {
+        Ok(Some(mut run)) => {
+            if seen {
+                peaks_evict(t, k, stamp, run.want);
+            }
+            run.dirty = now();
+            t.peaks.insert(src, Some(kpeaks_new()));
+            k.run = Some(run);
+        }
         Ok(None) => {
             t.peaks.insert(src, None);
         }
-        Err(()) => {
+        Err(true) if !seen => {
+            k.deferred.insert(src);
+        }
+        Err(_) => {
             k.refused += 1;
             t.peaks.insert(src, None);
         }
@@ -3499,27 +3551,65 @@ fn peaks_step(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline)
     true
 }
 
-/// STRIAKWAVEFORM (SR9059): source `src`'s scan opened, `held` bytes already in the tables (the block's rules). `Ok(None)`:
-/// no reel or no audio track; `Err(())`: audio_core does not play it, its door refused, or refused by size.
-fn peaks_open(reels: &Reels, src: timeline_core::SourceId, held: u64) -> Result<Option<KScanRun>, ()> {
+/// STRIAKWAVEFORM (SR9059): source `src`'s scan opened within `room` bytes (STRIAKWAVEPARTIAL SR9102: the caller's grant,
+/// the free bytes plus, for a painted source, the evictable ones) (the block's rules). `Ok(None)`: no reel or no audio
+/// track; `Err(true)`: refused by size; `Err(false)`: audio_core does not play it or its door refused.
+fn peaks_open(reels: &Reels, src: timeline_core::SourceId, room: u64) -> Result<Option<KScanRun>, bool> {
     use audio_core::AudioDecoder as _;
     let Some(r) = reels.get(src) else { return Ok(None) };
     let Some((i, _)) = r.a else { return Ok(None) };
     let t = &r.d.tracks()[i];
     if !audio_core::container::plays(r.d.format(), &t.codec) {
-        return Err(());
+        return Err(false);
     }
-    let cap = KPEAK_MAX.min(KPEAK_BYTES.saturating_sub(held));
+    let cap = KPEAK_MAX.min(room);
     let stated = (t.duration_ns as u128 * timeline_core::view::PEAKS_PER_SEC as u128).div_ceil(1_000_000_000) as u64;
     if stated > cap {
-        return Err(());
+        return Err(true);
     }
-    let dec = audio_core::Decoder::from_source(audio_core::container::open_demuxed(r.d.share()).map_err(|_| ())?);
+    let dec = audio_core::Decoder::from_source(audio_core::container::open_demuxed(r.d.share()).map_err(|_| false)?);
     let info = dec.info();
     if info.rate == 0 {
-        return Err(());
+        return Err(false);
     }
-    Ok(Some(KScanRun { src, dec, rate: info.rate, ch: info.channels.max(1), cap, buf: Vec::new(), p: kpeaks_new(), ms: 0 }))
+    Ok(Some(KScanRun { src, dec, rate: info.rate, ch: info.channels.max(1), cap, want: stated, n: 0, buf: Vec::new(), ms: 0, dirty: 0 }))
+}
+
+// ---- STRIAKWAVEPARTIAL (LEDGER SR9102): the band's waveform grows as it scans, and the byte cap evicts (named tail block) ----
+// PARTIAL: a scan publishes its table as it grows: opened as an EMPTY table in `KThumbs.peaks` (held for the want, paints
+// nothing), each step's buckets appended there by `kpeaks_extend` under a short THUMBS lock (the decode never under it);
+// timeline_core's `paint_peaks` paints a short table's scanned columns and leaves the rest of the body flat. The band is
+// marked at most every KPEAK_PAINT_MS and at the scan's end. A finishing pass over the whole table (SR9074's
+// `Peaks::finish`) runs ONCE at the scan's end; a table being published has none yet. EVICT: each want stamps the sources
+// timeline_core's `view::peaks_seen` shows in the layout the band last painted, asks those first, then `peaks_want`'s
+// full rule. A painted source may take the bytes of the tables not seen in this want (least-recently-seen first, removed
+// so they are asked again once painted); an off-canvas source opens only within the free bytes, else it is DEFERRED (not
+// cached) until painted. A table seen in this want, and the running scan, are never evicted. Byte term: [`kpeaks_bytes`].
+// Owed: NLE-WAVEFORM-KERNEL-PREEMPT (an off-canvas scan in progress finishes before a newly painted source is asked),
+// NLE-WAVEFORM-KERNEL-DRAGSEEN (the stamps read the job's opened timeline under the last painted layout, not a drag's).
+
+/// STRIAKWAVEPARTIAL (SR9102): the band is marked for a growing table at most this often (ms).
+const KPEAK_PAINT_MS: u64 = 100;
+
+/// STRIAKWAVEPARTIAL (SR9102): THE one byte term of a held table (SR9074's `view::peaks_bytes` folds here).
+fn kpeaks_bytes(p: &timeline_core::view::Peaks) -> u64 {
+    p.buckets.len() as u64
+}
+
+/// STRIAKWAVEPARTIAL (SR9102): tables not seen in want `stamp` evicted least-recently-seen first until `need` more bytes
+/// fit under KPEAK_BYTES (or none is left to evict).
+fn peaks_evict(t: &mut KThumbs, k: &mut KScan, stamp: u64, need: u64) {
+    loop {
+        let held: u64 = t.peaks.values().flatten().map(kpeaks_bytes).sum();
+        if held.saturating_add(need) <= KPEAK_BYTES {
+            return;
+        }
+        let last = |s: &timeline_core::SourceId| k.seen.get(s).copied().unwrap_or(0);
+        let old = t.peaks.iter().filter(|(s, p)| p.is_some() && last(*s) != stamp).min_by_key(|(s, _)| last(*s)).map(|(s, _)| *s);
+        let Some(s) = old else { return };
+        t.peaks.remove(&s);
+        k.evicted += 1;
+    }
 }
 
 // ---- STRIAHELPTHREE (LEDGER SR9043): the kernel face's keys help, painted from EDIT_KEYS (named tail block) ----
