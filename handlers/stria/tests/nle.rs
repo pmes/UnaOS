@@ -3551,3 +3551,177 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIASLIPVIEW (LEDGER SR858): the slip drag previews the clip's new first and last frame (named tail block) ----
+use stria::nle_face::{Role, Still, preview, slip_split};
+
+/// The left and right cells of a side-by-side pair.
+fn striaslipview_halves(s: &Still) -> (Vec<u8>, Vec<u8>) {
+    let (w, row) = (s.width as usize / 2 * 4, s.width as usize * 4);
+    let (mut l, mut r) = (Vec::new(), Vec::new());
+    for y in 0..s.height as usize {
+        l.extend_from_slice(&s.rgba[y * row..y * row + w]);
+        r.extend_from_slice(&s.rgba[y * row + w..(y + 1) * row]);
+    }
+    (l, r)
+}
+
+/// The frames a twin editor's timeline shows at `t0` and `t1` (the synth fixture's reels).
+fn striaslipview_frames(tl: &Timeline, t0: i64, t1: i64) -> (Still, Still) {
+    let (_, src) = synth_fixture();
+    (preview(tl, &src, t0).unwrap().expect("a frame"), preview(tl, &src, t1).unwrap().expect("a frame"))
+}
+
+/// Ctrl-press `(x, y)` and move by `dx` (the drag stays live).
+fn striaslipview_press_move(face: &mut Face, x: f64, y: f64, dx: f64, mods: u8) {
+    face.on(&nle3eslipdrag_btn(true, x, y, mods));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + dx, y, 0));
+}
+
+/// Rule: a Ctrl-drag of 40 px on B (SR737's pair, B[0,10)@10: slip 5) shows, on the next paint, B's NEW first and last
+/// frame side by side: the left cell is a twin's frame at tick 10 after `slip 5`, the right its frame at 19, the left
+/// differs from the unslipped frame at 10, and the playhead's frame is not re-rendered while the pair shows.
+#[test]
+fn striaslipview_slip_drag_shows_the_new_first_and_last_frame() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    face.state.seek(12);
+    face.paint();
+    let before = face.still().cloned().expect("the playhead frame at 12");
+    let (x, y) = face.layout().point(0, 15);
+    striaslipview_press_move(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    face.paint();
+    assert_eq!(twin.verb("slip 5"), Some(Ok(())));
+    let (first, last) = striaslipview_frames(&twin.timeline, 10, 19);
+    let pair = face.slip_view().cloned().expect("a pair during the slip");
+    assert_eq!((pair.width, pair.height), (first.width * 2, first.height));
+    let (l, r) = striaslipview_halves(&pair);
+    assert_eq!((l, r), (first.rgba.clone(), last.rgba.clone()), "left = new first frame, right = new last frame");
+    let (old_first, _) = striaslipview_frames(&tl, 10, 19);
+    assert_ne!(first.rgba, old_first.rgba, "the slip moved the first frame");
+    assert_eq!(face.still(), Some(&before), "the playhead frame is not re-rendered while the pair shows");
+    assert_eq!(face.state.timeline, tl, "nothing committed during the drag");
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striaslipview: slip 5 on B[0,10)@10 -> pair {}x{} (frames at 10 and 19)", pair.width, pair.height);
+}
+
+/// Rule: the release commits ONE slip (undo depth 1, SR760's road unchanged) and the next paint shows no pair; Esc
+/// mid-drag commits nothing and clears the pair.
+#[test]
+fn striaslipview_release_and_escape_clear_the_pair() {
+    let (mut face, mut twin, tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    striaslipview_press_move(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    face.paint();
+    assert!(face.slip_view().is_some());
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y, bandy::MOD_CONTROL));
+    assert_eq!(twin.verb("slip 5"), Some(Ok(())));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&twin.timeline, 1));
+    face.paint();
+    assert!(face.slip_view().is_none(), "released: no pair");
+    assert!(face.verb("undo"));
+    striaslipview_press_move(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    face.paint();
+    assert!(face.slip_view().is_some());
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.paint();
+    assert!(face.slip_view().is_none(), "Esc: no pair");
+    assert_eq!(face.state.timeline, tl);
+    println!("striaslipview: release = one slip, then no pair; Esc = no pair");
+}
+
+/// Rule: only a valid video Slip shows the pair: a plain Move, a plain TrimIn, a Ctrl Slide, a refused slip (-5 at
+/// B[0,10): `Drag::shown` None) and a slip on the audio track paint no pair, and the refused slip's paint falls back to
+/// today's playhead frame.
+#[test]
+fn striaslipview_other_drags_show_no_pair() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    let esc = bandy::SMessage::BrowserKey("Escape".into());
+    for (px, py, dx, mods, what) in [
+        (x, y, 40.0, 0, "Move"),
+        (l.x_of(10) as f64 + 1.0, y, 16.0, 0, "TrimIn"),
+        (l.x_of(10) as f64 + 1.0, y, 16.0, bandy::MOD_CONTROL, "Slide"),
+        (l.point(1, 15).0, l.point(1, 15).1, 40.0, bandy::MOD_CONTROL, "audio Slip"),
+    ] {
+        face.state.select_at(0, 12).unwrap();
+        striaslipview_press_move(&mut face, px, py, dx, mods);
+        assert!(face.dragging().is_some(), "{what}: a live drag");
+        face.paint();
+        assert!(face.slip_view().is_none(), "{what}: no pair");
+        face.on(&esc);
+    }
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(12);
+    striaslipview_press_move(&mut face, x, y, -40.0, bandy::MOD_CONTROL);
+    face.paint();
+    assert!(face.slip_view().is_none(), "a refused slip shows no pair");
+    let (_, src) = synth_fixture();
+    assert_eq!(face.still(), preview(&face.state.timeline, &src, 12).unwrap().as_ref(), "today's playhead frame");
+    println!("striaslipview: Move / TrimIn / Slide / audio slip / refused slip -> no pair");
+}
+
+/// Rule: the throttle: a second slip delta painted at once keeps the first pair and sets `slip_due`; the serve clock's
+/// `slip_tick` turns true once the window (max(SLIP_VIEW_MS, the pair's own time)) passes (polled, bounded), and the
+/// repaint then shows the pair of the new delta (a twin's `slip 6`).
+#[test]
+fn striaslipview_throttle_keeps_the_pair_until_the_window_passes() {
+    let (mut face, mut twin, _tl) = nle3eslipface_pair();
+    let (x, y) = face.layout().point(0, 15);
+    striaslipview_press_move(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    face.paint();
+    let p5 = face.slip_view().cloned().expect("the slip 5 pair");
+    assert!(!face.slip_due());
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 48.0, y, 0));
+    assert_eq!(face.dragging().map(|d| d.delta), Some(6));
+    face.paint();
+    assert_eq!(face.slip_view(), Some(&p5), "inside the window the pair stays");
+    assert!(face.slip_due(), "the stale pair is due");
+    let t0 = std::time::Instant::now();
+    while !face.slip_tick() && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(face.slip_tick(), "the window passed within 5 s");
+    face.paint();
+    assert_eq!(twin.verb("slip 6"), Some(Ok(())));
+    let (first, last) = striaslipview_frames(&twin.timeline, 10, 19);
+    assert_eq!(striaslipview_halves(face.slip_view().expect("the slip 6 pair")), (first.rgba, last.rgba));
+    assert!(!face.slip_due() && !face.slip_tick());
+    println!("striaslipview: second delta kept the pair, due; after {:?} the clock repaint shows slip 6", t0.elapsed());
+}
+
+/// Rule: on a split face the tracks Surface renders no pair (its paint carries no still); the preview Surface does.
+#[test]
+fn striaslipview_split_face_pair_on_the_preview_surface_only() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(1, 2);
+    face.state.select_at(0, 12).unwrap();
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: bandy::MOD_CONTROL, surface: 2 });
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y, 2));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Slip));
+    face.paint_role(Role::Tracks);
+    assert!(face.slip_view().is_none(), "the tracks Surface renders no pair");
+    face.paint_role(Role::Preview);
+    assert!(face.slip_view().is_some(), "the preview Surface does");
+    println!("striaslipview: split face: tracks none, preview the pair");
+}
+
+/// Rule: `slip_split` KATs: two frames side by side at the first's size; a missing side leaves its cell FIELD; both
+/// missing is None; a frame of another size is letterboxed into its cell.
+#[test]
+fn striaslipview_split_kats() {
+    let px = |w: u32, h: u32, v: u8| Still { width: w, height: h, rgba: vec![v; (w * h * 4) as usize] };
+    let field = timeline_core::view::FIELD;
+    let s = slip_split(Some(&px(2, 2, 9)), Some(&px(2, 2, 5))).unwrap();
+    assert_eq!((s.width, s.height), (4, 2));
+    assert_eq!(striaslipview_halves(&s), (vec![9; 16], vec![5; 16]));
+    let s = slip_split(None, Some(&px(2, 1, 5))).unwrap();
+    assert_eq!(striaslipview_halves(&s), (field.repeat(2), vec![5; 8]));
+    assert_eq!(slip_split(None, None), None);
+    let s = slip_split(Some(&px(4, 2, 9)), Some(&px(2, 2, 5))).unwrap();
+    assert_eq!((s.width, s.height), (8, 2));
+    let (_, r) = striaslipview_halves(&s);
+    assert_eq!((&r[0..4], &r[4..12], &r[12..16]), (&field[..], &[5u8; 8][..], &field[..]), "letterboxed: a 2x2 in a 4x2 cell");
+    println!("striaslipview: slip_split KATs");
+}
