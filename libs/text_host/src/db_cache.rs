@@ -2,7 +2,7 @@
 //! [`crate::db::FontDb::discover`], so an unchanged font set is not re-indexed at every process start.
 //!
 //! The index lives in the caller's directory ([`crate::fontconfig::Config::cache_dir`]; Aether's data dir /fonts) as
-//! one text file, [`INDEX_FILE`]: a header (magic and format version), the scanned directory list, then per walked
+//! one text file, [`index_file`]: a header (magic and format version), the scanned directory list, then per walked
 //! file `F path size mtime_ns` and one `A` line per face (index, weight, slant, stretch, the family count, the
 //! families, the full names), closed by an `end` trailer carrying the counts; after it, AETHERFONTDBCACHECMAP
 //! (SR697) appends one `C` line per face whose cmap a process read (see the named tail block). Fields are
@@ -23,7 +23,7 @@ use crate::fontconfig::Config;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// The index file's name inside the cache directory.
+/// The index file's name PREFIX inside the cache directory; the file is `<prefix>-<16 hex>`, keyed by the directory list ([`index_file`]).
 pub const INDEX_FILE: &str = "fontdb-index.v2";
 const MAGIC: &str = "fontdb-index";
 const VERSION: &str = "2";
@@ -216,7 +216,7 @@ fn parse(text: &str, dirs: &[PathBuf]) -> Option<(Vec<PathBuf>, HashMap<PathBuf,
 /// The index's answer for the walked `files` of `config` (see the module comment).
 pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State) {
     let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off) };
-    let parsed = std::fs::read_to_string(dir.join(INDEX_FILE)).ok().and_then(|t| parse(&t, &config.dirs));
+    let parsed = std::fs::read_to_string(dir.join(index_file(&config.dirs))).ok().and_then(|t| parse(&t, &config.dirs));
     let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss) };
     let live: HashSet<&PathBuf> = files.iter().collect();
     for p in &order {
@@ -244,15 +244,15 @@ pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], stat
     }
     let Some(dir) = config.cache_dir.as_deref() else { return };
     let Some(text) = render(&config.dirs, files, faces) else { return };
-    let _ = write_atomic(dir, &text);
+    let _ = write_atomic(dir, &index_file(&config.dirs), &text);
 }
 
 /// Writes the index through a per-process temp file in the same directory and a rename.
-fn write_atomic(dir: &Path, text: &str) -> std::io::Result<()> {
+fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{INDEX_FILE}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)?;
-    let r = std::fs::rename(&tmp, dir.join(INDEX_FILE));
+    let r = std::fs::rename(&tmp, dir.join(name));
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -287,7 +287,7 @@ mod tests {
             Config { cache_dir: None, ..self.cfg() }
         }
         fn index(&self) -> PathBuf {
-            self.0.join("cache").join(INDEX_FILE)
+            self.0.join("cache").join(index_file(&self.cfg().dirs))
         }
         fn copy_in(&self, rel: &str) -> PathBuf {
             let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts").join(rel);
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
         assert!(same(&a.faces, &b.faces), "{:?} vs {:?}", a.faces, b.faces);
         let left: Vec<_> = fs::read_dir(t.0.join("cache")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
-        assert_eq!(left, vec![std::ffi::OsString::from(INDEX_FILE)], "only the index remains");
+        assert_eq!(left, vec![std::ffi::OsString::from(index_file(&t.cfg().dirs))], "only the index remains");
     }
 
     /// A changed mtime makes the index stale: re-discovered, the same records, then a hit again.
@@ -599,6 +599,64 @@ mod tests {
         let (_, map) = parse(&(body + &other), &dirs).expect("an unmatched stamp or face is ignored");
         assert_eq!(map[&file].covs, vec![None]);
     }
+
+    /// AETHERFONTDBCACHEKEYED (SR767): the FNV-1a 64 vectors and two fixed index names, so the name is stable across
+    /// builds.
+    #[test]
+    fn fontdb_cache_fnv_kat() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(index_file(&[PathBuf::from("/usr/share/fonts")]), "fontdb-index.v2-afbe62a5d6c7305c");
+        assert_eq!(
+            index_file(&[PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")]),
+            "fontdb-index.v2-63b0aea28512e7b7"
+        );
+    }
+
+    /// The name is the prefix and 16 lowercase hex digits of the `dirs` header line: one list one name, another order
+    /// or another set another name (the order is the one `parse` compares).
+    #[test]
+    fn fontdb_cache_index_file_keyed() {
+        let (a, b) = (PathBuf::from("/a"), PathBuf::from("/b"));
+        let ab = index_file(&[a.clone(), b.clone()]);
+        let hex = ab.strip_prefix("fontdb-index.v2-").expect("the prefix");
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "{hex}");
+        assert_eq!(ab, index_file(&[a.clone(), b.clone()]), "one list, one name");
+        assert_ne!(ab, index_file(&[b.clone(), a.clone()]), "another order is another index");
+        assert_ne!(ab, index_file(&[a.clone()]), "another set is another index");
+    }
+
+    /// Two roots with different directory lists share one cache dir without sharing a file: each misses once, then
+    /// each hits; the dir holds exactly the two keyed files and no unkeyed one.
+    #[test]
+    fn fontdb_cache_keyed_two_roots_hit_kat() {
+        let t = Tmp::new("keyed");
+        t.copy_in(INTER);
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fonts").join(NOTO);
+        fs::create_dir_all(t.0.join("fonts2")).unwrap();
+        fs::copy(&src, t.0.join("fonts2").join(src.file_name().unwrap())).expect("fixture font");
+        let root_b = || Config { dirs: vec![t.0.join("fonts"), t.0.join("fonts2")], ..t.cfg() };
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss", "root A, first start");
+        assert_eq!(FontDb::discover(root_b()).discover_cache(), "miss", "root B, first start");
+        let a = FontDb::discover(t.cfg());
+        assert_eq!(a.discover_cache(), "hit", "root A is not thrashed by B");
+        assert_eq!(a.discover_bytes(), 0);
+        let b = FontDb::discover(root_b());
+        assert_eq!(b.discover_cache(), "hit", "root B is not thrashed by A");
+        assert!(b.faces.len() > a.faces.len());
+        let mut left: Vec<String> = fs::read_dir(t.0.join("cache"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![index_file(&t.cfg().dirs), index_file(&root_b().dirs)];
+        want.sort();
+        assert_eq!(left, want, "exactly the two keyed files");
+        assert!(!t.0.join("cache").join(INDEX_FILE).exists(), "no unkeyed index");
+    }
 }
 
 // ---- AETHERFONTDBCACHECMAP (LEDGER SR697): the persisted cmap coverage (named tail block) ----
@@ -695,15 +753,15 @@ pub(crate) fn read_coverage(config: &Config, state: State, f: &FaceInfo) -> Opti
     if let (false, Some(dir), Some((size, mtime)), Some(p)) =
         (state == State::Off, config.cache_dir.as_deref(), before, f.path.to_str())
     {
-        let _ = append(dir, &c_line(p, f.index, size, mtime, &cov));
+        let _ = append(dir, &index_file(&config.dirs), &c_line(p, f.index, size, mtime, &cov));
     }
     Some((cov, n))
 }
 
 /// Appends `line` to an existing index in one write; never creates the file.
-fn append(dir: &Path, line: &str) -> std::io::Result<()> {
+fn append(dir: &Path, name: &str, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::OpenOptions::new().append(true).open(dir.join(INDEX_FILE))?.write_all(line.as_bytes())
+    std::fs::OpenOptions::new().append(true).open(dir.join(name))?.write_all(line.as_bytes())
 }
 
 /// The per-face coverage cells of a discovery: pre-filled from `seeds` (aligned to the faces), else empty.
@@ -714,4 +772,26 @@ pub(crate) fn seed(n: usize, mut seeds: Vec<Option<Coverage>>) -> Vec<std::sync:
             None => std::sync::OnceLock::new(),
         })
         .collect()
+}
+
+// ---- AETHERFONTDBCACHEKEYED (LEDGER SR767): the index file keyed by its directory list (named tail block) ----
+// SR738 / SR746 share one cache dir between roots whose directory lists differ (Aether's system dirs, quartzite's, a
+// test's fixture dir); with one file per dir, `parse`'s `dirs` guard rejected the other root's index and each rewrote
+// it (miss, miss, ...). Each distinct list now owns `<INDEX_FILE>-<16 hex>`: the FNV-1a 64 of EXACTLY the `dirs`
+// header line `render` writes (Config order, escaped), so two lists share a file iff `parse` would accept one's index
+// for the other; the guard stays (belt, and a collision guard). The old unkeyed file is never read or removed.
+
+/// The index file's name for `dirs`: [`INDEX_FILE`], `-`, and the FNV-1a 64 of the `dirs` header line in hex.
+pub fn index_file(dirs: &[PathBuf]) -> String {
+    let mut key = String::from("dirs");
+    for d in dirs {
+        key.push('\t');
+        key.push_str(&escape(&d.to_string_lossy()));
+    }
+    format!("{INDEX_FILE}-{:016x}", fnv1a64(key.as_bytes()))
+}
+
+/// FNV-1a 64 (stable across builds and Rust versions, unlike `DefaultHasher`).
+fn fnv1a64(b: &[u8]) -> u64 {
+    b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
 }
