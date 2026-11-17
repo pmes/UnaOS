@@ -41,7 +41,7 @@ fn walk<H: Host>(tree: &mut LayoutTree<H>, id: NodeId, saved: &mut Saved) {
             }
             let auto_l = kst.margin.left == LengthPercentageAuto::auto();
             let auto_r = kst.margin.right == LengthPercentageAuto::auto();
-            if (auto_l || auto_r) && (!kst.max_size.width.is_auto() || shrink_table(tree, k)) {
+            if (auto_l || auto_r || centred_maxwidth(&kst, crate::tree::rule_align_mark(tree, k))) && (!kst.max_size.width.is_auto() || shrink_table(tree, k)) {
                 continue; // centred under a max-width: keep the clamped 100%
             }
             let mut n = kst.clone();
@@ -148,6 +148,9 @@ pub(crate) fn auto_overflow<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Saved
             let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
             let auto_l = kst.margin.left == LengthPercentageAuto::auto();
             let auto_r = kst.margin.right == LengthPercentageAuto::auto();
+            if !(auto_l || auto_r) && centred_maxwidth(&kst, crate::tree::rule_align_mark(tree, k)) {
+                if tree.taffy.layout(k).is_ok_and(|kl| kl.size.width + kl.margin.left + kl.margin.right > cb + 0.01) { let mut n = kst.clone(); n.size.width = Dimension::auto(); n.align_self = Some(AlignSelf::STRETCH); saved.push((k, kst)); let _ = tree.taffy.set_style(k, n); changed = true; }
+                continue; } // AETHERCENTERMAXWIDTH (SR1164): an overflowing centred max-width placeholder goes back to blockwidth's STRETCH road
             if !(auto_l || auto_r)
                 || kst.position == Position::Absolute
                 || !crate::collapse::in_flow_block_pub(tree, k, &kst)
@@ -183,4 +186,18 @@ pub(crate) fn auto_overflow<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Saved
 fn shrink_table<H: Host>(tree: &LayoutTree<H>, k: NodeId) -> bool {
     use crate::DomNode;
     tree.node_map.get(&k).and_then(|n| n.tag()).is_some_and(|t| t == "table")
+}
+
+// ---- AETHERCENTERMAXWIDTH (LEDGER SR1164): a max-width placeholder under a centring column is placed like a narrow block (named tail block) ----
+
+/// AETHERCENTERMAXWIDTH (SR1164): whether block child style `kst` is the builder's 100% placeholder with a max-width
+/// under a column whose centring road (`tree::place_narrow_blocks`, its `rule_align` record) aligns it CENTER / END
+/// (`<center>`, `align=center`, -webkit-center / -webkit-right, an rtl column's inline start). Blink places such a box
+/// like a definite narrower block (`<center><div style="max-width: 300px">` at x 250 in 800): `place_narrow_blocks`
+/// writes the align-self and its mark, [`walk`] keeps the clamped 100% (the margin-auto + max-width road), and
+/// [`auto_overflow`] puts the box back on `width: auto` + STRETCH when its edges would overflow the container.
+pub(crate) fn centred_maxwidth(kst: &Style, to: Option<AlignSelf>) -> bool {
+    kst.size.width == Dimension::percent(1.0)
+        && !kst.max_size.width.is_auto()
+        && matches!(to, Some(AlignSelf::CENTER | AlignSelf::END))
 }

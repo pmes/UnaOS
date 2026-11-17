@@ -1244,7 +1244,7 @@ fn place_narrow_blocks<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, ali
         }
         let Some(tag) = tree.node_map.get(&k).and_then(|n| n.tag()) else { continue };
         let table = tag == "table";
-        if (!table && is_table_part(&tag)) || (!table && (kst.size.width.is_auto() || kst.size.width == Dimension::percent(1.0))) {
+        if (!table && is_table_part(&tag)) || (!table && (kst.size.width.is_auto() || (kst.size.width == Dimension::percent(1.0) && !crate::blockwidth::centred_maxwidth(&kst, Some(to))))) {
             if !table && kst.size.width.is_auto() && !is_table_part(&tag) && tree.paint_map.get(&k).and_then(|p| p.float).unwrap_or(0) == 0 && !centres_as_block(tree, k) { let mut n = kst; n.align_self = Some(taffy::style::AlignSelf::STRETCH); tree.rule_align.insert(k, taffy::style::AlignSelf::STRETCH); let _ = tree.taffy.set_style(k, n); } continue; // AETHERCENTERAUTOWIDTH (SR1159)
         }
         let mut n = kst;

@@ -758,8 +758,8 @@ fn center_autowidth_fills() {
 
 /// AETHERCENTERAUTOWIDTH (SR1159): the kinds `centres_as_block` names keep the centring road (pins): a 200px div, a
 /// shrink-to-fit table, a CSS-sized block img; a block img sized by its attributes only is at (0, 800) before and after
-/// SR1159 (blockwidth's placeholder road; owed AETHER-CENTER-IMG-ATTR-BLOCK); a `max-width: 300px` div is 300 wide where blockwidth's STRETCH road puts it (owed
-/// AETHER-CENTER-MAXWIDTH: Chromium centres it); a floated `width: auto` div keeps the float arm's align-self, no mark.
+/// SR1159 (blockwidth's placeholder road; owed AETHER-CENTER-IMG-ATTR-BLOCK); a `max-width: 300px` div is 300 wide and centred (x 250,
+/// AETHER-CENTER-MAXWIDTH BUILT by SR1164: Chromium centres it); a floated `width: auto` div keeps the float arm's align-self, no mark.
 #[test]
 fn center_autowidth_narrow_kinds_stay_centred() {
     use layout_core::taffy::style::AlignSelf;
@@ -785,7 +785,7 @@ fn center_autowidth_narrow_kinds_stay_centred() {
     assert_eq!(box_of(&tree, &doc.by_id("ia")).0, 0.0, "a block img sized by its width / height attributes only: today at x 0 (AETHER-CENTER-IMG-ATTR-BLOCK owed)");
     assert_eq!(box_of(&tree, &doc.by_id("ia")).2, AW, "and 800 wide today, before and after SR1159");
     let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
-    assert_eq!((x, w), (MAXW_X, 300.0), "max-width: 300px: 300 wide at today's x (AETHER-CENTER-MAXWIDTH owed)");
+    assert_eq!((x, w), (MAXW_X, 300.0), "max-width: 300px: 300 wide and centred (SR1164)");
     let fl = id_of(&tree, &doc.by_id("fl"));
     assert_ne!(tree.taffy.style(fl).unwrap().align_self, Some(AlignSelf::STRETCH), "a float keeps its own align-self");
     assert_eq!(layout_core::rule_align_mark(&tree, fl), None, "the rule writes no mark on a float");
@@ -793,8 +793,8 @@ fn center_autowidth_narrow_kinds_stay_centred() {
     assert!(x == 0.0 && w > 0.0 && w < AW - 100.0, "the float sits at the start, shrunk to its text (x {x} w {w})");
 }
 
-/// AETHERCENTERAUTOWIDTH (SR1159): today's x of a `max-width: 300px` div under `<center>` at 800 (measured).
-const MAXW_X: f32 = 0.0;
+/// AETHERCENTERAUTOWIDTH (SR1159): the x of a `max-width: 300px` div under `<center>` at 800 (SR1164 centres it: Chromium's 250).
+const MAXW_X: f32 = 250.0;
 
 /// AETHERCENTERAUTOWIDTH (SR1159): center > div > div, both `width: auto`: the inner column inherits -webkit-center and
 /// both fill.
@@ -848,4 +848,132 @@ fn center_autowidth_restyle() {
     assert_eq!(tree.taffy.style(r).unwrap().align_self, None, "and no rule align-self");
     let (x, _, w, _) = box_of(&tree, &doc.by_id("r"));
     assert_eq!((x, w), (0.0, AW), "text-align: left: still fills");
+}
+
+// ---- AETHERCENTERMAXWIDTH (LEDGER SR1164): a max-width block under a centring column is placed like a narrow block (named tail block) ----
+
+/// AETHERCENTERMAXWIDTH (SR1164): one `<div id="m" style=...>` holding a line of text under a parent `<div style=...>`.
+fn maxw_doc(parent: &str, child: &str) -> N {
+    page(vec![el("div", &[("id", "c"), ("style", parent)], vec![el("div", &[("id", "m"), ("style", child)], vec![text("cap")])])])
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): `<center><div style="max-width: 300px">` at 800 is 300 wide at x 250 (Chromium), the
+/// rule marks CENTER; `<div align=center>` and -webkit-center the same.
+#[test]
+fn center_maxwidth_centred() {
+    use layout_core::taffy::style::AlignSelf;
+    let doc = page(vec![el("center", &[], vec![el("div", &[("id", "m"), ("style", "max-width: 300px")], vec![text("cap")])])]);
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (250.0, 300.0), "<center>: the max-width block is centred");
+    assert_eq!(layout_core::rule_align_mark(&tree, id_of(&tree, &doc.by_id("m"))), Some(AlignSelf::CENTER), "the rule marks CENTER");
+    let doc = maxw_doc("text-align: -webkit-center", "max-width: 300px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (250.0, 300.0), "-webkit-center: centred");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): -webkit-right ends it: x 500 at 800.
+#[test]
+fn center_maxwidth_webkit_right() {
+    let doc = maxw_doc("text-align: -webkit-right", "max-width: 300px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (500.0, 300.0), "-webkit-right: at the end");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): plain `text-align: center` aligns inline content only (CSS 2.2 §16.2): the max-width
+/// block stays at x 0, 300 wide (pin).
+#[test]
+fn center_maxwidth_plain_center_leaves() {
+    let doc = maxw_doc("text-align: center", "max-width: 300px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (0.0, 300.0), "plain text-align: center leaves the block at the start");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): a max-width wider than the container fills it (pin), and with horizontal padding the
+/// clamped 100% would overflow: `auto_overflow` puts it back on STRETCH, so the border box is (0, 800).
+#[test]
+fn center_maxwidth_wider_than_container() {
+    let doc = maxw_doc("text-align: -webkit-center", "max-width: 1000px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (0.0, AW), "max-width 1000 at 800: fills");
+    let doc = maxw_doc("text-align: -webkit-center", "max-width: 1000px; padding: 0 20px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (0.0, AW), "padded max-width 1000 at 800: fills, no overflow");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): a percent max-width resolves against the container: 50% of 800 at x 200.
+#[test]
+fn center_maxwidth_percent() {
+    let doc = maxw_doc("text-align: -webkit-center", "max-width: 50%");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (200.0, 400.0), "max-width: 50%: centred");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): `margin: 0 auto; max-width: 300px` with no centring parent already centres through
+/// blockwidth's clamped 100% and taffy's auto margins (pin: x 250 before and after SR1164).
+#[test]
+fn center_maxwidth_margin_auto_no_center() {
+    let doc = maxw_doc("", "margin: 0 auto; max-width: 300px");
+    let tree = lay(&doc, AW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (250.0, 300.0), "margin: 0 auto centres the max-width block");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): a max-width block that is also floated or absolutely positioned is not on the road
+/// (a float keeps its own align-self; an absolute box is out of flow): no rule mark on either; the float sits at x 0;
+/// the absolute box keeps no rule align-self (its static position is taffy's own) (pins).
+#[test]
+fn center_maxwidth_float_abs_untouched() {
+    use layout_core::taffy::style::AlignSelf;
+    for child in ["float: left; max-width: 300px", "position: absolute; max-width: 300px"] {
+        let doc = maxw_doc("text-align: -webkit-center", child);
+        let tree = lay(&doc, AW, 400.0);
+        let m = id_of(&tree, &doc.by_id("m"));
+        assert_eq!(layout_core::rule_align_mark(&tree, m), None, "{child}: no rule mark");
+        assert!(!matches!(tree.taffy.style(m).unwrap().align_self, Some(AlignSelf::CENTER)), "{child}: no rule CENTER");
+    }
+    let doc = maxw_doc("text-align: -webkit-center", "float: left; max-width: 300px");
+    let tree = lay(&doc, AW, 400.0);
+    assert_eq!(box_of(&tree, &doc.by_id("m")).0, 0.0, "the float sits at x 0");
+}
+
+/// AETHERCENTERMAXWIDTH (SR1164): the write rides SR686's undo road: max-width restyled away (`auto`: apply_specs folds
+/// a declared value only) fills with no mark; back to 300px it centres again (mark CENTER); the parent losing its
+/// centring leaves it 300 wide at x 0 with no mark.
+#[test]
+fn center_maxwidth_restyle() {
+    use layout_core::taffy::style::AlignSelf;
+    let doc = page(vec![el("center", &[("id", "c")], vec![el("div", &[("id", "m"), ("style", "max-width: 300px")], vec![text("restyle")])])]);
+    let mut tree = lay(&doc, AW, 400.0);
+    let m = id_of(&tree, &doc.by_id("m"));
+    let c = id_of(&tree, &doc.by_id("c"));
+    let cx = layout_core::css::ParseCx::new(AW, 400.0);
+    let restyle = |tree: &mut Tree, id, prop: &str, value: &str| {
+        let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+        layout_core::css::apply_declaration(prop, value, &mut s, &cx);
+        layout_core::apply_specs(tree, &[(id, std::rc::Rc::new(s))]);
+        layout_core::remeasure(tree, &F);
+    };
+    assert_eq!(box_of(&tree, &doc.by_id("m")).0, 250.0, "centred");
+
+    restyle(&mut tree, m, "max-width", "auto");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (0.0, AW), "max-width removed: fills");
+    assert_eq!(layout_core::rule_align_mark(&tree, m), None, "and the rule holds no mark");
+
+    restyle(&mut tree, m, "max-width", "300px");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (250.0, 300.0), "max-width back: centred again");
+    assert_eq!(layout_core::rule_align_mark(&tree, m), Some(AlignSelf::CENTER), "mark CENTER");
+
+    restyle(&mut tree, c, "text-align", "left");
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("m"));
+    assert_eq!((x, w), (0.0, 300.0), "the parent lost its centring: at the start");
+    assert_eq!(layout_core::rule_align_mark(&tree, m), None, "no mark");
 }
