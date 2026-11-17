@@ -599,3 +599,59 @@ mod striaxformpresets {
         assert_eq!(st.verb("scale-"), Some(Err(EditError::Kind)));
     }
 }
+
+// ---- STRIAXFORMMORE (LEDGER SR975): the placement's clamped step and nudge (named tail block) ----
+mod striaxformmore {
+    use super::base;
+    use timeline_core::editor::EditorState;
+    use timeline_core::{EditError, Xform};
+
+    #[test]
+    fn striaxformmore_clamp_step_and_nudge() {
+        let d = Xform::SCALE_STEP as i32;
+        let n = Xform::NUDGE_STEP as i32;
+        assert_eq!(Xform::clamped(2000, -5, 7), Xform::NONE);
+        assert_eq!(Xform::clamped(0, 2000, -1), Xform { x: 999, y: 0, s: 1 });
+        assert_eq!(Xform::PIP.fit_step(d), Xform::PIP.stepped(d), "a step that fits is SR938's");
+        assert_eq!(Xform { x: 0, y: 0, s: 500 }.fit_step(d), Some(Xform { x: 0, y: 0, s: 550 }));
+        assert_eq!(Xform { x: 500, y: 500, s: 500 }.fit_step(d), Some(Xform { x: 450, y: 450, s: 550 }));
+        assert_eq!(Xform { x: 10, y: 10, s: 50 }.fit_step(-d), Some(Xform { x: 34, y: 34, s: 1 }));
+        assert_eq!(Xform { x: 0, y: 0, s: 980 }.fit_step(d), Some(Xform::NONE));
+        assert_eq!(Xform::NONE.fit_step(d), None, "the whole frame cannot grow");
+        assert_eq!(Xform { x: 3, y: 4, s: 1 }.fit_step(-d), None, "the smallest rect cannot shrink");
+        assert_eq!(Xform::PIP.nudged(n, 0), Some(Xform { x: 750, y: 725, s: 250 }));
+        assert_eq!(Xform { x: 750, y: 725, s: 250 }.nudged(n, 0), None, "at the right edge");
+        assert_eq!(Xform { x: 10, y: 725, s: 250 }.nudged(-n, -n), Some(Xform { x: 0, y: 700, s: 250 }));
+        assert_eq!(Xform::NONE.nudged(0, n), None, "the whole frame cannot move");
+    }
+
+    #[test]
+    fn striaxformmore_nudge_words_one_undo_step_each() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip left"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("pip left"), Some(Err(EditError::Xform)), "the whole frame cannot move");
+        assert_eq!(st.undo_depth(), 0);
+        assert_eq!(st.verb("pip tl"), Some(Ok(())));
+        assert_eq!(st.verb("pip left"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (2, Some(Xform { x: 0, y: 25, s: 250 })));
+        assert_eq!(st.verb("pip left"), Some(Err(EditError::Xform)));
+        assert_eq!(st.undo_depth(), 2, "a refused nudge commits nothing");
+        assert_eq!(st.verb("pip down"), Some(Ok(())));
+        assert_eq!(st.verb("pip right"), Some(Ok(())));
+        assert_eq!(st.verb("pip up"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (5, Some(Xform { x: 25, y: 25, s: 250 })));
+        assert_eq!(st.verb("pip 0 0"), Some(Ok(())));
+        assert_eq!(st.verb("scale+"), Some(Ok(())), "a step at the top-left edge clamps");
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (7, Some(Xform { x: 0, y: 0, s: 300 })));
+        assert_eq!(st.verb("pip sideways"), Some(Err(EditError::Xform)), "SR879's arms still refuse an unknown word");
+        for _ in 0..7 {
+            assert!(st.undo());
+        }
+        assert_eq!(st.timeline, tl);
+        st.timeline.tracks[1].clips = tl.tracks[0].clips.clone();
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("pip left"), Some(Err(EditError::Kind)));
+    }
+}

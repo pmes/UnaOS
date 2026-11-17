@@ -3844,3 +3844,23 @@ fn striaxformpresets_face_presets_and_placement_line() {
     assert_eq!(face.last_error.take(), Some(format!("scale+: {}", EditError::Xform)));
     assert_eq!(face.state.undo_depth(), 3);
 }
+// ---- STRIAXFORMMORE (LEDGER SR975): the face's nudge words and the placement line (named tail block) ----
+
+/// `pip left` (a timeline_core nudge word, no VERBS change) moves the selected clip's rect one step, one undo step; the
+/// message row reads the placement with no error (SR938's note: any `pip` word); a nudge past the edge is refused by name
+/// on the message row with no undo step.
+#[test]
+fn striaxformmore_face_nudge_note() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("pip tl"));
+    assert!(face.verb("pip left"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.message_text().as_deref(), Some("pip: x 0 y 25 scale 250"));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(face.verb("pip left"));
+    assert_eq!(face.last_error.take(), Some(format!("pip left: {}", timeline_core::EditError::Xform)));
+    assert_eq!(face.state.undo_depth(), 2);
+}
