@@ -1895,7 +1895,7 @@ fn attribute_changed(vm: &mut Vm, el: usize, local: &str, ns: Namespace, old: Op
     restyle_root(crate::css::Change::Attribute { el, name: local.to_string(), old: old.clone(), new: new.clone() });
     with_doc(|d| crate::dom::attribute_steps(d, NodeId(el), local, ns, old.clone(), new.clone()));
     if ns == Namespace::None {
-        super::controls::attribute_changed(el, local, &old, &new);
+        super::controls::attribute_changed(vm, el, local, &old, &new);
     }
     if ns == Namespace::None && local.starts_with("on") {
         super::events::handler_attribute_changed(vm, el, &local[2..], new.is_some());
