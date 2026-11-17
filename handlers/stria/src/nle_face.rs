@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "xfade", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "xfade", "xfade-curve", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -249,8 +249,8 @@ impl Face {
                 None => return false,
             },
         };
-        if let Err(e) = r {
-            self.last_error = Some(match self.state.xfade_refusal(v, e) { Some(s) => format!("{v}: {s}"), None => format!("{v}: {e}") }); // STRIAXFADECURVE (SR904): an `xfade` refusal's audio wording (timeline_core editor.rs tail)
+        if r.is_ok() { if let Some(s) = self.state.xfade_reading(v) { self.last_error = Some(format!("xfade: {s}")); } } if let Err(e) = r { // STRIAXFADECURVEBUTTON (SR925): after any xfade word the message row reads the crossfade (`xfade: 12 equal`)
+            self.last_error = Some(match self.state.xfade_refusal(v, e).or_else(|| self.state.xfade_curve_refusal(v, e)) { Some(s) => format!("{v}: {s}"), None => format!("{v}: {e}") }); // STRIAXFADECURVE (SR904): an `xfade` refusal's audio wording (timeline_core editor.rs tail); STRIAXFADECURVEBUTTON (SR925): and `xfade-curve`'s
         }
         true
     }
@@ -386,6 +386,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("c", "xfade"), // STRIAXFADECURVEBUTTON (SR925): c / C (Shift+c, text) put / take the crossfade and swap its curve (x is the kernel's delete, X the mark clear)
+    ("C", "xfade-curve"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2602,6 +2604,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("xfade", "put / take the selected audio clip's crossfade"), // STRIAXFADECURVEBUTTON (SR925)
+    ("xfade-curve", "switch the crossfade's curve linear / equal"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).

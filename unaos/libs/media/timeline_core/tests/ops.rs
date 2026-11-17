@@ -434,3 +434,61 @@ fn striaxfadecurve_refusal_text() {
     assert_eq!(st.xfade_refusal("xfade", EditError::NoSource), None);
     println!("striaxfadecurve: five audio wordings; kind / NoSource -> None");
 }
+
+// ---- STRIAXFADECURVEBUTTON (LEDGER SR925): the crossfade curve cycle word and the xfade reading (named tail block) ----
+
+/// `xfade-curve` swaps the head cut's crossfade curve at the same length: equal 12 -> linear 12 -> equal 12, one undo step
+/// each; undo takes the swap back.
+#[test]
+fn striaxfadecurvebutton_cycle_one_undo_step_each() {
+    use timeline_core::{AudioXfade, Curve};
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::EqualPower }]);
+    assert_eq!(st.verb("xfade-curve"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::Linear }]);
+    assert_eq!(st.verb("xfade-curve"), Some(Ok(())));
+    assert_eq!(st.timeline.audio_xfades, vec![AudioXfade { track: 1, at: 20, dur: 12, curve: Curve::EqualPower }]);
+    assert_eq!(st.undo_depth(), 3);
+    assert!(st.undo());
+    assert_eq!(st.timeline.audio_xfades[0].curve, Curve::Linear);
+    println!("striaxfadecurvebutton: equal 12 -> linear 12 -> equal 12 (3 undo steps); undo -> linear");
+}
+
+/// Refusals commit nothing: no selection `NoClip`, a plain cut with no crossfade / a video clip / no butting clip
+/// `Transition`; each worded (the new no-crossfade text, else SR904's).
+#[test]
+fn striaxfadecurvebutton_cycle_refusals_and_text() {
+    let mut st = striaaudiocrossfade_state();
+    let tl0 = st.timeline.clone();
+    assert_eq!(st.verb("xfade-curve"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.xfade_curve_refusal("xfade-curve", EditError::NoClip), Some("no clip selected (select the incoming audio clip)"));
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade-curve"), Some(Err(EditError::Transition)));
+    assert_eq!(st.xfade_curve_refusal("xfade-curve", EditError::Transition), Some("no crossfade on the selected clip's head cut (xfade puts one)"));
+    st.select(0, 0).unwrap();
+    assert_eq!(st.verb("xfade-curve"), Some(Err(EditError::Transition)));
+    assert_eq!(st.xfade_curve_refusal("xfade-curve", EditError::Transition), Some("the selected clip is not on an audio track"));
+    st.select(1, 2).unwrap();
+    assert_eq!(st.verb("xfade-curve"), Some(Err(EditError::Transition)));
+    assert_eq!(st.xfade_curve_refusal("xfade-curve", EditError::Transition), Some("no clip ends where the selected clip starts"));
+    assert_eq!(st.xfade_curve_refusal("xfade", EditError::Transition), None);
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
+    println!("striaxfadecurvebutton: no selection / no crossfade / video clip / no butting clip refused in words");
+}
+
+/// `xfade_reading`: the head cut's explicit record as `<ticks> <curve>`, `off` without one; any other word `None`.
+#[test]
+fn striaxfadecurvebutton_reading() {
+    let mut st = striaaudiocrossfade_state();
+    assert_eq!(st.xfade_reading("xfade"), None);
+    st.select(1, 1).unwrap();
+    assert_eq!(st.xfade_reading("xfade").as_deref(), Some("off"));
+    assert_eq!(st.verb("xfade 10"), Some(Ok(())));
+    assert_eq!(st.xfade_reading("xfade 10").as_deref(), Some("10 equal"));
+    assert_eq!(st.verb("xfade-curve"), Some(Ok(())));
+    assert_eq!(st.xfade_reading("xfade-curve").as_deref(), Some("10 linear"));
+    assert_eq!(st.xfade_reading("kind"), None);
+    println!("striaxfadecurvebutton: off -> 10 equal -> 10 linear; kind -> None");
+}

@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -759,5 +759,58 @@ impl EditorState {
             EditError::Handle => Some("the crossfade is longer than the incoming clip or the outgoing clip's handle"),
             _ => None,
         }
+    }
+}
+
+// ---- STRIAXFADECURVEBUTTON (LEDGER SR925): the crossfade curve cycle word and the xfade reading (named tail block) ----
+// `xfade-curve` (the face's `C` key and `Curve` button) swaps the curve of the crossfade on the selected clip's head cut
+// (explicit or derived, `crossfade_at` with a clip partner): equal-power -> linear, linear -> equal, at the same length,
+// through SR904's `xfade_curve_word` (ONE commit). No crossfade there: `Transition`, worded by `xfade_curve_refusal`
+// (every other refusal reads SR904's `xfade_refusal` text). `xfade_reading` is what the face's message row shows after
+// any xfade word succeeds: `<ticks> <linear|equal>` of the head cut's explicit record, `off` when it has none.
+impl EditorState {
+    /// The `xfade-curve` word of [`EditorState::verb`]; `None` when `v` is not it.
+    fn xfade_cycle_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        if v != "xfade-curve" {
+            return None;
+        }
+        let Some((track, ci)) = self.selection else { return Some(Err(EditError::NoClip)) };
+        Some(match self.timeline.crossfade_at(track, ci) {
+            Some(x) if x.partner == crate::Partner::Clip => {
+                let next = if x.curve == crate::Curve::EqualPower { "linear" } else { "equal" };
+                self.xfade_curve_word(None, next, None)
+            }
+            _ => Err(EditError::Transition),
+        })
+    }
+    /// The honest text of a refused `xfade-curve` (`e` its error), read against the unchanged state: no crossfade on a
+    /// cut that has one to take, else SR904's [`EditorState::xfade_refusal`] text; `None` for any other word.
+    pub fn xfade_curve_refusal(&self, v: &str, e: EditError) -> Option<&'static str> {
+        if v != "xfade-curve" {
+            return None;
+        }
+        if e == EditError::Transition {
+            if let Some((track, ci)) = self.selection {
+                let t = self.timeline.tracks.get(track)?;
+                let i = t.clips.get(ci)?;
+                if t.kind == crate::Kind::Audio && t.clips.iter().any(|c| c.end() == i.at) {
+                    return Some("no crossfade on the selected clip's head cut (xfade puts one)");
+                }
+            }
+        }
+        self.xfade_refusal("xfade", e)
+    }
+    /// After an xfade word `v` (`xfade ...` or `xfade-curve`): the selected clip's head cut's explicit crossfade as
+    /// `<ticks> <linear|equal>`, `off` when it has none; `None` for any other word or no selected clip.
+    pub fn xfade_reading(&self, v: &str) -> Option<alloc::string::String> {
+        if v.split_ascii_whitespace().next() != Some("xfade") && v != "xfade-curve" {
+            return None;
+        }
+        let (track, ci) = self.selection?;
+        let i = self.timeline.tracks.get(track)?.clips.get(ci)?;
+        Some(match self.timeline.audio_xfades.iter().find(|x| x.track == track && x.at == i.at) {
+            Some(x) => alloc::format!("{} {}", x.dur, if x.curve == crate::Curve::EqualPower { "equal" } else { "linear" }),
+            None => alloc::string::String::from("off"),
+        })
     }
 }
