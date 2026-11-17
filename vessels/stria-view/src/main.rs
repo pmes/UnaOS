@@ -216,7 +216,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| bin_token(face, tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| bin_token(face, tok)).or_else(|| nudge_token(tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIANUDGEMORE (SR944): the nudge words (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -2403,5 +2403,42 @@ mod striasourceinfokey_tests {
         let j = info_json(&f);
         assert!(j.starts_with(",\"info\":\"info: B: utp1 64x48 ~") && j.ends_with(" kb/s\""), "{j}");
         println!("striasourceinfokey witness: at:12:0,key:Ctrl+i -> {j}");
+    }
+}
+
+// ---- STRIANUDGEMORE (LEDGER SR944): the witness's nudge words (named tail block) ----
+/// `nudge:<d>` -> the face word `nudge <d>` (timeline_core's `editor::nudge_words` takes the count: signed, nonzero); a bare
+/// `nudge…` word that is a KEYS action (`nudge-`, `nudge+`, `nudge-10`, `nudge+10`) -> itself; each as the surface's
+/// `Input`. Any other token is `None` (so `nudge:0`, `nudge:x`, `nudge+7` stay bad tokens).
+fn nudge_token(tok: &str) -> Option<Vec<SMessage>> {
+    let text = match tok.strip_prefix("nudge:") {
+        Some(d) => timeline_core::editor::nudge_words(&format!("nudge {d}")).map(|d| format!("nudge {d}"))?,
+        None if tok.starts_with("nudge") && nle_face::KEYS.iter().any(|&(_, a)| a == tok) => tok.to_string(),
+        None => return None,
+    };
+    Some(vec![SMessage::Input { target: SURFACE.into(), text }])
+}
+
+#[cfg(test)]
+mod strianudgemore_tests {
+    use super::*;
+
+    /// STRIANUDGEMORE M3: `--do` takes the nudge words: `nudge+` one frame, `nudge+10` ten, `nudge:-3` a free count, each
+    /// one commit with the message line's new `at`; `nudge:0`, `nudge:x` and `nudge+7` are bad tokens.
+    #[test]
+    fn do_takes_the_nudge_words() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:30:0").is_empty());
+        assert_eq!(face.state.selection, Some((0, 2)));
+        assert_eq!(drive(&mut face, "nudge+"), vec!["nudge: at 26 (00:00:01:01)".to_string()]);
+        assert_eq!(drive(&mut face, "nudge+10"), vec!["nudge: at 36 (00:00:01:11)".to_string()]);
+        assert_eq!(drive(&mut face, "nudge:-3"), vec!["nudge: at 33 (00:00:01:08)".to_string()]);
+        assert_eq!(face.state.undo_depth(), 3);
+        for t in ["nudge:0", "nudge:x", "nudge+7"] {
+            assert_eq!(drive(&mut face, t), vec![format!("bad token {t}")]);
+        }
+        assert_eq!(face.state.selected().map(|c| c.at), Some(33));
+        println!("stria-view strianudgemore witness: nudge+ / nudge+10 / nudge:-3 -> at 33, three commits");
     }
 }
