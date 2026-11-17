@@ -370,7 +370,7 @@ fn eval_scroll(q: &ScrollStateQuery, st: &ScrollState) -> Tri {
 pub fn inherited_property(name: &str) -> bool {
     matches!(
         name,
-        "color" | "font" | "font-family" | "font-size" | "font-style" | "font-weight" | "font-variant" | "font-stretch" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style"
+        "color" | "font" | "font-family" | "font-size" | "font-style" | "font-weight" | "font-variant" | "font-stretch" | "font-synthesis" | "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps"
             | "font-feature-settings" | "font-variation-settings" | "font-kerning" | "font-size-adjust" | "line-height"
             | "letter-spacing" | "word-spacing" | "text-align" | "text-align-last" | "text-indent" | "text-transform"
             | "text-shadow" | "text-rendering" | "text-orientation" | "text-combine-upright" | "white-space"
