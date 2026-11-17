@@ -283,14 +283,14 @@ impl FontDb {
             faces.extend(v);
             bytes_read += n;
         }
-        let faces = cached.unwrap_or_else(|| { crate::db_cache::store(&config, &files, &faces, cache); faces }); // AETHERFONTDBCACHE (SR684)
+        let mut swept = 0; let faces = cached.unwrap_or_else(|| { swept = crate::db_cache::store(&config, &files, &faces, cache); faces }); // AETHERFONTDBCACHE (SR684); AETHERFONTDBCACHESWEEP (SR770): the swept count
         eprintln!(
             "[fonts] discover files={} bytes_read={} faces={} ms={} cache={}",
             files.len(),
             bytes_read / 1024,
             faces.len(),
             t0.elapsed().as_millis(),
-            cache.as_str()
+            crate::db_cache::cache_word(cache, swept)
         );
         let (cmaps, scan_bytes) = (crate::db_cache::seed(faces.len(), seeds), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425); AETHERFONTDBCACHECMAP (SR697) seeds
         FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes, cache }
@@ -1063,7 +1063,7 @@ mod default_cache_tests {
         let cfg = || Config { dirs: vec![dir.join("fonts")], cache_dir: cache_dir.clone(), ..Config::default() };
         let a = FontDb::discover(cfg());
         assert_eq!(a.discover_cache(), "miss");
-        assert!(xdg.join("unaos/fonts").join(crate::db_cache::INDEX_FILE).is_file(), "store creates the dir and the index");
+        assert!(xdg.join("unaos/fonts").join(crate::db_cache::index_file(&cfg().dirs)).is_file(), "store creates the dir and the index");
         let b = FontDb::discover(cfg());
         assert_eq!(b.discover_cache(), "hit");
         assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
