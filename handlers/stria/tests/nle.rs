@@ -4111,3 +4111,25 @@ fn striachaptersmkv_export_reimports_markers() {
     assert!(!file.windows(4).any(|w| w == [0x10, 0x43, 0xA7, 0x70]), "no markers, no Chapters");
     assert!(Sources::from_media("RE", &file, 25).unwrap().unwrap().0.markers.is_empty());
 }
+
+// ---- STRIACHAPTERSRANGE (LEDGER SR9121): a re-imported Matroska export keeps its ranged chapter as a ranged marker (named tail block) ----
+
+/// STRIACHAPTERSRANGE M3: SR9096's fixture (End spans 20..50, clamped to the range 10..30): the MKV re-import shows End at
+/// tick 10 with len 10 (its ChapterTimeEnd 800 ms) and Act 1 a point; the MP4 re-import keeps both points (`chpl` carries
+/// no end; the QuickTime chapter track is owed, NLE-CHAPTERS-QT).
+#[test]
+fn striachaptersrange_export_reimports_ranges() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as};
+    let (tl, src) = synth_fixture();
+    let tl = tl.mark(5, "Intro").unwrap().mark(12, "Act 1").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap();
+    for (c, ext, end_len) in [(Container::Mkv, "mkv", 10), (Container::Mp4, "mp4", 0)] {
+        let dir = nlefaceexport_dir(&format!("striachaptersrange-{ext}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        export_as(&tl, 10..30, &src, &dir, Box::new(PngSequence), AudioOut::Mp4, c).unwrap();
+        let file = std::fs::read(dir.join(format!("audio.{ext}"))).unwrap();
+        let (back, _) = Sources::from_media("RE", &file, 25).unwrap().expect("the export opens as media");
+        let marks: Vec<(i64, &str, i64)> = back.markers.iter().map(|m| (m.at, m.name.as_str(), m.len)).collect();
+        assert_eq!(marks, vec![(2, "Act 1", 0), (10, "End", end_len)], "{ext}: the chapters as markers, the end as a range");
+        println!("striachaptersrange: audio.{ext} re-imports {marks:?}");
+    }
+}

@@ -55,8 +55,8 @@ pub fn facts_of(bytes: &[u8]) -> Option<MediaFacts> {
 
 /// STRIACHAPTERSMKV (SR9096): NLE-CHAPTERS-PROBE: the chapters of a whole container file as (start ns, title): an MP4's
 /// `chpl` ([`crate::mp4::chapters`]) or a Matroska / WebM file's Chapters ([`crate::mkv::chapters`]); empty for anything
-/// else. THE one dispatch an importer reads them by.
-pub fn chapters_of(bytes: &[u8]) -> alloc::vec::Vec<(i64, alloc::string::String)> {
+/// else. THE one dispatch an importer reads them by. STRIACHAPTERSRANGE (SR9121): each with its end ns when the file has one (Matroska ChapterTimeEnd).
+pub fn chapters_of(bytes: &[u8]) -> alloc::vec::Vec<(i64, alloc::string::String, Option<i64>)> {
     match crate::probe(bytes) {
         Some(crate::Format::Mp4) => crate::mp4::chapters(bytes),
         Some(_) => crate::mkv::chapters(bytes),
