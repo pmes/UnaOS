@@ -7968,6 +7968,102 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
     }
 
+    // ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): the UA control colours and the canvas under color-scheme: dark (named tail block) ----
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): one row per control, 12px apart, under `:root { color-scheme: <scheme> }`:
+    /// an unstyled `<button>` (#b0), a text field (#f0), a `<button>` with an author red background (#br), a `<button>`
+    /// inside `div { color-scheme: normal }` (#bn), and a paragraph (#t, the root's CanvasText).
+    fn color_scheme_engine(scheme: &str) -> crate::AetherEngine {
+        let html = format!(r##"<!doctype html><html><head><style>
+            :root {{ color-scheme: {scheme} }}
+            div {{ margin: 0 0 12px }}
+            </style></head><body style="margin:0;font:20px serif">
+            <div><button id="b0">Hello</button></div>
+            <div><input id="f0" type="text" style="width:120px"></div>
+            <div><button id="br" style="background:rgb(255, 0, 0)">Hello</button></div>
+            <div style="color-scheme:normal"><button id="bn">Hello</button></div>
+            <p id="t">Text</p>
+        </body></html>"##);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn color_scheme_dark_face(c: (u8, u8, u8)) -> bool {
+        c == (107, 107, 107)
+    }
+
+    fn color_scheme_light_face(c: (u8, u8, u8)) -> bool {
+        c == (239, 239, 239)
+    }
+
+    fn color_scheme_dark_field(c: (u8, u8, u8)) -> bool {
+        c == (59, 59, 59)
+    }
+
+    fn color_scheme_white_ink(c: (u8, u8, u8)) -> bool {
+        c.0 > 200 && c.1 > 200 && c.2 > 200
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): under a dark root an unstyled button paints Chromium's dark ButtonFace
+    /// (#6b6b6b) with a white label, and no light face.
+    #[test]
+    fn color_scheme_dark_button_face_and_label() {
+        let mut e = color_scheme_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_dark_face) > 20, "the dark face fills the button");
+        assert_eq!(css_wide_color_ink(&mut e, "b0", color_scheme_light_face), 0, "no light face under dark");
+        assert!(css_wide_color_ink(&mut e, "b0", color_scheme_white_ink) > 3, "the label paints white ButtonText");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the dark root's canvas is #121212 and its text white (CanvasText).
+    #[test]
+    fn color_scheme_dark_canvas_and_text() {
+        let mut e = color_scheme_engine("dark");
+        assert_eq!(imgalt_px(&e, 395, 595), (18, 18, 18), "the dark canvas");
+        assert!(css_wide_color_ink(&mut e, "t", color_scheme_white_ink) > 3, "the paragraph paints white CanvasText");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): a text field under dark fills the dark Field (#3b3b3b).
+    #[test]
+    fn color_scheme_dark_field_fill() {
+        let mut e = color_scheme_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "f0", color_scheme_dark_field) > 20, "the dark field fill");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): an author background on a dark button wins: red, no dark face.
+    #[test]
+    fn color_scheme_dark_author_background_wins() {
+        let mut e = color_scheme_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "br", css_wide_red) > 20, "the author red wins");
+        assert_eq!(css_wide_color_ink(&mut e, "br", color_scheme_dark_face), 0, "no dark face under the author red");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): `color-scheme: normal` under the dark root resets (Some(0), not the
+    /// inherit road): the light face and a black label.
+    #[test]
+    fn color_scheme_normal_resets_under_dark() {
+        let mut e = color_scheme_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "bn", color_scheme_light_face) > 20, "the normal button paints the light face");
+        assert!(css_wide_color_ink(&mut e, "bn", color_scheme_dark_face) <= 2, "no dark face under normal (a black label glyph's antialias can land on (107, 107, 107) over the light face)");
+        assert!(css_wide_color_ink(&mut e, "bn", css_wide_controls_black) > 3, "the normal button's label is black");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): ARMED twins: `light dark` is light (the host prefers light) and `normal`
+    /// is today's light road: the light face, no dark face or field, a white canvas, black text.
+    #[test]
+    fn color_scheme_light_twins() {
+        for scheme in ["light dark", "normal"] {
+            let mut e = color_scheme_engine(scheme);
+            assert!(css_wide_color_ink(&mut e, "b0", color_scheme_light_face) > 20, "{scheme}: the light face");
+            assert!(css_wide_color_ink(&mut e, "b0", color_scheme_dark_face) <= 2, "{scheme}: no dark face (a label glyph's antialias pixel may hit (107, 107, 107))");
+            assert_eq!(css_wide_color_ink(&mut e, "f0", color_scheme_dark_field), 0, "{scheme}: no dark field");
+            assert_eq!(imgalt_px(&e, 395, 595), (255, 255, 255), "{scheme}: the white canvas");
+            assert!(css_wide_color_ink(&mut e, "t", css_wide_controls_black) > 3, "{scheme}: black text");
+        }
+    }
+
     // ---- AETHERTABLEALIGN (LEDGER SR1071): a table's align= is auto margins / float, never text-align (named tail block) ----
 
     /// AETHERTABLEALIGN (SR1071): `<table align=center>` centres the table BOX (HTML rendering §15.3.11: the two auto
