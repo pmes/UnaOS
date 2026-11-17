@@ -3143,7 +3143,7 @@ fn apply_display<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 /// border-style keyword -> paint code (0 solid, 1 dashed, 2 dotted,
 /// 3 double); the 3D styles paint solid in their colour.
-fn border_style_code(v: &str) -> Option<u8> {
+pub fn border_style_code(v: &str) -> Option<u8> {
     match v.trim() {
         "solid" | "groove" | "ridge" | "inset" | "outset" => Some(0),
         "dashed" => Some(1),
@@ -5183,4 +5183,17 @@ pub fn alignment_valid(prop: &str, value: &str) -> bool {
 /// a declared colour's alpha through [`color_alpha`] (`transparent` 0), None when opaque or currentcolor (SR1126's shape).
 fn deco_alpha_of<H: Host>(c: Option<Option<(u8, u8, u8)>>, v: &str) -> Option<f32> {
     c.flatten().and(Some(color_alpha::<H>(v)).filter(|a| *a < 1.0))
+}
+
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): the border-style paint code back to its keyword (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the inverse of [`border_style_code`] — 1 dashed, 2 dotted, 3 double,
+/// every other code `solid` (the render's `style_on` default; groove / ridge / inset / outset collapse to 0 and read solid).
+pub fn border_style_word(code: u8) -> &'static str {
+    match code {
+        1 => "dashed",
+        2 => "dotted",
+        3 => "double",
+        _ => "solid",
+    }
 }
