@@ -185,8 +185,8 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator)
+        [w @ ("kind" | "ease" | "target"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAINSERTMARKSKEYSNEXT (SR985): `target:V2`
+        [w @ ("insert" | "overwrite" | "insert-all"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -520,6 +520,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("insert", "Insert"), button("overwrite", "Overwrite"), // STRIAINSERTOVERWRITE (SR852): the selected clip's source range at the playhead, rippling / over its track
         button("insert-marked", "Insert Marks"), button("overwrite-marked", "Overwrite Marks"), // STRIAINSERTMARKS (SR905): the selected clip's source into the in / out marks, rippling / over its track
+        button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -926,7 +927,7 @@ mod striainsertoverwrite_tests {
     fn striainsertoverwrite_buttons_and_token() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 5..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "help"]); // STRIAINSERTMARKS (SR905)
+        assert_eq!(ids[ids.len() - 8..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKS (SR905); STRIAINSERTMARKSKEYSNEXT (SR985)
         let mut f = face();
         let a1 = f.state.timeline.tracks[1].clone();
         let errors = drive(&mut f, "at:12:0,ruler:15,insert");
@@ -957,7 +958,7 @@ mod striainsertmarks_tests {
     fn striainsertmarks_buttons_and_drive() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 3..], ["insert-marked", "overwrite-marked", "help"]);
+        assert_eq!(ids[ids.len() - 6..], ["insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKSKEYSNEXT (SR985)
         let (tl, src) = nle_face::synth_fixture();
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         let a1 = f.state.timeline.tracks[1].clone();
@@ -969,5 +970,33 @@ mod striainsertmarks_tests {
         assert_eq!((c.src, f.state.playhead, f.state.timeline.marks), (SourceId(1), 9, (Some(5), Some(9))));
         assert_eq!(f.state.timeline.tracks[1], a1, "insert ripples only the target track");
         println!("striainsertmarks witness: at:12:0,ruler:5,in,ruler:9,out,insert-marked -> clip 5:0:4, playhead 9");
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the insert-all / insert-marked-all / target buttons through `--do` (named tail block) ----
+
+#[cfg(test)]
+mod striainsertmarkskeysnext_tests {
+    use super::*;
+    use timeline_core::{Clip, SourceId};
+
+    /// The three buttons sit just before `help`; `--do at:12:0,ruler:15,insert-all` lays B 0..10 at 15 on V1 and ripples A1
+    /// (its B split at 15, the tail at 25); `target:A1` then `insert` is refused by kind on the witness's error list.
+    #[test]
+    fn striainsertmarkskeysnext_buttons_and_drive() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids[ids.len() - 4..], ["insert-all", "insert-marked-all", "target", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "at:12:0,ruler:15,insert-all");
+        assert!(errors.is_empty(), "{errors:?}");
+        let c = f.state.selected().expect("the laid clip selected");
+        assert_eq!(format!("{}:{}:{}", c.at, c.src_in, c.src_out), "15:0:10");
+        assert_eq!(f.state.timeline.tracks[1].clips[2], Clip::new(SourceId(1), 5, 10, 25), "A1 rippled");
+        let errors = drive(&mut f, "target:A1,insert");
+        assert_eq!(f.state.target, Some(1));
+        assert!(errors.iter().any(|e| e.contains("video and audio tracks do not mix")), "{errors:?}");
+        println!("striainsertmarkskeysnext witness: at:12:0,ruler:15,insert-all -> clip 15:0:10, A1 rippled; target:A1,insert -> {errors:?}");
     }
 }

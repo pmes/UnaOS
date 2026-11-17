@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "insert", "overwrite", "insert-marked", "overwrite-marked", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core)
+pub const VERBS: [&str; 33] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.target_verb(v) { return r; } if let Some(r) = self.laid_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3118,7 +3118,7 @@ impl Face {
     /// The four insert words: timeline_core's dispatch, then the laid line (`Some(true)`); `None` for any other word.
     fn laid_verb(&mut self, v: &str) -> Option<bool> {
         let w = v.split_ascii_whitespace().next()?;
-        if !matches!(w, "insert" | "overwrite" | "insert-marked" | "overwrite-marked") {
+        if !matches!(w, "insert" | "overwrite" | "insert-marked" | "overwrite-marked" | "insert-all" | "insert-marked-all") { // STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks words
             return None;
         }
         match self.state.verb(v)? {
@@ -3150,5 +3150,28 @@ impl Face {
         if taken {
             self.laid = None;
         }
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the all-tracks insert words and the target track on the face (named tail block) ----
+// `insert-all` / `insert-marked-all` are SR924's laid words too (the laid line names the clip they lay); `target` goes through
+// timeline_core's ONE dispatch (`EditorState::verb`: session state, no undo step, the document stays clean) and leaves
+// `target: V2` / `target: off` in SR924's `laid` note (cleared by the next taken input); a refusal is `<word>: <why>`.
+// Owed: NLE-INSERT-TARGET-PAINT (the band marks the target's header).
+
+impl Face {
+    /// The `target` words: timeline_core's dispatch, then the note (`Some(true)`); `None` for any other word.
+    fn target_verb(&mut self, v: &str) -> Option<bool> {
+        if v.split_ascii_whitespace().next()? != "target" {
+            return None;
+        }
+        match self.state.verb(v)? {
+            Ok(()) => self.laid = Some(format!("target: {}", self.state.target_label().unwrap_or_else(|| "off".to_string()))),
+            Err(e) => {
+                self.laid = None;
+                self.last_error = Some(format!("{v}: {e}"));
+            }
+        }
+        Some(true)
     }
 }

@@ -45,11 +45,12 @@ pub struct EditorState {
     redo: Vec<Timeline>,
     /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
     pub transition: Option<(usize, usize)>,
+    pub target: Option<usize>, // STRIAINSERTMARKSKEYSNEXT (SR985): the insert words' target track, session state like `selection` (file tail)
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, target: None }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -305,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
+        let ph = self.playhead; if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -683,14 +684,14 @@ impl EditorState {
     }
     /// The selected clip's source range laid at the playhead on its own track.
     pub fn insert_selected(&mut self, mode: crate::Mode) -> Result<(), EditError> {
-        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?; let track = self.aim(track)?; // STRIAINSERTMARKSKEYSNEXT (SR985): the target track when set (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         self.place_at_playhead(track, c.src, c.src_in, c.src_out, mode)
     }
     /// Reel `reel`'s ticks `src_in..src_out` laid at the playhead on the first track holding a clip of that reel.
     pub fn insert_reel(&mut self, reel: &str, src_in: i64, src_out: i64, mode: crate::Mode) -> Result<(), EditError> {
         let src = self.timeline.source_by_reel(reel).ok_or(EditError::NoSource)?.id;
-        let track = self.timeline.tracks.iter().position(|t| t.clips.iter().any(|c| c.src == src)).ok_or(EditError::NoTrack)?;
+        let track = self.timeline.tracks.iter().position(|t| t.clips.iter().any(|c| c.src == src)).ok_or(EditError::NoTrack)?; let track = self.aim(track)?; // STRIAINSERTMARKSKEYSNEXT (SR985): the target track when set (file tail)
         self.place_at_playhead(track, src, src_in, src_out, mode)
     }
     /// The `insert` / `overwrite` words of [`EditorState::verb`]; `None` when `v` is neither (or malformed).
@@ -710,6 +711,7 @@ fn insert_words(v: &str, fps: Option<u32>) -> Option<(crate::Mode, Option<(&str,
     let mode = match w.next()? {
         "insert" => crate::Mode::Insert,
         "overwrite" => crate::Mode::Overwrite,
+        "insert-all" => crate::Mode::InsertAll, // STRIAINSERTMARKSKEYSNEXT (SR985): at the playhead, every track rippled
         _ => return None,
     };
     let Some(reel) = w.next() else { return Some((mode, None)) };
@@ -840,7 +842,7 @@ impl EditorState {
     /// The selected clip's source from its in point, for the marked length, laid at the in mark on its track (`mode`).
     pub fn place_marked(&mut self, mode: crate::Mode) -> Result<(), EditError> {
         let (Some(a), Some(b)) = self.timeline.marks else { return Err(EditError::NoMarks) };
-        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?; let track = self.aim(track)?; // STRIAINSERTMARKSKEYSNEXT (SR985): the target track when set (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         let ph = core::mem::replace(&mut self.playhead, a);
         let r = self.place_at_playhead(track, c.src, c.src_in, c.src_in.saturating_add(b - a), mode);
@@ -855,7 +857,8 @@ impl EditorState {
         let mode = match w.next()? {
             "insert-marked" => crate::Mode::Insert,
             "overwrite-marked" => crate::Mode::Overwrite,
-            "insert" | "overwrite" => return Some(Err(EditError::InsertForm)),
+            "insert-marked-all" => crate::Mode::InsertAll, // STRIAINSERTMARKSKEYSNEXT (SR985): into the marks, every track rippled
+            "insert" | "overwrite" | "insert-all" => return Some(Err(EditError::InsertForm)),
             _ => return None,
         };
         Some(if w.next().is_none() { self.place_marked(mode) } else { Err(EditError::InsertForm) })
@@ -931,5 +934,172 @@ mod striainsertmarks_tests {
         }
         assert_eq!(s.undo_depth(), 0);
         assert_eq!(EditError::NoMarks.to_string(), "no in / out marks set");
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the all-tracks insert words and the insert target track (named tail block) ----
+// `insert-all` (bare, or SR852's `<reel> <in> <out>`) and `insert-marked-all` are SR852's / SR905's roads in
+// `Mode::InsertAll`: THE one `Timeline::place` ripples every track, the ONE `commit` makes it one undo step. `target`
+// sets the insert words' target track: session state like `selection` (not in the Timeline, not in the EDL, no undo step,
+// the document stays clean). `target` alone cycles off -> track 0 -> ... -> the last -> off; `target V2` / `target A1` name
+// a track by its `Timeline::track_number` label; `target off` clears it; an unknown label (or more words) is
+// `EditError::NoTrack`. Every insert road (`insert_selected`, `insert_reel`, `place_marked`: all six insert words) lays on
+// the target when one is set; a target of another kind than the road's own track is `EditError::Kind` (`move_clip`'s rule).
+// Owed: NLE-INSERT-TARGET-PAINT (the band marks the target's header), NLE-INSERT-KERNEL (no key).
+impl EditorState {
+    /// The track an insert road lays on: the target when one is set (another kind than `track`'s: `Kind`; gone:
+    /// `NoTrack`), else `track`.
+    fn aim(&self, track: usize) -> Result<usize, EditError> {
+        let Some(t) = self.target else { return Ok(track) };
+        let to = self.timeline.tracks.get(t).ok_or(EditError::NoTrack)?.kind;
+        let from = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?.kind;
+        if to != from {
+            return Err(EditError::Kind);
+        }
+        Ok(t)
+    }
+    /// Set (or clear) the insert words' target track; no such track: `NoTrack`. No undo step.
+    pub fn set_target(&mut self, target: Option<usize>) -> Result<(), EditError> {
+        if target.is_some_and(|t| t >= self.timeline.tracks.len()) {
+            return Err(EditError::NoTrack);
+        }
+        self.target = target;
+        Ok(())
+    }
+    /// The target track's label (`V2`, `A1`); `None` with no target.
+    pub fn target_label(&self) -> Option<alloc::string::String> {
+        let t = self.target?;
+        let k = self.timeline.tracks.get(t)?.kind;
+        let n = self.timeline.track_number(t)?;
+        Some(alloc::format!("{}{n}", if k == crate::Kind::Video { 'V' } else { 'A' }))
+    }
+    /// The `target` words of [`EditorState::verb`]; `None` for any other word.
+    fn target_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next()? != "target" {
+            return None;
+        }
+        let arg = w.next();
+        if w.next().is_some() {
+            return Some(Err(EditError::NoTrack));
+        }
+        let n = self.timeline.tracks.len();
+        let to = match arg {
+            None => match self.target {
+                None if n > 0 => Some(0),
+                Some(t) if t + 1 < n => Some(t + 1),
+                _ => None,
+            },
+            Some("off") => None,
+            Some(l) => match track_by_label(&self.timeline, l) {
+                Some(t) => Some(t),
+                None => return Some(Err(EditError::NoTrack)),
+            },
+        };
+        Some(self.set_target(to))
+    }
+}
+
+/// `V2` / `a1` -> the index of the second video / first audio track; `None` for any other word or a missing track.
+fn track_by_label(tl: &Timeline, l: &str) -> Option<usize> {
+    let k = match l.as_bytes().first()? {
+        b'V' | b'v' => crate::Kind::Video,
+        b'A' | b'a' => crate::Kind::Audio,
+        _ => return None,
+    };
+    let n = l.get(1..)?.parse::<usize>().ok()?.checked_sub(1)?;
+    tl.tracks.iter().enumerate().filter(|(_, t)| t.kind == k).nth(n).map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod striainsertmarkskeysnext_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// SR852's cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and A1, and an empty V2 (index 2).
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// `insert-all` at 15 with B selected: V1 is place's Insert, A1 is split at 15 and rippled by 10; ONE undo restores.
+    #[test]
+    fn striainsertmarkskeysnext_insert_all_ripples_every_track_and_undoes_once() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(15);
+        assert_eq!(st.verb("insert-all"), Some(Ok(())));
+        let want = tl0.place(0, Clip::new(SourceId(1), 0, 10, 15), Mode::InsertAll).unwrap();
+        assert_eq!(st.timeline, want);
+        assert_eq!(st.timeline.tracks[0], tl0.place(0, Clip::new(SourceId(1), 0, 10, 15), Mode::Insert).unwrap().tracks[0]);
+        let a1 = &st.timeline.tracks[1].clips;
+        assert_eq!(a1[..], [Clip::new(SourceId(0), 13, 23, 0), Clip::new(SourceId(1), 0, 5, 10), Clip::new(SourceId(1), 5, 10, 25), Clip::new(SourceId(0), 23, 33, 35)]);
+        assert!(st.timeline.tracks[2].clips.is_empty());
+        assert_eq!((st.selection, st.playhead, st.undo_depth()), (Some((0, 2)), 25, 1));
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0, "ONE undo restores");
+    }
+
+    /// `insert-marked-all` into 5..9 ripples A1 by 4 from 5; `insert-all A 13 23` names the range; malformed shapes are
+    /// `InsertForm`.
+    #[test]
+    fn striainsertmarkskeysnext_marked_and_reel_shapes() {
+        let mut st = state();
+        st.timeline = st.timeline.set_marks((Some(5), Some(9))).unwrap();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("insert-marked-all"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 4, 5), Mode::InsertAll).unwrap());
+        assert_eq!(st.timeline.tracks[1].clips[1], Clip::new(SourceId(0), 18, 23, 9), "A1's head split at 5, its tail at 9");
+        assert_eq!(st.timeline.marks, (Some(5), Some(9)), "marks kept");
+        let mut s = state();
+        s.seek(10);
+        assert_eq!(s.verb("insert-all A 0 5"), Some(Ok(())));
+        assert_eq!(s.timeline.tracks[1].clips[1], Clip::new(SourceId(1), 0, 10, 15), "A1's clip at 10 moved by 5");
+        for v in ["insert-all A", "insert-all A 1 2 3", "insert-marked-all now"] {
+            assert_eq!(s.verb(v), Some(Err(EditError::InsertForm)), "{v}");
+        }
+    }
+
+    /// `target V2` steers `insert` onto V2 (V1 untouched); a target of the other kind is `Kind`; the target words take no
+    /// undo step and leave the timeline; `target` alone cycles and wraps to off; unknown labels are `NoTrack`.
+    #[test]
+    fn striainsertmarkskeysnext_target_steers_the_insert_roads() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("target V2"), Some(Ok(())));
+        assert_eq!((st.target, st.target_label().as_deref(), st.undo_depth()), (Some(2), Some("V2"), 0));
+        assert_eq!(st.timeline, tl0, "the target is not the document");
+        st.select(0, 1).unwrap();
+        st.seek(5);
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(2, Clip::new(SourceId(1), 0, 10, 5), Mode::Insert).unwrap());
+        assert_eq!(st.timeline.tracks[0], tl0.tracks[0], "V1 untouched");
+        assert_eq!(st.selection, Some((2, 0)), "the laid clip on V2 selected");
+        assert_eq!(st.verb("target a1"), Some(Ok(())));
+        st.select(0, 0).unwrap();
+        let before = st.timeline.clone();
+        assert_eq!(st.verb("insert"), Some(Err(EditError::Kind)));
+        assert_eq!(st.verb("insert A 0 5"), Some(Err(EditError::Kind)), "the reel's first track is V1");
+        assert_eq!(st.timeline, before);
+        assert_eq!(st.verb("target off"), Some(Ok(())));
+        assert_eq!(st.target, None);
+        for want in [Some(0), Some(1), Some(2), None] {
+            assert_eq!(st.verb("target"), Some(Ok(())));
+            assert_eq!(st.target, want);
+        }
+        for v in ["target V3", "target A0", "target X1", "target V1 now"] {
+            assert_eq!(st.verb(v), Some(Err(EditError::NoTrack)), "{v}");
+        }
+        assert_eq!(st.verb("targets"), None);
     }
 }

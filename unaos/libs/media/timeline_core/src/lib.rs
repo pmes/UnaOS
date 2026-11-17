@@ -340,6 +340,7 @@ pub enum Mode {
     Insert,
     /// Cut `at..at+len` out of whatever is there (trimming or splitting it) and lay the clip in the hole.
     Overwrite,
+    InsertAll, // STRIAINSERTMARKSKEYSNEXT (SR985): Insert on the target track and the same room (split, ripple) on every other track (file tail)
 }
 
 /// Why an edit (or a timeline) was refused.
@@ -604,7 +605,7 @@ impl Timeline {
         }
         let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
         match mode {
-            Mode::Insert => {
+            Mode::Insert | Mode::InsertAll => {
                 split_at(t, clip.at);
                 for c in t.clips.iter_mut().filter(|c| c.at >= clip.at) {
                     c.at += clip.len();
@@ -614,7 +615,7 @@ impl Timeline {
         }
         t.clips.push(clip);
         sort(t);
-        tl.retarget_transitions(self)?; tl.validate()?;
+        if mode == Mode::InsertAll { tl.ripple_others(track, clip.at, clip.len()); } tl.retarget_transitions(self)?; tl.validate()?;
         Ok(tl)
     }
 
@@ -1530,5 +1531,27 @@ impl Timeline {
         let mut tl = self.clone();
         tl.marks = m;
         Ok(tl)
+    }
+}
+
+// ---- STRIAINSERTMARKSKEYSNEXT (LEDGER SR985): the all-tracks insert's room on the other tracks (named tail block) ----
+// `Mode::InsertAll` rides THE one `Timeline::place`: its Insert arm makes room on the target track, then `ripple_others`
+// makes the same room on every other track (the clip spanning `at` split there, every clip from `at` on later by `len`),
+// before place's ONE `retarget_transitions` against the original and ONE `validate`. A transition or audio crossfade whose
+// cut the ripple opens is refused there by name (`EditError::Transition`), never dropped. The export marks are not moved.
+// Owed: NLE-INSERT-ROOM-ONE (the Insert arm's body onto this per-track room), NLE-INSERT-SYNC-MARKS.
+
+impl Timeline {
+    /// Split at `at` and move every clip from `at` on later by `len`, on every track but `track`.
+    fn ripple_others(&mut self, track: usize, at: i64, len: i64) {
+        for (k, t) in self.tracks.iter_mut().enumerate() {
+            if k == track {
+                continue;
+            }
+            split_at(t, at);
+            for c in t.clips.iter_mut().filter(|c| c.at >= at) {
+                c.at += len;
+            }
+        }
     }
 }
