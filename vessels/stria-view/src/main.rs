@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "history"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -921,6 +921,26 @@ mod striaundohistory_tests {
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         let errors = drive(&mut f, "at:12:0,split,history");
         assert_eq!(errors, vec!["history: 1 split".to_string()]);
+        assert_eq!(f.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): the witness's `history:<n>` token (named tail block) ----
+#[cfg(test)]
+mod striaundohistorydrag_tests {
+    use super::*;
+
+    /// `--do ...,history:<n>` is the face's `history <n>`: the top n undo entries on the message line (the witness's
+    /// `errors`), nothing committed.
+    #[test]
+    fn striaundohistorydrag_count_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "at:12:0,split,history:1");
+        assert_eq!(errors, vec!["history: 1 split".to_string()]);
+        assert_eq!(f.state.undo_depth(), 1);
+        let errors = drive(&mut f, "history:0");
+        assert_eq!(errors, vec!["history: \"0\" is not a count 1..=256".to_string()]);
         assert_eq!(f.state.undo_depth(), 1);
     }
 }

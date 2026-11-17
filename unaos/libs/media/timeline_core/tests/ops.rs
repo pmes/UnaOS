@@ -322,3 +322,28 @@ fn striaundohistory_bounded() {
     assert_eq!(top.len(), 23, "24 falls inside a two-byte char: clipped to 23");
     assert_eq!(st.undo_depth(), UNDO_MAX);
 }
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): a drag's undo entry named by its kind (named tail block) ----
+
+/// Every drag kind that commits names its undo entry with a `drag ` word within `WORD_MAX`; a marquee and a scrub commit
+/// nothing and have no word.
+#[test]
+fn striaundohistorydrag_drag_kind_words() {
+    use timeline_core::editor::WORD_MAX;
+    use timeline_core::view::DragKind;
+    let named = [
+        (DragKind::TrimIn, "drag trim in"),
+        (DragKind::TrimOut, "drag trim out"),
+        (DragKind::TransitionIn, "drag transition in"),
+        (DragKind::TransitionOut, "drag transition out"),
+        (DragKind::Move, "drag move"),
+        (DragKind::Slip, "drag slip"),
+        (DragKind::Slide, "drag slide"),
+    ];
+    for (k, w) in named {
+        assert_eq!(k.word(), Some(w), "{k:?}");
+        assert!(w.len() <= WORD_MAX, "{w}");
+    }
+    assert_eq!(DragKind::Marquee.word(), None);
+    assert_eq!(DragKind::Scrub.word(), None);
+}

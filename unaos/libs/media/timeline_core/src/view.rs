@@ -706,7 +706,7 @@ impl Drag {
         }
     }
     /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing).
-    pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
+    fn finish_unnamed(&self, st: &mut EditorState) -> Result<(), EditError> {
         match self.kind {
             DragKind::Marquee => {
                 let (x0, y0, x1, y1) = (self.origin.0, self.origin.1, self.at.0, self.at.1);
@@ -1187,5 +1187,38 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): a drag's undo entry named by its kind (named tail block) ----
+// `Drag::finish` was the one commit road outside any verb, so its undo entry read `(unnamed)` in the history line. The
+// public [`Drag::finish`] arms its kind's word through SR876's `EditorState::arm_word` (the ONE name store; an outer
+// armed word wins) around the unchanged body (`finish_unnamed`), and disarms after. A marquee or a scrub commits
+// nothing and has no word. Both faces (the host face's release, the kernel Player's drag) call this one fn.
+
+impl DragKind {
+    /// The word a drag of this kind names its undo entry with; `None` for the kinds that commit nothing.
+    pub fn word(self) -> Option<&'static str> {
+        match self {
+            DragKind::TrimIn => Some("drag trim in"),
+            DragKind::TrimOut => Some("drag trim out"),
+            DragKind::TransitionIn => Some("drag transition in"),
+            DragKind::TransitionOut => Some("drag transition out"),
+            DragKind::Move => Some("drag move"),
+            DragKind::Slip => Some("drag slip"),
+            DragKind::Slide => Some("drag slide"),
+            DragKind::Marquee | DragKind::Scrub => None,
+        }
+    }
+}
+
+impl Drag {
+    /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing),
+    /// its undo entry named by the drag's kind ([`DragKind::word`]).
+    pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
+        let armed = self.kind.word().map_or(false, |w| st.arm_word(w));
+        let r = self.finish_unnamed(st);
+        st.disarm_word(armed);
+        r
     }
 }

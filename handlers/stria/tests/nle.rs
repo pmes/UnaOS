@@ -3688,3 +3688,84 @@ fn striaundohistory_face_word() {
     assert_eq!(line.as_deref(), Some("history: 1 ]"));
     println!("striaundohistory: {line:?}");
 }
+
+// ---- STRIAUNDOHISTORYDRAG (LEDGER SR912): a drag's step named by its kind, `history <n>` (named tail block) ----
+
+/// A drag's undo entry carries its kind's word (`Drag::finish` arms it through `arm_word`): a plain 40 px drag of B is
+/// `drag move`, a Ctrl drag `drag slip`; undo / redo move the names with the snapshots; a transition's right-edge drag
+/// is `drag transition out`, and a refused one adds no entry.
+#[test]
+fn striaundohistorydrag_drag_names_its_step() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, 0);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    let l = face.layout();
+    let at = face.state.selected().map(|c| c.at).unwrap();
+    let (x, y) = l.point(0, at + 2);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, bandy::MOD_CONTROL);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+    assert!(face.verb("undo"));
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move"));
+    assert!(face.verb("redo"));
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 drag slip | 1 drag move"));
+
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = nlefaceexport_face(tl, src);
+    let tr = face.state.timeline.tracks[0].transitions[0];
+    let l = face.layout();
+    let (_, y0, x1, y1) = l.transition_rect(0, &tr);
+    let (x, y) = (x1 as f64 - 1.0, (y0 + y1) as f64 / 2.0);
+    let tick = face.state.zoom as f64;
+    nle3eslipdrag_drag(&mut face, x, y, 1000.0 * tick, bandy::MOD_ALT);
+    if face.last_error.take().is_some() {
+        assert_eq!(face.state.undo_depth(), 0, "a refused edge drag adds no entry");
+    } else {
+        assert!(face.verb("undo"), "the long edge drag committed: take it back");
+    }
+    nle3eslipdrag_drag(&mut face, x, y, tick, bandy::MOD_ALT);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 5);
+    assert!(face.verb("history"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 1 drag transition out"));
+    println!("striaundohistorydrag: {line:?}");
+}
+
+/// `history <n>` lists the top n entries (bounded by the stack's cap, `UNDO_MAX`); a count of 0, above the cap or not a
+/// number is refused by name on the message line; none of them commits, dirties or moves the undo stack.
+#[test]
+fn striaundohistorydrag_history_count() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    assert!(face.verb("delete"));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("slip+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let (tl1, depth, dirty) = (face.state.timeline.clone(), face.state.undo_depth(), face.dirty());
+    assert_eq!(depth, 3);
+    for (v, want) in [
+        ("history 2", "history: 3 slip+ | 2 delete"),
+        ("history 1", "history: 3 slip+"),
+        ("history 99", "history: 3 slip+ | 2 delete | 1 split"),
+        ("history 0", "history: \"0\" is not a count 1..=256"),
+        ("history 257", "history: \"257\" is not a count 1..=256"),
+        ("history x", "history: \"x\" is not a count 1..=256"),
+    ] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{v}");
+        assert_eq!((face.state.timeline == tl1, face.state.undo_depth(), face.dirty()), (true, depth, dirty), "{v}");
+    }
+}
