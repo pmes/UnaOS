@@ -1422,7 +1422,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
                 )
             {
-                return;
+                return apply_font_wide(value, style, cx);
             }
             let mut rest = value; let font_prior = reset_font_prefix(&mut style.paint);
             // Leading style / variant / weight / stretch keywords.
@@ -3614,4 +3614,35 @@ fn restore_font_prefix<H: Host>(paint: &mut PaintStyle<H>, prior: FontPrefix) {
 fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     apply_declaration("font-size", size, style, cx);
     apply_declaration("line-height", "normal", style, cx);
+}
+
+// ---- AETHERFONTSHORTHANDINHERIT (LEDGER SR810): css-cascade-4 §7.3 the CSS-wide keywords on font reach its longhands (named tail block) ----
+
+/// AETHERFONTSHORTHANDINHERIT (SR810): a CSS-wide keyword on the `font` shorthand applies to each longhand it resets
+/// (css-cascade-4 §7.3). `inherit` / `unset` (every font longhand is inherited, so unset == inherit) take the
+/// longhands' own inherit road, None: font-style / -weight / -stretch / -variant-caps through [`restore_font_prefix`],
+/// line-height through the `line-height` arm (its `font_rel` entry, so the font-relative replay cannot bring an earlier
+/// line-height back) then None, font-family None; the size takes the parent-relative road `smaller` / `larger` use
+/// (font_size None, font_size_rel (0, 1.0)), because a None size is the tag's code default (13.333 px on a control),
+/// not the parent's. `initial` is SR805's reset ([`reset_font_prefix`], [`reset_font_shorthand_rest`] at `medium`)
+/// plus the standard family. `revert` (no UA cascade layer is modelled) and the system fonts are dropped as before.
+/// None clears only this block's earlier values (merge_paint copies Somes): an explicit inherit that beats an earlier
+/// rule and the tag defaults is owed (AETHER-CSS-WIDE-LONGHANDS).
+fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    match kw {
+        "inherit" | "unset" => {
+            restore_font_prefix(&mut style.paint, (None, None, None, None));
+            apply_declaration("line-height", "inherit", style, cx);
+            style.paint.line_height = None;
+            style.paint.family = None;
+            style.paint.font_size = None;
+            style.paint.font_size_rel = Some((0, 1.0));
+        }
+        "initial" => {
+            reset_font_prefix(&mut style.paint);
+            reset_font_shorthand_rest("medium", style, cx);
+            style.paint.family = Some(crate::STANDARD);
+        }
+        _ => {} // revert and the six system fonts: dropped (AETHER-CSS-WIDE-REVERT, AETHER-FONT-SHORTHAND-SYSTEM owed)
+    }
 }
