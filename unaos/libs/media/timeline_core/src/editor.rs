@@ -731,7 +731,7 @@ impl EditorState {
         for &(track, idx) in &self.set {
             let own = tl.tracks.get(track).and_then(|t| t.clips.get(idx)).ok_or(EditError::NoClip)?.opacity;
             let pct = (own as i16 + d).clamp(0, crate::OPAQUE as i16) as u8;
-            tl = tl.set_opacity(&[(track, idx)], pct)?;
+            tl = match key_step(&tl, (track, idx), self.playhead, d) { Some(r) => r?, None => tl.set_opacity(&[(track, idx)], pct)? }; // STRIAOPACITYKEYSFACE (SR9085): a keyed clip writes its point at the playhead (file tail)
         }
         if tl != self.timeline {
             self.commit(tl);
@@ -786,4 +786,20 @@ impl EditorState {
             _ => None,
         }
     }
+}
+
+// ---- STRIAOPACITYKEYSFACE (LEDGER SR9085): the opacity step on a keyed clip writes the point at the playhead (named tail block) ----
+// `opacity-` / `opacity+` (SR958's `step_opacity_each`) on a clip WITH opacity points step the curve, not the static
+// percent the points override: the point at the playhead is set (replaced, or inserted there) to the clip's
+// `opacity_at(playhead)` + `d`, clamped to 0..=[`crate::OPAQUE`], through SR9048's `Timeline::set_opacity_key`. A keyed
+// clip not under the playhead, or full, is refused by name (`EditError::OpacityKey`); an unkeyed clip keeps SR958's road.
+
+/// STRIAOPACITYKEYSFACE: the step of `pick` on `tl` when it carries opacity points; `None` for an unkeyed clip.
+fn key_step(tl: &crate::Timeline, pick: (usize, usize), ph: i64, d: i16) -> Option<Result<crate::Timeline, EditError>> {
+    let c = tl.tracks.get(pick.0)?.clips.get(pick.1)?;
+    if c.opacity_keys.is_empty() {
+        return None;
+    }
+    let pct = (c.opacity_at(ph) as i16 + d).clamp(0, crate::OPAQUE as i16) as u8;
+    Some(tl.set_opacity_key(&[pick], ph, Some(pct)))
 }

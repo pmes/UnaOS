@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "opacity"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIAOPACITYFACE (SR898): `opacity:50`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "opacity" | "opacity-key"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIAOPACITYKEYSFACE (SR9085): `opacity-key:40`; STRIAOPACITYFACE (SR898): `opacity:50`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -517,7 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
+        button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), button("opacity-key", "Key"), button("opacity-unkey", "Unkey"), // STRIAOPACITYKEYSFACE (SR9085): the opacity point at the playhead set / cleared (THE `opacity-key` / `opacity-unkey` verbs); STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -923,10 +923,37 @@ mod striaopacityface_tests {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
         let n = ids.len();
-        assert_eq!(&ids[n - 3..], &["opacity-".to_string(), "opacity+".to_string(), "help".to_string()]);
+        assert_eq!(&ids[n - 5..n - 2], &["opacity-".to_string(), "opacity+".to_string(), "opacity-key".to_string()]); // STRIAOPACITYKEYSFACE (SR9085): the two key buttons now sit between these and help
         let errors = drive(&mut face, "opacity+");
         assert!(errors.is_empty(), "{errors:?}"); assert_eq!(face.message_text().as_deref(), Some("opacity: 60 %")); // STRIAOPACITYNEXT (SR993): the step's percent is a note, not an error
         assert_eq!(face.state.selected().map(|c| c.opacity), Some(60));
         println!("striaopacityface: buttons {:?}; opacity+ -> {errors:?}", &ids[n - 3..]);
+    }
+}
+
+// ---- STRIAOPACITYKEYSFACE (LEDGER SR9085): `--do opacity-key:<n>` and the two key buttons (named tail block) ----
+#[cfg(test)]
+mod striaopacitykeysface_tests {
+    use super::*;
+
+    /// `--do at:12:0,opacity-key:40` sets a point at 40 % on the clicked clip with no error and the note names it; the
+    /// transport's last three buttons are `opacity-key`, `opacity-unkey`, `help`; `opacity-unkey` clears the point.
+    #[test]
+    fn striaopacitykeysface_do_key_and_buttons() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,opacity-key:40");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.message_text().as_deref(), Some("opacity key: 40 % at 12"));
+        assert_eq!(face.state.selected().map(|c| c.opacity_at(12)), Some(40));
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
+        let n = ids.len();
+        assert_eq!(&ids[n - 3..], &["opacity-key".to_string(), "opacity-unkey".to_string(), "help".to_string()]);
+        let errors = drive(&mut face, "opacity-unkey");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.message_text().as_deref(), Some("opacity key cleared at 12"));
+        assert_eq!(face.state.selected().map(|c| c.opacity_keys.is_empty()), Some(true));
+        println!("striaopacitykeysface: buttons {:?}", &ids[n - 3..]);
     }
 }

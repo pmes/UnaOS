@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "opacity-", "opacity+", "help"]; // STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "opacity-", "opacity+", "opacity-key", "opacity-unkey", "help"]; // STRIAOPACITYKEYSFACE (SR9085): `opacity-key` / `opacity-unkey` are transport buttons (the point at the playhead); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -3115,7 +3115,7 @@ impl Face {
             return None;
         }
         self.last_error = Some(match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
-            Ok(()) => { self.last_error = None; self.note = Some(format!("opacity: {} %", self.state.selected().map_or(timeline_core::OPAQUE, |c| c.opacity))); return Some(true); } // STRIAOPACITYNEXT (SR993): the step's percent is a note, not an error (file tail)
+            Ok(()) => { self.last_error = None; self.note = Some(format!("opacity: {} %", self.state.selected().map_or(timeline_core::OPAQUE, |c| c.opacity_at(self.state.playhead)))); return Some(true); } // STRIAOPACITYKEYSFACE (SR9085): a keyed clip names its curve at the playhead; STRIAOPACITYNEXT (SR993): the step's percent is a note, not an error (file tail)
             Err(e) => format!("opacity: {e}"),
         });
         Some(true)

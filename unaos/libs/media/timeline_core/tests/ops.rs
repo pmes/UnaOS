@@ -427,3 +427,83 @@ fn striaopacitykeys_words_are_one_undo_step() {
     }
     assert_eq!(st.timeline, tl);
 }
+
+// ---- STRIAOPACITYKEYSFACE (LEDGER SR9085): the step on a keyed clip and the curve painted on the selection (named tail block) ----
+
+/// V1's A[0,10)@0 with opacity points `pts` (source ticks, percent).
+fn striaopacitykeysface_keyed(pts: &[(i64, u8)]) -> Timeline {
+    let (mut tl, _, _) = base();
+    let keys = pts.iter().fold(timeline_core::OpacityKeys::NONE, |k, &(t, p)| k.with(t, p).unwrap());
+    tl.tracks[0].clips[0] = tl.tracks[0].clips[0].with_opacity_keys(keys);
+    tl.validate().unwrap();
+    tl
+}
+
+/// `opacity-` on a keyed clip under the playhead writes the point there at the curve's value - 10 as ONE undo step (the
+/// static percent unchanged); `opacity+` replaces it; a keyed clip off the playhead is refused by name; an unkeyed clip
+/// keeps SR958's road.
+#[test]
+fn striaopacitykeysface_step_writes_the_point_at_the_playhead() {
+    use timeline_core::editor::EditorState;
+    let tl = striaopacitykeysface_keyed(&[(2, 20), (8, 80)]);
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    st.seek(5);
+    assert_eq!(st.timeline.tracks[0].clips[0].opacity_at(5), 50);
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), d0 + 1);
+    let c = st.timeline.tracks[0].clips[0];
+    assert_eq!((c.opacity_at(5), c.opacity, c.opacity_keys.len()), (40, timeline_core::OPAQUE, 3), "a point inserted at the playhead");
+    assert_eq!(st.verb("opacity+"), Some(Ok(())));
+    let c = st.timeline.tracks[0].clips[0];
+    assert_eq!((c.opacity_at(5), c.opacity_keys.len()), (50, 3), "the point at the playhead replaced");
+    st.seek(15);
+    let d1 = st.undo_depth();
+    assert_eq!(st.verb("opacity-"), Some(Err(EditError::OpacityKey)), "the keyed clip is not under the playhead");
+    assert_eq!(st.undo_depth(), d1);
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("opacity-"), Some(Ok(())));
+    let b = st.timeline.tracks[0].clips[1];
+    assert_eq!((b.opacity, b.opacity_keys.is_empty()), (90, true), "unkeyed: the static percent");
+    while st.undo_depth() > 0 {
+        assert!(st.undo());
+    }
+    assert_eq!(st.timeline, tl);
+}
+
+/// The primary selected keyed clip paints its points in `KEY_INK`; a flat 100 % curve paints only while selected (an
+/// unselected keyed clip at 100 % is byte-identical to the unkeyed one); an unselected keyed body shades at its curve.
+#[test]
+fn striaopacitykeysface_curve_paints_on_the_selected_clip() {
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, KEY_INK, Layout, Order, ROW, ROW_H, clip_colour, opacity_colour};
+    let (w, h) = (320u32, 160u32);
+    let paint = |st: &EditorState| view::paint(st, w, h, Order::Rgba, None, None);
+    let state = |tl: Timeline, sel: bool, ph: i64| {
+        let mut st = EditorState::new(tl);
+        if sel {
+            st.select(0, 0).unwrap();
+        }
+        st.seek(ph);
+        st
+    };
+    let (plain, a, _) = base();
+    let flat = striaopacitykeysface_keyed(&[(2, 100), (8, 100)]);
+    assert_eq!(paint(&state(flat.clone(), false, 0)), paint(&state(plain.clone(), false, 0)), "unselected, flat 100 %: byte-identical");
+    assert_ne!(paint(&state(flat, true, 0)), paint(&state(plain.clone(), true, 0)), "selected: the curve paints");
+    let keyed = striaopacitykeysface_keyed(&[(2, 20), (8, 80)]);
+    let st = state(keyed.clone(), true, 0);
+    let l = Layout::of(w, h, &st);
+    let y1 = l.row_y(0) + ROW_H as i64;
+    let (x, y) = (l.x_of(2), y1 - 3 - (ROW_H as i64 - 6) * 20 / 100);
+    let px = paint(&st);
+    let i = (y as usize * w as usize + x as usize) * 4;
+    assert_eq!([px[i], px[i + 1], px[i + 2], px[i + 3]], KEY_INK, "the 20 % point at tick 2");
+    let st = state(keyed, false, 5);
+    let l = Layout::of(w, h, &st);
+    let (bx, by) = l.point(0, 5);
+    let px = paint(&st);
+    let i = (by as usize * w as usize + bx as usize) * 4;
+    assert_eq!([px[i], px[i + 1], px[i + 2], px[i + 3]], opacity_colour(clip_colour(a.0, Kind::Video), ROW[0], 50), "the body at its curve at the playhead");
+}

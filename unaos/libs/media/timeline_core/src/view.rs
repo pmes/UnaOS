@@ -330,10 +330,10 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             if x1 <= 0 || x0 >= w as i64 {
                 continue;
             }
-            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity)); // STRIAOPACITYFACE (SR898): the body at its opacity (file tail)
+            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity_at(st.playhead))); // STRIAOPACITYKEYSFACE (SR9085): a keyed clip's shade is its curve at the playhead; STRIAOPACITYFACE (SR898): the body at its opacity (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
-                text.text(&mut c, &opacity_label(label, clip.opacity), x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32)); // STRIAOPACITYMORE (SR958): the label names a non-opaque clip's percent (file tail)
+                text.text(&mut c, &opacity_label(label, clip.opacity_at(st.playhead)), x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32)); // STRIAOPACITYKEYSFACE (SR9085): a keyed clip's label reads its curve at the playhead; STRIAOPACITYMORE (SR958): the label names a non-opaque clip's percent (file tail)
             }
         }
     }
@@ -348,7 +348,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
         c.frame(x0, y0, x1, y1, SELECT);
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
-        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
+        c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE); paint_opacity_keys(&mut c, l, &clip, y0, y1); // STRIAOPACITYKEYSFACE (SR9085): the primary's opacity curve and points (file tail)
     }
     paint_transitions(&mut c, l, st);
     // The playhead, through the ruler and the tracks.
@@ -1214,4 +1214,38 @@ pub fn opacity_label(label: alloc::string::String, pct: u8) -> alloc::string::St
         return label;
     }
     alloc::format!("{label} {pct}%")
+}
+
+// ---- STRIAOPACITYKEYSFACE (LEDGER SR9085): the selected clip's opacity curve and points (named tail block) ----
+// On the PRIMARY selected clip with opacity points, one [`KEY_INK`] pixel per column between the trim handles at the
+// height of [`crate::Clip::opacity_at`] there (100 % near the body's top, 0 % near its foot), and a 3 x 3 px [`KEY_INK`]
+// square on each point the clip shows. An unkeyed clip paints NOTHING here, so every golden stays byte-identical. Amber
+// squares on the curve, distinct from the placement points' white 3 x 7 px marks (SR9069 `XKEY`). Both faces paint it
+// through `paint_in`.
+
+/// STRIAOPACITYKEYSFACE: the opacity curve and points' ink (amber).
+pub const KEY_INK: [u8; 4] = [0xff, 0xc8, 0x40, 255];
+
+/// STRIAOPACITYKEYSFACE: the y of opacity `pct` on a clip row `y0..y1` (100 % at `y0 + 3`, 0 % at `y1 - 3`).
+fn key_y(y0: i64, y1: i64, pct: u8) -> i64 {
+    (y1 - 3) - (y1 - y0 - 6) * pct.min(crate::OPAQUE) as i64 / crate::OPAQUE as i64
+}
+
+/// STRIAOPACITYKEYSFACE: `clip`'s opacity curve and its points on row `y0..y1`; nothing when it has no points.
+fn paint_opacity_keys(c: &mut Canvas, l: Layout, clip: &crate::Clip, y0: i64, y1: i64) {
+    if clip.opacity_keys.is_empty() {
+        return;
+    }
+    let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+    for x in (x0 + HANDLE_W).max(0)..(x1 - HANDLE_W).min(l.w as i64) {
+        let y = key_y(y0, y1, clip.opacity_at(l.tick_at(x as f64)));
+        c.rect(x, y, x + 1, y + 1, KEY_INK);
+    }
+    for (kt, pct) in clip.opacity_keys.iter() {
+        let t = clip.at + (kt - clip.src_in);
+        if clip.covers(t) {
+            let (x, y) = (l.x_of(t), key_y(y0, y1, pct));
+            c.rect(x - 1, y - 1, x + 2, y + 2, KEY_INK);
+        }
+    }
 }

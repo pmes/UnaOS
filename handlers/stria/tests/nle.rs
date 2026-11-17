@@ -3833,3 +3833,29 @@ fn striaopacitykeys_face_note() {
     assert_eq!((face.last_error.take(), face.note.as_deref()), (None, Some("opacity key cleared at 12")));
     println!("striaopacitykeys: opacity-key 40 -> note, unkey off a point -> refusal");
 }
+
+// ---- STRIAOPACITYKEYSFACE (LEDGER SR9085): the key words on the transport, the step on a keyed clip names its curve (named tail block) ----
+
+/// `opacity-key` / `opacity-unkey` are VERBS words before `help`; after `opacity-key 40` at 12 the transport's
+/// `opacity-` writes the point at the playhead and the note reads `opacity: 30 %` (the curve there, not the static 100).
+#[test]
+fn striaopacitykeysface_buttons_and_step_note() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    let pos = |w: &str| VERBS.iter().position(|v| *v == w);
+    assert!(pos("opacity-key").is_some_and(|i| pos("opacity-unkey").is_some_and(|j| i < j && Some(j) < pos("help"))));
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(12);
+    assert!(face.verb("opacity-key 40"));
+    assert_eq!(face.last_error.take(), None);
+    let d0 = face.state.undo_depth();
+    assert!(face.verb("opacity-"));
+    assert_eq!((face.last_error.take(), face.message_text().as_deref()), (None, Some("opacity: 30 %")));
+    assert_eq!(face.state.undo_depth(), d0 + 1);
+    let c = face.state.timeline.tracks[0].clips[1];
+    assert_eq!((c.opacity_at(12), c.opacity), (30, timeline_core::OPAQUE));
+    assert!(face.verb("opacity-unkey"));
+    assert_eq!((face.last_error.take(), face.note.as_deref()), (None, Some("opacity key cleared at 12")));
+    println!("striaopacitykeysface: opacity-key 40, opacity- -> 30 % at 12");
+}
