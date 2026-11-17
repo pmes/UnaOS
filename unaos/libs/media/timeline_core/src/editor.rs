@@ -755,3 +755,40 @@ impl EditorState {
         alloc::format!("history: {}", items.join(" | "))
     }
 }
+
+// ---- STRIAKUNDOHIST (LEDGER SR9004): the count jump `undo <n>` / `redo <n>`, lifted from the host face (named tail block) ----
+// SR934's rule, moved here unchanged from `stria::nle_face` `Face::undo_jump_verb` so both faces run ONE copy (the host
+// face's word and the kernel Player's digit after `H`): `undo <n>` / `redo <n>` step the ONE `undo` / `redo` n times (n in
+// 1..=the stack's depth), so every step stays its own entry and `redo <n>` returns exactly. The line names where it landed
+// through SR876's names: the oldest of the n entries undone (`history(n)` read BEFORE stepping), or the newest entry after
+// a redo (`history(1)`); an unnamed step reads `(unnamed)`. Any other count is refused by name and nothing moves.
+impl EditorState {
+    /// `undo <n>` / `redo <n>`: the steps and the landing line, or the refusal line; `None` for any other word.
+    pub fn jump(&mut self, v: &str) -> Option<alloc::string::String> {
+        let (back, arg) = match (v.strip_prefix("undo "), v.strip_prefix("redo ")) {
+            (Some(a), _) => (true, a.trim()),
+            (_, Some(a)) => (false, a.trim()),
+            _ => return None,
+        };
+        let (word, depth) = if back { ("undo", self.undo_depth()) } else { ("redo", self.redo_depth()) };
+        let n = match arg.parse::<usize>() {
+            Ok(n) if depth > 0 && (1..=depth).contains(&n) => n,
+            _ if depth == 0 => return Some(alloc::format!("{word}: nothing to {word}")),
+            _ => return Some(alloc::format!("{word}: {arg:?} is not a count 1..={depth}")),
+        };
+        let name = |w: Option<&str>| w.map_or_else(|| alloc::string::String::from("(unnamed)"), |w| alloc::format!("{w:?}"));
+        Some(if back {
+            let at = name(self.history(n).last().and_then(|&(_, w)| w));
+            for _ in 0..n {
+                self.undo();
+            }
+            alloc::format!("undo {n}: back to before {at}")
+        } else {
+            for _ in 0..n {
+                self.redo();
+            }
+            let at = name(self.history(1).first().and_then(|&(_, w)| w));
+            alloc::format!("redo {n}: forward to after {at}")
+        })
+    }
+}
