@@ -2958,10 +2958,10 @@ mod shorthand_computed_tests {
             ("a", "flex", "0 1 auto"),
             ("a", "border-width", "0px"),
             ("a", "border-style", "none"),
-            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: a colour or border-image longhand
-            // has no computed row, so these rows still read "".
+            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: border / outline / background still
+            // have a longhand with no computed row, so they read "".
             ("a", "border", ""),
-            ("a", "border-color", ""),
+            ("a", "border-color", "rgb(0, 0, 0)"), // SR1104: the four colour longhands are report columns, so border-color composes
             ("a", "outline", ""),
             ("a", "background", ""),
             ("o", "overflow", "hidden visible"),

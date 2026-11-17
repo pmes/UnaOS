@@ -1280,12 +1280,13 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 37; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 40; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
     "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
     "margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width", // SR1096
     "border-right-style", "border-bottom-style", "border-left-style", // SR1103
+    "border-top-color", "border-right-color", "border-bottom-color", // SR1104
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1413,6 +1414,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             };
             let side = |i: usize| paint.border.map(|b| layout_core::paint::border_ink(b, paint.currentcolor, me.color)).and_then(|b| b[i]);
             let sstyle = |i: usize| { let w = paint.border_width.and_then(|w| w[i]).or(side(i).map(|s| s.0)).unwrap_or(0.0); (if side(i).is_some() && w > 0.0 { layout_core::css::border_style_word(paint.border_style.map_or(0, |s| s[i])) } else { "none" }).to_string() }; // AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the four border-style columns, the render's paint rule
+            let scolor = |i: usize| rgb(side(i).map(|s| s.1).unwrap_or(me.color)); // AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): the four border-color columns, one rule (an unpainted side reads the element's color)
             // AETHERCSSOMBOXSIDECOLUMNS (SR1096): the box-side columns, one expression per property for all four sides (i: top, right, bottom, left).
             let mside = |i: usize| st.as_ref().map(|s| lpa_s(rect_side(&s.margin, i))).unwrap_or_else(|| px(0.0));
             let pside = |i: usize| st.as_ref().map(|s| lp(rect_side(&s.padding, i))).unwrap_or_else(|| px(0.0));
@@ -1438,7 +1440,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 list_style_word(me.list_style).to_string(),
                 bside(0),
                 sstyle(0),
-                rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
+                scolor(3),
                 pside(0),
                 mside(0),
                 flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(), unicode_bidi_word(crate::render::unicode_bidi_of(tag, &paint, &any.node_at(id))).to_string(),
@@ -1447,6 +1449,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 rgb(paint.decoration_color.flatten().unwrap_or(me.color)),
                 mside(1), mside(2), mside(3), pside(1), pside(2), pside(3), bside(1), bside(2), bside(3),
                 sstyle(1), sstyle(2), sstyle(3), // SR1103
+                scolor(0), scolor(1), scolor(2), // SR1104
             ];
             out.insert(id, values);
             inh.insert(id, me);
