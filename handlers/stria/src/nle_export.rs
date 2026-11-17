@@ -700,7 +700,7 @@ pub fn export_as_with(
 ) -> Result<ExportReport, ExportError> {
     let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     sink.container = container;
-    let total = if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 };
+    let total = export_total(tl, &range); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the one frame-count rule, the face's seed too (file tail)
     let rr = render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?; // NLESTANDINAUDIOEDITOR (SR713): the render report kept for its stand-in count
     sink.finish(tl.tb).map(|e| ExportReport { stand_in_audio: rr.stand_in_audio, ..e }) // NLESTANDINAUDIOEDITOR (SR713)
 }
@@ -1016,4 +1016,17 @@ pub fn pass2_cli_of(s: &str) -> Result<Pass2Cli, String> {
 pub fn pass2_words(cli: &Pass2Cli) -> String {
     let p = pass2_of(cli.qcomp, cli.cplxblur, cli.qblur_q8, cli.qpstep);
     format!("qcomp={} cplxblur={} qblur={} qpstep={}", p.qcomp.0 as f64 / p.qcomp.1 as f64, p.cplxblur, f64::from(p.qblur_q8) / 256.0, p.qpstep)
+}
+
+// ---- NLE5DEXPORTMESSAGEETATOTAL (LEDGER SR820): the export's one frame count (named tail block) ----
+// SR803's face read `total` 0 until the export thread's first reading (`export: starting`, stria-view `"total":0`). The count
+// is known the moment the export is asked for: [`export_as_with`] reports it with every frame and the editor face's
+// `start_export` seeds `ExportJob.total` with it before the spawn, both through this ONE rule. Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-KERNEL, NLE5D-EXPORT-MESSAGE-ETA-STALL-WITNESS, NLE5D-EXPORT-MESSAGE-ETA-STALL-FINALIZE,
+// NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The frames an export of output ticks `range` of `tl` encodes: the range's ticks (a tick is a frame: `Timebase` is seconds
+/// per tick) when the timeline has a video track, 0 without one; an empty or reversed range is 0.
+pub fn export_total(tl: &Timeline, range: &std::ops::Range<i64>) -> u64 {
+    if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 }
 }

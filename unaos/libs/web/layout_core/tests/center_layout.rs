@@ -422,3 +422,148 @@ fn left_and_webkit_left_split() {
     assert_eq!(line_x("width: 300px; text-align: left", &[]), 0.0, "left: the line is at the left");
     assert_eq!(line_x("width: 300px", &[("align", "left")]), 0.0, "align=left: the line is at the left");
 }
+
+// ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
+
+/// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): CSS 2.2 §10.3.3 in rtl: a definite-width block with neither
+/// margin auto is over-constrained and margin-left is the one ignored, so it sits margin-right from the right edge
+/// (SR711's `place_narrow_blocks` END: taffy's End places it at free + margin-left). One auto margin takes the slack and
+/// two centre, either direction (taffy's auto margins); the ltr twin keeps margin-left; a `direction` restyle round
+/// trip re-derives the placement through SR686's `rule_align` undo.
+#[test]
+fn rtl_margins_over_constrained() {
+    let col = |col_style: &str, kid_style: &str| {
+        page(vec![el("div", &[("id", "col"), ("style", col_style)], vec![el("div", &[("id", "n"), ("style", kid_style)], vec![text("ab")])])])
+    };
+    let offset_in = |tree: &Tree, doc: &N| {
+        let (cx, _, cw, _) = box_of(tree, &doc.by_id("col"));
+        let (x, _, _, _) = box_of(tree, &doc.by_id("n"));
+        assert_eq!(cw, 300.0, "the column is 300 wide");
+        x - cx
+    };
+    let m = "width: 100px; margin-left: 10px; margin-right: 20px";
+    let cases: [(&str, N, f32); 6] = [
+        ("rtl 10 / 20", col("width: 300px; direction: rtl", m), 180.0),
+        ("ltr 10 / 20", col("width: 300px", m), 10.0),
+        ("rtl auto / 20", col("width: 300px; direction: rtl", "width: 100px; margin-left: auto; margin-right: 20px"), 180.0),
+        ("rtl 0 auto", col("width: 300px; direction: rtl", "width: 100px; margin: 0 auto"), 100.0),
+        ("rtl 400 wide, 10 / 20", col("width: 300px; direction: rtl", "width: 400px; margin-left: 10px; margin-right: 20px"), -120.0),
+        ("rtl text-align: center, 10 / 20", col("width: 300px; direction: rtl; text-align: center", m), 180.0),
+    ];
+    for (how, doc, want) in &cases {
+        let tree = lay(doc, VW, 400.0);
+        assert_eq!(offset_in(&tree, doc), *want, "{how}: the block's offset in the 300px column");
+    }
+
+    let doc = col("width: 300px", m);
+    let mut tree = lay(&doc, VW, 400.0);
+    assert_eq!(offset_in(&tree, &doc), 10.0, "ltr: margin-left binds");
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    for (dir, want) in [("rtl", 180.0), ("ltr", 10.0)] {
+        let mut spec = layout_core::css::SpecifiedStyle::<TH>::default();
+        layout_core::css::apply_declaration("direction", dir, &mut spec, &cx);
+        let specs = [(id_of(&tree, &doc.by_id("col")), std::rc::Rc::new(spec))];
+        layout_core::apply_specs(&mut tree, &specs);
+        layout_core::remeasure(&mut tree, &F);
+        assert_eq!(offset_in(&tree, &doc), want, "direction: {dir} restyle: the block's offset");
+    }
+
+// ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): the rule's container align-items / justify-content undone (named tail block) ----
+
+/// AETHERCENTERRESTYLEITEMS (SR782): the container side of SR686's restyle. `td align=center` (a column) takes the
+/// rule's `align_items: CENTER`; a restyle of the SAME tree (`apply_specs` + the in-place `remeasure`) to `text-align:
+/// left` puts it back to NORMAL, so the 200px #d sits at the cell's content start instead of staying centred by the
+/// cell's cross axis. A plain `center` restyle re-derives it (CENTER, #d at the start, SR436) and a later `left` undoes
+/// the new mark. An author `align-items: center` folded on a flex column (the fold lands it) and an author
+/// `justify-content: center` on a row cell (the rule's justify-only mark) survive the undo.
+#[test]
+fn center_restyle_undoes_rule_align_items() {
+    use layout_core::taffy::style::{AlignItems, JustifyContent};
+    use std::rc::Rc;
+    let cx = layout_core::css::ParseCx::new(VW, 400.0);
+    let spec = |decls: &[(&str, &str)]| {
+        let mut s = layout_core::css::SpecifiedStyle::<TH>::default();
+        for (n, v) in decls {
+            layout_core::css::apply_declaration(n, v, &mut s, &cx);
+        }
+        Rc::new(s)
+    };
+    let restyle = |tree: &mut Tree, doc: &N, id: &str, decls: &[(&str, &str)]| {
+        let specs = [(id_of(tree, &doc.by_id(id)), spec(decls))];
+        layout_core::apply_specs(tree, &specs);
+        layout_core::remeasure(tree, &F);
+    };
+    let items = |tree: &Tree, doc: &N, id: &str| tree.taffy.style(id_of(tree, &doc.by_id(id))).unwrap().align_items;
+    let justify = |tree: &Tree, doc: &N, id: &str| tree.taffy.style(id_of(tree, &doc.by_id(id))).unwrap().justify_content;
+    let at_start = |tree: &Tree, doc: &N, how: &str| {
+        let (cx0, _, _, _) = box_of(tree, &doc.by_id("cell"));
+        let (dx, _, dw, _) = box_of(tree, &doc.by_id("d"));
+        assert!(dw > 0.0 && (dx - (cx0 + 1.0)).abs() < 0.5, "{how}: #d sits at the cell's content start (x {dx}, cell {cx0})");
+    };
+
+    // (a) SR686's fixture: the rule's align_items on the cell is undone by a text-align: left restyle.
+    let doc = page(vec![el(
+        "table",
+        &[("style", "width: 600px; border-spacing: 0")],
+        vec![el(
+            "tr",
+            &[],
+            vec![el(
+                "td",
+                &[("id", "cell"), ("align", "center")],
+                vec![
+                    el("table", &[("id", "t")], vec![el("tr", &[], vec![el("td", &[], vec![text("cell")])])]),
+                    el("div", &[("id", "d"), ("style", "width: 200px")], vec![text("ab")]),
+                ],
+            )],
+        )],
+    )]);
+    let mut tree = lay(&doc, VW, 400.0);
+    assert_eq!(items(&tree, &doc, "cell"), AlignItems::CENTER, "td align=center: the rule centres the cell's column");
+    restyle(&mut tree, &doc, "cell", &[("text-align", "left")]);
+    assert_eq!(items(&tree, &doc, "cell"), AlignItems::NORMAL, "text-align: left: the rule's align_items is undone");
+    at_start(&tree, &doc, "text-align: left");
+
+    // (b) -webkit-center -> plain center re-derives (and re-marks); a later left undoes the new mark.
+    let mut tree = lay(&doc, VW, 400.0);
+    restyle(&mut tree, &doc, "cell", &[("text-align", "center")]);
+    assert_eq!(items(&tree, &doc, "cell"), AlignItems::CENTER, "text-align: center: the rule's align_items is re-derived");
+    at_start(&tree, &doc, "text-align: center");
+    restyle(&mut tree, &doc, "cell", &[("text-align", "left")]);
+    assert_eq!(items(&tree, &doc, "cell"), AlignItems::NORMAL, "center then left: the re-derived mark is undone");
+
+    // (c) An author align-items: center that the fold lands (a flex column) survives the undo.
+    let fx = page(vec![el(
+        "div",
+        &[("id", "fx"), ("align", "center"), ("style", "display: flex; flex-direction: column; width: 600px")],
+        vec![el("div", &[("style", "width: 200px")], vec![text("ab")])],
+    )]);
+    let flex = [("display", "flex"), ("flex-direction", "column"), ("width", "600px")];
+    let mut tree = lay(&fx, VW, 400.0);
+    assert_eq!(items(&tree, &fx, "fx"), AlignItems::CENTER, "align=center on a flex column: the rule's align_items");
+    let mut decls = flex.to_vec();
+    decls.extend([("align-items", "center"), ("text-align", "left")]);
+    restyle(&mut tree, &fx, "fx", &decls);
+    assert_eq!(items(&tree, &fx, "fx"), AlignItems::CENTER, "an author align-items: center folded by the restyle is kept");
+    let mut tree = lay(&fx, VW, 400.0);
+    let mut decls = flex.to_vec();
+    decls.push(("text-align", "left"));
+    restyle(&mut tree, &fx, "fx", &decls);
+    assert_eq!(items(&tree, &fx, "fx"), AlignItems::NORMAL, "control: with no author align-items the column is NORMAL");
+
+    // (d) The justify-only mark: a 300px block holding inline content only is a row, and the -webkit-center it inherits
+    // from `div align=center` makes the rule write its justify_content alone. A restyle of the ANCESTOR to text-align:
+    // left (the row box gets no spec of its own) undoes it; an author justify-content: center folded on the row is kept.
+    // (A text-align declaration on the row box itself folds its own justify, css.rs `"left"` -> START, and drops the mark.)
+    let row = page(vec![el("div", &[("id", "wrap"), ("align", "center")], vec![el("div", &[("id", "row"), ("style", "width: 300px")], vec![text("inline only")])])]);
+    let mut tree = lay(&row, VW, 400.0);
+    assert_eq!(justify(&tree, &row, "row"), JustifyContent::CENTER, "inherited -webkit-center on a row box: the rule's justify_content");
+    restyle(&mut tree, &row, "wrap", &[("text-align", "left")]);
+    assert_eq!(justify(&tree, &row, "row"), JustifyContent::NORMAL, "the ancestor's text-align: left: the rule's justify_content is undone");
+    let mut tree = lay(&row, VW, 400.0);
+    let specs = [(id_of(&tree, &row.by_id("wrap")), spec(&[("text-align", "left")])), (id_of(&tree, &row.by_id("row")), spec(&[("justify-content", "center")]))];
+    layout_core::apply_specs(&mut tree, &specs);
+    layout_core::remeasure(&mut tree, &F);
+    assert_eq!(justify(&tree, &row, "row"), JustifyContent::CENTER, "an author justify-content: center folded by the restyle is kept");
+}
+}

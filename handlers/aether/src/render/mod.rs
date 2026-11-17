@@ -1003,16 +1003,16 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     let parent_font_size = inherited.font_size;
     let own_family = spec
         .family
-        .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FAMILY, inherited.family, |f| crate::layout::default_family(tag, f)));
     inherited.font_size = spec.used_font_size.or(spec.font_size).unwrap_or_else(|| {
-        crate::layout::ua_font_size(tag, inherited.font_size, inherited.family, own_family)
+        layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FONT_SIZE, inherited.font_size, |fs| crate::layout::ua_font_size(tag, fs, inherited.family, own_family))
     });
     inherited.weight = spec
         .weight
         .map(|w| w.resolve(inherited.weight))
-        .unwrap_or_else(|| crate::layout::default_weight(tag, inherited.weight));
+        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WEIGHT, inherited.weight, |w| crate::layout::default_weight(tag, w)));
     inherited.italic =
-        spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
+        spec.italic.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_ITALIC, inherited.italic, |i| crate::layout::default_italic(tag, i)));
     if let Some(st) = spec.stretch {
         inherited.stretch = st;
     }
@@ -1023,7 +1023,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     inherited.rtl = spec.rtl.unwrap_or_else(|| crate::layout::default_rtl(dom_node, inherited.rtl));
     inherited.family = spec
         .family
-        .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
+        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_FAMILY, inherited.family, |f| crate::layout::default_family(tag, f)));
     if let Some(lh) = spec.line_height {
         inherited.line_height = lh;
     }
@@ -1075,11 +1075,11 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.color = spec.color.unwrap_or(if tag == "a" {
+    inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
         (0, 0, 238) // UA default link blue
     } else {
         inherited.color
-    });
+    }));
 }
 
 /// Draws one line's worth of text with its baseline at `baseline_y` — an
