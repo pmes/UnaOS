@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -658,5 +658,172 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIAINSERTOVERWRITE (LEDGER SR852): insert / overwrite a source range at the playhead through place (named tail block) ----
+// `insert` / `overwrite` ride THE verb dispatch both faces call and lay a source range at the PLAYHEAD through
+// `Timeline::place` (`Mode::Insert` splits what spans the playhead and ripples THAT track only; `Mode::Overwrite` carves
+// the hole) and the ONE `commit` (undo restores the whole pre-op timeline). Three-point editing without a source viewer:
+// bare, the range is the SELECTED clip's `(src, src_in, src_out)` on its track (nothing selected: `EditError::NoClip`);
+// `insert <reel> <in> <out>` names it (frames or a non-drop `HH:MM:SS:FF` through `edl::parse_tc`) on the FIRST track
+// holding a clip of that reel (none: `EditError::NoTrack`; an unknown reel `EditError::NoSource`). The laid clip is a fresh
+// `Clip::new` (unity gain, no fades). The timeline's marks are the export range and are not consulted. After the edit
+// the laid clip is selected and the playhead sits at its end, so a repeat appends. A malformed shape is not this verb.
+impl EditorState {
+    /// Lay source `src` ticks `src_in..src_out` at the playhead on `track` (`Timeline::place` in `mode`, ONE commit); the
+    /// laid clip is selected and the playhead moves to its end.
+    pub fn place_at_playhead(&mut self, track: usize, src: crate::SourceId, src_in: i64, src_out: i64, mode: crate::Mode) -> Result<(), EditError> {
+        let clip = Clip::new(src, src_in, src_out, self.playhead);
+        let tl = self.timeline.place(track, clip, mode)?;
+        self.commit(tl);
+        self.select_at(track, clip.at).unwrap_or_else(|_| self.deselect());
+        self.seek(clip.end());
+        Ok(())
+    }
+    /// The selected clip's source range laid at the playhead on its own track.
+    pub fn insert_selected(&mut self, mode: crate::Mode) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        self.place_at_playhead(track, c.src, c.src_in, c.src_out, mode)
+    }
+    /// Reel `reel`'s ticks `src_in..src_out` laid at the playhead on the first track holding a clip of that reel.
+    pub fn insert_reel(&mut self, reel: &str, src_in: i64, src_out: i64, mode: crate::Mode) -> Result<(), EditError> {
+        let src = self.timeline.source_by_reel(reel).ok_or(EditError::NoSource)?.id;
+        let track = self.timeline.tracks.iter().position(|t| t.clips.iter().any(|c| c.src == src)).ok_or(EditError::NoTrack)?;
+        self.place_at_playhead(track, src, src_in, src_out, mode)
+    }
+    /// The `insert` / `overwrite` words of [`EditorState::verb`]; `None` when `v` is neither (or malformed).
+    fn insert_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let (mode, range) = insert_words(v, self.timeline.fps())?;
+        Some(match range {
+            None => self.insert_selected(mode),
+            Some((reel, a, b)) => self.insert_reel(reel, a, b, mode),
+        })
+    }
+}
+
+/// `insert` / `overwrite` bare -> `(mode, None)`; `insert <reel> <in> <out>` -> `(mode, Some((reel, in, out)))`; any other
+/// shape is not this verb.
+fn insert_words(v: &str, fps: Option<u32>) -> Option<(crate::Mode, Option<(&str, i64, i64)>)> {
+    let mut w = v.split_ascii_whitespace();
+    let mode = match w.next()? {
+        "insert" => crate::Mode::Insert,
+        "overwrite" => crate::Mode::Overwrite,
+        _ => return None,
+    };
+    let Some(reel) = w.next() else { return Some((mode, None)) };
+    let a = insert_tick(w.next()?, fps)?;
+    let b = insert_tick(w.next()?, fps)?;
+    w.next().is_none().then_some((mode, Some((reel, a, b))))
+}
+
+/// A source tick: an integer frame count, else a non-drop `HH:MM:SS:FF` at `fps` through the EDL's one parser.
+fn insert_tick(s: &str, fps: Option<u32>) -> Option<i64> {
+    s.parse::<i64>().ok().or_else(|| edl::parse_tc(s, fps?, 0).ok())
+}
+
+#[cfg(test)]
+mod striainsertoverwrite_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// `verb_tests`' cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and on A1.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_source("C", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striainsertoverwrite_insert_splits_ripples_the_track_and_undoes_once() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(15);
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        let want = tl0.place(0, Clip::new(SourceId(1), 0, 10, 15), Mode::Insert).unwrap();
+        assert_eq!(st.timeline, want);
+        let v1 = &st.timeline.tracks[0].clips;
+        assert_eq!(v1[1], Clip::new(SourceId(1), 0, 5, 10), "the spanned clip split at the playhead");
+        assert_eq!(v1[2], Clip::new(SourceId(1), 0, 10, 15), "the laid clip at the playhead");
+        assert_eq!(v1[3], Clip::new(SourceId(1), 5, 10, 25), "its tail moved later by the range's length");
+        assert_eq!(v1[4], Clip::new(SourceId(0), 23, 33, 35));
+        assert_eq!(st.timeline.tracks[1], tl0.tracks[1], "insert ripples only the target track");
+        assert_eq!((st.selection, st.playhead), (Some((0, 2)), 25), "laid clip selected, playhead at its end");
+        assert_eq!(st.undo_depth(), 1);
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0, "ONE undo restores");
+    }
+
+    #[test]
+    fn striainsertoverwrite_overwrite_cuts_the_hole_and_keeps_the_end() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(12);
+        assert_eq!(st.verb("overwrite"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 10, 12), Mode::Overwrite).unwrap());
+        assert_eq!(st.timeline.end(), tl0.end(), "the range fits: the end is unchanged");
+        assert_eq!(st.timeline.tracks[0].clips[1], Clip::new(SourceId(1), 0, 2, 10));
+        assert_eq!(st.timeline.tracks[0].clips[2], Clip::new(SourceId(1), 0, 10, 12));
+        assert_eq!(st.playhead, 22);
+    }
+
+    #[test]
+    fn striainsertoverwrite_argument_form_by_frames_and_timecode() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.seek(10);
+        assert_eq!(st.verb("insert A 40 45"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.place(0, Clip::new(SourceId(0), 40, 45, 10), Mode::Insert).unwrap(), "reel A's first track is V1");
+        let mut tc = state();
+        tc.seek(10);
+        assert_eq!(tc.verb("insert A 00:00:01:15 00:00:01:20"), Some(Ok(())));
+        assert_eq!(tc.timeline, st.timeline, "the timecode form is the frame form");
+        let mut ow = state();
+        ow.seek(10);
+        assert_eq!(ow.verb("overwrite B 00:00:00:00 5"), Some(Ok(())));
+        assert_eq!(ow.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 5, 10), Mode::Overwrite).unwrap());
+    }
+
+    #[test]
+    fn striainsertoverwrite_refusals_by_name_leave_the_state() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.seek(10);
+        assert_eq!(st.verb("insert"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("overwrite"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("insert Z 0 5"), Some(Err(EditError::NoSource)));
+        assert_eq!(st.verb("insert A 5 5"), Some(Err(EditError::Empty)));
+        assert_eq!(st.verb("insert A 9 3"), Some(Err(EditError::Empty)));
+        assert_eq!(st.verb("insert A 45 51"), Some(Err(EditError::OutOfSource)));
+        assert_eq!(st.verb("insert A -1 5"), Some(Err(EditError::Negative)));
+        assert_eq!(st.verb("insert C 0 5"), Some(Err(EditError::NoTrack)), "a reel on no track");
+        assert_eq!((st.timeline.clone(), st.undo_depth(), st.playhead), (tl0, 0, 10));
+        for v in ["insert A", "insert A 1", "insert A 1 x", "insert A 1 2 3", "inserts", "overwrite A 00:00:00:25 30"] {
+            assert_eq!(st.verb(v), None, "{v}: not this verb");
+        }
+    }
+
+    #[test]
+    fn striainsertoverwrite_repeat_appends_and_edl_round_trips() {
+        let mut st = state();
+        st.select(0, 1).unwrap();
+        st.seek(35);
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        let v1 = &st.timeline.tracks[0].clips;
+        assert_eq!((v1[3], v1[4]), (Clip::new(SourceId(1), 0, 10, 35), Clip::new(SourceId(1), 0, 10, 45)));
+        assert_eq!(st.playhead, 55);
+        let text = edl::write(&st.timeline, "INSERT").unwrap();
+        assert_eq!(edl::parse(&text, 25).unwrap(), st.timeline);
     }
 }

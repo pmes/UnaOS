@@ -3551,3 +3551,51 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIAINSERTOVERWRITE (LEDGER SR852): insert / overwrite from the face through timeline_core's dispatch (named tail block) ----
+
+/// The two words are transport words just before `help` (still the last); with B selected and the playhead mid-B the
+/// face's `insert` is `place` Insert of B 0..10 at the playhead on V1 (A1 not rippled), `overwrite` the Overwrite; the
+/// message row reads the laid clip's reel line.
+#[test]
+fn striainsertoverwrite_face_words_are_place_at_the_playhead() {
+    assert_eq!(VERBS[VERBS.len() - 3..], ["insert", "overwrite", "help"]);
+    for (word, mode) in [("insert", timeline_core::Mode::Insert), ("overwrite", timeline_core::Mode::Overwrite)] {
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl.clone(), src);
+        face.state.select(0, 1).unwrap();
+        face.state.seek(15);
+        assert!(face.verb(word), "{word}");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert_eq!(face.state.timeline, tl.place(0, Clip::new(SourceId(1), 0, 10, 15), mode).unwrap(), "{word}");
+        assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "{word}: only the target track moves");
+        assert_eq!(face.state.selected(), Some(Clip::new(SourceId(1), 0, 10, 15)));
+        assert_eq!(face.state.playhead, 25);
+        assert!(face.message_text().is_some_and(|m| m.starts_with("B: ")), "{:?}", face.message_text());
+        assert!(face.verb("undo"));
+        assert_eq!(face.state.timeline, tl, "{word}: one undo");
+    }
+    println!("striainsertoverwrite: insert / overwrite at 15 lay B 0..10 on V1; VERBS ends insert, overwrite, help");
+}
+
+/// No selection: the bare words are refused by the editor's name on the message line; the argument form by timecode lays
+/// the named reel's range at the playhead on the reel's first track.
+#[test]
+fn striainsertoverwrite_face_refusal_and_timecode_form() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    for v in ["insert", "overwrite"] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert!(face.verb("insert Z 0 5"));
+    assert_eq!(face.last_error.take(), Some(format!("insert Z 0 5: {}", EditError::NoSource)));
+    assert_eq!(face.state.timeline, tl);
+    face.state.seek(10);
+    assert!(!face.verb("insert A 00:00:00:40 45"), "a frame field past the rate is not this word");
+    assert!(face.verb("insert A 00:00:01:15 00:00:01:20"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let want = tl.place(0, Clip::new(SourceId(0), 40, 45, 10), timeline_core::Mode::Insert).unwrap();
+    assert_eq!(face.state.timeline, want);
+    println!("striainsertoverwrite: no selection -> insert: {}; insert A 00:00:01:15 00:00:01:20 lays A 40..45 at 10 on V1", EditError::NoClip);
+}
