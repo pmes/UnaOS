@@ -1861,12 +1861,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-color" => {
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint), "border-color" => {
             // `transparent` (or a fully transparent rgba) is how a page
             // says "keep the box, drop the stroke" — the UA control border
             // must go with it, or every quiet button paints an empty frame.
             let v = value.trim().to_ascii_lowercase();
-            if v == "transparent" || (v.starts_with("rgba(") && parse_color_str::<H>(&v).is_none()) {
+            if border_transparent::<H>(&v) {
                 style.paint.border = Some([None; 4]);
                 return;
             }
@@ -3689,7 +3689,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px",
+        "border-width" => "3px", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", // SR1014 fold: the branch's table row
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -3836,4 +3836,41 @@ fn apply_align_content<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
         "inherit" | "initial" | "unset" => return,
         other => return H::record_css(&format!("align-content-value:{}", other)),
     });
+}
+
+// ---- AETHERCSSBORDERSIDECOLOR (LEDGER SR1014): the border-*-color longhands write one side's colour (named tail block) ----
+
+/// AETHERCSSBORDERSIDECOLOR (SR1014): `transparent`, or a fully transparent rgba (`parse_color_str` answers None), as a
+/// border colour: Aether drops the side (no transparent stroke). Lifted from the `border-color` arm, which calls it too.
+fn border_transparent<H: Host>(v: &str) -> bool {
+    let v = v.trim().to_ascii_lowercase();
+    v == "transparent" || (v.starts_with("rgba(") && parse_color_str::<H>(&v).is_none())
+}
+
+/// AETHERCSSBORDERSIDECOLOR (SR1014): `border-top-color` / `-right-` / `-bottom-` / `-left-color` (css-backgrounds-3
+/// §3.1) write ONE side's colour, its width kept. A side with no entry has style none in Aether's model (a side paints
+/// iff its entry is Some), so the longhand creates nothing there and no ink paints, as Chromium (the colour is not
+/// stored: AETHER-CSS-BORDER-COLOR-STORED owed). The colour goes through `border_color_of` unchanged; only this side's
+/// currentcolor bit keeps its answer, the other three are put back. `transparent` drops the side, as `border-color` does.
+fn side_color_of<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
+    let Some(mut sides) = paint.border.filter(|b| b[side].is_some()) else { return };
+    if border_transparent::<H>(value) {
+        sides[side] = None;
+        paint.border = Some(sides);
+        return;
+    }
+    let before = paint.currentcolor;
+    let Some(c) = border_color_of::<H>(paint, value) else {
+        if !is_neutral_keyword(value) {
+            H::record_css(&format!("border-side-color-value:{}", clip(value)));
+        }
+        return;
+    };
+    let bit = 1u8 << side;
+    paint.currentcolor = (before & !bit) | (paint.currentcolor & bit);
+    paint.border_alpha = Some(color_alpha::<H>(value));
+    if let Some((w, _)) = sides[side] {
+        sides[side] = Some((w, c));
+    }
+    paint.border = Some(sides);
 }
