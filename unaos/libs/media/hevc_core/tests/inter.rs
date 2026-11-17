@@ -1841,17 +1841,18 @@ fn conceal_main10_high_precision_offset_unshifted() {
 }
 
 /// SR1035: the chroma offset of 7-56 under the flag at 10 bits. P2 and P5 carry unit luma (no luma entry) and chroma
-/// weights with ChromaLog2WeightDenom 6: Cb ChromaWeight 32 (delta -32), delta_chroma_offset 600; Cr ChromaWeight 64,
-/// delta_chroma_offset -300. With the flag WpOffsetHalfRangeC is 512 and the shift 0: Cb Clip3(-512, 511, 512 + 600 - 256)
-/// = +511 (the upper edge), Cr -300 (outside the flag-off range); without it the half range is 128 and the shift 2: Cb
-/// 127 << 2 = 508, Cr -128 << 2 = -512 (the lower edge -half << shift is -512 at both flag values, so it carries no
+/// weights with ChromaLog2WeightDenom 6: Cb ChromaWeight 32 (delta -32), delta_chroma_offset 511 (SR1043: was 600, outside
+/// the flag-off delta range -512..511 that `pred_weight_list` now refuses; the results are unchanged); Cr ChromaWeight 64,
+/// delta_chroma_offset -300. With the flag WpOffsetHalfRangeC is 512 and the shift 0: Cb Clip3(-512, 511, 512 + 511 - 256
+/// = 767) = +511 (the upper edge), Cr -300 (outside the flag-off range); without it the half range is 128 and the shift 2: Cb
+/// Clip3(-128, 127, 128 + 511 - 64 = 575) = 127, << 2 = 508, Cr -128 << 2 = -512 (the lower edge -half << shift is -512 at both flag values, so it carries no
 /// contrast). Whole-sample vectors at log2WD 6 + 4 = 10 read Cb ((v + 1) >> 1) + o, Cr v + o, clipped to 0..1023. The
 /// concealed POC 3 (P4, its copy) equals P5 (the decoder's own MC) and the hand equation on P2 advanced by (4, 2).
 #[test]
 fn conceal_main10_high_precision_chroma_half_range() {
     let i0 = gradient10();
     let pi = PpsInter { weighted_pred: true, ..Default::default() };
-    let chroma = Some((0, vec![Some([(-32, 600), (0, -300)])]));
+    let chroma = Some((0, vec![Some([(-32, /* SR1043 */ 511), (0, -300)])]));
     let mut p4s = Vec::new();
     for high in [false, true] {
         let (ocb, ocr) = if high { (511, -300) } else { (508, -512) };
@@ -1936,4 +1937,116 @@ fn conceal_main10_high_precision_bidir() {
         p6s.push(img16_of(by_poc(&f, 6)).y);
     }
     assert_ne!(p6s[0], p6s[1], "the flag changes the weighted bi concealment: + 12 rounding, not + 36");
+}
+
+// ---- HEVCWPOFFSETRANGE (LEDGER SR1043): pred_weight_table offsets outside 7.4.7.3's ranges refuse the slice (named tail block) ----
+
+/// SR1043: decode a weighted head (8-bit [`headers`] + [`idr`], or SR1035's 10-bit [`headers10_hp`] + [`idr10`] with
+/// high_precision_offsets_enabled_flag `high`), then return the decode of ONE skip-only P1 whose one-entry table carries
+/// `luma` as luma_offset_l0 (delta_luma_weight 0) and `cb` / `cr` as delta_chroma_offset_l0 (delta_chroma_weight 0; the
+/// other component 0). Before SR1043 every value parsed (the armed contrast is the pre-arc decoder's Ok).
+fn wp_probe(depth10: bool, high: bool, luma: Option<i32>, cb: Option<i32>, cr: Option<i32>) -> hevc_core::Result<()> {
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    let mut s = if depth10 { headers10_hp(&pi, high) } else { headers(false, true, &pi) };
+    s.extend(if depth10 { idr10(&gradient10()) } else { idr(&gradient(), true) });
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("the weighted head and the IDR decode");
+    let chroma = (cb.is_some() || cr.is_some()).then(|| (0, vec![Some([(0, cb.unwrap_or(0)), (0, cr.unwrap_or(0))])]));
+    let cfg = SliceCfg { weights: Some((6, vec![luma.map(|o| (0, o))])), chroma_weights: chroma, ..p_slice(1, vec![(-1, true)]) };
+    d.decode_annexb(&picture(&cfg, skip_picture))
+}
+
+const LUMA_OFF: hevc_core::Error = hevc_core::Error::Invalid("luma_offset");
+const CHROMA_OFF: hevc_core::Error = hevc_core::Error::Invalid("delta_chroma_offset");
+
+/// SR1043: at 8 bits WpOffsetHalfRangeY is 128: luma_offset_l0 127 and -128 parse, 128 and -129 refuse the slice by name.
+#[test]
+fn wp_offset_range_8bit_luma() {
+    for o in [127, -128, 0] {
+        assert_eq!(wp_probe(false, false, Some(o), None, None), Ok(()), "luma_offset {o}");
+    }
+    for o in [128, -129, 300, -300] {
+        assert_eq!(wp_probe(false, false, Some(o), None, None), Err(LUMA_OFF), "luma_offset {o}");
+    }
+}
+
+/// SR1043: at 8 bits WpOffsetHalfRangeC is 128, so delta_chroma_offset_l0 runs -512..511: 511 and -512 parse, 512 and
+/// -513 refuse by name, on Cb and on Cr.
+#[test]
+fn wp_offset_range_8bit_chroma_delta() {
+    for o in [511, -512] {
+        assert_eq!(wp_probe(false, false, None, Some(o), None), Ok(()), "Cb delta_chroma_offset {o}");
+        assert_eq!(wp_probe(false, false, None, None, Some(o)), Ok(()), "Cr delta_chroma_offset {o}");
+    }
+    for o in [512, -513] {
+        assert_eq!(wp_probe(false, false, None, Some(o), None), Err(CHROMA_OFF), "Cb delta_chroma_offset {o}");
+        assert_eq!(wp_probe(false, false, None, None, Some(o)), Err(CHROMA_OFF), "Cr delta_chroma_offset {o}");
+    }
+}
+
+/// SR1043: at 10 bits WITHOUT high_precision_offsets_enabled_flag the half ranges stay 1 << 7 whatever the depth: the
+/// 8-bit ranges hold (luma 127 / 128, chroma delta 511 / 512).
+#[test]
+fn wp_offset_range_10bit_without_flag() {
+    assert_eq!(wp_probe(true, false, Some(127), None, None), Ok(()));
+    assert_eq!(wp_probe(true, false, Some(-128), None, None), Ok(()));
+    assert_eq!(wp_probe(true, false, Some(128), None, None), Err(LUMA_OFF));
+    assert_eq!(wp_probe(true, false, Some(-129), None, None), Err(LUMA_OFF));
+    assert_eq!(wp_probe(true, false, None, Some(511), None), Ok(()));
+    assert_eq!(wp_probe(true, false, None, Some(512), None), Err(CHROMA_OFF));
+}
+
+/// SR1043: at 10 bits WITH the flag (SR1035's head) WpOffsetHalfRangeY / C are 1 << 9 = 512: luma_offset 511 and -512
+/// parse, 512 and -513 refuse; delta_chroma_offset 2047 and -2048 parse, 2048 and -2049 refuse.
+#[test]
+fn wp_offset_range_10bit_high_precision() {
+    for o in [511, -512, 128, -300] {
+        assert_eq!(wp_probe(true, true, Some(o), None, None), Ok(()), "luma_offset {o}");
+    }
+    for o in [512, -513] {
+        assert_eq!(wp_probe(true, true, Some(o), None, None), Err(LUMA_OFF), "luma_offset {o}");
+    }
+    for o in [2047, -2048, 600] {
+        assert_eq!(wp_probe(true, true, None, Some(o), None), Ok(()), "Cb delta_chroma_offset {o}");
+        assert_eq!(wp_probe(true, true, None, None, Some(o)), Ok(()), "Cr delta_chroma_offset {o}");
+    }
+    for o in [2048, -2049] {
+        assert_eq!(wp_probe(true, true, None, Some(o), None), Err(CHROMA_OFF), "Cb delta_chroma_offset {o}");
+        assert_eq!(wp_probe(true, true, None, None, Some(o)), Err(CHROMA_OFF), "Cr delta_chroma_offset {o}");
+    }
+}
+
+/// SR1043: a refused slice is a lost slice. IDR0 (the gradient), P1 (the gradient moved by (8, 4), a unit table), P2
+/// (luma_offset_l0 128 at 8 bits: refused by name before its picture starts), P3 (skip-only, references POC 2 alone):
+/// POC 2 is generated and concealed from POC 1 through the existing lost-picture road, and every output frame equals
+/// the same stream with P2 dropped.
+#[test]
+fn wp_offset_refused_slice_conceals_as_lost() {
+    let i0 = gradient();
+    let unit = Some((6, vec![None]));
+    let head = {
+        let mut s = headers(false, true, &PpsInter { weighted_pred: true, ..Default::default() });
+        s.extend(idr(&i0, true));
+        s.extend(picture(&SliceCfg { weights: unit.clone(), ..p_slice(1, vec![(-1, true)]) }, |e| amvp_then_merge(e, [32, 16])));
+        s
+    };
+    let bad = picture(&SliceCfg { weights: Some((6, vec![Some((0, 128))])), ..p_slice(2, vec![(-1, true)]) }, skip_picture);
+    let p3 = picture(&SliceCfg { weights: unit, ..p_slice(3, vec![(-1, true)]) }, skip_picture);
+    let mut runs = Vec::new();
+    for with_bad in [true, false] {
+        let mut d = Decoder::new();
+        d.decode_annexb(&head).expect("the head, the IDR and P1 decode");
+        if with_bad {
+            assert_eq!(d.decode_annexb(&bad), Err(LUMA_OFF), "P2's out-of-range luma_offset refuses the slice");
+        }
+        d.decode_annexb(&p3).expect("decode past the refused picture");
+        d.flush();
+        assert_eq!(d.take_generated_refs(), vec![2], "with P2 {with_bad}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 2, src_poc: 1, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "with P2 {with_bad}");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 1, 3], "with P2 {with_bad}");
+        assert_frame(by_poc(&f, 3), &shifted(&shifted(&i0, 8, 4), 8, 4), "P from the picture concealed from POC 1, advanced by its motion");
+        runs.push(f.iter().map(|f| f.planes.clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(runs[0], runs[1], "the refused slice decodes as the lost one");
 }
