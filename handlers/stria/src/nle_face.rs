@@ -464,6 +464,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+Shift+R", "crop-r-"),
     ("Alt+b", "crop-b+"),
     ("Alt+Shift+B", "crop-b-"),
+    ("y", "link-av"), ("Y", "unlink"), ("Ctrl+l", "link"), ("Meta+l", "link"), ("Ctrl+Shift+L", "unlink-all"), ("Shift+Meta+L", "unlink-all"), // STRIALINKAUTOTHREE (SR9039): the four link words' keys (text y / Y, the Player's letters; GTK orders a chord Ctrl, Alt, Shift, Meta)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
     ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
@@ -2687,6 +2688,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("crop-r-", "uncrop the right side"),
     ("crop-b+", "crop the bottom in"),
     ("crop-b-", "uncrop the bottom"),
+    ("link-av", "link each picture to its sound"), ("unlink", "unlink the selected clips"), ("link", "link the selected clips"), ("unlink-all", "unlink every clip"), // STRIALINKAUTOTHREE (SR9039): the link keys' phrases
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
