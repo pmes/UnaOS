@@ -7505,4 +7505,132 @@ mod tests {
         assert_eq!(w(&mut e, "b10"), 20.0, "2em; bogus: 2em of 10px through the replay (before: 400, auto)");
         assert_eq!(w(&mut e, "b20"), 40.0, "2em; bogus: 2em of 20px through the replay (before: 400, auto)");
     }
+
+    // ---- AETHERCSSOMFONTFAMILYUSED (LEDGER SR1024): getComputedStyle fontFamily is the specified list, pinned (named tail block) ----
+
+    fn cssom_font_family_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="root">Hello</div>
+            <div id="list" style='font-family: Arial, "Times New Roman", serif'>Hello</div>
+            <pre id="pre">Hello</pre>
+            <button id="btn">Hello</button>
+            <div style="font-family: Georgia, serif"><pre id="inh" style="font-family: inherit">Hello</pre></div>
+            <div style="font-family: Georgia, serif"><span id="bad" style="font-family: 12px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): an author list reads back as written (Chromium: generics bare, a one-ident
+    /// name bare, other names quoted); no family at all reads the standard font.
+    #[test]
+    fn cssom_font_family_specified_list() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "list", "fontFamily"), r#"Arial, "Times New Roman", serif"#);
+        assert_eq!(font_shorthand_cs(&mut e, "root", "fontFamily"), r#""Times New Roman""#);
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): the UA tag defaults: `pre` reads `monospace`; a button reads Aether's control
+    /// family word (`Arial`; Chromium's per-platform word is owed AETHER-CSSOM-FONT-FAMILY-UA-CONTROL).
+    #[test]
+    fn cssom_font_family_tag_defaults() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pre", "fontFamily"), "monospace");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontFamily"), "Arial");
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): `font-family: inherit` on a `pre` takes the parent's list, not the tag's monospace.
+    #[test]
+    fn cssom_font_family_inherit() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inh", "fontFamily"), "Georgia, serif");
+    }
+
+    /// AETHERCSSOMFONTFAMILYUSED (SR1024): an unquoted word that is not an identifier (`12px`) makes the declaration
+    /// invalid: it is dropped and the child reads the inherited list (it used to read `"12px"`).
+    #[test]
+    fn cssom_font_family_bogus_dropped() {
+        let mut e = cssom_font_family_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "bad", "fontFamily"), "Georgia, serif");
+        for bad in ["12px", "Font 2", "#x", "a/b", "-1x", "Arial, 12px"] {
+            assert!(crate::fonts::parse_family_list(bad).is_none(), "{bad} is not a family list");
+        }
+        for good in ["-x", "_a", "Times   New Roman", "Font2, sans-serif", "--x"] {
+            assert!(crate::fonts::parse_family_list(good).is_some(), "{good} is a family list");
+        }
+    }
+
+    // ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
+
+    /// AETHERCSSWIDEALL (SR1021): a blue parent holding `.x` (red, margin-left 20px, bold, block) and its `.x.r` twin
+    /// (`all: unset`), each alone in a section and each after a span; a red parent holding an `all: initial` div and a
+    /// plain one; an `all: unset; color: green` div. 400 px wide, rows 12px apart.
+    fn css_wide_all_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            section { display: block; margin: 0 0 12px }
+            .x { color: rgb(255, 0, 0); margin-left: 20px; font-weight: bold; display: block }
+            .x.r { all: unset }
+            .i { all: initial }
+            .g { all: unset; color: green }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(0, 0, 255)">
+              <section><div id="ax" class="x">Hello</div></section>
+              <section><div id="axr" class="x r">Hello</div></section>
+              <section><span id="sx">Hi</span><div id="bx" class="x">World</div></section>
+              <section><span id="sxr">Hi</span><div id="bxr" class="x r">World</div></section>
+            </div>
+            <div style="color:rgb(255, 0, 0)"><div id="ai" class="i">Hello</div><div id="ai0">Hello</div></div>
+            <section><div id="ag" class="g">Hello</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `.x.r { all: unset }` after `.x`: color reads the blue parent, weight 400, the box at
+    /// x 0, and it is inline (on its sibling span's line); the `.x` twin reads red / 700, sits at 20 and starts a new line
+    /// (armed).
+    #[test]
+    fn css_wide_all_unset_resets() {
+        let mut e = css_wide_all_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "the .x twin is red (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "fontWeight"), "700", "the .x twin is bold (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "axr", "color"), "rgb(0, 0, 255)", "all: unset: color inherits the parent");
+        assert_eq!(font_shorthand_cs(&mut e, "axr", "fontWeight"), "400", "all: unset: weight inherits normal");
+        let (axl, ..) = imgalt_rect(&mut e, "ax");
+        let (axrl, ..) = imgalt_rect(&mut e, "axr");
+        assert!((axl - 20.0).abs() <= 0.5, "the .x box at 20 (armed): {axl}");
+        assert!(axrl.abs() <= 0.5, "all: unset: margin-left 0: {axrl}");
+        let (_, st, ..) = imgalt_rect(&mut e, "sx");
+        let (_, bt, ..) = imgalt_rect(&mut e, "bx");
+        assert!(bt > st + 5.0, "the block .x after a span is on a new line (armed): {bt} vs {st}");
+        let (_, srt, ..) = imgalt_rect(&mut e, "sxr");
+        let (_, brt, ..) = imgalt_rect(&mut e, "bxr");
+        assert!((brt - srt).abs() <= 5.0, "all: unset: display inline, on the span's line: {brt} vs {srt}");
+        assert!(css_wide_color_ink(&mut e, "axr", css_wide_blue) > 3, "the unset box paints the blue parent");
+        assert_eq!(css_wide_color_ink(&mut e, "axr", css_wide_red), 0, "no red");
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `all: initial` under a red parent paints CanvasText black (initial, not inherit); the
+    /// plain div beside it paints red (armed).
+    #[test]
+    fn css_wide_all_initial_black() {
+        let mut e = css_wide_all_engine();
+        assert!(css_wide_color_ink(&mut e, "ai0", css_wide_red) > 3, "the plain div is red (armed)");
+        assert!(css_wide_color_ink(&mut e, "ai", css_wide_controls_black) > 3, "all: initial paints black");
+        assert_eq!(css_wide_color_ink(&mut e, "ai", css_wide_red), 0, "all: initial paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "ai", "color"), "rgb(0, 0, 0)", "cssom reads black");
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `all: unset; color: green`: the later colour wins.
+    #[test]
+    fn css_wide_all_later_color_wins() {
+        let mut e = css_wide_all_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ag", "color"), "rgb(0, 128, 0)", "the later green wins");
+    }
 }
