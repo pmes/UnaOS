@@ -925,6 +925,7 @@ fn origin(d: &Demuxer, i: usize) -> i64 {
 struct Reels {
     tb: timeline_core::Timebase,
     reels: Vec<Reel>,
+    titles: Vec<(timeline_core::SourceId, String)>, // STRIAKTITLE (LEDGER SR9009): the generated title sources (no file), drawn by `title_card`
 }
 
 impl Reels {
@@ -1038,9 +1039,9 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
-    let mut reels = Reels { tb: tl.tb, reels: Vec::new() };
+    let mut reels = Reels { tb: tl.tb, reels: Vec::new(), titles: Vec::new() }; // STRIAKTITLE (LEDGER SR9009): the titles beside the reels
     for s in &tl.sources {
-        let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
+        if let Some(t) = &s.title { reels.titles.push((s.id, t.clone())); continue; } let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else { // STRIAKTITLE (LEDGER SR9009): a title is no file: drawn by `title_card` (file tail)
             return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV)", s.reel, dir, s.reel))));
         };
         let mut d = Demuxer::open(read_all(&rp).map_err(|e| ("read-refused", Some(e)))?).map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?;
@@ -1052,7 +1053,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         );
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
-    if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // NLE-TITLE-KERNEL (SR828): a titled source is refused by name, never scheduled onto a frame road with no title arm
+    let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // STRIAKTITLE (LEDGER SR9009): a titled source is scheduled (every frame its own key) and drawn by `title_card` (file tail)
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
     rep.steps = steps.len();
@@ -1062,8 +1063,8 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         super::export::arm_audio(jid); snd::open(&reels, tl, seek_ms); // NLE6EXPORT (rmbp-ledger B959): an Encode job's sound into the export's offline capture (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound, one mixer source per audio track, the crossfade's second (file tail)
     }
     // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
-    let first = steps.iter().filter(|s| s.kind == Kind::Video).find_map(|s| s.src).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref());
-    let Some((fw, fh, codec)) = first.map(|v| (v.1.width, v.1.height, tok(&v.1.codec))) else {
+    let first = steps.iter().filter(|s| s.kind == Kind::Video).filter_map(|s| s.src).find(|id| reels.titles.iter().all(|t| t.0 != *id)).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref()); // STRIAKTITLE (LEDGER SR9009): a title sizes no frame
+    let Some((fw, fh, codec)) = first.map(|v| (v.1.width, v.1.height, tok(&v.1.codec))).or_else(|| timeline_core::view::title_size(tl, &steps, |id| reels.get(id).and_then(|r| r.v.as_ref()).map(|v| (v.1.width, v.1.height)).filter(|&(w, h)| w > 0 && h > 0)).map(|(w, h)| (w, h, "title"))) else { // STRIAKTITLE (LEDGER SR9009): a title-only EDL sizes by timeline_core's `view::title_size`
         return Err(("no-video", Some(String::from("the EDL cuts no video"))));
     };
     let out_ms = |t: i64| (tl.tb.to_ns(t).max(0) as u64) / 1_000_000;
@@ -1089,7 +1090,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
             Some(id) => {
-                let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
+                let (w, h, px, ord) = match title_card(&reels, id, fw as usize, fh as usize, &mut run) { Some(c) => c, None => edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)? }; // STRIAKTITLE (LEDGER SR9009): a title's frame is its card (file tail)
                 coded(rep, s.out_t, ord, &px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) }
             }
         };
@@ -1211,7 +1212,7 @@ fn edl_mix(
                     return Ok(());
                 }
             }
-            match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
+            match title_card(reels, o, w, h, mix).map(Ok).unwrap_or_else(|| edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true)) { // STRIAKTITLE (LEDGER SR9009): a title as the outgoing is its card (file tail)
                 Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(px.rgb()),
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
@@ -2664,4 +2665,56 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKTITLE (LEDGER SR9009): the Player's title card over the kernel text seam (named tail block) ----
+// handlers.md §5 NLE5b NLE-TITLE-KERNEL. A generated title source (`timeline_core::Source::title`) has no file: `edl_run`
+// keeps its text in `Reels::titles`, and its frame is a card drawn here: opaque black, one line in the title ink, placed by
+// timeline_core's `view::title_fit` (Stria's `title_still` places its line by the same fn). The kernel's text seam
+// (`video::text::draw_with`) has fixed faces, so the line's px picks `Face::Title` (or `Face::Body` below its cell) and a
+// whole magnification k, each covered pixel a k x k block (text.rs `blowup`'s shape); the host's positions, the kernel's
+// glyphs (`ViewLabels`' precedent). Drawn per step: the gap road allocates a w x h frame per step already.
+
+/// STRIAKTITLE: the card's ink (0RGB) and the scale its line px is drawn at, for title source `id` — ONE place a title
+/// style reads from (today the lifted `view::TITLE_INK` at scale 1).
+fn card_style(_reels: &Reels, _id: timeline_core::SourceId) -> (u32, f32) {
+    let k = timeline_core::view::TITLE_INK;
+    ((k[0] as u32) << 16 | (k[1] as u32) << 8 | k[2] as u32, 1.0)
+}
+
+/// STRIAKTITLE: the face and whole magnification a `px`-tall line is drawn with: `Face::Title` when `px` reaches its cell,
+/// else `Face::Body`; k = px / the face's cell height, 1 at least.
+fn card_face(px: f32) -> (super::text::Face, usize) {
+    let f = if px >= super::text::Face::Title.cell_h() as f32 { super::text::Face::Title } else { super::text::Face::Body };
+    (f, (px as usize / f.cell_h().max(1)).max(1))
+}
+
+/// STRIAKTITLE: the frame of source `id` when it is a title (`None`: a media reel): a `w` x `h` card as `edl_frame`'s
+/// `(w, h, 0RGB, no ordinal)`. The decode run in `slot` is dropped (Stria's `title_frame` parks it), so the next media
+/// step opens by its seek.
+fn title_card(reels: &Reels, id: timeline_core::SourceId, w: usize, h: usize, slot: &mut Option<EdlRun>) -> Option<(usize, usize, Px, Option<u32>)> {
+    let text = reels.titles.iter().find(|t| t.0 == id).map(|t| t.1.as_bytes())?;
+    *slot = None;
+    let (ink, scale) = card_style(reels, id);
+    let mut px = alloc::vec![0u32; w * h];
+    let (size, x, baseline) = timeline_core::view::title_fit(w as u32, h as u32, &mut |p| {
+        let (f, k) = card_face(p * scale);
+        ((super::text::advance(text, false, f) * k) as f32, (f.cell_h() * k) as f32, 0.0)
+    });
+    let (f, k) = card_face(size * scale);
+    let x0 = (x.max(0.0) as usize).min(w);
+    let top = baseline as isize - (f.cell_h() * k) as isize;
+    let (wi, hi) = (w as isize, h as isize);
+    let _ = super::text::draw_with(text, false, f, 0, 0, (w - x0) / k, ink, &mut |gx, gy, a| {
+        let o = super::font::blend(0, ink, a);
+        for dy in 0..k as isize {
+            for dx in 0..k as isize {
+                let (cx, cy) = (x0 as isize + gx * k as isize + dx, top + gy * k as isize + dy);
+                if cx >= 0 && cx < wi && cy >= 0 && cy < hi {
+                    px[(cy * wi + cx) as usize] = o;
+                }
+            }
+        }
+    });
+    Some((w, h, px.into(), None))
 }

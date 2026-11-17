@@ -1255,3 +1255,111 @@ mod striamarkers_tests {
         assert_eq!(inside as i64, (0..=MARKER_W).map(|k| 2 * (MARKER_W - k) + 1).sum::<i64>(), "the triangle alone (labels off)");
     }
 }
+
+// ---- STRIAKTITLE (LEDGER SR9009): the title card's rules, both faces' (named tail block) ----
+/// STRIAKTITLE (LEDGER SR9009): a title card's frame size when nothing else sizes it (Stria's render and the kernel Player).
+pub const TITLE_SIZE: (u32, u32) = (1280, 720);
+/// STRIAKTITLE: the title ink (straight alpha) on its opaque black card.
+pub const TITLE_INK: [u8; 4] = [255, 255, 255, 255];
+
+/// STRIAKTITLE: the frame size a title asks for — `None` when no video step (its own source or a transition's outgoing)
+/// is a title (`crate::Source::title`); else the first untitled source in `tl.sources` that `size` answers (its video
+/// width x height, both nonzero), else [`TITLE_SIZE`]. Both faces call it only when no media step sized the frame.
+pub fn title_size(tl: &Timeline, steps: &[crate::schedule::Step], size: impl Fn(crate::SourceId) -> Option<(u32, u32)>) -> Option<(u32, u32)> {
+    let titled = |src: crate::SourceId| tl.source(src).is_some_and(|s| s.title.is_some());
+    let has_title = steps.iter().filter(|s| s.kind == Kind::Video).flat_map(|s| [s.src, s.vmix.and_then(|m| m.src)]).flatten().any(titled);
+    if !has_title {
+        return None;
+    }
+    Some(tl.sources.iter().filter(|s| s.title.is_none()).find_map(|s| size(s.id)).unwrap_or(TITLE_SIZE))
+}
+
+/// STRIAKTITLE: where a title card's one line sits on a `w` x `h` card — `measure(px)` is the line's `(width, ascent,
+/// descent)` drawn at `px`. The line is `h / 10` px (8 at least), shrunk once to 90% of the width when wider (1 px at
+/// least), centred: returns `(px, x, baseline)`, `x` and `baseline` rounded.
+pub fn title_fit(w: u32, h: u32, measure: &mut dyn FnMut(f32) -> (f32, f32, f32)) -> (f32, f32, f32) {
+    let mut px = (h as f32 / 10.0).max(8.0);
+    let mut m = measure(px);
+    let room = w as f32 * 0.9;
+    if m.0 > room {
+        px = (px * room / m.0).max(1.0);
+        m = measure(px);
+    }
+    (px, libm::roundf((w as f32 - m.0) / 2.0), libm::roundf((h as f32 + m.1 - m.2) / 2.0))
+}
+
+#[cfg(test)]
+mod striaktitle_tests {
+    use super::*;
+    use crate::{Clip, SourceId, Timeline};
+
+    /// Every frame a key, no length known: the schedule's view of a fixed GOP-1 source.
+    struct Idx;
+    impl crate::SourceIndex for Idx {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            None
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, t_ns: i64) -> Option<i64> {
+            Some(t_ns)
+        }
+    }
+
+    /// A video track of media `A` (ticks 0..10) then, when `title`, source `T1` titled (ticks 10..20).
+    fn tl(title: bool) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        if title {
+            tl.sources[1].title = Some(alloc::string::String::from("Hello"));
+        }
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, 10, 10)];
+        tl
+    }
+
+    fn steps(tl: &Timeline) -> Vec<crate::schedule::Step> {
+        crate::schedule::schedule(tl, 0..tl.end(), &Idx).unwrap()
+    }
+
+    #[test]
+    fn striaktitle_title_size_none_without_title() {
+        let t = tl(false);
+        assert_eq!(title_size(&t, &steps(&t), |_| Some((640, 360))), None);
+    }
+
+    #[test]
+    fn striaktitle_title_size_first_untitled_size() {
+        let t = tl(true);
+        let asked = core::cell::Cell::new(0u32);
+        let got = title_size(&t, &steps(&t), |id| {
+            asked.set(asked.get() + 1);
+            assert_eq!(id, SourceId(0), "only an untitled source is asked");
+            Some((640, 360))
+        });
+        assert_eq!(got, Some((640, 360)));
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn striaktitle_title_size_default_when_no_media() {
+        let t = tl(true);
+        assert_eq!(title_size(&t, &steps(&t), |_| None), Some(TITLE_SIZE));
+    }
+
+    /// A line 10 px wide per px of size, ascent 0.8 px and descent 0.2 px per px.
+    #[test]
+    fn striaktitle_title_fit_centres_and_shrinks_once() {
+        let mut lin = |px: f32| (px * 10.0, px * 0.8, px * 0.2);
+        // 1000 x 100: 10 px, 100 wide, fits; x = 450, baseline = (100 + 8 - 2) / 2 = 53.
+        assert_eq!(title_fit(1000, 100, &mut lin), (10.0, 450.0, 53.0));
+        // 100 x 100: 10 px is 100 wide > 90: shrunk once to 9 px (90 wide), x = 5, baseline = (100 + 7.2 - 1.8) / 2 = 53.
+        assert_eq!(title_fit(100, 100, &mut lin), (9.0, 5.0, 53.0));
+        // a 40 px tall card still asks 8 px (the floor); measured once when it fits.
+        let mut n = 0;
+        let (px, _, _) = title_fit(1000, 40, &mut |p| {
+            n += 1;
+            (p, 0.0, 0.0)
+        });
+        assert_eq!((px, n), (8.0, 1));
+    }
+}

@@ -995,11 +995,11 @@ impl Sources {
 /// render's frame size and cached on [`Sources`]. The frame size stays render's rule (the first scheduled media video step's
 /// reel; a titled step sizes nothing); a range whose video steps size nothing but hold a title takes the first untitled
 /// source in `tl.sources` with a video stream, else [`TITLE_SIZE`]. The schedule keys a title itself (every frame is a key).
-pub const TITLE_SIZE: (u32, u32) = (1280, 720);
+pub const TITLE_SIZE: (u32, u32) = timeline_core::view::TITLE_SIZE; // STRIAKTITLE (SR9009): lifted into timeline_core, the kernel Player's too
 /// STRIATITLECLIP: the stills a [`Sources`] keeps, oldest dropped past this many.
 const TITLE_CACHE_MAX: usize = 8;
 /// STRIATITLECLIP: the title ink (straight alpha).
-const TITLE_INK: [u8; 4] = [255, 255, 255, 255];
+const TITLE_INK: [u8; 4] = timeline_core::view::TITLE_INK; // STRIAKTITLE (SR9009): lifted into timeline_core
 
 /// STRIATITLECLIP: the still cache, `(text, w, h, still)`; locked for one find or one push, never across a raster.
 type TitleCache = std::sync::Mutex<Vec<(String, u32, u32, Arc<timeline_core::view::Still>)>>;
@@ -1011,16 +1011,18 @@ fn titled(tl: &Timeline, src: SourceId) -> bool {
 
 /// STRIATITLECLIP: when nothing sized the frame and a video step (or its outgoing) is a title, the size rule above.
 fn title_size(tl: &Timeline, sources: &Sources, steps: &[timeline_core::schedule::Step], r: &mut RenderReport) {
-    let has_title = steps.iter().filter(|s| s.kind == Kind::Video).flat_map(|s| [s.src, s.vmix.and_then(|m| m.src)]).flatten().any(|src| titled(tl, src));
-    if r.width != 0 || !has_title {
+    if r.width != 0 {
         return;
     }
-    let reel = tl.sources.iter().filter(|s| s.title.is_none()).find_map(|s| {
-        let m = sources.get(s.id).ok()?;
+    // STRIAKTITLE (SR9009): the rule is timeline_core's `view::title_size` (the kernel Player calls the same fn)
+    let size = timeline_core::view::title_size(tl, steps, |id| {
+        let m = sources.get(id).ok()?;
         let t = &m.demux.tracks()[m.video?];
         (t.width > 0 && t.height > 0).then_some((t.width, t.height))
     });
-    (r.width, r.height) = reel.unwrap_or(TITLE_SIZE);
+    if let Some(wh) = size {
+        (r.width, r.height) = wh;
+    }
 }
 
 /// STRIATITLECLIP: the frame of title source `src` at source tick `src_t` (`None`: not a title): the cached still at the
@@ -1038,14 +1040,14 @@ pub fn title_still(text: &str, w: u32, h: u32) -> timeline_core::view::Still {
     use text_host::line::{PixelOrder, TextStyle};
     let mut rgba = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
     let mut style = TextStyle::new(&["sans"], (h as f32 / 10.0).max(8.0));
-    let mut line = style.shape(text);
-    let room = w as f32 * 0.9;
-    if line.width > room {
-        style.size = (style.size * room / line.width).max(1.0);
-        line = style.shape(text);
-    }
-    let x = ((w as f32 - line.width) / 2.0).round();
-    let baseline = ((h as f32 + line.ascent - line.descent) / 2.0).round();
+    // STRIAKTITLE (SR9009): size, shrink and centring are timeline_core's `view::title_fit` (the kernel Player's too)
+    let (px, x, baseline) = timeline_core::view::title_fit(w, h, &mut |px| {
+        style.size = px;
+        let l = style.shape(text);
+        (l.width, l.ascent, l.descent)
+    });
+    style.size = px;
+    let line = style.shape(text);
     line.paint(&mut rgba, w, h, w as usize * 4, PixelOrder::Rgba, x, baseline, TITLE_INK, (0, w as i32));
     timeline_core::view::Still { width: w, height: h, rgba }
 }
