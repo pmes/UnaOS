@@ -860,6 +860,8 @@ pub struct SliceCfg {
     pub weights_l1: Option<Vec<Option<(i32, i32)>>>,
     /// HEVCCONCEALWEIGHTEDCHROMA (SR776): delta_chroma_log2_weight_denom and per l0 entry Some([(delta_chroma_weight, delta_chroma_offset); Cb, Cr]) or None; None: chroma flags 0.
     pub chroma_weights: Option<(i32, Vec<Option<[(i32, i32); 2]>>)>,
+    /// HEVCCONCEALWEIGHTEDCHROMAL1 (SR793): per l1 entry Some([(delta_chroma_weight, delta_chroma_offset); Cb, Cr]) or None; the denom delta is `chroma_weights`' (one per table, 0 when None).
+    pub chroma_weights_l1: Option<Vec<Option<[(i32, i32); 2]>>>,
     pub five_minus_max_num_merge_cand: u32,
     pub deblocking_disabled: bool,
 }
@@ -958,7 +960,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
                 if let Some((dw, off)) = w { b.se(*dw); b.se(*off); }
                 for (dw, doff) in chroma_l0(c, i).into_iter().flatten() { b.se(dw); b.se(doff); }
             }
-            if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, w1); } }
+            if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, c, w1); } }
         }
         b.ue(c.five_minus_max_num_merge_cand);
         if let Some(v) = s.use_integer_mv {
@@ -1175,17 +1177,17 @@ impl CabacEnc {
 
 // ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): the L1 pred_weight_table of a B slice (named tail block) ----
 /// HEVCCONCEALWEIGHTEDBIMIXED (SR768): 7.3.6.3's l1 half of pred_weight_table (slice_type B): luma_weight_l1_flag per
-/// entry, chroma_weight_l1_flag 0 per entry, then (delta_luma_weight_l1, luma_offset_l1) of each `Some` entry.
-pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
+/// entry, chroma_weight_l1_flag per entry from `chroma_l1` (SR793), then per entry (delta_luma_weight_l1, luma_offset_l1) of a `Some` entry and its Cb, Cr pairs.
+pub fn pred_weight_l1(b: &mut BitWriter, c: &SliceCfg, ws: &[Option<(i32, i32)>]) {
     for w in ws {
         b.flag(w.is_some());
     }
-    for _ in ws {
-        b.bit(0); // chroma_weight_l1_flag
+    for i in 0..ws.len() {
+        b.flag(chroma_l1(c, i).is_some()); // chroma_weight_l1_flag
     }
-    for (dw, off) in ws.iter().flatten() {
-        b.se(*dw);
-        b.se(*off);
+    for (i, w) in ws.iter().enumerate() {
+        if let Some((dw, off)) = w { b.se(*dw); b.se(*off); }
+        for (dw, doff) in chroma_l1(c, i).into_iter().flatten() { b.se(dw); b.se(doff); }
     }
 }
 
@@ -1194,4 +1196,115 @@ pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
 /// Cr] when that l0 entry carries chroma_weight_l0_flag 1 (7.3.6.3), else None.
 pub fn chroma_l0(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
     c.chroma_weights.as_ref().and_then(|cw| cw.1.get(i).copied().flatten())
+}
+
+// ---- HEVCCONCEALWEIGHTEDCHROMAL1 (LEDGER SR793): an l1 entry's chroma weights (named tail block) ----
+/// HEVCCONCEALWEIGHTEDCHROMAL1 (SR793): entry `i` of `c.chroma_weights_l1` — [(delta_chroma_weight, delta_chroma_offset); Cb,
+/// Cr] when that l1 entry carries chroma_weight_l1_flag 1 (7.3.6.3), else None.
+pub fn chroma_l1(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
+    c.chroma_weights_l1.as_ref().and_then(|cw| cw.get(i).copied().flatten())
+}
+
+// ---- HEVCCONCEALWEIGHTEDCHROMA422 (LEDGER SR798): the 8.5.3.3.3.2 chroma oracle at any plane geometry (named tail block) ----
+
+/// HEVCCONCEALWEIGHTEDCHROMA422 (SR798): 8.5.3.3.3.2 written out for one chroma sample (x, y) of the w x h reference plane
+/// `r` (nearest-edge clamped) at the eighth-sample chroma vector `mv`, 8-bit (shift1 0, shift2 6): the 14-bit intermediate
+/// predSampleLX. ONE oracle for every chroma format (4:2:0 16x16, 4:2:2 16x32, 4:4:4 32x32 at the 32x32 fixtures); tests/rext.rs
+/// `hand_chroma` (SR758) and tests/inter.rs's 16x16 `hand_chroma` are one-line wrappers over it (SR807).
+pub fn hand_chroma_wh(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -> i32 {
+    let s = |x: i32, y: i32| r[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize] as i32;
+    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
+    let (xi, yi) = (x + (mv[0] >> 3), y + (mv[1] >> 3));
+    let hz = |yy: i32| (0..4).map(|i| CHROMA_FILTER[xf][i] * s(xi + i as i32 - 1, yy)).sum::<i32>();
+    if yf == 0 {
+        if xf == 0 { s(xi, yi) << 6 } else { hz(yi) }
+    } else if xf == 0 {
+        (0..4).map(|i| CHROMA_FILTER[yf][i] * s(xi, yi + i as i32 - 1)).sum()
+    } else {
+        (0..4).map(|n| CHROMA_FILTER[yf][n] * hz(yi + n as i32 - 1)).sum::<i32>() >> 6
+    }
+}
+
+// ---- HEVCTESTKITPBODY (LEDGER SR807): the IDR head over pcm_cu_fmt at any chroma format (named tail block) ----
+
+/// SR798 (moved to the kit by SR807; tests/inter.rs and tests/rext.rs `conceal_subpel_case` call it): VPS, SPS (32x32,
+/// log2_ctb 4, log2_max_tb 4, pcm (8, 8, 3, 4) at chroma_format_idc `idc`, inter SPS `x`), PPS (`pi`, deblocking off) and
+/// IDR0: four 16x16 pcm CTBs through the kit's `pcm_cu_fmt` over the non-linear pattern (x * 37 + y * 29 + seed) % 256
+/// (seeds 0 / 90 / 170, SR758's: a linear ramp's filtered fractions round alike, so a wrong (SubWidthC, SubHeightC) arm
+/// could hide).
+pub fn head_fmt(idc: u32, x: &InterSps, pi: &PpsInter) -> Vec<u8> {
+    let (sw, sh) = match idc {
+        1 => (2usize, 2usize),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { width: 32, height: 32, log2_ctb: 4, log2_max_tb: 4, chroma_format_idc: idc, pcm: Some((8, 8, 3, 4, true)), ..Default::default() }, x)));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    for k in 0..4 {
+        let (bx, by) = (k % 2, k / 2);
+        let ctb = |seed: usize, w: usize, h: usize| (0..w * h).map(|i| (((bx * w + i % w) * 37 + (by * h + i / w) * 29 + seed) % 256) as u16).collect::<Vec<u16>>();
+        let (cw, ch) = (16 / sw, 16 / sh);
+        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, ch), &ctb(170, cw, ch), (sw, sh));
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    s.extend(nal(19, &e.finish().out));
+    s
+}
+
+// ---- HEVCTESTKITPBODYSHARED (LEDGER SR812): the P-body writers, one copy for inter.rs and rext.rs (named tail block) ----
+
+/// initType of a slice_type with cabac_init_flag 0: P 1, B 2.
+pub fn init_type(slice_type: u32) -> usize {
+    if slice_type == 1 { 1 } else { 2 }
+}
+
+/// The four CTBs as skip coding units with MaxNumMergeCand 1 (cu_skip_flag ctxInc 0, 1, 1, 2: the left / above
+/// neighbours were skipped).
+pub fn skip_picture(mut e: CabacEnc) -> Vec<u8> {
+    for (k, inc) in [0usize, 1, 1, 2].into_iter().enumerate() {
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    e.finish().out
+}
+
+/// CTB 0 a 2Nx2N AMVP prediction unit (no neighbours, no TMVP: mvp 0, so mv = mvd), no residual; CTBs 1..3 skip
+/// coding units (MaxNumMergeCand 1) whose first merge candidate is CTB 0's motion (A1, B1, then CTB 2 by A1); the
+/// whole picture moves by `mvd`. cu_skip_flag ctxInc: 0 (CTB 0), 0 (CTB 1: CTB 0 not skipped), 0 (CTB 2), 2.
+pub fn amvp_then_merge(mut e: CabacEnc, mvd: [i32; 2]) -> Vec<u8> {
+    e.split_cu(0, false);
+    e.cu_skip(0, false);
+    e.pred_inter();
+    e.part_mode_2nx2n();
+    e.merge_flag(false);
+    e.mvd(mvd);
+    e.mvp_flag(0);
+    e.rqt_root_cbf(false);
+    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+        e.terminate(0);
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+        if last {
+            break;
+        }
+    }
+    e.finish().out
+}
+
+/// SR812 (moved with `init_type`, `skip_picture`, `amvp_then_merge` and `picture` from tests/inter.rs; inter.rs and rext.rs
+/// `conceal_subpel_case` call them): a TRAIL_R P slice of POC `poc` over the negative pictures `neg`, MaxNumMergeCand 1,
+/// deblocking off.
+pub fn p_slice(poc: u32, neg: Vec<(i32, bool)>) -> SliceCfg {
+    SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: poc, neg, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() }
+}
+
+pub fn picture(cfg: &SliceCfg, body: impl FnOnce(CabacEnc) -> Vec<u8>) -> Vec<u8> {
+    nal(cfg.nal_type, &body(CabacEnc::new(slice_header(cfg), init_type(cfg.slice_type), 26)))
 }
