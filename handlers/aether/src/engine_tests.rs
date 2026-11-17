@@ -12608,4 +12608,84 @@ b</div>
         assert!(strike.iter().all(|r| both.contains(r)), "the span's own strike paints: {both:?} vs {strike:?}");
         assert_eq!(font_shorthand_cs(&mut e, "ppl", "textDecorationLine"), "line-through");
     }
+
+    // ---- AETHERCSSTEXTDECORATIONOVERLINE (LEDGER SR1128): text-decoration-line: overline stored, propagated, painted and read back (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): 20px serif black rows 20px apart, red decorations: `#ov` an overlined div,
+    /// `#ou` overline + underline, `#tu2` the underline twin, `#ts2` the strike twin, `#all` the three lines declared out of
+    /// order, `#po` an overlined div holding the undecorated span `#pos`, `#ao` a div holding the link `#aol` declaring
+    /// `text-decoration: overline red`.
+    fn overline_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="ov" style="text-decoration: overline red">Hgjx Hgjx</div>
+            <div id="ou" style="text-decoration: overline underline red">Hgjx Hgjx</div>
+            <div id="tu2" style="text-decoration: underline red">Hgjx Hgjx</div>
+            <div id="ts2" style="text-decoration: line-through red">Hgjx Hgjx</div>
+            <div id="all" style="text-decoration-line: line-through overline underline">Hgjx Hgjx</div>
+            <div id="po" style="text-decoration: overline red"><span id="pos">Hgjx Hgjx</span></div>
+            <div id="ao"><a id="aol" href="#x" style="text-decoration: overline red">Hgjx Hgjx</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): the overline paints red rows above the strike band (at baseline − ascent,
+    /// the top of the glyphs) and none in the underline band (armed: before SR1128 `#ov` painted no red row).
+    #[test]
+    fn overline_paints_above() {
+        let mut e = overline_engine();
+        let (over, under, strike) = (text_decoration_line_reset_rows(&mut e, "ov"), text_decoration_line_reset_rows(&mut e, "tu2"), text_decoration_line_reset_rows(&mut e, "ts2"));
+        assert!(!over.is_empty(), "armed: the overline paints red rows");
+        assert!(!under.is_empty() && !strike.is_empty(), "the twins paint: {under:?} {strike:?}");
+        let top = *strike.iter().min().unwrap();
+        assert!(over.iter().all(|r| *r < top), "the overline sits above the strike band: {over:?} vs {strike:?}");
+        assert!(over.iter().all(|r| !under.contains(r)), "no overline row in the underline band: {over:?} vs {under:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): `overline underline` paints both bands.
+    #[test]
+    fn overline_underline_both() {
+        let mut e = overline_engine();
+        let (both, over, under) = (text_decoration_line_reset_rows(&mut e, "ou"), text_decoration_line_reset_rows(&mut e, "ov"), text_decoration_line_reset_rows(&mut e, "tu2"));
+        assert!(!over.is_empty() && !under.is_empty(), "the twins paint: {over:?} {under:?}");
+        assert!(over.iter().all(|r| both.contains(r)), "the overline band: {both:?} vs {over:?}");
+        assert!(under.iter().all(|r| both.contains(r)), "the underline band: {both:?} vs {under:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): css-text-decor-3 §2.1: the div's overline paints through its undecorated
+    /// span (propagation, the line-through shape), and the span reads `none` (text-decoration-line is not inherited).
+    #[test]
+    fn overline_propagates_into_child() {
+        let mut e = overline_engine();
+        let (through, over) = (text_decoration_line_reset_rows(&mut e, "po"), text_decoration_line_reset_rows(&mut e, "ov"));
+        assert!(!over.is_empty(), "armed: the overline paints");
+        assert_eq!(through, over, "the parent's overline paints through the span");
+        assert_eq!(font_shorthand_cs(&mut e, "pos", "textDecorationLine"), "none");
+    }
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): textDecorationLine reads the overline in Chromium's order `underline overline
+    /// line-through` whatever the declared order (armed: before SR1128 `#ov` read `none`, `#ou` `underline`).
+    #[test]
+    fn overline_column_words() {
+        let mut e = overline_engine();
+        for (id, want) in [("ov", "overline"), ("ou", "underline overline"), ("all", "underline overline line-through")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecorationLine"), want, "#{id} textDecorationLine");
+        }
+    }
+
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): `<a style="text-decoration: overline red">` paints its div twin's overline
+    /// rows and no UA underline (SR1122's whole-set write with the third flag), and reads `overline`.
+    #[test]
+    fn overline_link_no_underline() {
+        let mut e = overline_engine();
+        let (link, over) = (text_decoration_line_reset_rows(&mut e, "ao"), text_decoration_line_reset_rows(&mut e, "ov"));
+        assert!(!over.is_empty(), "armed: the overline paints");
+        assert_eq!(link, over, "the link paints the overline only");
+        assert_eq!(font_shorthand_cs(&mut e, "aol", "textDecorationLine"), "overline");
+    }
 }

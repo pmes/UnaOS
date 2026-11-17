@@ -2958,3 +2958,41 @@ fn text_decoration_line_reset_longhand_invalid_dropped() {
         assert_eq!(deco_lines(&[&[("text-decoration-line", "line-through")], &[("text-decoration-line", v)]]), (Some(false), Some(true)), "{v} after line-through");
     }
 }
+
+// ---- AETHERCSSTEXTDECORATIONOVERLINE (LEDGER SR1128): the line set's third flag, overline, stored and cascaded (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): the (underline, line_through, overline) triple a cascade of rules leaves.
+fn deco_lines3(rules: &[&[(&str, &str)]]) -> (Option<bool>, Option<bool>, Option<bool>) {
+    let s = cascade(rules);
+    (s.paint.underline, s.paint.line_through, s.paint.overline)
+}
+
+/// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): `text-decoration-line: overline` stores the third flag (armed: before SR1128
+/// the word was accepted and dropped, overline None).
+#[test]
+fn text_decoration_overline_longhand() {
+    let t = (Some(false), Some(false), Some(true));
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "overline")]]), t, "the longhand");
+    assert_eq!(deco_lines3(&[&[("text-decoration", "overline")]]), t, "the shorthand");
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "underline")], &[("text-decoration-line", "overline")]]), t, "a later set replaces, across rules");
+}
+
+/// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): all three lines in any order, longhand and shorthand.
+#[test]
+fn text_decoration_overline_all_three() {
+    let all = (Some(true), Some(true), Some(true));
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "underline overline line-through")]]), all);
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "line-through overline underline")]]), all);
+    assert_eq!(deco_lines3(&[&[("text-decoration", "overline underline line-through red")]]), all);
+}
+
+/// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): `none` and a shorthand without a line clear the overline with the pair (SR1122's
+/// whole-set rule); an invalid longhand is dropped and the earlier overline stands.
+#[test]
+fn text_decoration_overline_none_resets() {
+    let none = (Some(false), Some(false), Some(false));
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "overline")], &[("text-decoration-line", "none")]]), none);
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "overline")], &[("text-decoration", "red")]]), none);
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "overline")], &[("text-decoration-line", "overline overline")]]), (Some(false), Some(false), Some(true)));
+    assert_eq!(deco_lines3(&[&[("text-decoration-line", "none overline")]]), (None, None, None));
+}

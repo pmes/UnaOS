@@ -102,6 +102,8 @@ pub struct PaintStyle<H: Host> {
     pub letter_spacing: Option<f32>,
     /// text-decoration: line-through.
     pub line_through: Option<bool>,
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): text-decoration: overline (the line set's third flag; propagated as line-through).
+    pub overline: Option<bool>,
     /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration-color` (css-text-decor-3 §2.3): `Some(Some(c))` a colour,
     /// `Some(None)` `currentcolor` (the initial value; the `text-decoration` shorthand resets to it), None unspecified.
     pub decoration_color: Option<Option<(u8, u8, u8)>>,
@@ -327,7 +329,7 @@ impl<H: Host> Default for PaintStyle<H> {
             word_break: None,
             overflow_wrap: None,
             letter_spacing: None,
-            line_through: None,
+            line_through: None, overline: None,
             decoration_color: None, decoration_style: None, decoration_thickness: None, underline_offset: None, underline_position: None, deco_alpha: None,
             ws_lead: None,
             ws_trail: None,

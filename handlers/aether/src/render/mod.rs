@@ -27,7 +27,7 @@ struct Inherited {
     word_break: u8,
     overflow_wrap: u8,
     letter_spacing: f32, caret_color: Option<(u8, u8, u8, u8)>,
-    line_through: bool,
+    line_through: bool, overline: bool,
     /// vertical-align super/sub: paint-time baseline shift in px.
     shift_y: f32,
     /// list-style-type in effect (layout::PaintStyle::list_style codes).
@@ -492,7 +492,7 @@ fn root_inherited() -> Inherited {
         word_break: 0,
         overflow_wrap: 0,
         letter_spacing: 0.0, caret_color: None,
-        line_through: false,
+        line_through: false, overline: false,
         shift_y: 0.0,
         list_style: 1,
         family: crate::fonts::STANDARD, // the default standard font (Times New Roman)
@@ -690,7 +690,7 @@ fn draw_decorations(
     face: &Font, size: f32, deco: Deco, x0: f32, x1: f32, baseline: f32, color: (u8, u8, u8),
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {
-    if !(deco.underline || deco.line_through) || x1 <= x0 {
+    if !(deco.underline || deco.line_through || deco.overline) || x1 <= x0 {
         return;
     }
     let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color); let t = deco.thickness.unwrap_or(m.thickness); let k = deco_line_alpha(&deco);
@@ -715,7 +715,7 @@ fn draw_decorations(
     }
     if deco.line_through {
         for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline - m.line_through_offset, t) { hline(a, b, y, h); }
-    }
+    } if deco.overline { for (a, b, y, h) in deco_rects(deco.style, x0, x1, baseline - m.overline_offset, t) { hline(a, b, y, h); } }
 }
 
 /// How one background (or mask) layer maps onto a box: the painted image
@@ -969,7 +969,7 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let deco = Deco { underline, line_through: false, color: None, alpha: 1.0, style: 0, thickness: None, ul_offset: None, ul_pos: 0 };
+    let deco = Deco { underline, line_through: false, overline: false, color: None, alpha: 1.0, style: 0, thickness: None, ul_offset: None, ul_pos: 0 };
     draw_lines(
         text, origin_x, origin_y, max_width, adv, line_height_mult, color,
         &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
@@ -1015,7 +1015,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     }
 
     if matches!(tag, "input" | "textarea" | "select" | "button") { // SR1058 fold (trunk red since SR1053): css-text-decor-3 §2.1: an ancestor's decoration is not propagated into an atomic inline (a control); it resets here, and only the control's own rule decorates its text
-        inherited.underline = false; inherited.line_through = false; inherited.deco_color = None;
+        inherited.underline = false; inherited.line_through = false; inherited.overline = false; inherited.deco_color = None;
     }
     if (tag == "a" || tag == "u") && spec.underline != Some(false) {
         inherited.underline = true;
@@ -1034,7 +1034,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; } caret_inherit(inherited, spec);
     inherited.line_through = spec
         .line_through
-        .unwrap_or_else(|| crate::layout::default_line_through(tag, false)) || inherited.line_through;
+        .unwrap_or_else(|| crate::layout::default_line_through(tag, false)) || inherited.line_through; inherited.overline = spec.overline.unwrap_or(false) || inherited.overline;
     // html.css list styles: ul disc (circle one level down,
     // square deeper), ol decimal; inherited into the items.
     inherited.list_style = list_style_of(tag, inherited.list_style, spec, dom_node);
@@ -1154,7 +1154,7 @@ fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Deco {
     underline: bool,
-    line_through: bool, color: Option<(u8, u8, u8)>, alpha: f32, style: u8, thickness: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
+    line_through: bool, overline: bool, color: Option<(u8, u8, u8)>, alpha: f32, style: u8, thickness: Option<f32>, ul_offset: Option<f32>, ul_pos: u8,
 }
 
 /// Draws a run on the lines fonts::lines breaks it into — the same breaker
@@ -3428,7 +3428,7 @@ fn frame_walk(
                             inherited.line_height,
                             inherited.color,
                             &mode,
-                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color, alpha: inherited.deco_alpha, style: inherited.deco_style, thickness: inherited.deco_thick, ul_offset: inherited.ul_offset, ul_pos: inherited.ul_pos },
+                            Deco { underline: inherited.underline, line_through: inherited.line_through, overline: inherited.overline, color: inherited.deco_color, alpha: inherited.deco_alpha, style: inherited.deco_style, thickness: inherited.deco_thick, ul_offset: inherited.ul_offset, ul_pos: inherited.ul_pos },
                             inherited.shadows(layout),
                             surface,
                             width,
@@ -3796,7 +3796,7 @@ fn frame_walk(
                             }
                             continue;
                         }
-                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color, alpha: i.deco_alpha, style: i.deco_style, thickness: i.deco_thick, ul_offset: i.ul_offset, ul_pos: i.ul_pos };
+                        let deco = Deco { underline: i.underline, line_through: i.line_through, overline: i.overline, color: i.deco_color, alpha: i.deco_alpha, style: i.deco_style, thickness: i.deco_thick, ul_offset: i.ul_offset, ul_pos: i.ul_pos };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
                         // page once the staging buffer is composited.
@@ -4615,7 +4615,7 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// decorating box, to its own `color` (inherit_element calls this after its colour write), so a descendant's text keeps
 /// the decorating box's ink; None now means only "no decorating ancestor" (draw_decorations' run-ink fallback).
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
-    let own = tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some(); if own {
+    let own = tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some() || spec.overline.is_some(); if own {
         inherited.deco_color = None; inherited.deco_alpha = 1.0; inherited.deco_style = 0; inherited.deco_thick = None; // SR1116: ul_offset is inherited (css-text-decor-4 §2.6): kept at a decorating box
     }
     if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(o) = spec.underline_offset { inherited.ul_offset = o; } if let Some(p) = spec.underline_position { inherited.ul_pos = p; } if let Some(c) = spec.decoration_color {

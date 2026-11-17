@@ -442,6 +442,9 @@ pub fn baseline_offset(font: &Face, size: f32, mult: f32) -> f32 {
 pub struct DecoMetrics {
     pub underline_offset: f32,
     pub line_through_offset: f32,
+    /// AETHERCSSTEXTDECORATIONOVERLINE (SR1128): the overline's top above the baseline: the ascent in whole px (the top of
+    /// the inline box, as Blink paints it: recalled, not measured; AETHER-CSS-TEXT-DECORATION-OVERLINE-METRIC-CHROMIUM owed).
+    pub overline_offset: f32,
     pub thickness: f32,
 }
 
@@ -456,7 +459,7 @@ pub fn decoration_metrics(face: &Face, size: f32) -> DecoMetrics {
     let underline_offset = (th / 2.0).ceil().max(1.0);
     let (asc, _, _) = line_metrics(face, size);
     let lt_top = (-(asc / 3.0) - th / 2.0 + 0.5).floor();
-    DecoMetrics { underline_offset, line_through_offset: -lt_top, thickness }
+    DecoMetrics { underline_offset, line_through_offset: -lt_top, overline_offset: asc, thickness }
 }
 
 /// Advance of U+0020 in px (its advance in the face).
