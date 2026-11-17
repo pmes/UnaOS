@@ -621,6 +621,7 @@ pub struct Drag {
     pub guide: Option<i64>,
     /// STRIARIPPLETRIM (SR850): a trim begun with shift on the primary's handle ripples (`EditorState::ripple_trim`).
     pub ripple: bool,
+    pub roll: bool, // STRIAROLLMORE (SR954): the face's roll tool turned this trim into a roll of its handle's cut (`EditorState::roll_selected`; set by [`Drag::rolled`])
 }
 
 impl Drag {
@@ -647,7 +648,7 @@ impl Drag {
             snap: !nosnap,
             additive: shift, toggle: false,
             guide: None,
-            ripple: false,
+            ripple: false, roll: false, // STRIAROLLMORE (SR954)
         };
         if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) {
             let y0 = l.row_y(track) as f64;
@@ -723,6 +724,7 @@ impl Drag {
             st.select(self.track, self.idx)?;
         }
         match self.kind {
+            DragKind::TrimOut if self.roll => st.roll_selected(self.delta), // STRIAROLLMORE (SR954): the roll tool's drag is ONE roll of the cut at the clip's out edge
             DragKind::TrimIn | DragKind::TrimOut if self.ripple => st.ripple_trim(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta),
             DragKind::TrimIn => st.trim(Edge::In, self.delta),
             DragKind::TrimOut => st.trim(Edge::Out, self.delta),
@@ -808,7 +810,7 @@ impl Drag {
             }
             DragKind::TrimIn | DragKind::TrimOut => {
                 let Some(c) = st.timeline.tracks.get(self.track).and_then(|tr| tr.clips.get(self.idx)) else { return };
-                (vec![if self.kind == DragKind::TrimIn { c.at } else { c.end() }], &one, true)
+                { slide_ex = self.trim_exclude(); (vec![if self.kind == DragKind::TrimIn { c.at } else { c.end() }], &slide_ex, true) } // STRIAROLLMORE (SR954): a roll also excludes the butted next clip
             }
             DragKind::Move => {
                 let set: &[(usize, usize)] = if st.set.len() > 1 { &st.set } else { &one };
@@ -1005,7 +1007,7 @@ impl Drag {
             snap: !nosnap,
             additive: false, toggle: false,
             guide: None,
-            ripple: false,
+            ripple: false, roll: false, // STRIAROLLMORE (SR954)
         })
     }
     /// The edge drag's ONE commit: the transition `(track, idx)` selected, then `set_transition_dur` of the pointer's length.
@@ -3336,5 +3338,130 @@ mod striamultiselectmore_tests {
         assert!(!d.toggle, "a shift-press on a non-member adds it");
         assert!(!d.release_still(&mut st));
         assert_eq!(st.set, alloc::vec![(0, 0), (0, 1)]);
+    }
+}
+
+// ---- STRIAROLLMORE (LEDGER SR954): the roll tool's drag (named tail block) ----
+// No modifier and no hit region is free on the selected clip's edge zone, so a roll drag is a FACE TOOL: the host face
+// passes its tool flag to [`Drag::rolled`] right after `Drag::begin_with` (whose signature the kernel calls, unchanged).
+// A trim-handle drag whose cut has a butted neighbour becomes a roll of that cut: the out handle rolls the cut at the
+// clip's out edge, the in handle rolls the previous clip's out cut (the drag is re-aimed at that clip, and `finish`'s
+// re-select selects it). `Drag::finish` commits it as ONE `EditorState::roll_selected` (SR851's op), `Drag::shown`
+// previews it, and the snap excludes both clips of the cut. No butted neighbour, a ripple or a slide: unchanged.
+impl Drag {
+    /// The drag as the roll tool sees it (`on`: the tool is on); unchanged when off or when the handle has no butted
+    /// neighbour.
+    pub fn rolled(self, st: &EditorState, on: bool) -> Drag {
+        if !on || self.ripple || !matches!(self.kind, DragKind::TrimIn | DragKind::TrimOut) {
+            return self;
+        }
+        let Some(tr) = st.timeline.tracks.get(self.track) else { return self };
+        let Some(&c) = tr.clips.get(self.idx) else { return self };
+        if self.kind == DragKind::TrimOut {
+            return match tr.clips.get(self.idx + 1) {
+                Some(b) if b.at == c.end() => Drag { roll: true, ..self },
+                _ => self,
+            };
+        }
+        match self.idx.checked_sub(1).and_then(|i| tr.clips.get(i).map(|a| (i, *a))) {
+            Some((i, a)) if a.end() == c.at => Drag { kind: DragKind::TrimOut, idx: i, roll: true, ..self },
+            _ => self,
+        }
+    }
+    /// The clips a trim's moving edge does not snap to: the trimmed clip, and for a roll the butted next clip too.
+    fn trim_exclude(&self) -> Vec<(usize, usize)> {
+        let mut v = vec![(self.track, self.idx)];
+        if self.roll {
+            v.push((self.track, self.idx + 1));
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod striarollmore_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLEFXA 0..10 at 0, 10..20 at 10, 20..30 at 20 (three butted clips), a 40-tick source, the view band `Role::Tracks`
+    /// 320x56; clip `sel` selected.
+    fn roll_fixture(sel: usize) -> (Timeline, EditorState, Layout, f64, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10), Clip::new(a, 20, 30, 20)];
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, sel).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        (tl, st, l, z, y)
+    }
+
+    /// STRIAROLLMORE (SR954) M3: the tool on, clip 0's out handle dragged +3 ticks (no snap) is a roll: the preview equals
+    /// the commit, which equals `Timeline::roll(0, 0, 3)`; ONE undo restores. The tool off, the same drag is the plain trim.
+    #[test]
+    fn roll_tool_on_the_out_handle_rolls_the_cut() {
+        let (tl, mut st, l, z, y) = roll_fixture(0);
+        let x = l.x_of(10) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.idx, d.roll), (DragKind::TrimOut, 0, true));
+        d.update(&st, x + 3.0 * z, y);
+        assert_eq!(d.delta, 3);
+        let shown = d.shown(&st).unwrap().timeline;
+        d.finish(&mut st).unwrap();
+        assert_eq!(st.timeline, tl.roll(0, 0, 3).unwrap());
+        assert_eq!(shown, st.timeline);
+        assert_eq!(st.undo_depth(), 1);
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl);
+        let (_, mut st, ..) = roll_fixture(0);
+        let d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap().rolled(&st, false);
+        assert_eq!((d.kind, d.roll), (DragKind::TrimOut, false));
+    }
+
+    /// STRIAROLLMORE (SR954) M3: the tool on, clip 1's IN handle is the previous clip's out cut: the drag is re-aimed at
+    /// clip 0 (TrimOut, roll) and its -2 commit is `Timeline::roll(0, 0, -2)` with clip 0 selected.
+    #[test]
+    fn roll_tool_on_the_in_handle_rolls_the_previous_cut() {
+        let (tl, mut st, l, z, y) = roll_fixture(1);
+        let x = l.x_of(10) as f64 + 1.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, true, false).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.idx, d.roll), (DragKind::TrimOut, 0, true));
+        d.update(&st, x - 2.0 * z, y);
+        d.finish(&mut st).unwrap();
+        assert_eq!(st.timeline, tl.roll(0, 0, -2).unwrap());
+        assert_eq!(st.selection, Some((0, 0)));
+    }
+
+    /// STRIAROLLMORE (SR954) M3: the tool leaves alone a handle with no butted neighbour (clip 0's in, clip 2's out), a
+    /// ripple (shift) and a slide (the slip modifier).
+    #[test]
+    fn roll_tool_leaves_gaps_ripple_and_slide() {
+        let (_, mut st, l, _, y) = roll_fixture(0);
+        let d = Drag::begin_with(&mut st, l, l.x_of(0) as f64 + 1.0, y, false, true, false).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.idx, d.roll), (DragKind::TrimIn, 0, false));
+        let d = Drag::begin_with(&mut st, l, l.x_of(10) as f64 - 2.0, y, true, true, false).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.ripple, d.roll), (DragKind::TrimOut, true, false));
+        let d = Drag::begin_with(&mut st, l, l.x_of(10) as f64 - 2.0, y, false, true, true).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.roll), (DragKind::Slide, false));
+        let (_, mut st, l, _, y) = roll_fixture(2);
+        let d = Drag::begin_with(&mut st, l, l.x_of(30) as f64 - 2.0, y, false, true, false).unwrap().rolled(&st, true);
+        assert_eq!((d.kind, d.idx, d.roll), (DragKind::TrimOut, 2, false));
+    }
+
+    /// STRIAROLLMORE (SR954) M3: a roll's moving cut does not snap to the butted next clip's head (it is the cut itself)
+    /// and still snaps to the playhead: the playhead at 13, the pointer 26 px (3.25 ticks, unsnapped +4) past the cut at
+    /// 10 puts the edge 2 px from the playhead, so the delta snaps to +3.
+    #[test]
+    fn roll_snap_skips_its_own_cut_and_takes_the_playhead() {
+        let (_, mut st, _, _, _) = roll_fixture(0);
+        st.playhead = 13;
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        let x = l.x_of(10) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap().rolled(&st, true);
+        assert_eq!(d.trim_exclude(), alloc::vec![(0, 0), (0, 1)]);
+        d.update(&st, x + 3.25 * z, y);
+        assert_eq!((d.delta, d.guide), (3, Some(13)));
     }
 }
