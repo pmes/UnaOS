@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &queued_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -904,5 +904,42 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the witness's waiting export count (named tail block) ----
+/// The witness's `"queued"` field, only while export requests wait (`Face::export_queued`); the default line is unchanged.
+fn queued_json(face: &Face) -> String {
+    match face.export_queued() {
+        0 => String::new(),
+        n => format!(",\"queued\":{n}"),
+    }
+}
+
+#[cfg(test)]
+mod striaexportqueuemore_tests {
+    use super::*;
+
+    /// STRIAEXPORTQUEUEMORE (SR971): a paused job with one request queued behind it carries `"queued":1`; `export-clear`
+    /// drops it and the field is gone; cancelled and joined, nothing is left.
+    #[test]
+    fn striaexportqueuemore_witness_queued_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaexportqueuemore-witness-a");
+        let other = exe.parent().expect("its directory").join("striaexportqueuemore-witness-b");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(queued_json(&face), "");
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        assert!(face.verb(&format!("export {} png", other.display())));
+        assert_eq!(queued_json(&face), r#","queued":1"#);
+        assert!(face.verb("export-clear"));
+        assert_eq!(queued_json(&face), "");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert!(!other.exists(), "the dropped request made nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("striaexportqueuemore witness: ,\"queued\":1 then cleared");
     }
 }

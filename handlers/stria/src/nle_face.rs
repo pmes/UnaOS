@@ -2210,7 +2210,7 @@ impl Face {
     /// Esc's export arm: ask the running job to stop (its next frame refuses); false when none runs.
     pub fn cancel_export(&mut self) -> bool {
         let Some(j) = self.export.as_ref() else { return false };
-        j.cancel.store(true, Relaxed); self.export_queue.clear(); // STRIAEXPORTQUEUE (SR881): Esc drops the waiting requests too
+        j.cancel.store(true, Relaxed); self.drop_queue_on_cancel(); // STRIAEXPORTQUEUE (SR881): Esc drops the waiting requests too; STRIAEXPORTQUEUEMORE (SR971): and names the dropped count (file tail)
         true
     }
     /// Block until the running export ends and report it as [`Face::export_tick`] would; false when none runs.
@@ -2362,7 +2362,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.reel_line()) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3241,9 +3241,43 @@ impl Face {
         }
         let names: Vec<String> = self.export_queue.iter().take(EXPORT_LIST_SHOWN).map(|r| {
             let name = r.dir.file_name().map_or_else(|| r.dir.display().to_string(), |f| f.to_string_lossy().into_owned());
-            format!("{name} {}", r.fmt)
+            format!("{name} {}{}", r.fmt, list_entry_note(r)) // STRIAEXPORTQUEUEMORE (SR971): the range / audio word (file tail)
         }).collect();
         let more = if n > EXPORT_LIST_SHOWN { format!(", +{} more", n - EXPORT_LIST_SHOWN) } else { String::new() };
         format!("export: {n} waiting: {}{more}", names.join(", "))
+    }
+}
+
+// ---- STRIAEXPORTQUEUEMORE (LEDGER SR971): the queue's range / audio on the list, the Esc and running counts (named tail block) ----
+// SR932's `export-list` entry names the request's marked range (` ticks <a>..<b>`, `ticks_note`) and its audio word when not
+// the default `wav` (`nle_export::audio_word`), so SR932's plain lines are unchanged. Esc (`cancel_export`) drops the waiting
+// requests through `drop_queue_on_cancel`, which names them `export: cancelling (dropped <n> waiting)` (none waiting: no
+// message, as before); the cancel line replaces it when the job is reported, as SR914's skipping line. The running row
+// (`message_text`) carries ` (<n> waiting)` after the cloud's unchanged `job_line` while requests wait. Face thread only.
+// Owed: NLE5D-EXPORT-QUEUE-ESC-GTK (a GTK `Shift+Escape` alias: a new key).
+
+/// STRIAEXPORTQUEUEMORE (SR971): an `export-list` entry's tail after `<name> <fmt>`: ` ticks <a>..<b>` for a marked range,
+/// then ` <audio>` when the audio is not the default `wav`; empty for a whole-timeline `wav` request.
+fn list_entry_note(r: &ExportRequest) -> String {
+    let audio = if r.audio == AudioOut::Wav { String::new() } else { format!(" {}", crate::nle_export::audio_word(&r.audio)) };
+    format!("{}{audio}", ticks_note(&r.range))
+}
+
+impl Face {
+    /// Esc's queue arm: drop the waiting requests; when any were dropped the message line names them
+    /// (`export: cancelling (dropped <n> waiting)`).
+    fn drop_queue_on_cancel(&mut self) {
+        let n = self.export_queue.len();
+        self.export_queue.clear();
+        if n > 0 {
+            self.last_error = Some(format!("export: cancelling (dropped {n} waiting)"));
+        }
+    }
+    /// The running row's waiting count: ` (<n> waiting)` while requests wait, else empty.
+    fn waiting_note(&self) -> String {
+        match self.export_queue.len() {
+            0 => String::new(),
+            n => format!(" ({n} waiting)"),
+        }
     }
 }
