@@ -8,7 +8,7 @@
 //! need no second road. It is reached ONLY through [`Demuxer::open_wav`]: [`crate::probe`] and [`Demuxer::open`] stay
 //! WAV-blind, because a player plays a bare WAV through audio_core's own reader exactly when the demuxer refuses it.
 //! Accepted: `fmt ` tag 1 (8-bit unsigned, 16 / 24 / 32-bit integer), tag 3 (32 / 64-bit float), and WAVE_FORMAT_EXTENSIBLE
-//! whose SubFormat is one of those at full valid width; 1..=8 channels; a `data` size 0 / 0xFFFFFFFF (streamed) runs to the end of the file (STRIAIMPORTWAVWIDE, SR920). Everything else is refused by name (`wav: ...`).
+//! whose SubFormat is one of those with valid bits at or below the container (decoded at the container width), RF64 / BW64 with its `ds64` data size (STRIAWAVVALIDBITS, SR937); 1..=8 channels; a `data` size 0 / 0xFFFFFFFF (streamed) runs to the end of the file (STRIAIMPORTWAVWIDE, SR920). Everything else is refused by name (`wav: ...`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,7 +20,7 @@ pub const FRAMES: u64 = 1024;
 
 /// True when `b` starts with a RIFF/WAVE header (`RIFF` at 0, `WAVE` at 8).
 pub fn is_wav(b: &[u8]) -> bool {
-    b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE"
+    b.len() >= 12 && (&b[0..4] == b"RIFF" || &b[0..4] == b"RF64" || &b[0..4] == b"BW64") && &b[8..12] == b"WAVE" // STRIAWAVVALIDBITS (SR937): RF64 / BW64 (EBU Tech 3306 / ITU-R BS.2088) are WAV too
 }
 
 impl Demuxer {
@@ -56,7 +56,7 @@ fn fmt_of(f: &[u8]) -> Result<(u16, bool, u16, u32), Error> {
             return Err(Error::Invalid("wav: short WAVE_FORMAT_EXTENSIBLE"));
         }
         let valid = le16(f, 18);
-        if valid != 0 && valid != bits {
+        if valid > bits { // STRIAWAVVALIDBITS (SR937): valid bits at or below the container are left-justified, decoded at the container width
             return Err(Error::Unsupported("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"));
         }
         tag = le16(f, 24); // the SubFormat GUID's first two bytes are the format tag
@@ -97,7 +97,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
             }
             b"data" => {
                 let (bits, float, ch, rate) = fmt.ok_or(Error::Invalid("wav: no fmt chunk"))?;
-                let len = if len == 0 || len == 0xFFFF_FFFF { data.len() - body } else { len }; // STRIAIMPORTWAVWIDE (SR920): a streamed data size runs to the end of the file
+                let len = if len == 0xFFFF_FFFF && &data[0..4] != b"RIFF" { rf64_data_len(data)? } else if len == 0 || len == 0xFFFF_FFFF { data.len() - body } else { len }; // STRIAWAVVALIDBITS (SR937): an RF64 / BW64 data size comes from ds64. STRIAIMPORTWAVWIDE (SR920): a streamed data size runs to the end of the file
                 if !body.checked_add(len).is_some_and(|e| e <= data.len()) {
                     return Err(Error::Invalid("wav: data chunk runs past the end of the file"));
                 }
@@ -149,4 +149,18 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
         }
         p = body.checked_add(len).and_then(|e| e.checked_add(len & 1)).ok_or(Error::Truncated)?;
     }
+}
+
+// ---- STRIAWAVVALIDBITS (LEDGER SR937): RF64 / BW64 ds64 data size (named tail block) ----
+
+/// STRIAWAVVALIDBITS (SR937): the 64-bit `data` size of an RF64 / BW64 file, read from its `ds64` chunk, which must be
+/// the first chunk (offset 12: riffSize u64, dataSize u64, sampleCount u64, tableLength u32). A size past `usize` is
+/// `usize::MAX`, which the caller refuses as running past the end of the file.
+fn rf64_data_len(data: &[u8]) -> Result<usize, Error> {
+    if data.len() < 20 + 28 || &data[12..16] != b"ds64" || le32(data, 16) < 28 {
+        return Err(Error::Invalid("wav: RF64 without a ds64 chunk"));
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&data[28..36]);
+    Ok(usize::try_from(u64::from_le_bytes(b)).unwrap_or(usize::MAX))
 }

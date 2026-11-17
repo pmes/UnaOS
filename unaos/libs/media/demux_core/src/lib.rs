@@ -22,7 +22,7 @@
 //!   ContentCompression), `Cluster` (known or unknown size) → `Timestamp`, `SimpleBlock`,
 //!   `BlockGroup` (`Block`, `BlockDuration`, `ReferenceBlock`); Xiph, fixed and EBML lacing. See
 //!   [`mkv`].
-//! * **RIFF/WAVE** (STRIAIMPORTWAV, SR889): integer PCM 8/16/24/32, float 32/64, a streamed data, as one PCM track, ONLY through [`Demuxer::open_wav`]. See [`wav`].
+//! * **RIFF/WAVE** (STRIAIMPORTWAV, SR889): integer PCM 8/16/24/32, float 32/64, a streamed data, EXTENSIBLE valid bits below the container and RF64 / BW64 ds64 (STRIAWAVVALIDBITS, SR937), as one PCM track, ONLY through [`Demuxer::open_wav`]. See [`wav`].
 //!
 //! # One API
 //!

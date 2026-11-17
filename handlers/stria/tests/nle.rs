@@ -3905,3 +3905,121 @@ fn striaimportwavwide_refusals_by_name() {
     let e = refusal(striaimportwavwide_wav(1, 16, 1, 48_000, Some(0), &[]));
     assert!(e.contains("wav: no samples"), "{e}");
 }
+
+// ---- STRIAWAVVALIDBITS (LEDGER SR937): EXTENSIBLE valid bits below the container and RF64 / BW64 reels (named tail block) ----
+
+/// STRIAWAVVALIDBITS (SR937): a mono 48 kHz RIFF/WAVE file whose 40-byte `fmt ` is WAVE_FORMAT_EXTENSIBLE at container
+/// `bits` with `valid` valid bits, SubFormat KSDATAFORMAT_SUBTYPE_PCM.
+fn striawavvalidbits_ext(bits: u16, valid: u16, payload: &[u8]) -> Vec<u8> {
+    let align = bits / 8;
+    let mut w = Vec::new();
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(4 + 8 + 40 + 8 + payload.len() as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&40u32.to_le_bytes());
+    w.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&48_000u32.to_le_bytes());
+    w.extend_from_slice(&(48_000 * align as u32).to_le_bytes());
+    w.extend_from_slice(&align.to_le_bytes());
+    w.extend_from_slice(&bits.to_le_bytes());
+    w.extend_from_slice(&22u16.to_le_bytes());
+    w.extend_from_slice(&valid.to_le_bytes());
+    w.extend_from_slice(&4u32.to_le_bytes()); // front centre
+    w.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    w.extend_from_slice(payload);
+    w
+}
+
+/// STRIAWAVVALIDBITS (SR937): a mono 48 kHz PCM16 `magic` (RF64 / BW64) file: a `ds64` chunk first whose dataSize is
+/// `ds64_size` (None: no ds64 chunk at all), the `data` size field 0xFFFFFFFF, then `trailer` after the samples.
+fn striawavvalidbits_rf64(magic: &[u8; 4], ds64_size: Option<u64>, payload: &[u8], trailer: &[u8]) -> Vec<u8> {
+    let mut w = Vec::new();
+    w.extend_from_slice(magic);
+    w.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    if let Some(n) = ds64_size {
+        w.extend_from_slice(b"ds64");
+        w.extend_from_slice(&28u32.to_le_bytes());
+        w.extend_from_slice(&(4 + 36 + 24 + 8 + payload.len() as u64 + trailer.len() as u64).to_le_bytes());
+        w.extend_from_slice(&n.to_le_bytes());
+        w.extend_from_slice(&(n / 2).to_le_bytes());
+        w.extend_from_slice(&0u32.to_le_bytes());
+    }
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&48_000u32.to_le_bytes());
+    w.extend_from_slice(&96_000u32.to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    w.extend_from_slice(payload);
+    w.extend_from_slice(trailer);
+    w
+}
+
+#[test]
+fn striawavvalidbits_extensible_below_container_renders() {
+    // 20 valid bits in a 24-bit container and 24 in 32, left-justified: decoded at the container width.
+    for (bits, valid) in [(24u16, 20u16), (32, 24)] {
+        let wav = striawavvalidbits_ext(bits, valid, &striaimportwavwide_payload(bits, false, 96_000));
+        let d = gneiss_pal::dsp::demux::Demuxer::open_wav(wav.clone()).expect("open_wav");
+        assert_eq!(d.tracks()[0].codec, gneiss_pal::dsp::demux::Codec::Pcm { bits, float: false, big_endian: false });
+        let (src, s) = striaimportwav_render(wav, (10, 30), 20);
+        assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50));
+        assert_eq!((s.rate, s.ch), (48_000, 1));
+        assert_eq!(s.pcm.len(), 20 * 1920);
+        let skip = 10 * 1920;
+        for (j, got) in s.pcm.iter().enumerate() {
+            assert_eq!(*got, q(striaimportwav_sample(skip + j) as i32), "{valid} in {bits} sample {j}");
+        }
+    }
+}
+
+#[test]
+fn striawavvalidbits_rf64_takes_the_ds64_size() {
+    let payload = striaimportwavwide_payload(16, false, 96_000);
+    let trailer = b"LIST\x04\x00\x00\x00INFO"; // a chunk after the samples: never read as audio
+    for magic in [b"RF64", b"BW64"] {
+        let wav = striawavvalidbits_rf64(magic, Some(payload.len() as u64), &payload, trailer);
+        assert!(gneiss_pal::dsp::demux::wav::is_wav(&wav));
+        // The Player's road is kept: probe and Demuxer::open stay WAV-blind.
+        assert_eq!(gneiss_pal::dsp::demux::probe(&wav), None);
+        assert!(gneiss_pal::dsp::demux::Demuxer::open(wav.clone()).is_err());
+        let d = gneiss_pal::dsp::demux::Demuxer::open_wav(wav.clone()).expect("open_wav");
+        assert_eq!(d.samples().iter().map(|s| s.duration).sum::<u64>(), 96_000, "{magic:?}");
+        let (tl, _) = Sources::from_media("W", &wav, 25).unwrap().expect("an RF64 is media");
+        assert_eq!(tl.tracks.len(), 1);
+        assert_eq!((tl.tracks[0].clips[0].src_in, tl.tracks[0].clips[0].src_out), (0, 50));
+        let (src, s) = striaimportwav_render(wav, (0, 50), 50);
+        assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50));
+        assert_eq!(s.pcm.len(), 96_000);
+        for (j, got) in s.pcm.iter().enumerate() {
+            assert_eq!(*got, q(striaimportwav_sample(j) as i32), "{magic:?} sample {j}");
+        }
+    }
+}
+
+#[test]
+fn striawavvalidbits_refusals_by_name() {
+    let refusal = |bytes: Vec<u8>| {
+        let tl = Timeline::new(25);
+        let mut src = Sources::new(&tl);
+        src.add(SourceId(0), bytes).expect_err("refused").to_string()
+    };
+    // More valid bits than the container holds.
+    let e = refusal(striawavvalidbits_ext(24, 28, &striaimportwavwide_payload(24, false, 2400)));
+    assert!(e.contains("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"), "{e}");
+    let payload = striaimportwavwide_payload(16, false, 2400);
+    // An RF64 whose data size field defers to a ds64 chunk it does not carry.
+    let e = refusal(striawavvalidbits_rf64(b"RF64", None, &payload, &[]));
+    assert!(e.contains("wav: RF64 without a ds64 chunk"), "{e}");
+    // A ds64 data size past the end of the file.
+    let e = refusal(striawavvalidbits_rf64(b"BW64", Some(2 * payload.len() as u64), &payload, &[]));
+    assert!(e.contains("wav: data chunk runs past the end of the file"), "{e}");
+}
