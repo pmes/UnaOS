@@ -6637,7 +6637,7 @@ fn paint_opacity_keys(c: &mut Canvas, l: Layout, clip: &crate::Clip, y0: i64, y1
 
 // ---- STRIAGAINENVDRAG (LEDGER SR9082): drag a gain envelope point, a press on the line adds one (named tail block) ----
 // A press (the host face's, no Shift / Ctrl / Cmd; begun BEFORE `begin_with`, the `begin_transition_edge` shape, so the
-// kernel Player, which calls only `begin_with`, never begins one) on the SELECTED audio clip's painted envelope begins
+// kernel Player begins one too since STRIAKGAINENV (SR9111), both faces through `Drag::begin_grab`) on the SELECTED audio clip's painted envelope begins
 // `DragKind::GainEnv`: on a point's dot (within [`ENV_GRAB`] px in x and y; the nearest in x) that point, elsewhere within
 // [`ENV_GRAB`] px of the line (outside the two trim-handle zones) the line at the pressed source tick. The release is ONE
 // `EditorState::set_selected_gain_env`: the point (or a new one) lands at the grabbed tick + the tick delta (never snapped),
@@ -7513,5 +7513,105 @@ mod striaxformhover_tests {
         let at = |x: usize, y: usize| &out[(y * l.w as usize + x) * 4..(y * l.w as usize + x) * 4 + 4];
         assert_eq!(at(196, 65), &SELECT, "the hovered corner");
         assert_eq!(at(235, 65), &[0u8; 4], "another corner untouched");
+    }
+}
+
+// ---- STRIAKGAINENV (LEDGER SR9111): the press's ordered begins before begin_with, both faces (named tail block) ----
+// The host face tried three begins before `begin_with` and the kernel Player none, so the Player could not begin a transition
+// edge or an envelope drag. [`Drag::begin_grab`] is THE ordered list both faces call before their (unchanged) `begin_with`:
+// (1) a transition widget's edge ([`Drag::begin_transition_edge`], `nosnap`), (2) a press elsewhere on a widget selects that
+// transition ([`Grab::Pick`], no drag), and a press off every widget clears the transition selection, (3) with no `shift` /
+// `slip`, the selected audio clip's envelope ([`Drag::begin_gain_env`]); `None`: the caller's `begin_with` decides. It calls
+// the three existing fns and copies none of their rules.
+
+/// STRIAKGAINENV (SR9111): what a press took before `begin_with`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Grab {
+    /// A transition edge drag or the selected audio clip's envelope drag.
+    Drag(Drag),
+    /// A transition widget's middle: that transition selected (`Err`: the selection's refusal); no drag.
+    Pick(Result<(), EditError>),
+}
+
+impl Drag {
+    /// STRIAKGAINENV (SR9111): the press's begins in the host's order, before `begin_with` (see the block comment); the
+    /// arguments are `begin_with`'s.
+    pub fn begin_grab(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool, slip: bool) -> Option<Grab> {
+        if let Some(d) = Drag::begin_transition_edge(st, l, x, y, nosnap) {
+            return Some(Grab::Drag(d));
+        }
+        if let Some((t, i)) = l.transition_at(&st.timeline, x, y) {
+            return Some(Grab::Pick(st.select_transition(t, i)));
+        }
+        st.transition = None;
+        if shift || slip {
+            return None;
+        }
+        Drag::begin_gain_env(st, l, x, y).map(Grab::Drag)
+    }
+}
+
+#[cfg(test)]
+mod striakgainenv_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, GainEnv, TransitionKind};
+
+    /// One track of `kind` holding `clips` (the first selected when `select`), the tracks band of a 320x56 canvas.
+    fn st(kind: Kind, clips: alloc::vec::Vec<Clip>, select: bool) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = clips;
+        let mut st = EditorState::new(tl);
+        if select {
+            st.select(0, 0).unwrap();
+        }
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    /// M3: on a dissolve's widget the left edge zone begins TransitionIn, its middle picks it (no drag), a press off every
+    /// widget clears the transition selection and grabs nothing, so `begin_with` there is still the clip's Move.
+    #[test]
+    fn striakgainenv_transition_order() {
+        let a = crate::SourceId(0);
+        let (mut s, l) = st(Kind::Video, alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 40, 20)], false);
+        s.timeline = s.timeline.add_transition(0, 20, TransitionKind::Dissolve, 10).unwrap();
+        let tr = s.timeline.tracks[0].transitions[0];
+        let (x0, y0, x1, _) = l.transition_rect(0, &tr);
+        assert!(x1 - x0 > 2 * HANDLE_W, "the widget has a middle: {x0}..{x1}");
+        let yw = y0 as f64 + 5.0;
+        match Drag::begin_grab(&mut s, l, x0 as f64 + 0.5, yw, false, false, false) {
+            Some(Grab::Drag(d)) => assert_eq!((d.kind, d.track, d.idx), (DragKind::TransitionIn, 0, 0)),
+            g => panic!("the edge: {g:?}"),
+        }
+        s.transition = None;
+        assert_eq!(Drag::begin_grab(&mut s, l, (x0 + x1) as f64 / 2.0, yw, false, false, false), Some(Grab::Pick(Ok(()))));
+        assert_eq!(s.transition, Some((0, 0)), "the middle selects it");
+        let (bx, by) = (l.x_of(5) as f64 + 0.5, l.row_y(0) as f64 + 5.0);
+        assert_eq!(Drag::begin_grab(&mut s, l, bx, by, false, false, false), None);
+        assert_eq!(s.transition, None, "a press off every widget clears it");
+        assert_eq!(Drag::begin_with(&mut s, l, bx, by, false, false, false).map(|d| d.kind), Some(DragKind::Move));
+        std::println!("striakgainenv: edge -> TransitionIn, middle -> Pick, elsewhere -> None (begin_with's Move)");
+    }
+
+    /// M3: a plain press on the selected audio clip's envelope line begins GainEnv through begin_grab; with Shift or the
+    /// slip modifier it grabs nothing (begin_with decides).
+    #[test]
+    fn striakgainenv_envelope_order() {
+        let e = GainEnv::EMPTY.with(4, -1200).unwrap().with(16, 0).unwrap();
+        let c = Clip { gain_env: e, ..Clip::new(crate::SourceId(0), 0, 20, 0) };
+        let (mut s, l) = st(Kind::Audio, alloc::vec![c], true);
+        let (top, bottom) = gain_env_rows(&l, 0);
+        let (x, y) = (l.x_of(10) as f64 + 0.5, gain_y(c.gain_cdb + c.gain_env.at(10), top, bottom) as f64 + 0.5);
+        match Drag::begin_grab(&mut s, l, x, y, false, false, false) {
+            Some(Grab::Drag(d)) => assert_eq!((d.kind, d.track, d.idx, d.snap), (DragKind::GainEnv, 0, 0, false)),
+            g => panic!("the envelope: {g:?}"),
+        }
+        assert_eq!(Drag::begin_grab(&mut s, l, x, y, true, false, false), None, "Shift");
+        assert_eq!(Drag::begin_grab(&mut s, l, x, y, false, false, true), None, "slip");
+        assert_eq!(Drag::begin_grab(&mut s, l, x, y + 10.0, false, false, false), None, "off the line");
+        std::println!("striakgainenv: plain -> GainEnv, Shift / slip / off the line -> None");
     }
 }

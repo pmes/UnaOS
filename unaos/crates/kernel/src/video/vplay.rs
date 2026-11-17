@@ -2339,7 +2339,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it) DragKind::XfadeIn => "xfade-in", DragKind::XfadeOut => "xfade-out", // STRIAXFADETHREE (SR9023): the audio crossfade bracket's edges (the Player's press never begins them) DragKind::Source => "source", // STRIASOURCEDRAG (SR9081): never begun here (the Player loads no source); named for the exhaustive match DragKind::GainEnv => "gain-env", // STRIAGAINENVDRAG (SR9082): the arm only; the Player never begins one (edit_press calls begin_with)
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it) DragKind::XfadeIn => "xfade-in", DragKind::XfadeOut => "xfade-out", // STRIAXFADETHREE (SR9023): the audio crossfade bracket's edges (the Player's press never begins them) DragKind::Source => "source", // STRIASOURCEDRAG (SR9081): never begun here (the Player loads no source); named for the exhaustive match DragKind::GainEnv => "gain-env", // STRIAGAINENVDRAG (SR9082) / STRIAKGAINENV (SR9111): begun by edit_begin (Drag::begin_grab)
     }
 }
 
@@ -2353,7 +2353,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     band_note_clear(); let d = { // STRIAKINSERTALL (SR9090): a band press ends the band's note (it marks BAND_DIRTY: the band repaints)
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false }; if e.snap_off && timeline_core::view::snap_badge_hit(&l, x as f64, (y - y0) as f64) { let at = e.st.playhead; edit_snap(&mut e.snap_off, at); return true; } // STRIAKSNAPSHOW (SR9104): a press on the snap-off badge turns snap on, no drag (file tail)
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, crate::video::keymap::shift_held(), timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off), false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail)
+        let d = match edit_begin(&mut e.st, l, x as f64, (y - y0) as f64crate::video::keymap::shift_held(), timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off)).map(|d| d.rolled(&e.stROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) { Ok(d) => d, Err(picked) => return picked }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail) // STRIAKGAINENV (SR9111): timeline_core's ONE press order, then begin_with (file tail)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); SCRUB_SOUGHT.store(i64::MIN, Ordering::Release); // STRIAKSCRUB (SR9060): a press starts a fresh scrub (file tail); NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
@@ -4624,4 +4624,33 @@ fn meter_reset(at: i64) -> Option<u64> {
     BAND_DIRTY.store(true, Ordering::Release);
     serial_println!("[nle] edit meters-reset at={} cleared={}+{}", at, latches, holds);
     None
+}
+
+// ---- STRIAKGAINENV (LEDGER SR9111): the Player's press takes timeline_core's ONE press order (named tail block) ----
+// handlers.md §5 NLE5b's NLE-GAIN-ENV-DRAG-KERNEL. [`edit_press`] called only `Drag::begin_with`, so the Player's band never
+// began a transition edge drag or the selected audio clip's envelope drag the host face begins. [`edit_begin`] asks the host's
+// ordered list first (`view::Drag::begin_grab`: the transition edge, the widget pick, the envelope), then `begin_with`; the
+// release is the generic [`edit_drag_end`] (`Drag::finish`: `set_transition_dur` / `set_selected_gain_env`, the save), the band's
+// `Drag::shown` the preview. A press on a widget's middle selects that transition (no drag; the band repaints) and a press off
+// every widget clears the selection, as the host's. Wire: `[nle] press transition track=<n> idx=<n> selected` | `refused (<why>)`;
+// the drags print the existing `[nle] drag press <gain-env|transition-in|transition-out>` and `[nle] drag <kind> from= to=` lines.
+
+/// STRIAKGAINENV (SR9111): the press's begin on the Player's editor state: `Ok(drag)`; `Err(true)`: a transition picked (the
+/// press is taken, no drag); `Err(false)`: nothing under the press.
+fn edit_begin(st: &mut timeline_core::editor::EditorState, l: timeline_core::view::Layout, x: f64, y: f64) -> Result<timeline_core::view::Drag, bool> {
+    use timeline_core::view::{Drag, Grab};
+    let nosnap = false;
+    match Drag::begin_grab(st, l, x, y, false, nosnap, false) {
+        Some(Grab::Drag(d)) => Ok(d),
+        Some(Grab::Pick(r)) => {
+            BAND_DIRTY.store(true, Ordering::Release);
+            let (t, i) = l.transition_at(&st.timeline, x, y).unwrap_or((0, 0));
+            match r {
+                Ok(()) => serial_println!("[nle] press transition track={} idx={} selected", t, i),
+                Err(why) => serial_println!("[nle] press transition track={} idx={} refused ({})", t, i, why),
+            }
+            Err(true)
+        }
+        None => Drag::begin_with(st, l, x, y, false, nosnap, false).ok_or(false),
+    }
 }

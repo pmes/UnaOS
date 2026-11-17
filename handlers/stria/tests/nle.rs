@@ -15694,3 +15694,41 @@ fn striahistorynames_face_words() {
     assert_eq!(line.as_deref(), Some("history: 2 kind W001 | 1 transition +1"));
     println!("striahistorynames: {line:?}");
 }
+
+// ---- STRIAKGAINENV (LEDGER SR9111): the face's press takes timeline_core's ONE press order (named tail block) ----
+
+/// M3: the host press through `Drag::begin_grab` keeps its order: on V1's dissolve at tick 10 the left edge zone begins
+/// TransitionIn, the widget's middle selects the transition with no drag, a press off every widget clears it; on A1 with
+/// an envelope a plain press on the line is GainEnv and a Shift press is not.
+#[test]
+fn striakgainenv_face_order() {
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 9).unwrap();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let l = face.layout();
+    let tr = face.state.timeline.tracks[0].transitions[0];
+    let (x0, y0, x1, _) = l.transition_rect(0, &tr);
+    assert!(x1 - x0 > 2 * stria::nle_face::HANDLE_W, "the widget has a middle: {x0}..{x1}");
+    let yw = y0 as f64 + 5.0;
+    face.on(&nle3eslipdrag_btn(true, x0 as f64 + 0.5, yw, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TransitionIn), "the edge");
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(false, x0 as f64 + 0.5, yw, 0));
+    let mid = (x0 + x1) as f64 / 2.0;
+    face.on(&nle3eslipdrag_btn(true, mid, yw, 0));
+    assert_eq!((face.dragging().map(|d| d.kind), face.state.transition), (None, Some((0, 0))), "the middle picks it");
+    face.on(&nle3eslipdrag_btn(false, mid, yw, 0));
+    face.state.select(1, 0).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("env -6"));
+    face.state.seek(9);
+    assert!(face.verb("env 0"));
+    let (lx, ly) = striagainenvdrag_point(&face, 1, 2);
+    face.on(&nle3eslipdrag_btn(true, lx, ly, bandy::MOD_SHIFT));
+    assert_ne!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv), "Shift skips the envelope");
+    assert_eq!(face.state.transition, None, "a press off every widget clears the transition");
+    face.on(&bandy::SMessage::BrowserKey("Escape".into()));
+    face.on(&nle3eslipdrag_btn(true, lx, ly, 0));
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv), "a plain press on the line");
+    println!("striakgainenv face: edge -> TransitionIn, middle -> picked, Shift on the line -> not GainEnv, plain -> GainEnv");
+}

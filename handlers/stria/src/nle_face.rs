@@ -55,7 +55,7 @@ pub use timeline_core::editor::{Edge, EditorState, UNDO_MAX, ZOOM_DEFAULT, ZOOM_
 
 /// NLE6KEYS (rmbp-ledger B961): the geometry ([`Layout`], [`Hit`], [`Role`]) and the painter are timeline_core's
 /// (`timeline_core::view`), the ONE view the kernel Player's EDL band paints too; re-exported so every `nle_face::` path stands.
-pub use timeline_core::view::{Drag, DragKind, DragShown, HANDLE_W, Hit, Layout, MARQUEE_MIN, ROW_H, RULER_H, Role, SNAP_PX, Still, THUMB_H, THUMB_W, TRANS_H, TRANS_MIN_W, fnv1a, snap_targets, snap_to, transition_mid}; // NLE6FACEDRAG (rmbp-ledger B975): the drag model moved to timeline_core::view, both faces call it
+pub use timeline_core::view::{Drag, DragKind, DragShown, Grab, HANDLE_W, Hit, Layout, MARQUEE_MIN, ROW_H, RULER_H, Role, SNAP_PX, Still, THUMB_H, THUMB_W, TRANS_H, TRANS_MIN_W, fnv1a, snap_targets, snap_to, transition_mid}; // NLE6FACEDRAG (rmbp-ledger B975): the drag model moved to timeline_core::view, both faces call it
 use timeline_core::view::{self, Canvas, FIELD, Order, TRANS};
 #[cfg(test)]
 use timeline_core::view::{GUIDE, HANDLE, PLAYHEAD, ROW, SELECT, TRANS_FILL, clip_colour};
@@ -514,7 +514,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y)); if self.snap_off && view::snap_badge_hit(&self.layout(), x, y) { self.drag = None; return self.verb("snap"); } // STRIAKSNAPSHOW (SR9104): a press on the snap-off badge turns snap on, no scrub (timeline_core view.rs tail)
-        if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_source(x, y, mods) { return r; } if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; } // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview band begins the source drag (file tail) if let Some(r) = self.press_gain_env(x, y, mods) { return r; } // STRIAGAINENVDRAG (SR9082): the selected audio clip's envelope point or line (file tail)
+        if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_source(x, y, mods) { return r; } if let Some(r) = self.press_grab // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview band begins the source drag (file tail)(x, y, mods) { return r; } // STRIAKGAINENV (SR9111): timeline_core's ONE press order before begin_with: the transition edge, the widget pick, the envelope (file tail)
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -2423,18 +2423,12 @@ impl Face {
 
 // ---- NLETRANSITIONFACE (LEDGER SR691): the transition widget's edge drag and kind / ease (named tail block) ----
 
-/// NLETRANSITIONFACE (SR691): a press on a transition widget's edge zone begins timeline_core's edge drag
+/// NLETRANSITIONFACE (SR691): a press on a transition widget's edge zone begins timeline_core's edge drag (through `Drag::begin_grab`, STRIAKGAINENV SR9111)
 /// (`Drag::begin_transition_edge`; the release's generic `Drag::finish` is its ONE `set_transition_dur`, the paint's
 /// `Drag::shown` / `paint_drag` its preview and guide); the `kind` / `ease` words are timeline_core's verbs
 /// (`EditorState::verb`), with the selected transition's thumbnail re-rendered after them.
 impl Face {
-    /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
-    fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
-        let l = self.layout();
-        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off).or_else(|| Drag::begin_xfade_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0)))?; // STRIAXFADETHREE (SR9023): else an audio crossfade bracket's edge (timeline_core view.rs tail)
-        self.drag = Some(d);
-        Some(true)
-    }
+view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off).or_else(|| Drag::begin_xfade_edge(&mut self.state, l, x, y, )) // STRIAXFADETHREE (SR9023): else an audio crossfade bracket's edge (timeline_core view.rs tail)
     /// A `kind` / `ease` word on the selected transition: timeline_core's verb; the thumbnail (keyed without the kind
     /// and the ease) is dropped so the next frame renders it again.
     fn look_verb(&mut self, v: &str) -> Result<(), EditError> {
@@ -11312,19 +11306,10 @@ impl Face {
 
 // ---- STRIAGAINENVDRAG (LEDGER SR9082): the envelope drag's press and its note (named tail block) ----
 // A press with no Shift / Ctrl / Cmd on the selected audio clip's painted envelope begins timeline_core's envelope drag
-// (`Drag::begin_gain_env`, before `begin_with`, as the transition edge); the release's generic `Drag::finish` is its ONE
+// (`Drag::begin_gain_env` through `Drag::begin_grab`, STRIAKGAINENV SR9111, before `begin_with`); the release's generic `Drag::finish` is its ONE
 // `set_selected_gain_env`, `Drag::shown` its preview. After the commit the NOTE reads `env: <db_words> at <tick>, <n> points`
 // (the landed point's offset and timeline tick, the point count); a refusal stays `drag: <EditError>` on `last_error`.
 impl Face {
-    /// The press began an envelope drag (`Some(true)`); `None`: a modifier held, or not on the envelope.
-    fn press_gain_env(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
-        if mods & (bandy::MOD_SHIFT | bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0 {
-            return None;
-        }
-        let d = Drag::begin_gain_env(&self.state, self.layout(), x, y)?;
-        self.drag = Some(d);
-        Some(true)
-    }
     /// Where an envelope drag's point lands `(source tick, offset)`, read before its commit; `None` for any other drag.
     fn gain_env_land(&self, d: &Drag) -> Option<(i64, i32)> {
         if d.kind != DragKind::GainEnv {
@@ -12008,5 +11993,28 @@ impl Face {
     fn xform_hover_corner(&self) -> Option<u8> {
         let role = self.pointer_role();
         self.xform_hover(&self.state, self.layout_for(role).with_message(self.labels.is_some()), role).and_then(|d| d.corner)
+    }
+}
+
+// ---- STRIAKGAINENV (LEDGER SR9111): the press takes timeline_core's ONE press order (named tail block) ----
+// The begins the press tried before `begin_with` (the transition edge, the widget pick, the envelope) are timeline_core's
+// `Drag::begin_grab`, the same list the kernel Player's `edit_press` calls: Shift adds to the set and skips the envelope,
+// Alt / Option turns snapping off, Ctrl / Cmd is the slip modifier and skips the envelope.
+impl Face {
+    /// The press began a transition edge or envelope drag, or picked a transition (`Some(true)`); `None`: the press is
+    /// `begin_with`'s.
+    fn press_grab(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
+        let l = self.layout();
+        let (shift, nosnap, slip) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
+        match Drag::begin_grab(&mut self.state, l, x, y, shift, nosnap, slip)? {
+            Grab::Drag(d) => self.drag = Some(d),
+            Grab::Pick(r) => {
+                self.drag = None;
+                if let Err(e) = r {
+                    self.last_error = Some(format!("transition: {e}"));
+                }
+            }
+        }
+        Some(true)
     }
 }
