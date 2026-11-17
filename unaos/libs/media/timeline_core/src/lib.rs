@@ -1839,7 +1839,7 @@ impl Xform {
 // the last after it, and between two points moves x, y and s linearly, through SR975's ONE clamp [`Xform::clamped`].
 // [`Clip::xform_at`] is the placement shown at a timeline tick (the static `xform` when unkeyed: byte-identical), read by
 // [`Timeline::xform_at`], the one lookup the render's composite reads; [`Clip::placed`] is what the schedule (two-layer
-// step) and the kernel Player's refusal ask. Stored in the EDL as `* UNA XKEY <src_tick> <x> <y> <s>` lines (edl.rs).
+// step) asks; the kernel Player places it per tick by [`Timeline::place_step`] (STRIAKXFORMKEYS SR9073). Stored in the EDL as `* UNA XKEY <src_tick> <x> <y> <s>` lines (edl.rs).
 
 /// A clip's placement points: `n` of them, sorted by source tick, unique ticks, each rect inside the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3889,3 +3889,35 @@ fn striaxformkeys_face_key_note() {
     assert_eq!(face.last_error.take(), Some(format!("pip key: {}", timeline_core::EditError::XKey)));
     assert_eq!(face.state.undo_depth(), 3);
 }
+
+// ---- STRIAKXFORMKEYS (LEDGER SR9073): the placement key words on keys, the same byte pair on both faces (named tail block) ----
+/// STRIAKXFORMKEYS (SR9073): `p` / `P` (text) are `pip key` / `pip unkey` in the face's KEYS and in the kernel Player's
+/// EDIT_KEYS (vplay.rs, read as text: the kernel is not a host crate), each with a help phrase; `p` sets the point at the
+/// playhead (one undo step), `P` removes it (one more), and a `BrowserKey("p")` alone is not taken.
+#[test]
+fn striakxformkeys_p_keys_both_faces() {
+    use stria::nle_face::{EditorState, Face, HELP, KEYS, PixelOrder, synth_fixture};
+    let vplay = include_str!("../../../unaos/crates/kernel/src/video/vplay.rs");
+    for (k, w) in [("p", "pip key"), ("P", "pip unkey")] {
+        assert!(KEYS.contains(&(k, w)), "host KEYS {k} -> {w}");
+        assert_eq!(KEYS.iter().filter(|r| r.0 == k).count(), 1, "{k} is one row");
+        assert!(vplay.contains(&format!("(b'{k}', \"{w}\")")), "kernel EDIT_KEYS {k} -> {w}");
+        assert!(HELP.iter().any(|(a, p)| *a == w && !p.is_empty()), "a help phrase for {w}");
+    }
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    face.state.playhead = 10;
+    assert!(face.verb("pip tl"));
+    let depth = face.state.undo_depth();
+    assert!(!face.on(&bandy::SMessage::BrowserKey("p".into())), "a one-char BrowserKey alone is not taken");
+    assert!(face.on(&bandy::SMessage::BrowserText("p".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.timeline.tracks[0].clips[1].xkeys.len(), 1, "p sets the point at the playhead");
+    assert_eq!(face.state.undo_depth(), depth + 1);
+    assert!(face.on(&bandy::SMessage::BrowserText("P".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert!(face.state.timeline.tracks[0].clips[1].xkeys.is_empty(), "P removes it");
+    assert_eq!(face.state.undo_depth(), depth + 2);
+    println!("striakxformkeys: p / P on both faces; undo {}", face.state.undo_depth());
+}

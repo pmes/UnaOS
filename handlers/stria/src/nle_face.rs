@@ -387,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("p", "pip key"), ("P", "pip unkey"), // STRIAKXFORMKEYS (LEDGER SR9073): p / P (text) set / remove the placement point at the playhead, the kernel Player's EDIT_KEYS p / P too
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -496,7 +497,7 @@ impl Face {
         }
         let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
         if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
-        if VERBS.contains(&act) || slipslide_word(act).is_some() { // NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
+        if VERBS.contains(&act) || slipslide_word(act).is_some() || matches!(act, "pip key" | "pip unkey") { // STRIAKXFORMKEYS (LEDGER SR9073): the key words through the face's one verb road; NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
         let r = match act {
@@ -2603,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("pip key", "set the placement point at the playhead"), ("pip unkey", "remove the placement point at the playhead"), // STRIAKXFORMKEYS (LEDGER SR9073)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
