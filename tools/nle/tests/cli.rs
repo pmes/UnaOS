@@ -130,7 +130,7 @@ fn cli_export_refuses_by_name() {
     // Refused BY NAME: `nle: <msg>` on stderr, exit 1 (NLECLIREFUSALSBYNAME SR801: every refusal; the table words from stria's).
     let video_want = format!("nle: --video bogus: one of {}", VIDEO_NAMES.join("|"));
     let audio_want = format!("nle: --audio bogus: one of {}|aac:KBPS", AUDIO_NAMES.join("|"));
-    let named: [(&[&str], &str); 20] = [
+    let named: [(&[&str], &str); 22] = [
         (&["--qblur", "17"], "nle: --qblur 17: not a number within 0..=16"),
         (&["--qblur", "x"], "nle: --qblur x: not a number within 0..=16"),
         (&["--qcomp", "2"], "nle: --qcomp 2: not a fraction within 0..=1"),
@@ -151,6 +151,8 @@ fn cli_export_refuses_by_name() {
         (&["--src", "AX"], "nle: --src AX: REEL=<media> expected"),
         (&["--pass", "x"], "nle: --pass x: not 1 or 2"),
         (&["--out"], "nle: --out: a value is required"),
+        (&["--qpstep"], "nle: --qpstep: a value is required"), // NLECLIREFUSALSREST (SR814): SR773's arm through `value`
+        (&["--qpstep", "x"], "nle: --qpstep x: not an integer within 0..=51"),
     ];
     for (i, (extra, want)) in named.iter().enumerate() {
         let out = dir.join(format!("named{i}"));
@@ -244,5 +246,35 @@ fn cli_help_exits_zero_on_stdout() {
         assert_eq!(out.lines().count(), 5, "{road:?}: five usage lines: {out}");
         assert_eq!(out.lines().next(), Some(USAGE_FIRST), "{road:?}");
         assert_eq!(out, usage, "{road:?}: stdout carries the same usage `nle` prints on stderr");
+    }
+}
+
+// ---- NLECLIREFUSALSREST (LEDGER SR814): the positional numbers and the missing --out by name (named tail block) ----
+#[test]
+fn cli_positional_refusals() {
+    let (dir, edl, srcs) = fixture("positional");
+    // `--make-src`'s numbers: a bad one is refused by name, exit 1, and nothing is written.
+    let made = dir.join("made.mp4");
+    let m = s(&made);
+    let bad_nums: [(&[&str], &str); 2] = [
+        (&["--make-src", &m, "x", "50", "25"], "nle: --make-src x: not a whole number within 0..=4294967295"),
+        (&["--make-src", &m, "0", "y", "25"], "nle: --make-src y: not a whole number within 0..=4294967295"),
+    ];
+    for (args, want) in bad_nums {
+        let (code, out, err) = nle(args);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, format!("{want}\n").as_str(), ""), "{args:?}");
+        assert!(!made.exists(), "{args:?}: refused before the file is written");
+    }
+    // `size --fps`: refused by name before the EDL is read or written.
+    let before = std::fs::read(&edl).unwrap();
+    let (code, out, err) = nle(&["size", &edl, "A", "fill", "--fps", "x"]);
+    assert_eq!((code, err.as_str(), out.as_str()), (1, "nle: --fps x: not a whole number within 0..=4294967295\n", ""));
+    assert_eq!(std::fs::read(&edl).unwrap(), before, "the EDL is untouched");
+    // The missing `--out` of render / export: named by verb with the usage's placeholder.
+    for (verb, want) in [("render", "nle: render: --out <stem> is required"), ("export", "nle: export: --out <dir> is required")] {
+        let mut args: Vec<&str> = vec![verb, edl.as_str()];
+        args.extend(srcs.iter().map(String::as_str));
+        let (code, out, err) = nle(&args);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, format!("{want}\n").as_str(), ""), "{verb}");
     }
 }

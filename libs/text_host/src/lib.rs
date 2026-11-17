@@ -155,7 +155,7 @@ pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'s
         family: info.families.first().cloned().unwrap_or_default(),
         style: info.style,
     }));
-    faces_loaded().lock().ok()?.insert(key, face);
+    let face: &'static Face = *faces_loaded().lock().ok()?.entry(key).or_insert(face); // TEXTHOST-FALLBACKSYNTH-PTR-FLAKE (SR813): first writer wins, so the cache's one object per key holds under parallel first loads
     Some(face)
 }
 
@@ -648,4 +648,37 @@ pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<
     }));
     m.insert(key, twin);
     Some(twin)
+}
+
+// ---- TEXTHOSTFALLBACKSYNTHPTRFLAKE (LEDGER SR813): the loaded-face cache's one object per key under parallel first loads (named tail block) ----
+
+#[cfg(test)]
+mod facecache_identity_tests {
+    use super::*;
+
+    /// Eight threads first-load ONE key at once (the static fixture through a path with a distinct `..` component, so
+    /// the key is the same file's but no other test's: PathBuf equality keeps `..`): every caller gets the one cached
+    /// object, which a later load returns and which is installed (before SR813 a racing `insert` replaced the first
+    /// writer's object, the static-cover pointer pin's once-in-~30 red).
+    #[test]
+    fn facecache_concurrent_first_load_one_object() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../libs/..")
+            .join("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let info = db::faces_in_file(&p).into_iter().next().expect("the tree's static fixture face");
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (info, gate) = (info.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    load_face_synth(&info, true, true).map(|f| f as *const Face as usize)
+                })
+            })
+            .collect();
+        let got: Vec<usize> = threads.into_iter().map(|t| t.join().unwrap().expect("the fixture loads")).collect();
+        let face = load_face_synth(&info, true, true).unwrap();
+        assert!(got.iter().all(|&a| a == face as *const Face as usize), "one object per key: {got:?}");
+        assert!(is_installed(face) && face.synth_bold && face.synth_oblique);
+    }
 }
