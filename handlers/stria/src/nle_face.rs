@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    meter_hold: MeterHold, // STRIAMETERSCLIPHOLD (SR862): the meters' 2 s peak hold and the clip latch (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, meter_hold: MeterHold::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -257,7 +258,7 @@ impl Face {
     /// A click on the surface (buffer pixels): the ruler scrubs, a clip is selected and scrubbed to, an empty track
     /// spot scrubs and deselects.
     fn click(&mut self, x: f64, y: f64) -> bool {
-        if let Some(r) = self.pick_transition(x, y) { return r; }
+        if let Some(r) = self.meter_clip_reset(x, y) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
         let l = self.layout();
         match l.hit(&self.state.timeline, x, y) {
             Hit::Ruler(t) => self.state.seek(t),
@@ -277,7 +278,7 @@ impl Face {
     /// forward and at 0 going back. True when it moved or stopped.
     pub fn tick(&mut self) -> bool {
         if self.hover_dwell_tick() && !self.playing { return true; } // STRIAINFOREELHOVERDELAY (SR789): the hover dwell counts on THE face clock; the crossing tick repaints (file tail)
-        if !self.playing {
+        if !self.playing { self.meter_hold_tick();
             return false;
         }
         let ph = self.state.playhead;
@@ -285,7 +286,7 @@ impl Face {
             self.playing = false; self.sync_audio(); // NLEPLAYAUDIO (SR676)
             return true;
         }
-        if !self.play_tick(ph) { self.feed_meters(ph, self.rate); self.state.nudge(self.rate); } // NLEPLAYAUDIO (SR676): a forward played tick is ONE render, shown at its own playhead
+        if !self.play_tick(ph) { self.feed_meters(ph, self.rate); self.state.nudge(self.rate); } self.meter_hold_tick(); // NLEPLAYAUDIO (SR676): a forward played tick is ONE render, shown at its own playhead
         true
     }
     /// The canvas as painted now (the preview at the playhead rendered first). While a drag is live the drag's
@@ -322,7 +323,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.meter_hold_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
                 if face.tick() | face.export_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
@@ -421,7 +422,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
-        if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
+        if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; }
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -1340,7 +1341,7 @@ impl Face {
     }
     /// What the strip paints: the meters while playing, nothing when stopped (never a frozen reading).
     fn meter_levels(&self) -> Vec<MeterLevel> {
-        if self.playing { self.meters.levels() } else { Vec::new() }
+        if self.playing { self.meter_hold.shown(self.meters.levels()) } else { Vec::new() }
     }
 }
 
@@ -1602,9 +1603,9 @@ impl Face {
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
         let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
-            return paint_meters(px, l, self.order, &self.meter_levels());
+            return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
-        { let px = paint_marks(paint_export(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
+        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -3060,4 +3061,233 @@ pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
     let after = STALL_AFTER.as_secs_f64();
     let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
     (since_last.as_secs_f64() > limit).then(|| format!("stalled {}", eta_words_of(since_last).trim_start_matches('~')))
+}
+
+// ---- STRIAMETERSCLIPHOLD (LEDGER SR862): the meters' 2 s peak hold and the clip latch (named tail block) ----
+
+/// How long the strip's peak line stands at the highest reading, in seconds of the face clock (`2 * fps` ticks).
+pub const METER_HOLD_S: u32 = 2;
+/// A reading at or above this latches the clip cap: between the 16-bit rail (32767 / 32768 = -0.000265 dBFS, what
+/// `render` clamps a sum to) and the next code below it (32766 / 32768 = -0.00053 dBFS).
+pub const METER_CLIP_DB: f64 = -0.0003;
+const METER_CLIP: [u8; 4] = [0xff, 0x30, 0x30, 255];
+/// The clip cap's height (px) at the top of a latched meter.
+const METER_CLIP_H: i64 = 3;
+
+/// The face's display rule over the meters' readings: a held peak per meter (`(key, held dBFS, ticks left)`, the key
+/// `MeterLevel::track`) and the meters that reached the rail (latched until a click on that meter). Face thread only.
+#[derive(Debug, Clone, Default)]
+pub struct MeterHold {
+    held: Vec<(Option<usize>, f64, u32)>,
+    clipped: Vec<Option<usize>>,
+}
+
+impl MeterHold {
+    /// One face-clock tick: every hold ages by one (dropped at 0); then, when `levels` are given (playing), a reading
+    /// above its hold (or with none) holds for `ticks`, and a reading at [`METER_CLIP_DB`] latches its meter.
+    pub fn step(&mut self, levels: Option<&[MeterLevel]>, ticks: u32) {
+        self.held.retain_mut(|h| {
+            h.2 = h.2.saturating_sub(1);
+            h.2 > 0
+        });
+        for lv in levels.unwrap_or(&[]) {
+            match self.held.iter_mut().find(|h| h.0 == lv.track) {
+                Some(h) if lv.peak_db > h.1 => (h.1, h.2) = (lv.peak_db, ticks),
+                Some(_) => {}
+                None if ticks > 0 => self.held.push((lv.track, lv.peak_db, ticks)),
+                None => {}
+            }
+            if lv.peak_db >= METER_CLIP_DB && !self.clipped.contains(&lv.track) {
+                self.clipped.push(lv.track);
+            }
+        }
+    }
+    /// The readings as the strip shows them: each peak raised to its meter's standing hold (the identity with none).
+    pub fn shown(&self, mut levels: Vec<MeterLevel>) -> Vec<MeterLevel> {
+        for lv in &mut levels {
+            if let Some(h) = self.held.iter().find(|h| h.0 == lv.track) {
+                lv.peak_db = lv.peak_db.max(h.1);
+            }
+        }
+        levels
+    }
+    /// A hold still stands (the face clock must keep counting).
+    pub fn pending(&self) -> bool {
+        !self.held.is_empty()
+    }
+    /// The latched meters, in latch order.
+    pub fn clipped(&self) -> &[Option<usize>] {
+        &self.clipped
+    }
+    /// Clear one meter's latch; false when it was not latched.
+    pub fn unclip(&mut self, key: Option<usize>) -> bool {
+        let n = self.clipped.len();
+        self.clipped.retain(|k| *k != key);
+        self.clipped.len() != n
+    }
+}
+
+/// The rect `(x0, y0, x1, y1)` of meter `key` on `l`, as [`paint_meters`] lays it out (a track's inside its row, the
+/// master down the preview band); `None` where that meter has no bar.
+fn meter_rect(l: Layout, key: Option<usize>) -> Option<(i64, i64, i64, i64)> {
+    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
+    let (y0, y1) = match key {
+        Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
+        Some(_) => return None,
+        None => (1, l.preview_h as i64 - 1),
+    };
+    (y1 - y0 >= 2).then_some((x0, y0, x1, y1))
+}
+
+/// The clip caps over a painted canvas: [`METER_CLIP`] across the top [`METER_CLIP_H`] px of each latched meter's rect,
+/// playing or stopped. No latch paints nothing.
+fn paint_meter_clips(px: Vec<u8>, l: Layout, order: PixelOrder, clipped: &[Option<usize>]) -> Vec<u8> {
+    if clipped.is_empty() {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
+    for &key in clipped {
+        if let Some((x0, y0, x1, y1)) = meter_rect(l, key) {
+            c.rect(x0, y0, x1, (y0 + METER_CLIP_H).min(y1), METER_CLIP);
+        }
+    }
+    c.px
+}
+
+impl Face {
+    /// One face-clock tick of the meter hold: `METER_HOLD_S * fps` ticks, the readings taken only while playing.
+    fn meter_hold_tick(&mut self) {
+        let ticks = METER_HOLD_S * self.state.timeline.fps().unwrap_or(25).max(1);
+        let levels = self.playing.then(|| self.meters.levels());
+        self.meter_hold.step(levels.as_deref(), ticks);
+    }
+    /// A peak hold still stands: `serve`'s clock keeps ticking until it expires.
+    pub fn meter_hold_pending(&self) -> bool {
+        self.meter_hold.pending()
+    }
+    /// The meters latched at the rail (`None` the master).
+    pub fn meter_clipped(&self) -> &[Option<usize>] {
+        self.meter_hold.clipped()
+    }
+    /// The latched meter whose bar holds `(x, y)`.
+    fn meter_clip_at(&self, x: f64, y: f64) -> Option<Option<usize>> {
+        let l = self.layout();
+        self.meter_hold.clipped().iter().copied().find(|&k| {
+            meter_rect(l, k).is_some_and(|(x0, y0, x1, y1)| x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64)
+        })
+    }
+    /// A click on a latched meter clears its latch (`Some(true)`); anywhere else `None` (the click it always was).
+    fn meter_clip_reset(&mut self, x: f64, y: f64) -> Option<bool> {
+        let key = self.meter_clip_at(x, y)?;
+        Some(self.meter_hold.unclip(key))
+    }
+}
+
+#[cfg(test)]
+mod striameterscliphold_tests {
+    use super::*;
+    use gneiss_pal::dsp::audio::meter::dbfs;
+
+    fn lv(track: Option<usize>, peak_db: f64) -> MeterLevel {
+        MeterLevel { track, peak_db, rms_db: -40.0 }
+    }
+
+    /// M3: a -6 dB peak stands for `2 * fps - 1` ticks over a -20 dB reading and drops at the next; an equal reading does
+    /// not re-arm it; a stopped face's ticks age it out.
+    #[test]
+    fn striameterscliphold_hold_keeps_the_peak_two_seconds() {
+        let n = METER_HOLD_S * 25;
+        let mut h = MeterHold::default();
+        h.step(Some(&[lv(Some(1), -6.0)]), n);
+        for k in 1..n {
+            h.step(Some(&[lv(Some(1), -20.0)]), n);
+            assert_eq!(h.shown(vec![lv(Some(1), -20.0)])[0].peak_db, -6.0, "tick {k}: held");
+        }
+        h.step(Some(&[lv(Some(1), -20.0)]), n);
+        assert_eq!(h.shown(vec![lv(Some(1), -20.0)])[0].peak_db, -20.0, "tick {n}: the hold expired");
+        let mut p = MeterHold::default();
+        p.step(Some(&[lv(None, -6.0)]), n);
+        for _ in 0..10 {
+            p.step(Some(&[lv(None, -6.0)]), n);
+        }
+        assert_eq!(p.held[0].2, n - 10, "an equal reading does not re-arm");
+        for _ in 0..n {
+            p.step(None, n);
+        }
+        assert!(!p.pending() && p.clipped().is_empty());
+    }
+
+    /// M3: no hold state is the identity: the readings and the painted pixels are unchanged, so the
+    /// `nle4c_meter_strip_golden` paint (GOLDEN_METERS) is the same bytes through the new road.
+    #[test]
+    fn striameterscliphold_no_hold_is_identity() {
+        let mut st = EditorState::new(synth_fixture().0);
+        st.seek(15);
+        let l = Layout::of(320, 160, &st);
+        let base = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let levels = vec![lv(Some(1), -6.0), lv(None, 0.0)];
+        let h = MeterHold::default();
+        assert_eq!(h.shown(levels.clone()), levels);
+        let bars = paint_meters(base, l, PixelOrder::Rgba, &h.shown(levels.clone()));
+        assert_eq!(paint_meter_clips(bars.clone(), l, PixelOrder::Rgba, h.clipped()), bars);
+    }
+
+    /// M3: +24 dB drives track 1 and the master to the rail: both latch; the caps paint stopped; a click on the master's
+    /// bar clears only it, a press + release on track 1's clears it with the playhead and selection unmoved; with no
+    /// latch the strip takes the click as before (a seek by `Layout::hit`). The threshold sits between the rail and the
+    /// code below it.
+    #[test]
+    fn striameterscliphold_clip_latches_and_click_clears() {
+        assert!(dbfs(32767.0 / 32768.0) >= METER_CLIP_DB, "a full-scale sample latches");
+        assert!(dbfs(32766.0 / 32768.0) < METER_CLIP_DB, "one LSB under does not");
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.verb("play");
+        face.tick();
+        face.tick();
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        face.verb("play");
+        assert!(!face.playing);
+        let l = face.layout();
+        let row = l.row_y(1);
+        let px = face.paint();
+        let at = |x: usize, y: usize| px[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4].to_vec();
+        assert_eq!(at(316, row as usize + 2), METER_CLIP.to_vec());
+        assert_eq!(at(316, 1), METER_CLIP.to_vec());
+        let (ph, sel) = (face.state.playhead, face.state.selection);
+        assert!(face.on(&SMessage::BrowserClick(316.0, 30.0, 0)));
+        assert_eq!(face.meter_clipped(), &[Some(1)]);
+        let y = row as f64 + 10.0;
+        assert!(!face.on(&SMessage::BrowserButton { down: true, x: 316.0, y, mods: 0, surface: 0 }));
+        assert!(face.on(&SMessage::BrowserButton { down: false, x: 316.0, y, mods: 0, surface: 0 }));
+        assert!(face.meter_clipped().is_empty());
+        assert_eq!((face.state.playhead, face.state.selection), (ph, sel), "a latch click moves nothing");
+        let px = face.paint();
+        assert_ne!(px[((row as usize + 2) * 320 + 316) * 4..((row as usize + 2) * 320 + 316) * 4 + 4], METER_CLIP, "cleared");
+        let t = match l.hit(&face.state.timeline, 316.0, y) {
+            Hit::Clip(_, _, t) | Hit::Track(_, t) | Hit::Ruler(t) => t,
+            Hit::None => panic!("the strip lies over a track row"),
+        };
+        assert!(face.on(&SMessage::BrowserButton { down: true, x: 316.0, y, mods: 0, surface: 0 }) | face.on(&SMessage::BrowserButton { down: false, x: 316.0, y, mods: 0, surface: 0 }));
+        assert_eq!(face.state.playhead, t.min(face.state.timeline.end()), "no latch: the strip's click is the click it always was");
+    }
+
+    /// M3: a hold set by played ticks keeps the face clock asked for (`meter_hold_pending`); stopped, `2 * fps` ticks ask
+    /// no repaint and age it out.
+    #[test]
+    fn striameterscliphold_idle_hold_expires() {
+        let (tl, src) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(!face.meter_hold_pending());
+        face.verb("play");
+        face.tick();
+        face.tick();
+        assert!(face.meter_hold_pending());
+        face.verb("play");
+        let n = METER_HOLD_S * 25;
+        assert!((0..n).all(|_| !face.tick()), "an idle hold asks no repaint");
+        assert!(!face.meter_hold_pending());
+    }
 }
