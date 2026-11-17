@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "seqrate"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIASEQFACE (SR9088): `seqrate:12`, `seqrate:25/2`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -517,7 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
+        button("title", "Title"), button("seqrate", "Rate"), // STRIASEQFACE (SR9088): the selected sequence reel's next rate (THE `seqrate` word); STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -903,5 +903,26 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIASEQFACE (LEDGER SR9088): the witness's `seqrate:<rate>` token (named tail block) ----
+#[cfg(test)]
+mod striaseqface_tests {
+    use super::*;
+
+    /// `seqrate:<rate>` is the face's `seqrate <rate>` word, bare `seqrate` the Rate button's; over the synthetic (movie)
+    /// fixture with nothing selected the word is taken and refused by name, the timeline unchanged.
+    #[test]
+    fn striaseqface_token_carries_the_rate() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        for (tok, want) in [("seqrate:12", "seqrate 12"), ("seqrate:25/2", "seqrate 25/2"), ("seqrate", "seqrate")] {
+            let m = token(&face, tok).expect(tok);
+            assert!(matches!(m.as_slice(), [SMessage::Input { target, text }] if target == SURFACE && text == want), "{tok}");
+        }
+        let mut face = face;
+        assert_eq!(drive(&mut face, "seqrate:12"), vec![format!("seqrate: {}", timeline_core::EditError::NoClip)]);
+        assert_eq!(face.state.timeline, tl);
     }
 }

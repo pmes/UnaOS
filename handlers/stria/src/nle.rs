@@ -483,8 +483,8 @@ impl Aud {
 
 /// Render output ticks `range` of `tl` (see the module docs).
 pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sink: &mut dyn RenderSink) -> Result<RenderReport, RenderError> {
-    let steps = schedule(tl, range.clone(), sources).map_err(RenderError::Schedule)?;
-    let runs = audio_runs(tl, range, sources).map_err(RenderError::Schedule)?;
+    let steps = schedule(tl, range.clone(), &SeqRated(sources, tl)).map_err(RenderError::Schedule)?; // STRIASEQFACE (SR9088): the length check reads each sequence reel's effective rate (file tail)
+    let runs = audio_runs(tl, range, &SeqRated(sources, tl)).map_err(RenderError::Schedule)?; // STRIASEQFACE (SR9088): the same length check (file tail)
     let mut r = RenderReport::default();
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
@@ -978,7 +978,7 @@ impl Sources {
     /// unknown id or a reel with nothing to say. Reads the open demuxer only (no survey walk, no lock). STRIAINFOREELAUDIO (SR761):
     /// then ` | <audio decoder> <rate>` from the reel's audio Track (`media::track_audio_decoder` / `media::track_audio_bitrate`).
     pub fn summary(&self, id: SourceId) -> Option<String> {
-        if let Some(q) = self.seq(id) { return Some(q.summary()); } let m = self.get(id).ok()?; // STRIASEQINFO (SR940): a sequence reel's line (file tail)
+        if let Some(q) = self.seq(id) { return Some(q.summary(q.rate)); } let m = self.get(id).ok()?; // STRIASEQINFO (SR940): a sequence reel's line (file tail)
         let v = m.video.map(|i| &m.demux.tracks()[i]);
         let (codec, w, h) = v.map_or(("", 0, 0), |t| (t.codec_name.as_str(), t.width, t.height));
         let profile = v.and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default();
@@ -1083,7 +1083,7 @@ struct Seq {
     first: u64,
     last: u64,
     w: u32,
-    h: u32, held: SeqHeld, rate: SeqRate, // STRIASEQREPORT (SR943): its own frames a second (file tail); STRIASEQINFO (SR940): the last decoded frame (file tail)
+    h: u32, held: SeqHeld, rate: SeqRate, files: u64, orient: u8, // STRIASEQFACE (SR9088): the files found and the first JPEG's EXIF orientation (file tail); STRIASEQREPORT (SR943): its own frames a second (file tail); STRIASEQINFO (SR940): the last decoded frame (file tail)
 }
 
 impl Seq {
@@ -1093,7 +1093,7 @@ impl Seq {
     }
     /// STRIAIMPORTIMAGESEQUENCE: the reel's length in ticks, one per file number `first..=last`.
     fn len(&self) -> i64 {
-        self.ticks(self.last - self.first + 1) // STRIASEQREPORT (SR943): at its own rate when set (file tail)
+        self.ticks(self.last - self.first + 1, self.rate) // STRIASEQFACE (SR9088): the open rate (file tail); STRIASEQREPORT (SR943): at its own rate when set (file tail)
     }
 }
 
@@ -1133,7 +1133,7 @@ impl Sources {
             None => ("", prefix),
         };
         let entries = std::fs::read_dir(if dir.is_empty() { "." } else { dir }).map_err(|e| refuse(format!("{e}")))?;
-        let (mut first, mut last) = (u64::MAX, 0u64);
+        let (mut first, mut last) = (u64::MAX, 0u64); let mut found = 0u64; // STRIASEQFACE (SR9088): the files that match (file tail)
         for e in entries.flatten() {
             let Ok(name) = e.file_name().into_string() else { continue };
             let Some(mid) = name.strip_prefix(stem).and_then(|m| m.strip_suffix(suffix)) else { continue };
@@ -1142,13 +1142,13 @@ impl Sources {
             }
             let Ok(n) = mid.parse::<u64>() else { continue };
             if format!("{n:0width$}") == mid {
-                (first, last) = (first.min(n), last.max(n));
+                (first, last) = (first.min(n), last.max(n)); found += 1; // STRIASEQFACE (SR9088)
             }
         }
         if first == u64::MAX {
             return Err(refuse(String::from("no file matches")));
         }
-        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default(), rate: seq_rate_tick(rate, self.tb).map_err(refuse)? }; // STRIASEQINFO (SR940): nothing kept yet; STRIASEQREPORT (SR943): the rate against the timeline's tick; STRIASEQMORE (SR978): a fractional rate folds into it (file tail)
+        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, files: 0, orient: 1, held: Default::default(), rate: seq_rate_tick(rate, self.tb).map_err(refuse)? }; // STRIASEQINFO (SR940): nothing kept yet; STRIASEQREPORT (SR943): the rate against the timeline's tick; STRIASEQMORE (SR978): a fractional rate folds into it (file tail)
         let p = seq.path(first);
         let mut head = Vec::new();
         std::fs::File::open(&p).and_then(|f| f.take(SEQ_HEAD).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?; // STRIASEQMORE (SR978): a head long enough for a JPEG's APP segments (file tail)
@@ -1160,7 +1160,7 @@ impl Sources {
         if let Ok(mut v) = self.stand_in.lock() {
             v.retain(|s| *s != id);
         }
-        self.seqs.push((id, Seq { w: f.width, h: f.height, ..seq }.upright(&p))); // STRIASEQTHREE (SR9022): a JPEG reel's size taken upright (file tail)
+        self.seqs.push((id, Seq { w: f.width, h: f.height, files: found, ..seq }.upright(&p))); // STRIASEQFACE (SR9088): the count found (file tail); STRIASEQTHREE (SR9022): a JPEG reel's size taken upright (file tail)
         Ok(())
     }
     /// STRIAIMPORTIMAGESEQUENCE: source `id`'s sequence, when it is one.
@@ -1186,14 +1186,14 @@ fn seq_size(sources: &Sources, src: SourceId, kind: Kind, r: &mut RenderReport) 
 fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64) -> Result<Option<Frame>, RenderError> {
     let Some(q) = sources.seq(src) else { return Ok(None) };
     *run = None;
-    let n = u64::try_from(src_t).ok().and_then(|k| q.file_at(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?; // STRIASEQREPORT (SR943): tick to file at the reel's rate (file tail)
-    if let Some(f) = q.held_frame(n, q.frame_in(src_t, n), tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); let stamp = seq_stamp(&path); // STRIASEQRATEEDL (SR9053): the frame of an animated file at this tick (file tail); STRIASEQTHREE (SR9022): the file's stamp before its read (file tail); STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
+    let r = sources.seq_rate_in(tl, src); let n = u64::try_from(src_t).ok().and_then(|k| q.file_at(k, r)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?; // STRIASEQREPORT (SR943): tick to file at the reel's rate (file tail)
+    if let Some(f) = q.held_frame(n, q.frame_in(src_t, n, r), tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); let stamp = seq_stamp(&path); // STRIASEQRATEEDL (SR9053): the frame of an animated file at this tick (file tail); STRIASEQTHREE (SR9022): the file's stamp before its read (file tail); STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
     let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
     let mut img = gneiss_pal::dsp::image::decode(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?; img.apply_orientation(); // STRIASEQTHREE (SR9022): turned upright by its EXIF orientation (file tail); STRIASEQMORE (SR978): the sniffing decode, every format seq_format names
-    Ok(Some(q.keep(n, img.width, img.height, seq_canvases(img.frames.take(), img.rgba), q.frame_in(src_t, n), tl.tb.to_ns(src_t), stamp))) // STRIASEQRATEEDL (SR9053): every canvas of an animated file kept, this tick's handed on (file tail); STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
+    Ok(Some(q.keep(n, img.width, img.height, seq_canvases(img.frames.take(), img.rgba), q.frame_in(src_t, n, r), tl.tb.to_ns(src_t), stamp))) // STRIASEQRATEEDL (SR9053): every canvas of an animated file kept, this tick's handed on (file tail); STRIASEQTHREE (SR9022): kept with its stamp (file tail); STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
 }
 
 // ---- STRIASEQINFO (LEDGER SR940): a sequence reel's line and its kept frame (named tail block) ----
@@ -1204,8 +1204,8 @@ type SeqHeld = std::sync::Mutex<SeqKept>; // STRIASEQTHREE (SR9022): a bounded s
 
 impl Seq {
     /// STRIASEQINFO: the reel's person's line for [`Sources::summary`]: `seq <first>..=<last> <w>x<h>`.
-    fn summary(&self) -> String {
-        format!("seq {}..={} {}x{}{}", self.first, self.last, self.w, self.h, self.rate.map(seq_rate_text).unwrap_or_default()) // STRIASEQREPORT (SR943): ` @<rate>` only when set; STRIASEQMORE (SR978): ` @n/d` for a fractional one
+    fn summary(&self, rate: SeqRate) -> String { // STRIASEQFACE (SR9088): the rate it names is the caller's (file tail)
+        format!("seq {}..={} {}x{}{}{}", self.first, self.last, self.w, self.h, rate.map(seq_rate_text).unwrap_or_default(), seq_facts(self)) // STRIASEQFACE (SR9088): orientation and holes, off-default only (file tail); STRIASEQREPORT (SR943): ` @<rate>` only when set; STRIASEQMORE (SR978): ` @n/d` for a fractional one
     }
     /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
     fn held_frame(&self, n: u64, i: usize, pts_ns: i64) -> Option<Frame> { // STRIASEQRATEEDL (SR9053): `i` the canvas of an animated file (file tail)
@@ -1246,15 +1246,15 @@ impl Seq {
         OpenReport { indexed: false, decode_time: DecodeTime::Presentation, edits: 0, applied: None, colour: None, stand_in: false, seq: true }
     }
     /// STRIASEQREPORT: the ticks `count` files last: `count` at one file per tick, else ceil(count * den / (R * num)), exact.
-    fn ticks(&self, count: u64) -> i64 {
-        let Some((r, num, den, _)) = self.rate else { return count as i64 };
+    fn ticks(&self, count: u64, rate: SeqRate) -> i64 { // STRIASEQFACE (SR9088): the rate a parameter (file tail)
+        let Some((r, num, den, _)) = rate else { return count as i64 };
         let per = r as i128 * num as i128;
         ((count as i128 * den as i128 + per - 1) / per) as i64
     }
     /// STRIASEQREPORT: the file number shown at source tick `k`: `first + k` at one file per tick, else
     /// `first + floor(k * R * num / den)`, exact (`None` on overflow).
-    fn file_at(&self, k: u64) -> Option<u64> {
-        let Some((r, num, den, _)) = self.rate else { return self.first.checked_add(k) };
+    fn file_at(&self, k: u64, rate: SeqRate) -> Option<u64> { // STRIASEQFACE (SR9088): the rate a parameter (file tail)
+        let Some((r, num, den, _)) = rate else { return self.first.checked_add(k) };
         let off = k as u128 * r as u128 * num as u128 / den as u128;
         self.first.checked_add(u64::try_from(off).ok()?)
     }
@@ -1376,7 +1376,7 @@ impl Seq {
             return self;
         }
         let o = std::fs::read(p).ok().and_then(|b| gneiss_pal::dsp::image::decode(&b).ok()).map_or(1, |i| i.orientation);
-        if (5..=8).contains(&o) { Seq { w: self.h, h: self.w, ..self } } else { self }
+        if (5..=8).contains(&o) { Seq { w: self.h, h: self.w, orient: o, ..self } } else { Seq { orient: o, ..self } } // STRIASEQFACE (SR9088): the orientation kept for the summary
     }
 }
 
@@ -1444,8 +1444,8 @@ impl Sources {
     pub fn seq_rated(&self, tl: &Timeline) -> Timeline {
         let mut out = tl.clone();
         for s in out.sources.iter_mut() {
-            if let Some(q) = self.seq(s.id) {
-                s.seq_rate = q.rate.map(|r| (r.0, r.3));
+            if self.seq(s.id).is_some() { // STRIASEQFACE (SR9088): a sequence reel (its rate read below)
+                s.seq_rate = self.seq_rate_in(tl, s.id).map(|r| (r.0, r.3)); // STRIASEQFACE (SR9088): the effective rate (a face word's, else the open rate)
             }
         }
         out
@@ -1456,8 +1456,8 @@ impl Seq {
     /// STRIASEQRATEEDL: the canvas of file `n` shown at source tick `k`: `k` minus the file's first tick (`ticks(n - first)`,
     /// the inverse of `file_at`), so frame order across the ticks the file covers (not the file's own delays: the seat's
     /// ruling). 0 at every tick with no rate (one tick per file).
-    fn frame_in(&self, k: i64, n: u64) -> usize {
-        usize::try_from(k.saturating_sub(self.ticks(n.saturating_sub(self.first)))).unwrap_or(0)
+    fn frame_in(&self, k: i64, n: u64, rate: SeqRate) -> usize { // STRIASEQFACE (SR9088): the rate a parameter (file tail)
+        usize::try_from(k.saturating_sub(self.ticks(n.saturating_sub(self.first), rate))).unwrap_or(0)
     }
 }
 
@@ -1485,4 +1485,93 @@ fn seq_pick(all: &[u8], w: u32, h: u32, i: usize) -> Vec<u8> {
 fn seq_pick_vec(all: Vec<u8>, w: u32, h: u32, i: usize) -> Vec<u8> {
     let size = w as usize * h as usize * 4;
     if size == 0 || all.len() <= size { all } else { seq_pick(&all, w, h, i) }
+}
+
+// ---- STRIASEQFACE (LEDGER SR9088): the face's rate word, the effective rate, the summary's orientation and holes (named tail block) ----
+// A sequence reel's rate is fixed on its `Seq` at the add (the pattern's `@R`, else the document's `* UNA SEQRATE`), and
+// `Sources` is shared with a running export, so a word cannot change it there: the face commits the MODEL's `seq_rate` (and
+// the reel's `duration`) and every rule that maps ticks to files reads ONE effective rate, [`Sources::seq_rate_in`]: the open
+// rate while the model still says what the document said at open, else the model's. Undo back to the document's rate shows
+// the open rate again. The summary names the first JPEG's EXIF orientation and a hole count, only when off-default.
+
+/// STRIASEQFACE (SR9088): the rates the bare `seqrate` word steps through (frames a second), the next above the reel's
+/// effective rate (one file per tick counts as the timeline's rate), wrapping to the first.
+pub const SEQ_FACE_RATES: [u64; 7] = [12, 15, 24, 25, 30, 50, 60];
+
+impl Sources {
+    /// STRIASEQFACE: sequence source `id`'s effective rate against `tl`: the open rate (`Seq.rate`) while the model's
+    /// `seq_rate` equals the document's at open ([`Sources::seq_doc_rate`]), else the model's folded on `tl`'s tick (the
+    /// open rate when it cannot fold). `None` for a reel that is no sequence, or one file per tick.
+    fn seq_rate_in(&self, tl: &Timeline, id: SourceId) -> SeqRate {
+        let q = self.seq(id)?;
+        let m = tl.source(id).and_then(|s| s.seq_rate);
+        if m == self.seq_doc_rate(id) {
+            return q.rate;
+        }
+        seq_rate_tick(m, tl.tb).unwrap_or(q.rate)
+    }
+    /// STRIASEQFACE: [`Sources::summary`] with a sequence reel's rate the effective one against `tl` (the face's message row).
+    pub fn summary_in(&self, tl: &Timeline, id: SourceId) -> Option<String> {
+        match self.seq(id) {
+            Some(q) => Some(q.summary(self.seq_rate_in(tl, id))),
+            None => self.summary(id),
+        }
+    }
+    /// STRIASEQFACE: the `seqrate [<rate>]` word on sequence source `id`: `Ok(Some((rate, duration)))` the reduced rate and
+    /// the reel's length in ticks at it (what `EditorState::set_seq_rate` commits), `Ok(None)` when the reel already plays at
+    /// that rate. `arg` is N, N/D or N.F (SR943's parser and refusal text); `None` steps to the next [`SEQ_FACE_RATES`] entry.
+    /// Refused by name: `not an image sequence`; a rate the document gave but the open `@R` overrides (the effective-rate rule
+    /// cannot tell it from the document's); a rate too fine for the tick.
+    pub fn seq_rerate(&self, tl: &Timeline, id: SourceId, arg: Option<&str>) -> Result<Option<((u64, u64), i64)>, String> {
+        let q = self.seq(id).ok_or_else(|| String::from("not an image sequence"))?;
+        let now = self.seq_rate_in(tl, id).map(|r| (r.0, r.3));
+        let cur = now.unwrap_or((tl.tb.den.max(1), tl.tb.num.max(1)));
+        let want = match arg {
+            Some(a) => {
+                let s = format!("@{a}");
+                let (_, r) = seq_rate(&s)?;
+                r.ok_or_else(|| format!("rate \"{a}\" is not a frame rate above 0 (N, N/D or N.F)"))?
+            }
+            None => SEQ_FACE_RATES.iter().find(|&&f| f as u128 * cur.1 as u128 > cur.0 as u128).map_or((SEQ_FACE_RATES[0], 1), |&f| (f, 1)),
+        };
+        if self.seq_doc_rate(id) == Some(want) && q.rate.map(|r| (r.0, r.3)) != Some(want) {
+            let txt = if want.1 == 1 { format!("{}", want.0) } else { format!("{}/{}", want.0, want.1) };
+            return Err(format!("{txt} is the document's rate; the open{} holds", q.rate.map(seq_rate_text).unwrap_or_default()));
+        }
+        if now == Some(want) {
+            return Ok(None);
+        }
+        let tick = seq_rate_tick(Some(want), tl.tb)?;
+        Ok(Some((want, q.ticks(q.last - q.first + 1, tick))))
+    }
+}
+
+/// STRIASEQFACE: the [`SourceIndex`] [`render`]'s schedule reads: a sequence reel lasts its files at the effective rate
+/// against the timeline being rendered (a reel the face lengthened keeps its clips); every other answer is [`Sources`]'s.
+struct SeqRated<'a>(&'a Sources, &'a Timeline);
+
+impl SourceIndex for SeqRated<'_> {
+    fn duration(&self, src: SourceId) -> Option<i64> {
+        match self.0.seq(src) {
+            Some(q) => Some(q.ticks(q.last - q.first + 1, self.0.seq_rate_in(self.1, src))),
+            None => self.0.duration(src),
+        }
+    }
+    fn keyframe_ns(&self, src: SourceId, kind: Kind, t_ns: i64) -> Option<i64> {
+        self.0.keyframe_ns(src, kind, t_ns)
+    }
+}
+
+/// STRIASEQFACE: the summary's facts past the size and rate: ` orient <o>` for a first JPEG whose EXIF orientation is not 1,
+/// ` <found> of <range> files` when numbers between the first and the last have no file; empty by default.
+fn seq_facts(q: &Seq) -> String {
+    let mut s = String::new();
+    if q.orient != 1 {
+        s.push_str(&format!(" orient {}", q.orient));
+    }
+    let range = q.last - q.first + 1;
+    if q.files < range {
+        s.push_str(&format!(" {} of {range} files", q.files));
+    }
+    s
 }

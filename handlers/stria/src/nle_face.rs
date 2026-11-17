@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "title", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "title", "seqrate", "help"]; // STRIASEQFACE (SR9088): seqrate (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.seqrate_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // STRIASEQFACE (SR9088): the `seqrate` word (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2355,7 +2355,7 @@ impl Face {
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
         let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
-        let s = self.sources.summary(c.src)?;
+        let s = self.sources.summary_in(&self.state.timeline, c.src)?; // STRIASEQFACE (SR9088): a sequence reel's effective rate (nle.rs tail)
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         Some(format!("{name}: {s}"))
     }
@@ -3119,4 +3119,36 @@ pub fn add_title(st: &mut EditorState, text: &str) -> Result<(), EditError> {
     let tb = st.timeline.tb;
     let dur = (TITLE_SECS * tb.den / tb.num.max(1)) as i64;
     st.add_title(text, dur)
+}
+
+// ---- STRIASEQFACE (LEDGER SR9088): the `seqrate` word on the selected clip's sequence reel (named tail block) ----
+// `seqrate [<N|N/D|N.F>]` sets the selected clip's image-sequence reel rate (bare: the next of `nle::SEQ_FACE_RATES`): the
+// host computes the rate and the reel's length at it (`Sources::seq_rerate`, it knows the file count) and timeline_core commits
+// both in ONE step (`EditorState::set_seq_rate`), so undo restores them and the face reads dirty. The render, the schedule's
+// length check, the save and the message row's reel line (`Sources::summary_in`) follow the model's rate. Refusals ride
+// `last_error` as `seqrate: <why>`. Not an `EditorState::verb` word: the kernel Player opens no sequence.
+impl Face {
+    /// STRIASEQFACE (SR9088): the `seqrate` word (taken, refused or not, as `Some(true)`); `None` for any other word.
+    fn seqrate_verb(&mut self, v: &str) -> Option<bool> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("seqrate") {
+            return None;
+        }
+        let (arg, extra) = (w.next(), w.next());
+        if let Err(e) = self.seqrate(arg, extra.is_some()) {
+            self.last_error = Some(format!("seqrate: {e}"));
+        }
+        Some(true)
+    }
+    /// STRIASEQFACE: the word's work: nothing selected `EditError::NoClip`'s text; else `<reel>: <why>` for a second
+    /// argument, a reel that is no sequence, a bad rate (nle.rs `seq_rerate`) or a clip past the new length.
+    fn seqrate(&mut self, arg: Option<&str>, extra: bool) -> Result<(), String> {
+        let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
+        let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |s| s.reel.clone());
+        if extra {
+            return Err(format!("{name}: one rate word"));
+        }
+        let Some((rate, dur)) = self.sources.seq_rerate(&self.state.timeline, c.src, arg).map_err(|e| format!("{name}: {e}"))? else { return Ok(()) };
+        self.state.set_seq_rate(c.src, rate, dur).map_err(|e| format!("{name}: {e}"))
+    }
 }

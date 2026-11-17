@@ -4295,7 +4295,7 @@ fn striaseqthree_jpeg_exif6_is_upright() {
     let (tl, s) = striaimportimagesequence_tl(1);
     let mut src = Sources::new(&tl);
     src.add_sequence(s, &pat).unwrap();
-    assert_eq!(src.summary(s).as_deref(), Some("seq 1..=1 32x48"), "a 48x32 stored card with EXIF 6 is 32x48 upright");
+    assert_eq!(src.summary(s).as_deref(), Some("seq 1..=1 32x48 orient 6"), "a 48x32 stored card with EXIF 6 is 32x48 upright"); // STRIASEQFACE (SR9088): the summary names the EXIF orientation
     let mut sink = StriaTitleFrames::default();
     let r = render(&tl, 0..1, &src, &mut sink).unwrap();
     assert_eq!((r.width, r.height), (32, 48), "the reel's size is upright");
@@ -4420,4 +4420,139 @@ fn striaseqrateedl_animated_default_shows_first_frame() {
         assert!(sink.0[t].3 == [255u8, 255, 255, 255].to_vec(), "tick {t}: one tick per file shows its canvas 0");
     }
     println!("striaseqrateedl: no rate -> each tick its file's first canvas");
+}
+
+// ---- STRIASEQFACE (LEDGER SR9088): the face's `seqrate` word, the effective rate, the summary's facts (named tail block) ----
+// `seqrate [<rate>]` on the selected clip's sequence reel commits the model's `seq_rate` and the reel's length at it in ONE step
+// (`EditorState::set_seq_rate`); the render, the schedule's length check, the save and the message row's reel line read the
+// effective rate (the open rate while the model says what the document said, else the model's). Written, not run here.
+
+/// A face over the three-file SEQ reel 7..=9 (4x4) at 25/s, its one clip `0..len` selected.
+fn striaseqface_face(name: &str, len: i64) -> (Face, Timeline) {
+    let pat = striaimportimagesequence_dir(name, 4, 4, &[(7, [200, 10, 10]), (8, [10, 200, 10]), (9, [10, 10, 200])]);
+    let (tl, s) = striaimportimagesequence_tl(len);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    (face, tl)
+}
+
+#[test]
+fn striaseqface_word_sets_the_rate() {
+    let (mut face, tl) = striaseqface_face("seqface-word", 3);
+    assert_eq!(face.reel_line().as_deref(), Some("SEQ: seq 7..=9 4x4"));
+    assert!(VERBS.contains(&"seqrate") && VERBS.last() == Some(&"help"), "seqrate is a transport word, help stays last");
+    assert!(face.verb("seqrate 12"));
+    assert_eq!(face.last_error, None);
+    assert_eq!((face.state.timeline.sources[0].seq_rate, face.state.timeline.sources[0].duration), (Some((12, 1)), 7), "3 files at 12/s: ceil(75/12) ticks");
+    assert_eq!(face.state.undo_depth(), 1, "one commit");
+    assert!(face.dirty());
+    assert_eq!(face.reel_line().as_deref(), Some("SEQ: seq 7..=9 4x4 @12"), "the message row names the word's rate");
+    assert!(face.verb("seqrate 12"));
+    assert_eq!(face.state.undo_depth(), 1, "the same rate again commits nothing");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl, "undo restores the rate and the length");
+    assert!(!face.dirty());
+    assert_eq!(face.reel_line().as_deref(), Some("SEQ: seq 7..=9 4x4"));
+    println!("striaseqface: seqrate 12 -> (12,1) 7 ticks, `SEQ: seq 7..=9 4x4 @12`; undo -> clean");
+}
+
+#[test]
+fn striaseqface_bare_word_cycles() {
+    let (mut face, _) = striaseqface_face("seqface-cycle", 1);
+    for want in [30, 50, 60, 12, 15] {
+        assert!(face.verb("seqrate"));
+        assert_eq!(face.last_error.take(), None, "-> {want}");
+        assert_eq!(face.state.timeline.sources[0].seq_rate, Some((want, 1)), "the next of SEQ_FACE_RATES above the reel's rate");
+    }
+    assert_eq!(stria::nle::SEQ_FACE_RATES, [12, 15, 24, 25, 30, 50, 60]);
+    println!("striaseqface: bare seqrate at 25/s -> 30, 50, 60, 12, 15");
+}
+
+#[test]
+fn striaseqface_refusals_by_name() {
+    let (mut face, tl) = striaseqface_face("seqface-refuse", 3);
+    for (word, why) in [
+        ("seqrate x", String::from("seqrate: SEQ: rate \"x\" is not a frame rate above 0 (N, N/D or N.F)")),
+        ("seqrate 12 13", String::from("seqrate: SEQ: one rate word")),
+        ("seqrate 50", format!("seqrate: SEQ: {}", timeline_core::EditError::OutOfSource)),
+    ] {
+        assert!(face.verb(word), "{word}");
+        assert_eq!(face.last_error.take(), Some(why), "{word}");
+        assert_eq!(face.state.timeline, tl, "{word}: the timeline unchanged");
+    }
+    face.state.deselect();
+    assert!(face.verb("seqrate 12"));
+    assert_eq!(face.last_error.take(), Some(format!("seqrate: {}", timeline_core::EditError::NoClip)));
+    let (stl, ssrc) = synth_fixture();
+    let mut movie = Face::new(EditorState::new(stl.clone()), ssrc, (320, 160), PixelOrder::Rgba, false);
+    movie.state.select(0, 0).unwrap();
+    let c = movie.state.selected().unwrap();
+    let reel = stl.source(c.src).unwrap().reel.clone();
+    assert!(movie.verb("seqrate 12"));
+    assert_eq!(movie.last_error.take(), Some(format!("seqrate: {reel}: not an image sequence")));
+    assert_eq!(movie.state.timeline, stl);
+    let pat = striaimportimagesequence_dir("seqface-doc", 4, 4, &[(7, [10, 10, 10]), (8, [20, 20, 20])]);
+    let (dtl, s, _) = striaseqrateedl_doc(4, (12, 1));
+    let mut src = Sources::new(&dtl);
+    src.add_sequence(s, &format!("{pat}@25/2")).unwrap();
+    let mut doc = Face::new(EditorState::new(dtl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    doc.state.select(0, 0).unwrap();
+    assert!(doc.verb("seqrate 12"));
+    assert_eq!(doc.last_error.take().as_deref(), Some("seqrate: SEQ: 12 is the document's rate; the open @25/2 holds"));
+    assert_eq!(doc.state.timeline, dtl);
+    println!("striaseqface: refusals named: bad rate, two words, past the end, no clip, a movie reel, the document's rate");
+}
+
+#[test]
+fn striaseqface_render_and_schedule_follow() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqface-render", 4, 4, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut st = EditorState::new(tl);
+    let (rate, dur) = src.seq_rerate(&st.timeline, s, Some("12")).unwrap().expect("a new rate");
+    assert_eq!((rate, dur), ((12, 1), 7));
+    st.set_seq_rate(s, rate, dur).unwrap();
+    st.select(0, 0).unwrap();
+    for _ in 0..4 {
+        st.verb("}").unwrap().unwrap();
+    }
+    assert_eq!(st.timeline.tracks[0].clips[0].src_out, 7, "the clip reaches the reel's new length");
+    assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(3), "the open length is unchanged");
+    let mut sink = StriaTitleFrames::default();
+    render(&st.timeline, 0..7, &src, &mut sink).unwrap();
+    for (t, file) in [0usize, 0, 0, 1, 1, 2, 2].into_iter().enumerate() {
+        assert!(sink.0[t].3 == striaimportimagesequence_px(4, 4, cols[file]), "tick {t}: file {}", 7 + file);
+    }
+    assert_eq!(src.summary_in(&st.timeline, s).as_deref(), Some("seq 7..=9 4x4 @12"));
+    println!("striaseqface: seqrate 12 + }} x4 -> render 0..7 files 7,7,7,8,8,9,9 (schedule reads the effective length)");
+}
+
+#[test]
+fn striaseqface_save_writes_the_word_rate() {
+    let (face, tl) = striaseqface_face("seqface-save", 3);
+    let path = common::fresh_dir("striaseqface", "save").join("seq.edl");
+    std::fs::write(&path, edl::write(&tl, "seq").unwrap()).unwrap();
+    let mut face = face.with_doc(Some(path.as_path()));
+    assert!(face.verb("seqrate 25/2"));
+    assert!(face.dirty());
+    face.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("* UNA SEQRATE SEQ 25/2\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().sources[0].seq_rate, Some((25, 2)));
+    assert!(!face.dirty(), "clean after the save");
+    println!("striaseqface: seqrate 25/2 + save -> `* UNA SEQRATE SEQ 25/2`");
+}
+
+#[test]
+fn striaseqface_summary_names_holes() {
+    let pat = striaimportimagesequence_dir("seqface-holes", 4, 4, &[(7, [1, 2, 3]), (9, [4, 5, 6])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=9 4x4 2 of 3 files"), "a hole names the files found");
+    println!("striaseqface: files 7, 9 -> seq 7..=9 4x4 2 of 3 files (orientation: striaseqthree_jpeg_exif6_is_upright)");
 }
