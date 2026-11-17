@@ -539,7 +539,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r, proxy)?;
-                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; let rgba = cropped(tl, s.track, s.out_t, false, rgba, fw, fh, reel_fit(tl, src, s.vmix.is_none())); let rgba = graded(tl.grade_at(s.track, s.out_t, false), rgba); // STRIACOLORLIFT (SR869): the clip's grade on the frame it holds (file tail); NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()),; let rgba = cropped(tl, s.track, s.out_t, false, rgba, fw, fh, reel_fit(tl, src, s.vmix.is_none())) tl.grade_at(s.track, s.out_t, false))?; // STRIAGRADEMORE (SR957): the clip's grade inside reel_rgba, on the source frame before the fit, so the bars stay FIELD (file tail); STRIACOLORLIFT (SR869): the clip's grade on the frame it holds; NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
                 sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r, proxy)?);
                 r.frames += 1;
             }
@@ -725,7 +725,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r, proxy)?;
-            cropped(tl, s.track, s.out_t, true, graded(tl.grade_at(s.track, s.out_t, true), reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0), w, h, reel_fit(tl, src, false)) // STRIACOLORLIFT (SR869): the outgoing clip's grade (file tail); NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            cropped(tl, s.track, s.out_t, true, reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false), tl.grade_at(s.track, s.out_t, true))?.0, w, h, reel_fit(tl, src, false)) // STRIAGRADEMORE (SR957): the outgoing clip's grade inside reel_rgba (file tail); STRIACOLORLIFT (SR869): the outgoing clip's grade; NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -904,17 +904,18 @@ fn src_rgba(sources: &Sources, src: SourceId, f: &Frame, run: Option<&Track>) ->
 /// NLESIZEPOLICY (LEDGER SR394): `fit` is the reel's [`SizePolicy`] ([`reel_fit`]): Letterbox as above, Fill / Stretch
 /// through the same painter's `Canvas::blit_policy` (` fit=<name>` appended to the line), Adopt hands the frame on at its own
 /// size (`[STRIA] :: nle size switch reel=<id> <W>x<H> adopted`); returns the RGBA and its size.
-fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32, fit: SizePolicy) -> Result<(Vec<u8>, u32, u32), RenderError> {
+#[allow(clippy::too_many_arguments)] // STRIAGRADEMORE (SR957): the grade made it eight
+fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32, fit: SizePolicy, g: timeline_core::Grade) -> Result<(Vec<u8>, u32, u32), RenderError> { // STRIAGRADEMORE (SR957): `g` the step's clip grade (file tail)
     let now = (f.width, f.height);
     let reel = sources.get(src).ok().and_then(|m| m.video.map(|i| (m.demux.tracks()[i].width, m.demux.tracks()[i].height))).filter(|&(rw, rh)| rw > 0 && rh > 0).unwrap_or(now);
     let last = run.as_mut().and_then(|v| v.size.replace(now)); let rt = run.as_ref().map(|v| &v.track); // STRIAPROXYMEDIA (SR882): the run's track converts its frame
     if now == (w, h) {
-        return Ok((src_rgba(sources, src, f, rt), w, h));
+        return Ok((graded(g, src_rgba(sources, src, f, rt)), w, h));
     }
     if reel != (w, h) {
         return Err(RenderError::Size { src, width: now.0, height: now.1 });
     }
-    let rgba = src_rgba(sources, src, f, rt);
+    let rgba = graded(g, src_rgba(sources, src, f, rt));
     if fit == SizePolicy::Adopt {
         if last != Some(now) {
             log::info!("[STRIA] :: nle size switch reel={} {}x{} adopted", src.0, now.0, now.1);
@@ -1599,3 +1600,9 @@ impl Seq {
         self.first.checked_add(u64::try_from(off).ok()?)
     }
 }
+
+// ---- STRIAGRADEMORE (LEDGER SR957): the grade on the source frame, before the fit (named tail block) ----
+// NLE-GRADE-BARS: [`reel_rgba`] takes the step's clip grade and passes the source frame through SR869's [`graded`] BEFORE
+// the size policy fits it, so a size switch's Letterbox bars (the FIELD fill painted after) are never graded; Fill / Stretch /
+// Adopt get the graded source. Its two callers (the step's own frame and a transition's outgoing frame) pass
+// `Timeline::grade_at`; an IDENTITY grade is no pass, so every ungraded render is byte-identical.

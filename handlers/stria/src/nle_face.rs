@@ -434,6 +434,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("h", "history"), ("Ctrl+i", "info"), // STRIASOURCEINFOKEY (SR942): Ctrl / Cmd+I (the platform's Get Info chord) stands the selected clip's reel line (`i` / `I` are the marks)
     ("Meta+i", "info"),
     ("n", "snap"), // STRIASNAPMORE (SR952): n flips the drag snap default through the snap word (text key)
+    ("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+"), // STRIAGRADEMORE (SR957): the digits step the selected clip's grade (SR899's VERBS words, text keys)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
@@ -2672,6 +2673,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("gain-", "clip gain down one step"), ("gain+", "clip gain up one step"), ("track-gain-", "track gain down 1 dB"), ("track-gain+", "track gain up 1 dB"), ("mute", "mute / unmute the clip's track"), ("solo", "solo / unsolo the clip's track"), // STRIATRACKGAINKEYS (SR926)
     ("history", "list the last undo steps"), ("info", "name the selected clip's source for 5 seconds"), // STRIASOURCEINFOKEY (SR942): the Ctrl+i / Meta+i row
     ("snap", "drag snap on / off (Alt: this drag only)"), // STRIASNAPMORE (SR952)
+    ("bright-", "brightness down one step"), ("bright+", "brightness up one step"), ("contrast-", "contrast down one step"), ("contrast+", "contrast up one step"), ("sat-", "saturation down one step"), ("sat+", "saturation up one step"), // STRIAGRADEMORE (SR957): the grade keys' phrases
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
@@ -4601,7 +4603,7 @@ impl Face {
     pub fn clip_reel_line(&self, c: Clip) -> Option<String> {
         let s = self.pcache.summary(&self.sources, c.src)?; // STRIAPERFPREVIEWCACHE (SR918): read once per reel (file tail)
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
-        Some(format!("{name}: {s}{}", grade_note(c.grade))) // STRIAGRADEFACE (SR899): the clip's grade while not identity (file tail)
+        reel_words(name, s, grade_note(c.grade)) // STRIAGRADEMORE (SR957): the summary-less arm (file tail); STRIAGRADEFACE (SR899): the clip's grade while not identity
     }
     /// STRIASOURCEINFO (SR875): the `info` word: the selected clip's reel line as `info: <reel>: <summary>`, standing
     /// [`INFO_SECS`] (a new `info` restarts it). Refused on the message line: nothing selected `info: no such clip`
@@ -7488,5 +7490,21 @@ impl Face {
     /// The picked export preset a bare `export` takes (None: the export's own words).
     pub fn export_preset(&self) -> Option<&'static crate::nle_export::ExportPreset> {
         self.export_preset
+    }
+}
+
+// ---- STRIAGRADEMORE (LEDGER SR957): the grade's keys and a summary-less reel's note (named tail block) ----
+// NLE-GRADE-KEYS: KEYS binds `1`..`6` (text keys) to SR899's six grade step words; `Face::key` routes a VERBS action through
+// `Face::verb`, so the keys and the buttons are ONE road, and HELP carries their phrases. NLE-GRADE-NOTE-NOSUMMARY:
+// [`Face::reel_line`] reads its line through [`reel_words`], so a graded clip on a reel with nothing to say still shows its grade.
+
+/// STRIAGRADEMORE (SR957): the reel line from its reel `name`, the reel's `summary` and the grade `note` ([`grade_note`]):
+/// a summary gives `<name>: <summary><note>` (SR899's line); no summary and a grade gives `<name>: bright <b> contrast <c>
+/// sat <s>`; no summary and no grade gives `None`.
+pub fn reel_words(name: String, summary: Option<String>, note: String) -> Option<String> {
+    match summary {
+        Some(s) => Some(format!("{name}: {s}{note}")),
+        None if !note.is_empty() => Some(format!("{name}: {}", note.trim_start())),
+        None => None,
     }
 }
