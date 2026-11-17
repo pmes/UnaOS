@@ -194,6 +194,7 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
+    help_query: Option<String>, // STRIAHELPSEARCH (SR874): `help <word>`'s query, the rows the help shows are THE help_rows filtered by it (file tail)
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
@@ -206,7 +207,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -241,14 +242,14 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.help_search_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
                 self.rate = 1; self.sync_audio(); // NLEPLAYAUDIO (SR676): the device follows the transport
                 Ok(())
             }
-            "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
+            "help" => { self.help = !self.help; self.help_query = None; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
             v if speed_word(v).is_some() => speed_verb(&mut self.state, v), // STRIACLIPSPEED (SR829): `speed` cycles 1x / 2x / 4x, `speed <q>` sets it (file tail)
             v if title_text(v).is_some() => add_title(&mut self.state, title_text(v).unwrap_or("Title")), // STRIATITLECLIP (SR828): `title [<text...>]` lays a 5 s title card at the playhead (file tail)
             v if slipslide_word(v).is_some() => slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
@@ -2705,7 +2706,7 @@ impl Face {
         if per == 0 {
             return px;
         }
-        let rows = help_rows();
+        let rows = self.help_rows_shown();
         // The columns: (first row, keys width, phrase width), as many as the width holds, at least one.
         let mut cols: Vec<(usize, f32, f32)> = Vec::new();
         let (mut x, mut start) = (HELP_PAD, 0usize);
@@ -4464,5 +4465,52 @@ mod striajkltransport_tests {
         key(&mut mute, "l");
         assert!(mute.tick());
         assert!(mute.play.stretch.is_none());
+    }
+}
+
+// ---- STRIAHELPSEARCH (LEDGER SR874): help <word> filters the keys help rows (named tail block) ----
+// `help <word>` (the words after `help`, joined by one space) shows the keys help with only THE `help_rows` whose keys or
+// phrase contain the query, ASCII case-insensitive; `paint_help` paints them through its one column / `…` road. No row
+// matches: refused by name on the one message line (`help: no key matches "<q>"`), the help left as it was. Bare `help`
+// (`?`, the button) is SR744's toggle unchanged and clears the query, so it always shows the whole table. View-only: no
+// undo step, the document not dirtied. Owed: NLE5D-KEYS-HELP-SEARCH-ACTION (match the action word too: help_rows drops it),
+// NLE5D-KEYS-HELP-SEARCH-LIVE (type to filter while shown), NLE5D-KEYS-HELP-SEARCH-BUTTON (a query field on the bar).
+
+/// STRIAHELPSEARCH (SR874): [`help_rows`] whose keys or phrase contain `q` (ASCII case-insensitive).
+pub fn help_matching(q: &str) -> Vec<(String, &'static str)> {
+    let q = q.to_ascii_lowercase();
+    help_rows().into_iter().filter(|(k, p)| k.to_ascii_lowercase().contains(&q) || p.to_ascii_lowercase().contains(&q)).collect()
+}
+
+impl Face {
+    /// The `help <word>` form: show the help filtered by the query; a query no row matches is refused by name and the help
+    /// left as it was; a blank query is the bare `help`. `None` for any other word (bare `help` included).
+    fn help_search_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("help") || v == "help" {
+            return None;
+        }
+        let q = words.collect::<Vec<_>>().join(" ");
+        if q.is_empty() {
+            return Some(self.verb("help"));
+        }
+        if help_matching(&q).is_empty() {
+            self.last_error = Some(format!("help: no key matches \"{q}\""));
+            return Some(true);
+        }
+        self.help = true;
+        self.help_query = Some(q);
+        Some(true)
+    }
+    /// The query the help is filtered by (`help <word>`); `None` for the whole table.
+    pub fn help_query(&self) -> Option<&str> {
+        self.help_query.as_deref()
+    }
+    /// The rows the help shows: [`help_matching`] the query, or [`help_rows`] verbatim without one.
+    pub fn help_rows_shown(&self) -> Vec<(String, &'static str)> {
+        match &self.help_query {
+            Some(q) => help_matching(q),
+            None => help_rows(),
+        }
     }
 }

@@ -187,7 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-" | "pan" | "help"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, ["color", b, c, s] => SMessage::Input { target: SURFACE.into(), text: format!("color {b} {c} {s}") }, // STRIACOLORLIFT (SR869): `color:<b>:<c>:<s>` (file tail); STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
@@ -257,7 +257,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &tc_json(&face) + &help_search_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face) + &markers_json(&face) + &color_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -1352,5 +1352,41 @@ mod striacolorlift_tests {
         assert!(drive(&mut face, "undo").is_empty());
         assert_eq!(color_json(&face), "");
         println!("striacolorlift witness: color:0:0:-1000 -> \"color\":[0,0,-1000]");
+    }
+}
+
+// ---- STRIAHELPSEARCH (LEDGER SR874): the witness's `help <word>` reading (named tail block) ----
+/// `"help_query"` and the shown row count, only while the keys help shows filtered (`help:<word>`, `Face::help_query`);
+/// the bare help's line is unchanged.
+fn help_search_json(face: &Face) -> String {
+    match face.help_query() {
+        Some(q) if face.help_shown() => format!(",\"help_query\":\"{}\",\"help_rows\":{}", q.replace('"', "'"), face.help_rows_shown().len()),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod striahelpsearch_tests {
+    use super::*;
+
+    /// STRIAHELPSEARCH M3: `--do help:slip` shows the filtered help, the line carries the query and the shown count; a
+    /// bare `help` hides it and both fields are gone; `help:zzz` is refused by name.
+    #[test]
+    fn striahelpsearch_witness_query_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(help_search_json(&f), "");
+        let errors = drive(&mut f, "help:slip");
+        assert!(errors.is_empty(), "{errors:?}");
+        let n = nle_face::help_matching("slip").len();
+        assert!(n > 0);
+        assert_eq!(help_json(&f), ",\"help\":true");
+        assert_eq!(help_search_json(&f), format!(",\"help_query\":\"slip\",\"help_rows\":{n}"));
+        drive(&mut f, "help");
+        assert_eq!((help_json(&f), help_search_json(&f)), (String::new(), String::new()));
+        let errors = drive(&mut f, "help:zzz");
+        assert_eq!(errors, vec!["help: no key matches \"zzz\"".to_string()]);
+        assert!(!f.help_shown());
+        println!("striahelpsearch witness: help:slip -> ,\"help_query\":\"slip\",\"help_rows\":{n}");
     }
 }
