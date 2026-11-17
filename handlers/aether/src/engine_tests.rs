@@ -6941,4 +6941,74 @@ mod tests {
         let (_, rb, ..) = imgalt_rect(&mut e, "tpr");
         assert!(((b - s) - (rb - rs) - 30.0).abs() <= 1.0, "top: initial drops the 30px offset: {} vs {}", b - s, rb - rs);
     }
+
+    // ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): one 20px row per probe at 400 px wide, rows 12px apart, the image a
+    /// 2x2 opaque red PNG data: URL (decoded synchronously, tiled): `.im` and its `.im.r { background-image: none }`
+    /// twin, `.ii.r { background-image: initial }`, a green-plus-image `.bi` and its `.bi.r { background: initial }`
+    /// twin, `.bn.r { background: none }`, `.im.r.u` (a later url after none), and a green-plus-image `.ic` whose
+    /// `.ic.r { background-image: none }` twin keeps the green.
+    fn css_wide_bgnone_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .im, .ii, .bn { background-image: url(PNG) }
+            .im.r { background-image: none }
+            .ii.r { background-image: initial }
+            .bn.r { background: none }
+            .im.r.u { background-image: url(PNG) }
+            .bi { background: rgb(0, 160, 0) url(PNG) }
+            .bi.r { background: initial }
+            .ic { background: rgb(0, 160, 0) url(PNG) }
+            .ic.r { background-image: none }
+            </style></head><body style="margin:0">
+            <div id="im" class="im"></div>
+            <div id="imr" class="im r"></div>
+            <div id="iir" class="ii r"></div>
+            <div id="bi" class="bi"></div>
+            <div id="bir" class="bi r"></div>
+            <div id="bnr" class="bn r"></div>
+            <div id="imu" class="im r u"></div>
+            <div id="ic" class="ic"></div>
+            <div id="icr" class="ic r"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=");
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background-image: none` / `initial` and `background: none` after an
+    /// image rule paint no image ink (the `.im` twin paints red, armed).
+    #[test]
+    fn css_wide_bgnone_image_cleared() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "im", css_wide_red) > 100, "the .im image paints red (armed)");
+        for id in ["imr", "iir", "bnr"] {
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no image");
+        }
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background: initial` after a green colour plus an image resets both:
+    /// no red, no green (the `.bi` twin paints the image, armed).
+    #[test]
+    fn css_wide_bgnone_shorthand_initial() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 100, "the .bi image paints (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "bir", css_wide_red), 0, "background: initial: no image");
+        assert_eq!(css_wide_color_ink(&mut e, "bir", css_wide_green), 0, "background: initial: transparent");
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): a later url after none paints; `background-image: none` over a green
+    /// colour plus an image keeps the green (the `.ic` twin paints red over it, armed).
+    #[test]
+    fn css_wide_bgnone_later_url_and_colour() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "imu", css_wide_red) > 100, "a later url after none paints");
+        assert!(css_wide_color_ink(&mut e, "ic", css_wide_red) > 100, "the .ic image covers the green (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "icr", css_wide_red), 0, "background-image: none: no image");
+        assert!(css_wide_color_ink(&mut e, "icr", css_wide_green) > 100, "the green colour stays");
+    }
 }
