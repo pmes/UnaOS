@@ -37,6 +37,7 @@
 //! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 //! NLEHOSTSAVE (SR677): the face keeps the `<edl>` path (`Face::with_doc`); `save` (the Save button, `--do save`) writes it back through `edl::write`, and the JSON line carries `"dirty"` after `transition`.
 //! NLEFACEEXPORT (SR694): `export` (the Export button, `--do export`) runs the face's export off its thread; while it runs the JSON line carries `"export":{"done":<n>,"total":<m>,"audio":"<word>"[,"pass":<k>,"passes":<n>][,"eta_secs":<s>][,"stalled_secs":<s>]}` (the keys: [`EXPORT_JSON_KEYS`]) after the other fields (the default line unchanged).
+//! NLEFACEEXPORTJSONDOCOS (SR1118): every field of the line (its order, type, when it appears and the arc that added it) and the `--do` words are docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md; the keys every line carries are [`WITNESS_KEYS`].
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
@@ -254,7 +255,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
-    println!(
+    witness_out(format!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
         st.timeline.tracks.len(),
@@ -268,7 +269,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         transition_json(&face),
         face.dirty(),
         if c.mute { ",\"audio\":\"none\"" } else { "" } // NLEPLAYAUDIO (SR676): the witness opens no device
-    );
+    ));
     0
 }
 
@@ -1066,6 +1067,92 @@ mod exportjsonzero_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         println!("nlefaceexportjsonzero witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONDOCOS (LEDGER SR1118): the witness line's top-level keys, listed once (named tail block) ----
+/// The keys every witness line carries, in the order [`witness`] (the one writer) emits them. The conditional keys follow
+/// them in this order: `meters`, `help`, `presses`, `surfaces`, `fnvs`, `export` (its keys: [`EXPORT_JSON_KEYS`]), `range`,
+/// `reel`, `audio`; docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md names each one's type, condition and arc.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const WITNESS_KEYS: [&str; 16] = ["playhead", "tracks", "clips", "selection", "clip", "playing", "rate", "undo", "zoom", "w", "h", "fnv", "errors", "set", "transition", "dirty"];
+
+/// The witness's one print: the line on stdout (a test build also keeps it in `WITNESS_LAST` for the schema walk).
+fn witness_out(line: String) {
+    #[cfg(test)]
+    {
+        WITNESS_LAST.with(|l| *l.borrow_mut() = line.clone());
+    }
+    println!("{line}");
+}
+
+#[cfg(test)]
+thread_local! {
+    static WITNESS_LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+#[cfg(test)]
+mod witnessdocs_tests {
+    use super::*;
+
+    /// The depth-1 keys of the JSON object `j` starts with, in order, up to its close (strings skipped whole, so a `:` inside a
+    /// value is no key).
+    fn top_keys(j: &str) -> Vec<String> {
+        let (b, mut keys, mut depth, mut i) = (j.as_bytes(), Vec::new(), 0usize, 0usize);
+        while i < b.len() {
+            match b[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while b[i] != b'"' {
+                        i += if b[i] == b'\\' { 2 } else { 1 };
+                    }
+                    if depth == 1 && b.get(i + 1) == Some(&b':') {
+                        keys.push(j[start..i].to_string());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        keys
+    }
+
+    /// NLEFACEEXPORTJSONDOCOS (SR1118): the default synth line (the face as `main` builds it) carries exactly `WITNESS_KEYS`,
+    /// none twice and no `export`; a job held at k = 0 and cancelled by the script's Esc (still on the face: `export_tick`
+    /// runs only in `serve`) adds `export` last, its keys the first three of `EXPORT_JSON_KEYS`.
+    #[test]
+    fn nlefaceexportjsondocos_witness_keys() {
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: false, mute: false };
+        let face = |c: &Cli| { let (tl, src) = nle_face::synth_fixture(); route(c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, c.labels).with_doc(None)) };
+        assert_eq!(witness(&c, face(&c)), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        assert_eq!(top_keys(&line), WITNESS_KEYS, "{line}");
+        let mut sorted = WITNESS_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), WITNESS_KEYS.len(), "a key listed twice");
+        println!("nlefaceexportjsondocos witness: {line}");
+        let dir = std::env::current_exe().expect("the test binary").parent().expect("its directory").join("nlefaceexportjsondocos-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = Cli { script: Some("key:Escape".into()), ..c };
+        let mut held = face(&c);
+        held.export_paused_at(&dir, "png", 0).unwrap();
+        assert_eq!(witness(&c, held), 0);
+        let line = WITNESS_LAST.with(|l| l.borrow().clone());
+        let keys = top_keys(&line);
+        assert_eq!(keys[..WITNESS_KEYS.len()], WITNESS_KEYS, "{line}");
+        assert_eq!(keys[WITNESS_KEYS.len()..], ["export"], "{line}: export last");
+        let obj = line.split_once(",\"export\":").map(|(_, o)| o).unwrap_or_else(|| panic!("{line}"));
+        assert_eq!(top_keys(obj), &EXPORT_JSON_KEYS[..3], "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
