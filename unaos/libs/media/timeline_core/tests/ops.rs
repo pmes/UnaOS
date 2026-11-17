@@ -2942,3 +2942,53 @@ mod striaxformmore {
         assert_eq!(st.verb("pip left"), Some(Err(EditError::Kind)));
     }
 }
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the bracket names its curve, and the curve's one word (named tail block) ----
+
+/// Every label the painter asks for: (text, clip span).
+struct StriaXfadeMoreLabels(Vec<(String, (i32, i32))>);
+impl timeline_core::view::Text for StriaXfadeMoreLabels {
+    fn text(&mut self, _: &mut timeline_core::view::Canvas, s: &str, _: f32, _: f32, clip: (i32, i32)) {
+        self.0.push((s.to_string(), clip));
+    }
+}
+
+/// The curve labels of a labels-on paint of `st`.
+fn striaxfademore_names(st: &EditorState, l: timeline_core::view::Layout) -> Vec<(String, (i32, i32))> {
+    use timeline_core::view::{Order, Text, paint_in};
+    let mut rec = StriaXfadeMoreLabels(Vec::new());
+    let _ = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+    rec.0.into_iter().filter(|(s, _)| s == "equal" || s == "linear").collect()
+}
+
+/// With labels on, the explicit crossfade's bracket names its curve once, clipped to the bracket; the curve word follows
+/// `xfade-curve`; without a record (undo) nothing is named.
+#[test]
+fn striaxfademore_bracket_names_its_curve() {
+    use timeline_core::view::{Layout, TRANS_MIN_W};
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    let l = Layout::of(320, 160, &st);
+    assert_eq!(striaxfademore_names(&st, l), Vec::new());
+    assert_eq!(st.verb("xfade 8"), Some(Ok(())));
+    let (x0, x1) = (l.x_of(20), l.x_of(28).max(l.x_of(20) + TRANS_MIN_W));
+    assert_eq!(striaxfademore_names(&st, l), vec![("equal".to_string(), (x0 as i32, x1 as i32))]);
+    assert_eq!(st.verb("xfade-curve"), Some(Ok(())));
+    assert_eq!(striaxfademore_names(&st, l), vec![("linear".to_string(), (x0 as i32, x1 as i32))]);
+    assert!(st.undo() && st.undo());
+    assert_eq!(striaxfademore_names(&st, l), Vec::new());
+    println!("striaxfademore: bracket {x0}..{x1} named equal -> linear; none after undo");
+}
+
+/// `Curve::word` is the `xfade` words' spelling, and the reading uses it.
+#[test]
+fn striaxfademore_curve_word() {
+    use timeline_core::Curve;
+    assert_eq!((Curve::Linear.word(), Curve::EqualPower.word()), ("linear", "equal"));
+    let mut st = striaaudiocrossfade_state();
+    st.select(1, 1).unwrap();
+    assert_eq!(st.verb("xfade 8 linear"), Some(Ok(())));
+    assert_eq!(st.xfade_reading("xfade").as_deref(), Some("8 linear"));
+    println!("striaxfademore: Linear -> linear, EqualPower -> equal");
+}
+

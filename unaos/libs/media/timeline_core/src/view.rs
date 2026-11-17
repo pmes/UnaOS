@@ -350,7 +350,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail)
+    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -2180,7 +2180,7 @@ mod ripple_drag_tests {
 // explicit record (byte-identical).
 
 /// The brackets of every explicit audio crossfade on a visible row.
-fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState) {
+fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState, labels: &mut Option<&mut dyn Text>) { // STRIAXFADEMORE (SR980): and the painter's labels, for the curve's name
     use crate::schedule::{ENV_ONE, xfade_weight};
     for x in st.timeline.audio_xfades.iter().filter(|x| x.track < l.rows) {
         let bracket = Transition { at: x.at, kind: TransitionKind::Dissolve, dur: x.dur, from_black: false, to_black: false, ease: crate::Ease::Linear, want: None };
@@ -2189,7 +2189,7 @@ fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState) {
             continue;
         }
         c.rect(x0, y0, x1, y1, TRANS_FILL);
-        c.frame(x0, y0, x1, y1, TRANS);
+        c.frame(x0, y0, x1, y1, TRANS); paint_xfade_name(c, labels, x.curve, (x0, y0, x1)); // STRIAXFADEMORE (SR980): the bracket names its curve (file tail)
         let (span, h) = ((x1 - x0 - 2).max(1), y1 - y0 - 3);
         for px in x0 + 1..x1 - 1 {
             let p = ((px - x0 - 1) * ENV_ONE as i64 / span) as u32;
@@ -3876,5 +3876,18 @@ mod striabinmore_tests {
                 assert_eq!(px(&got, w, w as i64 - BIN_THUMB_W - 1, y), px(&base, w, w as i64 - BIN_THUMB_W - 1, y), "left of the thumb unchanged");
             }
         }
+    }
+}
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the crossfade bracket names its curve (named tail block) ----
+// SR925 owed NLE-XFADE-CURVE-PAINT: the bracket plots its curve but never names it. With labels on, each explicit audio
+// crossfade's bracket (drawn by `paint_audio_xfades`, THE `transition_rect`) names its curve (`Curve::word`: `equal` /
+// `linear`) through the painter's `Text` hook, just above the bracket and clipped to its width. Labels off, or no explicit
+// record: nothing is drawn, so every labels-off golden and every record-free paint is byte-identical.
+
+/// The curve's word over a bracket `x0..x1` whose top is `y0`; nothing without labels.
+fn paint_xfade_name(c: &mut Canvas, labels: &mut Option<&mut dyn Text>, curve: crate::Curve, (x0, y0, x1): (i64, i64, i64)) {
+    if let Some(text) = labels.as_mut() {
+        text.text(c, curve.word(), x0 as f32 + 2.0, y0 as f32 - 1.0, (x0 as i32, x1 as i32));
     }
 }

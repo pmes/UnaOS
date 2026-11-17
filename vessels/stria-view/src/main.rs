@@ -269,7 +269,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -2953,5 +2953,30 @@ mod striasnapnext_tests {
         assert_eq!(drive(&mut f, "zoom+"), Vec::<String>::new());
         assert_eq!(note_json(&f), "");
         println!("striasnapnext witness: snap -> \"note\":\"snap: off\", key:n -> snap: on, zoom+ -> absent");
+    }
+}
+
+// ---- STRIAXFADEMORE (LEDGER SR980): the witness's note (named tail block) ----
+/// The witness's `"note"` field, only while the face's note stands (`Face::note`: a success reading such as
+/// `xfade: 10 equal`, no longer an error); the default line is unchanged.
+fn note_json(face: &Face) -> String {
+    face.note.as_ref().map(|s| format!(",\"note\":\"{}\"", s.replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striaxfademore_tests {
+    use super::*;
+
+    /// `at:12:1,xfade` selects the audio clip at 10 and puts its crossfade: the reading is the `"note"` field, not an
+    /// error; a bare face has no field.
+    #[test]
+    fn striaxfademore_note_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(note_json(&face), "");
+        let errors = drive(&mut face, "at:12:1,xfade");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(note_json(&face), r#","note":"xfade: 10 equal""#);
+        println!("striaxfademore witness: {}", note_json(&face));
     }
 }
