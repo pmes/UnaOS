@@ -15,7 +15,7 @@
 //! stria-view --synth --size 320x160 --do at:12:0,split,delete,undo [--out shot.rgba] [--labels]
 //! ```
 //! `--do`: comma-separated transport verbs (`stria::nle_face::VERBS`), `at:<tick>:<track>` (a click on that track at
-//! that tick) and `ruler:<tick>` (a click on the ruler); STRIAFREEZEMORE (SR970): `freeze:<len>`, `freeze-all:<len>`, `title:<text>`, `retitle:<text>` (the word, a space, everything after the first `:`). NLE2B (SR208), the gestures as a face sends them:
+//! that tick) and `ruler:<tick>` (a click on the ruler); STRIAFREEZEMORE (SR970): `freeze:<len>`, `freeze-all:<len>`, `title:<text>`, `retitle:<text>` (the word, a space, everything after the first `:`); STRIAFREEZETHREE (SR9029): `title-style:<key=value ...>`. NLE2B (SR208), the gestures as a face sends them:
 //! `press:<x>:<y>` / `move:<x>:<y>` (surface pixels), `release` (at the last pointer: `BrowserButton` up + `BrowserClick`),
 //! `key:<name>` (as GTK sends it: `BrowserKey`, plus `BrowserText` for a one-character key; `key:space` types a space)
 //! and `wheel:<n>` (n notches at the last pointer, n > 0 up = zoom in). The JSON line also carries `playing`, `rate`
@@ -914,7 +914,7 @@ mod exportstall_tests {
 /// everything after the FIRST `:` (so `freeze:00:00:01:00` keeps the timecode's colons); `None` for any other token.
 fn word_token(tok: &str) -> Option<Vec<SMessage>> {
     let (w, rest) = tok.split_once(':')?;
-    matches!(w, "freeze" | "freeze-all" | "title" | "retitle").then(|| vec![SMessage::Input { target: SURFACE.into(), text: format!("{w} {rest}") }])
+    matches!(w, "freeze" | "freeze-all" | "title" | "retitle" | "title-style").then(|| vec![SMessage::Input { target: SURFACE.into(), text: format!("{w} {rest}") }])
 }
 
 #[cfg(test)]

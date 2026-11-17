@@ -244,7 +244,7 @@ impl Face {
             }
             "help" => { self.help = !self.help; Ok(()) } // NLE5DKEYSHELP (SR744): the keys help overlay on / off (file tail)
             v if speed_word(v).is_some() => speed_verb(&mut self.state, v), // STRIACLIPSPEED (SR829): `speed` cycles 1x / 2x / 4x, `speed <q>` sets it (file tail)
-            v if title_text(v).is_some() => add_title(&mut self.state, title_text(v).unwrap_or("Title")), // STRIATITLECLIP (SR828): `title [<text...>]` lays a 5 s title card at the playhead (file tail)
+            v if title_text(v).is_some() => add_title(&mut self.state, &timeline_core::editor::title_lines(title_text(v).unwrap_or("Title"))), // STRIATITLECLIP (SR828): `title [<text...>]` lays a 5 s title card at the playhead (file tail); STRIAFREEZETHREE (SR9029): a typed `\n` is a line break
             v if slipslide_word(v).is_some() => slipslide_word(v).and_then(|w| self.state.verb(&w)).unwrap_or(Err(EditError::NoClip)), // NLE3ESLIPFACE (SR737): the one-frame words onto SR704's `slip <d>` / `slide <d>` (file tail); NLE3ESLIPSTEP (SR752): and the SLIP_STEP words `slip-10` ... (keys only)
             _ => match self.state.verb(v) {
                 Some(r) => r, // NLE6KEYS (rmbp-ledger B961): timeline_core's ONE verb dispatch (the kernel Player's keys call it too)

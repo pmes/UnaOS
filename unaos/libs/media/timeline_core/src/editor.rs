@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail)
+        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -764,7 +764,7 @@ impl EditorState {
     /// or empty is "Title" (stria's `title_text` default).
     fn retitle_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let t = if v == "retitle" { "" } else { v.strip_prefix("retitle ")?.trim() };
-        Some(self.retitle(if t.is_empty() { "Title" } else { t }))
+        Some(self.retitle(&title_lines(if t.is_empty() { "Title" } else { t }))) // STRIAFREEZETHREE (SR9029): a typed `\n` is a line break
     }
 }
 
@@ -815,5 +815,107 @@ mod striafreezemore_tests {
         st.deselect();
         assert_eq!(st.verb("retitle X"), Some(Err(EditError::NoClip)));
         assert_eq!((text(&st), st.undo_depth()), (Some("Hello"), d));
+    }
+}
+
+// ---- STRIAFREEZETHREE (LEDGER SR9029): the typed line break and the title-style word as ONE commit (named tail block) ----
+// A face word is one line of text, so the `title` / `retitle` words read the two characters `\n` as a line break
+// (`title_lines`); the EDL's own quoting is unchanged. `title-style` sets the selected clip's title source's
+// [`crate::TitleStyle`] through `Timeline::set_title_style` in ONE commit: bare `title-style` is the default style,
+// `title-style size=N align=left|centre|right ink=RRGGBB` (any subset) changes those over the current style.
+
+/// STRIAFREEZETHREE: a typed title text with each two-character `\n` read as a line break (LF).
+pub fn title_lines(text: &str) -> alloc::string::String {
+    text.replace("\\n", "\n")
+}
+
+impl EditorState {
+    /// STRIAFREEZETHREE: the selected clip's title source styled `style`: ONE commit, so undo restores the old style; the same
+    /// style is Ok with no commit. Refused by name: no selection `NoClip`; a media reel `NoSource`.
+    pub fn title_style(&mut self, style: crate::TitleStyle) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if self.timeline.source(c.src).filter(|s| s.title.is_some()).map(|s| s.title_style) == Some(style) {
+            return Ok(());
+        }
+        let tl = self.timeline.set_title_style(c.src, style)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// STRIAFREEZETHREE: the `title-style [<key=value...>]` word (`None` for any other word); unreadable pairs `Style`.
+    fn title_style_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let words = if v == "title-style" { "" } else { v.strip_prefix("title-style ")?.trim() };
+        if words.is_empty() {
+            return Some(self.title_style(crate::TitleStyle::DEFAULT));
+        }
+        let Some(c) = self.selected() else { return Some(Err(EditError::NoClip)) };
+        let Some(now) = self.timeline.source(c.src).filter(|s| s.title.is_some()).map(|s| s.title_style) else { return Some(Err(EditError::NoSource)) };
+        Some(now.with_words(words).ok_or(EditError::Style).and_then(|s| self.title_style(s)))
+    }
+}
+
+#[cfg(test)]
+mod striafreezethree_tests {
+    use super::*;
+    use crate::{Kind, TitleAlign, TitleStyle};
+
+    /// V1 = A[0,10)@0 then a 25-tick title "Hello" laid at 10 (selected).
+    fn titled() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        let mut st = EditorState::new(tl);
+        st.seek(10);
+        assert_eq!(st.add_title("Hello", 25), Ok(()));
+        st
+    }
+
+    fn style(st: &EditorState) -> Option<TitleStyle> {
+        st.timeline.source_by_reel("T1").map(|s| s.title_style)
+    }
+
+    /// `title-style` pairs commit one undo step; the same style none; bare resets; bad pairs `Style`.
+    #[test]
+    fn striafreezethree_title_style_one_undo_step() {
+        let mut st = titled();
+        let d = st.undo_depth();
+        assert_eq!(st.verb("title-style size=15 align=left ink=FFCC00"), Some(Ok(())));
+        let s = TitleStyle { size: 15, align: TitleAlign::Left, ink: [0xFF, 0xCC, 0x00] };
+        assert_eq!((style(&st), st.undo_depth()), (Some(s), d + 1));
+        assert_eq!(st.verb("title-style align=left"), Some(Ok(())), "the same style");
+        assert_eq!(st.undo_depth(), d + 1, "no step for the same style");
+        assert_eq!(st.verb("title-style align=right"), Some(Ok(())));
+        assert_eq!(style(&st), Some(TitleStyle { align: TitleAlign::Right, ..s }), "a subset keeps the rest");
+        assert!(st.undo());
+        assert_eq!(style(&st), Some(s), "one undo restores");
+        assert_eq!(st.verb("title-style"), Some(Ok(())));
+        assert_eq!(style(&st), Some(TitleStyle::DEFAULT), "bare resets");
+        let d = st.undo_depth();
+        assert_eq!(st.verb("title-style size=99"), Some(Err(EditError::Style)));
+        assert_eq!(st.verb("title-style font=sans"), Some(Err(EditError::Style)));
+        assert_eq!(st.undo_depth(), d, "a refusal commits nothing");
+        assert_eq!(st.verb("title-styles"), None, "not this word");
+    }
+
+    /// A media reel is `NoSource`, no selection `NoClip`.
+    #[test]
+    fn striafreezethree_title_style_refusals() {
+        let mut st = titled();
+        assert_eq!(st.select_at(0, 3), Ok(()));
+        assert_eq!(st.verb("title-style size=20"), Some(Err(EditError::NoSource)));
+        assert_eq!(st.verb("title-style"), Some(Err(EditError::NoSource)));
+        st.deselect();
+        assert_eq!(st.verb("title-style size=20"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("title-style"), Some(Err(EditError::NoClip)));
+    }
+
+    /// `retitle` reads a typed `\n` as a line break; a text with none is unchanged.
+    #[test]
+    fn striafreezethree_typed_line_break() {
+        assert_eq!(title_lines("Top\\nBottom"), "Top\nBottom");
+        assert_eq!(title_lines("Hello"), "Hello");
+        let mut st = titled();
+        assert_eq!(st.verb("retitle One\\nTwo"), Some(Ok(())));
+        assert_eq!(st.timeline.source_by_reel("T1").and_then(|s| s.title.as_deref()), Some("One\nTwo"));
     }
 }

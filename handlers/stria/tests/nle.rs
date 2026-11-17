@@ -4063,3 +4063,85 @@ fn striafreezemore_face_retitle_renders_the_new_text() {
     assert_eq!(text(&face).as_deref(), Some("Hello"));
     println!("striafreezemore: title Hello -> retitle Bye -> undo Hello; a media clip -> no such source");
 }
+
+// ---- STRIAFREEZETHREE (LEDGER SR9029): a title's lines and style through the one raster and the face (named tail block) ----
+
+/// The default-style calls are the one raster's: `title_still` equals `title_card` at the default style, and the cache keys
+/// the style (the same style the same `Arc`, another style another still).
+#[test]
+fn striafreezethree_default_card_is_the_still() {
+    use timeline_core::TitleStyle;
+    let (w, h) = (64, 48);
+    assert!(stria::nle::title_card("Hello", &TitleStyle::DEFAULT, w, h).rgba == stria::nle::title_still("Hello", w, h).rgba);
+    let (_, src) = striatitleclip_timeline(false, "Hello", 2);
+    let x = src.title_still_cached("Hello", w, h);
+    assert!(Arc::ptr_eq(&x, &src.title_card_cached("Hello", &TitleStyle::DEFAULT, w, h)), "the default style is the same still");
+    let big = TitleStyle { size: 20, ..TitleStyle::DEFAULT };
+    assert!(!Arc::ptr_eq(&x, &src.title_card_cached("Hello", &big, w, h)), "another style is another still");
+    println!("striafreezethree: default card == title_still; the cache keys the style");
+}
+
+/// "TOP\nBOTTOM" stacks two lines around the middle: ink above and below the centre row, none on it (capitals: no
+/// descender reaches the interline gap); one line "TOP" is not the two-line card.
+#[test]
+fn striafreezethree_two_lines_stack() {
+    if striatitleclip_no_font() {
+        return;
+    }
+    let (w, h) = (320usize, 160usize);
+    let s = stria::nle::title_card("TOP\nBOTTOM", &timeline_core::TitleStyle::DEFAULT, w as u32, h as u32);
+    let lit = |y: usize| (0..w).filter(|&x| s.rgba[(y * w + x) * 4] > 128).count();
+    let above: usize = (0..h / 2).map(lit).sum();
+    let below: usize = (h / 2 + 1..h).map(lit).sum();
+    assert!(above > 0 && below > 0, "ink above {above} and below {below}");
+    assert_eq!(lit(h / 2), 0, "the centre row is the interline gap");
+    assert!(s.rgba != stria::nle::title_still("TOP", w as u32, h as u32).rgba);
+    println!("striafreezethree: TOP/BOTTOM at 320x160: {above} lit px above the middle, {below} below");
+}
+
+/// Left alignment keeps the ink in the left half; a red ink paints red only (r > g == b) on opaque black.
+#[test]
+fn striafreezethree_align_and_ink() {
+    if striatitleclip_no_font() {
+        return;
+    }
+    use timeline_core::{TitleAlign, TitleStyle};
+    let (w, h) = (320usize, 160usize);
+    let style = TitleStyle { size: 10, align: TitleAlign::Left, ink: [255, 0, 0] };
+    let s = stria::nle::title_card("Hi", &style, w as u32, h as u32);
+    let px = |x: usize, y: usize| &s.rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+    let lit: Vec<(usize, usize)> = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| px(x, y)[0] > 0).collect();
+    assert!(!lit.is_empty(), "the card carries ink");
+    assert!(lit.iter().all(|&(x, _)| x < w / 2), "left aligned: no ink right of the middle");
+    assert!(s.rgba.chunks(4).all(|p| p[3] == 255 && p[1] == p[2] && p[1] <= p[0]), "red on black only");
+    let right = stria::nle::title_card("Hi", &TitleStyle { align: TitleAlign::Right, ..style }, w as u32, h as u32);
+    let rx = (0..w).filter(|&x| (0..h).any(|y| right.rgba[(y * w + x) * 4] > 0)).min();
+    assert!(rx.is_some_and(|x| x > w / 2), "right aligned: the first ink right of the middle ({rx:?})");
+    println!("striafreezethree: left red Hi lit {} px, right Hi first ink at {rx:?}", lit.len());
+}
+
+/// synth_fixture: `title One\nTwo` (typed `\n`) lays a two-line title; `title-style size=20 align=left ink=FFCC00` is one
+/// undo step the document keeps as its TITLESTYLE line; a media clip selected is refused by name.
+#[test]
+fn striafreezethree_face_title_style_and_lines() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(12);
+    assert!(face.verb("title One\\nTwo"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let t1 = |f: &Face| f.state.timeline.source_by_reel("T1").cloned();
+    assert_eq!(t1(&face).and_then(|s| s.title).as_deref(), Some("One\nTwo"));
+    let d = face.state.undo_depth();
+    assert!(face.verb("title-style size=20 align=left ink=FFCC00"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), d + 1);
+    let doc = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(doc.contains("* UNA TITLE T1 \"One\\nTwo\"\n* UNA TITLESTYLE T1 20 left FFCC00\n"), "{doc}");
+    assert!(face.state.undo());
+    assert_eq!(t1(&face).map(|s| s.title_style), Some(timeline_core::TitleStyle::DEFAULT), "one undo restores");
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("title-style size=20"));
+    assert_eq!(face.last_error.take().as_deref(), Some("title-style size=20: no such source"));
+    println!("striafreezethree: title One\\nTwo -> two lines; title-style one step, TITLESTYLE kept; a media clip refused");
+}
