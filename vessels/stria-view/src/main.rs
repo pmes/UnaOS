@@ -15,7 +15,7 @@
 //! stria-view --synth --size 320x160 --do at:12:0,split,delete,undo [--out shot.rgba] [--labels]
 //! ```
 //! `--do`: comma-separated transport verbs (`stria::nle_face::VERBS`), `at:<tick>:<track>` (a click on that track at
-//! that tick) and `ruler:<tick>` (a click on the ruler). NLE2B (SR208), the gestures as a face sends them:
+//! that tick) and `ruler:<tick>` (a click on the ruler); STRIAFREEZEMORE (SR970): `freeze:<len>`, `freeze-all:<len>`, `title:<text>`, `retitle:<text>` (the word, a space, everything after the first `:`). NLE2B (SR208), the gestures as a face sends them:
 //! `press:<x>:<y>` / `move:<x>:<y>` (surface pixels), `release` (at the last pointer: `BrowserButton` up + `BrowserClick`),
 //! `key:<name>` (as GTK sends it: `BrowserKey`, plus `BrowserText` for a one-character key; `key:space` types a space)
 //! and `wheel:<n>` (n notches at the last pointer, n > 0 up = zoom in). The JSON line also carries `playing`, `rate`
@@ -61,7 +61,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, freeze:LEN, freeze-all:LEN, title:TEXT, retitle:TEXT)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -204,7 +204,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| token(face, tok)).or_else(|| word_token(tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAFREEZEMORE (SR970): `freeze:<len>` / `title:<text>` ... (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -906,5 +906,57 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAFREEZEMORE (LEDGER SR970): the witness's word:arg tokens (named tail block) ----
+/// STRIAFREEZEMORE: `freeze:<len>`, `freeze-all:<len>`, `title:<text>`, `retitle:<text>` as the Input word `"<w> <rest>"`, `rest`
+/// everything after the FIRST `:` (so `freeze:00:00:01:00` keeps the timecode's colons); `None` for any other token.
+fn word_token(tok: &str) -> Option<Vec<SMessage>> {
+    let (w, rest) = tok.split_once(':')?;
+    matches!(w, "freeze" | "freeze-all" | "title" | "retitle").then(|| vec![SMessage::Input { target: SURFACE.into(), text: format!("{w} {rest}") }])
+}
+
+#[cfg(test)]
+mod striafreezemore_tests {
+    use super::*;
+
+    /// `freeze:00:00:01:00` lays the same 25-tick hold as `freeze:1` (synth_fixture, 25 fps, playhead 5); `freeze:x` is the
+    /// freeze word's own refusal by name, not a bad token.
+    #[test]
+    fn striafreezemore_freeze_timecode_and_seconds_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "ruler:5").is_empty());
+        let ph = face.state.playhead;
+        let e0 = face.state.timeline.end();
+        let errors = drive(&mut face, "freeze:00:00:01:00");
+        assert!(errors.is_empty(), "{errors:?}");
+        let tc = face.state.timeline.clone();
+        assert_eq!(tc.end(), e0 + 25, "a one-second hold");
+        assert!(drive(&mut face, "undo").is_empty());
+        face.state.seek(ph);
+        assert!(drive(&mut face, "freeze:1").is_empty());
+        assert_eq!(face.state.timeline, tc, "the timecode and the seconds lay the same hold");
+        let errors = drive(&mut face, "freeze:x");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("freeze x: "), "{errors:?}");
+        println!("striafreezemore witness: freeze:00:00:01:00 == freeze:1 (+25 ticks); freeze:x -> {}", errors[0]);
+    }
+
+    /// `title:Hello world` lays T1 "Hello world"; `retitle:Bye: now` retypes it (the colon after the first kept).
+    #[test]
+    fn striafreezemore_title_and_retitle_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let text = |f: &Face| f.state.timeline.source_by_reel("T1").and_then(|s| s.title.clone());
+        let errors = drive(&mut face, "ruler:12,title:Hello world");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(text(&face).as_deref(), Some("Hello world"));
+        let errors = drive(&mut face, "retitle:Bye: now");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(text(&face).as_deref(), Some("Bye: now"));
+        assert_eq!(drive(&mut face, "nope:x"), vec!["bad token nope:x".to_string()]);
+        println!("striafreezemore witness: title:Hello world -> T1, retitle:Bye: now -> {:?}", text(&face));
     }
 }

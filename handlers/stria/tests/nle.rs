@@ -4035,3 +4035,31 @@ fn striafreezemarks_face_export_range_follows() {
     assert_eq!((face.marks(), face.export_range()), ((Some(2), Some(20)), Some(2..20)), "plain freeze leaves the marks");
     println!("striafreezemarks: marks 2..20, freeze-all 1 at 5 -> 2..45, undo -> 2..20, freeze 1 -> 2..20");
 }
+
+// ---- STRIAFREEZEMORE (LEDGER SR970): `retitle` retypes the selected title through the face (named tail block) ----
+
+/// synth_fixture: `title Hello` at 12, then `retitle Bye` retypes T1 in one undo step and the document keeps the new text; one
+/// undo restores "Hello"; a media clip selected is refused by name on the message line.
+#[test]
+fn striafreezemore_face_retitle_renders_the_new_text() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(12);
+    assert!(face.verb("title Hello"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let d = face.state.undo_depth();
+    assert!(face.verb("retitle Bye"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let text = |f: &Face| f.state.timeline.source_by_reel("T1").and_then(|s| s.title.clone());
+    assert_eq!((text(&face).as_deref(), face.state.undo_depth()), (Some("Bye"), d + 1));
+    let doc = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(doc.contains("* UNA TITLE T1 \"Bye\"\n"), "{doc}");
+    assert!(face.state.undo());
+    assert_eq!(text(&face).as_deref(), Some("Hello"), "one undo restores the old text");
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("retitle X"));
+    assert_eq!(face.last_error.take().as_deref(), Some("retitle X: no such source"));
+    assert_eq!(text(&face).as_deref(), Some("Hello"));
+    println!("striafreezemore: title Hello -> retitle Bye -> undo Hello; a media clip -> no such source");
+}
