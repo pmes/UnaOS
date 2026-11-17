@@ -9113,3 +9113,26 @@ fn striaproxybuttons_purge_refusals() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("striaproxybuttons purge refusals: {line}");
 }
+
+// ---- STRIAFREEZEMARKS (LEDGER SR931): the export marks ride `freeze-all` through the face (named tail block) ----
+
+/// synth_fixture (end 35, 25 fps), marks 2..20: `freeze-all 1` at tick 5 moves the out mark by the 25-tick hold, so the export
+/// range still ends on the same picture (2..45); one undo restores 2..20; plain `freeze 1` leaves the marks.
+#[test]
+fn striafreezemarks_face_export_range_follows() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert_eq!(face.state.set_marks((Some(2), Some(20))), Ok(()));
+    face.state.seek(5);
+    assert!(face.verb("freeze-all 1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!((face.marks(), face.export_range()), ((Some(2), Some(45)), Some(2..45)), "the out mark rides the hold");
+    assert_eq!(face.state.undo_depth(), 2, "the marks and the hold: the hold is one step");
+    assert!(face.state.undo());
+    assert_eq!(face.marks(), (Some(2), Some(20)), "one undo restores the marks");
+    assert!(face.verb("freeze 1"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!((face.marks(), face.export_range()), ((Some(2), Some(20)), Some(2..20)), "plain freeze leaves the marks");
+    println!("striafreezemarks: marks 2..20, freeze-all 1 at 5 -> 2..45, undo -> 2..20, freeze 1 -> 2..20");
+}

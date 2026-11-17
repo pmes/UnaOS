@@ -2956,7 +2956,7 @@ impl Timeline {
 // necessary: 258, 512, 65536 are exact, 257 and 500 are not). `freeze_all` is `freeze` and then, on EVERY other track, the same
 // gap opened at the playhead (`ripple_gap`: `place` Insert's room-making without the clip), in ONE value: a refusal on any track
 // (`Rate` off a rated clip's grid, `Transition` for a transition or audio crossfade on a cut at the playhead) refuses the whole
-// op. The export marks do not move (NLE-FREEZE-MARKS owed).
+// op. The export marks at or after the playhead move with `freeze_all` (STRIAFREEZEMARKS SR931); plain `freeze` leaves them.
 impl Timeline {
     /// STRIAFREEZELEN: [`Timeline::freeze`] at tick `t` for `ticks` ticks, and every other track rippled by `ticks` at `t` (the
     /// clip spanning `t` split, every clip from `t` on moved later), so picture and sound stay in sync after the hold. Returns
@@ -2966,7 +2966,7 @@ impl Timeline {
         for k in (0..tl.tracks.len()).filter(|&k| k != track) {
             tl = tl.ripple_gap(k, t, ticks)?;
         }
-        Ok((tl, track))
+        Ok((tl.ripple_marks(t, ticks)?, track)) // STRIAFREEZEMARKS (SR931): the export marks at or after the hold ride the ripple
     }
 
     /// STRIAFREEZELEN: open a gap of `len` ticks at tick `at` on `track`: the clip strictly spanning `at` is split there (a
@@ -3121,5 +3121,77 @@ impl Timeline {
     fn paired_xfades(&self, track: usize) -> usize {
         let n = self.tracks.get(track).map_or(0, |t| t.clips.len());
         (0..n).filter(|&ci| self.audio_crossfade(track, ci).is_some()).count()
+    }
+}
+
+// ---- STRIAFREEZEMARKS (LEDGER SR931): the export marks ride freeze_all's ripple (named tail block) ----
+// `freeze_all` moves EVERY track by the hold's length at the playhead, so each set export mark at or after the playhead
+// (`m >= t`, `place` Insert's own `c.at >= at`) moves by the same length in the same value: the marked range keeps its
+// meaning. A mark before the playhead stays. Plain `freeze` (one track moved) leaves the marks. `set_marks` stays the one
+// gate (the shift keeps in < out and every mark >= 0). `title`'s Insert leaves the marks (NLE-INSERT-MARKS owed).
+impl Timeline {
+    /// STRIAFREEZEMARKS: the timeline with each set mark `m >= at` moved to `m + by` (marks before `at` stay), through
+    /// [`Timeline::set_marks`].
+    fn ripple_marks(&self, at: i64, by: i64) -> Result<Timeline, EditError> {
+        let mv = |m: Option<i64>| m.map(|x| if x >= at { x + by } else { x });
+        self.set_marks((mv(self.marks.0), mv(self.marks.1)))
+    }
+}
+
+#[cfg(test)]
+mod striafreezemarks_tests {
+    extern crate std;
+    use super::*;
+
+    /// V1 and A1 alike: A[0,20)@0 and B[0,10)@30 (end 40), marks `m`.
+    fn fixture(m: (Option<i64>, Option<i64>)) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for k in 0..2 {
+            tl.tracks[k].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 30)];
+        }
+        tl.set_marks(m).unwrap()
+    }
+
+    #[test]
+    fn striafreezemarks_all_moves_marks_at_or_after() {
+        let cases = [
+            ((Some(2), Some(35)), (Some(2), Some(85)), "in before stays, out after moves"),
+            ((Some(10), Some(35)), (Some(60), Some(85)), "both after move"),
+            ((Some(7), Some(35)), (Some(57), Some(85)), "a mark exactly at the playhead moves"),
+            ((Some(2), Some(7)), (Some(2), Some(57)), "an out mark at the playhead moves past the hold"),
+            ((None, Some(12)), (None, Some(62)), "one mark set"),
+            ((Some(3), None), (Some(3), None), "one mark before the playhead"),
+            ((None, None), (None, None), "no marks"),
+        ];
+        for (m, want, why) in cases {
+            let (fr, _) = fixture(m).freeze_all(7, 50).unwrap();
+            assert_eq!(fr.marks, want, "{why}");
+        }
+        std::println!("striafreezemarks: freeze-all at 7 by 50 moves every mark >= 7 by 50");
+    }
+
+    #[test]
+    fn striafreezemarks_plain_freeze_leaves_marks() {
+        let tl = fixture((Some(10), Some(35)));
+        let (fr, _) = tl.freeze(7, 50).unwrap();
+        assert_eq!(fr.marks, (Some(10), Some(35)), "one track moved: the marks stay");
+        assert_eq!(fr.end(), tl.end() + 50);
+    }
+
+    #[test]
+    fn striafreezemarks_one_undo_step() {
+        let tl = fixture((Some(2), Some(35)));
+        let mut st = crate::editor::EditorState::new(tl.clone());
+        st.seek(7);
+        assert_eq!(st.verb("freeze-all 1"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.timeline.marks), (1, (Some(2), Some(60))), "the marks move in the hold's commit");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl, "one undo restores the marks with every track");
+        assert_eq!(st.verb("freeze 1"), Some(Ok(())));
+        assert_eq!(st.timeline.marks, (Some(2), Some(35)), "plain freeze leaves the marks");
     }
 }
