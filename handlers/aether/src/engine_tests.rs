@@ -7482,4 +7482,27 @@ mod tests {
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
+
+    // ---- AETHERFONTRELINVALIDSUPERSEDES (LEDGER SR1055): font_rel records only the length declarations an arm accepted (named tail block) ----
+
+    /// AETHERFONTRELINVALIDSUPERSEDES (SR1055): a child with `width: 2em; width: bogus` follows its font through the
+    /// font-relative replay: 20px under a 10px parent, 40px under a 20px one, as the plain `width: 2em` control does.
+    /// Before: the replay list held `bogus` (not font-relative), so the element left the replay and kept the first pass's
+    /// refused None width: auto, the 400px viewport.
+    #[test]
+    fn font_rel_invalid_replay_follows_font() {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:10px"><div id="b10" style="width:2em;width:bogus">x</div><div id="c10" style="width:2em">x</div></div>
+            <div style="font-size:20px"><div id="b20" style="width:2em;width:bogus">x</div><div id="c20" style="width:2em">x</div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 400));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let w = |e: &mut crate::AetherEngine, id: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().width"));
+        assert_eq!(w(&mut e, "c10"), 20.0, "control: 2em of 10px");
+        assert_eq!(w(&mut e, "c20"), 40.0, "control: 2em of 20px");
+        assert_eq!(w(&mut e, "b10"), 20.0, "2em; bogus: 2em of 10px through the replay (before: 400, auto)");
+        assert_eq!(w(&mut e, "b20"), 40.0, "2em; bogus: 2em of 20px through the replay (before: 400, auto)");
+    }
 }

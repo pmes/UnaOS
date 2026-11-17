@@ -442,12 +442,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         style.animatable.retain(|(p, _)| p != prop);
         style.animatable.push((prop.to_string(), value.to_string()));
     }
-    if is_length_property(prop) {
-        // Kept in cascade order for the font-relative re-resolution.
-        let list = style.paint.font_rel.get_or_insert_with(Vec::new);
-        list.retain(|(p, _)| p != prop);
-        list.push((prop.to_string(), value.to_string()));
-    }
+    let fr = font_rel_record(prop, value, &mut style.paint); // Kept in cascade order for the font-relative re-resolution; a refusing arm undoes it (SR1055).
     let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
@@ -540,12 +535,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     style.row_gap = Some(r);
                     style.column_gap = Some(c);
                 }
-                _ => H::record_css(&format!("gap-value:{}", clip(value))),
+                _ => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("gap-value:{}", clip(value))) }
             }
         }
         "row-gap" | "grid-row-gap" => match parse_length_percentage_str(value, cx) {
             Some(v) => style.row_gap = Some(v),
-            None => H::record_css(&format!("gap-value:{}", clip(value))),
+            None => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("gap-value:{}", clip(value))) }
         },
         "column-gap" | "grid-column-gap" => {
             // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
@@ -556,7 +551,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     style.paint.col_gap = Some(None);
                 }
             }
-            apply_column_gap(value, style, cx);
+            apply_column_gap(value, style, cx); if value != "normal" && parse_length_percentage_str(value, cx).is_none() { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "flex-grow" => match value.parse::<f32>() {
             Ok(v) if v >= 0.0 => style.flex_grow = Some(v),
@@ -568,7 +563,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         "flex-basis" => match parse_flex_basis(value, cx) {
             Some(v) => style.flex_basis = Some(v),
-            None => H::record_css(&format!("flex-basis-value:{}", clip(value))),
+            None => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("flex-basis-value:{}", clip(value))) }
         },
         "flex" => match parse_flex_shorthand(value, cx) {
             Some((g, sh, b)) => {
@@ -576,10 +571,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.flex_shrink = Some(sh);
                 style.flex_basis = Some(b);
             }
-            None => H::record_css(&format!("flex-value:{}", clip(value))),
+            None => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("flex-value:{}", clip(value))) }
         },
         "width" | "min-width" | "max-width" => {
-            let d = parse_dimension_str(value, cx);
+            let d = parse_dimension_str(value, cx); if d.is_none() && !(value.contains('(') && value.contains('%')) { font_rel_undo(&mut style.paint, prop, &fr); }
             let i = match prop { "width" => 0, "min-width" => 1, _ => 2 };
             // css-values-4 §10: a math function mixing % with lengths
             // resolves against the containing block's width — known only
@@ -601,8 +596,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 _ => style.max_width = d,
             }
         }
-        "height" => style.height = parse_dimension_str(value, cx),
-        "max-height" => style.max_height = parse_dimension_str(value, cx),
+        "height" => { style.height = parse_dimension_str(value, cx); if style.height.is_none() { font_rel_undo(&mut style.paint, prop, &fr); } }
+        "max-height" => { style.max_height = parse_dimension_str(value, cx); if style.max_height.is_none() { font_rel_undo(&mut style.paint, prop, &fr); } }
         "table-layout" => match value {
             "fixed" => style.paint.table_fixed = Some(true),
             "auto" => style.paint.table_fixed = Some(false),
@@ -624,9 +619,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "border-spacing" => {
             if let Some(px) = split_top_level(value).first().and_then(|v| parse_px(v, cx)) {
                 style.paint.border_spacing = Some(px.max(0.0));
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
-        "min-height" => style.min_height = parse_dimension_str(value, cx),
+        "min-height" => { style.min_height = parse_dimension_str(value, cx); if style.min_height.is_none() { font_rel_undo(&mut style.paint, prop, &fr); } }
         // overflow hidden/clip/auto/scroll all CLIP paint here (no inner
         // scrollbars yet — clipping is the honest approximation; visible
         // overflow was smearing collapsed menus over the page).
@@ -802,22 +797,22 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "padding" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_str(v, cx)) {
                 style.padding = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => {
             if let Some(v) = parse_length_percentage_str(value, cx) {
                 style.padding[side_index(prop)] = Some(v);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "margin" => {
             if let Some(r) = parse_sides(value, |v| parse_length_percentage_auto_str(v, cx)) {
                 style.margin = [Some(r.top), Some(r.right), Some(r.bottom), Some(r.left)];
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
             if let Some(v) = parse_length_percentage_auto_str(value, cx) {
                 style.margin[side_index(prop)] = Some(v);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "position" => {
             style.paint.position_kind = match value {
@@ -842,7 +837,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "top" | "right" | "bottom" | "left" => {
-            let v = parse_length_percentage_auto_str(value, cx);
+            let v = parse_length_percentage_auto_str(value, cx); if v.is_none() { font_rel_undo(&mut style.paint, prop, &fr); }
             match prop {
                 "top" => style.inset_top = v,
                 "right" => style.inset_right = v,
@@ -873,7 +868,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     set_inset_px(style, i, pick(i), cx);
                 }
             }
-            None => {
+            None => { font_rel_undo(&mut style.paint, prop, &fr);
                 if !is_neutral_keyword(value) {
                     H::record_css(&format!("inset-value:{}", clip(value)));
                 }
@@ -1125,7 +1120,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 "bottom" => Some((7, 0.0)),
                 v if v.ends_with('%') => v.trim_end_matches('%').trim().parse::<f32>().ok().map(|p| (9, p / 100.0)),
                 v => parse_px(v, cx).map(|px| (8, px)),
-            };
+            }; if style.paint.vertical_align.is_none() { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         // `clear` (CSS 2.2 §9.5.2) is consumed only by a generated clearfix box (`layout::generated`);
         // a real element's clearance is still unimplemented, so it stays ledgered.
@@ -1165,7 +1160,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 if px <= -999.0 {
                     style.paint.text_hidden = Some(true);
                 }
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         // text-align is INHERITED: it aligns the inline content of every
         // descendant block, not just this box's own flex children. The
@@ -1557,7 +1552,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             };
             match lh {
                 Some(f) => style.paint.line_height = Some(f),
-                None => H::record_css(&format!("line-height-value:{}", clip(value))),
+                None => { font_rel_undo(&mut style.paint, prop, &fr); H::record_css(&format!("line-height-value:{}", clip(value))) }
             }
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
@@ -1595,7 +1590,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             if got_any {
                 sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v);
                 style.paint.border = Some(sides);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "text-decoration" | "text-decoration-line" => {
             let v = value.trim(); deco_shorthand_color::<H>(prop, v, &mut style.paint);
@@ -1647,7 +1642,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.letter_spacing = Some(0.0);
             } else if let Some(px) = parse_px(value, cx) {
                 style.paint.letter_spacing = Some(px);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "box-sizing" => match value {
             "border-box" => style.box_sizing = Some(taffy::style::BoxSizing::BorderBox),
@@ -1737,7 +1732,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 let mut widths = style.paint.border_width.unwrap_or([None; 4]);
                 widths[side] = Some(w);
                 style.paint.border_width = Some(widths);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         // border-radius: parsed but not rendered (taffy doesn't support it yet).
         // At minimum, stops the property from appearing in unsupported ledgers.
@@ -1754,10 +1749,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     [a, b] => [*a, *b, *a, *b],
                     [a, b, c] => [*a, *b, *c, *b],
                     [a, b, c, d] => [*a, *b, *c, *d],
-                    _ => return,
+                    _ => return font_rel_undo(&mut style.paint, prop, &fr),
                 };
                 style.paint.radius = Some(r);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "border-top-left-radius" | "border-top-right-radius"
         | "border-bottom-right-radius" | "border-bottom-left-radius" => {
@@ -1791,7 +1786,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     ok = false;
                 }
             }
-            if ok {
+            if !ok { font_rel_undo(&mut style.paint, prop, &fr); } if ok {
                 style.paint.outline_style = Some(st);
                 style.paint.outline_width = Some(width);
                 style.paint.outline_color = Some(color);
@@ -1807,7 +1802,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "outline-width" => {
             if let Some(px) = outline_width_value(value, cx) {
                 style.paint.outline_width = Some(px);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "outline-color" => {
             if let Some(c) = outline_color_value::<H>(value) {
@@ -1817,7 +1812,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "outline-offset" => {
             if let Some(px) = parse_px(value, cx) {
                 style.paint.outline_offset = Some(px);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "border" => {
             let v = value.trim();
@@ -1843,7 +1838,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
             if got_any {
                 style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v);
-            } else {
+            } else { font_rel_undo(&mut style.paint, prop, &fr);
                 H::record_css(&format!("border-value:{}", clip(value)));
             }
         }
@@ -1894,7 +1889,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     *side = Some((w, c));
                 }
                 style.paint.border = Some(sides);
-            }
+            } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
         "border-style" => {} // stroke style is uniform; nothing to record
         // css-ui-4 §5.1: `[<url> [<x> <y>]?,]* <keyword>` — images are not loaded, so the fallback
@@ -4025,5 +4020,40 @@ pub fn unicode_bidi_code(value: &str) -> Option<u8> {
         "isolate-override" => Some(4),
         "plaintext" => Some(5),
         _ => None,
+    }
+}
+
+// ---- AETHERFONTRELINVALIDSUPERSEDES (LEDGER SR1055): font_rel records only the length declarations an arm accepted (named tail block) ----
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): what [`font_rel_record`] displaced: `None` when the property is not a length
+/// property, else the earlier entry's index and value (`None` when there was none).
+type FontRelUndo = Option<Option<(usize, String)>>;
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): records `(prop, value)` last in `PaintStyle::font_rel` (cascade order, one entry
+/// per property: the earlier one goes) BEFORE the arm runs, so the css-wide roads and the arms' accepting early returns
+/// stay recorded; returns what [`font_rel_undo`] puts back when the arm refuses the value.
+fn font_rel_record<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> FontRelUndo {
+    if !is_length_property(prop) {
+        return None;
+    }
+    let list = paint.font_rel.get_or_insert_with(Vec::new);
+    let prev = list.iter().position(|(p, _)| p == prop).map(|i| (i, list.remove(i).1));
+    list.retain(|(p, _)| p != prop);
+    list.push((prop.to_string(), value.to_string()));
+    Some(prev)
+}
+
+/// AETHERFONTRELINVALIDSUPERSEDES (SR1055): a length arm's refusal road: the refused value leaves `font_rel` and the entry it
+/// displaced goes back at its original index, so the font-relative replay keeps the last ACCEPTED declaration
+/// (`width: 2em; width: bogus` replays 2em). A neutral keyword ([`is_neutral_keyword`]) stays recorded.
+fn font_rel_undo<H: Host>(paint: &mut PaintStyle<H>, prop: &str, fr: &FontRelUndo) {
+    let (Some(prev), Some(list)) = (fr, paint.font_rel.as_mut()) else { return };
+    let Some(i) = list.iter().rposition(|(p, _)| p == prop) else { return };
+    if is_neutral_keyword(&list[i].1) {
+        return;
+    }
+    list.remove(i);
+    if let Some((at, v)) = prev {
+        list.insert((*at).min(list.len()), (prop.to_string(), v.clone()));
     }
 }
