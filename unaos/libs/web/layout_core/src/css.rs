@@ -1837,7 +1837,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { if split_top_level(value).len() > 1 { return border_color_sides::<H>(value, &mut style.paint); } sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
             // `transparent` (or a fully transparent rgba) is how a page
             // says "keep the box, drop the stroke" — the UA control border
             // must go with it, or every quiet button paints an empty frame.
@@ -5101,4 +5101,34 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
 /// numeric filter. Before SR1075 `thin` / `thick` were dropped and `border-width` took one value.
 fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
     crate::paint::outline_width_keyword(value).or_else(|| parse_px(value, cx))
+}
+
+// ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSIDES (SR1085): css-backgrounds-3 §3.2 `border-color: <color>{1,4}` in the top / right / bottom /
+/// left order. ONE colour keeps the `border-color` arm's own road unchanged; 2-4 colours (before SR1085 dropped whole:
+/// `parse_color_str` reads no multi-token value) expand through [`parse_sides`] (token indices into `split_top_level`)
+/// and each side goes through the `border-<side>-color` arm's two writers, `sys_border_slot` (cleared first, so an
+/// earlier keyword does not block the join; SR1046's one slot keeps the first keyword) and `side_color_of` (a side with
+/// no entry pends, `transparent` drops or forgets the side). `border_alpha` stays ONE frame value: the first
+/// non-transparent token's (AETHER-CSS-BORDER-ALPHA-PER-SIDE owed). Five values or a bad token drop the declaration.
+fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
+    let (toks, n) = (split_top_level(value), core::cell::Cell::new(0usize));
+    let ok = |v: &str| parse_color_str::<H>(v).is_some() || v.eq_ignore_ascii_case("currentcolor") || border_transparent::<H>(v);
+    let Some(r) = parse_sides(value, |v| {
+        let i = n.get();
+        n.set(i + 1);
+        ok(v).then_some(i)
+    }) else {
+        return;
+    };
+    let sides = [toks[r.top], toks[r.right], toks[r.bottom], toks[r.left]];
+    paint.sys_border = None;
+    for (i, tok) in sides.into_iter().enumerate() {
+        sys_border_slot(paint, 1 << i, tok);
+        side_color_of::<H>(i, tok, paint);
+    }
+    if let Some(t) = sides.into_iter().find(|t| !border_transparent::<H>(t)) {
+        paint.border_alpha = Some(color_alpha::<H>(t));
+    }
 }

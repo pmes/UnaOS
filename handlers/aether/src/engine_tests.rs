@@ -9518,4 +9518,39 @@ b</div>
         let (_, _, w, h) = imgalt_rect(&mut e, "tz");
         assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
     }
+
+    // ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORSIDES (SR1085): under a green body ink, `#bs` a 40x20 box with `border: 2px solid;
+    /// border-color: red blue` (top / bottom red, left / right blue; before SR1085 the value was dropped and the frame
+    /// took the ink).
+    fn border_color_sides_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="bs" style="width:40px;height:20px;border:2px solid;border-color:red blue"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORSIDES (SR1085): `border-color: red blue` paints the top and bottom edges red and the left and
+    /// right edges blue; getComputedStyle reads borderLeftColor rgb(0, 0, 255) (border-top-color is no report column:
+    /// AETHER-CSSOM-BORDER-SIDE-COLOR-COLUMNS owed).
+    #[test]
+    fn border_color_sides_paints_two_colours() {
+        let mut e = border_color_sides_engine();
+        let edges = border_side_color_edges(&mut e, "bs");
+        for (i, c) in edges.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!(css_wide_red(*c), "#bs: side {i} is red: {c:?}");
+            } else {
+                assert!(css_wide_blue(*c), "#bs: side {i} is blue: {c:?}");
+            }
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "bs", "borderLeftColor"), "rgb(0, 0, 255)");
+    }
 }
