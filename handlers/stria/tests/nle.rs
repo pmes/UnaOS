@@ -3940,3 +3940,67 @@ fn striaimportimagesequence_readd_forgets_sequence() {
     src.add_sequence(s, &pat).unwrap();
     assert_eq!(timeline_core::SourceIndex::duration(&src, s), Some(1), "the sequence again");
 }
+
+// ---- STRIASEQINFO (LEDGER SR940): a sequence reel's line and its kept frame (named tail block) ----
+// `Sources::summary` names a sequence reel `seq <first>..=<last> <w>x<h>` (the face's reel line, stria-view's `"reel"`), and a
+// sequence reel keeps its last decoded frame (one per reel, keyed by file number) so a repaint of the same tick reads no file.
+
+#[test]
+fn striaseqinfo_summary_names_the_sequence() {
+    let pat = striaimportimagesequence_dir("seqinfo-summary", 16, 8, &[(7, [1, 2, 3]), (8, [4, 5, 6]), (9, [7, 8, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    assert_eq!(src.summary(s).as_deref(), Some("seq 7..=9 16x8"));
+    assert_eq!(src.summary(SourceId(7)), None, "an unknown id says nothing");
+    println!("striaseqinfo: summary=\"seq 7..=9 16x8\"");
+}
+
+#[test]
+fn striaseqinfo_face_reel_line_names_it() {
+    use stria::nle_face::{EditorState, Face, PixelOrder};
+    let pat = striaimportimagesequence_dir("seqinfo-face", 16, 8, &[(7, [1, 2, 3]), (8, [4, 5, 6]), (9, [7, 8, 9])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, false);
+    assert_eq!(face.reel_line(), None, "nothing selected");
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.reel_line().as_deref(), Some("SEQ: seq 7..=9 16x8"));
+    println!("striaseqinfo: face reel_line=\"SEQ: seq 7..=9 16x8\"");
+}
+
+#[test]
+fn striaseqinfo_repaint_reads_no_file() {
+    let cols = [[200, 10, 10], [10, 200, 10], [10, 10, 200]];
+    let pat = striaimportimagesequence_dir("seqinfo-repaint", 4, 4, &[(7, cols[0]), (8, cols[1]), (9, cols[2])]);
+    let (tl, s) = striaimportimagesequence_tl(3);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    let mut first = StriaTitleFrames::default();
+    render(&tl, 1..2, &src, &mut first).unwrap();
+    assert!(first.0[0].3 == striaimportimagesequence_px(4, 4, cols[1]), "tick 1 is file 8");
+    std::fs::remove_file(pat.replace("%04d", "0008")).unwrap();
+    let mut again = StriaTitleFrames::default();
+    render(&tl, 1..2, &src, &mut again).expect("the kept frame: file 8 is not read again");
+    assert!(again.0 == first.0, "the repaint is the same frame");
+    render(&tl, 2..3, &src, &mut StriaTitleFrames::default()).unwrap();
+    let e = render(&tl, 1..2, &src, &mut StriaTitleFrames::default()).unwrap_err().to_string();
+    assert!(e.contains("frame 8 missing"), "one frame kept: file 9 replaced it, so tick 1 reads its file: {e}");
+    println!("striaseqinfo: repaint of tick 1 after removing file 8 -> kept frame; after tick 2 -> {e}");
+}
+
+#[test]
+fn striaseqinfo_readd_forgets_kept_frame() {
+    let pat = striaimportimagesequence_dir("seqinfo-readd", 4, 4, &[(7, [1, 1, 1])]);
+    let (tl, s) = striaimportimagesequence_tl(1);
+    let mut src = Sources::new(&tl);
+    src.add_sequence(s, &pat).unwrap();
+    render(&tl, 0..1, &src, &mut StriaTitleFrames::default()).unwrap();
+    let png = gneiss_pal::dsp::image::encode_rgba(4, 4, &striaimportimagesequence_px(4, 4, [90, 90, 90])).unwrap();
+    std::fs::write(pat.replace("%04d", "0007"), png).unwrap();
+    src.add_sequence(s, &pat).unwrap();
+    let mut got = StriaTitleFrames::default();
+    render(&tl, 0..1, &src, &mut got).unwrap();
+    assert!(got.0[0].3 == striaimportimagesequence_px(4, 4, [90, 90, 90]), "the re-added reel reads the rewritten file");
+}
