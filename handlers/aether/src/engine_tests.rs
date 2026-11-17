@@ -6498,6 +6498,68 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
     }
 
+    // ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor is inherit; outline's currentColor pinned (named tail block) ----
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): one row per probe at 20px serif under a red parent, the rules in a sheet:
+    /// `.a { color: blue }` (`#ca`, the armed twin) and its `.a.b { color: currentcolor }` (`#cb`), a same-block
+    /// `color: blue; color: currentColor` (`#cs`), a link `a.b2 { color: currentcolor }` (`#cl`, past the UA link blue),
+    /// and an empty 40x20 box with `outline: 2px solid currentcolor` (`#co`). Rows 12px apart.
+    fn currentcolor_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .a { color: blue }
+            .a.b { color: currentcolor }
+            a.b2 { color: currentcolor }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><span id="ca" class="a">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><span id="cb" class="a b">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><span id="cs" style="color:blue;color:currentColor">Hello</span></div>
+            <div style="color:rgb(255, 0, 0)"><a id="cl" class="b2" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0);padding:8px"><div id="co" style="width:40px;height:20px;margin:0;outline:2px solid currentcolor"></div></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2: `color: currentcolor` is `inherit`: after `.a { color:
+    /// blue }`, in one block after `color: blue`, and on a link, each paints the red parent's ink (no blue) and cssom
+    /// reads rgb(255, 0, 0); the `.a` twin paints blue (armed).
+    #[test]
+    fn currentcolor_color_is_inherit() {
+        let mut e = currentcolor_engine();
+        assert!(css_wide_color_ink(&mut e, "ca", css_wide_blue) > 3, "#ca paints blue (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "ca", css_wide_red), 0, "#ca paints no red (armed)");
+        for id in ["cb", "cs", "cl"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 3, "#{id} paints the red parent's ink");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(255, 0, 0)", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSCOLORCURRENTCOLOR (SR841): pinned: `outline: 2px solid currentcolor` on an empty box under a red parent
+    /// paints red outline ink around it (outline_color Some(None) -> focusring's `current_color`), no blue.
+    #[test]
+    fn currentcolor_outline_pinned() {
+        let mut e = currentcolor_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "co");
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (((l - 3.0).floor().max(0.0)) as usize, ((l + w + 3.0).ceil() as usize).min(sw));
+        let (y0, y1) = (((t - 3.0).floor().max(0.0)) as usize, ((t + h + 3.0).ceil() as usize).min(sh));
+        let (mut red, mut blue) = (0, 0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = imgalt_px(&e, x, y);
+                red += css_wide_red(c) as usize;
+                blue += css_wide_blue(c) as usize;
+            }
+        }
+        assert!(red > 40, "the outline paints the element's red ({red} px)");
+        assert_eq!(blue, 0, "no blue");
+    }
+
     // ---- AETHERCSSOMFONTFAMILYUSED (LEDGER SR1024): getComputedStyle fontFamily is the specified list, pinned (named tail block) ----
 
     fn cssom_font_family_engine() -> crate::AetherEngine {
