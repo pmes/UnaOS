@@ -679,8 +679,7 @@ fn track_flags(text: &str, tl: &mut Timeline) -> Result<(), EdlError> {
         if w.len() != 1 {
             return Err(EdlError::Syntax { line });
         }
-        let (kind, num) = channel(w[0]).ok_or(EdlError::Syntax { line })?;
-        let ti = (0..tl.tracks.len()).filter(|&t| tl.tracks[t].kind == kind).nth(num - 1).ok_or(EdlError::Syntax { line })?;
+        let ti = tl.track_named(w[0]).ok_or(EdlError::Syntax { line })?; // STRIATRACKGAINTHREE (SR9024): THE named-track lookup
         if seen.contains(&(solo, ti)) {
             return Err(EdlError::Syntax { line });
         }
@@ -769,8 +768,7 @@ fn track_gains(text: &str, tl: &mut Timeline) -> Result<(), EdlError> {
         if w.len() != 2 {
             return Err(EdlError::Syntax { line });
         }
-        let (kind, num) = channel(w[0]).ok_or(EdlError::Syntax { line })?;
-        let ti = (0..tl.tracks.len()).filter(|&t| tl.tracks[t].kind == kind).nth(num - 1).ok_or(EdlError::Syntax { line })?;
+        let ti = tl.track_named(w[0]).ok_or(EdlError::Syntax { line })?; // STRIATRACKGAINTHREE (SR9024): THE named-track lookup
         let cdb: i32 = w[1].parse().map_err(|_| EdlError::Syntax { line })?;
         if seen.contains(&ti) {
             return Err(EdlError::Syntax { line });

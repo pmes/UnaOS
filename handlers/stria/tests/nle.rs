@@ -4028,3 +4028,46 @@ fn striatrackgainkeysnext_face_mute_by_channel() {
     assert_eq!((&face.state.timeline, face.dirty()), (&tl0, false));
     println!("striatrackgainkeysnext face: solo A1 + mute V1 with no selection, two undos restore; mute A9 -> {}", timeline_core::EditError::NoTrack);
 }
+
+// ---- STRIATRACKGAINTHREE (LEDGER SR9024): the face note after mute / solo; the track gain line names the channel's track (named tail block) ----
+/// M3: `mute` / `solo A1` put their success line on the face NOTE (not last_error), message_text reads it; a hover keeps
+/// it, the next taken Input clears it; a refusal stays on last_error and wins over the note.
+#[test]
+fn striatrackgainthree_face_note_mute() {
+    use bandy::SMessage;
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("mute"));
+    assert_eq!((face.last_error.as_deref(), face.note.as_deref()), (None, Some("mute: A1 on")));
+    assert_eq!(face.message_text().as_deref(), Some("mute: A1 on"));
+    assert!(face.verb("solo V1"));
+    assert_eq!(face.note.as_deref(), Some("solo: V1 on"));
+    assert!(face.verb("mute A1"));
+    assert_eq!(face.note.as_deref(), Some("mute: A1 off"));
+    face.on(&SMessage::BrowserMouseMove(1.0, 1.0, 0));
+    assert_eq!(face.note.as_deref(), Some("mute: A1 off"), "a hover keeps the note");
+    face.on(&SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "zoom+".into() });
+    assert_eq!(face.note, None, "the next taken input clears it");
+    face.note = Some("x".into());
+    assert!(face.verb("mute A9"));
+    assert_eq!(face.message_text(), Some(format!("mute A9: {}", timeline_core::EditError::NoTrack)), "an error wins over the note");
+    assert_eq!(face.state.undo_depth(), 3);
+    println!("striatrackgainthree face: mute -> note 'mute: A1 on'; cleared by the next Input; mute A9 on last_error");
+}
+
+/// M3: `track-gain A1 -6` with V1's clip selected sets A1 (one undo step) and its line names A1, not the selection's V1.
+#[test]
+fn striatrackgainthree_face_track_gain_channel() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("track-gain A1 -6"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-gain: A1 -6.0 dB"));
+    assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.timeline.tracks[0].gain_cdb, face.state.undo_depth()), (-600, 0, 1));
+    assert!(face.verb("track-gain- A1"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-gain: A1 -7.0 dB"));
+    assert!(face.verb("track-gain A2 -6"));
+    assert_eq!(face.last_error.take(), Some(format!("track-gain A2 -6: {}", timeline_core::EditError::NoTrack)));
+    println!("striatrackgainthree face: track-gain A1 -6 with V1 selected -> track-gain: A1 -6.0 dB");
+}
