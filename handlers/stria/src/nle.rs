@@ -1007,13 +1007,7 @@ fn cropped(tl: &Timeline, track: Option<usize>, out_t: i64, outgoing: bool, rgba
 /// The RGBA a video step shows when its clip is placed (`Clip::xform`, picture-in-picture): the step's own frame `b`
 /// (`w x h`, uncropped: `cropped` leaves a placed clip's frame alone) with its crop, placed by its reel's policy into the
 /// placement's rect over the lower frame `a` (the schedule's outgoing: the track below, or black) at the step's mix weight,
-/// by timeline_core's ONE `xform_frame`. `None` when the step's clip is not placed (the mix as before).
+/// by timeline_core's `Timeline::place_step` (STRIAKXFORM SR9011: the rule the kernel Player calls too). `None` when the step's clip is not placed (the mix as before).
 fn xformed(tl: &Timeline, s: &timeline_core::schedule::Step, a: &[u8], b: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let (ti, src, m) = (s.track?, s.src?, s.vmix?);
-    let xf = tl.xform_at(ti, s.out_t);
-    if xf == timeline_core::Xform::NONE {
-        return None;
-    }
-    let (top, under) = (b.as_chunks::<4>().0, a.as_chunks::<4>().0);
-    Some(timeline_core::xform_frame(top, under, w as usize, h as usize, tl.crop_at(ti, s.out_t, false), reel_fit(tl, src, false), xf, m.t).into_flattened())
+    Some(tl.place_step(s, a.as_chunks::<4>().0, b.as_chunks::<4>().0, w as usize, h as usize)?.into_flattened()) // STRIAKXFORM (LEDGER SR9011): the one placement rule, lifted into timeline_core
 }

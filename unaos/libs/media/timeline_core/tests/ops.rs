@@ -755,3 +755,72 @@ mod striaxformkeys {
         assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "a point with no event above");
     }
 }
+
+// ---- STRIAKXFORM (LEDGER SR9011): a schedule step's placement, the one rule both faces call (named tail block) ----
+mod striakxform {
+    use timeline_core::schedule::{Frac, Step, VideoMix};
+    use timeline_core::{Clip, Crop, Kind, SizePolicy, SourceId, Timeline, TransitionKind, Xform, xform_frame};
+
+    const W: usize = 8;
+    const H: usize = 4;
+
+    /// V1 holds source A, V2 holds source B placed by `xf`; the step is V2's at tick 5 over A (the schedule's shape for a
+    /// placed clip: STRIAOPACITY's Dissolve `VideoMix` of the track below at the clip's weight `t`).
+    fn two(xf: Xform, t: Frac) -> (Timeline, Step, SourceId) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        let b = tl.add_source("B", 100);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = vec![Clip { xform: xf, ..Clip::new(b, 0, 20, 0) }];
+        tl.validate().unwrap();
+        let s = Step { kind: Kind::Video, track: Some(1), src: Some(b), src_t: 5, out_t: 5, len: 1, seek: None, vmix: Some(VideoMix { kind: TransitionKind::Dissolve, src: Some(a), src_t: 5, seek: None, t }) };
+        (tl, s, b)
+    }
+
+    fn frames() -> (Vec<[u8; 4]>, Vec<[u8; 4]>) {
+        let under: Vec<[u8; 4]> = (0..W * H).map(|i| [i as u8, 10, 20, 255]).collect();
+        let top: Vec<[u8; 4]> = (0..W * H).map(|i| [200, i as u8, 100, 255]).collect();
+        (under, top)
+    }
+
+    #[test]
+    fn striakxform_place_step_is_xform_frame() {
+        let (under, top) = frames();
+        for t in [Frac { num: 100, den: 100 }, Frac { num: 50, den: 100 }] {
+            let (tl, s, _) = two(Xform::PIP, t);
+            let want = xform_frame(&top, &under, W, H, Crop::NONE, SizePolicy::Letterbox, Xform::PIP, t);
+            assert_eq!(tl.place_step(&s, &under, &top, W, H), Some(want), "the step's frame is the one composite at t {:?}", t);
+        }
+        let (mut tl, s, _) = two(Xform::PIP, Frac { num: 1, den: 1 });
+        let crop = Crop { l: 250, t: 0, r: 0, b: 0 };
+        tl.tracks[1].clips[0].crop = crop;
+        let want = xform_frame(&top, &under, W, H, crop, SizePolicy::Letterbox, Xform::PIP, Frac { num: 1, den: 1 });
+        assert_eq!(tl.place_step(&s, &under, &top, W, H), Some(want), "the clip's crop goes inside the rect");
+    }
+
+    #[test]
+    fn striakxform_place_step_none_unplaced() {
+        let (under, top) = frames();
+        let (tl, s, _) = two(Xform::NONE, Frac { num: 1, den: 1 });
+        assert_eq!(tl.place_step(&s, &under, &top, W, H), None, "an unplaced clip mixes as before");
+        let (tl, s, _) = two(Xform::PIP, Frac { num: 1, den: 1 });
+        assert_eq!(tl.place_step(&Step { vmix: None, ..s }, &under, &top, W, H), None, "no mix: no placement");
+        assert_eq!(tl.place_step(&Step { track: None, ..s }, &under, &top, W, H), None, "a gap: no placement");
+        assert_eq!(tl.place_step(&Step { src: None, ..s }, &under, &top, W, H), None, "no source: no placement");
+        assert_eq!(tl.place_step(&Step { out_t: 30, ..s }, &under, &top, W, H), None, "past the clip: no placement");
+    }
+
+    #[test]
+    fn striakxform_place_step_adopt_is_letterbox() {
+        let (under, top) = frames();
+        let (tl, s, b) = two(Xform::PIP, Frac { num: 1, den: 1 });
+        let letterbox = tl.place_step(&s, &under, &top, W, H);
+        let adopt = tl.set_size_policy(b, SizePolicy::Adopt).unwrap();
+        assert_eq!(adopt.place_step(&s, &under, &top, W, H), letterbox, "Adopt places as Letterbox (the host's reel_fit(false))");
+        let stretch = tl.set_size_policy(b, SizePolicy::Stretch).unwrap();
+        let want = xform_frame(&top, &under, W, H, Crop::NONE, SizePolicy::Stretch, Xform::PIP, Frac { num: 1, den: 1 });
+        assert_eq!(stretch.place_step(&s, &under, &top, W, H), Some(want), "the source's own policy");
+    }
+}
