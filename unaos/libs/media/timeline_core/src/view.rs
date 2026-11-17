@@ -336,6 +336,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
             }
+            paint_gain_fades(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip); // STRIACLIPGAINFACE (SR838): the gain line and fade ramps over the body (file tail)
         }
     }
     // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
@@ -1534,5 +1535,130 @@ mod striasnapdrag_tests {
         d.update(&st, to, y);
         assert_eq!(l.tick_at(to), 69, "the raw tick");
         assert_eq!((d.origin_tick + d.delta, d.guide), (70, Some(70)));
+    }
+}
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the gain line and the fade ramps on the clip body (named tail block) ----
+// A clip that carries a gain or a fade shows it on its body: a 1-px gain line on a dB scale (0 dB at mid-height,
+// `GAIN_MAX_CDB` at the top, `GAIN_MIN_CDB` pinned to the bottom, through the meters' ONE dB map [`db_frac`]) and, over
+// the fade columns, a 1-px ramp at the mix's own envelope (`schedule::env_q16`). A unity clip with no fade paints
+// nothing, so every golden and the kernel view pin are unchanged. Painted last in the body arm: over the peaks and the label.
+
+/// STRIACLIPGAINFACE (SR838): the gain line's and the fade ramps' ink.
+pub const GAIN_INK: [u8; 4] = [0xff, 0xf0, 0xa0, 255];
+
+/// The ONE dB map (the meters' strip, lifted from stria `paint_meters`): `db` on a linear scale from `floor_db` (0) to
+/// 0 dB (1), clamped.
+pub fn db_frac(db: f64, floor_db: f64) -> f64 {
+    ((db - floor_db) / -floor_db).clamp(0.0, 1.0)
+}
+
+/// The row of the gain line for `cdb` centi-dB in a body spanning rows `top..=bottom`: 0 dB at mid-height, the top at
+/// `GAIN_MAX_CDB`, the bottom at `GAIN_MIN_CDB` (each half through [`db_frac`]).
+pub fn gain_y(cdb: i32, top: i64, bottom: i64) -> i64 {
+    let mid = (top + bottom) / 2;
+    let db = cdb as f64 / 100.0;
+    let (max_db, min_db) = (crate::GAIN_MAX_CDB as f64 / 100.0, crate::GAIN_MIN_CDB as f64 / 100.0);
+    if cdb >= 0 {
+        mid - (db_frac(db - max_db, -max_db) * (mid - top) as f64 + 0.5) as i64
+    } else {
+        bottom - (db_frac(db, min_db) * (bottom - mid) as f64 + 0.5) as i64
+    }
+}
+
+/// THE gain / fade painter: inside `body` (`x0, y0, x1, y1`, the clip body rect [`paint_in`] filled) the gain line at
+/// [`gain_y`] across the body, and over the columns whose tick lies in the fade-in or the fade-out a ramp at
+/// `env_q16(clip, t)` (bottom = silence, top = full), each column joined to the last by a vertical run. Nothing for a
+/// clip with no gain and no fade, or a body under 2 px.
+pub fn paint_gain_fades(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip) {
+    let (x0, y0, x1, y1) = body;
+    if (clip.gain_cdb == 0 && clip.fade_in <= 0 && clip.fade_out <= 0) || x1 - x0 < 2 || y1 - y0 < 2 {
+        return;
+    }
+    let (top, bottom) = (y0, y1 - 1);
+    let gy = gain_y(clip.gain_cdb, top, bottom);
+    c.rect(x0, gy, x1, gy + 1, GAIN_INK);
+    let (xa, z) = (l.x_of(clip.at), l.zoom.max(1) as i64);
+    let one = crate::schedule::ENV_ONE as i64;
+    let mut prev: Option<i64> = None;
+    for x in x0.max(0)..x1.min(c.w as i64) {
+        let t = clip.at + (x - xa).max(0) / z;
+        if !(t < clip.at + clip.fade_in || t >= clip.end() - clip.fade_out) {
+            prev = None;
+            continue;
+        }
+        let y = bottom - crate::schedule::env_q16(clip, t) as i64 * (bottom - top) / one;
+        let (a, b) = match prev {
+            Some(p) => (p.min(y), p.max(y)),
+            None => (y, y),
+        };
+        c.rect(x, a, x + 1, b + 1, GAIN_INK);
+        prev = Some(y);
+    }
+}
+
+#[cfg(test)]
+mod striaclipgainface_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    /// One audio track, `clip` on it, the tracks band of a 320x56 canvas (body rows 18..54: top 18, bottom 53, mid 35).
+    fn one(clip: Clip) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![clip];
+        let st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    /// The rows of `GAIN_INK` in column `x`.
+    fn ink_rows(px: &[u8], x: i64) -> Vec<i64> {
+        (0..56i64).filter(|&y| px[((y * 320 + x) * 4) as usize..((y * 320 + x) * 4 + 4) as usize] == GAIN_INK).collect()
+    }
+
+    fn a(at: i64) -> Clip {
+        Clip::new(crate::SourceId(0), 0, 20, at)
+    }
+
+    #[test]
+    fn gain_y_and_db_frac_pins() {
+        assert_eq!(db_frac(-30.0, -60.0), 0.5);
+        assert_eq!(db_frac(-90.0, -60.0), 0.0);
+        assert_eq!(db_frac(6.0, -60.0), 1.0);
+        assert_eq!(gain_y(0, 18, 53), 35);
+        assert_eq!(gain_y(2400, 18, 53), 18);
+        assert_eq!(gain_y(-14_400, 18, 53), 53);
+        assert_eq!(gain_y(1200, 18, 53), 26);
+    }
+
+    #[test]
+    fn gain_line_mid_at_unity_higher_at_plus_12_and_none_on_a_plain_clip() {
+        let (st, l) = one(a(0));
+        let plain = paint_in(&st, l, Order::Rgba, None, None);
+        let xm = l.x_of(10);
+        assert!(ink_rows(&plain, xm).is_empty(), "a unity clip with no fade shows no line");
+        let (st, l) = one(a(0).faded(2, 0));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(ink_rows(&px, xm), alloc::vec![35], "0 dB at mid-height");
+        let (st, l) = one(a(0).gained(1200));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let rows = ink_rows(&px, xm);
+        assert_eq!(rows, alloc::vec![26]);
+        assert!(rows[0] < 35, "+12 dB sits higher");
+    }
+
+    #[test]
+    fn fade_in_of_half_the_clip_ramps_through_mid_at_a_quarter() {
+        // +24 dB puts the gain line on the top row, so the ink near mid in the quarter column is the ramp.
+        let (st, l) = one(a(0).gained(2400).faded(10, 0));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let (x0, x1) = (l.x_of(0), l.x_of(20));
+        let q = x0 + (x1 - x0) / 4;
+        let rows = ink_rows(&px, q);
+        assert!(rows.iter().any(|&y| (y - 35).abs() <= 1), "{rows:?}");
+        assert!(ink_rows(&px, x0 + 1).contains(&53), "the ramp starts at the bottom corner");
+        assert_eq!(ink_rows(&px, l.x_of(15)), alloc::vec![18], "past the fade only the line");
     }
 }

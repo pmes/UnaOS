@@ -4001,3 +4001,85 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     println!("striasnapdrag: A@25 dragged 21 px left snaps to the in mark 22; Alt lands at 23");
 }
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the face speaks the NLE4 gain / fades (named tail block) ----
+// `gain-` / `gain+` / `gain [<dB>]` / `fade-in` / `fade-out` on the selected clip through timeline_core's ONE verb dispatch
+// and the one commit; the message line reads the outcome; a refusal names its `EditError` and drops the edit; the EDL's
+// existing `* UNA GAIN` / `* UNA FADE` writer carries the face-edited clip (pinned unchanged).
+
+/// synth_fixture with the audio track's clips replaced by ONE 20-tick clip (A 13..33 at 0), selected.
+fn striaclipgainface_face() -> stria::nle_face::Face {
+    let (mut tl, src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    tl.tracks[1].clips = vec![timeline_core::Clip::new(a, 13, 33, 0)];
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face
+}
+
+#[test]
+fn striaclipgainface_gain_steps_read_on_the_message_line_and_undo() {
+    let mut face = striaclipgainface_face();
+    for _ in 0..3 {
+        assert!(face.verb("gain+"));
+    }
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 300);
+    assert_eq!(face.last_error.take().as_deref(), Some("gain +3.0 dB"));
+    assert_eq!(face.state.undo_depth(), 3);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 200);
+    assert!(face.verb("undo") && face.verb("undo"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0, "undo restores unity");
+    assert!(face.verb("gain-"));
+    assert_eq!(face.last_error.take().as_deref(), Some("gain -1.0 dB"));
+    assert!(face.verb("gain"));
+    assert_eq!(face.last_error.take().as_deref(), Some("gain 0.0 dB"));
+    assert_eq!(stria::nle_face::db_words(-350), "-3.5 dB");
+}
+
+#[test]
+fn striaclipgainface_gain_absolute_and_out_of_range_refused_by_name() {
+    let mut face = striaclipgainface_face();
+    assert!(face.verb("gain -3"));
+    assert_eq!(face.last_error.take().as_deref(), Some("gain -3.0 dB"));
+    let (tl, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    assert!(face.verb("gain -200"));
+    assert_eq!(face.last_error.take(), Some(format!("gain: {}", timeline_core::EditError::Gain)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, depth), "the edit dropped");
+    assert_eq!(face.state.selected().unwrap().gain_cdb, -300);
+    face.state.deselect();
+    assert!(face.verb("gain+"));
+    assert_eq!(face.last_error.take(), Some(format!("gain+: {}", timeline_core::EditError::NoClip)));
+}
+
+#[test]
+fn striaclipgainface_fades_longer_than_the_clip_refused_and_cleared() {
+    let mut face = striaclipgainface_face();
+    assert!(face.verb("fade-in 10"));
+    assert_eq!(face.last_error.take().as_deref(), Some("fade-in 10, fade-out 0"));
+    assert!(face.verb("fade-out 15"));
+    assert_eq!(face.last_error.take(), Some(format!("fade-out: {}", timeline_core::EditError::Fade)));
+    let c = face.state.selected().unwrap();
+    assert_eq!((c.fade_in, c.fade_out), (10, 0), "the clip keeps its fade-in");
+    assert!(face.verb("fade-in 00:00:00:05"));
+    assert_eq!(face.state.selected().unwrap().fade_in, 5);
+    assert!(face.verb("fade-in 0"));
+    assert_eq!(face.state.selected().unwrap().fade_in, 0, "fade-in 0 clears");
+}
+
+#[test]
+fn striaclipgainface_face_edit_round_trips_the_edl_and_every_word_is_a_button() {
+    let mut face = striaclipgainface_face();
+    for v in ["gain+", "gain+", "gain+", "fade-in 10"] {
+        assert!(face.verb(v));
+    }
+    let text = timeline_core::edl::write(&face.state.timeline, "GAIN").unwrap();
+    assert!(text.contains("* UNA GAIN 300\n"), "{text}");
+    assert!(text.contains("* UNA FADE 00:00:00:10 00:00:00:00\n"), "{text}");
+    assert_eq!(timeline_core::edl::parse(&text, 25).unwrap(), face.state.timeline);
+    for w in ["gain-", "gain+", "gain", "fade-in", "fade-out"] {
+        assert!(stria::nle_face::VERBS.contains(&w), "{w}");
+        assert!(face.verb(w), "{w}");
+    }
+    assert_eq!(stria::nle_face::VERBS.last(), Some(&"help"));
+}
