@@ -67,7 +67,7 @@ pub fn is_multicol<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
 /// §3.4: the used (count, width, gap) for a content box `avail` px wide; `font_size` resolves `normal` gaps.
 pub fn used_columns<H: Host>(tree: &LayoutTree<H>, id: NodeId, avail: f32, font_size: f32) -> Option<(u32, f32, f32)> {
     let p = tree.paint_map.get(&id)?;
-    let gap = p.col_gap.unwrap_or(font_size).max(0.0);
+    let gap = p.col_gap.flatten().unwrap_or(font_size).max(0.0); // AETHERCSSALIGNCONTENTFIELD (SR1016): Some(None) = explicit normal
     let count = p.col_count.flatten();
     let width = p.col_width.flatten().map(|w| w.max(0.0));
     let u = avail.max(0.0);

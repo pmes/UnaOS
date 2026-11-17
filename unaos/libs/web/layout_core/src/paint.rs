@@ -198,7 +198,7 @@ pub struct PaintStyle<H: Host> {
     /// `column-rule` longhands (style [`crate::multicol::RULE_NONE`] = none / hidden).
     pub col_count: Option<Option<u32>>,
     pub col_width: Option<Option<f32>>,
-    pub col_gap: Option<f32>,
+    pub col_gap: Option<Option<f32>>, // AETHERCSSALIGNCONTENTFIELD (SR1016): Some(None) = an explicit normal (1em), the col_width shape
     pub col_fill: Option<u8>,
     pub col_rule_width: Option<f32>,
     pub col_rule_style: Option<u8>,

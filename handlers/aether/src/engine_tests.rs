@@ -7011,4 +7011,67 @@ mod tests {
         assert_eq!(css_wide_color_ink(&mut e, "icr", css_wide_red), 0, "background-image: none: no image");
         assert!(css_wide_color_ink(&mut e, "icr", css_wide_green) > 100, "the green colour stays");
     }
+
+    // ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content its own field; column-gap an explicit normal (named tail block) ----
+
+    /// AETHERCSSALIGNCONTENTFIELD (SR1016): wrapping 100 x 200 flex containers, the rules in a sheet. `.sb` two 100 x 20
+    /// lines with `align-content: space-between`, `.sb.r` the same with a later `align-content: initial` (normal =
+    /// stretch: two 100px lines), `.ie` align-items center + align-content flex-end ([a 50x20, b 50x10] then [c 100x20]).
+    fn align_content_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; flex-wrap: wrap; width: 100px; height: 200px; margin: 0 0 10px }
+            .sb { align-content: space-between }
+            .sb.r { align-content: initial }
+            .ie { align-items: center; align-content: flex-end }
+            </style></head><body style="margin:0">
+            <div id="sb" class="f sb"><div id="sb1" style="width:100px;height:20px"></div><div id="sb2" style="width:100px;height:20px"></div></div>
+            <div id="sbr" class="f sb r"><div id="sbr1" style="width:100px;height:20px"></div><div id="sbr2" style="width:100px;height:20px"></div></div>
+            <div id="ie" class="f ie"><div id="iea" style="width:50px;height:20px"></div><div id="ieb" style="width:50px;height:10px"></div><div id="iec" style="width:100px;height:20px"></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 800));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSALIGNCONTENTFIELD (SR1016): space-between puts the second line at the container's bottom (180), a later
+    /// `align-content: initial` gives normal's stretched lines (100), and align-items center beside align-content
+    /// flex-end both apply (160 / 165 / 180): the shared arm wrote align-items for both.
+    #[test]
+    fn align_content_space_between_engine() {
+        let mut e = align_content_engine();
+        let top = |e: &mut crate::AetherEngine, id: &str, c: &str| imgalt_rect(e, id).1 - imgalt_rect(e, c).1;
+        assert!((top(&mut e, "sb1", "sb") - 0.0).abs() <= 0.5, "space-between: the first line at the top");
+        assert!((top(&mut e, "sb2", "sb") - 180.0).abs() <= 0.5, "space-between: the second line at the bottom: {}", top(&mut e, "sb2", "sb"));
+        assert!((top(&mut e, "sbr2", "sbr") - 100.0).abs() <= 0.5, "initial = normal = stretch: {}", top(&mut e, "sbr2", "sbr"));
+        assert!((top(&mut e, "iea", "ie") - 160.0).abs() <= 0.5, "flex-end packs the lines at the bottom: {}", top(&mut e, "iea", "ie"));
+        assert!((top(&mut e, "ieb", "ie") - 165.0).abs() <= 0.5, "align-items center inside its line: {}", top(&mut e, "ieb", "ie"));
+        assert!((top(&mut e, "iec", "ie") - 180.0).abs() <= 0.5, "the second line: {}", top(&mut e, "iec", "ie"));
+    }
+
+    /// AETHERCSSALIGNCONTENTFIELD (SR1016): a two-column 410px div at 20px with red blocks: `column-gap: 40px` leaves
+    /// x 220 in the gutter (185..225, white), a later rule's `column-gap: normal` is 1em (gutter 195..215), so x 220 is
+    /// the second column's red; `initial` the same. Before, normal kept 40px.
+    #[test]
+    fn column_gap_normal_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .mc { width: 410px; column-count: 2; column-gap: 40px; font-size: 20px; margin: 0 0 20px }
+            .mc div { height: 20px; background-color: rgb(255, 0, 0) }
+            .mc.n { column-gap: normal }
+            .mc.i { column-gap: initial }
+            </style></head><body style="margin:0">
+            <div class="mc"><div></div><div></div></div>
+            <div class="mc n"><div></div><div></div></div>
+            <div class="mc i"><div></div><div></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(500, 200));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(imgalt_px(&e, 100, 10), (255, 0, 0), "the first column paints red (armed)");
+        assert_ne!(imgalt_px(&e, 220, 10), (255, 0, 0), "column-gap: 40px: x 220 is gutter (armed)");
+        assert_eq!(imgalt_px(&e, 220, 50), (255, 0, 0), "column-gap: normal after 40px: 1em gutter, x 220 is column two");
+        assert_eq!(imgalt_px(&e, 220, 90), (255, 0, 0), "column-gap: initial after 40px: 1em gutter");
+    }
 }

@@ -75,7 +75,7 @@ pub struct SpecifiedStyle<H: Host> {
     pub inset_right: Option<LengthPercentageAuto>,
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
-    pub align_items: Option<taffy::style::AlignItems>,
+    pub align_items: Option<taffy::style::AlignItems>, pub align_content: Option<taffy::style::AlignContent>, // AETHERCSSALIGNCONTENTFIELD (SR1016): align-content's own field, folded by fold_into on a flex container
     pub align_self: Option<taffy::style::AlignSelf>,
     pub box_sizing: Option<taffy::style::BoxSizing>,
     /// `display: flex` (Some(true)) versus any other display (Some(false)).
@@ -304,7 +304,7 @@ impl<H: Host> SpecifiedStyle<H> {
                 node_style.flex_direction = FlexDirection::Row;
             }
             node_style.flex_wrap = self.flex_wrap.unwrap_or(taffy::style::FlexWrap::NoWrap);
-            node_style.align_items = self.align_items.unwrap_or(taffy::style::AlignItems::NORMAL);
+            node_style.align_items = self.align_items.unwrap_or(taffy::style::AlignItems::NORMAL); node_style.align_content = self.align_content.unwrap_or(taffy::style::AlignContent::NORMAL);
         } else if let Some(w) = self.flex_wrap {
             node_style.flex_wrap = w;
         }
@@ -551,9 +551,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
             if prop == "column-gap" {
                 if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
-                    style.paint.col_gap = Some(px);
+                    style.paint.col_gap = Some(Some(px));
                 } else if value == "normal" {
-                    style.paint.col_gap = None;
+                    style.paint.col_gap = Some(None);
                 }
             }
             apply_column_gap(value, style, cx);
@@ -1462,7 +1462,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-items" | "align-content" => match value {
+        "align-content" => apply_align_content(value, style), "align-items" => match value {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -2733,7 +2733,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
         if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
     }
     take!(display, flex_direction, width, height, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_self,
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_content, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint);
@@ -3701,8 +3701,8 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "flex-flow" => "row nowrap",
         "flex-basis" => "auto",
         "flex" => "0 1 auto",
-        "align-items" | "justify-content" => "normal",
-        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px",
+        "align-items" | "justify-content" | "align-content" => "normal",
+        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px", "column-gap" | "grid-column-gap" => "normal",
         "background-repeat" => "repeat",
         "background-position" => "0% 0%",
         "background-size" => "auto",
@@ -3810,4 +3810,30 @@ fn merge_bg_image_none<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         dst.bg_gradient = Some(None);
         dst.bg_image_none = true;
     }
+}
+
+// ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content writes its own field; column-gap an explicit normal (named tail block) ----
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): css-align-3 §5.4 / css-flexbox-1 §8.4 `align-content` writes
+/// `SpecifiedStyle::align_content`, taffy's own `Style::align_content`, folded on a real flex container by `fold_into`
+/// (normal = taffy's NORMAL, stretch for flex; a single-line container shows no effect). The arm it shared with
+/// `align-items` wrote `align_items` (`align-content: center` centred the items, `space-between` was refused).
+/// `initial` / `unset` arrive here as `normal` through `noninherited_initial`; `inherit` stays neutral
+/// (AETHER-CSS-WIDE-NONINHERITED-INHERIT). The multicol gutter's explicit `normal` is `PaintStyle::col_gap`'s Some(None).
+fn apply_align_content<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
+    use taffy::style::AlignContent as A;
+    style.align_content = Some(match value {
+        "normal" => A::NORMAL,
+        "flex-start" => A::FLEX_START,
+        "start" => A::START,
+        "flex-end" => A::FLEX_END,
+        "end" => A::END,
+        "center" => A::CENTER,
+        "stretch" => A::STRETCH,
+        "space-between" => A::SPACE_BETWEEN,
+        "space-around" => A::SPACE_AROUND,
+        "space-evenly" => A::SPACE_EVENLY,
+        "inherit" | "initial" | "unset" => return,
+        other => return H::record_css(&format!("align-content-value:{}", other)),
+    });
 }
