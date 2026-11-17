@@ -1905,3 +1905,10 @@ exec-rmbp-aetherstickynestedscroller|5b44bcbaa|cut141h
 exec-rmbp-aetherpaintindexnonifctext|5b44bcbaa|cut141h
 exec-rmbp-aethercssomnestedscrollerrects|1243cb17e|cut142h
 exec-rmbp-aetherscrollstatestucknested|1243cb17e|cut142h
+exec-rmbp-aethertextjustify|297df59d0|cut143h
+exec-rmbp-aethertextalignlastpre|297df59d0|cut143h
+exec-rmbp-aetherrtlfloatstart|297df59d0|cut143h
+exec-rmbp-aethercenterautowidth|297df59d0|cut143h
+exec-rmbp-aetherbidiplaintext|297df59d0|cut143h
+exec-rmbp-aetherpaintindexfilterextent|297df59d0|cut143h
+exec-rmbp-aetherscrolldamageunstuckexact|297df59d0|cut143h

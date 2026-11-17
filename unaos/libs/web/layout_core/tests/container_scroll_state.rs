@@ -121,3 +121,70 @@ fn scroll_state_and_standard_style_queries() {
     assert_eq!(box_of(&t2, &doc.by_id("sk")).2, 50.0, "stuck: top");
     assert_eq!(box_of(&t2, &doc.by_id("nk")).2, 800.0, "not scroll-state(stuck) does not apply");
 }
+
+// ---- AETHERSCROLLSTATESTUCKNESTED (LEDGER SR1155): scroll-state(stuck) against the nearest scrollport (named tail block) ----
+
+/// AETHERSCROLLSTATESTUCKNESTED (SR1155): a 300px spacer, then a 200px `overflow-y: auto` panel holding a 30px spacer,
+/// the sticky `top: 0` header `#hn` (20px, a scroll-state container) and 1000px; 800x600. The header holds against the
+/// PANEL's padding box (document y 300), not the viewport: panel offset 0 or 20 leaves it at its flow place (330, 310);
+/// offset 100 holds it (armed: the viewport copy read 0, flow 230 below the viewport's top); a page scroll of 340 with the
+/// panel unscrolled leaves it alone (armed: the viewport copy read `stuck: top`). The second cascade styles from the bit.
+#[test]
+fn scroll_state_stuck_nested_panel() {
+    let sheet = css_core::stylesheet::parse_stylesheet(SHEET);
+    let env = css_core::media::Environment::viewport(800.0, 600.0);
+    let supports = |_: &css_core::parser::Declaration| true;
+    let import = |_: &str| -> Option<&css_core::stylesheet::Stylesheet> { None };
+    let cond = css_core::cascade::Conditions { env: &env, supports: &supports, import: &import };
+    let mut rules = css_core::cascade::RuleSet::new();
+    rules.add_sheet(&sheet, css_core::cascade::Origin::Author, &cond);
+    let doc = page(vec![
+        el("div", &[("style", "height: 300px")], vec![]),
+        el(
+            "div",
+            &[("id", "pn"), ("style", "width: 200px; height: 200px; overflow-y: auto")],
+            vec![
+                el("div", &[("style", "height: 30px")], vec![]),
+                el(
+                    "div",
+                    &[("id", "hn"), ("style", "position: sticky; top: 0px; height: 20px; container-type: scroll-state")],
+                    vec![el("div", &[("id", "skn"), ("class", "sk")], vec![]), el("div", &[("id", "nkn"), ("class", "nk")], vec![])],
+                ),
+                el("div", &[("style", "height: 1000px")], vec![]),
+            ],
+        ),
+    ]);
+    let first = cascade_sheet(&doc, &rules, None, 800.0, 600.0);
+    let mut t1 = lay_styled(&doc, &first, 800.0, 600.0);
+    let (pn, hn) = (id_of(&t1, &doc.by_id("pn")), id_of(&t1, &doc.by_id("hn")));
+    let vp = (800.0, 600.0);
+    assert_eq!(scroll::sticky_scroller(&t1, hn), Some(pn), "the panel is the header's scrollport");
+    assert_eq!(scroll::sticky_stuck(&t1, hn, (0.0, 0.0), vp), 0, "unscrolled: at its flow place");
+    scroll::set_offset(&mut t1, pn, 0.0, 20.0);
+    assert_eq!(scroll::sticky_stuck(&t1, hn, (0.0, 0.0), vp), 0, "panel at 20: flow 310 is still below the panel's top 300");
+    scroll::set_offset(&mut t1, pn, 0.0, 0.0);
+    assert_eq!(scroll::sticky_stuck(&t1, hn, (0.0, 340.0), vp), 0, "a page scroll does not stick a header inside a panel (armed: the viewport copy read TOP)");
+    scroll::set_offset(&mut t1, pn, 0.0, 100.0);
+    let (pl, pt, pr, pb, ..) = scroll::sticky_scrollport(&t1, hn, (0.0, 0.0), vp);
+    assert_eq!((pl, pt, pr, pb), (0.0, 300.0, 200.0, 500.0), "the panel's padding box in document space");
+    assert_eq!(scroll::sticky_stuck(&t1, hn, (0.0, 0.0), vp), TOP, "panel at 100: held at the panel's top (armed: the viewport copy read 0)");
+
+    let vs = (0.0, 0.0);
+    let query = |e: &N, c: &ContainerRule| -> bool {
+        let mut cur = DomNode::parent(e);
+        while let Some(a) = cur {
+            if let Some((tid, _)) = t1.node_map.iter().find(|(_, n)| n.id == a.id) {
+                if t1.paint_map.get(tid).and_then(|p| p.container_scroll) == Some(true) {
+                    let st = scroll::scroll_state(&t1, *tid, vs, vp);
+                    return c.evaluate_full(None, &|_| None, Some(&st)) == Tri::True;
+                }
+            }
+            cur = DomNode::parent(&a);
+        }
+        false
+    };
+    let second = cascade_sheet(&doc, &rules, Some(&query), 800.0, 600.0);
+    let t2 = lay_styled(&doc, &second, 800.0, 600.0);
+    assert_eq!(box_of(&t2, &doc.by_id("skn")).2, 50.0, "stuck: top inside the scrolled panel");
+    assert_ne!(box_of(&t2, &doc.by_id("nkn")).2, 60.0, "not scroll-state(stuck) does not apply");
+}

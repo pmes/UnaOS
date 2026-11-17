@@ -2774,6 +2774,22 @@ fn text_decoration_color_alpha_cascade() {
     assert_eq!((r.paint.decoration_color, r.paint.deco_alpha), (Some(None), None), "the shorthand's reset clears both");
 }
 
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): border_style_word is the exact inverse of border_style_code (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): every paint code round-trips through its keyword, and the 3D styles
+/// (which paint solid) collapse to code 0 and read back `solid`.
+#[test]
+fn border_style_word_round_trip() {
+    use layout_core::css::{border_style_code, border_style_word};
+    for (w, c) in [("solid", 0u8), ("dashed", 1), ("dotted", 2), ("double", 3)] {
+        assert!(border_style_code(w) == Some(c) && border_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["groove", "ridge", "inset", "outset"] {
+        assert_eq!(border_style_code(w).map(border_style_word), Some("solid"), "{w}");
+    }
+    assert_eq!((border_style_code("none"), border_style_code("hidden")), (None, None), "none / hidden clear the side, no code");
+}
+
 // ---- AETHERTEXTALIGNLASTPRE (LEDGER SR1161): css-text-3 §7.2 a preserved newline is a forced break (named tail block) ----
 
 /// AETHERTEXTALIGNLASTPRE (SR1161): one paragraph, then a 16-word one, under `{ws}` at 98px (5px glyphs): pre-wrap
