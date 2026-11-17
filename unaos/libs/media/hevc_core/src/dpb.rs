@@ -440,7 +440,7 @@ impl Dpb {
                     }
                     out.clear();
                     out.resize((cw * ch) as usize, 0);
-                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().map(|(pw, high)| [0, 1].map(|l| crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high))), only.is_some(), &mut out);
+                    conceal_fetch(&s.planes[c], c, cx, cy, cw, ch, &cand, (sub_w, sub_h), bd, s.weights.as_ref().map(|(pw, high)| [0, 1].map(|l| scale_weight(crate::inter::explicit_weight_of(Some(pw), c, l, m.ref_idx[l], bd, *high), if only.is_some() { (1, 1) } else { conceal_poc_pair(s.poc, m.ref_poc[l], pic.poc) }, bd, *high))), only.is_some(), &mut out);
                     let plane = &mut pic.planes[c];
                     for j in 0..ch {
                         for i in 0..cw {
@@ -469,7 +469,7 @@ fn project_lists(m: &crate::picture::PuMotion, s_poc: i32, c_poc: i32) -> [Optio
     let mut cand = [None, None];
     for (l, slot) in cand.iter_mut().enumerate() {
         if m.uses(l) && !m.ref_lt[l] && m.ref_poc[l] != s_poc {
-            *slot = Some(crate::inter::scale_mv(m.mv[l], s_poc - m.ref_poc[l], c_poc - s_poc));
+            *slot = Some({ let (tb, td) = conceal_poc_pair(s_poc, m.ref_poc[l], c_poc); crate::inter::scale_mv(m.mv[l], td, tb) });
         }
     }
     cand
@@ -643,3 +643,85 @@ const CONCEAL_BLOCK_SAMPLES: usize = CONCEAL_BLOCK * CONCEAL_BLOCK;
 /// [`bidir_blocks`] / [`forward_blocks`] count, on every chroma_format_idc; [`CONCEAL_BLOCK_SAMPLES`] is its square, so
 /// the step and the stack buffer cannot drift (a 16x16 block is this one edit: HEVC-CONCEAL-BLOCK-16 owed).
 const CONCEAL_BLOCK: usize = 8;
+
+// ---- HEVCCONCEALWEIGHTEDDISTANCE (LEDGER SR1056): source weights scaled by the POC distance ratio (named tail block) ----
+/// HEVCCONCEALWEIGHTEDDISTANCE (SR1056): the ONE POC pair a concealment candidate is scaled by — (c - s, s - r) for lost
+/// picture `c_poc`, source `s_poc` and the source block's reference `ref_poc`: [`project_lists`] hands it to `scale_mv`
+/// (tb, td) and [`Dpb::conceal_motion`] to [`scale_weight`] (num, den), so the vector and the weights read one ratio.
+fn conceal_poc_pair(s_poc: i32, ref_poc: i32, c_poc: i32) -> (i32, i32) {
+    (c_poc - s_poc, s_poc - ref_poc)
+}
+
+/// HEVCCONCEALWEIGHTEDDISTANCE (SR1056): the source's explicit (w, o, log2WD) (inter.rs `explicit_weight_of`, coded for s
+/// predicted from r) rescaled to the lost picture's distance by the ratio num / den = (c - s) / (s - r) of
+/// [`conceal_poc_pair`]: a fade of constant per-picture gain f has g = w / 2^denom = f^(s - r) (denom = log2WD - shift1,
+/// shift1 = Max(2, 14 - bitDepth)), so the GAIN scales in the log domain, g' = 2^(log2(g) num / den) through
+/// [`log2_q16`] / [`exp2_q16`], w' = g' 2^denom rounded and clamped to 7.4.7.3's weight range [2^denom - 128,
+/// 2^denom + 127] (a non-positive weight is kept: it has no log); the OFFSET (already shifted by WpOffsetBdShift, so the
+/// shift stays exact) scales linearly, o' = o num / den rounded half away from zero, clamped to 7.4.7.3's half range in
+/// that shifted domain [-(half << sh), (half - 1) << sh] (half 1 << (bitDepth - 1) under high_precision_offsets_enabled_flag
+/// `high`, else 128; sh 0 or bitDepth - 8: HEVCWPOFFSETRANGE SR1043's bound; HEVC-WP-HALF-RANGE-ONE owed). log2WD is kept.
+/// num == den and den == 0 return the triple unchanged; the forward road passes (1, 1) (its ratio is always -1 and
+/// `conceal_fetch`'s `inv` already undoes the coded weights at that distance). Chroma rides the same call (c = 1 / 2).
+/// Round trip of the Q16 gain against the true g^r (tests/inter.rs `conceal_weighted_distance_log_error_table`):
+///
+/// | g (Q16)       | r 1/2              | r 2                 | r 3                 |
+/// |---------------|--------------------|---------------------|---------------------|
+/// | 0.5 (32768)   | 46431 (+0.194%)    | 16384 (0)           | 8192 (0)            |
+/// | 0.8 (52429)   | 58530 (-0.149%)    | 41973 (+0.071%)     | 33571 (+0.048%)     |
+/// | 1.25 (81920)  | 73356 (+0.115%)    | 102234 (-0.162%)    | 127932 (-0.053%)    |
+/// | 2 (131072)    | 92862 (+0.194%)    | 262144 (0)          | 524288 (0)          |
+pub fn scale_weight((w, o, lwd): (i32, i32, u32), (num, den): (i32, i32), bd: u32, high: bool) -> (i32, i32, u32) {
+    if num == den || den == 0 {
+        return (w, o, lwd);
+    }
+    let round = |n: i64, d: i64| {
+        let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+        if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) }
+    };
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let base = 1i64 << lwd.saturating_sub(shift1);
+    let w2 = if w > 0 {
+        let x = (((w as i64) << 16) / base) as u32;
+        let g = exp2_q16(round(log2_q16(x) * num as i64, den as i64)) as i64;
+        ((g * base + 32768) >> 16).clamp(base - 128, base + 127) as i32
+    } else {
+        w
+    };
+    let (half, sh) = if high { (1i64 << (bd - 1), 0) } else { (128i64, bd - 8) };
+    let o2 = round(o as i64 * num as i64, den as i64).clamp(-(half << sh), (half - 1) << sh) as i32;
+    (w2, o2, lwd)
+}
+
+/// HEVCCONCEALWEIGHTEDDISTANCE (SR1056): log2 of the Q16 value `x` (65536 = 1.0; 0 read as 1) in Q16, table-free: x =
+/// 2^n m with the mantissa m normalised to [sqrt(1/2), sqrt(2)), then log2 m = (2 / ln 2) atanh(s), s = (m - 1) / (m + 1)
+/// (|s| <= 0.172), to second order in s^2: (2 / ln 2)(s + s^3 / 3); 189098 is 2 / ln 2 in Q16. Error under 2e-4.
+pub fn log2_q16(x: u32) -> i64 {
+    let x = x.max(1) as i64;
+    let mut n = 63 - (x as u64).leading_zeros() as i64;
+    let mut m = if n >= 16 { x >> (n - 16) } else { x << (16 - n) };
+    if m >= 92682 {
+        m >>= 1;
+        n += 1;
+    }
+    let s = ((m - 65536) << 16) / (m + 65536);
+    ((n - 16) << 16) + 189098 * (s + s * s * s / (3i64 << 32)) / 65536
+}
+
+/// HEVCCONCEALWEIGHTEDDISTANCE (SR1056): 2^(y / 65536) in Q16, table-free: y = 65536 i + f with f in [-0.5, 0.5) (Q16),
+/// 2^f by the second-order minimax fit 1 + 0.70297 f + 0.23987 f^2 (46070, 15720 in Q16; relative error under 0.2%),
+/// shifted by i; saturates at u32::MAX, 0 below 2^-31.
+pub fn exp2_q16(y: i64) -> u32 {
+    let i = (y + 32768) >> 16;
+    let f = y - (i << 16);
+    let m = 65536 + (46070 * f + 15720 * f * f / 65536) / 65536;
+    if i >= 16 {
+        u32::MAX
+    } else if i >= 0 {
+        (m << i).min(u32::MAX as i64) as u32
+    } else if i > -32 {
+        (m >> -i) as u32
+    } else {
+        0
+    }
+}
