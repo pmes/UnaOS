@@ -459,6 +459,44 @@ fn curr_entries(h: &SliceHeader, sps: &Sps) -> Result<[Vec<bool>; 2]> {
 /// outside -WpOffsetHalfRangeY..WpOffsetHalfRangeY - 1 and delta_chroma_offset_lX outside -4 * WpOffsetHalfRangeC ..
 /// 4 * WpOffsetHalfRangeC - 1 (7.4.7.3).
 fn wp_half_ranges(sps: &Sps) -> (i32, i32) {
-    let half = |bd: u32| 1i32 << if sps.range_ext.high_precision_offsets_enabled_flag { bd - 1 } else { 7 };
+    let half = |bd: u32| wp_half_range(bd, sps.range_ext.high_precision_offsets_enabled_flag);
     (half(sps.bit_depth_luma), half(sps.bit_depth_chroma))
+}
+
+// ---- HEVCWPHALFRANGEONE (LEDGER SR1081): the ONE weighted-prediction offset half range (named tail block) ----
+
+/// HEVCWPHALFRANGEONE (SR1081): WpOffsetHalfRangeY / WpOffsetHalfRangeC of 7.4.3.2.2 for a plane of bit depth `bd`:
+/// 1 << (bd - 1) under high_precision_offsets_enabled_flag `high`, else 1 << 7 = 128 whatever the depth. The ONE rule
+/// 7.4.7.3's offset ranges and 7-56's chroma offset share: read by `wp_half_ranges` (pred_weight_list's refusals),
+/// inter.rs `explicit_weight_of` (7-56) and dpb.rs `scale_weight` (the concealment offset clamp).
+pub(crate) fn wp_half_range(bd: u32, high: bool) -> i32 {
+    if high { 1 << (bd - 1) } else { 1 << 7 }
+}
+
+#[cfg(test)]
+mod hevcwphalfrangeone_tests {
+    use super::{wp_half_range, wp_half_ranges};
+    use crate::ps::Sps;
+
+    /// 7.4.3.2.2: 128 without the flag at any depth; 1 << (bd - 1) with it.
+    #[test]
+    fn wp_half_range_values() {
+        assert_eq!(wp_half_range(8, false), 128);
+        assert_eq!(wp_half_range(10, false), 128);
+        assert_eq!(wp_half_range(8, true), 128);
+        assert_eq!(wp_half_range(10, true), 512);
+        assert_eq!(wp_half_range(12, true), 2048);
+        assert_eq!(wp_half_range(16, true), 32768);
+    }
+
+    /// SR1043's per-plane pair is the ONE rule applied to the SPS's luma and chroma depths, flag off and on.
+    #[test]
+    fn wp_half_range_is_wp_half_ranges() {
+        for (flag, want) in [(false, 128), (true, 512)] {
+            let mut sps = Sps { bit_depth_luma: 10, bit_depth_chroma: 10, ..Default::default() };
+            sps.range_ext.high_precision_offsets_enabled_flag = flag;
+            assert_eq!(wp_half_ranges(&sps), (wp_half_range(10, flag), wp_half_range(10, flag)), "flag {flag}");
+            assert_eq!(wp_half_ranges(&sps), (want, want), "flag {flag}");
+        }
+    }
 }

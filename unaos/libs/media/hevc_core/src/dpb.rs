@@ -661,7 +661,7 @@ fn conceal_poc_pair(s_poc: i32, ref_poc: i32, c_poc: i32) -> (i32, i32) {
 /// 2^denom + 127] (a non-positive weight is kept: it has no log); the OFFSET (already shifted by WpOffsetBdShift, so the
 /// shift stays exact) scales linearly, o' = o num / den rounded half away from zero, clamped to 7.4.7.3's half range in
 /// that shifted domain [-(half << sh), (half - 1) << sh] (half 1 << (bitDepth - 1) under high_precision_offsets_enabled_flag
-/// `high`, else 128; sh 0 or bitDepth - 8: HEVCWPOFFSETRANGE SR1043's bound; HEVC-WP-HALF-RANGE-ONE owed). log2WD is kept.
+/// `high`, else 128; sh 0 or bitDepth - 8: HEVCWPOFFSETRANGE SR1043's bound; the rule is slice.rs `wp_half_range`, HEVCWPHALFRANGEONE SR1081). log2WD is kept.
 /// num == den and den == 0 return the triple unchanged; the forward road passes (1, 1) (its ratio is always -1 and
 /// `conceal_fetch`'s `inv` already undoes the coded weights at that distance). Chroma rides the same call (c = 1 / 2).
 /// Round trip of the Q16 gain against the true g^r (tests/inter.rs `conceal_weighted_distance_log_error_table`):
@@ -689,7 +689,7 @@ pub fn scale_weight((w, o, lwd): (i32, i32, u32), (num, den): (i32, i32), bd: u3
     } else {
         w
     };
-    let (half, sh) = if high { (1i64 << (bd - 1), 0) } else { (128i64, bd - 8) };
+    let (half, sh) = (crate::slice::wp_half_range(bd, high) as i64, if high { 0 } else { bd - 8 });
     let o2 = round(o as i64 * num as i64, den as i64).clamp(-(half << sh), (half - 1) << sh) as i32;
     (w2, o2, lwd)
 }

@@ -652,7 +652,7 @@ pub(crate) fn explicit_weight_of(pw: Option<&crate::slice::PredWeights>, c: usiz
     } else {
         let d = pw.chroma_log2_weight_denom;
         let (w, delta) = wl.chroma.get(r).map(|e| e[c - 1]).unwrap_or((1 << d, 0));
-        let half = if high { 1i32 << (bd - 1) } else { 128 };
+        let half = crate::slice::wp_half_range(bd, high);
         let o = (half + delta - ((half * w) >> d)).clamp(-half, half - 1);
         (w, o << off_shift, d + shift1)
     }
