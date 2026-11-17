@@ -194,7 +194,7 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
-    pub scan: NormalizeScan, // STRIANORMALIZETHREE (SR9035): the normalize scan (synchronous, or off the face's thread under `serve`; file tail)
+    pub scan: NormalizeScan, pub note: Option<String>, // STRIANORMALIZELUFS (SR9054): a success line on the message row, read after last_error, cleared by the next acting input (file tail); STRIANORMALIZETHREE (SR9035): the normalize scan (synchronous, or off the face's thread under `serve`; file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
 }
 
@@ -202,7 +202,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, loudness: None, peaks: WavePeaks::default(), scan: NormalizeScan::default() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, loudness: None, peaks: WavePeaks::default(), scan: NormalizeScan::default(), note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -210,7 +210,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -237,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.normalize_lufs_verb(v) { return r; } if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2362,7 +2362,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3401,7 +3401,7 @@ struct NormalizeJob {
     clip: Clip,
     target: i32,
     os: u32,
-    handle: std::thread::JoinHandle<Result<Option<f32>, String>>,
+    handle: std::thread::JoinHandle<Result<Option<NormalizeRead>, String>>, // STRIANORMALIZELUFS (SR9054): a peak or a loudness reading (file tail)
 }
 
 impl Face {
@@ -3416,7 +3416,7 @@ impl Face {
         }
         let index = self.state.selection.map_or(0, |(_, i)| i);
         let sources = self.sources.clone();
-        let handle = std::thread::spawn(move || crate::nle::peak_mix(&sources, c.src, ns, os).map_err(|e| e.to_string()));
+        let handle = std::thread::spawn(move || crate::nle::peak_mix(&sources, c.src, ns, os).map(|p| p.map(NormalizeRead::Peak)).map_err(|e| e.to_string())); // STRIANORMALIZELUFS (SR9054): the peak as a NormalizeRead (file tail)
         self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, handle });
         Ok(None)
     }
@@ -3444,11 +3444,126 @@ impl Face {
             Err(e) => Err(e),
             Ok(None) => Err("no audio".to_string()),
             Ok(Some(_)) if !stands => Err("the selection moved".to_string()),
-            Ok(Some(peak)) => self.normalize_finish(peak, j.target, j.os),
+            Ok(Some(NormalizeRead::Peak(peak))) => self.normalize_finish(peak, j.target, j.os), Ok(Some(NormalizeRead::Lufs(l))) => { let r = self.normalize_lufs_finish(l, j.target); return self.normalize_lufs_say(r); } // STRIANORMALIZELUFS (SR9054): a loudness reading sets the gain through its own finish (file tail)
         };
         self.last_error = Some(match r {
             Ok(line) | Err(line) => format!("normalize: {line}"),
         });
         true
+    }
+}
+
+// ---- STRIANORMALIZELUFS (LEDGER SR9054): `normalize lufs [<LUFS>]` — the clip's gain from its loudness, bounded by its true peak (named tail block) ----
+// `normalize lufs [<LUFS>]` (default -23, EBU R128) measures the selected audio clip ALONE at unity (nle.rs
+// `loudness_clip`: SR995's one measure body over a one-clip render) and sets its gain so the integrated loudness lands
+// on the target, bounded so the true peak never passes `NORMALIZE_TP_CEILING_CDB` (-1 dBTP, R128's maximum): both
+// readings move one-for-one with the gain (BS.1770's relative gate is scale-free; only the -70 LUFS absolute gate is
+// not). The gain goes through SR838's one road (`set_selected_gain`: validate, one commit, one undo step), the scan
+// through SR9035's (`scan.thread`: off the face's thread under `serve`, joined by `normalize_tick`). The success line is
+// the face note (`Face.note`, read by `message_text` after `last_error`); `measuring` and every refusal ride
+// `last_error` as SR878's lines do. A host-face word: the kernel Player never sees it (the gain is the `* UNA GAIN` it reads).
+
+/// STRIANORMALIZELUFS (SR9054): the target when the word names none, centi-LU (-23 LUFS, EBU R128).
+pub const NORMALIZE_LUFS_TARGET_CDB: i32 = -2300;
+
+/// STRIANORMALIZELUFS (SR9054): the true-peak ceiling the gain never passes, centi-dB (-1 dBTP, EBU R128's maximum).
+pub const NORMALIZE_TP_CEILING_CDB: i32 = -100;
+
+/// STRIANORMALIZELUFS (SR9054): what one normalize scan read: SR9035's peak, or one clip's loudness reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NormalizeRead {
+    Peak(f32),
+    Lufs(crate::nle::LoudnessReading),
+}
+
+/// STRIANORMALIZELUFS (SR9054): the gain (centi-dB) that brings reading `r` to `target_cdb` LUFS, rounded DOWN, and
+/// bounded (rounded down) so the true peak stays at or under [`NORMALIZE_TP_CEILING_CDB`]; the flag is true when that
+/// ceiling set the gain. `None` for a silent clip (integrated not finite or at the meter's -70 LUFS floor).
+pub fn normalize_lufs_gain_cdb(r: &crate::nle::LoudnessReading, target_cdb: i32) -> Option<(i32, bool)> {
+    if !(r.lufs.is_finite() && r.lufs > gneiss_pal::dsp::audio::meter::LUFS_FLOOR) {
+        return None;
+    }
+    let by_l = (target_cdb as f64 - 100.0 * r.lufs).floor();
+    let by_tp = if r.true_peak_db.is_finite() { (NORMALIZE_TP_CEILING_CDB as f64 - 100.0 * r.true_peak_db).floor() } else { by_l };
+    Some((by_l.min(by_tp) as i32, by_tp < by_l))
+}
+
+impl Face {
+    /// The `normalize lufs [<LUFS>]` word; `None` for any other word (SR878's `normalize_verb` keeps the rest).
+    fn normalize_lufs_verb(&mut self, v: &str) -> Option<bool> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|w| *w == "normalize")?;
+        w.next().filter(|w| *w == "lufs")?;
+        let (arg, extra) = (w.next(), w.next());
+        let r = self.normalize_lufs(arg, extra);
+        Some(self.normalize_lufs_say(r))
+    }
+    /// The rule behind [`Face::normalize_lufs_verb`]: `Ok` the success line (or `measuring` for a served face's scan,
+    /// `Err` with that word so it rides `last_error`), `Err` a refusal (the timeline unmoved).
+    fn normalize_lufs(&mut self, arg: Option<&str>, extra: Option<&str>) -> Result<String, String> {
+        if let Some(x) = extra {
+            return Err(format!("{x} is not a LUFS level"));
+        }
+        let target = match arg {
+            None => NORMALIZE_LUFS_TARGET_CDB,
+            Some(a) => timeline_core::editor::cdb_of(a).ok_or_else(|| format!("{a} is not a LUFS level"))?,
+        };
+        if target > 0 {
+            return Err("target above 0 LUFS".to_string());
+        }
+        let (track, index) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?;
+        let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
+        if self.state.timeline.tracks.get(track).map(|t| t.kind) != Some(Kind::Audio) {
+            return Err("not an audio clip".to_string());
+        }
+        if !self.scan.thread {
+            let r = crate::nle::loudness_clip(&self.state.timeline, track, index, &self.sources, None).map_err(|e| e.to_string())?.ok_or_else(|| "no audio".to_string())?;
+            return self.normalize_lufs_finish(r, target);
+        }
+        if self.scan.job.is_some() {
+            return Err("busy".to_string());
+        }
+        let (tl, sources) = (self.state.timeline.clone(), self.sources.clone());
+        let handle = std::thread::spawn(move || crate::nle::loudness_clip(&tl, track, index, &sources, None).map(|r| r.map(NormalizeRead::Lufs)).map_err(|e| e.to_string()));
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os: 0, handle });
+        Err(NORMALIZE_SCANNING.to_string())
+    }
+    /// The gain from a loudness reading `r` set through SR838's one road, and its line: `lufs <l> LUFS, true peak <t>
+    /// dBTP -> gain <g>`, ` (true-peak bound)` when the ceiling set it.
+    fn normalize_lufs_finish(&mut self, r: crate::nle::LoudnessReading, target: i32) -> Result<String, String> {
+        let (cdb, bound) = normalize_lufs_gain_cdb(&r, target).ok_or_else(|| "silent clip".to_string())?;
+        self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
+        Ok(format!("lufs {:.1} LUFS, true peak {:.1} dBTP -> gain {}{}", r.lufs, r.true_peak_db, db_words(cdb), if bound { " (true-peak bound)" } else { "" }))
+    }
+    /// A normalize-lufs outcome on the message row: success the face note (any standing error cleared), else
+    /// `last_error`; each prefixed `normalize: `. True (repaint).
+    fn normalize_lufs_say(&mut self, r: Result<String, String>) -> bool {
+        match r {
+            Ok(line) => {
+                self.last_error = None;
+                self.note = Some(format!("normalize: {line}"));
+            }
+            Err(line) => self.last_error = Some(format!("normalize: {line}")),
+        }
+        true
+    }
+}
+
+// The face note (the settled SR990 shape; this branch had none): `Face.note` is read by `message_text` after
+// `last_error` (an error wins) and before the export line and the reel line; it stands across repaints until the next
+// acting input clears it.
+impl Face {
+    /// Clear the note on an acting input: a typed word, a click, a press, select-all, a named key, a one-char text
+    /// key. A move, a release, the wheel, a zoom and a resize keep it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let acts = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() > 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if acts {
+            self.note = None;
+        }
     }
 }

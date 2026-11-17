@@ -4398,3 +4398,158 @@ fn strianormalizethree_scan_refuses_a_moved_selection() {
     assert_eq!(face.last_error.take(), Some("normalize: the selection moved".to_string()));
     assert_eq!(face.state.timeline, tl, "the timeline unmoved");
 }
+
+// ---- STRIANORMALIZELUFS (LEDGER SR9054): `normalize lufs` — the clip's gain from its loudness, bounded by its true peak (named tail block) ----
+
+/// STRIANORMALIZELUFS (SR9054): the selected clip (track 1, index 0) of `face` measured alone at unity.
+fn strianormalizelufs_reading(face: &stria::nle_face::Face) -> stria::nle::LoudnessReading {
+    stria::nle::loudness_clip(&face.state.timeline, 1, 0, &stria::nle_face::synth_fixture().1, None).unwrap().expect("source A has audio")
+}
+
+/// STRIANORMALIZELUFS (SR9054): the integrated loudness of `face`'s selected clip alone at the gain it now carries.
+fn strianormalizelufs_gained_lufs(face: &stria::nle_face::Face) -> stria::nle::LoudnessReading {
+    let (mut alone, range) = stria::nle::clip_alone(&face.state.timeline, 1, 0).unwrap();
+    alone.tracks[1].clips[0].gain_cdb = face.state.selected().unwrap().gain_cdb;
+    stria::nle::loudness_reading(&alone, range, &stria::nle_face::synth_fixture().1, None).unwrap().unwrap()
+}
+
+/// Rule: `normalize lufs <t>` (a target the true peak does not bound) sets the gain so the clip alone reads `t` LUFS
+/// (rounded down, within 0.1 LU), one undo step, the line on the note naming both readings; the same word again commits
+/// nothing; `undo` restores unity.
+#[test]
+fn strianormalizelufs_sets_gain_to_the_target_in_one_undo_step() {
+    let (mut face, _) = strianormalize_face();
+    let r = strianormalizelufs_reading(&face);
+    let target = ((r.lufs - 6.0) * 100.0).round() as i32;
+    let (want, bound) = stria::nle_face::normalize_lufs_gain_cdb(&r, target).unwrap();
+    assert!(!bound, "6 dB down is not true-peak bound");
+    let depth = face.state.undo_depth();
+    let word = format!("normalize lufs {:.2}", target as f64 / 100.0);
+    assert!(face.verb(&word));
+    assert_eq!(face.last_error, None, "a success is not an error");
+    assert_eq!(face.state.selected().unwrap().gain_cdb, want);
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    let line = format!("normalize: lufs {:.1} LUFS, true peak {:.1} dBTP -> gain {}", r.lufs, r.true_peak_db, stria::nle_face::db_words(want));
+    assert_eq!(face.note, Some(line.clone()));
+    assert_eq!(face.message_text(), Some(line.clone()), "the note is the message line");
+    let got = strianormalizelufs_gained_lufs(&face).lufs;
+    assert!((got - target as f64 / 100.0).abs() < 0.1, "{got} LUFS for a {target} cLU target");
+    assert!(got <= target as f64 / 100.0 + 0.01, "never above the target");
+    assert!(face.verb(&word));
+    assert_eq!(face.state.undo_depth(), depth + 1, "the same gain commits nothing");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0);
+    println!("strianormalizelufs: {:.2} LUFS -> {got:.2} LUFS at gain {want} cdB, line \"{line}\"", r.lufs);
+}
+
+/// Rule: a target the true peak cannot reach (0 LUFS) is bounded so the true peak lands at or under -1 dBTP, and the
+/// line says so; the bare word's target is -23 LUFS.
+#[test]
+fn strianormalizelufs_true_peak_bound_and_default_target() {
+    let (mut face, _) = strianormalize_face();
+    let r = strianormalizelufs_reading(&face);
+    let (want, bound) = stria::nle_face::normalize_lufs_gain_cdb(&r, 0).unwrap();
+    assert!(bound, "0 LUFS is bounded by the true peak: {r:?}");
+    assert!(face.verb("normalize lufs 0"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, want);
+    assert!(face.note.as_deref().is_some_and(|n| n.ends_with(" (true-peak bound)")), "{:?}", face.note);
+    assert!(r.true_peak_db + want as f64 / 100.0 <= -1.0 + 1e-9, "the true peak stays under the ceiling");
+    let tp = strianormalizelufs_gained_lufs(&face).true_peak_db;
+    assert!(tp <= -1.0 + 0.05, "{tp} dBTP after the gain");
+    let (mut face, _) = strianormalize_face();
+    assert!(face.verb("normalize lufs"));
+    let want = stria::nle_face::normalize_lufs_gain_cdb(&r, stria::nle_face::NORMALIZE_LUFS_TARGET_CDB).unwrap().0;
+    assert_eq!(face.state.selected().unwrap().gain_cdb, want);
+    assert_eq!(stria::nle_face::NORMALIZE_LUFS_TARGET_CDB, -2300);
+    println!("strianormalizelufs: 0 LUFS bound at gain {want} cdB, true peak after {tp:.2} dBTP");
+}
+
+/// Rule: every refusal is named on `last_error` and leaves the timeline, the undo depth and the note; the bare
+/// `normalize` is still SR878's peak word.
+#[test]
+fn strianormalizelufs_refusals_by_name() {
+    let (mut face, _) = strianormalize_face();
+    let (tl, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    for (word, want) in [
+        ("normalize lufs loud", "normalize: loud is not a LUFS level"),
+        ("normalize lufs -23 more", "normalize: more is not a LUFS level"),
+        ("normalize lufs 1", "normalize: target above 0 LUFS"),
+    ] {
+        assert!(face.verb(word), "{word}");
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{word}");
+    }
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("normalize lufs"));
+    assert_eq!(face.last_error.take().as_deref(), Some("normalize: not an audio clip"));
+    face.state.deselect();
+    assert!(face.verb("normalize lufs -16"));
+    assert_eq!(face.last_error.take(), Some(format!("normalize: {}", timeline_core::EditError::NoClip)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth(), &face.note), (&tl, depth, &None));
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("normalize"));
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("normalize: peak ")), "the bare word is SR878's");
+}
+
+/// Rule: `clip_alone` keeps only the one clip, at unity, its marks cleared; `loudness_clip` is `loudness_reading` over it,
+/// whatever the clip's own gain or its neighbours.
+#[test]
+fn strianormalizelufs_clip_alone_is_the_clip_at_unity() {
+    let (mut face, a) = strianormalize_face();
+    let lone = strianormalizelufs_reading(&face);
+    let mut tl = face.state.timeline.clone();
+    tl.tracks[1].clips = vec![timeline_core::Clip::new(a, 13, 33, 0).gained(-600), timeline_core::Clip::new(a, 0, 20, 30)];
+    tl.marks = (Some(2), Some(9));
+    let (alone, range) = stria::nle::clip_alone(&tl, 1, 0).unwrap();
+    assert_eq!(range, 0..20);
+    assert_eq!(alone.tracks[1].clips, vec![timeline_core::Clip::new(a, 13, 33, 0)]);
+    assert!(alone.tracks.iter().enumerate().all(|(i, t)| i == 1 || t.clips.is_empty()));
+    assert_eq!((alone.marks, alone.audio_xfades.len()), ((None, None), 0));
+    assert_eq!(stria::nle::clip_alone(&tl, 1, 2), None);
+    face.state = stria::nle_face::EditorState::new(tl.clone());
+    face.state.select(1, 0).unwrap();
+    let again = strianormalizelufs_reading(&face);
+    assert_eq!((again.lufs, again.true_peak_db), (lone.lufs, lone.true_peak_db), "the clip's own gain and its neighbour are not measured");
+    println!("strianormalizelufs: alone {lone:?}");
+}
+
+/// Rule: a served face (`scan.thread`) answers `measuring`, refuses a second word as `busy`, and its tick sets the
+/// synchronous gain with the synchronous line on the note in one undo step; a moved selection sets nothing.
+#[test]
+fn strianormalizelufs_scan_runs_off_the_face_thread() {
+    let (mut sync, _) = strianormalize_face();
+    assert!(sync.verb("normalize lufs -20"));
+    let (want_gain, want_note) = (sync.state.selected().unwrap().gain_cdb, sync.note.clone());
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    let depth = face.state.undo_depth();
+    assert!(face.verb("normalize lufs -20"));
+    assert_eq!(face.last_error.take(), Some(format!("normalize: {}", stria::nle_face::NORMALIZE_SCANNING)));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0, "the gain waits for the scan");
+    assert!(face.verb("normalize lufs -20"));
+    assert_eq!(face.last_error.take(), Some("normalize: busy".to_string()));
+    strianormalizethree_wait(&mut face);
+    assert_eq!((face.state.selected().unwrap().gain_cdb, face.note.clone(), face.last_error.clone()), (want_gain, want_note, None));
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    assert!(face.verb("normalize lufs -20"));
+    face.state.select(0, 0).unwrap();
+    let tl = face.state.timeline.clone();
+    strianormalizethree_wait(&mut face);
+    assert_eq!(face.last_error.take(), Some("normalize: the selection moved".to_string()));
+    assert_eq!(face.state.timeline, tl, "the timeline unmoved");
+}
+
+/// Rule: the pure gain: silence refuses, the lower of the loudness and true-peak gains wins (floored), an unknown true
+/// peak leaves the loudness gain.
+#[test]
+fn strianormalizelufs_gain_rule() {
+    let r = |lufs: f64, tp: f64| stria::nle::LoudnessReading { lufs, range_lu: 0.0, true_peak_db: tp };
+    let g = stria::nle_face::normalize_lufs_gain_cdb;
+    assert_eq!(g(&r(-70.0, -60.0), -2300), None, "at the gate's floor");
+    assert_eq!(g(&r(f64::NAN, -60.0), -2300), None);
+    assert_eq!(g(&r(-30.0, -20.0), -2300), Some((700, false)));
+    assert_eq!(g(&r(-30.0, -5.0), -2300), Some((400, true)));
+    assert_eq!(g(&r(-30.004, f64::NEG_INFINITY), -2300), Some((700, false)));
+    assert_eq!(g(&r(-12.0, -1.0), -2300), Some((-1100, false)));
+}
