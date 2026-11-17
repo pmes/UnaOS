@@ -254,6 +254,8 @@ pub struct PaintStyle<H: Host> {
     pub outline_offset: Option<f32>,
     /// AETHERCSSCURRENTCOLORREST (SR849): bits 0-3 = border side [top, right, bottom, left] colour is `currentColor`, [`CC_BG`] = background-color is; the RGB in `border` / `background` is then a carrier the paint reads replace.
     pub currentcolor: u8,
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): a border colour declared on a side with no entry (style none here), kept per side [top, right, bottom, left] as (colour or the grey carrier, currentcolor) for the road that creates the side later (`border-width`, a style longhand, the merge onto an earlier rule's sides).
+    pub border_pending: Option<[Option<((u8, u8, u8), bool)>; 4]>,
 }
 
 
@@ -365,7 +367,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_width: None,
             outline_color: None,
             outline_offset: None,
-            currentcolor: 0,
+            currentcolor: 0, border_pending: None,
         }
     }
 }
@@ -1054,4 +1056,20 @@ impl<H: Host> PaintStyle<H> {
             self.currentcolor = (self.currentcolor & !CC_BG) | (src.currentcolor & CC_BG);
         }
     }
+}
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a control's theme frame takes the pending border colour (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the 1px theme frame a control paints when the author gave it no side: each side
+/// takes its pending colour (`PaintStyle::border_pending`; the element's ink when the entry is currentcolor), else
+/// Chromium's #767676. Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
+pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
+    let p = pending.unwrap_or([None; 4]);
+    let mut sides = [Some((1.0, (118, 118, 118))); 4];
+    for (i, side) in sides.iter_mut().enumerate() {
+        if let Some((c, cc)) = p[i] {
+            *side = Some((1.0, if cc { ink } else { c }));
+        }
+    }
+    sides
 }

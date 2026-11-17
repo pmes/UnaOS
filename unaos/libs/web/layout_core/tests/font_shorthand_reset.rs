@@ -477,7 +477,7 @@ fn currentcolorrest_border_marker() {
     assert_eq!(cc(&[("border", "2px solid currentcolor"), ("border-top", "2px solid blue")]), CC_SIDES & !1, "the top bit cleared");
     let s = styled(&[("border-color", "currentcolor")]);
     assert_eq!(s.paint.currentcolor, CC_SIDES, "border-color: currentcolor");
-    assert_eq!(s.paint.border, Some([Some((1.0, (128, 128, 128))); 4]), "the sides built at 1px with the grey carrier");
+    assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some(((128, 128, 128), true)); 4])), "SR1058: no frame built (style none); the grey carrier pends with its currentcolor answer");
     assert_eq!(cc(&[("border-width", "3px")]), CC_SIDES, "border-width alone: the created sides take currentcolor");
     assert_eq!(cc(&[("border", "2px solid red"), ("border-width", "3px")]), 0, "border-width keeps the red sides");
 }
