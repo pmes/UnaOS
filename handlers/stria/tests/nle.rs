@@ -11132,3 +11132,24 @@ fn striacropmore_keys_step_the_crop() {
     assert!(!face.on(&bandy::SMessage::BrowserText("Alt+l".into())));
     println!("striacropmore: eight chords, Alt+l Alt+b Alt+Shift+L -> 0/0/0/{s}");
 }
+
+// ---- STRIALINKMORE (LEDGER SR967): the face's `alone` word (named tail block) ----
+#[test]
+fn strialinkmore_face_alone_word() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert_eq!(&VERBS[VERBS.len() - 2..], ["alone", "help"], "alone before help");
+    assert!(face.verb("alone"));
+    assert_eq!(face.last_error.take().as_deref(), Some("alone: no such clip"), "nothing selected, on the message row");
+    face.state.select(0, 2).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    assert!(face.verb("link"));
+    face.state.select(0, 2).unwrap();
+    assert_eq!(face.state.set, vec![(0, 2), (1, 2)]);
+    let linked = face.state.timeline.clone();
+    assert!(face.verb("alone"));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 2)]));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&linked, 1), "link only: alone is no edit");
+    println!("strialinkmore: VERBS[{}] alone; set {:?}", VERBS.len() - 2, face.state.set);
+}

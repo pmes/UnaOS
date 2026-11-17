@@ -547,7 +547,7 @@ fn transport() -> TetraNode {
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
-        button("link", "Link"), button("unlink", "Unlink"), button("unlink-all", "Unlink all"), button("link-av", "Link A/V"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
+        button("link", "Link"), button("unlink", "Unlink"), button("unlink-all", "Unlink all"), button("link-av", "Link A/V"), button("alone", "Alone"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group; STRIALINKMORE (SR967): `alone` keeps the primary without its mates
         button("info", "Info"), // STRIASOURCEINFO (SR875): the selected clip's reel line, standing five seconds on the message row
         button("track-up", "Track Up"), button("track-down", "Track Down"), // STRIATRACKREORDER (SR877): the selected clip's track swaps with its same-kind neighbour
         button("meters-reset", "Reset Meters"), button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
@@ -2183,7 +2183,7 @@ mod striaautosavecap_tests {
         assert_eq!(autosaved_json(&face), "");
         assert!(drive(&mut face, "at:12:0,split").is_empty());
         assert!(face.dirty());
-        assert_eq!(autosaved_json(&face), "", "nothing written before the clock");
+        assert_eq!(autosaved_json(&face), "unlink", "nothing written before the clock");
         let ticks = format!("tick:{}", nle_face::AUTOSAVE_SECS * 25);
         let errors = drive(&mut face, &ticks);
         assert!(errors.is_empty(), "{errors:?}");
@@ -2281,7 +2281,7 @@ mod striaproxybuttons_tests {
             let SMessage::Input { target, text } = action else { panic!("not an Input") };
             assert_eq!((target.as_str(), text.as_str()), (SURFACE, want));
         }
-        assert_eq!(&nle_face::VERBS[nle_face::VERBS.len() - 3..], &["proxy-off", "proxy-all", "help"]);
+        assert_eq!(&nle_face::VERBS[nle_face::VERBS.len() - 3..], &["proxy-off", "proxy-allalone", "help"]);
         let (tl, src) = nle_face::synth_fixture();
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(drive(&mut f, "proxy-off"), vec!["proxy: no clip selected".to_string()]);
@@ -2735,5 +2735,35 @@ mod striacropmore_tests {
         assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 100, t: 0, r: 0, b: 0 }));
         assert_eq!(face.state.undo_depth(), 1);
         assert!(face.crop_dragging().is_none());
+    }
+}
+
+// ---- STRIALINKMORE (LEDGER SR967): the `alone` button through `--do` (named tail block) ----
+#[cfg(test)]
+mod strialinkmore_tests {
+    use super::*;
+
+    /// `--do alone` with nothing selected names its refusal; on a linked pair it keeps the primary alone in the set with
+    /// no undo step; the button sits before `help`.
+    #[test]
+    fn strialinkmore_alone_button() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "alone");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("no such clip"), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        f.state.select_add(1, 0).unwrap();
+        assert!(drive(&mut f, "link").is_empty());
+        f.state.select(0, 0).unwrap();
+        assert_eq!(f.state.set, vec![(0, 0), (1, 0)]);
+        let errors = drive(&mut f, "alone");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.state.selection, f.state.set.clone()), (Some((0, 0)), vec![(0, 0)]));
+        assert_eq!(f.state.undo_depth(), 1, "link only: alone is no edit");
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
+        assert_eq!(&ids[ids.len() - 2..], ["alone", "help"]);
     }
 }
