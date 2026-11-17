@@ -8116,3 +8116,102 @@ fn striaimportwavwide_refusals_by_name() {
     let e = refusal(striaimportwavwide_wav(1, 16, 1, 48_000, Some(0), &[]));
     assert!(e.contains("wav: no samples"), "{e}");
 }
+
+// ---- STRIAEXPORTQUEUESKIP (LEDGER SR914): the queue's skip / clear words and the queued-timeline snapshot (named tail block) ----
+
+/// Drain the running export and the queue through `export_tick` alone (the serve clock's road), bounded.
+fn striaexportqueueskip_drain(face: &mut Face) {
+    let t0 = std::time::Instant::now();
+    while face.exporting() {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(120), "the queue never drained");
+        face.export_tick();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn striaexportqueueskip_skip_word_starts_the_next() {
+    let (a, b) = (nlefaceexport_dir("skip-a"), nlefaceexport_dir("skip-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.verb("export-skip"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: skipping (1 waiting)"));
+    striaexportqueueskip_drain(&mut face);
+    assert_eq!(face.export_queued(), 0);
+    let line = face.last_error.take().expect("B's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", b.display())), "{line}");
+    assert!(a.join("000002.png").is_file() && !a.join("000003.png").exists(), "A cancelled after frame 3");
+    assert!(b.join("000034.png").is_file(), "B ran to the end after the skip");
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueueskip: export-skip started the queued job: \"{line}\"");
+}
+
+#[test]
+fn striaexportqueueskip_skip_with_nothing_running() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("export-skip"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export-skip: no export running"));
+    assert!(face.verb("export-clear"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: dropped 0 waiting"));
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.state.undo_depth(), 0, "view words push no undo step");
+    assert!(!face.dirty(), "view words leave the document clean");
+    assert!(!face.exporting());
+    println!("striaexportqueueskip: nothing running -> export-skip: no export running");
+}
+
+#[test]
+fn striaexportqueueskip_clear_keeps_the_running_job() {
+    let (a, b, c) = (nlefaceexport_dir("clear-a"), nlefaceexport_dir("clear-b"), nlefaceexport_dir("clear-c"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert!(face.verb(&format!("export {} png", c.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (2 waiting)"));
+    assert!(face.verb("export-clear"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: dropped 2 waiting"));
+    assert_eq!(face.export_queued(), 0);
+    assert!(face.exporting(), "the running job is left running");
+    assert_eq!(face.export_progress(), Some((3, 35)));
+    assert!(face.export_skip());
+    assert_eq!(face.wait_exports(), 1);
+    assert!(!b.exists() && !c.exists(), "the dropped requests made nothing");
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportqueueskip: export-clear dropped 2, the running job kept");
+}
+
+#[test]
+fn striaexportqueueskip_queued_job_exports_the_timeline_as_queued() {
+    let (a, b) = (nlefaceexport_dir("snap-a"), nlefaceexport_dir("snap-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export --all {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    for t in &mut face.state.timeline.tracks {
+        t.clips.truncate(1); // A[13,23)@0: the live timeline now ends at 10
+    }
+    let live = face.state.timeline.clone();
+    assert_eq!(live.end(), 10);
+    assert!(face.export_skip());
+    assert_eq!(face.wait_exports(), 2);
+    let line = face.last_error.take().expect("B's line");
+    assert!(line.starts_with("export: 35 frames, ") && line.ends_with(&format!(" -> {}", b.display())), "{line}");
+    assert!(b.join("000034.png").is_file(), "B exported the timeline as it stood when queued (35 frames)");
+    assert_eq!(face.state.timeline, live, "the live timeline is back after the start");
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportqueueskip: queued at 35 frames, live cut to 10, exported 35: \"{line}\"");
+}
+
+#[test]
+fn striaexportqueueskip_words_are_verbs_before_help() {
+    for w in ["export-skip", "export-clear"] {
+        assert!(VERBS.contains(&w), "{w}");
+    }
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["export-skip", "export-clear", "help"]);
+    println!("striaexportqueueskip: VERBS ends {:?}", &VERBS[VERBS.len() - 3..]);
+}
