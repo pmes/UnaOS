@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 31] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -1354,7 +1354,7 @@ fn paint_meters(px: Vec<u8>, l: Layout, order: PixelOrder, levels: &[MeterLevel]
     }
     let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
     let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
-    let frac = |db: f64| ((db - METER_VIEW_DB) / -METER_VIEW_DB).clamp(0.0, 1.0);
+    let frac = |db: f64| view::db_frac(db, METER_VIEW_DB); // STRIACLIPGAINFACE (SR838): the ONE dB map, lifted to timeline_core view
     for lv in levels {
         let (y0, y1) = match lv.track {
             Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
@@ -3155,4 +3155,34 @@ impl Face {
     pub fn wave_peaks(&self, id: timeline_core::SourceId) -> Option<&view::Peaks> {
         self.peaks.map.get(&id).and_then(|p| p.as_ref())
     }
+}
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the gain / fade words and their message line (named tail block) ----
+// `gain-` / `gain+` / `gain [<dB>]` / `fade-in [<frames|tc>]` / `fade-out [<frames|tc>]` ride timeline_core's ONE verb
+// dispatch (`EditorState::verb`: `Timeline::set_gain` / `set_fades` through the one commit). The face puts the outcome on
+// its message line: `gain -3.0 dB` / `fade-in 10, fade-out 0` after an edit (finish_export's precedent for a success
+// line), `<word>: <EditError>` for a refusal (the edit dropped).
+impl Face {
+    /// The gain / fade words; `None` for any other word.
+    fn clip_audio_verb(&mut self, v: &str) -> Option<bool> {
+        let word = v.split_ascii_whitespace().next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
+        match self.state.verb(v) {
+            Some(Ok(())) => self.last_error = self.state.selected().map(|c| audio_line(word, &c)),
+            Some(Err(e)) => self.last_error = Some(format!("{word}: {e}")),
+            None => return None,
+        }
+        Some(true)
+    }
+}
+
+/// A gain in centi-dB as a person reads it: `+3.0 dB`, `-3.5 dB`, `0.0 dB` (the tenth rounded half up on the magnitude).
+pub fn db_words(cdb: i32) -> String {
+    let tenths = (cdb.unsigned_abs() + 5) / 10;
+    let sign = if tenths == 0 { "" } else if cdb > 0 { "+" } else { "-" };
+    format!("{sign}{}.{} dB", tenths / 10, tenths % 10)
+}
+
+/// The message line after a gain / fade word: `gain <db_words>` or `fade-in <n>, fade-out <m>` (ticks).
+fn audio_line(word: &str, c: &Clip) -> String {
+    if word.starts_with("gain") { format!("gain {}", db_words(c.gain_cdb)) } else { format!("fade-in {}, fade-out {}", c.fade_in, c.fade_out) }
 }
