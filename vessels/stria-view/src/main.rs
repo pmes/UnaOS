@@ -26,6 +26,7 @@
 //! NLE3d (SR302): `transition:<track>:<idx>` clicks that transition's widget (selecting it; `delete`, `[` / `]` then edit
 //! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
 //! STRIATRANSITIONLENGTH (SR870): `dur:<n>` gives the selected transition exactly n ticks (timeline_core's `dur <n>` word).
+//! STRIATRANSITIONMORE (SR956): `dur:HH:MM:SS:FF` gives it a timecode count (the EDL's one parser, at the timeline's fps).
 //! NLE4C (SR301): `meters` feeds the face's meters the tick at the playhead (what one played tick feeds); the JSON line
 //! then ends `"meters":[{"track":<n>,"peak":<dBFS>,"rms":<dBFS>},...,{"track":"master",...}]`.
 //! SURFACEID (SR332): `--two-surfaces` puts a second Surface ([`AUX_SURFACE`]) above the editor's in the tree, so the
@@ -198,6 +199,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
         ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -2497,5 +2499,28 @@ mod striasnapmore_tests {
         assert_eq!(drive(&mut f, "snap"), vec!["snap: on".to_string()]);
         assert_eq!(snap_json(&f), "");
         println!("striasnapmore witness: key:n -> \"snap\":false, snap -> absent");
+    }
+}
+
+// ---- STRIATRANSITIONMORE (LEDGER SR956): the `dur:HH:MM:SS:FF` token (named tail block) ----
+
+#[cfg(test)]
+mod striatransitionmore_tests {
+    use super::*;
+
+    /// M3: `transition:0:0,dur:00:00:00:07` gives the selected dissolve 7 ticks at 25 fps (the JSON `"dur":7`, one undo
+    /// step); a frame field past the fps (`dur:00:00:00:25`) is refused by name, the state left.
+    #[test]
+    fn striatransitionmore_witness_dur_timecode_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "transition:0:0,dur:00:00:00:07");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(transition_json(&face).contains(r#""at":10,"dur":7,"#), "{}", transition_json(&face));
+        assert_eq!(face.state.undo_depth(), 1);
+        let before = face.state.clone();
+        assert_eq!(drive(&mut face, "dur:00:00:00:25"), vec![format!("dur 00:00:00:25: {}", timeline_core::EditError::Transition)]);
+        assert_eq!(face.state, before);
     }
 }
