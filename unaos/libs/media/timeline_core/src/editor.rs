@@ -1494,7 +1494,7 @@ impl EditorState {
     }
     /// The `close-gaps` / `gap <n>` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn gap_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if v.split_ascii_whitespace().eq(["close-gaps", "sync"]) { return Some(self.close_gaps_sync()); } if v.split_ascii_whitespace().eq(["close-gaps", "all"]) { return Some(self.close_gaps_all()); } if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second; STRIAGAPSALLTRACKS (SR929): `close-gaps all` (file tail); STRIAGAPSMORE (SR969): `close-gaps sync` (file tail)
+        if v.split_ascii_whitespace().eq(["close-gaps", "keep"]) { return Some(self.close_gaps_keep()); } if v.split_ascii_whitespace().eq(["close-gaps", "sync"]) { return Some(self.close_gaps_sync()); } if v.split_ascii_whitespace().eq(["close-gaps", "all"]) { return Some(self.close_gaps_all()); } if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second; STRIAGAPSALLTRACKS (SR929): `close-gaps all` (file tail); STRIAGAPSMORE (SR969): `close-gaps sync` (file tail); STRIAGAPSTHREE (SR9028): `close-gaps keep` (file tail)
             None => self.close_gaps(),
             Some(n) => self.insert_gap(n),
         })
@@ -4242,5 +4242,20 @@ impl EditorState {
         let depth = self.redo.len();
         let names = &self.hist.redo;
         (0..n.min(depth)).map(|k| (k + 1, names.len().checked_sub(k + 1).and_then(|j| names[j].as_deref()))).collect()
+    }
+}
+
+// ---- STRIAGAPSTHREE (LEDGER SR9028): `close-gaps keep` through the one commit (named tail block) ----
+// The selected clip's track closes its gaps but leaves open an inner gap carrying a black fade (`Timeline::close_gaps_keep`),
+// as ONE commit (one undo step); nothing selected is `EditError::NoClip`, and nothing to close commits nothing.
+impl EditorState {
+    /// Close the selected clip's track's gaps, keeping each faded gap open (one commit; nothing to close commits nothing).
+    pub fn close_gaps_keep(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.close_gaps_keep(track)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
     }
 }

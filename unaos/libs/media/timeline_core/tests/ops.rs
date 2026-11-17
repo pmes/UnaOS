@@ -3418,3 +3418,84 @@ fn striaxfadethree_xfade_edge_drag() {
     assert_eq!(st.timeline.audio_xfades[0].dur, 20);
     println!("striaxfadethree: right +2 -> 10, left -2 -> 10, middle none, +13 refused (Handle), snap -> 40 (dur 20)");
 }
+
+// ---- STRIAGAPSTHREE (LEDGER SR9028): the all-tracks close validated once, keep a faded gap open (named tail block) ----
+
+/// V1 A[0,10)@5 | B[0,10)@15 under a 3-tick dissolve at 15; A1 C[0,2)@0 | A[94,100)@4 | B[0,10)@10. Closing V1 alone moves
+/// the dissolve to 10, where A1's A|B cut coincidentally pairs onto A's zero handle (`Handle`): the half-closed value refuses.
+/// Closing A1 too moves that cut to 8 and the pairing is gone: the finished value is valid, so `close-gaps all` stands.
+#[test]
+fn striagapsthree_all_order_final_value_validates_once() {
+    let mut k = Timeline::new(25);
+    let (a, b, c) = (k.add_source("A", 100), k.add_source("B", 60), k.add_source("C", 50));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 5), Clip::new(b, 0, 10, 15)];
+    k.tracks[1].clips = vec![Clip::new(c, 0, 2, 0), Clip::new(a, 94, 100, 4), Clip::new(b, 0, 10, 10)];
+    let k = k.add_transition(0, 15, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(k.validate(), Ok(()));
+    assert_eq!(k.close_gaps(0), Err(EditError::Handle));
+    let all = k.close_gaps_all().unwrap();
+    let ats: Vec<i64> = all.tracks[1].clips.iter().map(|x| x.at).collect();
+    assert_eq!(ats, vec![0, 2, 8]);
+    assert_eq!(all.tracks[0].transitions[0].at, 10);
+    assert_eq!((all.audio_crossfade(1, 1), all.audio_crossfade(1, 2)), (None, None));
+    assert_eq!((all.gap_count_all(), all.validate()), (0, Ok(())));
+    println!("striagapsthree: A1 after close-gaps all {ats:?}");
+}
+
+/// A finished value that refuses falls back to SR929's chain, which names the refusing track as before; a plain timeline's
+/// all-tracks close is still the per-track close chained.
+#[test]
+fn striagapsthree_all_order_keeps_naming() {
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    k.tracks[1].clips = vec![Clip::new(a, 90, 100, 0), Clip::new(b, 0, 10, 15)];
+    let h = k.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(h.close_gaps_all(), Err((1, EditError::Handle)));
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 5), Clip::new(b, 0, 10, 15)];
+    k.tracks[1].clips = vec![Clip::new(a, 0, 15, 0), Clip::new(b, 0, 10, 15)];
+    let p = k.add_transition(0, 15, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(p.close_gaps_all(), Err((1, EditError::Transition)));
+    let (tl, _, _) = striagapclose_base();
+    assert_eq!(tl.close_gaps_all().unwrap(), tl.close_gaps(0).unwrap().close_gaps(1).unwrap());
+}
+
+/// SR909's base: `close_gaps_keep` leaves the 10..20 gap open with its to-black and from-black and closes the plain 40..45
+/// gap (the trailing to-black moves with its clip); one gap is left. With no black fade it is the plain close.
+#[test]
+fn striagapsthree_keep_leaves_a_faded_gap_open() {
+    let k = striagapsblack_base();
+    let c = k.close_gaps_keep(0).unwrap();
+    let ats: Vec<i64> = c.tracks[0].clips.iter().map(|x| x.at).collect();
+    assert_eq!(ats, vec![0, 20, 30, 40]);
+    let xs: Vec<(i64, bool, bool)> = c.tracks[0].transitions.iter().map(|x| (x.at, x.from_black, x.to_black)).collect();
+    assert_eq!(xs, vec![(10, false, true), (20, true, false), (30, false, false), (50, false, true)]);
+    assert_eq!((c.gap_count(0), c.validate()), (1, Ok(())));
+    assert_eq!(c.close_gaps_keep(0).unwrap(), c);
+    let (tl, _, _) = striagapclose_base();
+    assert_eq!(tl.close_gaps_keep(0).unwrap(), tl.close_gaps(0).unwrap());
+    assert_eq!(tl.close_gaps_keep(9), Err(EditError::NoTrack));
+    println!("striagapsthree: keep V1 {ats:?} transitions {xs:?}");
+}
+
+/// `close-gaps keep` through THE verb dispatch: nothing selected is `NoClip`; one commit; a second is an equal value
+/// (nothing); undo restores; a third word is not this verb.
+#[test]
+fn striagapsthree_editor_keep_one_undo_step() {
+    use timeline_core::editor::EditorState;
+    let k = striagapsblack_base();
+    let mut st = EditorState::new(k.clone());
+    assert_eq!(st.verb("close-gaps keep"), Some(Err(EditError::NoClip)));
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("close-gaps keep"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (k.close_gaps_keep(0).unwrap(), 1));
+    assert_eq!(st.verb("close-gaps keep"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1);
+    assert!(st.undo());
+    assert_eq!(st.timeline, k);
+    assert_eq!(st.verb("close-gaps keep x"), None);
+}
