@@ -194,12 +194,12 @@ pub struct Sources {
     applied: Vec<(SourceId, usize)>,
     /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
-    stand_in: std::sync::Mutex<Vec<SourceId>>, titles: TitleCache, // STRIATITLECLIP (SR828): the title stills, keyed (text, w, h) (file tail)
+    stand_in: std::sync::Mutex<Vec<SourceId>>, titles: TitleCache, seqs: Vec<(SourceId, Seq)>, // STRIATITLECLIP (SR828): the title stills, keyed (text, w, h) (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): the PNG sequence reels (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), titles: Default::default() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), titles: Default::default(), seqs: Vec::new() } // STRIAIMPORTIMAGESEQUENCE (SR888): no sequence reel yet
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -208,7 +208,7 @@ impl Sources {
     /// Open `bytes` (MP4 / Matroska / WebM) as source `id`.
     pub fn add(&mut self, id: SourceId, bytes: Vec<u8>) -> Result<(), RenderError> {
         let m = Media::open(bytes)?; self.note_open(id, &m); // NLE-STANDIN-OPEN (SR353): a reel no decoder fits opens as a stand-in reel
-        self.media.retain(|(s, _)| *s != id);
+        self.media.retain(|(s, _)| *s != id); self.seqs.retain(|q| q.0 != id); // STRIAIMPORTIMAGESEQUENCE (SR888): a re-added id forgets its sequence
         self.media.push((id, m));
         Ok(())
     }
@@ -270,13 +270,13 @@ impl std::fmt::Display for OpenReport {
 
 impl SourceIndex for Sources {
     fn duration(&self, src: SourceId) -> Option<i64> {
-        let m = self.get(src).ok()?;
+        if let Some(q) = self.seq(src) { return Some(q.len()); } let m = self.get(src).ok()?; // STRIAIMPORTIMAGESEQUENCE (SR888): a sequence lasts one tick per file number (file tail)
         let ns = [m.video, m.audio].into_iter().flatten().map(|i| m.demux.tracks()[i].duration_ns).max()?;
         // whole ticks only (1 µs of slack for a time base's rounding)
         Some(((ns as i128 + 1_000) * self.tb.den as i128 / (self.tb.num.max(1) as i128 * 1_000_000_000)) as i64)
     }
     fn keyframe_ns(&self, src: SourceId, kind: Kind, t_ns: i64) -> Option<i64> {
-        let m = self.get(src).ok()?;
+        if self.seq(src).is_some() { return (kind == Kind::Video).then_some(t_ns); } let m = self.get(src).ok()?; // STRIAIMPORTIMAGESEQUENCE (SR888): every file of a sequence is its own key (file tail)
         let (i, origin) = m.stream(kind)?;
         // DEMUXWIRE (SR213): NLEPROBE's keyframe-before (the search seek_track shares); an indexed reel's window may not
         // hold t, so the span holding it is read into a share first.
@@ -489,7 +489,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
         let Some(src) = s.src.or(s.vmix.and_then(|m| m.src)) else { continue }; // NLE3cBLACK: a to-black step sizes by its outgoing
-        if titled(tl, src) { continue; } let m = sources.get(src)?; // STRIATITLECLIP (SR828): a title sizes no frame (file tail)
+        if titled(tl, src) || seq_size(sources, src, s.kind, &mut r) { continue; } let m = sources.get(src)?; // STRIATITLECLIP (SR828): a title sizes no frame (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): a sequence sizes by its first file's header (file tail)
         match s.kind {
             Kind::Video if r.width == 0 => {
                 if let Some(i) = m.video {
@@ -680,7 +680,7 @@ fn vid_frame(
     tol: i64,
     r: &mut RenderReport,
 ) -> Result<Frame, RenderError> {
-    if let Some(f) = title_frame(tl, sources, run, src, src_t, r) { return Ok(f); } let target = tl.tb.to_ns(src_t); // STRIATITLECLIP (SR828): a title's frame is its cached still (file tail)
+    if let Some(f) = title_frame(tl, sources, run, src, src_t, r) { return Ok(f); } if let Some(f) = seq_frame(tl, sources, run, src, src_t)? { return Ok(f); } let target = tl.tb.to_ns(src_t); // STRIATITLECLIP (SR828): a title's frame is its cached still (file tail); STRIAIMPORTIMAGESEQUENCE (SR888): a sequence's frame is one file read and decoded (file tail)
     if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) {
         let key = match seek {
             Some(k) => k,
@@ -1066,4 +1066,132 @@ impl Sources {
         }
         s
     }
+}
+
+// ---- STRIAIMPORTIMAGESEQUENCE (LEDGER SR888): a PNG sequence as a video reel (named tail block) ----
+/// STRIAIMPORTIMAGESEQUENCE (LEDGER SR888): a reel whose `--src` path is a printf pattern (`<dir>/frame_%04d.png`: one `%d`
+/// or `%0Nd`, a `.png` suffix) is a sequence of PNG files, one per timeline tick: source tick k is file number `first + k`
+/// (the timeline's rate). [`Sources::add_sequence`] reads the directory's names once and the first file's header
+/// (pixel_core's ONE header reader `facts_of`) for the reel size; the render reads and decodes ONE file per tick through
+/// pixel_core's `decode_png`, never the whole sequence. A number between the first and the last with no file is refused,
+/// by name, when its tick is reached. The EDL names the reel only; the pattern lives in the loader's `--src`. Immutable
+/// after the add: no lock.
+struct Seq {
+    prefix: String,
+    width: usize,
+    suffix: String,
+    first: u64,
+    last: u64,
+    w: u32,
+    h: u32,
+}
+
+impl Seq {
+    /// STRIAIMPORTIMAGESEQUENCE: the path of file number `n`.
+    fn path(&self, n: u64) -> String {
+        format!("{}{:0w$}{}", self.prefix, n, self.suffix, w = self.width)
+    }
+    /// STRIAIMPORTIMAGESEQUENCE: the reel's length in ticks, one per file number `first..=last`.
+    fn len(&self) -> i64 {
+        (self.last - self.first + 1) as i64
+    }
+}
+
+/// STRIAIMPORTIMAGESEQUENCE: `path` as an image-sequence pattern: `(prefix, width, suffix)` around its one `%d` / `%0Nd`
+/// (width 0 for `%d`), no other `%` after it; `None` when it is no such pattern (a plain media path). The suffix's
+/// format is [`Sources::add_sequence`]'s rule (PNG only), so a `.jpg` pattern is refused by name there, not read as a file.
+pub fn seq_pattern(path: &str) -> Option<(&str, usize, &str)> {
+    let i = path.find('%')?;
+    let rest = &path[i + 1..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let spec = &rest[..digits];
+    if rest.as_bytes().get(digits) != Some(&b'd') || (!spec.is_empty() && !spec.starts_with('0')) {
+        return None;
+    }
+    let width = if spec.is_empty() { 0 } else { spec.parse().ok()? };
+    let suffix = &rest[digits + 1..];
+    if suffix.contains('%') {
+        return None;
+    }
+    Some((&path[..i], width, suffix))
+}
+
+impl Sources {
+    /// STRIAIMPORTIMAGESEQUENCE: open the PNG sequence `pattern` ([`seq_pattern`]) as source `id` (whatever `id` held is
+    /// forgotten). Refused by name (`RenderError::Demux`, `image sequence <pattern>: <why>`): no `%d` / `%0Nd`, a suffix other
+    /// than `.png`, an unreadable directory, no file matching, a first file with no PNG header. Logs
+    /// `[STRIA] :: nle seq reel=<id> frames=<first>..=<last> <w>x<h>`.
+    pub fn add_sequence(&mut self, id: SourceId, pattern: &str) -> Result<(), RenderError> {
+        use std::io::Read;
+        let refuse = |why: String| RenderError::Demux(format!("image sequence {pattern}: {why}"));
+        let (prefix, width, suffix) = seq_pattern(pattern).ok_or_else(|| refuse(String::from("no %d or %0Nd in the path")))?;
+        if !suffix.to_ascii_lowercase().ends_with(".png") {
+            return Err(refuse(String::from("only .png frames (the PNG decoder)")));
+        }
+        let (dir, stem) = match prefix.rfind('/') {
+            Some(k) => (&prefix[..=k], &prefix[k + 1..]),
+            None => ("", prefix),
+        };
+        let entries = std::fs::read_dir(if dir.is_empty() { "." } else { dir }).map_err(|e| refuse(format!("{e}")))?;
+        let (mut first, mut last) = (u64::MAX, 0u64);
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            let Some(mid) = name.strip_prefix(stem).and_then(|m| m.strip_suffix(suffix)) else { continue };
+            if mid.is_empty() || !mid.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(n) = mid.parse::<u64>() else { continue };
+            if format!("{n:0width$}") == mid {
+                (first, last) = (first.min(n), last.max(n));
+            }
+        }
+        if first == u64::MAX {
+            return Err(refuse(String::from("no file matches")));
+        }
+        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0 };
+        let p = seq.path(first);
+        let mut head = Vec::new();
+        std::fs::File::open(&p).and_then(|f| f.take(4096).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?;
+        let png = matches!(gneiss_pal::dsp::image::sniff(&head), Some(gneiss_pal::dsp::image::Format::Png));
+        let f = gneiss_pal::dsp::image::facts_of(&head).filter(|f| png && f.width > 0 && f.height > 0).ok_or_else(|| refuse(format!("{p}: not a PNG header")))?;
+        log::info!("[STRIA] :: nle seq reel={} frames={}..={} {}x{}", id.0, first, last, f.width, f.height);
+        self.media.retain(|(s, _)| *s != id);
+        self.seqs.retain(|q| q.0 != id);
+        if let Ok(mut v) = self.stand_in.lock() {
+            v.retain(|s| *s != id);
+        }
+        self.seqs.push((id, Seq { w: f.width, h: f.height, ..seq }));
+        Ok(())
+    }
+    /// STRIAIMPORTIMAGESEQUENCE: source `id`'s sequence, when it is one.
+    fn seq(&self, id: SourceId) -> Option<&Seq> {
+        self.seqs.iter().find(|q| q.0 == id).map(|q| &q.1)
+    }
+}
+
+/// STRIAIMPORTIMAGESEQUENCE: [`render`]'s sizing loop: `true` when `src` is a sequence (the step has no `Media` to read),
+/// after sizing the frame from the sequence's first file when a video step finds the frame unsized.
+fn seq_size(sources: &Sources, src: SourceId, kind: Kind, r: &mut RenderReport) -> bool {
+    let Some(q) = sources.seq(src) else { return false };
+    if kind == Kind::Video && r.width == 0 {
+        (r.width, r.height) = (q.w, q.h);
+    }
+    true
+}
+
+/// STRIAIMPORTIMAGESEQUENCE: the frame of sequence source `src` at source tick `src_t` (`Ok(None)`: not a sequence): file
+/// `first + src_t` read and decoded by `decode_png` as an RGBA `Frame`. The live decode run is dropped (parked), as the
+/// title arm does, so the next media step opens by its seek. A tick past the last file is [`RenderError::Short`]; a hole
+/// `image sequence reel=<id> frame <n> missing (<path>)`; a bad file [`RenderError::Decode`].
+fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64) -> Result<Option<Frame>, RenderError> {
+    let Some(q) = sources.seq(src) else { return Ok(None) };
+    *run = None;
+    let n = u64::try_from(src_t).ok().and_then(|k| q.first.checked_add(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?;
+    let path = q.path(n);
+    let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
+        _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
+    })?;
+    let img = gneiss_pal::dsp::image::decode_png(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?;
+    Ok(Some(Frame { width: img.width, height: img.height, pts_ns: tl.tb.to_ns(src_t), pixels: gneiss_pal::dsp::video::Pixels::Rgba(img.rgba) }))
 }
