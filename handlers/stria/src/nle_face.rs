@@ -155,7 +155,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 56] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail)
+pub const VERBS: [&str; 57] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "close-gaps", "copy", "cut", "paste", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,7 +194,7 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
-    hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
@@ -205,7 +205,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -240,7 +240,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.fit_verb(v) { return r; } if let Some(r) = self.tc_verb(v) { return r; } if let Some(r) = self.nudge_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -329,8 +329,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -3971,5 +3971,81 @@ impl Face {
             (Err(e), _) => self.last_error = Some(format!("{v}: {e}")),
         }
         Some(true)
+    }
+}
+
+// ---- STRIALOUDNESSREADOUT (LEDGER SR866): the `loudness` word — the export range's integrated loudness on the message line, off the face's thread (named tail block) ----
+
+/// STRIALOUDNESSREADOUT (SR866): a running measure, the export door's shape: a thread over clones of the timeline and
+/// the shared sources (no lock), joined on the face clock ([`Face::loudness_tick`]).
+struct LoudnessJob {
+    handle: Option<std::thread::JoinHandle<Result<Option<f64>, RenderError>>>,
+    /// The marked range measured (`None`: the whole timeline), named in the line.
+    range: Option<std::ops::Range<i64>>,
+}
+
+impl Face {
+    /// The `loudness` word: measure the export's range ([`Face::export_range`], else the whole timeline) through
+    /// `crate::nle::loudness` on its own thread. A running one refuses `loudness: busy`; a range past the end is
+    /// [`Face::range_check`]'s refusal. View-only: no undo step, the document untouched. `None` for any other word.
+    fn loudness_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "loudness" {
+            return None;
+        }
+        if self.loudness.is_some() {
+            self.last_error = Some("loudness: busy".into());
+            return Some(true);
+        }
+        let range = self.export_range();
+        if let Err(e) = self.range_check(&range) {
+            self.last_error = Some(format!("loudness: {e}"));
+            return Some(true);
+        }
+        let span = range.clone().unwrap_or(0..self.state.timeline.end());
+        let (tl, sources) = (self.state.timeline.clone(), Arc::clone(&self.sources));
+        match std::thread::Builder::new().name("nle-loudness".into()).spawn(move || crate::nle::loudness(&tl, span, &sources)) {
+            Ok(h) => self.loudness = Some(LoudnessJob { handle: Some(h), range }),
+            Err(e) => self.last_error = Some(format!("loudness: {e}")),
+        }
+        Some(true)
+    }
+    /// True while a measure's result has not been reported.
+    pub fn loudness_pending(&self) -> bool {
+        self.loudness.is_some()
+    }
+    /// One clock tick for the measure: a finished one's line goes to the message line; true when that happened.
+    pub fn loudness_tick(&mut self) -> bool {
+        if !self.loudness.as_ref().is_some_and(|j| j.handle.as_ref().is_some_and(|h| h.is_finished())) {
+            return false;
+        }
+        self.finish_loudness();
+        true
+    }
+    /// Block until the running measure ends and report it as [`Face::loudness_tick`] would; false when none runs.
+    pub fn wait_loudness(&mut self) -> bool {
+        if self.loudness.is_none() {
+            return false;
+        }
+        self.finish_loudness();
+        true
+    }
+    fn finish_loudness(&mut self) {
+        let Some(mut j) = self.loudness.take() else { return };
+        self.last_error = Some(match j.handle.take().map(|h| h.join()) {
+            Some(Ok(r)) => loudness_line(&r, &j.range),
+            _ => "loudness: the measure thread panicked".to_string(),
+        });
+    }
+}
+
+/// STRIALOUDNESSREADOUT (SR866): the measure's message line: `loudness: <x.x> LUFS integrated[ ticks a..b]`, the floor
+/// naming the gate, `loudness: no audio in the range`, or the render's refusal.
+pub fn loudness_line(r: &Result<Option<f64>, RenderError>, range: &Option<std::ops::Range<i64>>) -> String {
+    use gneiss_pal::dsp::audio::meter::LUFS_FLOOR;
+    match r {
+        Ok(Some(l)) if *l <= LUFS_FLOOR => format!("loudness: {LUFS_FLOOR:.1} LUFS integrated{} (nothing above the {LUFS_FLOOR:.0} LUFS gate)", ticks_note(range)),
+        Ok(Some(l)) => format!("loudness: {l:.1} LUFS integrated{}", ticks_note(range)),
+        Ok(None) => "loudness: no audio in the range".to_string(),
+        Err(e) => format!("loudness: {e}"),
     }
 }

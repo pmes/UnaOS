@@ -148,3 +148,187 @@ mod tests {
         assert_eq!(m.peak_db(), FLOOR_DB);
     }
 }
+
+// ---- STRIALOUDNESSREADOUT (LEDGER SR866): BS.1770 integrated loudness (named tail block) ----
+//
+// ITU-R BS.1770-4: each channel K-weighted (a high shelf, then the RLB high-pass), the channel-weighted mean square over
+// 400 ms blocks at 75 % overlap (four 100 ms hops), each block's loudness `-0.691 + 10 log10(z)`; the absolute gate
+// drops blocks at or under -70 LUFS, the relative gate those at or under (the loudness of the rest) - 10 LU, and the
+// integrated loudness is that of the mean `z` of what both gates keep. The filters are designed at any rate by the
+// bilinear transform from the analogue parameters that reproduce the standard's 48 kHz table. Streaming in [`Meter`]'s
+// shape (one f64 per 100 ms is all it keeps), [`integrated_lufs`] the one pure fn over a buffer.
+
+/// The reading when no block passes the absolute gate (silence, or less than one 400 ms block): the gate itself.
+pub const LUFS_FLOOR: f64 = -70.0;
+/// Hops per gating block (400 ms of 100 ms hops, 75 % overlap).
+const LUFS_BLOCK_HOPS: usize = 4;
+
+/// One biquad's coefficients `[b0, b1, b2, a1, a2]` (a0 = 1).
+type Biquad = [f64; 5];
+
+/// The K-weighting at `rate`: (stage 1 the high shelf, stage 2 the RLB high-pass).
+fn k_weighting(rate: u32) -> (Biquad, Biquad) {
+    let fs = rate.max(1) as f64;
+    let tan = |x: f64| {
+        let (s, c) = math::sincos(x);
+        s / c
+    };
+    let (f0, g, q) = (1681.974450955533, 3.999843853973347, 0.7071752369554196);
+    let k = tan(math::PI * f0 / fs);
+    let vh = math::pow(10.0, g / 20.0);
+    let vb = math::pow(vh, 0.4996667741545416);
+    let a0 = 1.0 + k / q + k * k;
+    let shelf = [(vh + vb * k / q + k * k) / a0, 2.0 * (k * k - vh) / a0, (vh - vb * k / q + k * k) / a0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0];
+    let (f0, q) = (38.13547087602444, 0.5003270373238773);
+    let k = tan(math::PI * f0 / fs);
+    let a0 = 1.0 + k / q + k * k;
+    let rlb = [1.0, -2.0, 1.0, 2.0 * (k * k - 1.0) / a0, (1.0 - k / q + k * k) / a0];
+    (shelf, rlb)
+}
+
+/// One sample through a transposed direct-form-II biquad with state `s`.
+fn biquad(c: &Biquad, x: f64, s: &mut [f64]) -> f64 {
+    let y = c[0] * x + s[0];
+    s[0] = c[1] * x - c[3] * y + s[1];
+    s[1] = c[2] * x - c[4] * y;
+    y
+}
+
+/// A mean square as loudness (LUFS).
+fn lufs_of(z: f64) -> f64 {
+    -0.691 + 10.0 * math::log10(z)
+}
+
+/// The BS.1770 integrated loudness meter (see the block comment above).
+#[derive(Debug, Clone)]
+pub struct Loudness {
+    ch: usize,
+    shelf: Biquad,
+    rlb: Biquad,
+    /// Per channel: the shelf's two state words, then the high-pass's.
+    state: Vec<[f64; 4]>,
+    /// The channel weights G (1.0; 5.1 as L R C LFE Ls Rs: 1, 1, 1, 0, 1.41, 1.41).
+    weights: Vec<f64>,
+    /// Frames per 100 ms hop.
+    hop: usize,
+    /// Frames into the open hop, and its weighted sum of squares.
+    n: usize,
+    acc: f64,
+    /// Each closed hop's weighted sum of squares.
+    hops: Vec<f64>,
+}
+
+impl Loudness {
+    pub fn new(rate: u32, ch: usize) -> Loudness {
+        let ch = ch.max(1);
+        let (shelf, rlb) = k_weighting(rate);
+        let weights = if ch == 6 { vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41] } else { vec![1.0; ch] };
+        let hop = ((rate.max(1) as usize + 5) / 10).max(1);
+        Loudness { ch, shelf, rlb, state: vec![[0.0; 4]; ch], weights, hop, n: 0, acc: 0.0, hops: Vec::new() }
+    }
+    /// Feed interleaved samples of the meter's channel count (a trailing partial frame is ignored).
+    pub fn push(&mut self, interleaved: &[f32]) {
+        for frame in interleaved.chunks_exact(self.ch) {
+            let mut sum = 0.0;
+            for (i, &x) in frame.iter().enumerate() {
+                let s = &mut self.state[i];
+                let y = biquad(&self.shelf, x as f64, &mut s[0..2]);
+                let y = biquad(&self.rlb, y, &mut s[2..4]);
+                sum += self.weights[i] * y * y;
+            }
+            self.acc += sum;
+            self.n += 1;
+            if self.n == self.hop {
+                self.hops.push(self.acc);
+                (self.n, self.acc) = (0, 0.0);
+            }
+        }
+    }
+    /// The gated integrated loudness of everything pushed, LUFS; [`LUFS_FLOOR`] when no block passes the absolute gate.
+    pub fn integrated(&self) -> f64 {
+        if self.hops.len() < LUFS_BLOCK_HOPS {
+            return LUFS_FLOOR;
+        }
+        let per = (LUFS_BLOCK_HOPS * self.hop) as f64;
+        let z: Vec<f64> = self.hops.windows(LUFS_BLOCK_HOPS).map(|w| w.iter().sum::<f64>() / per).collect();
+        let mean_over = |gate: f64| {
+            let (s, n) = z.iter().filter(|&&zj| lufs_of(zj) > gate).fold((0.0, 0usize), |(s, n), &zj| (s + zj, n + 1));
+            (n > 0).then(|| s / n as f64)
+        };
+        let Some(abs) = mean_over(LUFS_FLOOR) else { return LUFS_FLOOR };
+        match mean_over(lufs_of(abs) - 10.0) {
+            Some(m) => lufs_of(m),
+            None => LUFS_FLOOR,
+        }
+    }
+}
+
+/// THE pure fn: the BS.1770 integrated loudness (LUFS) of `interleaved` (`ch` channels at `rate`).
+pub fn integrated_lufs(interleaved: &[f32], ch: usize, rate: u32) -> f64 {
+    let mut l = Loudness::new(rate, ch);
+    l.push(interleaved);
+    l.integrated()
+}
+
+#[cfg(test)]
+mod strialoudnessreadout_tests {
+    use super::*;
+
+    /// `secs` of a `hz` sine whose peak is `dbfs` on each of `ch` identical channels.
+    fn tone(rate: u32, ch: usize, hz: f64, dbfs: f64, secs: f64) -> Vec<f32> {
+        let a = math::pow(10.0, dbfs / 20.0);
+        let n = (rate as f64 * secs) as usize;
+        (0..n).flat_map(|i| core::iter::repeat_n((a * math::sin(2.0 * math::PI * hz * i as f64 / rate as f64)) as f32, ch)).collect()
+    }
+
+    /// BS.1770-4 Tables 1 and 2: the 48 kHz coefficients, reproduced by the bilinear design.
+    #[test]
+    fn strialoudnessreadout_k_weighting_is_the_standards_48k_table() {
+        let (shelf, rlb) = k_weighting(48_000);
+        let want_shelf = [1.53512485958697, -2.69169618940638, 1.19839281085285, -1.69065929318241, 0.73248077421585];
+        let want_rlb = [1.0, -2.0, 1.0, -1.99004745483398, 0.99007225036621];
+        for (g, w) in shelf.iter().zip(want_shelf).chain(rlb.iter().zip(want_rlb)) {
+            assert!((g - w).abs() < 1e-8, "{shelf:?} {rlb:?}");
+        }
+    }
+
+    /// EBU Tech 3341's 997 Hz sine at -23 dBFS stereo reads -23.0 LUFS (and -33 dBFS -33.0), at 48 and 44.1 kHz.
+    #[test]
+    fn strialoudnessreadout_997hz_sine_reads_its_level() {
+        let l = integrated_lufs(&tone(48_000, 2, 997.0, -23.0, 20.0), 2, 48_000);
+        assert!((l + 23.0).abs() < 0.1, "{l}");
+        let l33 = integrated_lufs(&tone(48_000, 2, 997.0, -33.0, 20.0), 2, 48_000);
+        assert!((l33 + 33.0).abs() < 0.1, "{l33}");
+        let l44 = integrated_lufs(&tone(44_100, 2, 997.0, -23.0, 20.0), 2, 44_100);
+        assert!((l44 + 23.0).abs() < 0.1, "{l44}");
+    }
+
+    /// EBU Tech 3341 case 3: -36 / -23 / -36 dBFS for 10 / 60 / 10 s reads -23.0: the relative gate drops the quiet parts.
+    #[test]
+    fn strialoudnessreadout_relative_gate_drops_the_quiet_parts() {
+        let mut s = tone(48_000, 2, 997.0, -36.0, 10.0);
+        s.extend(tone(48_000, 2, 997.0, -23.0, 60.0));
+        s.extend(tone(48_000, 2, 997.0, -36.0, 10.0));
+        let l = integrated_lufs(&s, 2, 48_000);
+        assert!((l + 23.0).abs() < 0.1, "{l}");
+    }
+
+    /// Silence, and a tone shorter than one 400 ms block, read the gate's floor exactly.
+    #[test]
+    fn strialoudnessreadout_silence_reads_the_floor() {
+        assert_eq!(integrated_lufs(&vec![0.0; 2 * 48_000 * 2], 2, 48_000), LUFS_FLOOR);
+        assert_eq!(integrated_lufs(&tone(48_000, 2, 997.0, -23.0, 0.3), 2, 48_000), LUFS_FLOOR);
+        assert_eq!(integrated_lufs(&[], 2, 48_000), LUFS_FLOOR);
+    }
+
+    /// Pushing in odd chunks is one push: the meter streams.
+    #[test]
+    fn strialoudnessreadout_streaming_equals_one_push() {
+        let s = tone(48_000, 2, 997.0, -20.0, 3.0);
+        let mut m = Loudness::new(48_000, 2);
+        for c in s.chunks(2 * 777) {
+            m.push(c);
+        }
+        assert_eq!(m.integrated(), integrated_lufs(&s, 2, 48_000));
+    }
+}

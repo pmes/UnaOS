@@ -1140,3 +1140,27 @@ fn cropped(tl: &Timeline, track: Option<usize>, out_t: i64, outgoing: bool, rgba
     let (px, _) = rgba.as_chunks::<4>();
     timeline_core::crop_frame(px, w as usize, h as usize, crop, fit, timeline_core::view::FIELD).into_flattened()
 }
+
+// ---- STRIALOUDNESSREADOUT (LEDGER SR866): a range's integrated loudness through render (named tail block) ----
+
+/// STRIALOUDNESSREADOUT (SR866): the PCM-only sink (MixMeters' shape) feeding ONE `audio_core::meter::Loudness` built
+/// at the first PCM's rate and channel count (`render` fixes both for the whole range).
+#[derive(Debug, Default)]
+struct LoudnessSink {
+    l: Option<gneiss_pal::dsp::audio::meter::Loudness>,
+}
+
+impl RenderSink for LoudnessSink {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {}
+    fn pcm(&mut self, _out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        self.l.get_or_insert_with(|| gneiss_pal::dsp::audio::meter::Loudness::new(rate, channels as usize)).push(interleaved);
+    }
+}
+
+/// STRIALOUDNESSREADOUT (SR866): the BS.1770 integrated loudness (LUFS) of `range` of `tl` as [`render`] mixes it (the
+/// PCM an export of that range sends); `None` when the range sent no PCM (no audio track, or no audio in its sources).
+pub fn loudness(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources) -> Result<Option<f64>, RenderError> {
+    let mut sink = LoudnessSink::default();
+    render(tl, range, sources, &mut sink)?;
+    Ok(sink.l.map(|l| l.integrated()))
+}
