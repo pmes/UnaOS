@@ -4188,3 +4188,43 @@ fn striagainenvdrag_keys_free() {
     }
     println!("striagainenvdrag: chords {:?}", chords);
 }
+
+// ---- STRIAGAINENVDEL (LEDGER SR9110): a Shift-click removes an envelope point, a dragged one snaps (named tail block) ----
+/// M3: on A1's A[13,23)@0 with points (18, -6 dB) and (22, 0 dB): a Shift-click on the first dot (timeline tick 5) is ONE
+/// commit removing it with the note; undone, with the playhead at 7 a plain drag of that dot to x_of(6) + 3 snaps to the
+/// playhead (source 20, timeline 7) and an Alt drag to the same spot does not (source 19, timeline 6); undo restores.
+#[test]
+fn striagainenvdel_face_delete_and_snap() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("env -6"));
+    face.state.seek(9);
+    assert!(face.verb("env 0"));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(18, -600), (22, 0)]);
+    let (x, y) = striagainenvdrag_point(&face, 1, 5);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+    assert_ne!(face.dragging().map(|d| d.kind), Some(DragKind::GainEnv), "Shift is not the envelope drag");
+    face.on(&nle3eslipdrag_btn(false, x, y, bandy::MOD_SHIFT));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(22, 0)]);
+    assert_eq!((face.state.undo_depth(), face.last_error.as_deref(), face.note.as_deref()), (3, None, Some("env: removed at 5, 1 points")));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(18, -600), (22, 0)]);
+    face.state.seek(7);
+    let to = face.layout().x_of(6) as f64 + 3.0;
+    for (mods, pts, note) in [(0u8, [(20i64, -600i32), (22, 0)], "env: -6.0 dB at 7, 2 points"), (bandy::MOD_ALT, [(19, -600), (22, 0)], "env: -6.0 dB at 6, 2 points")] {
+        face.on(&nle3eslipdrag_btn(true, x, y, mods));
+        assert_eq!(face.dragging().map(|d| (d.kind, d.snap)), Some((DragKind::GainEnv, mods == 0)), "mods {mods}");
+        face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+        face.on(&nle3eslipdrag_btn(false, to, y, mods));
+        assert_eq!(face.state.selected().unwrap().gain_env.points(), &pts, "mods {mods}");
+        assert_eq!((face.state.undo_depth(), face.note.as_deref()), (3, Some(note)), "mods {mods}");
+        assert!(face.verb("undo"));
+    }
+    for _ in 0..2 {
+        assert!(face.verb("undo"));
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("striagainenvdel face: Shift-click on (18) removes it; drag to x_of(6)+3 -> 20 snapped to the playhead, Alt -> 19");
+}

@@ -440,7 +440,7 @@ impl Face {
         self.pointer = Some((x, y));
         let Some(mut d) = self.drag.take() else { return self.click(x, y) };
         d.update(&self.state, x, y);
-        if !d.moved() {
+        if !d.moved() { if let Some(r) = self.release_gain_env_del(&d) { return r; } // STRIAGAINENVDEL (SR9110): a Shift-click on an envelope point removes it (file tail)
             return if d.additive { true } else { self.click(x, y) };
         }
         if d.kind == DragKind::Scrub {
@@ -3228,7 +3228,7 @@ impl Face {
         if mods & (bandy::MOD_SHIFT | bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0 {
             return None;
         }
-        let d = Drag::begin_gain_env(&self.state, self.layout(), x, y)?;
+        let mut d = Drag::begin_gain_env(&self.state, self.layout(), x, y)?; d.snap = mods & bandy::MOD_ALT == 0; // STRIAGAINENVDEL (SR9110): the one press rule: Alt turns the envelope snap off
         self.drag = Some(d);
         Some(true)
     }
@@ -3243,5 +3243,22 @@ impl Face {
     fn gain_env_drag_note(&mut self, land: Option<(i64, i32)>) {
         let (Some((s, v)), Some(c)) = (land, self.state.selected()) else { return };
         self.note = Some(format!("env: {} at {}, {} points", db_words(v), c.at + (s - c.src_in), c.gain_env.points().len()));
+    }
+}
+
+// ---- STRIAGAINENVDEL (LEDGER SR9110): a Shift-click on an envelope point removes it (named tail block) ----
+// The unmoved release of a Shift press on a point of the selected audio clip's painted envelope (timeline_core's
+// `Drag::gain_env_removal`) is ONE `set_selected_gain_env` of the envelope without it; the NOTE reads `env: removed at
+// <tick>, <n> points` (the point's timeline tick, the points left); a refusal stays `drag: <EditError>` on `last_error`.
+impl Face {
+    /// The release was a Shift-click on an envelope point (`Some(true)`, committed or refused); `None` for any other.
+    fn release_gain_env_del(&mut self, d: &Drag) -> Option<bool> {
+        let (env, s) = d.gain_env_removal(&self.state)?;
+        let c = self.state.selected()?;
+        match self.state.set_selected_gain_env(env) {
+            Ok(()) => self.note = Some(format!("env: removed at {}, {} points", c.at + (s - c.src_in), env.points().len())),
+            Err(e) => self.last_error = Some(format!("drag: {e}")),
+        }
+        Some(true)
     }
 }
