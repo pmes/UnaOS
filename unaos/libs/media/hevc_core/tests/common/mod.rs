@@ -334,9 +334,8 @@ impl CabacEnc {
     }
     /// A 2^log2 coding unit with pcm_flag 1 (its quadtree split flag `split_inc` 0 coded first) holding `y` / `cb` /
     /// `cr` samples (row-major), the engine restarted after them.
-    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u8], cb: &[u8], cr: &[u8]) {
-        let w = |p: &[u8]| p.iter().map(|&v| v as u16).collect::<Vec<u16>>();
-        self.pcm_cu_bits(split_inc, log2, 8, 8, &w(y), &w(cb), &w(cr));
+    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
+        self.pcm_cu_bits(split_inc, log2, 8, 8, y, cb, cr);
     }
     /// HEVCMAIN10 (SR311): [`CabacEnc::pcm_cu`] with PcmBitDepthY / PcmBitDepthC of `luma_bits` / `chroma_bits`.
     pub fn pcm_cu_bits(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
@@ -1307,4 +1306,38 @@ pub fn p_slice(poc: u32, neg: Vec<(i32, bool)>) -> SliceCfg {
 
 pub fn picture(cfg: &SliceCfg, body: impl FnOnce(CabacEnc) -> Vec<u8>) -> Vec<u8> {
     nal(cfg.nal_type, &body(CabacEnc::new(slice_header(cfg), init_type(cfg.slice_type), 26)))
+}
+
+// ---- HEVCTESTKITBBODY (LEDGER SR833): the B-body writers, one copy in the kit (named tail block) ----
+
+/// SR833 (moved from tests/inter.rs with [`bi_body`]): [`bi_body`] with ref_idx `refs` (L0, L1) of `n` active references
+/// per list: CTB 0 a 2Nx2N AMVP unit, PRED_BI, L0 mvd `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion.
+pub fn bi_ref_body(mut e: CabacEnc, n: u32, refs: [u32; 2], m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
+    e.split_cu(0, false);
+    e.cu_skip(0, false);
+    e.pred_inter();
+    e.part_mode_2nx2n();
+    e.merge_flag(false);
+    e.pred_bi(0);
+    for (r, mv) in refs.into_iter().zip([m0, m1]) {
+        e.ref_idx(r, n);
+        e.mvd(mv);
+        e.mvp_flag(0);
+    }
+    e.rqt_root_cbf(false);
+    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
+        e.terminate(0);
+        e.split_cu(0, false);
+        e.cu_skip(inc, true);
+        if last {
+            break;
+        }
+    }
+    e.finish().out
+}
+
+/// One B picture's slice data: CTB 0 a 2Nx2N AMVP unit, PRED_BI, ref_idx 0 in both lists of `n` active references, L0 mvd
+/// `m0`, L1 mvd `m1` (mvp 0, so mv = mvd); CTBs 1..3 skip-merge its motion. [`bi_ref_body`] at refs (0, 0): the same bins.
+pub fn bi_body(e: CabacEnc, n: u32, m0: [i32; 2], m1: [i32; 2]) -> Vec<u8> {
+    bi_ref_body(e, n, [0, 0], m0, m1)
 }
