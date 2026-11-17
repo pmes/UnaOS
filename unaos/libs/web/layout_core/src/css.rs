@@ -538,7 +538,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             match (row, col) {
                 (Some(r), Some(c)) => {
                     style.row_gap = Some(r);
-                    style.column_gap = Some(c);
+                    style.column_gap = Some(c); if let Some(g) = parts.get(1).or(parts.first()).and_then(|v| col_gap_of(v, cx)) { style.paint.col_gap = Some(g) }
                 }
                 _ => H::record_css(&format!("gap-value:{}", clip(value))),
             }
@@ -550,11 +550,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "column-gap" | "grid-column-gap" => {
             // AETHERSTYLE3 (SR103): the multicol gutter too (css-multicol-1 §4.1; `normal` = 1em there).
             if prop == "column-gap" {
-                if let Some(px) = parse_px(value, cx).filter(|_| !value.ends_with('%')) {
-                    style.paint.col_gap = Some(Some(px));
-                } else if value == "normal" {
-                    style.paint.col_gap = Some(None);
-                }
+                if let Some(g) = col_gap_of(value, cx) { style.paint.col_gap = Some(g) }
             }
             apply_column_gap(value, style, cx);
         }
@@ -4362,4 +4358,17 @@ fn gap_length(value: &str, cx: &ParseCx) -> Option<LengthPercentage> {
         return Some(LengthPercentage::length(0.0));
     }
     parse_length_percentage_str(value, cx)
+}
+
+// ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the multicol gutter value of a gap token (named tail block) ----
+
+/// The multicol gutter (`PaintStyle::col_gap`) for one `column-gap` value or the `gap` / `grid-gap` shorthand's
+/// column token (css-multicol-1 §4.1, css-align-3 §8.3): `normal` is Some(None) (1em, SR1016); a length that is not a
+/// percentage is Some(Some(px)); anything else is None (the gutter is left untouched).
+fn col_gap_of(value: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = value.trim();
+    if v == "normal" {
+        return Some(None);
+    }
+    parse_px(v, cx).filter(|_| !v.ends_with('%')).map(Some)
 }

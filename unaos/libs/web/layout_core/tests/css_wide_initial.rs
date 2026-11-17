@@ -1151,3 +1151,46 @@ fn gap_normal_multicol_unchanged() {
     let s = styled(&[("column-count", "2"), ("column-gap", "40px"), ("column-gap", "normal")]);
     assert_eq!(s.paint.col_gap, Some(None), "in one block too");
 }
+
+// ---- AETHERCSSGAPSHORTHANDMULTICOL (LEDGER SR1079): the gap shorthand writes the multicol gutter (named tail block) ----
+
+/// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): `gap` / `grid-gap` is the shorthand for `row-gap` + `column-gap`
+/// (css-align-3 §8.3) and `column-gap` is the multicol gutter (css-multicol-1 §4.1), so the shorthand's column token
+/// writes `PaintStyle::col_gap` through `col_gap_of`: a px length is Some(Some(px)), `normal` Some(None) (1em), a
+/// percentage leaves it untouched; `row-gap` never touches it.
+#[test]
+fn gap_shorthand_multicol_col_gap() {
+    let mc = |v: &str| styled(&[("column-count", "2"), ("gap", v)]);
+    assert_eq!(styled(&[("column-count", "2")]).paint.col_gap, None, "no gap: the gutter is unset (armed)");
+    assert_eq!(mc("24px").paint.col_gap, Some(Some(24.0)), "gap: 24px is the 24px gutter");
+    let s = mc("10px 24px");
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "gap: 10px 24px: the COLUMN token");
+    assert_eq!(s.row_gap, styled(&[("row-gap", "10px")]).row_gap, "gap: 10px 24px: row gap 10px");
+    let s = styled(&[("column-count", "2"), ("grid-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "grid-gap: 24px, the alias");
+    assert_eq!(mc("5px normal").paint.col_gap, Some(None), "gap: 5px normal: the explicit normal (1em)");
+    let s = mc("10%");
+    assert_eq!(s.paint.col_gap, None, "gap: 10%: the gutter is untouched");
+    assert!(s.column_gap.is_some(), "gap: 10%: the flex / grid gap takes the percentage");
+    let s = styled(&[("column-count", "2"), ("row-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, None, "row-gap never writes the gutter");
+    let s = styled(&[("column-count", "2"), ("column-gap", "24px")]);
+    assert_eq!(s.paint.col_gap, Some(Some(24.0)), "column-gap: 24px reads back through the helper");
+    let s = cascade(&[&[("column-count", "2"), ("column-gap", "40px")], &[("gap", "normal")]]);
+    assert_eq!(s.paint.col_gap, Some(None), "a later gap: normal is the explicit normal across rules");
+}
+
+/// AETHERCSSGAPSHORTHANDMULTICOL (SR1079): the multicol road reads the shorthand's gutter: a 410px two-column box at
+/// 20px under `gap: 30px` lays a 30px gutter (1em = 20px without it).
+#[test]
+fn gap_shorthand_multicol_used_gap() {
+    let gap = |rules: &[&[(&str, &str)]]| {
+        let doc = page(vec![el("div", &[("id", "mc")], (0..4).map(|_| el("div", &[("style", "height: 20px")], vec![])).collect())]);
+        let mc = doc.by_id("mc");
+        let tree = lay_styled(&doc, &Sheet(vec![(mc.id, std::rc::Rc::new(cascade(rules)))]), 800.0, 600.0);
+        tree.multicol[&id_of(&tree, &mc)].gap
+    };
+    let base: &[(&str, &str)] = &[("width", "410px"), ("column-count", "2"), ("font-size", "20px")];
+    assert_eq!(gap(&[base]), 20.0, "no gap: 1em (armed)");
+    assert_eq!(gap(&[base, &[("gap", "30px")]]), 30.0, "gap: 30px is the 30px gutter");
+}
