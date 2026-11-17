@@ -186,8 +186,8 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator)
+        [w @ ("kind" | "ease" | "dur" | "gap"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -530,6 +530,7 @@ fn transport() -> TetraNode {
         button("zoom-fit", "Fit"), button("zoom-sel", "Fit Sel"), // STRIAZOOMTOFIT (SR859): fit the timeline / the selection in the window
         button("xfade", "Xfade"), button("tc", "TC"), // STRIATIMECODEDISPLAY (SR872): the playhead readout off / timecode / frames / seconds
         button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
+        button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1121,5 +1122,30 @@ mod striacopypaste_tests {
         let words: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
         assert_eq!(words[words.len() - 4..], ["copy", "cut", "paste", "help"]);
         println!("striacopypaste witness: V1 {:?}", v1.last());
+    }
+}
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): the witness's close-gaps button word and `gap:<n>` token (named tail block) ----
+#[cfg(test)]
+mod striagapclose_tests {
+    use super::*;
+
+    /// `close-gaps` (the Close Gaps button's word) closes V1's 20..25 gap; `gap:5` opens 5 ticks at the playhead (inside B:
+    /// a split), each the timeline_core op by hand; the button is in the transport row before help.
+    #[test]
+    fn striagapclose_witness_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,close-gaps").is_empty());
+        let closed = tl0.close_gaps(0).unwrap();
+        assert_eq!(face.state.timeline, closed);
+        assert_eq!(face.state.timeline.tracks[0].clips[2].at, 20);
+        assert!(drive(&mut face, "gap:5").is_empty());
+        assert_eq!(face.state.timeline, closed.insert_gap(0, 12, 5).unwrap());
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        assert_eq!(&ids[ids.len() - 2..], ["close-gaps".to_string(), "help".to_string()]);
+        println!("striagapclose witness: close-gaps -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }

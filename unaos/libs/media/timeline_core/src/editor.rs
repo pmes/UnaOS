@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1463,4 +1463,53 @@ mod striacopypaste_tests {
         assert_eq!((st.timeline == tl0, st.undo_depth()), (true, 0));
         assert_eq!(st.verb("copyx"), None);
     }
+}
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): close-gaps / gap <n> from the editor through the one commit (named tail block) ----
+// `close-gaps` closes every gap on the selected clip's track (`Timeline::close_gaps`, the leading gap included); `gap <n>`
+// opens `n` ticks of gap at the playhead on that track (`Timeline::insert_gap`). They ride THE verb dispatch both faces call;
+// each is ONE `commit` (one undo step), an equal value commits nothing, nothing selected is `EditError::NoClip`. After a
+// `gap` that split a clip, the selected indices past it on that track step by one, so the selection follows its clip.
+impl EditorState {
+    /// Close every gap on the selected clip's track (one commit; no gap commits nothing).
+    pub fn close_gaps(&mut self) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.close_gaps(track)?;
+        if tl != self.timeline {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+    /// Open `n` ticks of gap at the playhead on the selected clip's track (one commit).
+    pub fn insert_gap(&mut self, n: i64) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let ph = self.playhead;
+        let split = self.timeline.tracks.get(track).and_then(|t| t.clips.iter().position(|c| c.at < ph && ph < c.end()));
+        let tl = self.timeline.insert_gap(track, ph, n)?;
+        self.commit(tl);
+        if let Some(s) = split {
+            for p in self.set.iter_mut().chain(self.selection.iter_mut()).filter(|p| p.0 == track && p.1 > s) {
+                p.1 += 1;
+            }
+        }
+        Ok(())
+    }
+    /// The `close-gaps` / `gap <n>` words of [`EditorState::verb`]; `None` when `v` is neither.
+    fn gap_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match gap_words(v)? {
+            None => self.close_gaps(),
+            Some(n) => self.insert_gap(n),
+        })
+    }
+}
+
+/// `close-gaps` -> `Some(None)`, `gap <n>` (n an unsigned 32-bit count) -> `Some(Some(n))`; any other shape is not this verb.
+fn gap_words(v: &str) -> Option<Option<i64>> {
+    let mut w = v.split_ascii_whitespace();
+    let n = match w.next()? {
+        "close-gaps" => None,
+        "gap" => Some(i64::from(w.next()?.parse::<u32>().ok()?)),
+        _ => return None,
+    };
+    w.next().is_none().then_some(n)
 }

@@ -4999,3 +4999,33 @@ fn striacopypaste_face_refusals_name_the_error() {
     assert_eq!(face.state.timeline, tl);
     println!("striacopypaste: paste over a clip -> paste: {}", EditError::Overlap);
 }
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): close-gaps / gap <n> on the host face through the one dispatch (named tail block) ----
+
+/// The synth fixture's V1 (A@0, B@10, A@25: a gap 20..25): `close-gaps` (the Close Gaps button's word) closes it through
+/// `Face::verb`'s fall-through into timeline_core's `EditorState::verb` (ONE commit; undo restores), `gap 5` opens 5 ticks at
+/// the playhead; `close-gaps` sits right before `help` in VERBS; with nothing selected the refusal is named on the message line.
+#[test]
+fn striagapclose_face_words_ride_the_one_dispatch() {
+    let i = VERBS.iter().position(|&v| v == "close-gaps").expect("close-gaps in VERBS");
+    assert_eq!(VERBS[i + 1], "help");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("close-gaps"));
+    assert_eq!(face.last_error.take(), Some(format!("close-gaps: {}", EditError::NoClip)));
+    assert_eq!(face.state.timeline, tl);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("close-gaps"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.close_gaps(0).unwrap());
+    assert_eq!(face.state.timeline.tracks[0].clips[2].at, 20);
+    assert_eq!(face.state.timeline.tracks[1], tl.tracks[1]);
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.seek(10);
+    assert!(face.verb("gap 5"));
+    assert_eq!(face.state.timeline, tl.insert_gap(0, 10, 5).unwrap());
+    assert_eq!(face.state.timeline.tracks[0].clips[1].at, 15);
+    println!("striagapclose: VERBS[{i}] = close-gaps; V1 after gap 5 at 10: {:?}", face.state.timeline.tracks[0].clips);
+}
