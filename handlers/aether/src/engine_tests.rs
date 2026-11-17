@@ -7967,4 +7967,23 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "hp", "fontSize"), "20px", "a hidden div the same");
         assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
     }
+
+    // ---- AETHERTABLEALIGN (LEDGER SR1071): a table's align= is auto margins / float, never text-align (named tail block) ----
+
+    /// AETHERTABLEALIGN (SR1071): `<table align=center>` centres the table BOX (HTML rendering §15.3.11: the two auto
+    /// margins) and leaves its cells' text alone: getBoundingClientRect left 100 in a 400px body (it was 0) and the
+    /// cell's computed text-align `start` (it was `-webkit-center`).
+    #[test]
+    fn table_align_center_box_not_text() {
+        let html = r#"<!doctype html><html><body style="margin: 0"><table id="t" align="center" style="width: 200px; border-spacing: 0"><tr><td id="c">cell</td></tr></table></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let left = js_num(&mut engine, "document.getElementById('t').getBoundingClientRect().left");
+        let width = js_num(&mut engine, "document.getElementById('t').getBoundingClientRect().width");
+        assert_eq!((left, width), (100.0, 200.0), "align=center: the 200px table box is centred in the 400px body");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('c')).textAlign").unwrap();
+        assert_eq!(ta, "start", "align=center sets no text-align on the table's cells");
+    }
 }

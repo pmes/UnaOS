@@ -567,3 +567,109 @@ fn center_restyle_undoes_rule_align_items() {
     assert_eq!(justify(&tree, &row, "row"), JustifyContent::CENTER, "an author justify-content: center folded by the restyle is kept");
 }
 }
+
+// ---- AETHERTABLEALIGN (LEDGER SR1071): a table's align= is auto margins / float, never text-align (named tail block) ----
+
+const TW: f32 = 400.0;
+
+/// AETHERTABLEALIGN (SR1071): a one-cell table with the given attributes (`#t`, cell `#c` holding "cell") in a 400px body.
+fn align_table(attrs: &[(&'static str, &str)]) -> Spec {
+    let mut a = vec![("id", "t")];
+    a.extend_from_slice(attrs);
+    el("table", &a, vec![el("tr", &[], vec![el("td", &[("id", "c")], vec![text("cell")])])])
+}
+
+fn table_paint(tree: &Tree, doc: &N, id: &str) -> layout_core::PaintStyle<TH> {
+    tree.paint_map.get(&id_of(tree, &doc.by_id(id))).cloned().unwrap_or_default()
+}
+
+/// AETHERTABLEALIGN (SR1071): HTML rendering §15.3.11: `<table align=center>` is the two auto margins, so the BOX centres
+/// (an author-width table and a shrink-to-fit one; before SR1071 both sat at x 0) and the cells' text is NOT centred (the
+/// table carried text-align 5 and the cell's line sat in the middle of its 200px cell).
+#[test]
+fn table_align_center_centres_the_box_not_the_text() {
+    let doc = page(vec![align_table(&[("align", "center"), ("style", "width: 200px; border-spacing: 0")])]);
+    let tree = lay(&doc, TW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("t"));
+    assert_eq!((x, w), (100.0, 200.0), "align=center: the 200px table box is centred in the 400px body");
+    assert!(matches!(table_paint(&tree, &doc, "t").text_align, None | Some(0)), "align=center sets no text-align on a table (the fixture is quirks mode: the table quirk's 0)");
+    let il = &tree.inline[&id_of(&tree, &doc.by_id("c"))];
+    let (tx, tw) = il
+        .frags
+        .iter()
+        .find_map(|f| match f {
+            layout_core::inline::Frag::Text { x, width, .. } => Some((*x, *width)),
+            _ => None,
+        })
+        .expect("the cell's text line");
+    assert!(tw > 0.0 && tw < 150.0, "the cell's text is narrower than the cell ({tw})");
+    assert!(tx < 2.0, "the cell's text starts at the cell's content start, not centred (x {tx})");
+
+    let doc = page(vec![align_table(&[("align", "center")])]);
+    let tree = lay(&doc, TW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("t"));
+    assert!(w > 0.0 && w < TW - 100.0, "a shrink-to-fit table is narrower than the body ({w})");
+    assert!((x + w / 2.0 - TW / 2.0).abs() < 0.5, "align=center: the shrink-to-fit table is centred (x {x} w {w})");
+
+    let doc = page(vec![align_table(&[("style", "margin: 0 auto")])]);
+    let tree = lay(&doc, TW, 400.0);
+    let (x, _, w, _) = box_of(&tree, &doc.by_id("t"));
+    assert!(w > 0.0 && w < TW - 100.0 && (x + w / 2.0 - TW / 2.0).abs() < 0.5, "an author margin: 0 auto shrink-to-fit table centres (x {x} w {w})");
+}
+
+/// AETHERTABLEALIGN (SR1071): align=right / left are `float: right` / `float: left` through the float arm's own road: the
+/// box sits at the edge and a following block is placed exactly as under the author float (no wrap among block siblings:
+/// the float road's IFC-only limit). align=middle is nothing for a table.
+#[test]
+fn table_align_left_right_float() {
+    let p = || el("p", &[("id", "p")], vec![text("after")]);
+    let hint = page(vec![align_table(&[("align", "right"), ("style", "width: 200px; border-spacing: 0")]), p()]);
+    let author = page(vec![align_table(&[("style", "float: right; width: 200px; border-spacing: 0")]), p()]);
+    let (th, ta) = (lay(&hint, TW, 400.0), lay(&author, TW, 400.0));
+    let (x, _, w, _) = box_of(&th, &hint.by_id("t"));
+    assert_eq!((x, w), (200.0, 200.0), "align=right: the table box sits at the right edge");
+    assert_eq!(table_paint(&th, &hint, "t").float, Some(2), "align=right is float: right");
+    assert!(matches!(table_paint(&th, &hint, "t").text_align, None | Some(0)), "align=right sets no text-align on a table (the fixture is quirks mode: the table quirk's 0)");
+    assert_eq!(box_of(&th, &hint.by_id("t")), box_of(&ta, &author.by_id("t")), "align=right: the table as under float: right");
+    assert_eq!(box_of(&th, &hint.by_id("p")), box_of(&ta, &author.by_id("p")), "align=right: the following p as under float: right");
+
+    let doc = page(vec![align_table(&[("align", "left"), ("style", "width: 200px; border-spacing: 0")]), p()]);
+    let tree = lay(&doc, TW, 400.0);
+    assert_eq!(box_of(&tree, &doc.by_id("t")).0, 0.0, "align=left: the table box sits at the left edge");
+    assert_eq!(table_paint(&tree, &doc, "t").float, Some(1), "align=left is float: left");
+    assert!(matches!(table_paint(&tree, &doc, "t").text_align, None | Some(0)), "align=left sets no text-align on a table (the fixture is quirks mode: the table quirk's 0)");
+
+    let doc = page(vec![align_table(&[("align", "middle"), ("style", "width: 200px; border-spacing: 0")])]);
+    let tree = lay(&doc, TW, 400.0);
+    assert_eq!(box_of(&tree, &doc.by_id("t")).0, 0.0, "align=middle: nothing for a table");
+    assert!(matches!(table_paint(&tree, &doc, "t").text_align, None | Some(0)), "align=middle sets no text-align on a table (the fixture is quirks mode: the table quirk's 0)");
+    assert_eq!(table_paint(&tree, &doc, "t").float, None, "align=middle is no float");
+}
+
+/// AETHERTABLEALIGN (SR1071): the hint is the lowest-priority source: an author `margin-left: 0` beats it (x 0); the
+/// `<div align=center>` road (text-align -webkit-center) and the caption's align= (caption-side, UA -webkit-center)
+/// are unchanged; an rtl `<table align=center>` is still centred (taffy's auto margins outrank SR711's align-self END).
+#[test]
+fn table_align_css_wins_div_caption_rtl() {
+    let doc = page(vec![align_table(&[("align", "center"), ("style", "margin-left: 0; width: 200px; border-spacing: 0")])]);
+    let tree = lay(&doc, TW, 400.0);
+    assert_eq!(box_of(&tree, &doc.by_id("t")).0, 0.0, "style=\"margin-left: 0\" beats align=center");
+
+    let doc = page(vec![el("div", &[("id", "d"), ("align", "center")], vec![text("ab")])]);
+    let tree = lay(&doc, TW, 400.0);
+    assert_eq!(table_paint(&tree, &doc, "d").text_align, Some(5), "<div align=center> keeps -webkit-center");
+
+    let doc = page(vec![el(
+        "table",
+        &[("id", "t")],
+        vec![el("caption", &[("id", "cap"), ("align", "bottom")], vec![text("cap")]), el("tr", &[], vec![el("td", &[], vec![text("cell")])])],
+    )]);
+    let tree = lay(&doc, TW, 400.0);
+    let cap = table_paint(&tree, &doc, "cap");
+    assert_eq!((cap.text_align, cap.caption_side), (Some(5), Some(true)), "<caption align=bottom>: caption-side bottom, the UA -webkit-center");
+
+    let doc = page(vec![el("div", &[("dir", "rtl")], vec![align_table(&[("align", "center"), ("style", "width: 200px; border-spacing: 0")])])]);
+    let tree = lay(&doc, TW, 400.0);
+    assert_eq!(box_of(&tree, &doc.by_id("t")).0, 100.0, "rtl: align=center still centres the table box");
+}
+
