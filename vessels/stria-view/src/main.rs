@@ -987,8 +987,9 @@ mod exportjsonschema_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// NLEFACEEXPORTJSONSCHEMA (SR1106): a single-pass hold at 3 of 35 emits done / total / audio / eta_secs (done >= 1, so
-    /// the eta is known; no pass keys), a stalled_secs only past the stall rule, each key in `EXPORT_JSON_KEYS`' order.
+    /// NLEFACEEXPORTJSONSCHEMA (SR1106): a fresh single-pass job emits done / total / audio (no pass keys), a stalled_secs only
+    /// past the stall rule, each key in `EXPORT_JSON_KEYS`' order. NLEFACEEXPORTJSONZERO (SR1110): read at the k = 0 hold (before
+    /// the first frame, done 0, so no eta yet): exactly the three keys, where SR1106 held at 3 and had to accept eta_secs.
     #[test]
     fn nlefaceexportjsonschema_fresh_single_pass_keys() {
         use std::time::{Duration, Instant};
@@ -998,19 +999,18 @@ mod exportjsonschema_tests {
         let (tl, src) = nle_face::synth_fixture();
         let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         let start = Instant::now();
-        face.export_paused_at(&dir, "png", 3).unwrap();
-        while face.export_progress() != Some((3, 35)) {
-            assert!(start.elapsed() < Duration::from_secs(60), "reading {:?}", face.export_progress());
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::thread::sleep(Duration::from_millis(2));
         let j = export_json(&face);
         let keys = keys_of(&j);
-        let fresh = ["done", "total", "audio", "eta_secs"];
+        let fresh = ["done", "total", "audio"];
         if start.elapsed() < Duration::from_secs(4) {
             assert_eq!(keys, fresh, "{j}");
         } else {
-            assert!(keys == fresh || keys == ["done", "total", "audio", "eta_secs", "stalled_secs"], "{j}");
+            assert!(keys == fresh || keys == ["done", "total", "audio", "stalled_secs"], "{j}");
         }
         let at: Vec<usize> = keys.iter().map(|k| EXPORT_JSON_KEYS.iter().position(|e| e == k).unwrap_or_else(|| panic!("{k} not in EXPORT_JSON_KEYS: {j}"))).collect();
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{j}: out of EXPORT_JSON_KEYS order");
@@ -1030,5 +1030,42 @@ mod exportjsonschema_tests {
         assert_eq!(sorted.len(), 7, "a key listed twice");
         let line = r#","export":{"done":50,"total":70,"audio":"wav","pass":2,"passes":2,"eta_secs":3,"stalled_secs":6}"#;
         assert_eq!(keys_of(line), EXPORT_JSON_KEYS);
+    }
+}
+
+// ---- NLEFACEEXPORTJSONZERO (LEDGER SR1110): the witness's three-key export line before the first frame (named tail block) ----
+// `Face::start_export`'s progress closure is called once with reading 0 before the first frame, so `export_paused_at(.., 0)`
+// holds there: the line a page sees for the whole first frame of a real export (done 0, no eta: `eta_of` guards 0) is pinned.
+
+#[cfg(test)]
+mod exportjsonzero_tests {
+    use super::*;
+
+    /// NLEFACEEXPORTJSONZERO (SR1110): a job held at k = 0 of 35 reads `,"export":{"done":0,"total":35,"audio":"wav"}` byte for
+    /// byte (read fresh, under SR825's stall window), has written no frame, and the object is gone once it is cancelled and joined.
+    #[test]
+    fn nlefaceexportjsonzero_three_key_line_byte_exact() {
+        use std::time::{Duration, Instant};
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nlefaceexportjsonzero-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let start = Instant::now();
+        face.export_paused_at(&dir, "png", 0).unwrap();
+        while start.elapsed() < Duration::from_millis(250) {
+            assert_eq!(face.export_progress(), Some((0, 35)), "the k = 0 hold keeps the reading at 0");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let j = export_json(&face);
+        assert!(start.elapsed() < Duration::from_secs(4), "read under the stall window");
+        assert_eq!(j, r#","export":{"done":0,"total":35,"audio":"wav"}"#);
+        let written = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(written, 0, "held before the first frame: no frame file in {}", dir.display());
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nlefaceexportjsonzero witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
