@@ -688,5 +688,18 @@ fn dur_count(s: &str, fps: Option<u32>) -> Result<i64, ()> {
     if let Ok(n) = s.parse::<i64>() {
         return Ok(n);
     }
-    fps.and_then(|f| edl::parse_tc(s, f, 0).ok()).ok_or(())
+    fps.and_then(|f| edl::parse_tc(&dur_tc_full(s), f, 0).ok()).ok_or(())
+}
+
+// ---- STRIATRANSITIONNEXT (LEDGER SR991): `dur` short timecode forms (named tail block) ----
+// `dur SS:FF` and `dur MM:SS:FF` (every field exactly two ASCII digits) are padded with `00:` fields to the four-field
+// form, which THE one parser `edl::parse_tc` then reads with its own limits (SS / MM < 60, FF < fps). Any other text
+// passes through unchanged, so the full `HH:MM:SS:FF` form and the refusals are parse_tc's as before.
+/// `s` padded to `HH:MM:SS:FF` when it is a two- or three-field short form of two-digit fields; else `s` itself.
+fn dur_tc_full(s: &str) -> String {
+    let p: Vec<&str> = s.split(':').collect();
+    if (2..=3).contains(&p.len()) && p.iter().all(|x| x.len() == 2 && x.bytes().all(|b| b.is_ascii_digit())) {
+        return format!("{}{s}", "00:".repeat(4 - p.len()));
+    }
+    s.to_string()
 }

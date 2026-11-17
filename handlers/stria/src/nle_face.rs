@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub note: Option<String>, // STRIATRANSITIONNEXT (SR991): the message row's success note, after `last_error`; cleared by `clear_note` (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2360,7 +2361,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3095,5 +3096,61 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIATRANSITIONNEXT (LEDGER SR991): the new transition length on the message row (named tail block) ----
+// A successful length change of the selected transition (`dur ...`, `[` / `]` by button, witness or key: one road through
+// `Face::verb`) sets the face `note` `transition: HH:MM:SS:FF (<n> ticks)` (`edl::timecode` at the timeline's fps;
+// `transition: <n> ticks` off a 1/fps time base). `message_text` reads it after `last_error`; a refusal stays the error.
+// `clear_note` drops it on the next taken command input (an Input, a click, a press, select-all, a named key, a typed
+// character); a move, a release, the wheel, a zoom and a resize keep it. The length ops are unchanged:
+// `transition_verb` (`set_transition_dur`) and `EditorState::verb` (`dur`). Owed: NLE-TRANSITION-LENGTH-NOTE-DRAG (the
+// edge drag's release sets no note), NLE-TRANSITION-LENGTH-KERNEL (the Player selects no transition).
+
+impl Face {
+    /// Drop the note on a taken command input; a move, release, wheel, zoom or resize keeps it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let clears = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() != 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if clears {
+            self.note = None;
+        }
+    }
+    /// `[`, `]` or `dur ...` with a transition selected: the length change through its one road, then the note on success.
+    /// `None` with no transition selected or any other verb (the caller's roads, refusals included, as before).
+    fn transition_len_verb(&mut self, v: &str) -> Option<bool> {
+        self.state.selected_transition()?;
+        let failed = match v {
+            "[" | "]" => {
+                let e0 = self.last_error.clone();
+                self.transition_verb(v)?;
+                self.last_error.is_some() && self.last_error != e0
+            }
+            _ if v.split_ascii_whitespace().next() == Some("dur") => match self.state.verb(v)? {
+                Ok(()) => false,
+                Err(e) => {
+                    self.last_error = Some(format!("{v}: {e}"));
+                    true
+                }
+            },
+            _ => return None,
+        };
+        if !failed {
+            self.note = self.transition_note();
+        }
+        Some(true)
+    }
+    /// The selected transition's length as the note's text; `None` with none selected.
+    fn transition_note(&self) -> Option<String> {
+        let n = self.state.selected_transition()?.dur;
+        Some(match self.state.timeline.fps() {
+            Some(f) => format!("transition: {} ({n} ticks)", timeline_core::edl::timecode(n, f)),
+            None => format!("transition: {n} ticks"),
+        })
     }
 }

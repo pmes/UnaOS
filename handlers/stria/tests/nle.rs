@@ -3696,3 +3696,43 @@ fn striatransitionmore_bracket_help_names_the_transition() {
     assert_eq!(face.state.timeline, tl0.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 6).unwrap());
     assert_eq!(face.state.undo_depth(), 1);
 }
+
+// ---- STRIATRANSITIONNEXT (LEDGER SR991): the new transition length on the message row (named tail block) ----
+
+/// M3: a length change of the selected dissolve (`dur 00:00:00:06`, `dur 00:05`, `]`, the `[` key) names the new length on
+/// the message row (`Face::message_text`, the face `note`); a refusal shows the error, not a note; a pointer move keeps
+/// the note, the next command input drops it; with no transition selected there is no note.
+#[test]
+fn striatransitionnext_length_note_on_message_row() {
+    use bandy::SMessage;
+    use stria::nle_face::SURFACE;
+    let input = |t: &str| SMessage::Input { target: SURFACE.into(), text: t.into() };
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.on(&input("dur 6")));
+    assert_eq!(face.last_error.take(), Some(format!("dur 6: {}", timeline_core::EditError::Transition)));
+    assert_eq!(face.note, None, "no transition selected: no note");
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.on(&input("dur 00:00:00:06")));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:06 (6 ticks)"));
+    assert!(face.on(&input("dur 00:05")));
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:05 (5 ticks)"));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(face.on(&input("]")));
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:06 (6 ticks)"));
+    face.on(&SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    assert_eq!(face.note.as_deref(), Some("transition: 00:00:00:06 (6 ticks)"), "a move keeps the note");
+    face.on(&SMessage::BrowserKey("[".into()));
+    assert!(face.on(&SMessage::BrowserText("[".into())));
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:05 (5 ticks)"), "the key road");
+    assert!(face.on(&input("dur 99")));
+    assert_eq!(face.note, None, "a refusal leaves no note");
+    assert_eq!(face.message_text(), Some(format!("dur 99: {}", timeline_core::EditError::Handle)));
+    face.last_error = None;
+    assert!(face.on(&input("dur 7")));
+    assert!(face.note.is_some());
+    face.on(&input("zoom+"));
+    assert_eq!(face.note, None, "the next command input drops the note");
+}

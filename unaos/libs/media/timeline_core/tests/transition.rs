@@ -928,3 +928,42 @@ fn striatransitionmore_dur_timecode() {
     assert_eq!(st.verb("dur 7"), Some(Ok(())));
     assert_eq!(st.timeline.tracks[0].transitions[0].dur, 7);
 }
+
+// ---- STRIATRANSITIONNEXT (LEDGER SR991): `dur` short timecode forms (named tail block) ----
+
+#[test]
+fn striatransitionnext_dur_short_timecode() {
+    let mut st = striatransitionlength_state();
+    let (tl0, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("dur 00:07"), Some(Ok(())));
+    let mut by_ticks = striatransitionlength_state();
+    assert_eq!(by_ticks.verb("dur 7"), Some(Ok(())));
+    assert_eq!(st.timeline, by_ticks.timeline, "`SS:FF` is the same length as the ticks");
+    assert_eq!(st.undo_depth(), depth + 1, "one undo step");
+    assert_eq!(st.verb("dur 00:00:07"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), depth + 1, "the same length by `MM:SS:FF` commits nothing");
+    assert_eq!(st.verb("dur 00:09"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 9);
+    for (v, e) in [
+        ("dur 0:7", EditError::Transition),
+        ("dur 1:00:07", EditError::Transition),
+        ("dur 00:25", EditError::Transition),
+        ("dur 60:00", EditError::Transition),
+        ("dur 00;07", EditError::Transition),
+        ("dur 00:00", EditError::Transition),
+        ("dur 007:01", EditError::Transition),
+        ("dur 01:00", EditError::Handle),
+    ] {
+        let before = st.clone();
+        assert_eq!(st.verb(v), Some(Err(e)), "{v}");
+        assert_eq!(st, before, "{v}");
+    }
+    assert!(st.undo() && st.undo());
+    assert_eq!(st.timeline, tl0);
+    // a time base that is not 1/fps: ticks only
+    let mut tl = cuts().add_transition(0, 20, TransitionKind::Dissolve, 4).unwrap();
+    tl.tb.num = 1001;
+    let mut st = timeline_core::editor::EditorState::new(tl);
+    st.select_transition(0, 0).unwrap();
+    assert_eq!(st.verb("dur 00:07"), Some(Err(EditError::Transition)));
+}
