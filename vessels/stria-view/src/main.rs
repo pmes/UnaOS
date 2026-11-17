@@ -520,7 +520,7 @@ fn transport() -> TetraNode {
         button("mark", "Mark"), button("unmark", "Unmark"), // STRIAMARKERS (SR835): a named marker at the playhead (`M<n>`) / the one there removed
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("marker-", "Marker <"), button("marker+", "Marker >"), button("cut-", "Cut <"), button("cut+", "Cut >"), // STRIAMARKERJUMP (SR894): the playhead to the previous / next marker / clip edge (view words)
-        button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), button("marker marks", "Marker Marks"), // STRIAMARKERRANGES (SR9052): the export marks to the playhead's marker's range; STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
+        button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), button("marker marks", "Marker Marks"), button("export marker", "Export Marker"), button("export markers", "Export Markers"), // STRIAEXPORTRANGE (SR9075): the marker ranges as export-queue entries; STRIAMARKERRANGES (SR9052): the export marks to the playhead's marker's range; STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
         button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
