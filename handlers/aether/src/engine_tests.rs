@@ -8326,4 +8326,28 @@ mod tests {
         assert!((wavy[0] as i64 - tw) < (solid[0] as i64 - ts), "#lw reaches above: {wavy:?} vs {solid:?}");
         assert!((*wavy.last().unwrap() as i64 - tw) > (*solid.last().unwrap() as i64 - ts), "#lw reaches below");
     }
+
+    // ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+    /// AETHERCSSWIDECOLUMNGAPNORMALFLEX (SR1077): two flex rows of two 50px items under `column-gap: 10px`; the second
+    /// row's later rule `column-gap: normal` is the flex gap's 0 (css-align-3 §8.1), so its second item sits at x 50,
+    /// not 60. The first row (no normal) keeps the 10px gap (armed).
+    #[test]
+    fn gap_normal_flex_column_gap_engine() {
+        let html = r#"<!doctype html><html><head><style>
+            .r { display: flex; column-gap: 10px; width: 300px; height: 20px }
+            .r.t { column-gap: normal }
+            .r div { width: 50px; height: 20px; flex: none }
+            </style></head><body style="margin:0">
+            <div id="g" class="r"><div id="g1"></div><div id="g2"></div></div>
+            <div id="t" class="r t"><div id="t1"></div><div id="t2"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let left = |e: &mut crate::AetherEngine, id: &str, c: &str| imgalt_rect(e, id).0 - imgalt_rect(e, c).0;
+        assert!((left(&mut e, "g2", "g") - 60.0).abs() <= 0.5, "column-gap: 10px: x 60 (armed): {}", left(&mut e, "g2", "g"));
+        assert!((left(&mut e, "t2", "t") - 50.0).abs() <= 0.5, "a later column-gap: normal is 0: x 50: {}", left(&mut e, "t2", "t"));
+    }
 }
