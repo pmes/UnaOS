@@ -6270,6 +6270,86 @@ mod tests {
         assert!((wr - 400.0).abs() <= 0.5, "width: unset fills the container: {wr}");
     }
 
+    // ---- AETHERCSSOMINHERITEDRESTREPORT (LEDGER SR842): getComputedStyle reads the resolved white-space / list-style-type (named tail block) ----
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): one probe per row; the rules in a sheet so SR831's inherit bits reach the
+    /// paint map the report reads.
+    fn cssom_inherited_rest_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            pre.w { white-space: inherit }
+            ul ol.i { list-style-type: inherit }
+            li.sq { list-style-type: square }
+            </style></head><body style="margin:0;font:16px serif">
+            <pre id="pre">a  b</pre>
+            <div><pre id="prew" class="w">a  b</pre></div>
+            <div id="nw" style="white-space:nowrap">a b</div>
+            <div id="prex" style="white-space:pre">a  b</div>
+            <div id="pw" style="white-space:pre-wrap">a b</div>
+            <div id="pl" style="white-space:pre-line">a b</div>
+            <div id="bs" style="white-space:break-spaces">a b</div>
+            <textarea id="ta">a</textarea>
+            <nobr id="nb">a b</nobr>
+            <ol id="ol"><li id="olli">a</li></ol>
+            <ul id="ul1"><li><ul id="ul2"><li><ul id="ul3"><li id="ul3li">a</li></ul></li></ul></li></ul>
+            <ul><li><ol id="oli" class="i"><li id="olili">a</li></ol></li></ul>
+            <ul><li id="sq" class="sq">a</li></ul>
+            <ul id="none" style="list-style-type:none"><li>a</li></ul>
+            <ol id="lr" style="list-style-type:lower-roman"><li>a</li></ol>
+            <div id="plain">a</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn cssom_inherited_rest_cs(e: &mut crate::AetherEngine, id: &str, p: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).{p}")).unwrap()
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): white-space reads the paint code the renderer resolves (render/mod.rs's
+    /// or_tag + `default_white_space`): `pre` is `pre` (was `normal`), an explicit `pre` is `pre` (was `nowrap`), SR831's
+    /// `pre { white-space: inherit }` under a normal div reads `normal`, `textarea` pre-wrap, `nobr` nowrap.
+    #[test]
+    fn cssom_inherited_rest_white_space() {
+        let mut e = cssom_inherited_rest_engine();
+        for (id, want) in [
+            ("pre", "pre"), ("prew", "normal"), ("nw", "nowrap"), ("prex", "pre"), ("pw", "pre-wrap"), ("pl", "pre-line"),
+            ("bs", "break-spaces"), ("ta", "pre-wrap"), ("nb", "nowrap"), ("plain", "normal"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, id, "whiteSpace"), want, "#{id}: computed white-space");
+        }
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): list-style-type reads `render::list_style_of` (the code the marker paints):
+    /// `ol` and its item decimal (was disc), `ul ul` circle, `ul ul ul` square, SR831's `ul ol { list-style-type: inherit }`
+    /// the outer ul's disc, a declared square / none / lower-roman, a plain div the initial disc.
+    #[test]
+    fn cssom_inherited_rest_list_style() {
+        let mut e = cssom_inherited_rest_engine();
+        for (id, want) in [
+            ("ol", "decimal"), ("olli", "decimal"), ("ul1", "disc"), ("ul2", "circle"), ("ul3", "square"), ("ul3li", "square"),
+            ("oli", "disc"), ("olili", "disc"), ("sq", "square"), ("none", "none"), ("lr", "lower-roman"), ("plain", "disc"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, id, "listStyleType"), want, "#{id}: computed list-style-type");
+        }
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): the other columns of a plain div read as before the two emits changed.
+    #[test]
+    fn cssom_inherited_rest_other_columns_unchanged() {
+        let mut e = cssom_inherited_rest_engine();
+        for (p, want) in [
+            ("display", "block"), ("position", "static"), ("color", "rgb(0, 0, 0)"), ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ("fontSize", "16px"), ("fontWeight", "400"), ("fontStyle", "normal"), ("lineHeight", "normal"), ("textAlign", "start"),
+            ("textDecorationLine", "none"), ("visibility", "visible"), ("borderTopWidth", "0px"), ("borderTopStyle", "none"),
+            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, "plain", p), want, "#plain: computed {p}");
+        }
+    }
+
     // ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor is inherit; outline's currentColor pinned (named tail block) ----
 
     /// AETHERCSSCOLORCURRENTCOLOR (SR841): one row per probe at 20px serif under a red parent, the rules in a sheet:
