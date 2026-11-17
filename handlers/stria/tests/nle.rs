@@ -4549,3 +4549,80 @@ fn striamarkers_m_key_and_help_row() {
     assert!(HELP.iter().any(|(a, _)| *a == "mark"));
     println!("striamarkers: m marks M1; help row m -> {}", help_phrase("mark"));
 }
+
+// ---- STRIARIPPLETRIM (LEDGER SR850): a Shift drag on the trim handle ripples (named tail block) ----
+
+/// The synth face with V1 made three butted clips (A[13,23)@0 B[0,10)@10 A[38,48)@20 on 50-tick sources; A1 as the
+/// fixture lays it), V1 clip `sel` selected, and the timeline it opened with.
+fn striarippletrim_face(sel: usize) -> (Face, Timeline) {
+    let (mut tl, src) = synth_fixture();
+    tl.tracks[0].clips[2] = Clip::new(SourceId(0), 38, 48, 20);
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, sel).unwrap();
+    (face, tl)
+}
+
+/// Rule: a Shift-press on V1 clip 0's out handle dragged 3 ticks left ripples: V1's clips 1 and 2 each move -3, A1 does
+/// not move (the ripple is ONE track's), ONE undo step restores; the face equals a twin editor's `rtrim out -3`.
+#[test]
+fn striarippletrim_shift_drag_on_the_out_handle_ripples() {
+    let (mut face, tl) = striarippletrim_face(0);
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 - 2.0, l.point(0, 5).1);
+    let dx = -3.0 * l.zoom as f64;
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.idx, d.ripple)), Some((DragKind::TrimOut, 0, true)));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + dx, y, 0));
+    assert_eq!(face.dragging().map(|d| d.delta), Some(-3));
+    face.on(&nle3eslipdrag_btn(false, x + dx, y, bandy::MOD_SHIFT));
+    let mut twin = EditorState::new(tl.clone());
+    twin.select(0, 0).unwrap();
+    assert_eq!(twin.verb("rtrim out -3"), Some(Ok(())));
+    assert_eq!(face.state.timeline, twin.timeline);
+    let ats: Vec<i64> = face.state.timeline.tracks[0].clips.iter().map(|c| c.at).collect();
+    assert_eq!(ats, vec![0, 7, 17], "V1's later clips follow");
+    assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "A1 does not move");
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striarippletrim: Shift-drag -3 on V1 clip 0's out handle = rtrim out -3");
+}
+
+/// Rule: the same drag without Shift is the plain trim: V1's clips 1 and 2 stay (a gap opens).
+#[test]
+fn striarippletrim_plain_drag_leaves_the_gap() {
+    let (mut face, tl) = striarippletrim_face(0);
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 - 2.0, l.point(0, 5).1);
+    nle3eslipdrag_drag(&mut face, x, y, -3.0 * l.zoom as f64, 0);
+    assert_eq!(face.state.timeline, tl.trim_out(0, 0, 20).unwrap(), "A[13,23) out 3 earlier");
+    let ats: Vec<i64> = face.state.timeline.tracks[0].clips.iter().map(|c| c.at).collect();
+    assert_eq!(ats, vec![0, 10, 20], "the neighbours stay");
+    println!("striarippletrim: the plain drag trims and leaves the gap");
+}
+
+/// Rule: a ripple past the source (V1 clip 2's out 48 dragged 3 ticks on a 50-tick source) is refused by name on the
+/// message line through the drag's `{e}` road; the timeline and undo depth do not move.
+#[test]
+fn striarippletrim_refusal_reads_on_the_message_row() {
+    let (mut face, tl) = striarippletrim_face(2);
+    let l = face.layout();
+    let (x, y) = (l.x_of(30) as f64 - 2.0, l.point(0, 25).1);
+    nle3eslipdrag_drag(&mut face, x, y, 3.0 * l.zoom as f64, bandy::MOD_SHIFT | bandy::MOD_ALT);
+    assert_eq!(face.last_error.take(), Some(format!("drag: {}", EditError::OutOfSource)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("striarippletrim: ripple +3 past A's end -> {}", EditError::OutOfSource);
+}
+
+/// Rule: Shift off the selected clip's handle keeps its meaning: a Shift-press on another clip's body adds it to the set
+/// and begins the additive Move.
+#[test]
+fn striarippletrim_shift_elsewhere_still_adds() {
+    let (mut face, _tl) = striarippletrim_face(0);
+    let (x, y) = face.layout().point(0, 15);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.additive, d.ripple)), Some((DragKind::Move, true, false)));
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
+    println!("striarippletrim: Shift on another clip's body still adds it");
+}

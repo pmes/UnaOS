@@ -623,6 +623,8 @@ pub struct Drag {
     pub additive: bool,
     /// NLE2c: the tick the delta snapped to (painted as the guide line).
     pub guide: Option<i64>,
+    /// STRIARIPPLETRIM (SR850): a trim begun with shift on the primary's handle ripples (`EditorState::ripple_trim`).
+    pub ripple: bool,
 }
 
 impl Drag {
@@ -633,7 +635,7 @@ impl Drag {
     /// A press at `(x, y)`: on the primary's drawn trim handle (the rects [`paint`] draws) a trim; on a clip body a move
     /// (a clip of the set keeps the set and becomes its primary, `shift` adds the clip, else it alone is selected); on
     /// an empty track spot a marquee; on the ruler a scrub; anywhere else no drag. NLE3ESLIPDRAG (SR760): with `slip` the
-    /// same hits begin a slide (the trim handle) or a slip (the clip body) instead.
+    /// same hits begin a slide (the trim handle) or a slip (the clip body) instead. STRIARIPPLETRIM (SR850): with `shift` (and not `slip`) the trim handle begins a ripple trim (`ripple`).
     pub fn begin_with(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool, slip: bool) -> Option<Drag> {
         let origin_tick = l.tick_at(x);
         let mk = |kind, track, idx| Drag {
@@ -649,8 +651,9 @@ impl Drag {
             snap: !nosnap,
             additive: shift,
             guide: None,
+            ripple: false,
         };
-        if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift) {
+        if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) {
             let y0 = l.row_y(track) as f64;
             if y >= y0 && y < y0 + ROW_H as f64 {
                 let (x0, x1) = (l.x_of(c.at) as f64, l.x_of(c.end()) as f64);
@@ -663,7 +666,7 @@ impl Drag {
                     None
                 };
                 if let Some(kind) = kind {
-                    return Some(mk(if slip { DragKind::Slide } else { kind }, track, idx));
+                    return Some(Drag { ripple: shift, ..mk(if slip { DragKind::Slide } else { kind }, track, idx) });
                 }
             }
         }
@@ -724,6 +727,7 @@ impl Drag {
             st.select(self.track, self.idx)?;
         }
         match self.kind {
+            DragKind::TrimIn | DragKind::TrimOut if self.ripple => st.ripple_trim(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta),
             DragKind::TrimIn => st.trim(Edge::In, self.delta),
             DragKind::TrimOut => st.trim(Edge::Out, self.delta),
             DragKind::Slip => st.slip_selected(self.delta),
@@ -1005,6 +1009,7 @@ impl Drag {
             snap: !nosnap,
             additive: false,
             guide: None,
+            ripple: false,
         })
     }
     /// The edge drag's ONE commit: the transition `(track, idx)` selected, then `set_transition_dur` of the pointer's length.
@@ -2015,5 +2020,156 @@ mod striamarkers_tests {
         let (x, y) = (l.x_of(5) as usize, l.ruler_y as usize);
         assert_eq!(b[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4], MARKER);
         assert_eq!(inside as i64, (0..=MARKER_W).map(|k| 2 * (MARKER_W - k) + 1).sum::<i64>(), "the triangle alone (labels off)");
+    }
+}
+
+// ---- STRIARIPPLETRIM (LEDGER SR850): the ripple variant of the edge drag (named tail block) ----
+// A press with shift (and not the slip modifier) on the primary's drawn trim handle begins the same TrimIn / TrimOut drag
+// with `ripple` set; `Drag::finish` commits it as ONE `EditorState::ripple_trim` (the later clips of that track follow; one
+// undo step) and `Drag::shown` previews it (finish on a scratch state). Snapping is the plain trim's (`snap_delta` unchanged).
+
+#[cfg(test)]
+mod ripple_drag_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLEFXA 0..10 at 0, 10..20 at 10, 20..30 at 20 (three butted clips), a 40-tick source, the view band `Role::Tracks`
+    /// 320x56; clip `sel` selected.
+    fn ripple_fixture(sel: usize) -> (Timeline, EditorState, Layout, f64, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10), Clip::new(a, 20, 30, 20)];
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, sel).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        (tl, st, l, z, y)
+    }
+
+    /// A twin editor's `rtrim` word on clip `sel` of `tl` (THE ripple op by its verb).
+    fn rtrim_twin(tl: &Timeline, sel: usize, word: &str) -> (Result<(), EditError>, Timeline) {
+        let mut twin = EditorState::new(tl.clone());
+        twin.select(0, sel).unwrap();
+        let r = twin.verb(word).unwrap();
+        (r, twin.timeline)
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: shift on clip 0's out handle dragged -3 ticks is a ripple TrimOut: the preview
+    /// (`Drag::shown`) equals the committed timeline, clip 0 ends at 7 and clips 1 and 2 each move -3 (to 7 and 17), the
+    /// twin of `rtrim out -3`; ONE undo restores all three clips.
+    #[test]
+    fn shift_on_the_out_handle_ripples() {
+        let (tl, mut st, l, z, y) = ripple_fixture(0);
+        let x = l.x_of(10) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert_eq!((d.kind, d.idx, d.ripple), (DragKind::TrimOut, 0, true));
+        d.update(&st, x - 3.0 * z, y);
+        assert_eq!((d.delta, d.guide), (-3, None));
+        let want = tl.ripple_trim_out(0, 0, 7).unwrap();
+        assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the preview is the ripple");
+        assert_eq!(st.timeline, tl, "nothing committed before the release");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want);
+        let ats: Vec<i64> = st.timeline.tracks[0].clips.iter().map(|c| c.at).collect();
+        assert_eq!((st.timeline.tracks[0].clips[0].end(), ats), (7, alloc::vec![0, 7, 17]));
+        assert_eq!(rtrim_twin(&tl, 0, "rtrim out -3"), (Ok(()), want));
+        assert_eq!(st.undo_depth(), 1);
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl, "one undo restores all three");
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: the same drag without shift is the plain TrimOut: clips 1 and 2 stay (a gap opens).
+    #[test]
+    fn plain_out_handle_leaves_the_gap() {
+        let (tl, mut st, l, z, y) = ripple_fixture(0);
+        let x = l.x_of(10) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        assert_eq!((d.kind, d.ripple), (DragKind::TrimOut, false));
+        d.update(&st, x - 3.0 * z, y);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.trim_out(0, 0, 7).unwrap());
+        let ats: Vec<i64> = st.timeline.tracks[0].clips.iter().map(|c| c.at).collect();
+        assert_eq!(ats, alloc::vec![0, 10, 20], "the neighbours stay");
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: shift on clip 1's in handle dragged +3 ticks is a ripple TrimIn: clip 1 KEEPS its head
+    /// (at 10) with its source in at 13, its out edge and clip 2 move -3 (clip 2 to 17), clip 0 is untouched; `rtrim in 3`.
+    #[test]
+    fn shift_on_the_in_handle_ripples_keeping_the_head() {
+        let (tl, mut st, l, z, y) = ripple_fixture(1);
+        let x = l.x_of(10) as f64 + 1.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert_eq!((d.kind, d.idx, d.ripple), (DragKind::TrimIn, 1, true));
+        d.update(&st, x + 3.0 * z, y);
+        assert_eq!(d.delta, 3);
+        let shown = d.shown(&st).map(|s| s.timeline);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(shown, Some(st.timeline.clone()), "the preview equals the commit");
+        let c = &st.timeline.tracks[0].clips;
+        assert_eq!((c[0], c[1].at, c[1].src_in, c[1].end(), c[2].at), (tl.tracks[0].clips[0], 10, 13, 17, 17));
+        assert_eq!(rtrim_twin(&tl, 1, "rtrim in 3"), (Ok(()), st.timeline.clone()));
+        assert_eq!(st.undo_depth(), 1);
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: the moving edge snaps exactly as a plain trim's: the playhead at 6, the out edge dragged
+    /// to 3 px right of `x_of(6)` snaps (delta -4, the guide at 6); with the no-snap modifier the raw delta (-3) stands.
+    #[test]
+    fn ripple_snaps_and_alt_unsnaps() {
+        let (tl, mut st, l, _z, y) = ripple_fixture(0);
+        st.seek(6);
+        let x = l.x_of(10) as f64 - 2.0;
+        let to = x - 29.0;
+        let mut d = Drag::begin_with(&mut st.clone(), l, x, y, true, false, false).unwrap();
+        d.update(&st, to, y);
+        assert_eq!((d.ripple, d.delta, d.guide), (true, -4, Some(6)));
+        let mut n = Drag::begin_with(&mut st.clone(), l, x, y, true, true, false).unwrap();
+        n.update(&st, to, y);
+        assert_eq!((n.ripple, n.snap, n.delta, n.guide), (true, false, -3, None));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.ripple_trim_out(0, 0, 6).unwrap());
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: a ripple past the source's end (clip 2's out 30 dragged +11 on a 40-tick source) is
+    /// refused by name (`OutOfSource`): no preview, and the timeline and undo depth do not move.
+    #[test]
+    fn ripple_past_the_source_is_refused() {
+        let (tl, mut st, l, z, y) = ripple_fixture(2);
+        let x = l.x_of(30) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, true, false).unwrap();
+        d.update(&st, x + 11.0 * z, y);
+        assert_eq!((d.kind, d.ripple, d.delta), (DragKind::TrimOut, true, 11));
+        assert!(d.shown(&st).is_none(), "a refused ripple previews nothing");
+        assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: a dissolve on the 0/1 cut: the ripple drag of clip 0's out by -3 does exactly what the
+    /// `rtrim out -3` word does (the ripple op shifts the transition with the cut: it sits on the moved cut at 7).
+    #[test]
+    fn ripple_at_a_transitioned_cut_is_the_rtrim() {
+        let (tl0, _, l, z, y) = ripple_fixture(0);
+        let tl = tl0.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, 0).unwrap();
+        let x = l.x_of(10) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, true, false).unwrap();
+        d.update(&st, x - 3.0 * z, y);
+        assert_eq!(d.delta, -3);
+        let r = d.finish(&mut st);
+        let (tr, twin) = rtrim_twin(&tl, 0, "rtrim out -3");
+        assert_eq!((r, &st.timeline), (tr, &twin), "the drag is the word");
+        assert_eq!(r, Ok(()));
+        assert_eq!(st.timeline.tracks[0].transitions.iter().map(|t| t.at).collect::<Vec<_>>(), alloc::vec![7], "on the moved cut");
+    }
+
+    /// STRIARIPPLETRIM (SR850) M3: shift with the slip modifier on the handle keeps today's meaning (the edge block is skipped:
+    /// the body's slip, additive); never a ripple.
+    #[test]
+    fn shift_slip_on_the_handle_keeps_the_slip() {
+        let (_tl, mut st, l, _z, y) = ripple_fixture(0);
+        let x = l.x_of(10) as f64 - 2.0;
+        let d = Drag::begin_with(&mut st, l, x, y, true, false, true).unwrap();
+        assert_eq!((d.kind, d.ripple, d.additive), (DragKind::Slip, false, true));
     }
 }
