@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.frame_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3032,5 +3033,102 @@ pub fn eta_words_of(d: Duration) -> String {
         format!("~{}:{:02}", s / 60, s % 60)
     } else {
         format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+}
+
+// ---- STRIAEXPORTFRAME (LEDGER SR830): the playhead frame as a PNG (named tail block) ----
+// `frame [<path>]` saves the frame under the playhead: THE preview road (`preview`, one tick, the render's own frame size,
+// never the face's scaled paint) through pixel_core's ONE PNG writer (`gneiss_pal::dsp::image::encode_rgba`, the one
+// `PngSequence` calls), written synchronously on the face's thread. The outcome is THE message (`last_error`): `frame: <file
+// name>` or `frame: <why>`; `frame_saved` keeps the path the last `frame` wrote for the witness. `nle frame` calls the same
+// `save_frame`. Owed: NLE-EXPORT-FRAME-FORMAT, NLE-EXPORT-FRAME-RANGE (the export door's `png` writes every frame of the
+// range), NLE-EXPORT-FRAME-KERNEL, NLE-EXPORT-FRAME-USAGE, NLE-EXPORT-FRAME-TC.
+
+use gneiss_pal::dsp::image::PngError;
+
+/// STRIAEXPORTFRAME (SR830): why a frame was not saved.
+#[derive(Debug)]
+pub enum FrameError {
+    /// The render refused the tick.
+    Render(RenderError),
+    /// Nothing on the timeline sizes a video frame at this tick.
+    NoFrame(i64),
+    /// pixel_core's writer refused the picture.
+    Png(PngError),
+    /// The file could not be written (the path named).
+    Io(std::path::PathBuf, std::io::Error),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Render(e) => write!(f, "{e}"),
+            FrameError::NoFrame(t) => write!(f, "no video frame at tick {t}"),
+            FrameError::Png(e) => write!(f, "png: {e:?}"),
+            FrameError::Io(p, e) => write!(f, "{}: {e}", p.display()),
+        }
+    }
+}
+
+/// STRIAEXPORTFRAME (SR830): the default file of a saved frame: `<document dir>/<stem>-<tc>.png` (`tc` with `:` as `-`); no
+/// document: the cwd-relative `untitled-<tc>.png` (the export / save stem fallback word).
+pub fn frame_path(doc: Option<&std::path::Path>, tc: &str) -> std::path::PathBuf {
+    let tc = tc.replace(':', "-");
+    match doc {
+        Some(p) => p.with_file_name(format!("{}-{tc}.png", p.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled"))),
+        None => std::path::PathBuf::from(format!("untitled-{tc}.png")),
+    }
+}
+
+/// STRIAEXPORTFRAME (SR830): the frame tick `t` shows ([`preview`]) as one PNG ([`gneiss_pal::dsp::image::encode_rgba`]) at
+/// `path`; its size. Nothing is written when the render or the encoder refuses.
+pub fn save_frame(tl: &Timeline, sources: &Sources, t: i64, path: &std::path::Path) -> Result<(u32, u32), FrameError> {
+    let still = preview(tl, sources, t).map_err(FrameError::Render)?.ok_or(FrameError::NoFrame(t))?;
+    let png = gneiss_pal::dsp::image::encode_rgba(still.width, still.height, &still.rgba).map_err(FrameError::Png)?;
+    std::fs::write(path, &png).map_err(|e| FrameError::Io(path.to_path_buf(), e))?;
+    Ok((still.width, still.height))
+}
+
+impl Face {
+    /// The `frame [<path>]` verb (the rest after the word, trimmed, is the path): the playhead frame through [`save_frame`]
+    /// into the path, else [`frame_path`] beside the document at the playhead's timecode. No path and no document is refused
+    /// by name, as `export` refuses. `None` for any other word.
+    fn frame_verb(&mut self, v: &str) -> Option<bool> {
+        let rest = v.strip_prefix("frame")?;
+        if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+            return None;
+        }
+        let rest = rest.trim();
+        let ph = self.state.playhead;
+        let path = if !rest.is_empty() {
+            std::path::PathBuf::from(rest)
+        } else if self.doc_path.is_some() {
+            let tc = self.state.timeline.fps().map_or_else(|| ph.to_string(), |f| timeline_core::edl::timecode(ph, f));
+            frame_path(self.doc_path.as_deref(), &tc)
+        } else {
+            self.last_error = Some("frame: no file (no document path)".into());
+            self.frame_saved = None;
+            return Some(true);
+        };
+        match save_frame(&self.state.timeline, &self.sources, ph, &path) {
+            Ok(_) => {
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                self.last_error = Some(format!("frame: {name}"));
+                self.frame_saved = Some(path);
+            }
+            Err(e) => {
+                self.last_error = Some(format!("frame: {e}"));
+                self.frame_saved = None;
+            }
+        }
+        Some(true)
+    }
+    /// The message while it is a `frame` line (`frame: <name>` or `frame: <why>`).
+    pub fn frame_message(&self) -> Option<&str> {
+        self.last_error.as_deref().filter(|m| m.starts_with("frame: "))
+    }
+    /// The file the last `frame` verb wrote (`None` on a fresh face or after a refused `frame`).
+    pub fn frame_saved(&self) -> Option<&std::path::Path> {
+        self.frame_saved.as_deref()
     }
 }

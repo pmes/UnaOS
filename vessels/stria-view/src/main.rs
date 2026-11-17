@@ -253,7 +253,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &frame_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -514,6 +514,7 @@ fn transport() -> TetraNode {
         button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
         button("save", "Save"), // NLEHOSTSAVE (SR677): writes the timeline to the document's path
         button("export", "Export"), // NLEFACEEXPORT (SR694): exports beside the document (`<stem>-export/`, H.264), off the face's thread
+        button("frame", "Frame"), // STRIAEXPORTFRAME (SR830): the playhead frame as a PNG beside the document (`<stem>-<tc>.png`)
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
@@ -855,6 +856,54 @@ mod exporteta_tests {
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAEXPORTFRAME (LEDGER SR830): the witness's saved frame (named tail block) ----
+/// The witness's `"frame"` field: the file the last `frame` verb wrote (`Face::frame_saved`); absent on a fresh face or after
+/// a refused `frame` (the default line unchanged).
+fn frame_json(face: &Face) -> String {
+    face.frame_saved().map(|p| format!(",\"frame\":\"{}\"", p.display().to_string().replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striaexportframe_tests {
+    use super::*;
+
+    /// STRIAEXPORTFRAME M3: the Frame button sits after Export and fires the face's `frame` word; on a face opened from
+    /// `<dir>/reel.edl` it writes `reel-00-00-00-00.png` beside it and the witness carries the path; a fresh face carries
+    /// nothing; the `--do frame` road reads `frame: <name>` on the message; no document is refused by name.
+    #[test]
+    fn striaexportframe_button_writes_and_the_witness_names_it() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let at = row.iter().position(|b| matches!(b, TetraNode::Button { id, .. } if id == "frame")).expect("a frame button");
+        assert!(matches!(&row[at - 1], TetraNode::Button { id, .. } if id == "export"), "beside Export");
+        let TetraNode::Button { label, action, .. } = &row[at] else { panic!("not a button") };
+        assert_eq!(label, "Frame");
+        assert!(matches!(action, SMessage::Input { target, text } if target == SURFACE && text == "frame"));
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("striaexportframe-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("reel.edl");
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(&doc));
+        assert_eq!(frame_json(&face), "");
+        assert!(face.on(action));
+        let png = dir.join("reel-00-00-00-00.png");
+        assert!(png.exists(), "{}", png.display());
+        assert_eq!(face.frame_message(), Some("frame: reel-00-00-00-00.png"));
+        assert_eq!(frame_json(&face), format!(",\"frame\":\"{}\"", png.display()));
+        std::fs::remove_file(&png).unwrap();
+        assert_eq!(drive(&mut face, "frame"), vec!["frame: reel-00-00-00-00.png".to_string()]);
+        assert!(png.exists());
+        assert_eq!(frame_json(&face), format!(",\"frame\":\"{}\"", png.display()), "the key outlives the taken message");
+        let (tl, src) = nle_face::synth_fixture();
+        let mut bare = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut bare, "frame"), vec!["frame: no file (no document path)".to_string()]);
+        assert_eq!(frame_json(&bare), "");
+        println!("striaexportframe witness: {}", frame_json(&face));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
