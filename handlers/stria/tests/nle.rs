@@ -13712,3 +13712,19 @@ fn strianormalizelufs_gain_rule() {
     assert_eq!(g(&r(-30.004, f64::NEG_INFINITY), -2300), Some((700, false)));
     assert_eq!(g(&r(-12.0, -1.0), -2300), Some((-1100, false)));
 }
+
+// ---- STRIAKMARKERJUMP (LEDGER SR9064): the host KEYS rows match timeline_core's JUMP_KEYS (named tail block) ----
+// One character means one word on both faces: the kernel Player reads `timeline_core::editor::JUMP_KEYS`; the host face's
+// KEYS slice is a literal, so this test ties every shared jump byte to a KEYS row naming the same VERBS word.
+
+#[test]
+fn striakmarkerjump_host_keys_match_the_shared_jump_keys() {
+    for &(b, word) in timeline_core::editor::JUMP_KEYS.iter() {
+        let key = (b as char).to_string();
+        let row = stria::nle_face::KEYS.iter().find(|k| k.0 == key.as_str());
+        assert_eq!(row.map(|k| k.1), Some(word), "host key {key} must name {word}");
+        assert!(stria::nle_face::VERBS.contains(&word), "{word} is a VERBS word");
+        assert!(timeline_core::editor::jump_word(word).is_some(), "{word} is a jump word");
+    }
+    println!("striakmarkerjump: {} shared jump keys bound alike on both faces", timeline_core::editor::JUMP_KEYS.len());
+}

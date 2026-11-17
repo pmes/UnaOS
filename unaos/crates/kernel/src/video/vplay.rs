@@ -1960,7 +1960,7 @@ pub fn edit_live(path: &str) -> bool {
 
 /// The editor verb a key byte names ([`EDIT_KEYS`]).
 pub fn edit_verb(b: u8) -> Option<&'static str> {
-    if let Some(v) = jump_key(b) { return Some(v); } EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| help_verb(b)) // STRIAHELPTHREE (LEDGER SR9043): `?` admits the help, no EDIT_KEYS row (file tail)
+    if let Some(v) = jump_key(b) { return Some(v); } EDIT_KEYS.iter().find(|k| k.0 == b).map(|k| k.1).or_else(|| help_verb(b)) // STRIAHELPTHREE (LEDGER SR9043): `?` admits the help, no EDIT_KEYS row (file tail).or_else(|| timeline_core::editor::jump_key(b)) // STRIAKMARKERJUMP (LEDGER SR9064): ; / ' the marker jumps (timeline_core JUMP_KEYS)
 }
 
 /// The output tick shown at `ms` (the inverse of the job's `out_ms`).
@@ -1979,7 +1979,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let st = &mut e.st;
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
-        let at = st.playhead;
+        let at = st.playhead; if timeline_core::editor::jump_word(verb).is_some() { return edit_jump(st, verb, at); } // STRIAKMARKERJUMP (LEDGER SR9064): a jump key neither reselects nor saves (file tail)
         if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { edit_fit_mark(&mut e.fit, r.is_some(), verb, st.scale(), e.view); return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = flag_targetedit_target(&st.timeline, verb, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail); STRIAKTRACKGAIN (LEDGER SR9016): the gain words take the top audio clip (file tail)
             match top {
@@ -3535,4 +3535,25 @@ fn edit_refit(e: &mut Edit, path: &str, w: u32) {
         }
         Err(why) => serial_println!("[nle] edit {} refit w={} refused ({})", verb, w, why),
     }
+}
+
+// ---- STRIAKMARKERJUMP (LEDGER SR9064): the Player's marker jump keys through the seek door (named tail block) ----
+// `;` / `'` (timeline_core `JUMP_KEYS`, the host face's keys) name SR894's view words `marker-` / `marker+`: the ONE jump
+// (`EditorState::verb` -> `EditorState::jump`) on the Player's editor state, then the seek door (`vid::seek`, run by
+// player.rs `edit_pass` on the returned ms). Nothing is saved, no undo step. The ms is rounded UP so the next key's
+// `tick_of` lands on the same tick (a floored ms can read back one tick early at a non-integer rate and stick a forward
+// jump on its marker). Wire: `[nle] edit <verb> at=<tick> to=<tick> marker=<name>`, `[nle] edit <verb> at=<tick> unchanged`.
+
+/// A jump key on the Player's editor state: `Some(ms)` of the new playhead for the seek door; `None` when there is
+/// nowhere to go.
+fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -> Option<u64> {
+    let _ = st.verb(verb);
+    let to = st.playhead;
+    if to == at {
+        serial_println!("[nle] edit {} at={} unchanged", verb, at);
+        return None;
+    }
+    let name = st.timeline.marker_at(to).map(|m| m.name.clone()).unwrap_or_default();
+    serial_println!("[nle] edit {} at={} to={} marker={}", verb, at, to, name);
+    Some((st.timeline.tb.to_ns(to).max(0) as u64).div_ceil(1_000_000))
 }

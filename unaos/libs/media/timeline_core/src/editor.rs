@@ -4955,3 +4955,53 @@ fn pankey_words(v: &str) -> Option<Option<Option<i8>>> {
     }
     rest.starts_with(' ').then(|| pan_words(&alloc::format!("pan{rest}")))?.map(|p| Some(Some(p)))
 }
+
+// ---- STRIAKMARKERJUMP (LEDGER SR9064): the jump keys both faces bind (named tail block) ----
+// One character means one word on both faces: `;` / `'` are SR894's `marker-` / `marker+` (view words through
+// `EditorState::verb`). The kernel Player's key door reads this table (vplay.rs `edit_verb`); the host face's KEYS rows
+// are a literal slice and a test (stria tests/nle.rs) ties them to it.
+
+/// STRIAKMARKERJUMP (SR9064): the key bytes of the marker jump words.
+pub const JUMP_KEYS: [(u8, &str); 2] = [(b';', "marker-"), (b'\'', "marker+")];
+
+/// STRIAKMARKERJUMP (SR9064): the jump word a key byte names ([`JUMP_KEYS`]); `None` for any other byte.
+pub fn jump_key(b: u8) -> Option<&'static str> {
+    JUMP_KEYS.iter().find(|k| k.0 == b).map(|k| k.1)
+}
+
+#[cfg(test)]
+mod striakmarkerjump_tests {
+    use super::*;
+    use crate::Kind;
+
+    #[test]
+    fn striakmarkerjump_keys_name_the_marker_jump_words() {
+        assert_eq!(jump_key(b';').and_then(jump_word), Some((Jump::Marker, false)));
+        assert_eq!(jump_key(b'\'').and_then(jump_word), Some((Jump::Marker, true)));
+        for b in [b'm', b':', b'"', b',', b'.', b' ', 0u8] {
+            assert_eq!(jump_key(b), None, "{b}");
+        }
+    }
+
+    #[test]
+    fn striakmarkerjump_key_word_jumps_through_the_one_dispatch() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
+        let mut st = EditorState::new(tl);
+        st.timeline = st.timeline.mark(5, "A").unwrap().mark(30, "B").unwrap();
+        let tl0 = st.timeline.clone();
+        let (back, fwd) = (jump_key(b';').unwrap(), jump_key(b'\'').unwrap());
+        for want in [5, 30, 30] {
+            assert_eq!(st.verb(fwd), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        for want in [5, 5] {
+            assert_eq!(st.verb(back), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        assert_eq!(st.timeline, tl0);
+        assert!(!st.undo(), "a jump key is not an undo step");
+    }
+}
