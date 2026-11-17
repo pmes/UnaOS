@@ -290,7 +290,7 @@ fn seek_for(
     if next == Some((src, src_t)) {
         return Ok(None);
     }
-    idx.keyframe_ns(src, kind, tl.tb.to_ns(src_t)).map(Some).ok_or(ScheduleError::NoKeyframe(src))
+    if kind == Kind::Video && tl.source(src).is_some_and(|s| s.title.is_some()) { return Ok(Some(tl.tb.to_ns(src_t))); } idx.keyframe_ns(src, kind, tl.tb.to_ns(src_t)).map(Some).ok_or(ScheduleError::NoKeyframe(src)) // STRIATITLECLIP (SR828): a title on a video track is generated: every frame is its own key, no SourceIndex asked
 }
 
 /// NLE4: clip `c`'s fade envelope at timeline tick (edge) `t`, Q16: rising over `at..at + fade_in`, falling over

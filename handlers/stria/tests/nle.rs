@@ -3353,3 +3353,145 @@ fn nle5dexportmessageetasmooth_scripted_slow_start() {
     assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
     println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
 }
+
+// ---- STRIATITLECLIP (LEDGER SR828): a title card is a generated source — its still, its render, the face's word (named tail block) ----
+
+/// The frames a render hands out, at their own size.
+#[derive(Default)]
+struct StriaTitleFrames(Vec<(i64, u32, u32, Vec<u8>)>);
+
+impl RenderSink for StriaTitleFrames {
+    fn frame(&mut self, out_t: i64, w: u32, h: u32, rgba: &[u8]) {
+        self.0.push((out_t, w, h, rgba.to_vec()));
+    }
+    fn pcm(&mut self, _out_t: i64, _rate: u32, _ch: u16, _s: &[f32]) {}
+}
+
+/// No `sans` face on this machine: the glyph checks cannot run (said loudly, text_host's own skip rule).
+fn striatitleclip_no_font() -> bool {
+    let none = text_host::line::TextStyle::new(&["sans"], 16.0).primary().is_none();
+    if none {
+        println!("SKIP: striatitleclip: no `sans` face installed, the title's glyph checks did not run");
+    }
+    none
+}
+
+/// A 25 fps timeline: optional synth reel A (64x48, 50 ticks) at A[0,10)@0, then title T1 `text` (`dur` ticks) at 10 (or at
+/// 0 without A), all on V1.
+fn striatitleclip_timeline(with_a: bool, text: &str, dur: i64) -> (Timeline, Sources) {
+    let mut tl = Timeline::new(25);
+    let a = with_a.then(|| tl.add_source("A", 50));
+    let t = tl.add_source("T1", dur);
+    tl.sources[t.0 as usize].title = Some(text.to_string());
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = match a {
+        Some(a) => vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, dur, 10)],
+        None => vec![Clip::new(t, 0, dur, 0)],
+    };
+    tl.validate().unwrap();
+    let mut src = Sources::new(&tl);
+    if let Some(a) = a {
+        src.add(a, synth_source(0, 50, 25)).unwrap();
+    }
+    (tl, src)
+}
+
+#[test]
+fn striatitleclip_still_is_white_text_centred_on_black() {
+    if striatitleclip_no_font() {
+        return;
+    }
+    let s = stria::nle::title_still("Hello", 320, 160);
+    assert_eq!((s.width, s.height, s.rgba.len()), (320, 160, 320 * 160 * 4));
+    let px = |x: usize, y: usize| &s.rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+    assert_eq!(px(0, 0), &[0, 0, 0, 255], "corner black");
+    assert_eq!(px(319, 159), &[0, 0, 0, 255], "corner black");
+    let lit = (0..320).filter(|&x| px(x, 80)[0] > 128).count();
+    assert!(lit > 0, "the centre row carries ink");
+    assert!(s.rgba.chunks(4).all(|p| p[3] == 255), "opaque");
+    assert!(s.rgba.chunks(4).all(|p| p[0] == p[1] && p[1] == p[2]), "white on black only");
+    println!("striatitleclip: Hello at 320x160: {lit} lit px on the centre row");
+}
+
+#[test]
+fn striatitleclip_title_only_renders_at_title_size_from_the_cache() {
+    let (tl, src) = striatitleclip_timeline(false, "Hello", 2);
+    let mut a = StriaTitleFrames::default();
+    let r = render(&tl, 0..2, &src, &mut a).unwrap();
+    assert_eq!(r.frames, 2);
+    let (w, h) = stria::nle::TITLE_SIZE;
+    assert_eq!((w, h), (1280, 720));
+    let still = stria::nle::title_still("Hello", w, h);
+    for (i, f) in a.0.iter().enumerate() {
+        assert_eq!((f.0, f.1, f.2), (i as i64, w, h));
+        assert!(f.3 == still.rgba, "frame {i} is the still");
+    }
+    let mut b = StriaTitleFrames::default();
+    render(&tl, 0..2, &src, &mut b).unwrap();
+    assert!(a.0 == b.0, "the same text renders the same bytes");
+    let (x, y) = (src.title_still_cached("Hello", w, h), src.title_still_cached("Hello", w, h));
+    assert!(std::sync::Arc::ptr_eq(&x, &y), "the second ask is the cached still");
+    assert!(!std::sync::Arc::ptr_eq(&x, &src.title_still_cached("Hello", 64, 48)), "another size is another still");
+    println!("striatitleclip: title-only render {} frames at {w}x{h}, cached", r.frames);
+}
+
+#[test]
+fn striatitleclip_title_beside_a_reel_takes_its_size() {
+    let (tl, src) = striatitleclip_timeline(true, "Hello", 20);
+    let mut f = StriaTitleFrames::default();
+    render(&tl, 8..14, &src, &mut f).unwrap();
+    assert_eq!(f.0.len(), 6);
+    assert!(f.0.iter().all(|x| (x.1, x.2) == (64, 48)), "every frame at reel A's 64x48");
+    let still = stria::nle::title_still("Hello", 64, 48);
+    assert!(f.0[2..].iter().all(|x| x.3 == still.rgba), "ticks 10.. show the title");
+    let mut only = StriaTitleFrames::default();
+    render(&tl, 12..13, &src, &mut only).unwrap();
+    assert_eq!((only.0[0].1, only.0[0].2), (64, 48), "a range holding only the title still sizes by reel A");
+    println!("striatitleclip: title beside reel A renders at 64x48");
+}
+
+#[test]
+fn striatitleclip_dissolve_onto_a_title_mixes() {
+    let (tl, src) = striatitleclip_timeline(true, "Hello", 20);
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut f = StriaTitleFrames::default();
+    render(&tl, 10..15, &src, &mut f).unwrap();
+    assert_eq!(f.0.len(), 5);
+    let mid = &f.0[2].3;
+    let title = &f.0[4].3;
+    let mut alone = tl.clone();
+    alone.tracks[0].transitions.clear();
+    alone.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 20, 0)];
+    let mut a = StriaTitleFrames::default();
+    render(&alone, 12..13, &src, &mut a).unwrap();
+    assert!(mid != title, "the mid frame is not the title alone");
+    assert!(*mid != a.0[0].3, "the mid frame is not reel A alone");
+    println!("striatitleclip: dissolve A -> T1 at 10 for 4: mid frame differs from both ends");
+}
+
+#[test]
+fn striatitleclip_face_title_word_adds_a_title_at_the_playhead() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    assert!(VERBS.contains(&"title"));
+    assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(12);
+    assert!(face.verb("title Hello"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let t1 = face.state.timeline.source_by_reel("T1").expect("T1").clone();
+    assert_eq!((t1.duration, t1.title.as_deref()), (125, Some("Hello")));
+    let at = face.state.timeline.clip_at(0, 12).expect("a clip at the playhead");
+    let c = face.state.timeline.tracks[0].clips[at];
+    assert_eq!((c.src, c.at, c.src_in, c.src_out), (t1.id, 12, 0, 125));
+    assert_eq!(face.state.selection, Some((0, at)));
+    assert!(face.verb("title"));
+    assert_eq!(face.state.timeline.source_by_reel("T2").and_then(|s| s.title.clone()).as_deref(), Some("Title"));
+    assert!(face.state.undo());
+    assert!(face.state.timeline.source_by_reel("T2").is_none(), "undo removes the source");
+    assert!(face.state.timeline.source_by_reel("T1").is_some());
+    let text = edl::write(&face.state.timeline, "T").unwrap();
+    assert!(text.contains("* UNA SOURCE T1 00:00:05:00\n* UNA TITLE T1 \"Hello\"\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the document reopens with its title");
+    println!("striatitleclip: `title Hello` -> T1 125 ticks at 12; bare `title` -> T2 \"Title\"; undo drops T2");
+}
