@@ -614,10 +614,8 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             parts.join(" ")
         }
     };
+    if let Some(&(_, n)) = PLAIN_N.iter().find(|(s, _)| *s == sh) { return Some((plain_serialize(n, &vals), important)); }
     let s = match sh {
-        "margin" | "padding" | "inset" | "border-width" | "border-style" | "border-color" => {
-            four_serialize([vals[0], vals[1], vals[2], vals[3]])
-        }
         "border-top" | "border-right" | "border-bottom" | "border-left" => side(vals[0], vals[1], vals[2]),
         "border" => {
             // widths 0..4, styles 4..8, colors 8..12
@@ -627,23 +625,9 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             }
             side(vals[0], vals[4], vals[8])
         }
-        "gap" | "overflow" => {
-            if vals[0] == vals[1] {
-                vals[0].to_string()
-            } else {
-                format!("{} {}", vals[0], vals[1])
-            }
-        }
         "flex" => format!("{} {} {}", vals[0], vals[1], vals[2]),
         "font-synthesis" => font_synthesis_words(&vals)?,
         "outline" => side(vals[2], vals[1], vals[0]),
-        "border-radius" => {
-            if vals.iter().all(|v| *v == vals[0]) {
-                vals[0].to_string()
-            } else {
-                four_serialize([vals[0], vals[1], vals[2], vals[3]])
-            }
-        }
         "background" => {
             let color = vals[8];
             let rest_initial = ls.iter().zip(vals.iter()).take(8).all(|(l, v)| bg_initial(l) == *v);
@@ -2452,5 +2436,111 @@ mod border_image_tests {
         let b = Block::parse("border: 1px solid red; border-image: url(a.png) 30");
         assert_eq!(b.get("border"), "");
         assert_eq!(b.serialize(), "border-width: 1px; border-style: solid; border-color: red; border-image: url(\"a.png\") 30;");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLESERIALIZE (LEDGER SR1078): the plain n-value serialization rules as table data (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLESERIALIZE (SR1078): the shorthands whose serialization is the plain n-value collapse —
+/// n = 4 (top right bottom left: 4 -> 1-4 values through [`four_serialize`]) or n = 2 (2 -> 1-2 values). Each name is a
+/// [`SHORTHANDS`] row with exactly n longhands; every other row has a grammar arm in [`serialize_shorthand`]. The
+/// `shorthand_table_serialize_*` tests pin both, so a new 2- or 4-longhand row cannot silently read "".
+const PLAIN_N: &[(&str, u8)] = &[
+    ("margin", 4),
+    ("padding", 4),
+    ("inset", 4),
+    ("border-width", 4),
+    ("border-style", 4),
+    ("border-color", 4),
+    ("border-radius", 4),
+    ("gap", 2),
+    ("overflow", 2),
+];
+
+/// The plain n-value serialization of a [`PLAIN_N`] shorthand's longhand values (in [`SHORTHANDS`] order).
+fn plain_serialize(n: u8, vals: &[&str]) -> String {
+    match n {
+        4 => four_serialize([vals[0], vals[1], vals[2], vals[3]]),
+        2 if vals[0] == vals[1] => vals[0].to_string(),
+        2 => format!("{} {}", vals[0], vals[1]),
+        _ => vals.join(" "),
+    }
+}
+
+#[cfg(test)]
+mod shorthand_table_serialize_tests {
+    use super::*;
+
+    /// The rows whose serialization is a hand-written grammar arm in [`serialize_shorthand`].
+    const GRAMMAR: [&str; 10] = [
+        "border", "border-image", "border-top", "border-right", "border-bottom", "border-left", "font-synthesis", "flex",
+        "outline", "background",
+    ];
+
+    fn get(css: &str, sh: &str) -> String {
+        Block::parse(css).get(sh)
+    }
+
+    #[test]
+    fn shorthand_table_serialize_plain_rows_are_table_rows() {
+        for (i, (sh, n)) in PLAIN_N.iter().enumerate() {
+            assert!(PLAIN_N[..i].iter().all(|(s, _)| s != sh), "{sh} is one PLAIN_N row");
+            assert!(*n == 2 || *n == 4, "{sh}: n is 2 or 4");
+            assert_eq!(longhands(sh).map(|ls| ls.len()), Some(*n as usize), "{sh} has {n} longhands");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_serialize_every_row_has_a_road() {
+        for (sh, ls) in SHORTHANDS {
+            let plain = PLAIN_N.iter().any(|(s, _)| s == sh);
+            let grammar = GRAMMAR.contains(sh);
+            assert!(plain != grammar, "{sh} is in exactly one of PLAIN_N / GRAMMAR");
+            if (ls.len() == 2 || ls.len() == 4) && !grammar {
+                assert!(plain, "{sh}: a 2/4-longhand row with no grammar arm is PLAIN_N");
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_table_serialize_margin() {
+        assert_eq!(get("margin: 1px 2px 3px 4px", "margin"), "1px 2px 3px 4px");
+        assert_eq!(get("margin: 1px 2px 1px 2px", "margin"), "1px 2px");
+        assert_eq!(get("margin: 1px 2px 3px", "margin"), "1px 2px 3px");
+        assert_eq!(get("margin: 3px 3px 3px 3px", "margin"), "3px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_gap() {
+        assert_eq!(get("gap: 5px 5px", "gap"), "5px");
+        assert_eq!(get("gap: 5px 10px", "gap"), "5px 10px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_overflow() {
+        assert_eq!(get("overflow: hidden hidden", "overflow"), "hidden");
+        assert_eq!(get("overflow: hidden auto", "overflow"), "hidden auto");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_border_radius() {
+        assert_eq!(get("border-radius: 4px", "border-radius"), "4px");
+        let css = "border-top-left-radius: 1px; border-top-right-radius: 2px; border-bottom-right-radius: 1px; border-bottom-left-radius: 2px";
+        assert_eq!(get(css, "border-radius"), "1px 2px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_grammar_unmoved() {
+        assert_eq!(get("border: 1px solid red", "border"), "1px solid red");
+        assert_eq!(get("outline: red solid 1px", "outline"), "1px solid red");
+        assert_eq!(get("flex: 1 2 10px", "flex"), "1 2 10px");
+        assert_eq!(get("background: red", "background"), "red");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_missing_longhand() {
+        assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px", "margin"), "");
+        assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px; margin-left: 1px !important", "margin"), "");
+        assert_eq!(get("gap: 5px; column-gap: 6px !important", "gap"), "");
     }
 }
