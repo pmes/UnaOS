@@ -2133,7 +2133,7 @@ impl Face {
     }
     /// Start the job: the directory made here (a bad one refused by name, no thread), the encoder built on the thread
     /// (encoders are not `Send`), `range` (the marked range, NLE5DEXPORTRANGE SR717; `None`: the whole timeline), `audio` (the verb's word, default `AudioOut::Wav`, NLE5DEXPORTAUDIOOPTIONS SR722) into `Container::Mp4` (`nle export`'s defaults).
-    /// `pause_at`: the job holds after frame k until cancelled ([`Face::export_paused_at`]).
+    /// `pause_at`: the job holds after frame k (k = 0: before the first, NLEFACEEXPORTJSONZERO SR1110) until cancelled ([`Face::export_paused_at`]).
     fn start_export(&mut self, dir: &std::path::Path, fmt: &str, pause_at: Option<u64>, range: Option<std::ops::Range<i64>>, audio: AudioOut, plan: ExportPlan) -> Result<(), String> {
         if let Some((d, t)) = self.export_progress() {
             return Err(format!("busy ({d}/{t})"));
@@ -2161,7 +2161,7 @@ impl Face {
                     }
                     Ok(())
                 };
-                let video = face_video(&fmt, &tl, span.clone(), &sources, &path, plan, &mut progress)?; export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut |n, of| progress(n + (passes - 1) * of, passes * of)) // H264ENCTWOPASSFACEPROGRESS (SR1093): pass 1 inside the one closure; pass 2 reads frames + n of 2 x frames
+                progress(0, t.load(Relaxed))?; let video = face_video(&fmt, &tl, span.clone(), &sources, &path, plan, &mut progress)?; export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut |n, of| progress(n + (passes - 1) * of, passes * of)) // H264ENCTWOPASSFACEPROGRESS (SR1093): pass 1 inside the one closure; pass 2 reads frames + n of 2 x frames; NLEFACEEXPORTJSONZERO (SR1110): reading 0 once before the first frame (the k = 0 hold)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0), passes: passes as u8 });
