@@ -2773,3 +2773,79 @@ fn text_decoration_color_alpha_cascade() {
     let r = cascade(&[half, &[("text-decoration", "underline")]]);
     assert_eq!((r.paint.decoration_color, r.paint.deco_alpha), (Some(None), None), "the shorthand's reset clears both");
 }
+
+// ---- AETHERTEXTALIGNLASTPRE (LEDGER SR1161): css-text-3 §7.2 a preserved newline is a forced break (named tail block) ----
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): one paragraph, then a 16-word one, under `{ws}` at 98px (5px glyphs): pre-wrap
+/// lines `aa bb` (25) | `cc..hh ` (90) | `ii..nn ` (90) | `oo pp qq rr` (55); pre-line the same with 85px middles.
+fn pre_lines(ws: &str, extra: &str) -> Vec<Vec<(f32, f32)>> {
+    justify_lines(&format!("width: 98px; white-space: {ws}; text-align: justify; {extra}"), vec![text("aa bb\ncc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr")])
+}
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): justify under `ws`: the newline line keeps its natural 25 (pin: it was forced
+/// before too), the two wrapped lines end flush at 98 (armed: before SR1161 every preserved-mode line was forced and
+/// stayed ragged), the last line is natural (55).
+fn pre_justify_facts(ws: &str) {
+    let j = pre_lines(ws, "");
+    assert_eq!(j.len(), 4, "{ws}: four lines: {j:?}");
+    assert!((right_edge(&j[0]) - 25.0).abs() <= 0.5 && left_edge(&j[0]) == 0.0, "{ws}: the newline line is natural: {j:?}");
+    for l in &j[1..3] {
+        assert!((right_edge(l) - 98.0).abs() <= 0.5 && left_edge(l) == 0.0, "{ws}: armed: a wrapped line is justified: {j:?}");
+    }
+    assert!((right_edge(&j[3]) - 55.0).abs() <= 0.5, "{ws}: the last line is natural: {j:?}");
+}
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): with `text-align-last: center` the newline line is centred (armed: it took
+/// `text-align`, start) like the paragraph's last line; the wrapped lines stay flush.
+fn pre_center_facts(ws: &str) {
+    let c = pre_lines(ws, "text-align-last: center");
+    assert_eq!(c.len(), 4, "{ws}: four lines: {c:?}");
+    assert!((left_edge(&c[0]) - 36.5).abs() <= 0.6 && (right_edge(&c[0]) - 61.5).abs() <= 0.6, "{ws}: armed: the newline line is centred: {c:?}");
+    for l in &c[1..3] {
+        assert!((right_edge(l) - 98.0).abs() <= 0.5 && left_edge(l) == 0.0, "{ws}: the wrapped lines stay justified: {c:?}");
+    }
+    assert!((left_edge(&c[3]) - 21.5).abs() <= 0.6, "{ws}: the last line is centred: {c:?}");
+}
+
+#[test]
+fn text_align_last_pre_wrap_justify() {
+    pre_justify_facts("pre-wrap");
+}
+
+#[test]
+fn text_align_last_pre_wrap_center() {
+    pre_center_facts("pre-wrap");
+}
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): pre-line is the same road and the same mark (collapsed spaces, kept newlines).
+#[test]
+fn text_align_last_pre_line() {
+    pre_justify_facts("pre-line");
+    pre_center_facts("pre-line");
+}
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): white-space: normal collapses the source newline: 18 words, 6 per line, lines 1-2
+/// flush, the last natural (pin: unchanged).
+#[test]
+fn text_align_last_pre_collapsed() {
+    let n = pre_lines("normal", "text-align-last: center");
+    assert_eq!(n.len(), 3, "the newline is a space: {n:?}");
+    for l in &n[..2] {
+        assert!((right_edge(l) - 98.0).abs() <= 0.5 && left_edge(l) == 0.0, "lines 1-2 justified: {n:?}");
+    }
+    assert!((left_edge(&n[2]) - 6.5).abs() <= 0.6, "the last line centred: {n:?}");
+}
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): a `<br>` in pre-wrap is unchanged (pin): its line centred under text-align-last:
+/// center; the wrapped lines after it flush, the last centred.
+#[test]
+fn text_align_last_pre_br() {
+    let kids = vec![text("aa bb"), el("br", &[], vec![]), text("cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr")];
+    let b = justify_lines("width: 98px; white-space: pre-wrap; text-align: justify; text-align-last: center", kids);
+    assert_eq!(b.len(), 4, "four lines: {b:?}");
+    assert!((left_edge(&b[0]) - 36.5).abs() <= 0.6, "the <br> line is centred: {b:?}");
+    for l in &b[1..3] {
+        assert!((right_edge(l) - 98.0).abs() <= 0.5, "the wrapped lines are justified: {b:?}");
+    }
+    assert!((left_edge(&b[3]) - 21.5).abs() <= 0.6, "the last line is centred: {b:?}");
+}

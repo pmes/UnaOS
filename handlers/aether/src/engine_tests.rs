@@ -11531,4 +11531,32 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
         assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
     }
+
+    // ---- AETHERTEXTALIGNLASTPRE (LEDGER SR1161): css-text-3 §7.2 a preserved newline is a forced break (named tail block) ----
+
+    /// AETHERTEXTALIGNLASTPRE (SR1161, the seat's MEASURE condition 2): through aether's own breaker (the `Fonts`
+    /// override), a justified monospace pre-wrap paragraph at 100px: the line ended by the typed newline keeps its
+    /// natural width, every wrapped line ends flush at 100 (± 0.5; before SR1161 every pre-wrap line was forced and
+    /// ragged), the last line is natural.
+    #[test]
+    fn text_align_last_pre_wrap_aether_breaker() {
+        use crate::layout::inline::Frag;
+        if crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::MONO, 400, false)).is_none() {
+            return;
+        }
+        let css = "body{margin:0} p{margin:0;font:10px monospace;line-height:2;width:100px;white-space:pre-wrap;text-align:justify}";
+        let t = laid_out("<html><body><p id=p>ab cd\nef gh ij kl mn op qr st uv wx yz ab cd ef gh ij</p></body></html>", css);
+        let il = &t.inline[&node_by_id(&t, "p").unwrap()];
+        let j: Vec<f32> = il
+            .lines
+            .iter()
+            .map(|l| il.frags.iter().filter_map(|f| match f { Frag::Text { x, width, baseline, .. } if *baseline == l.2 => Some(x + width), _ => None }).fold(0.0f32, f32::max))
+            .collect();
+        assert!(j.len() >= 4, "a newline line, two or more wrapped lines, a last line: {j:?}");
+        assert!(j[0] < 50.0, "the newline line is natural: {j:?}");
+        for e in &j[1..j.len() - 1] {
+            assert!((e - 100.0).abs() <= 0.5, "armed: a wrapped pre-wrap line is justified: {j:?}");
+        }
+        assert!(*j.last().unwrap() < 99.0, "the last line is natural: {j:?}");
+    }
 }

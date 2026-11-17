@@ -699,14 +699,14 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                         continue;
                     }
                 }
-                let lines = ctx.fonts.break_lines(&run.text, &mode, &adv, line_w, cur_x, 1, has_content);
+                let (lines, nl_end) = break_marked(ctx.fonts, &run.text, &mode, &adv, line_w, cur_x, has_content); // AETHERTEXTALIGNLASTPRE (SR1161): each line's preserved-newline mark
                 let preserved = matches!(mode.white_space, 2 | 3 | 5);
                 for (i, l) in lines.into_iter().enumerate() {
                     if i > 0 {
                         let (left, right) = edges(&floats, y);
                         finish_line(
                             tree, ctx, root, root_m, &default_run, &shift, &mut pieces, &line_open, &stack, cur_x,
-                            has_content, forced || (preserved || mode.white_space == 4), left, right, align, &mut y, &mut out,
+                            has_content, forced || nl_end[i - 1], left, right, if nl_end[i - 1] { last_align } else { align }, &mut y, &mut out, // AETHERTEXTALIGNLASTPRE (SR1161): a newline line is a <br> line
                         );
                         for (f, side) in pending_floats.drain(..) {
                             place_float(&mut floats, &mut out, f, side, y);
@@ -1249,5 +1249,102 @@ fn last_line_align(align: u8, last: Option<u8>, rtl: bool) -> u8 {
         None => justify_last(align),
         Some(8) => 5 + rtl as u8,
         Some(c) => align_code(c, rtl),
+    }
+}
+
+// ---- AETHERTEXTALIGNLASTPRE (LEDGER SR1161): css-text-3 §7.2 a preserved newline is a forced break (named tail block) ----
+
+/// AETHERTEXTALIGNLASTPRE (SR1161): [`Fonts::break_lines`] over one text run, with each returned line's forced-break
+/// mark: true when the line ends at a preserved U+000A (white-space pre / pre-wrap / pre-line / break-spaces, the modes
+/// [`crate::lines::forced_breaks`] splits), so the line finish treats it as a `<br>` line ([`justify_line`] leaves it,
+/// [`last_line_align`] places it) and a wrapped line of those modes as a wrapped line. The breaker splits those modes
+/// into paragraphs at '\n' and opens a new line per paragraph, so breaking each paragraph alone (the first at
+/// `start_x` / `prior` with `lead`, the last with `trail`, the rest at 0 with neither) returns the same lines (the
+/// `break_marked_equals_one_call` KAT); the last line of every paragraph but the last is marked. Any other mode is the
+/// one call, unmarked.
+fn break_marked<F: Fonts + ?Sized>(fonts: &F, text: &str, mode: &crate::TextMode, adv: &crate::Adv, max_w: f32, start_x: f32, prior: bool) -> (Vec<crate::Line>, Vec<bool>) {
+    if !crate::lines::forced_breaks(mode) {
+        let lines = fonts.break_lines(text, mode, adv, max_w, start_x, 1, prior);
+        let n = lines.len();
+        return (lines, vec![false; n]);
+    }
+    let paras: Vec<&str> = text.split('\n').collect();
+    let last = paras.len() - 1;
+    let (mut lines, mut marks): (Vec<crate::Line>, Vec<bool>) = (Vec::new(), Vec::new());
+    for (pi, para) in paras.into_iter().enumerate() {
+        let m = crate::TextMode { lead: mode.lead && pi == 0, trail: mode.trail && pi == last, ..*mode };
+        let (sx, pr) = if pi == 0 { (start_x, prior) } else { (0.0, false) };
+        let ls = fonts.break_lines(para, &m, adv, max_w, sx, 1, pr);
+        let n = ls.len();
+        marks.extend((0..n).map(|k| pi < last && k + 1 == n));
+        lines.extend(ls);
+    }
+    (lines, marks)
+}
+
+#[cfg(test)]
+mod break_marked_kat {
+    use super::break_marked;
+    use crate::prelude::*;
+    use crate::{Adv, FontSel, Fonts, TextMode};
+
+    /// 5 px per char (the tests' fixed advance at 10px), ascent 8 / descent 2.
+    struct Mono;
+    impl Fonts for Mono {
+        fn has_face(&self, _sel: FontSel) -> bool {
+            true
+        }
+        fn measure(&self, run: &str, _adv: &Adv) -> f32 {
+            run.chars().count() as f32 * 5.0
+        }
+        fn line_metrics(&self, _sel: FontSel, _size: f32) -> (f32, f32, f32) {
+            (8.0, 2.0, 0.0)
+        }
+        fn x_height(&self, _sel: FontSel, _size: f32) -> f32 {
+            5.0
+        }
+    }
+
+    /// AETHERTEXTALIGNLASTPRE (SR1161, the seat's MEASURE condition 1): over a corpus (leading / trailing / doubled
+    /// '\n', leading spaces, a tab, a long unbreakable word, a hyphen) in every white-space mode, with lead / trail /
+    /// start_x / prior on and off, break_marked's lines are the one break_lines call's lines exactly (text and width);
+    /// a forced-break mode marks exactly one line per '\n' (each paragraph's last), every other mode none.
+    #[test]
+    fn break_marked_equals_one_call() {
+        let corpus = [
+            "aa bb\ncc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr",
+            "\naa bb",
+            "aa bb\n",
+            "aa\n\nbb cc",
+            "\n\n",
+            "",
+            "   lead spaces\n  and more   spaces here",
+            "tab\tstop\nx",
+            "unbreakablewordthatislongerthantheline aa\nbb unbreakablewordthatislongerthantheline",
+            "well-known short-lived\n words  ",
+        ];
+        let adv = Adv::new(FontSel::default(), 10.0, 0.0);
+        for ws in 0..6u8 {
+            for ow in [0u8, 1] {
+                for (lead, trail) in [(false, false), (true, false), (false, true), (true, true)] {
+                    for (sx, prior) in [(0.0f32, false), (30.0, true), (30.0, false)] {
+                        for t in corpus {
+                            let mode = TextMode { white_space: ws, overflow_wrap: ow, lead, trail, ..Default::default() };
+                            let one = Mono.break_lines(t, &mode, &adv, 60.0, sx, 1, prior);
+                            let (got, marks) = break_marked(&Mono, t, &mode, &adv, 60.0, sx, prior);
+                            assert_eq!(got, one, "ws {ws} ow {ow} lead {lead} trail {trail} sx {sx} prior {prior}: {t:?}");
+                            assert_eq!(marks.len(), got.len(), "one mark per line: {t:?}");
+                            let want = if matches!(ws, 2..=5) { t.matches('\n').count() } else { 0 };
+                            assert_eq!(marks.iter().filter(|m| **m).count(), want, "ws {ws}: one mark per newline: {t:?}");
+                            assert!(!marks.last().copied().unwrap_or(false), "the run's last line is never marked: {t:?}");
+                        }
+                    }
+                }
+            }
+        }
+        let mode = TextMode { white_space: 3, ..Default::default() };
+        let (l, m) = break_marked(&Mono, "aa bb\ncc dd ee ff gg hh", &mode, &adv, 60.0, 0.0, false);
+        assert_eq!(l.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["aa bb", "cc dd ee ff ", "gg hh"]);
+        assert_eq!(m, vec![true, false, false], "only the newline line is marked; the wrapped one is not");
     }
 }

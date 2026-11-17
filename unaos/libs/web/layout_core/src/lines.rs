@@ -12,7 +12,7 @@ fn collapses(m: &TextMode) -> bool {
 fn wraps(m: &TextMode) -> bool {
     !matches!(m.white_space, 1 | 2)
 }
-fn forced_breaks(m: &TextMode) -> bool {
+pub(crate) fn forced_breaks(m: &TextMode) -> bool { // AETHERTEXTALIGNLASTPRE (SR1161): THE predicate, read by inline::break_marked
     matches!(m.white_space, 2 | 3 | 4 | 5)
 }
 
