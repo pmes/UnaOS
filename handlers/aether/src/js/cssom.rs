@@ -1099,7 +1099,7 @@ fn initial_value(p: &str) -> &'static str {
         "z-index" | "width" | "height" | "top" | "left" | "right" | "bottom" | "flex-basis" | "cursor" => "auto",
         "float" | "clear" | "transform" | "box-shadow" | "text-shadow" | "max-width" | "max-height" | "filter"
         | "animation-name" | "text-transform" | "background-image" | "list-style-image" => "none",
-        "overflow" | "overflow-x" | "overflow-y" => "visible",
+        "overflow-x" | "overflow-y" => "visible",
         "box-sizing" => "content-box",
         "vertical-align" => "baseline",
         "background-repeat" => "repeat",
@@ -1158,7 +1158,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
         return inline;
     }
     crate::ledger::record_css(&format!("getComputedStyle-initial-not-cascaded:{prop}"));
-    initial_value(prop).to_string()
+    shorthand_computed(el, prop).unwrap_or_else(|| initial_value(prop).to_string())
 }
 
 thread_local! {
@@ -1854,12 +1854,7 @@ fn caption_side_computed(el: usize) -> String {
 /// `weight`, `style`, `none`): an element that declares only `font-synthesis-weight: none` reads `style`, not the
 /// shorthand its parent computes.
 fn font_synthesis_computed(el: usize) -> String {
-    let mut b = Block::default();
-    for l in longhands("font-synthesis").unwrap_or_default() {
-        let value = computed_value(el, &l);
-        b.decls.push(Decl { name: l, value, important: false });
-    }
-    serialize_shorthand(&b, "font-synthesis").map(|x| x.0).unwrap_or_default()
+    shorthand_computed(el, "font-synthesis").unwrap_or_default()
 }
 
 // ---- AETHERFONTSYNTHESISSMALLCAPS (LEDGER SR772): the font-synthesis shorthand serialized over its three longhands (named tail block) ----
@@ -2982,17 +2977,9 @@ fn offset_held_first(f: &Flushed, el: usize) -> Option<(f32, f32, f32, f32)> {
 /// longhands each at its own [`initial_value`], serialized by [`serialize_shorthand`] — so a shorthand's initial and
 /// its longhands' rows cannot disagree. None for a name that is not a row, for a row with a longhand that has no
 /// initial row (its value is the report's or has no static form), and for a row whose grammar does not serialize at
-/// initial (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS).
+/// initial (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS). Built on SR1092's [`shorthand_from`].
 fn shorthand_initial(sh: &str) -> Option<String> {
-    let mut b = Block::default();
-    for name in longhands(sh)? {
-        let value = initial_value(&name);
-        if value.is_empty() {
-            return None;
-        }
-        b.decls.push(Decl { name, value: value.to_string(), important: false });
-    }
-    serialize_shorthand(&b, sh).map(|x| x.0)
+    shorthand_from(sh, |l| initial_value(l).to_string())
 }
 
 /// The initial value of `prop` as getComputedStyle serializes it: a shorthand's derived through
@@ -3025,17 +3012,11 @@ mod shorthand_table_initial_tests {
         }
     }
 
-    /// The ONE shorthand row initial_value keeps: `computed_value`'s fallback still reads `initial_value` (no derived
-    /// value is invented there), so `overflow` keeps its `visible` read-back until AETHER-CSSOM-SHORTHAND-COMPUTED lands.
-    const KEPT_ROW: &str = "overflow";
-
+    /// SR1092: no shorthand row is kept — `overflow` reads `visible` through `computed_value`'s fallback composing its two
+    /// longhands (`shorthand_computed`), so the exception SR1086 kept is gone.
     #[test]
     fn shorthand_table_initial_no_shorthand_in_initial_value() {
         for (sh, _) in SHORTHANDS {
-            if *sh == KEPT_ROW {
-                assert_eq!(initial_value(sh), shorthand_initial(sh).unwrap(), "{sh}: the kept row equals the derived initial");
-                continue;
-            }
             assert_eq!(initial_value(sh), "", "{sh}: no hand-written shorthand row in initial_value");
         }
     }
@@ -3068,8 +3049,8 @@ mod shorthand_table_initial_tests {
     }
 
     /// getComputedStyle through `cascaded_value`'s `initial` closure: a declared CSS-wide `initial` on a shorthand reads
-    /// the derived initial. An undeclared shorthand stays "" at `computed_value`'s fallback (no value is invented for a
-    /// shorthand Aether does not compute; owed AETHER-CSSOM-SHORTHAND-COMPUTED).
+    /// the derived initial. SR1092: an undeclared shorthand composes from its longhands' computed values at
+    /// `computed_value`'s fallback (`shorthand_computed`), so #a's undeclared gap reads `normal` (was "").
     #[test]
     fn shorthand_table_initial_computed_gap() {
         let html = r#"<!doctype html><html><body><div id="a"></div><div id="g" style="gap: initial"></div><div id="r" style="border-radius: initial"></div></body></html>"#;
@@ -3077,7 +3058,7 @@ mod shorthand_table_initial_tests {
         engine.handle_event(crate::api::events::Event::Resize(400, 300));
         engine.load_html("https://example.com/", html, true);
         engine.render_frame();
-        for (id, prop, want) in [("g", "gap", "normal"), ("r", "border-radius", "0px"), ("a", "gap", "")] {
+        for (id, prop, want) in [("g", "gap", "normal"), ("r", "border-radius", "0px"), ("a", "gap", "normal")] {
             let got = engine
                 .js_engine
                 .as_mut()
@@ -3132,5 +3113,100 @@ mod white_space_longhands_accessor_tests {
         assert!(b.set("white-space-collapse", &css_core::parser::parse_component_values("preserve"), false));
         assert_eq!(b.get("white-space-collapse"), "preserve");
         assert_eq!(b.serialize(), "white-space-collapse: preserve;");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDCOMPUTED (LEDGER SR1092): a shorthand's computed value from its longhands' computed values (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDCOMPUTED (SR1092): the ONE shorthand builder — a [`Block`] of the [`SHORTHANDS`] row's longhands
+/// each at `value_of(longhand)`, serialized by [`serialize_shorthand`]. None for a name that is not a row, for a row with
+/// a longhand whose value is "" (SR1086's None-on-empty rule), and for a row whose grammar does not serialize those
+/// values. [`shorthand_initial`] passes [`initial_value`], [`shorthand_computed`] passes [`computed_value`].
+fn shorthand_from(sh: &str, value_of: impl Fn(&str) -> String) -> Option<String> {
+    let mut b = Block::default();
+    for name in longhands(sh)? {
+        let value = value_of(name.as_str());
+        if value.is_empty() {
+            return None;
+        }
+        b.decls.push(Decl { name, value, important: false });
+    }
+    serialize_shorthand(&b, sh).map(|x| x.0)
+}
+
+/// AETHERCSSOMSHORTHANDCOMPUTED (SR1092): a shorthand's computed value is the serialization of its longhands' computed
+/// values (each through [`computed_value`]: report column, cascaded, inherited or initial on its own) — the SR764
+/// `font_synthesis_computed` road generalised. `computed_value` takes it at its fallback, so an undeclared or partly
+/// declared shorthand (`margin-top: 5px` alone) composes (`5px 0px 0px`) and a fully declared one keeps its cascaded
+/// read. None where a longhand has no computed value or the grammar does not serialize (border with no colour row;
+/// owed AETHER-CSSOM-BORDER-COMPUTED).
+fn shorthand_computed(el: usize, sh: &str) -> Option<String> {
+    shorthand_from(sh, |l| computed_value(el, l))
+}
+
+#[cfg(test)]
+mod shorthand_computed_tests {
+    use super::*;
+
+    /// The derived initials SR1086 pinned, through the shared builder (byte-identical after the refactor).
+    #[test]
+    fn shorthand_computed_initial_unchanged() {
+        for (prop, want) in [
+            ("font-synthesis", "weight style small-caps"),
+            ("overflow", "visible"),
+            ("gap", "normal"),
+            ("margin", "0px"),
+            ("place-items", "normal"),
+            ("border", ""),
+        ] {
+            assert_eq!(initial_of(prop), want, "{prop}: initial");
+        }
+        assert_eq!(initial_value("overflow"), "", "SR1092: the overflow exception is gone from initial_value");
+    }
+
+    #[test]
+    fn shorthand_computed_reads() {
+        let html = r#"<!doctype html><html><body><div id="a"></div><div id="m" style="margin-top:5px"></div><div id="o" style="overflow-x:hidden"></div><div id="f" style="margin: 1em"></div><div id="p" style="align-items:center; justify-items:center"></div><div id="s" style="font-synthesis-weight:none"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let mut read = |target: &str, prop: &str| {
+            engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle({target}).getPropertyValue('{prop}')"))
+                .unwrap()
+        };
+        let by_id = |id: &str| format!("document.getElementById('{id}')");
+        for (id, prop, want) in [
+            ("m", "margin", "5px 0px 0px"),
+            ("a", "margin", "0px"),
+            ("a", "padding", "0px"),
+            ("a", "gap", "normal"),
+            ("a", "overflow", "visible"),
+            ("a", "border-radius", "0px"),
+            ("a", "inset", "auto"),
+            ("a", "flex", "0 1 auto"),
+            ("a", "border-width", "0px"),
+            ("a", "border-style", "none"),
+            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: a colour or border-image longhand
+            // has no computed row, so these rows still read "".
+            ("a", "border", ""),
+            ("a", "border-color", ""),
+            ("a", "outline", ""),
+            ("a", "background", ""),
+            ("o", "overflow", "hidden visible"),
+            // A fully declared shorthand keeps the cascaded road (the composition sits at the fallback).
+            ("f", "margin", "1em"),
+            ("p", "place-items", "center"),
+            ("s", "font-synthesis", "style small-caps"),
+        ] {
+            assert_eq!(read(&by_id(id), prop), want, "#{id}: computed {prop}");
+        }
+        // Owed AETHER-CSSOM-BOX-SIDE-COLUMNS: the UA body margin reaches getComputedStyle only through the margin-top
+        // report column, so the other sides compose at their initial 0px (Chromium reads `8px`).
+        assert_eq!(read("document.body", "margin"), "8px 0px 0px", "body: computed margin");
     }
 }
