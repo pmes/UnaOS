@@ -103,6 +103,8 @@ pub struct Clip {
     pub fade_out: i64,
     /// STRIACLIPSPEED (SR829): the clip's speed, Q16.16 (`0x1_0000` = 1x, the MP4 `elst` media_rate encoding); [`Clip::len`] / [`Clip::src_at`].
     pub rate_q16: u32,
+    /// STRIASPEEDREVERSE (SR9067): the clip plays its source window backwards ([`Clip::src_at`] descends); `false` = forward.
+    pub reverse: bool,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -111,7 +113,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, reverse: false }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -374,7 +376,7 @@ pub enum EditError {
     /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
     Gain,
     /// EDITMAP (SR223): an edit-list segment at a rate <= 0 (a rate-0 dwell hold, or reverse); STRIACLIPSPEED (SR829): a clip
-    /// at rate 0, an M2 speed <= 0, or an op that would cut a rated clip off its frame grid.
+    /// at rate 0, an M2 speed <= 0, or an op that would cut a rated clip off its frame grid; STRIASPEEDREVERSE (SR9067): an op a reversed clip does not support (a cut, a trim, a slide's follow, an outgoing handle).
     Rate,
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
@@ -483,7 +485,7 @@ impl Timeline {
             }
             self.validate_transitions(t)?;
         }
-        self.validate_audio_xfades()?;
+        self.validate_audio_xfades()?; self.validate_reverse()?; // STRIASPEEDREVERSE (SR9067): a reversed clip carries no outgoing handle (file tail)
         Ok(())
     }
 
@@ -1568,7 +1570,7 @@ impl Clip {
     /// STRIACLIPSPEED: the source tick timeline tick `t` shows: `src_in + floor((t - at) * rate / 0x1_0000)` (1x:
     /// `src_in + (t - at)`). The schedule's video and audio steps, `split` and the editor's mark-in / mark-out read it.
     pub fn src_at(&self, t: i64) -> i64 {
-        self.src_in + scale_q16(t - self.at, eff_rate(self.rate_q16))
+        if self.reverse { return reverse_src_at(self, t); } self.src_in + scale_q16(t - self.at, eff_rate(self.rate_q16)) // STRIASPEEDREVERSE (SR9067): the descending arm (file tail)
     }
     /// STRIACLIPSPEED: the same clip at speed `rate_q16` (Q16.16).
     pub fn at_rate(self, rate_q16: u32) -> Clip {
@@ -1579,7 +1581,7 @@ impl Clip {
 /// STRIACLIPSPEED: whether cutting track `t` at tick `at` keeps a rated clip spanning it whole: the head `src_in..src_at(at)`
 /// ends at `at` and the tail from `at` ends where the clip ended (always true at 1x and for any integer rate >= 1).
 fn cut_clean(t: &Track, at: i64) -> bool {
-    t.clips.iter().filter(|c| c.at < at && at < c.end() && c.rate_q16 != 0x1_0000).all(|c| {
+    t.clips.iter().filter(|c| c.at < at && at < c.end() && (c.rate_q16 != 0x1_0000 || c.reverse)).all(|c| !c.reverse && { // STRIASPEEDREVERSE (SR9067): a reversed clip is never cut (NLE-REVERSE-EDIT owed)
         let cut = c.src_at(at);
         Clip { src_out: cut, ..*c }.end() == at && Clip { src_in: cut, at, ..*c }.end() == c.end()
     })
@@ -1588,7 +1590,7 @@ fn cut_clean(t: &Track, at: i64) -> bool {
 /// STRIACLIPSPEED: clip `idx` of `t` has a butted neighbour that `slide` would make follow and that neighbour is rated;
 /// STRIACLIPSPEEDMORE (SR951): and, followed by `delta` through `follow_src`, that neighbour does not land exactly.
 fn slide_follows_rated(t: &Track, idx: usize, delta: i64) -> bool {
-    let Some(c) = t.clips.get(idx) else { return false };
+    let Some(c) = t.clips.get(idx) else { return false }; if reverse_butted(t, idx) { return true; } // STRIASPEEDREVERSE (SR9067): a reversed butted neighbour cannot follow (file tail)
     let rated = |o: &Clip| o.rate_q16 != 0x1_0000;
     idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && rated(p) && Clip { src_out: follow_src(*p, c.at, p.src_out, delta), ..*p }.end() != c.at.saturating_add(delta))
         || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && rated(n) && Clip { src_in: follow_src(*n, n.at, n.src_in, delta), at: n.at.saturating_add(delta), ..*n }.end() != n.end())
@@ -1840,5 +1842,152 @@ mod striaclipspeedmore_tests {
         assert_eq!(st.undo_depth(), 1, "a refusal pushes nothing");
         assert_eq!(st.verb("rspeed x"), None);
         std::println!("striaclipspeedmore: 2x drag -2 ticks ends at 3; rspeed 0.5 one undo step; rspeed 0 -> {}", EditError::Rate);
+    }
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): a clip plays backwards — the descending src_at, the refusals by name, set_reverse (named tail block) ----
+// A reversed clip (`reverse`, default false: every forward timeline is unchanged) shows its source window `src_in..src_out`
+// backwards at its `rate_q16`: timeline tick `t` shows `src_out - 1 - floor((t - at) * rate / 0x1_0000)`, so tick `at` shows
+// the LAST source tick and `end() - 1` a tick >= `src_in` (`len` is the ceiling). `len` is unchanged. The schedule needs no
+// arm: its continuity (`src_at(t + 1)`) holds on a descending clip, so a reversed clip seeks once and its run continues
+// backwards (the host's `vid_back` / `take_reversed` serve that). What a reversed clip does not support yet is refused
+// `Rate` by name (NLE-REVERSE-EDIT / NLE-REVERSE-HANDLE owed): a cut through it (`cut_clean`: `split`, `place`), a
+// slide's butted follow (`slide_follows_rated`), being the OUTGOING of a handle (`validate_reverse`: a video transition or
+// a transition to black ending at it, an audio crossfade with a Clip partner on its out cut, a fade to silence after it),
+// and the editor's trims (`EditorState::trim` / `ripple_trim`).
+
+/// STRIASPEEDREVERSE: the source tick a reversed clip `c` shows at timeline tick `t`.
+fn reverse_src_at(c: &Clip, t: i64) -> i64 {
+    c.src_out - 1 - scale_q16(t - c.at, eff_rate(c.rate_q16))
+}
+
+/// STRIASPEEDREVERSE: clip `idx` of `t` has a butted neighbour (previous ending at its start, next starting at its end) that
+/// is reversed: `slide` would move that neighbour's source edge the wrong way.
+fn reverse_butted(t: &Track, idx: usize) -> bool {
+    let Some(c) = t.clips.get(idx) else { return false };
+    idx.checked_sub(1).and_then(|i| t.clips.get(i)).is_some_and(|p| p.end() == c.at && p.reverse)
+        || t.clips.get(idx + 1).is_some_and(|n| n.at == c.end() && n.reverse)
+}
+
+impl Clip {
+    /// STRIASPEEDREVERSE: the same clip played backwards (`true`) or forwards (`false`).
+    pub fn reversed(self, reverse: bool) -> Clip {
+        Clip { reverse, ..self }
+    }
+}
+
+impl Timeline {
+    /// STRIASPEEDREVERSE: no reversed clip is the OUTGOING of a handle (its handle would run below `src_in`): a video
+    /// transition (or one to black) at its end, an audio crossfade with a Clip partner on its out cut, a fade to silence
+    /// after it. Refused `Rate` by name.
+    fn validate_reverse(&self) -> Result<(), EditError> {
+        for (ti, t) in self.tracks.iter().enumerate() {
+            for (ci, c) in t.clips.iter().enumerate().filter(|(_, c)| c.reverse) {
+                let video = t.transitions.iter().any(|x| x.at == c.end() && !x.from_black);
+                let under = t.clips.get(ci + 1).is_some_and(|n| n.at == c.end()) && self.crossfade_at(ti, ci + 1).is_some_and(|x| x.partner == Partner::Clip);
+                if video || under || self.fade_to_silence(ti, ci).is_some() {
+                    return Err(EditError::Rate);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// STRIASPEEDREVERSE: clip `idx` of `track` played backwards (`true`) or forwards; its `at`, window, rate and length stay.
+    /// Refused by name: `NoTrack` / `NoClip`; `Rate` when it would become a reversed outgoing of a handle (`validate`).
+    pub fn set_reverse(&self, track: usize, idx: usize, reverse: bool) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.reverse = reverse;
+        tl.validate()?;
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striaspeedreverse_tests {
+    extern crate std;
+    use super::*;
+    use crate::editor::{Edge, EditorState};
+
+    /// V1 on source A (50): `clips` laid as given.
+    fn tl(clips: Vec<Clip>) -> Timeline {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = clips;
+        tl
+    }
+
+    fn a(src_in: i64, src_out: i64, at: i64) -> Clip {
+        Clip::new(SourceId(0), src_in, src_out, at)
+    }
+
+    fn src_ats(c: &Clip) -> Vec<i64> {
+        (c.at..c.end()).map(|t| c.src_at(t)).collect()
+    }
+
+    #[test]
+    fn striaspeedreverse_src_at_descends_at_every_rate_and_len_stays() {
+        assert!(!a(10, 15, 0).reverse, "a new clip plays forward");
+        let one = a(10, 15, 3).reversed(true);
+        assert_eq!((one.len(), src_ats(&one)), (5, alloc::vec![14, 13, 12, 11, 10]));
+        let two = a(10, 20, 0).at_rate(0x2_0000).reversed(true);
+        assert_eq!((two.len(), src_ats(&two)), (5, alloc::vec![19, 17, 15, 13, 11]));
+        let half = a(10, 13, 0).at_rate(0x8000).reversed(true);
+        assert_eq!((half.len(), src_ats(&half)), (6, alloc::vec![12, 12, 11, 11, 10, 10]));
+        let odd = a(0, 10, 0).at_rate(0x3_0000).reversed(true);
+        assert!(src_ats(&odd).iter().all(|&s| (0..10).contains(&s)), "{:?}", src_ats(&odd));
+        assert_eq!(a(10, 15, 3).reversed(true).reversed(false), a(10, 15, 3));
+        std::println!("striaspeedreverse: 1x 10..15 -> {:?}; 2x 10..20 -> {:?}; 0.5x 10..13 -> {:?}", src_ats(&one), src_ats(&two), src_ats(&half));
+    }
+
+    #[test]
+    fn striaspeedreverse_handles_cuts_and_slides_refused_by_name() {
+        let base = tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]);
+        let rev = base.set_reverse(0, 0, true).unwrap();
+        assert!(rev.tracks[0].clips[0].reverse);
+        assert_eq!(rev.validate(), Ok(()));
+        let x = base.add_transition(0, 10, TransitionKind::Dissolve, 2).unwrap();
+        assert_eq!(x.set_reverse(0, 0, true), Err(EditError::Rate), "a reversed outgoing of a dissolve");
+        assert!(x.set_reverse(0, 1, true).is_ok(), "a reversed INCOMING has no handle");
+        let blk = tl(alloc::vec![a(0, 10, 0)]).add_transition_to_black(0, 10, TransitionKind::Dissolve, 2).unwrap();
+        assert_eq!(blk.set_reverse(0, 0, true), Err(EditError::Rate), "a reversed outgoing to black");
+        assert_eq!(rev.split(0, 5), Err(EditError::Rate), "a reversed clip is not cut");
+        assert_eq!(rev.place(0, a(40, 42, 4), Mode::Overwrite), Err(EditError::Rate));
+        assert_eq!(rev.slide(0, 1, 1), Err(EditError::Rate), "a reversed butted neighbour cannot follow");
+        assert_eq!(base.split(0, 5).map(|s| s.tracks[0].clips.len()), Ok(3), "a forward clip still cuts");
+        assert_eq!(base.set_reverse(3, 0, true), Err(EditError::NoTrack));
+        assert_eq!(base.set_reverse(0, 9, true), Err(EditError::NoClip));
+        std::println!("striaspeedreverse: dissolve / to-black outgoing, split, overwrite, slide -> {}", EditError::Rate);
+    }
+
+    #[test]
+    fn striaspeedreverse_audio_crossfade_outgoing_refused() {
+        let mut t = Timeline::new(25);
+        t.add_source("A", 50);
+        let at = t.add_track(Kind::Audio);
+        t.tracks[at].clips = alloc::vec![a(0, 10, 0), a(20, 30, 10)];
+        let x = t.add_audio_xfade(at, 10, 2, Curve::Linear).unwrap();
+        assert_eq!(x.set_reverse(at, 0, true), Err(EditError::Rate), "the crossfade's under layer would run below src_in");
+        assert!(t.set_reverse(at, 0, true).is_ok(), "a plain audio cut");
+    }
+
+    #[test]
+    fn striaspeedreverse_editor_word_is_one_undo_step_and_trims_refuse() {
+        let base = tl(alloc::vec![a(0, 10, 0), a(20, 30, 10)]);
+        let mut st = EditorState::new(base.clone());
+        assert_eq!(st.verb("reverse"), Some(Err(EditError::NoClip)));
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("reverse"), Some(Ok(())));
+        assert_eq!((st.selected().map(|c| c.reverse), st.undo_depth()), (Some(true), 1));
+        assert_eq!(st.verb("["), Some(Err(EditError::Rate)), "a key trim on a reversed clip");
+        assert_eq!(st.trim(Edge::Out, -1), Err(EditError::Rate));
+        assert_eq!(st.ripple_trim(Edge::In, 1), Err(EditError::Rate));
+        assert_eq!(st.undo_depth(), 1, "refusals push nothing");
+        assert_eq!(st.verb("reverse"), Some(Ok(())));
+        assert_eq!((st.timeline.clone(), st.undo_depth()), (base.clone(), 2), "toggled back");
+        assert!(st.undo());
+        assert!(st.selected().unwrap().reverse, "undo restores the reversed timeline");
+        std::println!("striaspeedreverse: `reverse` toggles in one commit each; `[` on a reversed clip -> {}", EditError::Rate);
     }
 }

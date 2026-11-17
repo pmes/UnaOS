@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &reverse_json(&face); // STRIASPEEDREVERSE (SR9067): `"reverse":true` only for a reversed selected clip (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -519,6 +519,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("speed", "Speed"), // STRIACLIPSPEED (SR829): the selected clip 1x -> 2x -> 4x -> 1x (THE `speed` verb)
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
+        button("reverse", "Reverse"), // STRIASPEEDREVERSE (SR9067): the selected clip plays backwards / forwards (THE `reverse` verb)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -904,5 +905,29 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): the witness reads a reversed selected clip (named tail block) ----
+/// STRIASPEEDREVERSE: `,"reverse":true` while the selected clip plays backwards; empty otherwise, so every forward line is
+/// unchanged.
+fn reverse_json(face: &Face) -> String {
+    if face.state.selected().is_some_and(|c| c.reverse) { ",\"reverse\":true".into() } else { String::new() }
+}
+
+#[cfg(test)]
+mod striaspeedreverse_tests {
+    use super::*;
+
+    #[test]
+    fn striaspeedreverse_witness_key_only_when_reversed() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(nle_face::EditorState::new(tl), src, (320, 160), nle_face::PixelOrder::Rgba, false);
+        assert_eq!(reverse_json(&face), "", "no selection");
+        face.state.select(0, 0).unwrap();
+        assert_eq!(reverse_json(&face), "", "a forward clip");
+        assert_eq!(face.state.verb("reverse"), Some(Ok(())));
+        assert_eq!(reverse_json(&face), ",\"reverse\":true");
+        println!("striaspeedreverse witness: {}", reverse_json(&face));
     }
 }

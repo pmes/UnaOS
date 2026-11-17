@@ -105,7 +105,7 @@ impl EditorState {
     }
     /// Move the selected clip's in (`Timeline::trim_in`) or out (`Timeline::trim_out`) point by `delta` source ticks.
     pub fn trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; if self.selected().is_some_and(|c| c.reverse) { return Err(EditError::Rate); } // STRIASPEEDREVERSE (SR9067): a reversed clip's trim is owed (NLE-REVERSE-EDIT)
         let c = self.selected().ok_or(EditError::NoClip)?;
         let tl = match edge {
             Edge::In => self.timeline.trim_in(track, idx, c.src_in + delta)?,
@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } // STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.reverse_verb(v) { return Some(r); } // STRIASPEEDREVERSE (SR9067): `reverse` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -462,7 +462,7 @@ impl EditorState {
     /// The ripple twin of [`EditorState::trim`]: the selected clip's in or out point by `delta` source ticks, keeping its
     /// start; the rest of its track follows.
     pub fn ripple_trim(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?; if self.selected().is_some_and(|c| c.reverse) { return Err(EditError::Rate); } // STRIASPEEDREVERSE (SR9067): a reversed clip's trim is owed (NLE-REVERSE-EDIT)
         let c = self.selected().ok_or(EditError::NoClip)?;
         let tl = match edge {
             Edge::In => self.timeline.ripple_trim_in(track, idx, c.src_in + delta)?,
@@ -726,5 +726,24 @@ impl EditorState {
     fn rspeed_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let q = crate::speed_q16(v.strip_prefix("rspeed ")?.trim(), 1)?;
         Some(self.ripple_speed(q))
+    }
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): the `reverse` word — the selected clip plays backwards, ONE commit (named tail block) ----
+// `reverse` toggles the selected clip's `reverse` through `Timeline::set_reverse` (its `at`, window, rate and length stay):
+// ONE commit, so undo restores the whole pre-op timeline; a refusal (`NoClip`, `Rate` for a reversed outgoing of a handle)
+// leaves the state. `trim` / `ripple_trim` refuse a reversed selection `Rate` (NLE-REVERSE-EDIT owed).
+impl EditorState {
+    /// Toggle the selected clip between forward and backward play (ONE commit).
+    pub fn reverse_selected(&mut self) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_reverse(track, idx, !c.reverse)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `reverse` word of [`EditorState::verb`]; `None`: not this word.
+    fn reverse_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        (v == "reverse").then(|| self.reverse_selected())
     }
 }

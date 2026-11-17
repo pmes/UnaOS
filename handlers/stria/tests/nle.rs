@@ -3955,3 +3955,68 @@ fn striaclipspeedmore_face_rspeed_ripples_where_speed_overlaps() {
     assert_eq!(face.state.timeline, tl, "undo restores");
     println!("striaclipspeedmore: rspeed 0.5 -> {ats:?}; speed 0.5 -> {}", EditError::Overlap);
 }
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): a reversed clip through the schedule, the render and the face (named tail block) ----
+
+/// V1 = A[0,20)@0 reversed at `rate` over the NLE1 reel A (utp1 counters 0..49): the counter each output tick shows, the
+/// schedule's video seeks, the render report.
+fn striaspeedreverse_video(rate: u32, ticks: i64) -> (Vec<Option<u32>>, usize, stria::nle::RenderReport) {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0).at_rate(rate).reversed(true)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let seeks = schedule(&tl, 0..ticks, &src).unwrap().iter().filter(|s| s.seek.is_some()).count();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..ticks, &src, &mut sink).unwrap();
+    (sink.frames.iter().map(|f| TestPattern::read_counter(&f.1, 64, 48)).collect(), seeks, r)
+}
+
+#[test]
+fn striaspeedreverse_video_counts_down() {
+    let (one, seeks, r) = striaspeedreverse_video(0x1_0000, 20);
+    assert_eq!(one, (0..20).rev().map(Some).collect::<Vec<_>>(), "counters 19..0");
+    assert_eq!((seeks, r.frames), (1, 20), "the schedule seeks once: the run continues backwards");
+    assert!(r.seeks >= 2, "the back cache re-opens at the keyframe below it: {}", r.seeks);
+    let (two, _, _) = striaspeedreverse_video(0x2_0000, 10);
+    assert_eq!(two, (0..10).rev().map(|k| Some(2 * k + 1)).collect::<Vec<_>>(), "2x: 19, 17, .., 1");
+    let (half, _, _) = striaspeedreverse_video(0x8000, 40);
+    assert_eq!(half, (0..40).map(|k| Some(19 - k / 2)).collect::<Vec<_>>(), "0.5x: each frame twice, descending");
+    println!("striaspeedreverse: 1x 19..0 schedule seeks=1 render seeks={} runup={}; 2x 19..1; 0.5x held twice", r.seeks, r.runup_frames);
+}
+
+#[test]
+fn striaspeedreverse_audio_samples_run_backwards() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let t = tl.add_track(Kind::Audio);
+    tl.tracks[t].clips = vec![Clip::new(a, 10, 20, 0).reversed(true)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let mut sink = Pcm::default();
+    render(&tl, 0..10, &src, &mut sink).unwrap();
+    assert_eq!((sink.rate, sink.pcm.len()), (SYNTH_RATE, 10 * PER));
+    for k in 0..10 * PER {
+        assert_eq!(sink.pcm[k], synth_sample(0, (20 * PER - 1 - k) as u64) as f32 / 32768.0, "sample {k}");
+    }
+    println!("striaspeedreverse: audio A[10,20) reversed: first sample is source sample {}, last {}", 20 * PER - 1, 10 * PER);
+}
+
+#[test]
+fn striaspeedreverse_face_word_toggles_in_one_step_and_saves_the_sign() {
+    assert_eq!(VERBS.iter().position(|v| *v == "reverse").map(|i| VERBS[i + 1]), Some("help"), "reverse sits right before help");
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("reverse"));
+    assert_eq!((face.state.selected().map(|c| c.reverse), face.state.undo_depth()), (Some(true), 1));
+    let text = edl::write(&face.state.timeline, "REV").unwrap();
+    assert!(text.contains("M2   A        -025.0 00:00:00:13\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the document reopens reversed");
+    assert!(face.verb("["));
+    assert_eq!(face.last_error.take(), Some(format!("[: {}", timeline_core::EditError::Rate)), "a reversed clip's trim is refused by name");
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "undo restores");
+    println!("striaspeedreverse: face `reverse` -> M2 -025.0; `[` -> {}", timeline_core::EditError::Rate);
+}

@@ -775,16 +775,16 @@ fn m2_comment(text: &str, i: usize, l: &str, fps: u32, line: usize, clip: Option
     if w.len() != 4 || w[0] != "M2" || w[1] != e[1] || parse_tc(w[3], fps, line)? != c.src_in {
         return Err(EdlError::Syntax { line });
     }
-    if w[2].starts_with('-') {
+    let (rev, sp) = w[2].strip_prefix('-').map_or((false, w[2]), |s| (true, s)); if sp.starts_with('-') { // STRIASPEEDREVERSE (SR9067): ONE leading `-` is a reversed clip (CMX: a negative speed plays backwards)
         return Err(EdlError::Edit(EditError::Rate));
     }
-    let q = crate::speed_q16(w[2], fps).ok_or(EdlError::Syntax { line })?;
+    let q = crate::speed_q16(sp, fps).ok_or(EdlError::Syntax { line })?; // STRIASPEEDREVERSE (SR9067): the magnitude
     if q == 0 {
         return Err(EdlError::Edit(EditError::Rate));
     }
     let n = e.len();
     let span = parse_tc(e[n - 1], fps, line - 1)? - parse_tc(e[n - 2], fps, line - 1)?;
-    c.rate_q16 = q;
+    c.rate_q16 = q; c.reverse = rev; // STRIASPEEDREVERSE (SR9067)
     if c.len() != span {
         return Err(EdlError::Duration { line: line - 1 });
     }
@@ -793,10 +793,10 @@ fn m2_comment(text: &str, i: usize, l: &str, fps: u32, line: usize, clip: Option
 
 /// STRIACLIPSPEED: clip `c`'s M2 line (empty at 1x).
 fn m2_line(reel: &str, c: &Clip, fps: u32) -> String {
-    if c.rate_q16 == 0x1_0000 {
+    if c.rate_q16 == 0x1_0000 && !c.reverse { // STRIASPEEDREVERSE (SR9067): a reversed clip writes M2 at 1x too
         return String::new();
     }
-    format!("M2   {:<8} {} {}\n", reel, m2_speed(c.rate_q16, fps), timecode(c.src_in, fps))
+    format!("M2   {:<8} {}{} {}\n", reel, if c.reverse { "-" } else { "" }, m2_speed(c.rate_q16, fps), timecode(c.src_in, fps)) // STRIASPEEDREVERSE (SR9067): the sign
 }
 
 /// STRIACLIPSPEED: `rate_q16 * fps / 0x1_0000` as an exact decimal: `{:03}` integer part, every needed decimal digit (>= 1).
@@ -865,12 +865,50 @@ mod striaclipspeed_tests {
         assert!(matches!(parse(&tc, 25), Err(EdlError::Syntax { .. })), "another source in");
         let slow = s.replacen(m2, "M2   A        025.0 00:00:00:13\n", 1);
         assert!(matches!(parse(&slow, 25), Err(EdlError::Duration { .. })), "a speed that does not fit the record span");
-        for bad in ["-050.0", "000.0"] {
+        for bad in ["--050.0", "000.0", "-000.0"] { // STRIASPEEDREVERSE (SR9067): was ["-050.0", "000.0"]; `-050.0` is now a reversed 2x
             let t = s.replacen(m2, &format!("M2   A        {bad} 00:00:00:13\n"), 1);
             assert!(matches!(parse(&t, 25), Err(EdlError::Edit(EditError::Rate))), "{bad}");
         }
         let junk = s.replacen(m2, "M2   A        fast 00:00:00:13\n", 1);
         assert!(matches!(parse(&junk, 25), Err(EdlError::Syntax { .. })), "unreadable speed");
         std::println!("striaclipspeed: M2 refusals: stray/reel/tc/junk Syntax, wrong speed Duration, -/0 Rate");
+    }
+}
+
+// ---- STRIASPEEDREVERSE (LEDGER SR9067): the M2 sign — a reversed clip (named tail block) ----
+// A reversed clip writes its M2 line at any rate (1x included) with the speed negated (`-025.0` at 25 fps 1x); the reader
+// takes ONE leading `-` as `reverse`, a second sign or a zero speed stays `Rate`. A forward 1x clip writes no M2 (unchanged).
+
+#[cfg(test)]
+mod striaspeedreverse_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    /// V1 A[13,23)@0 at `rate` reversed, A[30,40)@25.
+    fn rev(rate: u32) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0).at_rate(rate).reversed(true), Clip::new(a, 30, 40, 25)];
+        tl
+    }
+
+    #[test]
+    fn striaspeedreverse_m2_sign_round_trips() {
+        let one = write(&rev(0x1_0000), "REV").unwrap();
+        assert!(one.contains("M2   A        -025.0 00:00:00:13\n"), "{one}");
+        assert_eq!(one.matches("M2 ").count(), 1, "only the reversed clip writes M2");
+        assert_eq!(parse(&one, 25).unwrap(), rev(0x1_0000), "1x reversed round trips");
+        let two = write(&rev(0x2_0000), "REV").unwrap();
+        assert!(two.contains("M2   A        -050.0 00:00:00:13\n"), "{two}");
+        assert_eq!(parse(&two, 25).unwrap(), rev(0x2_0000));
+        assert_eq!(write(&parse(&two, 25).unwrap(), "REV").unwrap(), two, "byte-identical");
+        let mut fwd = rev(0x1_0000);
+        fwd.tracks[0].clips[0].reverse = false;
+        assert!(!write(&fwd, "REV").unwrap().contains("M2"), "a forward 1x EDL writes no M2");
+        let twice = one.replacen("-025.0", "--025.0", 1);
+        assert!(matches!(parse(&twice, 25), Err(EdlError::Edit(EditError::Rate))), "two signs");
+        std::println!("striaspeedreverse: M2 -025.0 / -050.0 round trip byte-identical; forward 1x writes none");
     }
 }

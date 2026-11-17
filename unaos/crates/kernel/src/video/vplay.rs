@@ -1037,7 +1037,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let st = timeline_core::editor::EditorState::open(text, 25).map_err(|e| ("edl-refused", Some(alloc::format!("edl: {}", e))))?; let st = edit_seed(jid, path, st); // NLE6KEYS (rmbp-ledger B961): the Player's one editor state survives the job's restarts (file tail)
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
-    let mt = crate::shell::vfs_mount_table();
+    if let Some(c) = tl.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| c.reverse) { return Err(("reverse-unsupported", Some(alloc::format!("a reversed clip of source {} (the Player's EDL mode plays forward only)", c.src.0)))); } let mt = crate::shell::vfs_mount_table(); // NLE-REVERSE-KERNEL (SR9067): a reversed clip is refused by name, never played forward
     if let Some(c) = tl.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| c.rate_q16 != 0x1_0000) { return Err(("rate-unsupported", Some(alloc::format!("a clip at rate {:#x} (the Player's EDL mode plays every clip at 1x)", c.rate_q16)))); } let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // NLE-SPEED-KERNEL (SR829): a rated clip is refused by name, never played at 1x
     for s in &tl.sources {
         let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
