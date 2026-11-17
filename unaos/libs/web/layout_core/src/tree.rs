@@ -1664,15 +1664,7 @@ fn reresolve_font_relative<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>,
     let viewport = ParseCx::new(tree.viewport.0, tree.viewport.1).viewport;
     for (id, decls) in todo {
         let Some(run) = elems.get(&id) else { continue };
-        let fs = run.font_size;
-        let (ex, ch) = if fonts.has_face(run.sel()) {
-            let ex = fonts.x_height(run.sel(), fs);
-            let ch = fonts.measure("0", &Adv::new(run.sel(), fs, 0.0));
-            (if ex > 0.0 { ex } else { fs * 0.5 }, ch)
-        } else {
-            (fs * 0.5, fs * 0.5)
-        };
-        let cx = ParseCx { viewport, font: (fs, root_fs, ex, ch), container: (None, None) };
+        let cx = ParseCx { viewport, font: font_units(fonts, run.sel(), run.font_size, root_fs), container: (None, None) };
         refold(tree, id, css::reapply_declarations(&decls, &cx)); // SR1130 / SR1136: the one refold tail, seeded with the paint fields fold_into reads
     }
     true
@@ -2726,16 +2718,7 @@ fn reresolve_container_units<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H
             cur = tree.taffy.parent(p);
         }
         let font = match elems.get(&id) {
-            Some(run) => {
-                let fs = run.font_size;
-                let (ex, ch) = if fonts.has_face(run.sel()) {
-                    let ex = fonts.x_height(run.sel(), fs);
-                    (if ex > 0.0 { ex } else { fs * 0.5 }, fonts.measure("0", &Adv::new(run.sel(), fs, 0.0)))
-                } else {
-                    (fs * 0.5, fs * 0.5)
-                };
-                (fs, root_fs, ex, ch)
-            }
+            Some(run) => font_units(fonts, run.sel(), run.font_size, root_fs),
             None => ParseCx::default().font,
         };
         let cx = ParseCx { viewport, font, container: (qw, qh) };
@@ -4049,4 +4032,18 @@ fn refold<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, mut spec: Specif
     }
     if let Ok(st) = tree.taffy.style(id) { let mut st = st.clone(); spec.fold_into(&mut st); let _ = tree.taffy.set_style(id, st); }
     if let Some(p) = tree.paint_map.get_mut(&id) { css::merge_paint(p, &spec.paint); }
+}
+
+// ---- AETHERFONTUNITSONEFN (LEDGER SR1142): ONE font_units for both re-resolutions (named tail block) ----
+
+/// AETHERFONTUNITSONEFN (SR1142): the font tuple `(fs, root_fs, ex, ch)` of `ParseCx::font` for a run of `sel` at
+/// `fs`: ex is the face's x-height (fs / 2 when the face reports none), ch the advance of "0"; with no face both are
+/// fs / 2. The font-relative and the container-unit re-resolutions both take it; `pub` for the host's cssom report.
+pub fn font_units<F: Fonts + ?Sized>(fonts: &F, sel: FontSel, fs: f32, root_fs: f32) -> (f32, f32, f32, f32) {
+    if !fonts.has_face(sel) {
+        return (fs, root_fs, fs * 0.5, fs * 0.5);
+    }
+    let ex = fonts.x_height(sel, fs);
+    let ch = fonts.measure("0", &Adv::new(sel, fs, 0.0));
+    (fs, root_fs, if ex > 0.0 { ex } else { fs * 0.5 }, ch)
 }
