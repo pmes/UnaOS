@@ -208,7 +208,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if let Some(r) = self.preview_history_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -3203,7 +3203,7 @@ impl Face {
         if matches!(msg, SMessage::BrowserButton { .. }) {
             self.buttons = true;
         }
-        if let Some(r) = at.and_then(|(x, y)| self.history_pick_at(x, y)) {
+        if let Some(r) = at.and_then(|(x, y)| self.history_pick_at(x, y, self.pointer_role())) {
             return Some(r);
         }
         self.note = None;
@@ -3212,12 +3212,12 @@ impl Face {
     }
     /// STRIAUNDOMORE (SR973): the point (buffer pixels) on the message row while it shows the noted history line: the
     /// entry under it undone to (`Some(true)`), or `Some(false)` off any entry; `None` off the row or no such line shown.
-    fn history_pick_at(&mut self, x: f64, y: f64) -> Option<bool> {
+    fn history_pick_at(&mut self, x: f64, y: f64, role: Role) -> Option<bool> {
         let style = self.labels.as_ref()?;
-        if self.split.is_some() {
+        if self.split.is_some() != (role == Role::Preview) {
             return None;
         }
-        let l = self.layout().with_message(true);
+        let l = self.layout_for(role).with_message(true);
         if l.message_h < MESSAGE_H || y < l.message_y as f64 || y >= (l.message_y + l.message_h) as f64 {
             return None;
         }
@@ -3297,4 +3297,31 @@ fn redo_entry_at(line: &str, at: usize, b: usize) -> Option<usize> {
         start = end + 3;
     }
     None
+}
+
+// ---- STRIAHISTORYSPLIT (LEDGER SR9056): the history line picked on the split preview Surface (named tail block) ----
+// Split, the message row (and so the noted history line) is painted on the preview Surface, whose pointer `takes` drops.
+// One fold ahead of `takes` (SR962's shape) hands a press down / click-only click there, while a note stands, to the ONE
+// pick fn `history_pick_at` with `Role::Preview` (its geometry from `layout_for`): an undo entry runs SR934's `undo <k>`,
+// a redo entry `redo <q>`, a press on the row off any entry is taken and moves nothing; anything else falls to `takes`.
+impl Face {
+    /// STRIAHISTORYSPLIT (SR9056): a split preview Surface's press down / click-only click while a note stands, through
+    /// [`Face::history_pick_at`] on the preview's row; `None` for anything else (unsplit, another Surface, no note, off the
+    /// row), which [`Face::takes`] then drops as before.
+    fn preview_history_input(&mut self, msg: &SMessage) -> Option<bool> {
+        let s = self.split?;
+        if msg.surface() != Some(s.preview) {
+            return None;
+        }
+        self.note.as_ref()?;
+        let (x, y) = match *msg {
+            SMessage::BrowserButton { down: true, x, y, .. } => (x, y),
+            SMessage::BrowserClick(x, y, _) if !self.buttons => (x, y),
+            _ => return None,
+        };
+        if matches!(msg, SMessage::BrowserButton { .. }) {
+            self.buttons = true;
+        }
+        self.history_pick_at(x, y, Role::Preview)
+    }
 }

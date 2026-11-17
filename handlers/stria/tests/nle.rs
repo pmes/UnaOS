@@ -3994,3 +3994,78 @@ fn striaundothree_redo_part_miss_and_undo_pick() {
     assert_eq!(line.as_deref(), Some("history: 3 slip+ | 2 delete | 1 split"));
     assert_eq!(fresh.message_text(), line, "no redo entries: the note is the history line");
 }
+
+// ---- STRIAHISTORYSPLIT (LEDGER SR9056): the history line picked on the split preview Surface (named tail block) ----
+
+/// SR973's face split over Surfaces 0 (preview) and 1 (tracks): the message row is the preview Surface's.
+fn striahistorysplit_face() -> (stria::nle_face::Face, Timeline) {
+    let (face, split) = striaundomore_face(true);
+    (face.on_surfaces(0, 1), split)
+}
+
+/// The point on the preview Surface's message row at byte `i` of `line` (the row's own geometry and shaper).
+fn striahistorysplit_at(face: &stria::nle_face::Face, line: &str, i: usize) -> (f64, f64) {
+    let l = face.layout_for(stria::nle_face::Role::Preview).with_message(true);
+    assert_eq!(l.message_h, stria::nle_face::MESSAGE_H, "the split preview has a message row");
+    let style = text_host::line::TextStyle::new(&["sans"], 11.0);
+    let x = 4.0 + style.shape(line).caret_x(line, i) as f64 + 2.0;
+    (x, (l.message_y + l.message_h / 2) as f64)
+}
+
+fn striahistorysplit_press(face: &mut stria::nle_face::Face, x: f64, y: f64, surface: u32) -> bool {
+    face.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface })
+}
+
+/// Rule: split, a press on the preview Surface's row on `2 delete` runs SR934's `undo 2` and clears the note; the same
+/// press on the tracks Surface (no row there) picks nothing and clears the note.
+#[test]
+fn striahistorysplit_pick_undo_on_preview() {
+    let (mut face, split) = striahistorysplit_face();
+    let line = striaundomore_history(&mut face);
+    assert_eq!(face.message_text().as_deref(), Some(line.as_str()));
+    let (x, y) = striahistorysplit_at(&face, &line, line.find("2 delete").unwrap());
+    assert!(striahistorysplit_press(&mut face, x, y, 0));
+    let landed = face.last_error.take();
+    assert_eq!(landed.as_deref(), Some("undo 2: back to before \"delete\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (1, 2));
+    assert_eq!(face.state.timeline, split);
+    assert!(face.message_text().is_none_or(|m| !m.starts_with("history:")), "the pick clears the note");
+    println!("striahistorysplit: pick at x {x:.1} -> {landed:?}");
+
+    let (mut tracks, _split) = striahistorysplit_face();
+    let line = striaundomore_history(&mut tracks);
+    let (x, y) = striahistorysplit_at(&tracks, &line, line.find("2 delete").unwrap());
+    striahistorysplit_press(&mut tracks, x, y, 1);
+    tracks.last_error = None;
+    assert_eq!(tracks.state.undo_depth(), 3, "the tracks Surface has no row: nothing is picked");
+    assert!(tracks.message_text().is_none_or(|m| !m.starts_with("history:")), "the press clears the note");
+}
+
+/// Rule: split, after `undo 2` the noted line carries the redo entries; a preview press on the separator is taken and
+/// moves nothing; on `r2 slip+` it runs `redo 2`; with no note a preview press is not taken.
+#[test]
+fn striahistorysplit_pick_redo_and_miss_on_preview() {
+    let (mut face, _split) = striahistorysplit_face();
+    let top = face.state.timeline.clone();
+    assert!(face.verb("undo 2"));
+    face.last_error = None;
+    assert!(face.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "history".into() }));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 split"));
+    let note = face.message_text().expect("the note on the row");
+    assert_eq!(note, "history: 1 split || redo: r1 delete | r2 slip+");
+    let (x, y) = striahistorysplit_at(&face, &note, note.find("|| redo").unwrap() + 4);
+    assert!(!striahistorysplit_press(&mut face, x, y, 0), "on the separator: taken, nothing to repaint");
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (1, 2));
+    assert_eq!(face.message_text().as_deref(), Some(note.as_str()), "the note stands");
+    let (x, y) = striahistorysplit_at(&face, &note, note.find("r2 slip+").unwrap());
+    assert!(striahistorysplit_press(&mut face, x, y, 0));
+    let landed = face.last_error.take();
+    assert_eq!(landed.as_deref(), Some("redo 2: forward to after \"slip+\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (3, 0));
+    assert_eq!(face.state.timeline, top);
+    println!("striahistorysplit: pick at x {x:.1} -> {landed:?}");
+
+    let shown = face.state.timeline.clone();
+    assert!(!striahistorysplit_press(&mut face, x, y, 0), "no note: the preview Surface takes no press");
+    assert_eq!((face.state.undo_depth(), face.state.timeline == shown), (3, true));
+}
