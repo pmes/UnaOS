@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "export-skip", "export-clear", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.export_queue_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3122,6 +3122,7 @@ pub struct ExportRequest {
     fmt: String,
     range: Option<std::ops::Range<i64>>,
     audio: AudioOut,
+    timeline: Timeline, // STRIAEXPORTQUEUESKIP (SR914): the timeline as it stood when queued, swapped in around start_export (file tail)
 }
 
 impl Face {
@@ -3136,17 +3137,17 @@ impl Face {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
         self.range_check(&range)?;
-        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio });
+        self.export_queue.push_back(ExportRequest { dir: dir.to_path_buf(), fmt: fmt.to_string(), range, audio, timeline: self.state.timeline.clone() }); // STRIAEXPORTQUEUESKIP (SR914): the queued snapshot
         self.last_error = Some(format!("export: queued ({} waiting)", self.export_queue.len()));
         Ok(())
     }
     /// Start the next queued request through [`Face::start_export`] (no job runs: called after `finish_export`). A request
-    /// that no longer starts (its directory, its range after an edit) is named after the finished job's line
+    /// that no longer starts (its directory; its range and timeline are the snapshot taken when queued, SR914) is named after the finished job's line
     /// (`; queued <dir>: <e>`) and the next one is tried, until one starts or the queue is empty.
     fn start_queued(&mut self) {
         while self.export.is_none() {
-            let Some(r) = self.export_queue.pop_front() else { return };
-            if let Err(e) = self.start_export(&r.dir, &r.fmt, None, r.range, r.audio) {
+            let Some(mut r) = self.export_queue.pop_front() else { return }; // STRIAEXPORTQUEUESKIP (SR914): mutable for the timeline swap
+            if let Err(e) = self.start_request(&mut r) { // STRIAEXPORTQUEUESKIP (SR914): the request's own timeline (file tail)
                 let prev = self.last_error.take().map(|l| format!("{l}; ")).unwrap_or_else(|| "export: ".to_string());
                 self.last_error = Some(format!("{prev}queued {}: {e}", r.dir.display()));
             }
@@ -3172,5 +3173,47 @@ impl Face {
         let Some(j) = self.export.as_ref() else { return false };
         j.cancel.store(true, Relaxed);
         true
+    }
+}
+
+// ---- STRIAEXPORTQUEUESKIP (LEDGER SR914): the queue's skip / clear words and the queued-timeline snapshot (named tail block) ----
+// `export-skip` cancels the running export through SR881's `Face::export_skip` (the next queued request starts when
+// `export_tick` reports the cancel); `export-clear` drops the waiting requests and leaves the running job. Both are view
+// words: no `commit`, no undo step, no dirty document. Each queued request carries the timeline as it stood when queued
+// (`ExportRequest.timeline`); `start_request` swaps it into `self.state.timeline` around the unchanged `start_export`
+// (face thread only, nothing paints in between), so its range check, total, span and the thread's clone all read the
+// snapshot. Owed: NLE5D-EXPORT-QUEUE-KEY (a key for export-skip; Esc stays cancel-all).
+
+impl Face {
+    /// Start a queued request over its own snapshot timeline through the unchanged [`Face::start_export`]; the live
+    /// timeline is back in place before this returns, whatever the outcome.
+    fn start_request(&mut self, r: &mut ExportRequest) -> Result<(), String> {
+        std::mem::swap(&mut self.state.timeline, &mut r.timeline);
+        let res = self.start_export(&r.dir, &r.fmt, None, r.range.clone(), r.audio);
+        std::mem::swap(&mut self.state.timeline, &mut r.timeline);
+        res
+    }
+    /// The queue's words: `export-skip` (`export: skipping (<n> waiting)`, or `export-skip: no export running`) and
+    /// `export-clear` (`export: dropped <n> waiting`); `None` for any other word.
+    fn export_queue_verb(&mut self, v: &str) -> Option<bool> {
+        match v {
+            "export-skip" => {
+                let line = if self.export_skip() { format!("export: skipping ({} waiting)", self.export_queue.len()) } else { "export-skip: no export running".to_string() };
+                self.last_error = Some(line);
+                Some(true)
+            }
+            "export-clear" => {
+                let n = self.export_clear();
+                self.last_error = Some(format!("export: dropped {n} waiting"));
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+    /// Drop the waiting export requests, the running job untouched; the number dropped.
+    pub fn export_clear(&mut self) -> usize {
+        let n = self.export_queue.len();
+        self.export_queue.clear();
+        n
     }
 }
