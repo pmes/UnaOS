@@ -13462,3 +13462,41 @@ fn striaxformkeys_face_key_note() {
     assert_eq!(face.last_error.take(), Some(format!("pip key: {}", timeline_core::EditError::XKey)));
     assert_eq!(face.state.undo_depth(), 3);
 }
+
+// ---- STRIAWAVEFORMSTEREO (LEDGER SR9051): the scan keeps each channel of a stereo source and builds the pyramid (named tail block) ----
+
+/// STRIAWAVEFORMSTEREO (SR9051): `scan_peaks` over a 2-s stereo PCM16 source (L a sawtooth, R silence) keeps two channel
+/// tables of 200 buckets beside the folded one (R all 0, L non-flat, the folded table their max), and finishes every table
+/// with its max pyramid (one byte on top, the table's max); the mono synth reel keeps no channel tables.
+#[test]
+fn striawaveformstereo_scan_keeps_both_channels() {
+    use timeline_core::view::PEAKS_PER_SEC;
+    let mut tl = Timeline::new(25);
+    let (a, st) = (tl.add_source("A", 50), tl.add_source("ST", 50));
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(st, 0, 50, 0)];
+    let frames = 2 * SYNTH_RATE as usize;
+    let pcm: Vec<i16> = (0..frames).flat_map(|f| [((f % 480) as i32 * 60 - 14_400) as i16, 0i16]).collect();
+    let track = gneiss_pal::dsp::demux::build::pcm16_track(2, SYNTH_RATE, 2, &pcm, 960);
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(st, gneiss_pal::dsp::demux::build::mp4(&[track], &gneiss_pal::dsp::demux::build::Mp4Options::default())).unwrap();
+    let p = stria::nle::scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("the stereo source has audio");
+    assert_eq!(p.buckets.len(), 200);
+    assert_eq!(p.chans.len(), 2, "a stereo source keeps L and R");
+    let (l, r) = (&p.chans[0], &p.chans[1]);
+    assert_eq!((l.buckets.len(), r.buckets.len()), (200, 200));
+    assert!(r.buckets.iter().all(|&b| b == 0), "R is silent");
+    let lmax = l.buckets.iter().copied().max().unwrap();
+    assert!(lmax > 0, "L carries the sawtooth");
+    assert!(p.buckets.iter().enumerate().all(|(i, &b)| b == l.buckets[i].max(r.buckets[i])), "the folded table is the max of L and R");
+    for t in [&p, l, r] {
+        assert_eq!(t.lod.last().map(|top| top.len()), Some(1), "the pyramid reaches one byte");
+        assert_eq!(t.lod.last().map(|top| top[0]), t.buckets.iter().copied().max());
+        assert_eq!(t.range_max(3, 197), t.buckets[3..197].iter().copied().max().unwrap());
+    }
+    let m = stria::nle::scan_peaks(&src, a, PEAKS_PER_SEC).unwrap().expect("the synth reel has audio");
+    assert!(m.chans.is_empty(), "a mono source keeps no channel tables");
+    assert_eq!(m.lod.last().map(|top| top.len()), Some(1));
+    println!("striawaveformstereo: stereo scan buckets={} chans={} L max={lmax} lod levels={}", p.buckets.len(), p.chans.len(), p.lod.len());
+}

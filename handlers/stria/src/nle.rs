@@ -1007,16 +1007,16 @@ pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Optio
     let mut a = Aud::open(m, id, 0, ch)?;
     let rate = a.rate.max(1);
     let step = rate as i64;
-    let mut p = timeline_core::view::Peaks { per_sec, buckets: Vec::new() };
+    let mut p = timeline_core::view::Peaks { per_sec, buckets: Vec::new(), chans: Vec::new(), lod: Vec::new() };
     for k in 0i64.. {
         a.fill((k + 1) * step, true)?;
         let pcm = a.drain(k * step, step);
         if pcm.is_empty() {
             break;
         }
-        p.buckets.extend(timeline_core::view::peaks_of(rate, ch, &pcm, per_sec).buckets);
+        p.append(timeline_core::view::peaks_of(rate, ch, &pcm, per_sec)); // STRIAWAVEFORMSTEREO (SR9051): a stereo source keeps its L / R tables (file tail)
     }
-    Ok(Some(p))
+    p.finish(); Ok(Some(p)) // STRIAWAVEFORMSTEREO (SR9051): the max pyramid of the whole table (file tail)
 }
 
 // ---- STRIATITLECLIP (LEDGER SR828): the title card's frames (named tail block) ----
