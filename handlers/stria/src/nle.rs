@@ -1014,3 +1014,37 @@ pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Optio
     }
     Ok(Some(p))
 }
+
+// ---- STRIANORMALIZE (LEDGER SR878): one source range's exact peak through the audio road (named tail block) ----
+
+/// STRIANORMALIZE (SR878): the exact peak (max |sample| over every channel, NaN ignored, NOT clamped at full scale) of
+/// source `id` over source time `ns` (nanoseconds from the source's origin), at the decoder's own rate: samples
+/// `samples(ns.start, rate) .. samples(ns.end, rate)`. The same road as [`scan_peaks`]: ONE [`Aud`] (opened at the audio
+/// keyframe before `ns.start`, as `mix_run` opens one), `fill` soft to the stream's end and `drain` one second at a time (a
+/// hole is silence). `Ok(None)`: the source has no audio stream. The face's `normalize` word reads it (SR827's u8 table
+/// clamps at 1.0, rounds to nearest and straddles the clip's edges, so it cannot set a peak target).
+pub fn peak_of(sources: &Sources, id: SourceId, ns: std::ops::Range<i64>) -> Result<Option<f32>, RenderError> {
+    let m = sources.get(id)?;
+    let Some(i) = m.audio else { return Ok(None) };
+    let ch = m.demux.tracks()[i].channels.max(1);
+    let key = sources.keyframe_ns(id, Kind::Audio, ns.start.max(0)).ok_or(RenderError::NoStream(id, Kind::Audio))?;
+    let mut a = Aud::open(m, id, key, ch)?;
+    let rate = a.rate.max(1);
+    let (s0, s1) = (samples(ns.start.max(0), rate), samples(ns.end.max(0), rate));
+    let mut peak = 0.0f32;
+    let mut at = s0;
+    while at < s1 {
+        let n = (rate as i64).min(s1 - at);
+        a.fill(at + n, true)?;
+        let pcm = a.drain(at, n);
+        if pcm.is_empty() {
+            break;
+        }
+        peak = pcm.iter().fold(peak, |m, &x| {
+            let v = if x < 0.0 { -x } else { x };
+            if v > m { v } else { m }
+        });
+        at += n;
+    }
+    Ok(Some(peak))
+}

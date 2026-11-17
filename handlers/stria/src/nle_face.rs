@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 31] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "gain-", "gain+", "gain", "fade-in", "fade-out", "help"]; // STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 32] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "gain-", "gain+", "gain", "fade-in", "fade-out", "normalize", "help"]; // STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3185,4 +3185,66 @@ pub fn db_words(cdb: i32) -> String {
 /// The message line after a gain / fade word: `gain <db_words>` or `fade-in <n>, fade-out <m>` (ticks).
 fn audio_line(word: &str, c: &Clip) -> String {
     if word.starts_with("gain") { format!("gain {}", db_words(c.gain_cdb)) } else { format!("fade-in {}, fade-out {}", c.fade_in, c.fade_out) }
+}
+
+// ---- STRIANORMALIZE (LEDGER SR878): the normalize word over the clip's exact peak (named tail block) ----
+// `normalize [<dBFS>]` (default -1 dBFS) sets the selected audio clip's gain so its peak lands on the target, never above
+// it: the peak is EXACT (nle.rs `peak_of`, the render's own audio road over the clip's source range, beside SR827's
+// `scan_peaks`; the u8 waveform table clamps at full scale, rounds to nearest and straddles the clip's edges), the gain
+// absolute (the clip's current gain ignored; fades only lower the level) and set through SR838's ONE road
+// (`EditorState::set_selected_gain`: `Timeline::set_gain`'s validate, one commit, one undo step; the same gain commits
+// nothing). A host-face word: the editor holds no media, so the kernel Player never sees it (the gain it writes is the
+// `* UNA GAIN` the kernel already reads). Every outcome is on the message line; a refusal leaves the timeline.
+
+/// STRIANORMALIZE (SR878): the word's default target, centi-dB (-1 dBFS).
+pub const NORMALIZE_TARGET_CDB: i32 = -100;
+
+impl Face {
+    /// The `normalize [<dBFS>]` word; `None` for any other word.
+    fn normalize_verb(&mut self, v: &str) -> Option<bool> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|w| *w == "normalize")?;
+        let (arg, extra) = (w.next(), w.next());
+        self.last_error = Some(match self.normalize(arg, extra) {
+            Ok(line) | Err(line) => format!("normalize: {line}"),
+        });
+        Some(true)
+    }
+    /// The rule behind [`Face::normalize_verb`]: `Ok` the success line, `Err` the refusal (the timeline unmoved).
+    fn normalize(&mut self, arg: Option<&str>, extra: Option<&str>) -> Result<String, String> {
+        if let Some(x) = extra {
+            return Err(format!("{x} is not a dBFS level"));
+        }
+        let target = match arg {
+            None => NORMALIZE_TARGET_CDB,
+            Some(a) => timeline_core::editor::cdb_of(a).ok_or_else(|| format!("{a} is not a dBFS level"))?,
+        };
+        if target > 0 {
+            return Err("target above 0 dBFS".to_string());
+        }
+        let (track, _) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?;
+        let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
+        if self.state.timeline.tracks.get(track).map(|t| t.kind) != Some(Kind::Audio) {
+            return Err("not an audio clip".to_string());
+        }
+        let tb = self.state.timeline.tb;
+        let peak = crate::nle::peak_of(&self.sources, c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no audio".to_string())?;
+        let cdb = normalize_gain_cdb(peak, target).ok_or_else(|| "silent clip".to_string())?;
+        self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
+        let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
+        Ok(format!("peak {} -> gain {}", db_words(peak_cdb), db_words(cdb)))
+    }
+}
+
+/// STRIANORMALIZE (SR878): the gain (centi-dB) that brings a linear `peak` (full scale 1.0) to `target_cdb`, rounded DOWN
+/// so the result is never above the target: `floor(target_cdb - 2000 log10 peak)`. `None` for a peak that is not a
+/// positive finite number (a silent clip). The cast saturates; `validate` refuses an out-of-range gain by name.
+pub fn normalize_gain_cdb(peak: f32, target_cdb: i32) -> Option<i32> {
+    let p = peak as f64;
+    if !(p.is_finite() && p > 0.0) {
+        return None;
+    }
+    Some((target_cdb as f64 - 2000.0 * p.log10()).floor() as i32)
 }

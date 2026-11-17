@@ -3793,3 +3793,115 @@ fn striaclipgainface_face_edit_round_trips_the_edl_and_every_word_is_a_button() 
     }
     assert_eq!(stria::nle_face::VERBS.last(), Some(&"help"));
 }
+
+// ---- STRIANORMALIZE (LEDGER SR878): the normalize word over the clip's exact peak (named tail block) ----
+
+/// STRIANORMALIZE (SR878): the synth fixture with source A 13..33 on the audio track (track 1), selected.
+fn strianormalize_face() -> (stria::nle_face::Face, timeline_core::SourceId) {
+    let (mut tl, src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    tl.tracks[1].clips = vec![timeline_core::Clip::new(a, 13, 33, 0)];
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    (face, a)
+}
+
+/// STRIANORMALIZE (SR878): the exact peak of synth source A (base 0, PCM16 at `SYNTH_RATE`) over ticks `t0..t1` at 25 fps,
+/// from `synth_sample` itself (full scale 32768, the PCM decoder's).
+fn strianormalize_want_peak(t0: u64, t1: u64) -> f32 {
+    let r = stria::nle::SYNTH_RATE as u64;
+    (t0 * r / 25..t1 * r / 25).map(|i| (stria::nle::synth_sample(0, i) as f32 / 32768.0).abs()).fold(0.0f32, f32::max)
+}
+
+/// Rule: `normalize` sets the selected audio clip's gain to floor(-100 - 2000 log10 peak) over the clip's exact source
+/// range, ONE undo step, its line on the message row; a second `normalize` commits nothing; `undo` restores unity.
+#[test]
+fn strianormalize_sets_gain_from_the_exact_peak_in_one_undo_step() {
+    let (mut face, _) = strianormalize_face();
+    let peak = strianormalize_want_peak(13, 33);
+    let want = stria::nle_face::normalize_gain_cdb(peak, -100).unwrap();
+    assert_eq!(want, (-100.0 - 2000.0 * (peak as f64).log10()).floor() as i32);
+    let depth = face.state.undo_depth();
+    assert!(stria::nle_face::VERBS.contains(&"normalize"));
+    assert!(face.verb("normalize"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, want);
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
+    let line = format!("normalize: peak {} -> gain {}", stria::nle_face::db_words(peak_cdb), stria::nle_face::db_words(want));
+    assert_eq!(face.last_error.take(), Some(line.clone()));
+    assert!(face.verb("normalize"));
+    assert_eq!(face.state.undo_depth(), depth + 1, "the same gain commits nothing");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0);
+    println!("strianormalize: peak {peak} -> gain {want} cdB, line \"{line}\"");
+}
+
+/// Rule: an explicit target in dBFS (`cdb_of`'s parse); 0 dBFS is allowed and the result never above it.
+#[test]
+fn strianormalize_explicit_targets() {
+    let (mut face, _) = strianormalize_face();
+    let peak = strianormalize_want_peak(13, 33);
+    assert!(face.verb("normalize -3"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, stria::nle_face::normalize_gain_cdb(peak, -300).unwrap());
+    assert!(face.verb("normalize 0"));
+    let g = face.state.selected().unwrap().gain_cdb;
+    assert_eq!(g, stria::nle_face::normalize_gain_cdb(peak, 0).unwrap());
+    assert!((peak as f64).log10() * 2000.0 + g as f64 <= 0.0, "never above the target");
+}
+
+/// Rule: every refusal is named on the message line and leaves the timeline.
+#[test]
+fn strianormalize_refusals_by_name() {
+    let (mut face, _) = strianormalize_face();
+    let tl = face.state.timeline.clone();
+    for (w, why) in [
+        ("normalize x", "x is not a dBFS level".to_string()),
+        ("normalize -1 2", "2 is not a dBFS level".to_string()),
+        ("normalize 1", "target above 0 dBFS".to_string()),
+        ("normalize -200", timeline_core::EditError::Gain.to_string()),
+    ] {
+        assert!(face.verb(w), "{w}");
+        assert_eq!(face.last_error.take(), Some(format!("normalize: {why}")), "{w}");
+        assert_eq!(face.state.timeline, tl, "{w}");
+    }
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("normalize"));
+    assert_eq!(face.last_error.take(), Some("normalize: not an audio clip".to_string()));
+    face.state.selection = None;
+    assert!(face.verb("normalize"));
+    assert_eq!(face.last_error.take(), Some(format!("normalize: {}", timeline_core::EditError::NoClip)));
+    assert_eq!(face.state.timeline, tl);
+}
+
+/// Rule: the gain the word sets rides the EDL's `* UNA GAIN` line and parses back.
+#[test]
+fn strianormalize_edl_round_trip() {
+    let (mut face, _) = strianormalize_face();
+    assert!(face.verb("normalize"));
+    let g = face.state.selected().unwrap().gain_cdb;
+    let text = timeline_core::edl::write(&face.state.timeline, "NORM").unwrap();
+    assert!(text.contains(&format!("* UNA GAIN {g}\n")), "{text}");
+    assert_eq!(timeline_core::edl::parse(&text, 25).unwrap(), face.state.timeline);
+}
+
+/// Rule: `peak_of` is the exact peak on `scan_peaks`' road (within one u8 step of SR827's table over the whole source);
+/// `normalize_gain_cdb` floors and refuses silence; `normalize` sits before `help` in VERBS.
+#[test]
+fn strianormalize_peak_of_reads_the_audio_road() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    let got = stria::nle::peak_of(&src, a, 0..tl.tb.to_ns(50)).unwrap().unwrap();
+    assert!((got - strianormalize_want_peak(0, 50)).abs() < 1e-6, "{got}");
+    let part = stria::nle::peak_of(&src, a, tl.tb.to_ns(13)..tl.tb.to_ns(33)).unwrap().unwrap();
+    assert!((part - strianormalize_want_peak(13, 33)).abs() < 1e-6, "{part}");
+    let table = stria::nle::scan_peaks(&src, a, timeline_core::view::PEAKS_PER_SEC).unwrap().unwrap();
+    let top = table.buckets.iter().copied().max().unwrap() as f32;
+    assert!((got * 255.0 - top).abs() <= 0.5 + 1e-3, "{got} vs {top}");
+    assert_eq!(stria::nle_face::normalize_gain_cdb(1.0, -100), Some(-100));
+    assert_eq!(stria::nle_face::normalize_gain_cdb(0.5, 0), Some(602), "floor(602.06)");
+    assert_eq!(stria::nle_face::normalize_gain_cdb(0.0, -100), None);
+    assert_eq!(stria::nle_face::normalize_gain_cdb(f32::NAN, -100), None);
+    let n = stria::nle_face::VERBS.len();
+    assert_eq!(&stria::nle_face::VERBS[n - 2..], &["normalize", "help"]);
+    println!("strianormalize: peak_of whole={got} part={part} table max={top}");
+}
