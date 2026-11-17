@@ -1547,12 +1547,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
             let lh = if matches!(v, "normal" | "initial" | "revert") {
                 Some(0.0)
-            } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
-                Some(crate::paint::line_height_zero_or(pct, -(pct / 100.0 * em)))
-            } else if let Ok(n) = v.parse::<f32>() {
+            } else if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()).filter(|p| *p >= 0.0) {
+                Some(crate::paint::line_height_zero_or(pct * em, -(pct / 100.0 * em)))
+            } else if let Some(n) = v.parse::<f32>().ok().filter(|n| *n >= 0.0) {
                 Some(crate::paint::line_height_zero_or(n, n.max(0.0)))
             } else {
-                parse_px(v, cx).map(|px| crate::paint::line_height_zero_or(px, -px.max(0.0)))
+                parse_px(v, cx).filter(|px| *px >= 0.0 || v.contains('(')).map(|px| crate::paint::line_height_zero_or(px, -px.max(0.0)))
             };
             match lh {
                 Some(f) => style.paint.line_height = Some(f),
