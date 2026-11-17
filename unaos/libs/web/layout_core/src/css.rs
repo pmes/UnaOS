@@ -533,8 +533,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "gap" | "grid-gap" => {
             let parts: Vec<&str> = split_top_level(value);
-            let row = parts.first().and_then(|v| parse_length_percentage_str(v, cx));
-            let col = parts.get(1).and_then(|v| parse_length_percentage_str(v, cx)).or(row);
+            let row = parts.first().and_then(|v| gap_length(v, cx));
+            let col = parts.get(1).and_then(|v| gap_length(v, cx)).or(row);
             match (row, col) {
                 (Some(r), Some(c)) => {
                     style.row_gap = Some(r);
@@ -543,7 +543,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 _ => H::record_css(&format!("gap-value:{}", clip(value))),
             }
         }
-        "row-gap" | "grid-row-gap" => match parse_length_percentage_str(value, cx) {
+        "row-gap" | "grid-row-gap" => match gap_length(value, cx) {
             Some(v) => style.row_gap = Some(v),
             None => H::record_css(&format!("gap-value:{}", clip(value))),
         },
@@ -1954,10 +1954,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
 
 /// The flex / grid `column-gap` (taffy's horizontal gap), as the arm always folded it.
 fn apply_column_gap<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
-    match parse_length_percentage_str(value, cx) {
+    match gap_length(value, cx) {
         Some(v) => style.column_gap = Some(v),
-        // `normal`: the flex/grid gap's initial 0 (css-align-3 §8.1) — nothing to fold.
-        None if value == "normal" => {}
         None => H::record_css(&format!("gap-value:{}", clip(value))),
     }
 }
@@ -4275,4 +4273,17 @@ fn sys_border_slot<H: Host>(paint: &mut PaintStyle<H>, mask: u8, value: &str) {
         _ => (old_k, rest),
     };
     paint.sys_border = (m != 0).then_some((k, m));
+}
+
+// ---- AETHERCSSWIDECOLUMNGAPNORMALFLEX (LEDGER SR1077): `normal` on the flex / grid gaps writes an explicit zero (named tail block) ----
+
+/// A flex / grid gap value (`gap`, `row-gap`, `column-gap`): `normal` is the gap's initial 0 (css-align-3 §8.1),
+/// written as an explicit zero so a later `normal` beats an earlier length in one block and across rules (merge
+/// copies Somes); anything else is `parse_length_percentage_str`. The multicol gutter's `normal` (1em) stays
+/// `PaintStyle::col_gap`'s Some(None), written by the column-gap arm.
+fn gap_length(value: &str, cx: &ParseCx) -> Option<LengthPercentage> {
+    if value.trim() == "normal" {
+        return Some(LengthPercentage::length(0.0));
+    }
+    parse_length_percentage_str(value, cx)
 }
