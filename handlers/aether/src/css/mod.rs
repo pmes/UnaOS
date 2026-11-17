@@ -1714,7 +1714,7 @@ fn line_height_used(paint: &crate::layout::PaintStyle, mult: f32, specified: f32
     if mult == 0.0 {
         return None;
     }
-    Some(layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult))
+    Some(line_height_used_px(paint, mult, specified, sel))
 }
 
 // ---- AETHERCSSOMINHERITEDRESTREPORT (LEDGER SR842): the report's white-space / list-style-type keywords (named tail block) ----
@@ -1942,4 +1942,16 @@ mod supports_value_tests {
         assert!(crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Css, "display:grid"), "armed: the engine records it");
         crate::ledger::reset();
     }
+}
+
+// ---- AETHERCSSOMLINEHEIGHTNORMALPX (LEDGER SR1063): the used line-height px, `normal` included (named tail block) ----
+
+/// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): the px the line box takes for the element, `normal` included: the layout's
+/// own resolver `Fonts::line_height` over SR819's used font size (mult 0 = `normal` = the face's ascent + descent + line
+/// gap, `fonts::line_height`; no second metrics fn). THE resolver: [`line_height_used`] routes its non-`normal` road
+/// through it and only adds the keyword gate. Chromium note: `getComputedStyle(el).lineHeight` stays the keyword
+/// `normal` for a computed `normal` (CSSOM resolved values: line-height resolves to the used value only when it is not
+/// `normal`), so the report keeps calling `line_height_used`; this fn is for a reader that needs the number.
+pub(crate) fn line_height_used_px(paint: &crate::layout::PaintStyle, mult: f32, specified: f32, sel: layout_core::FontSel) -> f32 {
+    layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult)
 }

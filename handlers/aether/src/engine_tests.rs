@@ -9114,6 +9114,50 @@ b</div>
         assert_eq!((w, h), (46.0, 26.0), "#pp: the popover's medium border");
     }
 
+    // ---- AETHERCSSOMLINEHEIGHTNORMALPX (LEDGER SR1063): the used line-height px, `normal` included (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): Chromium pin: `getComputedStyle(el).lineHeight` for `line-height: normal`
+    /// is the keyword `normal` (CSSOM resolved values: line-height resolves to the used value only when it is not
+    /// `normal`); the px road `css::line_height_used_px` does not change the string.
+    #[test]
+    fn line_height_normal_px_cssom_pin() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal", "Chromium keeps the keyword");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): `normal` (mult 0) is the serif face's ascent + descent + line gap at the used
+    /// size, at 16px and at the control font's 40/3 px (no face on the host: the size, HostFonts' fallback).
+    #[test]
+    fn line_height_normal_px_metrics() {
+        let sel = layout_core::FontSel { family: crate::fonts::SERIF, ..Default::default() };
+        let face = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SERIF, 400, false));
+        for size in [16.0f32, layout_core::CONTROL_FONT_PX] {
+            let want = face.map(|f| {
+                let (a, d, g) = crate::fonts::line_metrics(f, size);
+                a + d + g
+            }).unwrap_or(size);
+            let got = crate::css::line_height_used_px(&crate::layout::PaintStyle::default(), 0.0, size, sel);
+            assert_eq!(got, want, "normal at {size}px is the metrics sum");
+            assert!(got > 0.0, "normal at {size}px is a positive px");
+        }
+    }
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): the non-`normal` roads: `1.5` at 16px is 24, a 20px length (mult -20) is 20,
+    /// the used font size (20px) wins over the specified 16px (1.5 x 20 = 30); and `line_height_used` routes through the
+    /// px fn: the report's string for `num` (1.5 under 20px) and `len` (24px) is the px fn's value.
+    #[test]
+    fn line_height_used_px_roads() {
+        let sel = layout_core::FontSel { family: crate::fonts::SERIF, ..Default::default() };
+        let plain = crate::layout::PaintStyle::default();
+        assert_eq!(crate::css::line_height_used_px(&plain, 1.5, 16.0, sel), 24.0, "1.5 x 16px");
+        assert_eq!(crate::css::line_height_used_px(&plain, -20.0, 16.0, sel), 20.0, "a 20px length");
+        let used = crate::layout::PaintStyle { used_font_size: Some(20.0), ..Default::default() };
+        assert_eq!(crate::css::line_height_used_px(&used, 1.5, 16.0, sel), 30.0, "1.5 x the used 20px");
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&used, 1.5, 16.0, sel)));
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&plain, -24.0, 16.0, sel)));
+    }
+
     // ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
 
     /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): one 40x20 box per row under a green parent: `#ta` `border: 2px solid
