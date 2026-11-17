@@ -2604,7 +2604,7 @@ mod tests {
         );
         let (f, g, c) = (rect_by_id(&t, "f").unwrap(), rect_by_id(&t, "g").unwrap(), rect_by_id(&t, "c").unwrap());
         let lh = crate::fonts::face(&crate::fonts::FontSel::new(crate::layout::control_family(), 400, false))
-            .map(|x| crate::fonts::line_height(x, 13.333, 0.0))
+            .map(|x| crate::fonts::line_height(x, crate::layout::CONTROL_FONT_PX, 0.0)) // SR1023: the const
             .unwrap_or(15.0);
         assert_eq!(f.3, lh + 2.0 + 4.0, "field: line + padding + border");
         assert_eq!((g.2, g.3), (200.0, lh + 12.0 + 4.0), "border-box width, padding 6");
@@ -5762,14 +5762,14 @@ mod tests {
         let mut e = control_ua_font_engine();
         assert_eq!(font_shorthand_cs(&mut e, "txt", "fontSize"), "24px", "the body text is 24px");
         let bp = font_shorthand_cs(&mut e, "bp", "fontSize");
-        assert!(bp.starts_with("13.333"), "an unset button reads the control size, got {bp}");
+        assert!(bp.starts_with("13.3333"), "an unset button reads the control size, got {bp}");
         assert_eq!(font_shorthand_cs(&mut e, "bp", "fontFamily"), "Arial", "the control family");
         assert_eq!(font_shorthand_cs(&mut e, "tp", "fontFamily"), "monospace", "Chromium's textarea monospace");
         assert_eq!(font_shorthand_cs(&mut e, "bh", "fontSize"), "24px", "font: inherit takes the body's size");
         assert_eq!(font_shorthand_cs(&mut e, "bh", "fontFamily"), "serif", "font: inherit takes the body's family");
         let (_, _, _, h) = imgalt_rect(&mut e, "bp");
         let (_, _, _, hh) = imgalt_rect(&mut e, "bh");
-        assert!(h < hh, "the 13.333px button {h} is shorter than the 24px font: inherit twin {hh}");
+        assert!(h < hh, "the 13.3333px button {h} is shorter than the 24px font: inherit twin {hh}");
     }
 
     /// AETHERCSSCONTROLUAFONT (SR1009): `font: -webkit-small-control` resets the weight and style, so a control under
@@ -7806,7 +7806,7 @@ mod tests {
     fn system_font_used_size() {
         let mut e = system_font_engine();
         let control = font_shorthand_cs(&mut e, "pbtn", "fontSize");
-        assert!(control.starts_with("13.333"), "the control size: {control}");
+        assert!(control.starts_with("13.3333"), "the control size: {control}");
         assert_eq!(font_shorthand_cs(&mut e, "par", "fontSize"), "30px", "armed: the parent is 30px");
         assert_eq!(font_shorthand_cs(&mut e, "sys", "fontSize"), control, "font: menu is the control size");
         assert_eq!(font_shorthand_cs(&mut e, "kid", "fontSize"), control, "the child inherits the control size, not 30px");
@@ -7824,5 +7824,98 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "sys", "fontFamily"), family, "the control family");
         assert_eq!(font_shorthand_cs(&mut e, "sb", "fontFamily"), family, "the control family");
         assert_ne!(font_shorthand_cs(&mut e, "par", "fontFamily"), family, "armed: the parent is serif");
+    }
+
+    // ---- AETHERCONTROLFONTPXTHIRD (LEDGER SR1023): Chromium's 40/3 px control font, six-significant-digit px (named tail block) ----
+
+    /// AETHERCONTROLFONTPXTHIRD (SR1023): a plain button and six divs whose font-size exercises the report's serializer.
+    fn control_font_px_third_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <button id="btn">Go</button>
+            <div id="a" style="font-size:13.333333px">Hello</div>
+            <div id="b" style="font-size:16px">Hello</div>
+            <div id="c" style="font-size:0.5px">Hello</div>
+            <div id="d" style="font-size:12.5px">Hello</div>
+            <div id="e" style="font-size:1.23456789px">Hello</div>
+            <div id="f" style="font-size:123.456789px">Hello</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCONTROLFONTPXTHIRD (SR1023): the control font is Chromium's `-webkit-small-control` 40/3 px, and a plain
+    /// button's getComputedStyle fontSize reads Chromium's `13.3333px`.
+    #[test]
+    fn control_font_px_third_const() {
+        assert_eq!(crate::layout::CONTROL_FONT_PX, 40.0f32 / 3.0, "the one source is 40/3");
+        let mut e = control_font_px_third_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "13.3333px", "the control default");
+    }
+
+    /// AETHERCONTROLFONTPXTHIRD (SR1023): the report's px serializer keeps Chromium's six significant digits; a whole
+    /// number stays an integer.
+    #[test]
+    fn control_font_px_third_cssom_six_digits() {
+        let mut e = control_font_px_third_engine();
+        for (id, want) in [("a", "13.3333px"), ("b", "16px"), ("c", "0.5px"), ("d", "12.5px"), ("e", "1.23457px"), ("f", "123.457px")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontSize"), want, "#{id}");
+        }
+    }
+
+    /// AETHERCONTROLFONTPXTHIRD (SR1023): the 1/3000 px the control font gained does not move the control's line box
+    /// (measured: the line height at 40/3 and at the old size round to the same px).
+    #[test]
+    fn control_font_px_third_line_box() {
+        let Some(x) = crate::fonts::face(&crate::fonts::FontSel::new(crate::layout::control_family(), 400, false)) else { return };
+        let new = crate::fonts::line_height(x, crate::layout::CONTROL_FONT_PX, 0.0);
+        let old = crate::fonts::line_height(x, crate::layout::CONTROL_FONT_PX - 1.0 / 3000.0, 0.0);
+        assert!((new - old).abs() < 0.01, "line height {new} vs {old}");
+        assert_eq!(new.round(), old.round(), "the rounded line box holds: {new} vs {old}");
+    }
+
+    /// AETHERCONTROLFONTPXTHIRD (SR1023): CONTROL_FONT_PX is the one source: no code line (before its first `//`) in
+    /// aether's src or layout_core's src / tests holds the old three-decimal literal as a number token.
+    #[test]
+    fn control_font_px_third_scan() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for ent in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let needle = ["13", "333"].join(".");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for d in ["src", "../../unaos/libs/web/layout_core/src", "../../unaos/libs/web/layout_core/tests"] {
+            walk(&root.join(d), &mut files);
+        }
+        assert!(files.len() > 10, "the scan saw the trees: {}", files.len());
+        let mut hits = Vec::new();
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let b = code.as_bytes();
+                let mut at = 0;
+                while let Some(i) = code[at..].find(&needle) {
+                    let s = at + i;
+                    let e = s + needle.len();
+                    let before = s > 0 && b[s - 1].is_ascii_digit();
+                    let after = e < b.len() && b[e].is_ascii_digit();
+                    if !before && !after {
+                        hits.push(format!("{}:{}", f.display(), n + 1));
+                    }
+                    at = e;
+                }
+            }
+        }
+        assert!(hits.is_empty(), "literal control font size outside CONTROL_FONT_PX: {hits:?}");
     }
 }
