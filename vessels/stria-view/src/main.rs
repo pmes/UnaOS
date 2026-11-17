@@ -523,6 +523,7 @@ fn transport() -> TetraNode {
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
+        button("roll-", "Roll -"), button("roll+", "Roll +"), // STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }

@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -928,4 +928,40 @@ impl EditorState {
             MarkerWord::Unmark => self.unmark(),
         })
     }
+}
+
+// ---- STRIAROLLEDIT (LEDGER SR851): the roll edit from the editor (named tail block) ----
+// `roll-` / `roll+` (one frame = one tick) and `roll <d>` (signed ticks) ride THE verb dispatch both faces call, so the
+// host face's buttons, `stria-view --do` and a future kernel EDIT_KEYS binding reach the same words. The rule: the roll
+// moves the cut at the SELECTED clip's OUT edge (`Timeline::roll` on the selected clip and its butted next clip), ONE
+// commit per word (undo restores the whole pre-op timeline); the selection stays on the selected clip. Refused by name:
+// nothing selected or no butted next clip `EditError::NoClip`, and whatever `Timeline::roll` refuses.
+impl EditorState {
+    /// Roll the cut at the selected clip's out edge by `d` ticks (`Timeline::roll`).
+    pub fn roll_selected(&mut self, d: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.roll(track, idx, d)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `roll` words of [`EditorState::verb`]; `None` when `v` is not a roll word.
+    fn roll_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let d = roll_words(v)?;
+        Some(self.roll_selected(d))
+    }
+}
+
+/// `roll-` -> -1, `roll+` -> 1, `roll <d>` -> d (signed ticks); any other shape is not this verb.
+fn roll_words(v: &str) -> Option<i64> {
+    match v {
+        "roll-" => return Some(-1),
+        "roll+" => return Some(1),
+        _ => {}
+    }
+    let mut w = v.split_ascii_whitespace();
+    if w.next() != Some("roll") {
+        return None;
+    }
+    let d = w.next()?.parse::<i64>().ok()?;
+    w.next().is_none().then_some(d)
 }

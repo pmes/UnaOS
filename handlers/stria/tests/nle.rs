@@ -4626,3 +4626,46 @@ fn striarippletrim_shift_elsewhere_still_adds() {
     assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
     println!("striarippletrim: Shift on another clip's body still adds it");
 }
+
+// ---- STRIAROLLEDIT (LEDGER SR851): the roll words on the face (named tail block) ----
+
+/// Rule: with V1 clip 0 selected (synth_fixture: A[13,23)@0 B[0,10)@10 A[23,33)@25), three `roll+` words roll the A|B cut
+/// 3 ticks later (A [13,26)@0, B [3,10)@13), the third clip and A1 stay, ONE undo step per word; `roll-` steps back;
+/// the two words sit in VERBS immediately before `help`.
+#[test]
+fn striarolledit_face_roll_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 0).unwrap();
+    for _ in 0..3 {
+        assert!(face.verb("roll+"));
+    }
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 3).unwrap());
+    assert_eq!(face.state.timeline.tracks[0].clips[..2], [Clip::new(SourceId(0), 13, 26, 0), Clip::new(SourceId(1), 3, 10, 13)]);
+    assert_eq!(face.state.timeline.tracks[0].clips[2], tl.tracks[0].clips[2], "the third clip stays");
+    assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "A1 does not move");
+    assert_eq!(face.state.undo_depth(), 3);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 2).unwrap());
+    assert!(face.verb("roll-"));
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 1).unwrap());
+    let n = VERBS.len();
+    assert_eq!(VERBS[n - 3..], ["roll-", "roll+", "help"]);
+    println!("striarolledit: roll+ x3 on V1 clip 0 = Timeline::roll(0, 0, 3), one undo per word");
+}
+
+/// Rule: with nothing selected, or with a selected clip whose next clip is not butted (V1 clip 1 ends at 20, the next
+/// starts at 25), the word is refused by name on the message row; the timeline and undo depth do not move.
+#[test]
+fn striarolledit_refusals_read_on_the_message_row() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("roll+"));
+    assert_eq!(face.last_error.take(), Some(format!("roll+: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("roll+"));
+    assert_eq!(face.last_error.take(), Some(format!("roll+: {}", EditError::NoClip)));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+    println!("striarolledit: no selection / no butted next clip -> roll+: {}", EditError::NoClip);
+}
