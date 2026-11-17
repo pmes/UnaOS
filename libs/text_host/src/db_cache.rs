@@ -238,13 +238,13 @@ pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>
 }
 
 /// Rewrites the index after a miss or a stale answer (a no-op for Off and Hit); a failure leaves no index change.
-pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) {
+pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) -> usize {
     if !matches!(state, State::Miss | State::Stale) {
-        return;
+        return 0;
     }
-    let Some(dir) = config.cache_dir.as_deref() else { return };
-    let Some(text) = render(&config.dirs, files, faces) else { return };
-    let _ = write_atomic(dir, &index_file(&config.dirs), &text);
+    let Some(dir) = config.cache_dir.as_deref() else { return 0 };
+    let Some(text) = render(&config.dirs, files, faces) else { return 0 };
+    write_atomic(dir, &index_file(&config.dirs), &text).map_or(0, |()| sweep(dir, &index_file(&config.dirs))) // AETHERFONTDBCACHESWEEP (SR770): the sweep rides the write
 }
 
 /// Writes the index through a per-process temp file in the same directory and a rename.
@@ -657,6 +657,103 @@ mod tests {
         assert_eq!(left, want, "exactly the two keyed files");
         assert!(!t.0.join("cache").join(INDEX_FILE).exists(), "no unkeyed index");
     }
+
+    /// AETHERFONTDBCACHESWEEP (SR770): sets `p`'s mtime `secs` seconds into the past (the stale KAT's `set_modified` road).
+    fn age(p: &Path, secs: u64) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        fs::File::options().write(true).open(p).unwrap().set_modified(then).unwrap();
+    }
+
+    /// The cache dir's file names, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// A store sweeps the unkeyed index and a foreign keyed index past `SWEEP_AGE` and a writer's tmp past an hour;
+    /// the file just written, a younger foreign index and a file outside the prefix stay; the count is 3.
+    #[test]
+    fn fontdb_cache_sweep_kat() {
+        let t = Tmp::new("sweep");
+        t.copy_in(INTER);
+        let cache = t.0.join("cache");
+        let seed = [
+            (INDEX_FILE.to_string(), 31 * DAY),
+            (format!("{INDEX_FILE}-0123456789abcdef"), 31 * DAY),
+            (format!("{INDEX_FILE}-fedcba9876543210"), DAY),
+            (format!("{INDEX_FILE}-0123456789abcdef.4242.tmp"), 2 * 60 * 60),
+            ("other.txt".to_string(), 31 * DAY),
+        ];
+        for (n, secs) in &seed {
+            fs::write(cache.join(n), b"x").unwrap();
+            age(&cache.join(n), *secs);
+        }
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        let faces = FontDb::discover(t.off()).faces;
+        let swept = store(&t.cfg(), &files, &faces, State::Miss);
+        assert_eq!(swept, 3);
+        let mut want = vec![index_file(&t.cfg().dirs), format!("{INDEX_FILE}-fedcba9876543210"), "other.txt".to_string()];
+        want.sort();
+        assert_eq!(names(&cache), want);
+        assert_eq!(cache_word(State::Miss, swept), "miss swept=3");
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "hit", "the fresh index answers");
+    }
+
+    /// A store with nothing old to sweep leaves the dir as it was and the log word as today's.
+    #[test]
+    fn fontdb_cache_sweep_nothing_kat() {
+        let t = Tmp::new("sweepnone");
+        t.copy_in(INTER);
+        let cache = t.0.join("cache");
+        fs::write(cache.join(format!("{INDEX_FILE}-fedcba9876543210")), b"x").unwrap();
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let before = names(&cache);
+        assert_eq!(before.len(), 2);
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        let faces = FontDb::discover(t.off()).faces;
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale), 0);
+        assert_eq!(names(&cache), before);
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit), 0, "a hit never writes or sweeps");
+        assert_eq!(cache_word(State::Miss, 0), "miss");
+        assert_eq!(cache_word(State::Hit, 0), "hit");
+    }
+
+    /// The sweep's name grammar: the index names and their tmps only, never the file kept.
+    #[test]
+    fn fontdb_cache_sweep_names_kat() {
+        let keep = "fontdb-index.v2-0000000000000001";
+        assert_eq!(sweep_age(keep, keep), None, "the file just written");
+        assert_eq!(sweep_age("fontdb-index.v2", keep), Some(SWEEP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef", keep), Some(SWEEP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef.77.tmp", keep), Some(SWEEP_TMP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2.77.tmp", keep), Some(SWEEP_TMP_AGE));
+        assert_eq!(sweep_age("fontdb-index.v2-0000000000000001.77.tmp", keep), Some(SWEEP_TMP_AGE), "the kept name's tmp");
+        assert_eq!(sweep_age("fontdb-index.v20", keep), None);
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789ABCDEF", keep), None, "upper hex");
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcde", keep), None, "15 hex");
+        assert_eq!(sweep_age("fontdb-index.v2-0123456789abcdef0", keep), None, "17 hex");
+        assert_eq!(sweep_age("fontdb-index.v2.tmp", keep), None, "no pid");
+        assert_eq!(sweep_age("fontdb-index.v2.x7.tmp", keep), None, "not a pid");
+        assert_eq!(sweep_age("other.txt", keep), None);
+        assert_eq!(SWEEP_AGE, std::time::Duration::from_secs(30 * DAY));
+    }
+
+    /// `append` (SR697) opens without `create`: a C line for a swept index errs and the file stays absent.
+    #[test]
+    fn fontdb_cache_append_no_resurrect_kat() {
+        let t = Tmp::new("sweepappend");
+        let cache = t.0.join("cache");
+        let name = format!("{INDEX_FILE}-0123456789abcdef");
+        fs::write(cache.join(&name), b"x").unwrap();
+        age(&cache.join(&name), 31 * DAY);
+        assert_eq!(sweep(&cache, "fontdb-index.v2-0000000000000001"), 1);
+        assert!(append(&cache, &name, "C\tx\n").is_err());
+        assert!(!cache.join(&name).exists(), "append never recreates a swept index");
+    }
 }
 
 // ---- AETHERFONTDBCACHECMAP (LEDGER SR697): the persisted cmap coverage (named tail block) ----
@@ -794,4 +891,60 @@ pub fn index_file(dirs: &[PathBuf]) -> String {
 /// FNV-1a 64 (stable across builds and Rust versions, unlike `DefaultHasher`).
 fn fnv1a64(b: &[u8]) -> u64 {
     b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+// ---- AETHERFONTDBCACHESWEEP (LEDGER SR770): stale index files swept at store time (named tail block) ----
+// SR767 keys the index by its directory list, so a shared cache dir accumulates the old unkeyed `fontdb-index.v2`
+// and one file per list ever discovered (a test fixture dir, a removed user dir), each with its C lines; nothing read
+// or removed them. `store` (the one writer) now sweeps the dir after its rename: an index name other than the one just
+// written older than `SWEEP_AGE`, and a crashed `write_atomic` tmp older than an hour, are removed; errors are
+// ignored (a sweep never fails a store); nothing outside the `INDEX_FILE` names is touched. A hit never sweeps.
+
+/// The age past which an index file the store did not just write is removed (one const; a Config knob is owed).
+pub const SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// The age past which a `write_atomic` tmp (a crashed writer's) is removed.
+const SWEEP_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The age past which `name` is swept; None when the sweep never touches it (`keep`, or not an index name or tmp).
+fn sweep_age(name: &str, keep: &str) -> Option<std::time::Duration> {
+    if name == keep {
+        return None;
+    }
+    let rest = name.strip_prefix(INDEX_FILE)?;
+    let rest = match rest.strip_prefix('-') {
+        Some(r) if r.len() >= 16 && r.as_bytes()[..16].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)) => &r[16..],
+        Some(_) => return None,
+        None => rest,
+    };
+    if rest.is_empty() {
+        return Some(SWEEP_AGE);
+    }
+    let pid = rest.strip_prefix('.')?.strip_suffix(".tmp")?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then_some(SWEEP_TMP_AGE)
+}
+
+/// Removes the stale index files and tmps of `dir` (see the block comment), never `keep`; returns how many it removed.
+fn sweep(dir: &Path, keep: &str) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut n = 0;
+    for e in rd.flatten() {
+        let Some(age) = e.file_name().to_str().and_then(|name| sweep_age(name, keep)) else { continue };
+        let old = e
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|d| d > age);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The `cache=` word of the `[fonts] discover` line: the state, and ` swept=<n>` only when a store removed files.
+pub(crate) fn cache_word(state: State, swept: usize) -> String {
+    if swept > 0 { format!("{} swept={swept}", state.as_str()) } else { state.as_str().to_string() }
 }
