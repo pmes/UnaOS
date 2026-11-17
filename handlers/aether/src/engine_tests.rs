@@ -9613,4 +9613,80 @@ b</div>
         assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
         assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
     }
+
+    // ---- AETHERCSSSTICKYSCROLLBLITDAMAGE (LEDGER SR1135): a short scroll repaints the whole viewport when a box holds its place (named tail block) ----
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): scrolled 200px (shorter than the 300px viewport), the stuck red `#d` holds
+    /// at 1em = 20px: rows 20..39 red, rows 19 and 40 not. Before SR1135 the blit carried `#d`'s old rows 80..99 off-screen
+    /// and repainted only the exposed strip 100..300, so row 20 stayed white.
+    #[test]
+    fn sticky_scroll_blit_short_scroll_paints_stuck_box() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 200.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 200.0, "the page scrolled 200px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d: row 20 is its first row (armed: white before SR1135)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "#d: row 39 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
+        assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): after a full repaint at 400px, a +50 scroll keeps `#d` at rows 20..39
+    /// (before SR1135 the blit moved its rows off the top and left old document rows there), and a -50 scroll keeps it
+    /// there with no ghost at rows 70..89 (before SR1135 the blit shifted the stuck rows down by 50).
+    #[test]
+    fn sticky_scroll_blit_follow_on_scrolls() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 450.0, "the page scrolled to 450px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "+50: row 20 is still #d's first row (armed)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "+50: row 39 is still #d's last row");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled back to 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "-50: row 20 is #d's first row");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "-50: row 39 is #d's last row");
+        assert_ne!(imgalt_px(&e, 10, 70), (255, 0, 0), "-50: no ghost at row 70 (armed: the blit shifted row 20 here)");
+        assert_ne!(imgalt_px(&e, 10, 89), (255, 0, 0), "-50: no ghost at row 89 (armed: the blit shifted row 39 here)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a page with no fixed or sticky box keeps the blit: a 50px scroll damages
+    /// only the exposed 50px strip (unchanged); the sticky fixture's 50px scroll damages the whole viewport.
+    #[test]
+    fn sticky_scroll_blit_plain_page_damage_is_strip() {
+        let html = r#"<!doctype html><html><body style="margin:0"><div style="height:2000px"></div></body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "plain page: the exposed strip only");
+        let mut s = sticky_em_inset_engine();
+        s.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(s.damage_rects, vec![(0, 0, 400, 300)], "sticky page: the whole viewport");
+    }
+
+    /// AETHERCSSSTICKYSCROLLBLITDAMAGE (SR1135): a `position: fixed` box (top 10px, 20px tall) stays at rows 10..29 under
+    /// a 50px scroll; before SR1135 the blit moved its rows to -40..-21 and the strip repaint never revisited 10..29.
+    #[test]
+    fn sticky_scroll_blit_fixed_box_stays_put() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="position:fixed;top:10px;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 50.0, "the page scrolled 50px");
+        assert_eq!(imgalt_px(&e, 10, 10), (255, 0, 0), "row 10 is the fixed box's first row (armed)");
+        assert_eq!(imgalt_px(&e, 10, 29), (255, 0, 0), "row 29 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 9), (255, 0, 0), "row 9 is above it");
+        assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
+    }
 }
