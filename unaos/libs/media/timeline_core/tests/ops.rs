@@ -1435,3 +1435,46 @@ fn striapasteinsert_paste_as_refusals_by_name() {
     }
     assert_eq!(tl, before);
 }
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the grade step words (named tail block) ----
+
+/// Each step word moves one field of the selected clip's grade by GRADE_STEP in ONE undo step; past the range it is
+/// refused (EditError::Grade, not clamped) and the state stays; nothing selected is NoClip, an audio clip Kind.
+#[test]
+fn striagradeface_step_words_one_commit_each() {
+    use timeline_core::editor::{EditorState, GRADE_STEP};
+    let (tl, a, _) = base();
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(GRADE_STEP, 50);
+    assert_eq!(st.verb("bright+"), Some(Err(EditError::NoClip)));
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("bright+"), Some(Ok(())));
+    assert_eq!((st.timeline.tracks[0].clips[1].grade.brightness, st.undo_depth()), (50, 1));
+    assert_eq!(st.verb("bright-"), Some(Ok(())));
+    assert_eq!((st.timeline.tracks[0].clips[1].grade, st.undo_depth()), (timeline_core::Grade::IDENTITY, 2));
+    assert_eq!(st.verb("contrast-"), Some(Ok(())));
+    assert_eq!(st.verb("sat+"), Some(Ok(())));
+    let g = timeline_core::Grade { brightness: 0, contrast: -50, saturation: 50 };
+    assert_eq!((st.timeline.tracks[0].clips[1].grade, st.undo_depth()), (g, 4));
+    for _ in 0..19 {
+        assert_eq!(st.verb("sat+"), Some(Ok(())));
+    }
+    assert_eq!(st.timeline.tracks[0].clips[1].grade.saturation, 1000);
+    let (held, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("sat+"), Some(Err(EditError::Grade)));
+    assert_eq!((&st.timeline, st.undo_depth()), (&held, depth));
+    for _ in 0..depth {
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+    }
+    assert_eq!(st.timeline, tl);
+    for w in ["bright", "bright++", "sat", "contrast"] {
+        assert_eq!(st.verb(w), None, "{w}: not a step word");
+    }
+    let mut tl2 = tl.clone();
+    tl2.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    let mut st = EditorState::new(tl2.clone());
+    st.select(1, 0).unwrap();
+    assert_eq!(st.verb("bright+"), Some(Err(EditError::Kind)));
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl2, 0));
+}
+

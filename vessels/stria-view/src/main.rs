@@ -543,6 +543,7 @@ fn transport() -> TetraNode {
         button("meters-reset", "Reset Meters"), button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
         button("paste-insert", "Paste Insert"), button("paste-over", "Paste Over"), // STRIAPASTEINSERT (SR896): the clipboard laid at the playhead rippling the track / carving what is there
         button("snap", "Snap"), // STRIASNAPTOGGLE (SR892): the drag snap default on / off (THE `snap` word)
+        button("bright-", "Bright -"), button("bright+", "Bright +"), button("contrast-", "Contrast -"), button("contrast+", "Contrast +"), button("sat-", "Sat -"), button("sat+", "Sat +"), // STRIAGRADEFACE (SR899): step the selected clip's grade (timeline_core's words)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1716,5 +1717,24 @@ mod striarecentfiles_tests {
         assert!(!recent_asked(Some("play,play,meters")));
         assert!(!recent_asked(Some("recently")));
         assert!(recent_asked(Some("play,recent")));
+    }
+}
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the grade step buttons (named tail block) ----
+#[cfg(test)]
+mod striagradeface_tests {
+    use super::*;
+
+    /// M3: `at:12:0` selects B; `bright+` and `sat-` are the transport buttons' words (one undo step each) and the
+    /// witness's `color` field reads the stepped grade.
+    #[test]
+    fn striagradeface_witness_buttons() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,bright+,sat-");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(color_json(&face), r#","color":[50,0,-50]"#);
+        assert_eq!(face.state.undo_depth(), 2);
+        println!("striagradeface witness: bright+,sat- -> \"color\":[50,0,-50]");
     }
 }
