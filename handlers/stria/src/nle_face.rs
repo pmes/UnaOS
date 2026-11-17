@@ -323,8 +323,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() {
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1590,7 +1590,7 @@ impl Face {
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
-        let st = shown.as_ref().unwrap_or(&self.state);
+        let st = shown.as_ref().unwrap_or(&self.state); self.peaks.thumbs.fill(&st.timeline, &self.sources, l); // STRIATHUMBNAILS (SR839): the visible video heads decoded before the paint, THUMBS_PER_PAINT / THUMB_BUDGET_MS at most (file tail)
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
@@ -3049,6 +3049,7 @@ pub fn eta_words_of(d: Duration) -> String {
 pub struct WavePeaks {
     map: std::collections::BTreeMap<timeline_core::SourceId, Option<view::Peaks>>,
     scans: u32,
+    thumbs: Thumbs, // STRIATHUMBNAILS (SR839): each video clip head's still, decoded once per (source, src_in) (file tail)
 }
 
 impl view::PeakSource for WavePeaks {
@@ -3058,6 +3059,10 @@ impl view::PeakSource for WavePeaks {
     /// The mix's ONE gain curve (nle.rs `mix_into`'s).
     fn gain_q16(&self, cdb: i32) -> i64 {
         gneiss_pal::dsp::audio::ramp::gain_q16(cdb)
+    }
+    /// STRIATHUMBNAILS (SR839): the head still the face decoded for `(src, src_tick)`.
+    fn thumb(&self, src: timeline_core::SourceId, src_tick: i64) -> Option<&Still> {
+        self.thumbs.get(src, src_tick)
     }
 }
 
@@ -3091,5 +3096,136 @@ impl Face {
     /// STRIAWAVEFORM (SR827): source `id`'s peak table, once a paint has scanned it.
     pub fn wave_peaks(&self, id: timeline_core::SourceId) -> Option<&view::Peaks> {
         self.peaks.map.get(&id).and_then(|p| p.as_ref())
+    }
+}
+
+// ---- STRIATHUMBNAILS (LEDGER SR839): each video clip head's still, decoded once and cached (named tail block) ----
+// A video clip's body shows its head (timeline_core view.rs `paint_head`, through SR827's `PeakSource` hook, its `thumb`
+// method). The stills live in `Face.peaks` (`WavePeaks.thumbs`), beside the peak tables, never in the EDL. LAZY: `paint_role`
+// calls `Thumbs::fill` once the drag's shown timeline exists (a slip drag's new head fills live) and before `paint_in`. RULES:
+// * fill walks VIDEO tracks only, rows on the canvas, clips whose body left `x_of(at) + 1` lies in `0..w` (paint_head's rule)
+//   and whose body is at least THUMB_MIN_W px wide, not yet keyed; it always decodes the first wanted head, then stops once
+//   THUMBS_PER_PAINT heads are decoded or the fill has spent more than THUMB_BUDGET_MS; `pending` says a wanted head was left,
+//   and `serve`'s clock runs while it is set, so an idle face fills its heads at the timeline's frame rate.
+// * thumb_for keys `(src, src_in)` (a trim or slip changes the key; an entry never changes). A source `Sources` holds no media
+//   for (`SourceIndex::duration` none: a titled source (STRIATITLECLIP SR828) or a reel that failed to open) caches `None` with
+//   no decode; otherwise ONE `preview` of a one-clip timeline at tick 0 (the preview band's road: keyframe, run-up, colour,
+//   size policy, stand-in), scaled by `view::head_still`. A refusal is logged at debug (never `last_error`) and cached `None`.
+// * EVICTION: at THUMB_CACHE entries the OLDEST decoded (smallest insertion seq) goes before the insert; a hit refreshes nothing.
+// The decode runs on the face's thread (owed NLE-THUMBNAILS-BACKGROUND): on a long-GOP source one head costs a run-up of up
+// to one GOP, and the budget makes that one head per paint.
+
+/// STRIATHUMBNAILS (SR839): the most head stills a face keeps.
+pub const THUMB_CACHE: usize = 256;
+/// STRIATHUMBNAILS (SR839): the most heads one paint decodes.
+pub const THUMBS_PER_PAINT: u32 = 4;
+/// STRIATHUMBNAILS (SR839): a paint's fill stops past this many ms (after its first head).
+pub const THUMB_BUDGET_MS: u64 = 100;
+/// STRIATHUMBNAILS (SR839): a clip body narrower than this (px) asks for no head.
+pub const THUMB_MIN_W: i64 = 8;
+
+/// STRIATHUMBNAILS (SR839): the head stills by `(source, src_in)` (`None`: asked, no picture), each with its insertion seq.
+#[derive(Default)]
+pub struct Thumbs {
+    map: std::collections::BTreeMap<(timeline_core::SourceId, i64), (u64, Option<Still>)>,
+    seq: u64,
+    decodes: u32,
+    pending: bool,
+}
+
+impl Thumbs {
+    fn get(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        self.map.get(&(src, src_in)).and_then(|e| e.1.as_ref())
+    }
+    /// The visible video heads not keyed yet, decoded within this paint's bounds (see the block's RULES).
+    fn fill(&mut self, tl: &Timeline, sources: &Sources, l: Layout) {
+        let t0 = std::time::Instant::now();
+        let mut done = 0u32;
+        self.pending = false;
+        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
+            let y = l.row_y(row);
+            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
+                continue;
+            }
+            for c in &tr.clips {
+                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+                if x0 < 0 || x0 >= l.w as i64 || x1 - x0 < THUMB_MIN_W || self.map.contains_key(&(c.src, c.src_in)) {
+                    continue;
+                }
+                if done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS)) {
+                    self.pending = true;
+                    return;
+                }
+                let _ = self.thumb_for(tl, sources, c.src, c.src_in);
+                done += 1;
+            }
+        }
+    }
+    /// The head of `src` at `src_in`: cached, else decoded once (see the block's RULES).
+    fn thumb_for(&mut self, tl: &Timeline, sources: &Sources, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        use timeline_core::SourceIndex as _;
+        if !self.map.contains_key(&(src, src_in)) {
+            let still = if sources.duration(src).is_none() {
+                None
+            } else {
+                self.decodes += 1;
+                let mut one = tl.clone();
+                one.tracks.clear();
+                let v = one.add_track(Kind::Video);
+                one.tracks[v].clips.push(Clip::new(src, src_in, src_in + 1, 0));
+                match preview(&one, sources, 0) {
+                    Ok(f) => f.and_then(|f| view::head_still(&f)),
+                    Err(e) => {
+                        log::debug!("[nle-face] head {src:?}@{src_in}: {e}");
+                        None
+                    }
+                }
+            };
+            self.insert((src, src_in), still);
+        }
+        self.get(src, src_in)
+    }
+    /// Key `k` takes `v`, the oldest entry dropped first at THUMB_CACHE.
+    fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<Still>) {
+        if !self.map.contains_key(&k) && self.map.len() >= THUMB_CACHE {
+            if let Some(old) = self.map.iter().min_by_key(|e| (e.1).0).map(|e| *e.0) {
+                self.map.remove(&old);
+            }
+        }
+        self.seq += 1;
+        self.map.insert(k, (self.seq, v));
+    }
+}
+
+impl Face {
+    /// STRIATHUMBNAILS (SR839): the head decodes (`preview` calls) this face has made.
+    pub fn thumb_decodes(&self) -> u32 {
+        self.peaks.thumbs.decodes
+    }
+    /// STRIATHUMBNAILS (SR839): the head still of `(src, src_in)`, once a paint has decoded it.
+    pub fn thumb(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        self.peaks.thumbs.get(src, src_in)
+    }
+    /// STRIATHUMBNAILS (SR839): the last paint's fill left a wanted head undecoded (`serve`'s clock runs while it is true).
+    pub fn thumbs_pending(&self) -> bool {
+        self.peaks.thumbs.pending
+    }
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+
+    #[test]
+    fn thumb_cache_drops_the_oldest() {
+        let mut t = Thumbs::default();
+        let s = Still { width: 1, height: 1, rgba: vec![1, 2, 3, 255] };
+        for i in 0..=THUMB_CACHE as i64 {
+            t.insert((timeline_core::SourceId(0), i), Some(s.clone()));
+        }
+        assert_eq!(t.map.len(), THUMB_CACHE);
+        assert!(t.get(timeline_core::SourceId(0), 0).is_none(), "the first key went");
+        assert!(t.get(timeline_core::SourceId(0), 1).is_some() && t.get(timeline_core::SourceId(0), THUMB_CACHE as i64).is_some());
+        println!("striathumbnails: cache {} entries after {} inserts, oldest dropped", t.map.len(), THUMB_CACHE + 1);
     }
 }
