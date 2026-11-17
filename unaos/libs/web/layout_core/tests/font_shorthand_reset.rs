@@ -461,7 +461,7 @@ fn currentcolor_other_properties_pinned() {
 /// AETHERCSSCURRENTCOLORREST (SR849): the border arms write the side bits of `PaintStyle::currentcolor`: an explicit
 /// `currentcolor` and an omitted colour (css-backgrounds-3 §3.1: border-color's initial value is currentcolor) set
 /// them, a concrete colour clears them; the side shorthand touches its own bit only; `border-color: currentcolor` and
-/// `border-width` alone build 1px / grey-carrier sides with the bits set.
+/// `border-width` alone build 1px / grey-carrier sides with the bits set (SR1069: `border-width` alone builds none; a style does).
 #[test]
 fn currentcolorrest_border_marker() {
     use layout_core::paint::CC_SIDES;
@@ -478,7 +478,8 @@ fn currentcolorrest_border_marker() {
     let s = styled(&[("border-color", "currentcolor")]);
     assert_eq!(s.paint.currentcolor, CC_SIDES, "border-color: currentcolor");
     assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some(((128, 128, 128), true)); 4])), "SR1058: no frame built (style none); the grey carrier pends with its currentcolor answer");
-    assert_eq!(cc(&[("border-width", "3px")]), CC_SIDES, "border-width alone: the created sides take currentcolor");
+    assert_eq!(cc(&[("border-width", "3px")]), 0, "SR1069 (flipped in place): border-width alone creates no side, no bit (was CC_SIDES)");
+    assert_eq!(cc(&[("border-width", "3px"), ("border-style", "solid")]), CC_SIDES, "SR1069: the style-created sides take currentcolor");
     assert_eq!(cc(&[("border", "2px solid red"), ("border-width", "3px")]), 0, "border-width keeps the red sides");
 }
 

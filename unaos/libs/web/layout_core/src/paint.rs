@@ -41,7 +41,7 @@ pub struct PaintStyle<H: Host> {
     /// Text transform: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
     pub text_transform: Option<u8>,
     /// border-top-width, border-right-width, border-bottom-width, border-left-width.
-    /// Overrides border[side].0 if set.
+    /// Overrides border[side].0 if set. AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the ONE per-side width store (`border-width`, the longhands and the shorthands' width write it; a style-created side takes it, else medium).
     pub border_width: Option<[Option<f32>; 4]>,
     /// background-size: (width, height) in pixels or as fractional shorthand values.
     /// Empty string means default (cover), other values stored as-is for rendering.

@@ -375,7 +375,7 @@ impl<H: Host> SpecifiedStyle<H> {
         if let Some(sides) = self.paint.border {
             let w = |i: usize| LengthPercentage::length(sides[i].map(|(w, _)| w).unwrap_or(0.0));
             node_style.border = Rect { top: w(0), right: w(1), bottom: w(2), left: w(3) };
-        }
+        } else { border_width_fold(self.paint.border_width, &mut node_style.border); }
         if let Some(bs) = self.box_sizing {
             node_style.box_sizing = bs;
         }
@@ -1570,11 +1570,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             };
             let mut sides = style.paint.border.unwrap_or_default();
             if v == "none" || v == "0" {
-                sides[side] = None;
+                sides[side] = None; border_width_store(&mut style.paint, 1 << side, None);
                 style.paint.border = Some(sides);
                 return;
             }
-            let mut width = 1.0f32;
+            let mut width = border_medium();
             let mut color = (128, 128, 128);
             let mut got_any = false;
             for part in split_top_level(v) {
@@ -1593,7 +1593,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v);
+                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v); border_width_store(&mut style.paint, 1 << side, Some(width));
                 style.paint.border = Some(sides);
             }
         }
@@ -1734,9 +1734,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     "border-bottom-width" => 2,
                     _ => 3,
                 };
-                let mut widths = style.paint.border_width.unwrap_or([None; 4]);
-                widths[side] = Some(w);
-                style.paint.border_width = Some(widths);
+                border_width_store(&mut style.paint, 1 << side, Some(w));
             }
         }
         // border-radius: parsed but not rendered (taffy doesn't support it yet).
@@ -1822,10 +1820,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "border" => {
             let v = value.trim();
             if v == "none" || v == "0" {
-                style.paint.border = Some([None; 4]);
+                style.paint.border = Some([None; 4]); border_width_store(&mut style.paint, crate::paint::CC_SIDES, None);
                 return;
             }
-            let mut width = 1.0f32;
+            let mut width = border_medium();
             let mut color = (128, 128, 128);
             let mut got_any = false;
             for part in split_top_level(v) {
@@ -1842,7 +1840,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 }
             }
             if got_any {
-                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v);
+                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v); border_width_store(&mut style.paint, crate::paint::CC_SIDES, Some(width));
             } else {
                 H::record_css(&format!("border-value:{}", clip(value)));
             }
@@ -1887,14 +1885,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "border-width" => {
-            if let Some(w) = parse_px(value, cx) { width_cc(&mut style.paint);
-                let mut sides = border_create_sides(&mut style.paint, crate::paint::CC_SIDES, true);
-                for side in sides.iter_mut() {
-                    let c = side.map(|(_, c)| c).unwrap_or((128, 128, 128));
-                    *side = Some((w, c));
-                }
-                style.paint.border = Some(sides);
-            }
+            if let Some(w) = parse_px(value, cx) { border_width_store(&mut style.paint, crate::paint::CC_SIDES, Some(w)); }
         }
         "border-style" => {} // stroke style is uniform; nothing to record
         // css-ui-4 §5.1: `[<url> [<x> <y>]?,]* <keyword>` — images are not loaded, so the fallback
@@ -2601,7 +2592,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         deco_clone, text_combine, scroll_margin, container_scroll,
         outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src); border_width_apply(dst);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -3766,16 +3757,6 @@ fn border_color_of<H: Host>(paint: &mut PaintStyle<H>, value: &str) -> Option<(u
     }
 }
 
-/// `border-width`'s marker: each side the arm creates at the grey (no border yet, or that side absent) takes the
-/// initial border colour, currentcolor.
-fn width_cc<H: Host>(paint: &mut PaintStyle<H>) {
-    for i in 0..4 {
-        if paint.border.map_or(true, |b| b[i].is_none()) {
-            paint.currentcolor |= 1 << i;
-        }
-    }
-}
-
 // ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
 
 /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): css-backgrounds-3 §3.3: `background-image: none` is a value (no image
@@ -4199,8 +4180,8 @@ const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "smal
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
 /// AETHERCSSBORDERCOLORSTORED (SR1058): the ONE side-creating helper over `PaintStyle::border_pending`. Each side in
-/// `mask` with no entry takes its pending colour (width 1.0, the width the fabricated frame had; `border_width` still
-/// overrides at paint) and the pending entry's currentcolor bit; with `grey`, a side with no pending colour takes the
+/// `mask` with no entry takes its pending colour (width: the stored `border_width` else medium 3px, SR1069's `side_width`;
+/// before SR1069 1.0, the width the fabricated frame had) and the pending entry's currentcolor bit; with `grey`, a side with no pending colour takes the
 /// grey carrier and the bit (the initial currentcolor: `border-width`'s road before SR1058). Sides with an entry stay.
 fn border_create_sides<H: Host>(paint: &mut PaintStyle<H>, mask: u8, grey: bool) -> [Option<(f32, (u8, u8, u8))>; 4] {
     let mut sides = paint.border.unwrap_or([None; 4]);
@@ -4212,11 +4193,11 @@ fn border_create_sides<H: Host>(paint: &mut PaintStyle<H>, mask: u8, grey: bool)
         }
         match pend[i] {
             Some((c, cc)) => {
-                sides[i] = Some((1.0, c));
+                sides[i] = Some((side_width(paint.border_width, i), c));
                 if cc { paint.currentcolor |= bit } else { paint.currentcolor &= !bit }
             }
             None if grey => {
-                sides[i] = Some((1.0, (128, 128, 128)));
+                sides[i] = Some((side_width(paint.border_width, i), (128, 128, 128)));
                 paint.currentcolor |= bit;
             }
             None => {}
@@ -4225,16 +4206,12 @@ fn border_create_sides<H: Host>(paint: &mut PaintStyle<H>, mask: u8, grey: bool)
     sides
 }
 
-/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-style` / `border-*-style` with a style: the sides in `mask` that have a
-/// pending colour and no entry are created from it (`border-color: red; border-style: solid` keeps its frame). With no
-/// pending colour in `mask` nothing is written, so a style-only block never writes a `border` that would replace an
-/// earlier rule's sides at the merge (a lone style creating a medium side: AETHER-CSS-BORDER-SIDE-STYLE-WIDTH owed).
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-style` / `border-*-style` with a style: the sides in `mask` with no entry
+/// are created (`border-color: red; border-style: solid` keeps its frame). AETHERCSSBORDERSIDESTYLEWIDTH (SR1069):
+/// css-backgrounds-3 §4.2-4.3: a side exists iff its style is not none, so a style alone creates the masked sides at the
+/// stored width else medium 3px, in the pending colour else currentcolor (before SR1069: only where a colour pended).
 fn border_pending_create<H: Host>(paint: &mut PaintStyle<H>, mask: u8) {
-    let pend = paint.border_pending.unwrap_or([None; 4]);
-    let absent = |i: usize| paint.border.map_or(true, |b| b[i].is_none());
-    if (0..4).any(|i| mask & (1 << i) != 0 && pend[i].is_some() && absent(i)) {
-        paint.border = Some(border_create_sides(paint, mask, false));
-    }
+    paint.border = Some(border_create_sides(paint, mask, true));
 }
 
 /// AETHERCSSBORDERCOLORSTORED (SR1058): the `border-color` arm's colour `c` (from `border_color_of`, which set or
@@ -4294,7 +4271,7 @@ fn merge_border_pending<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
             let Some((c, cc)) = p[i] else { continue };
             match sides[i] {
                 Some((w, _)) => sides[i] = Some((w, c)),
-                None if create => sides[i] = Some((1.0, c)),
+                None if create => sides[i] = Some((side_width(dst.border_width, i), c)),
                 None => continue,
             }
             let bit = 1u8 << i;
@@ -4308,4 +4285,66 @@ fn merge_border_pending<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         }
     }
     dst.border_pending = Some(dp);
+}
+
+// ---- AETHERCSSBORDERSIDESTYLEWIDTH (LEDGER SR1069): a style alone creates medium sides; border-width stores, never fabricates (named tail block) ----
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): css-backgrounds-3 §4.3 `medium`, read from the ONE literal (the SR832
+/// `noninherited_initial` row `"border-width" => "3px"`): the width of a side its style creates with no declared width,
+/// and of a `border` / `border-<side>` shorthand without a width part.
+fn border_medium() -> f32 {
+    parse_px(noninherited_initial("border-width", "initial"), &ParseCx::default()).unwrap_or(0.0)
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the width side `i` is created at: the stored `border_width` entry, else medium.
+fn side_width(widths: Option<[Option<f32>; 4]>, i: usize) -> f32 {
+    widths.and_then(|w| w[i]).unwrap_or_else(border_medium)
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `PaintStyle::border_width` is the ONE per-side width store: every width
+/// writer (`border-width`, `border-<side>-width`, and the shorthands' width, None for `none`) stores the sides in `mask`,
+/// and a Some also moves an existing side's width (so the layout box, which reads `border`, agrees with the paint). No
+/// side is created: a width alone paints nothing (style none; AETHER-CSS-BORDER-WIDTH-STORED, closed here).
+fn border_width_store<H: Host>(paint: &mut PaintStyle<H>, mask: u8, w: Option<f32>) {
+    let mut ws = paint.border_width.unwrap_or([None; 4]);
+    for i in 0..4 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        ws[i] = w;
+        if let (Some(w), Some(b)) = (w, paint.border.as_mut()) {
+            if let Some((sw, _)) = b[i].as_mut() {
+                *sw = w;
+            }
+        }
+    }
+    paint.border_width = Some(ws);
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `merge_paint`'s token AFTER the copy: `dst`'s sides take `dst`'s stored widths,
+/// so an earlier rule's `border-width: 2px` sizes a later rule's style-created side, and a later width moves earlier sides.
+fn border_width_apply<H: Host>(dst: &mut PaintStyle<H>) {
+    let Some(ws) = dst.border_width else { return };
+    if let Some(b) = dst.border.as_mut() {
+        for i in 0..4 {
+            if let (Some(w), Some((sw, _))) = (ws[i], b[i].as_mut()) {
+                *sw = w;
+            }
+        }
+    }
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `fold_into`'s road when the cascade made no side: a stored width reaches only a
+/// taffy edge the UA layer already gave a width (a control's `ua_control` edges: its UA style is not none), so
+/// `input { border-width: 0 }` still drops the 2px edge; a 0 edge (style none) stays 0.
+fn border_width_fold(widths: Option<[Option<f32>; 4]>, border: &mut Rect<LengthPercentage>) {
+    let Some(ws) = widths else { return };
+    let zero = LengthPercentage::length(0.0);
+    for (i, edge) in [&mut border.top, &mut border.right, &mut border.bottom, &mut border.left].into_iter().enumerate() {
+        if let Some(w) = ws[i] {
+            if *edge != zero {
+                *edge = LengthPercentage::length(w);
+            }
+        }
+    }
 }
