@@ -1268,8 +1268,9 @@ fn place_shorthands_content() {
     }
 }
 
-/// AETHERCSSPLACESHORTHANDS (SR1074): `place-items` / `place-self` write align-items / align-self (justify-items /
-/// justify-self have no arm: the second half is recorded, nothing else written); `place-self: auto` is SR1068's marker.
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-items` / `place-self` write align-items / align-self and (SR1088: the
+/// arms exist now, the second half is applied, no longer recorded) justify-items / justify-self; `place-self: auto` is
+/// SR1068's marker and SR1088's.
 #[test]
 fn place_shorthands_items_self() {
     let one = |p: &str, v: &str| styled(&[(p, v)]);
@@ -1277,14 +1278,18 @@ fn place_shorthands_items_self() {
     assert!(s.align_items.is_some(), "armed: place-items: center writes align-items");
     assert_eq!(s.align_items, one("align-items", "center").align_items, "place-items: center");
     assert_eq!(s.justify, None, "justify-content untouched");
+    assert_eq!(s.justify_items, Some(AlignSelf::CENTER), "SR1088: place-items: center writes justify-items too");
     assert_eq!(one("place-items", "first baseline").align_items, one("align-items", "baseline").align_items, "first baseline is one value");
     assert_eq!(one("place-items", "end start").align_items, one("align-items", "end").align_items, "two values: the first");
+    assert_eq!(one("place-items", "end start").justify_items, Some(AlignSelf::START), "SR1088: two values: the second is justify-items");
     assert_eq!(one("place-items", "bogus").align_items, None, "bogus refused");
     assert_eq!(one("place-self", "flex-end").align_self, Some(AlignSelf::END), "place-self: flex-end");
     assert_eq!(one("place-self", "center start").align_self, Some(AlignSelf::CENTER), "place-self: center start");
+    assert_eq!(one("place-self", "center start").justify_self, Some(AlignSelf::START), "SR1088: place-self: center start justifies start");
     let s = one("place-self", "auto");
     assert_eq!(s.align_self, None, "place-self: auto");
     assert!(s.align_self_auto, "place-self: auto carries the auto marker");
+    assert!(s.justify_self.is_none() && s.justify_self_auto, "SR1088: place-self: auto carries justify-self's marker");
     let s = one("place-self", "bogus");
     assert!(s.align_self.is_none() && !s.align_self_auto, "place-self: bogus refused");
     let c = cascade(&[&[("align-items", "flex-start")], &[("place-items", "center")]]);
@@ -1297,4 +1302,85 @@ fn place_shorthands_in_skipped() {
     for n in ["place-content", "place-items", "place-self"] {
         assert!(ALL_SKIPPED.contains(&n) && !ALL_LONGHANDS.contains(&n), "{n} is a skipped shorthand");
     }
+}
+
+// ---- AETHERCSSJUSTIFYITEMSSELF (LEDGER SR1088): css-align-3 §6.2 / §6.3 justify-items / justify-self (named tail block) ----
+
+use layout_core::taffy::style::AlignItems;
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): the two arms map the align twins' words (one keyword map, `self_alignment`):
+/// center / end / flex-end / start / flex-start / stretch / normal / baseline (`first baseline`, `safe center` as one
+/// value through `align_word`); `auto` is justify-self's marker and refused on justify-items; bogus refused; `initial`
+/// through the non-inherited table (normal → STRETCH, auto → the marker).
+#[test]
+fn justify_items_self_words() {
+    let one = |p: &str, v: &str| styled(&[(p, v)]);
+    let ji = |v: &str| one("justify-items", v).justify_items;
+    assert_eq!(ji("center"), Some(AlignItems::CENTER), "armed: justify-items: center");
+    for (v, want) in [("end", AlignItems::END), ("flex-end", AlignItems::END), ("start", AlignItems::START), ("flex-start", AlignItems::START),
+                      ("stretch", AlignItems::STRETCH), ("normal", AlignItems::STRETCH), ("baseline", AlignItems::BASELINE),
+                      ("first baseline", AlignItems::BASELINE), ("safe center", AlignItems::CENTER), ("initial", AlignItems::STRETCH)] {
+        assert_eq!(ji(v), Some(want), "justify-items: {v}");
+        assert_eq!(ji(v), one("align-items", v).align_items, "justify-items: {v} is align-items' word");
+    }
+    for bad in ["bogus", "auto", "legacy", "space-between", "safe safe center"] {
+        assert_eq!(ji(bad), None, "justify-items: {bad} refused");
+    }
+    let js = |v: &str| one("justify-self", v);
+    assert_eq!(js("center").justify_self, Some(AlignSelf::CENTER), "armed: justify-self: center");
+    assert_eq!(js("end").justify_self, Some(AlignSelf::END), "justify-self: end");
+    assert_eq!(js("flex-start").justify_self, Some(AlignSelf::START), "justify-self: flex-start");
+    assert_eq!(js("normal").justify_self, Some(AlignSelf::STRETCH), "justify-self: normal");
+    for (v, want) in [("center", Some(AlignSelf::CENTER)), ("end", Some(AlignSelf::END)), ("baseline", Some(AlignSelf::BASELINE))] {
+        assert_eq!(js(v).justify_self, one("align-self", v).align_self, "justify-self: {v} is align-self's word");
+        assert_eq!(js(v).justify_self, want);
+    }
+    for v in ["auto", "initial", "unset"] {
+        let s = js(v);
+        assert!(s.justify_self.is_none() && s.justify_self_auto, "justify-self: {v} is the auto marker");
+        assert!(!s.align_self_auto, "justify-self: {v} leaves align-self's marker alone");
+    }
+    let s = js("bogus");
+    assert!(s.justify_self.is_none() && !s.justify_self_auto, "justify-self: bogus refused");
+    let s = one("align-self", "auto");
+    assert!(s.align_self_auto && !s.justify_self_auto, "align-self: auto leaves justify-self's marker alone");
+}
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): through `merge_specified` a later rule beats an earlier one, and a later
+/// `justify-self: auto` erases an earlier `end` (the marker, as SR1068's align-self); `place-content` writes neither.
+#[test]
+fn justify_items_self_cascade() {
+    let c = cascade(&[&[("justify-items", "start")], &[("justify-items", "center")]]);
+    assert_eq!(c.justify_items, Some(AlignItems::CENTER), "a later justify-items wins");
+    let c = cascade(&[&[("justify-items", "center")], &[("align-items", "end")]]);
+    assert_eq!(c.justify_items, Some(AlignItems::CENTER), "align-items leaves justify-items");
+    let c = cascade(&[&[("justify-self", "end")], &[("justify-self", "auto")]]);
+    assert!(c.justify_self.is_none() && c.justify_self_auto, "a later justify-self: auto beats an earlier end");
+    let c = cascade(&[&[("justify-self", "end")], &[("color", "red")]]);
+    assert_eq!(c.justify_self, Some(AlignSelf::END), "control: an unrelated later rule keeps end");
+    let c = cascade(&[&[("place-items", "center")], &[("justify-items", "end")]]);
+    assert_eq!((c.align_items, c.justify_items), (Some(AlignItems::CENTER), Some(AlignItems::END)), "a later longhand beats place-items' half");
+    let s = styled(&[("place-content", "center")]);
+    assert!(s.justify.is_some() && s.justify_items.is_none() && s.justify_self.is_none(), "place-content: unchanged, justify-content only");
+}
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): both are longhands `all` resets, never skipped shorthands.
+#[test]
+fn justify_items_self_longhands() {
+    for n in ["justify-items", "justify-self"] {
+        assert!(ALL_LONGHANDS.contains(&n) && !ALL_SKIPPED.contains(&n), "{n} is in ALL_LONGHANDS");
+    }
+}
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): `fold_into` writes taffy's `justify_items` / `justify_self`; an empty style
+/// leaves taffy's defaults (control).
+#[test]
+fn justify_items_self_fold() {
+    let mut st = layout_core::taffy::Style::default();
+    styled(&[("justify-items", "center"), ("justify-self", "end")]).fold_into(&mut st);
+    assert_eq!(st.justify_items, AlignItems::CENTER, "armed: justify-items folds");
+    assert_eq!(st.justify_self, Some(AlignSelf::END), "justify-self folds");
+    let (mut a, b): (layout_core::taffy::Style, layout_core::taffy::Style) = (Default::default(), Default::default());
+    SpecifiedStyle::<TH>::default().fold_into(&mut a);
+    assert_eq!((a.justify_items, a.justify_self), (b.justify_items, b.justify_self), "control: unset leaves taffy's defaults");
 }

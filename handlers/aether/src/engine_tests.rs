@@ -8645,7 +8645,8 @@ mod tests {
     }
 
     /// AETHERCSSPLACESHORTHANDS (SR1074): `place-items: center` on a 200px-tall flex row puts its 50 x 50 child at
-    /// y 75 (x stays 0: justify-items has no arm, its half is recorded); `place-self: center` on an item the same.
+    /// y 75 (x stays 0: SR1088 applies the justify-items half, which flex layout ignores, css-align-3 §6.1; the
+    /// `place-justify-dropped:` record is retired); `place-self: center` on an item the same.
     #[test]
     fn place_items_center_engine() {
         crate::ledger::reset();
@@ -8675,6 +8676,54 @@ mod tests {
         let p = at(&mut e, "pk", "p");
         assert!(near(p, (0.0, 75.0)), "place-self: center at y 75: {p:?}");
         let snap = crate::ledger::snapshot();
-        assert!(snap.contains(crate::ledger::ApiCategory::Css, "place-justify-dropped:center"), "the justify half is recorded");
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "place-justify-dropped:center"), "SR1088: the justify half is applied, not recorded");
+    }
+
+    // ---- AETHERCSSJUSTIFYITEMSSELF (LEDGER SR1088): css-align-3 §6.2 / §6.3 justify-items / justify-self (named tail block) ----
+
+    /// AETHERCSSJUSTIFYITEMSSELF (SR1088): (a) `justify-items: center` / `justify-self: end` on a 200 x 200 flex row are
+    /// parsed (no `property:` unhandled record) and ignored by flex layout (css-align-3 §6.1): the 50 x 50 child stays
+    /// at x 0; a bogus value is refused and recorded. (b) an abspos 50 x 50 box with `left: 0; right: 0` in a 200px
+    /// relative box is aligned by `justify-self: center` in its inset-modified containing block: x 75 (control: 0).
+    #[test]
+    fn justify_items_self_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 200px }
+            .k { width: 50px; height: 50px }
+            .ji { justify-items: center }
+            .js { justify-self: end }
+            .jb { justify-items: bogus }
+            .r { position: relative; width: 200px; height: 100px }
+            .a { position: absolute; left: 0; right: 0; top: 0; width: 50px; height: 50px }
+            .jc { justify-self: center }
+            </style></head><body style="margin:0">
+            <div id="i" class="f ji"><div id="ik" class="k"></div></div>
+            <div id="s" class="f"><div id="sk" class="k js"></div></div>
+            <div id="b" class="f jb"><div id="bk" class="k"></div></div>
+            <div id="r" class="r"><div id="rk" class="a jc"></div></div>
+            <div id="c" class="r"><div id="ck" class="a"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 1000));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
+            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
+            (a.0 - b.0, a.1 - b.1)
+        };
+        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
+        for (k, row) in [("ik", "i"), ("sk", "s"), ("bk", "b")] {
+            let v = at(&mut e, k, row);
+            assert!(near(v, (0.0, 0.0)), "{k}: flex ignores justify-items / justify-self: {v:?}");
+        }
+        let c = at(&mut e, "ck", "c");
+        assert!(near(c, (0.0, 0.0)), "control: the abspos box without justify-self sits at x 0: {c:?}");
+        let r = at(&mut e, "rk", "r");
+        assert!(near(r, (75.0, 0.0)), "armed: justify-self: center centres the abspos box at x 75: {r:?}");
+        let snap = crate::ledger::snapshot();
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "property:justify-items"), "justify-items has an arm");
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "property:justify-self"), "justify-self has an arm");
+        assert!(snap.contains(crate::ledger::ApiCategory::Css, "justify-items-value:bogus"), "the bogus value is refused and recorded");
     }
 }
