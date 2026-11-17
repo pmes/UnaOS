@@ -3282,3 +3282,74 @@ fn nle5dexportmessageetaband_tick_repaints_when_the_eta_word_moves() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetaband: tick repaints {w} -> {moved:?} at 3/35");
 }
+
+// ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetasmooth_eta_of_rate_kat() {
+    use stria::nle_face::eta_of_rate;
+    use std::time::Duration;
+    let e = eta_of_rate(32, 10.0).expect("32 frames at 10 fps");
+    assert_eq!(e.as_millis(), 3200, "{e:?}: 32 / 10 = 3.2 s");
+    assert_eq!(eta_of_rate(0, 10.0), Some(Duration::ZERO), "nothing left: no time left");
+    for r in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(eta_of_rate(32, r), None, "rate {r}: no estimate");
+    }
+    println!("nle5dexportmessageetasmooth: eta_of_rate 32 @ 10 fps = {e:?}; rate 0 / negative / NaN / inf -> None");
+}
+
+#[test]
+fn nle5dexportmessageetasmooth_ema_step_kat() {
+    use stria::nle_face::{ETA_TAU, ema_step};
+    let one = ema_step(0.0, 1.0, ETA_TAU, ETA_TAU);
+    assert!((one - (1.0 - (-1.0f64).exp())).abs() < 1e-12, "{one}: dt = tau moves 1 - 1/e of the step");
+    assert_eq!(ema_step(4.0, 9.0, 0.0, ETA_TAU), 4.0, "dt 0 keeps prev");
+    let step = ema_step(1.0, 10.0, 3.0 * ETA_TAU, ETA_TAU);
+    assert!(step > 9.5, "{step}: 1 -> 10 fps after 3 x tau sits above 9.5");
+    let thrice = ema_step(ema_step(ema_step(1.0, 10.0, ETA_TAU, ETA_TAU), 10.0, ETA_TAU, ETA_TAU), 10.0, ETA_TAU, ETA_TAU);
+    assert!((thrice - step).abs() < 1e-12, "{thrice} vs {step}: three tau steps are one 3 x tau step (the time rule)");
+    let mut sixty = 1.0;
+    for _ in 0..60 {
+        sixty = ema_step(sixty, 10.0, 1.0 / 60.0, ETA_TAU);
+    }
+    let mut twentyfive = 1.0;
+    for _ in 0..25 {
+        twentyfive = ema_step(twentyfive, 10.0, 1.0 / 25.0, ETA_TAU);
+    }
+    assert!((sixty - twentyfive).abs() < 1e-9, "{sixty} vs {twentyfive}: one second at 60 Hz or 25 Hz smooths the same");
+    println!("nle5dexportmessageetasmooth: ema_step tau {one:.6}, 3 tau {step:.6}, 1 s at 60 / 25 Hz {sixty:.9}");
+}
+
+#[test]
+fn nle5dexportmessageetasmooth_scripted_slow_start() {
+    use stria::nle_face::{ema_sample, eta_of_rate, eta_words, eta_words_of};
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let started = t0 - Duration::from_secs(2);
+    let total = 1000u64;
+    let mut st = (0.0, (started, 0u64));
+    st = ema_sample(st.0, st.1, 0, t0);
+    assert_eq!(st, (0.0, (started, 0)), "no move: unchanged");
+    st = ema_sample(st.0, st.1, 1, t0);
+    assert_eq!(st, (0.0, (t0, 1)), "the first move (the 2 s warm-up) only records");
+    st = ema_sample(st.0, st.1, 2, t0 + ms(1000));
+    assert!((st.0 - 1.0).abs() < 1e-9, "{}: the second move seeds 1 fps", st.0);
+    let mut now = t0 + ms(1000);
+    let mut done = 2;
+    for _ in 0..30 {
+        now += ms(100);
+        done += 10;
+        st = ema_sample(st.0, st.1, done, now);
+    }
+    assert_eq!(st.1, (now, 302));
+    let same = ema_sample(st.0, st.1, 302, now + ms(100));
+    assert_eq!(same, st, "a tick with done fixed changes nothing: the paused job keeps its rate");
+    let smooth = eta_of_rate(total - done, st.0).expect("an EMA eta");
+    let elapsed = now - started;
+    let mean = elapsed * (total - done) as u32 / done as u32;
+    assert!(smooth < mean, "{smooth:?} >= {mean:?}: after the fast run the EMA eta sits under the mean's");
+    assert!(st.0 > 50.0 && st.0 < 100.0, "{}: between the mean and the true 100 fps", st.0);
+    assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
+    println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
+}
