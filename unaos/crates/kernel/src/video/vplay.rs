@@ -1056,7 +1056,6 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     }
     if let Some(t) = tl.sources.iter().find(|s| s.title.is_some()) { return Err(("title-unsupported", Some(alloc::format!("title reel {} (the Player's EDL mode draws no title card)", t.reel)))); } if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.crop != timeline_core::Crop::NONE)) { return Err(("crop-unsupported", Some(String::from("the EDL crops a clip (* UNA CROP): the Player's frame road has no crop pass")))); } // NLE-CROP-KERNEL (SR867): a cropped clip refused by name, not shown uncropped (STRIACROP, LEDGER SR867)
     // NLE-GRADE-KERNEL BUILT by STRIAGRADENEXT (SR992): each step graded below, the outgoing side of a mix in edl_mix (edl_grade / edl_graded, file tail)
-    if tl.tracks.iter().any(|t| t.clips.iter().any(|c| c.xform != timeline_core::Xform::NONE)) { return Err(("xform-unsupported", Some(String::from("the EDL places a clip (* UNA XFORM): the Player's frame road has no placement pass")))); } // NLE-XFORM-KERNEL (SR879): a placed clip refused by name, not shown full-frame (STRIAPOSITIONSCALE, LEDGER SR879)
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?; // NLE-TITLE-KERNEL (SR828): a titled source is refused by name, never scheduled onto a frame road with no title arm
     rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
@@ -1100,7 +1099,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         };
         match (s.vmix, refused) {
             (Some(_), Some(why)) => edl_refuse(rep, &why),
-            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, tl.grade_at(s.track, s.out_t, true), &mut frame, &mut mix, rep)?, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail)
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, tl.grade_at(s.track, s.out_t, true), &mut frame, &mut mix, rep, (tl, s))?, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail) // STRIAKXFORM (LEDGER SR9011): the step, for its placement
             (None, _) => {}
         }
         if pts_ms < seek_ms {
@@ -1203,7 +1202,7 @@ fn edl_mix(
     m: timeline_core::schedule::VideoMix, og: timeline_core::Grade, // STRIAGRADENEXT (SR992): the outgoing clip's grade (file tail)
     frame: &mut Frame,
     mix: &mut Option<EdlRun>,
-    rep: &mut EdlReport,
+    rep: &mut EdlReport, at: (&timeline_core::Timeline, &timeline_core::schedule::Step), // STRIAKXFORM (LEDGER SR9011): the step, for its placement (timeline_core `Timeline::place_step`)
 ) -> Result<(), (&'static str, Option<String>)> {
     let t0 = crate::hidstall::now_us();
     let (w, h) = (frame.w, frame.h);
@@ -1233,7 +1232,7 @@ fn edl_mix(
         }
     };
     let b = unpack(frame.px.rgb());
-    timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
+    let placed = at.0.place_step(at.1, a.as_chunks::<4>().0, b.as_chunks::<4>().0, w, h); match placed { Some(p) => a = p.into_flattened(), None => timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32) } // STRIAKXFORM (LEDGER SR9011): a placed step is placed over its lower frame (picture in picture), not mixed whole
     let sum = frame_fnv_rgba(&a);
     if rep.mixes.len() < SHOWN_CAP {
         rep.mixes.push((out_t, sum));
