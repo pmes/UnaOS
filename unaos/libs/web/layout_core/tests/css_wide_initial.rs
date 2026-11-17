@@ -140,3 +140,119 @@ fn css_wide_initial_leaves_the_rest() {
     let s = cascade(&[&[("letter-spacing", "2px")], &[("letter-spacing", "unset")]]);
     assert_eq!(s.paint.letter_spacing, cascade(&[&[("letter-spacing", "2px")]]).paint.letter_spacing, "an inherited unset is not rewritten to 0px");
 }
+
+// ---- AETHERCSSWIDENONINHERITEDREST (LEDGER SR848): initial / unset on the rest of the non-inherited arms (named tail block) ----
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): `position: initial` / `unset` after `absolute` is static (in flow); `z-index:
+/// initial` is auto; `float` / `clear: initial` are none.
+#[test]
+fn css_wide_rest_position_float() {
+    let stat = styled(&[("position", "static")]);
+    assert_ne!(cascade(&[&[("position", "absolute")]]).position, stat.position, "the earlier absolute (armed)");
+    for kw in ["initial", "unset"] {
+        let s = cascade(&[&[("position", "absolute")], &[("position", kw)]]);
+        assert_eq!((s.position, s.paint.position_kind), (stat.position, Some(0)), "position: {kw} is static");
+    }
+    let s = cascade(&[&[("z-index", "5")], &[("z-index", "initial")]]);
+    assert_eq!(s.paint.z_index, Some(None), "z-index: initial is auto");
+    let s = cascade(&[&[("float", "left")], &[("float", "initial")]]);
+    assert_eq!(s.paint.float, Some(0), "float: initial is none");
+    let s = cascade(&[&[("clear", "both")], &[("clear", "initial")]]);
+    assert_eq!(s.paint.clear, Some(0), "clear: initial is none");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): `overflow: initial` / `unset` after `hidden` is visible and stops clipping;
+/// an axis longhand resets its own axis.
+#[test]
+fn css_wide_rest_overflow_visible() {
+    let vis = styled(&[("overflow", "visible")]).paint.overflow;
+    assert_ne!(cascade(&[&[("overflow", "hidden")]]).paint.overflow, vis, "the earlier hidden (armed)");
+    for kw in ["initial", "unset"] {
+        let s = cascade(&[&[("overflow", "hidden")], &[("overflow", kw)]]);
+        assert_eq!((s.paint.overflow, s.paint.clip), (vis, Some(false)), "overflow: {kw} is visible");
+    }
+    let s = styled(&[("overflow", "hidden"), ("overflow-y", "initial")]);
+    let o = s.paint.overflow.expect("overflow");
+    assert!(o[1] == vis.unwrap()[1] && o[0] != vis.unwrap()[0], "overflow-y: initial resets only y: {o:?}");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): `opacity: initial` after 0.5 is 1 (unhidden); `transform: initial` after a
+/// translate is none (the anim table's literals).
+#[test]
+fn css_wide_rest_opacity_transform() {
+    let s = cascade(&[&[("opacity", "0")], &[("opacity", "initial")]]);
+    assert_eq!((s.paint.opacity, s.paint.hidden), (Some(1.0), Some(false)), "opacity: initial is 1");
+    let t = cascade(&[&[("transform", "translateX(100px)")]]);
+    assert!(t.paint.transform.as_ref().is_some_and(|l| !l.is_empty()), "the earlier translate (armed)");
+    let s = cascade(&[&[("transform", "translateX(100px)")], &[("transform", "initial")]]);
+    assert_eq!(s.paint.transform, Some(Vec::new()), "transform: initial is none");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): each inset longhand and the `inset` shorthand reset to auto.
+#[test]
+fn css_wide_rest_insets_auto() {
+    let auto = styled(&[("inset", "auto")]);
+    for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+        let s = cascade(&[&[(side, "10px")], &[(side, "initial")]]);
+        let got = [s.inset_top, s.inset_right, s.inset_bottom, s.inset_left][i];
+        assert_eq!(got, auto.inset_top, "{side}: initial is auto (a Some, so it beats 10px)");
+        assert!(got.is_some());
+    }
+    let s = cascade(&[&[("inset", "10px")], &[("inset", "initial")]]);
+    assert_eq!([s.inset_top, s.inset_right, s.inset_bottom, s.inset_left], [auto.inset_top; 4], "inset: initial is auto");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): the flex longhands and shorthands reset to row / nowrap / 0 / 1 / auto.
+#[test]
+fn css_wide_rest_flex() {
+    let row = styled(&[("flex-direction", "row")]).flex_direction;
+    assert_ne!(cascade(&[&[("flex-direction", "column")]]).flex_direction, row, "the earlier column (armed)");
+    for kw in ["initial", "unset"] {
+        let s = cascade(&[&[("flex-direction", "column")], &[("flex-direction", kw)]]);
+        assert_eq!(s.flex_direction, row, "flex-direction: {kw} is row");
+    }
+    let nowrap = styled(&[("flex-wrap", "nowrap")]).flex_wrap;
+    let s = cascade(&[&[("flex-wrap", "wrap")], &[("flex-wrap", "initial")]]);
+    assert_eq!(s.flex_wrap, nowrap, "flex-wrap: initial is nowrap");
+    let s = cascade(&[&[("flex-flow", "column wrap")], &[("flex-flow", "initial")]]);
+    assert_eq!((s.flex_direction, s.flex_wrap), (row, nowrap), "flex-flow: initial is row nowrap");
+    let s = cascade(&[&[("flex-grow", "3")], &[("flex-grow", "initial")]]);
+    assert_eq!(s.flex_grow, Some(0.0), "flex-grow: initial is 0");
+    let s = cascade(&[&[("flex-shrink", "0")], &[("flex-shrink", "initial")]]);
+    assert_eq!(s.flex_shrink, Some(1.0), "flex-shrink: initial is 1");
+    let auto = styled(&[("flex-basis", "auto")]).flex_basis;
+    let s = cascade(&[&[("flex-basis", "50px")], &[("flex-basis", "initial")]]);
+    assert_eq!(s.flex_basis, auto, "flex-basis: initial is auto");
+    let s = cascade(&[&[("flex", "2 0 10px")], &[("flex", "unset")]]);
+    assert_eq!((s.flex_grow, s.flex_shrink, s.flex_basis), (Some(0.0), Some(1.0), auto), "flex: unset is 0 1 auto");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): align-items / justify-content reset to normal, gap / row-gap to 0;
+/// column-gap's keyword stays dropped (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL owed, pinned).
+#[test]
+fn css_wide_rest_align_gap() {
+    let n = styled(&[("align-items", "normal"), ("justify-content", "normal")]);
+    let s = cascade(&[&[("align-items", "center"), ("justify-content", "center")], &[("align-items", "initial"), ("justify-content", "initial")]]);
+    assert_eq!(s.align_items, n.align_items, "align-items: initial is normal");
+    assert_eq!(s.justify, n.justify, "justify-content: initial is normal");
+    let zero = styled(&[("gap", "0px")]);
+    let s = cascade(&[&[("gap", "10px")], &[("gap", "initial")]]);
+    assert_eq!((s.row_gap, s.column_gap), (zero.row_gap, zero.column_gap), "gap: initial is 0");
+    let s = cascade(&[&[("row-gap", "10px")], &[("row-gap", "initial")]]);
+    assert_eq!(s.row_gap, zero.row_gap, "row-gap: initial is 0");
+    let ten = cascade(&[&[("column-gap", "10px")]]);
+    let s = cascade(&[&[("column-gap", "10px")], &[("column-gap", "initial")]]);
+    assert_eq!(s.column_gap, ten.column_gap, "column-gap: initial unchanged by this arc (owed, pinned)");
+}
+
+/// AETHERCSSWIDENONINHERITEDREST (SR848): the background layer longhands reset to repeat / `0% 0%` / auto; the
+/// shorthand keeps SR832's colour-only rewrite (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE owed).
+#[test]
+fn css_wide_rest_background_layers() {
+    let s = cascade(&[&[("background-repeat", "no-repeat")], &[("background-repeat", "initial")]]);
+    assert_eq!(s.paint.bg_repeat, Some(0), "background-repeat: initial is repeat");
+    let s = cascade(&[&[("background-position", "10px 20px")], &[("background-position", "initial")]]);
+    assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "background-position: initial is 0% 0%");
+    let s = cascade(&[&[("background-size", "cover")], &[("background-size", "initial")]]);
+    assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "background-size: initial is auto");
+}
