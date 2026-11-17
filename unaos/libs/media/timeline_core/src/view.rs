@@ -1391,3 +1391,106 @@ mod striaprojectbin_tests {
         assert_eq!(short.len(), (w * 20 * 4) as usize, "rows past the canvas are clipped");
     }
 }
+
+// ---- STRIABINSCROLL (LEDGER SR939): the bin's row offset — clamp, offset hit, offset paint (named tail block) ----
+// The bin's reach: rows past the canvas are reached by a first-shown row `top` (the face's wheel moves it). ONE shared
+// offset, [`bin_offset`], feeds both [`bin_hit_from`] and [`paint_bin_from`], and both call STRIAPROJECTBIN's unchanged
+// [`bin_hit`] / [`paint_bin`] on a canvas `off` px taller (the paint crops those rows off). `top` is clamped to the list
+// ([`bin_clamp`]), so the last row sits at the canvas's bottom at most; `top` 0 paints `paint_bin`'s exact bytes.
+
+/// The largest first-shown row on a bin canvas `h` px tall: the sources past the rows that fit whole (at least one).
+pub fn bin_top_max(tl: &Timeline, h: u32) -> usize {
+    tl.sources.len().saturating_sub((h / BIN_ROW_H).max(1) as usize)
+}
+
+/// `top` clamped to `0..=bin_top_max(tl, h)`.
+pub fn bin_clamp(tl: &Timeline, h: u32, top: usize) -> usize {
+    top.min(bin_top_max(tl, h))
+}
+
+/// THE bin's row offset (px) for a first-shown row `top`: what the paint and the hit both shift by.
+pub fn bin_offset(top: usize) -> i64 {
+    bin_row_y(top)
+}
+
+/// [`bin_hit`] with the rows shifted up by `top` (clamped): the source row under canvas point `(x, y)`.
+pub fn bin_hit_from(tl: &Timeline, w: u32, h: u32, top: usize, x: f64, y: f64) -> Option<usize> {
+    if y < 0.0 {
+        return None;
+    }
+    let off = bin_offset(bin_clamp(tl, h, top));
+    bin_hit(tl, w, h.saturating_add(off as u32), x, y + off as f64)
+}
+
+/// [`paint_bin`] with the rows shifted up by `top` (clamped): painted `off` px taller, the first `off` rows dropped.
+pub fn paint_bin_from(tl: &Timeline, w: u32, h: u32, top: usize, order: Order, labels: Option<&mut dyn Text>) -> Vec<u8> {
+    let off = bin_offset(bin_clamp(tl, h, top)) as u32;
+    if off == 0 {
+        return paint_bin(tl, w, h, order, labels);
+    }
+    let mut px = paint_bin(tl, w, h.saturating_add(off), order, labels);
+    px.drain(..off as usize * w as usize * 4);
+    px
+}
+
+#[cfg(test)]
+mod striabinscroll_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// A (on V1), B, C, D (on no track) at 25 fps: four rows.
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_source("B", 50);
+        tl.add_source("C", 25);
+        tl.add_source("D", 30);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        tl
+    }
+
+    #[test]
+    fn striabinscroll_top_clamps_to_the_list() {
+        let tl = tl();
+        let h = 2 * BIN_ROW_H;
+        assert_eq!(bin_top_max(&tl, h), 2);
+        assert_eq!(bin_clamp(&tl, h, 1), 1);
+        assert_eq!(bin_clamp(&tl, h, 9), 2, "the last row sits at the bottom at most");
+        assert_eq!(bin_top_max(&tl, 4 * BIN_ROW_H), 0, "every row fits: no scroll");
+        assert_eq!(bin_top_max(&tl, 5), 3, "a canvas under one row still shows one");
+        assert_eq!(bin_top_max(&Timeline::new(25), h), 0);
+        assert_eq!(bin_offset(2), 2 * BIN_ROW_H as i64);
+    }
+
+    #[test]
+    fn striabinscroll_hit_shifts_by_the_offset() {
+        let tl = tl();
+        let (w, h) = (120u32, 2 * BIN_ROW_H);
+        for top in 0..3 {
+            for i in 0..2 {
+                let (x, y) = bin_point(i);
+                assert_eq!(bin_hit_from(&tl, w, h, top, x, y), Some(i + top));
+            }
+        }
+        assert_eq!(bin_hit_from(&tl, w, h, 0, 5.0, 5.0), bin_hit(&tl, w, h, 5.0, 5.0), "top 0 is bin_hit");
+        assert_eq!(bin_hit_from(&tl, w, h, 9, 5.0, 5.0), Some(2), "top clamped");
+        assert_eq!(bin_hit_from(&tl, w, h, 1, 5.0, -1.0), None);
+        assert_eq!(bin_hit_from(&tl, w, h, 1, 5.0, h as f64), None, "past the canvas");
+        assert_eq!(bin_hit_from(&tl, w, h, 1, w as f64, 5.0), None);
+    }
+
+    #[test]
+    fn striabinscroll_paint_crops_the_shifted_rows() {
+        let tl = tl();
+        let (w, h) = (120u32, 2 * BIN_ROW_H);
+        assert_eq!(paint_bin_from(&tl, w, h, 0, Order::Rgba, None), paint_bin(&tl, w, h, Order::Rgba, None), "top 0: byte-identical");
+        for top in 1..3 {
+            let got = paint_bin_from(&tl, w, h, top, Order::Rgba, None);
+            assert_eq!(got.len(), (w * h * 4) as usize);
+            let tall = paint_bin(&tl, w, h + top as u32 * BIN_ROW_H, Order::Rgba, None);
+            assert_eq!(got.as_slice(), &tall[top * BIN_ROW_H as usize * w as usize * 4..]);
+        }
+        assert_eq!(paint_bin_from(&tl, w, h, 9, Order::Bgra, None), paint_bin_from(&tl, w, h, 2, Order::Bgra, None));
+    }
+}

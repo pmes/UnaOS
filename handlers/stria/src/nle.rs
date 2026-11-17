@@ -988,3 +988,12 @@ impl Sources {
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
 }
+
+// ---- STRIABINSCROLL (LEDGER SR939): what a reel's media holds, for the bin's unused-reel lay (named tail block) ----
+impl Sources {
+    /// Whether source `id`'s opened media holds a stream of `kind` (its demux tracks at open); false for an id with no
+    /// media. The bin (`nle_face`) reads it to lay a reel that sits on no track yet on a track of a kind it can feed.
+    pub fn holds(&self, id: SourceId, kind: Kind) -> bool {
+        self.get(id).is_ok_and(|m| m.stream(kind).is_some())
+    }
+}

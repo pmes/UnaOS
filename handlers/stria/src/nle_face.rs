@@ -3115,6 +3115,7 @@ pub struct BinSurface {
     pub n: u32,
     pub canvas: (u32, u32),
     buttons: bool,
+    pub top: usize, wheel: i64, // STRIABINSCROLL (SR939): the first shown row and the wheel's notch remainder in thousandths of dy (file tail)
 }
 
 impl Face {
@@ -3123,7 +3124,7 @@ impl Face {
     pub fn with_bin(mut self, n: u32) -> Face {
         let Some(s) = self.split else { return self };
         let rows = self.state.timeline.sources.len().max(1) as u32;
-        self.split = Some(Split { bin: Some(BinSurface { n, canvas: (self.canvas.0, view::BIN_ROW_H * rows), buttons: false }), ..s });
+        self.split = Some(Split { bin: Some(BinSurface { n, canvas: (self.canvas.0, view::BIN_ROW_H * rows), buttons: false, top: 0, wheel: 0 }), ..s }); // STRIABINSCROLL (SR939): the first shown row and the wheel's remainder
         self
     }
     /// The bin's Surface, when the face has one.
@@ -3154,6 +3155,7 @@ impl Face {
             }
             SMessage::BrowserButton { down: false, x, y, .. } => self.bin_click(x, y),
             SMessage::BrowserClick(x, y, _) if !b.buttons => self.bin_click(x, y),
+            SMessage::BrowserScroll(_, dy, _) => self.bin_scroll(dy), // STRIABINSCROLL (SR939): the wheel scrolls the rows (file tail)
             _ => false,
         })
     }
@@ -3162,14 +3164,14 @@ impl Face {
     fn bin_click(&mut self, x: f64, y: f64) -> bool {
         let Some(b) = self.bin() else { return false };
         let tl = &self.state.timeline;
-        let Some(word) = view::bin_hit(tl, b.canvas.0, b.canvas.1, x, y).and_then(|i| view::bin_word(tl, i)) else { return false };
+        let Some(i) = view::bin_hit_from(tl, b.canvas.0, b.canvas.1, b.top, x, y) else { return false }; if let Some(r) = self.bin_unused(i) { return r; } let Some(word) = view::bin_word(&self.state.timeline, i) else { return false }; // STRIABINSCROLL (SR939): the hit shifted by the bin's first shown row; a reel on no track laid by its media's kind (file tail)
         self.verb(&word)
     }
     /// The bin's pixels (`Role::Bin`): timeline_core view's `paint_bin`, the labels through [`Labels`].
     fn paint_bin(&self) -> Vec<u8> {
         let (w, h) = self.bin().map(|b| b.canvas).unwrap_or(self.canvas);
         let mut lab = self.labels.as_ref().map(Labels);
-        view::paint_bin(&self.state.timeline, w, h, vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text))
+        view::paint_bin_from(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text)) // STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail)
     }
     /// [`Face::frames`]' blits, with the bin's appended when the face has one.
     fn bin_blit(&mut self, mut v: Vec<SMessage>) -> Vec<SMessage> {
@@ -3278,5 +3280,136 @@ mod striaprojectbin_tests {
         assert!(!f.on(&SMessage::BrowserMouseMove(5.0, 5.0, 2)));
         assert!(f.pointer().is_none(), "the bin's pointer is not the tracks'");
         assert_eq!(blit(&f.frames()[2]).1, 200);
+    }
+}
+
+// ---- STRIABINSCROLL (LEDGER SR939): the bin's wheel scroll and the unused reel's lay (named tail block) ----
+// The bin reaches every source: the wheel over the bin Surface moves its first shown row `BinSurface::top` one row per
+// [`WHEEL_STEP`] notch (down = later rows), clamped by timeline_core view's `bin_clamp`, and view's `paint_bin_from` /
+// `bin_hit_from` shift by that ONE offset. A reel that sits on no track yet is laid on the first track of a kind its media
+// holds (`Sources::holds`: video first, else audio) through `EditorState::place_at_playhead`, the road SR852's
+// `insert_reel` ends in (ONE commit, one undo step); a reel with no media opened keeps the word road and its refusal.
+
+impl Face {
+    /// The wheel over the bin: `dy` accumulates (thousandths, the remainder kept) and each whole [`WHEEL_STEP`] moves the
+    /// first shown row by one, clamped to the list; true only when the row moved.
+    fn bin_scroll(&mut self, dy: f64) -> bool {
+        let Some(s) = self.split else { return false };
+        let Some(b) = s.bin else { return false };
+        let step = (WHEEL_STEP * 1000.0) as i64;
+        let acc = b.wheel + (dy * 1000.0) as i64;
+        let notches = acc / step;
+        let top = view::bin_clamp(&self.state.timeline, b.canvas.1, (b.top as i64 + notches).max(0) as usize);
+        let moved = top != view::bin_clamp(&self.state.timeline, b.canvas.1, b.top);
+        self.split = Some(Split { bin: Some(BinSurface { top, wheel: acc - notches * step, ..b }), ..s });
+        moved
+    }
+    /// A click on bin row `i` whose reel sits on no track: laid at the playhead on the first track of a kind its media
+    /// holds (`Some(true)`; no such track: the word's refusal by name on the message line). `None` for a reel on a track
+    /// or one with no media opened (the word road decides).
+    fn bin_unused(&mut self, i: usize) -> Option<bool> {
+        let r = view::bin_rows(&self.state.timeline).into_iter().nth(i)?;
+        if r.kind != view::BinKind::Unused {
+            return None;
+        }
+        let held: Vec<Kind> = [Kind::Video, Kind::Audio].into_iter().filter(|k| self.sources.holds(r.src, *k)).collect();
+        if held.is_empty() {
+            return None;
+        }
+        let word = view::bin_word(&self.state.timeline, i)?;
+        let track = held.iter().find_map(|k| self.state.timeline.tracks.iter().position(|t| t.kind == *k));
+        let res = track.ok_or(EditError::NoTrack).and_then(|t| self.state.place_at_playhead(t, r.src, 0, r.duration, timeline_core::Mode::Insert));
+        if let Err(e) = res {
+            self.last_error = Some(format!("{word}: {e}"));
+        }
+        Some(true)
+    }
+}
+
+#[cfg(test)]
+mod striabinscroll_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    fn click(n: u32, (x, y): (f64, f64)) -> SMessage {
+        SMessage::BrowserClick(x, y, n)
+    }
+
+    fn wheel(dy: f64) -> SMessage {
+        SMessage::BrowserScroll(0.0, dy, 2)
+    }
+
+    /// The fixture plus reel C (synth media: video and audio) on no track.
+    fn with_unused() -> (Face, SourceId) {
+        let (mut tl, mut src) = synth_fixture();
+        let c = tl.add_source("C", 50);
+        src.add(c, synth_source(2000, 50, 25)).expect("synthetic source opens");
+        (Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1).with_bin(2), c)
+    }
+
+    /// A one-row bin: a notch down shows row 1 (B) and a click on the first row's pixels inserts B; the scroll clamps to
+    /// the list, half a notch is no step, a notch up comes back; the paint is view's `paint_bin_from`.
+    #[test]
+    fn striabinscroll_wheel_scrolls_rows_and_clamps() {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1).with_bin(2);
+        assert_eq!(f.bin().unwrap().top, 0);
+        assert!(!f.on(&wheel(WHEEL_STEP)), "every row fits: nothing to scroll");
+        assert_eq!(f.bin().unwrap().top, 0);
+        assert!(f.on(&SMessage::BrowserResize(320, view::BIN_ROW_H, 2)));
+        assert!(!f.on(&wheel(WHEEL_STEP / 2.0)), "half a notch is no step");
+        assert!(f.on(&wheel(WHEEL_STEP / 2.0)));
+        assert_eq!(f.bin().unwrap().top, 1);
+        assert!(!f.on(&wheel(WHEEL_STEP)), "clamped to the list");
+        assert_eq!(f.bin().unwrap().top, 1);
+        let want = view::paint_bin_from(&f.state.timeline, 320, view::BIN_ROW_H, 1, Order::Rgba, None);
+        assert_eq!(f.paint_role(Role::Bin), want);
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.on(&click(2, view::bin_point(0))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap(), "row 1 (B) under the first row's pixels");
+        assert!(f.on(&wheel(-WHEEL_STEP)));
+        assert_eq!(f.bin().unwrap().top, 0);
+        assert!(!f.on(&wheel(-WHEEL_STEP)), "clamped at the top");
+    }
+
+    /// An unused reel with media is laid on the first video track at the playhead: ONE commit, one undo step, the clip
+    /// selected and the playhead at its end; undo restores.
+    #[test]
+    fn striabinscroll_unused_reel_lays_on_its_kind_track() {
+        let (mut f, c) = with_unused();
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.on(&click(2, view::bin_point(2))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(c, 0, 50, 15), Mode::Insert).unwrap());
+        assert_eq!(f.state.timeline.tracks[1], tl0.tracks[1], "the video track only");
+        assert_eq!((f.state.selected(), f.state.playhead, f.state.undo_depth()), (Some(Clip::new(c, 0, 50, 15)), 65, 1));
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0);
+    }
+
+    /// No track of a kind the media holds: refused by the word's name, nothing changes; media on an audio-only timeline
+    /// goes to the audio track.
+    #[test]
+    fn striabinscroll_unused_reel_refusal_and_audio_track() {
+        let (mut f, c) = with_unused();
+        f.state.timeline.tracks.clear();
+        let tl0 = f.state.timeline.clone();
+        assert!(f.on(&click(2, view::bin_point(2))));
+        assert_eq!(f.last_error.take(), Some(format!("insert C 0 50: {}", EditError::NoTrack)));
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0));
+        let (mut g, c2) = with_unused();
+        assert_eq!(c, c2);
+        g.state.timeline.tracks.remove(0);
+        let tl1 = g.state.timeline.clone();
+        g.state.deselect();
+        g.state.seek(0);
+        assert!(g.on(&click(2, view::bin_point(2))));
+        assert!(g.last_error.is_none(), "{:?}", g.last_error);
+        assert_eq!(g.state.timeline, tl1.place(0, Clip::new(c, 0, 50, 0), Mode::Insert).unwrap(), "the audio track");
     }
 }
