@@ -198,13 +198,14 @@ pub struct Face {
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
+    slip_view: Option<SlipView>, // STRIASLIPVIEW (SR858): a slip drag's first / last frame pair, cached and throttled (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -328,8 +329,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.thumbs_pending() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.slip_due() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1597,9 +1598,9 @@ impl Face {
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
-        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
+        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state)); self.slip_refresh(role, shown.as_ref()); // STRIASLIPVIEW (SR858): a Slip drag's first / last frame pair (file tail)
         let st = shown.as_ref().unwrap_or(&self.state); self.peaks.thumbs.fill(&st.timeline, &self.sources, l); // STRIATHUMBNAILS (SR839): the visible video heads decoded before the paint, THUMBS_PER_PAINT / THUMB_BUDGET_MS at most (file tail)
-        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none() || scrubbing(&self.drag)) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIAAUDIOSCRUB (SR865): and a scrub step's, under its live Scrub drag
+        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none() || scrubbing(&self.drag)) && self.slip_view().is_none() { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIAAUDIOSCRUB (SR865): and a scrub step's, under its live Scrub drag
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1608,7 +1609,7 @@ impl Face {
                 }
             };
         }
-        let still = if role == Role::Tracks { None } else { self.still.as_ref() };
+        let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
         let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
@@ -3808,5 +3809,147 @@ mod audioscrub_tests {
         let ev = log.lock().unwrap().clone();
         assert!(!ev.contains(&Ev::Flush), "{ev:?}");
         assert_eq!(pushes(&log).len(), 1);
+    }
+}
+
+// ---- STRIASLIPVIEW (LEDGER SR858): the slip drag previews the clip's new first and last frame (named tail block) ----
+
+/// STRIASLIPVIEW (SR858): the least wall time between two renders of the slip pair; the window is the larger of this and
+/// the last pair's own render time, so the pair takes at most half the face thread however fast the pointer moves.
+pub const SLIP_VIEW_MS: u64 = 100;
+
+/// STRIASLIPVIEW (SR858): the cached pair of a live Slip drag: keyed by the shown clip `(track, idx, clip)`, when its
+/// render ended and how long it took, and `due` when a paint inside the throttle window kept a stale pair.
+struct SlipView {
+    key: (usize, usize, Clip),
+    still: Option<Still>,
+    ended: std::time::Instant,
+    took: Duration,
+    due: bool,
+}
+
+impl SlipView {
+    /// The throttle window has passed since the pair was rendered.
+    fn open(&self) -> bool {
+        std::time::Instant::now() >= self.ended + self.took.max(Duration::from_millis(SLIP_VIEW_MS))
+    }
+}
+
+impl Face {
+    /// STRIASLIPVIEW (SR858): before a paint of `role`: for a `DragKind::Slip` drag whose shown state (`Drag::shown`) is
+    /// valid on a video track, the slipped clip's first (`at`) and last (`end - 1`) frame through THE frame road
+    /// ([`preview`], twice, over the one-clip timeline [`slip_clip_timeline`]), side by side ([`slip_split`]). A paint with
+    /// the shown clip unchanged renders nothing; inside the throttle window the last pair stays and `due` is set (the
+    /// serve clock repaints at [`Face::slip_tick`]). Any other drag or none clears it; the tracks Surface leaves it.
+    fn slip_refresh(&mut self, role: Role, shown: Option<&EditorState>) {
+        if role == Role::Tracks {
+            return;
+        }
+        let cur = match (self.drag, shown) {
+            (Some(d), Some(s)) if d.kind == DragKind::Slip => s.timeline.tracks.get(d.track).filter(|t| t.kind == Kind::Video).and_then(|t| t.clips.get(d.idx)).map(|c| ((d.track, d.idx, *c), &s.timeline)),
+            _ => None,
+        };
+        let Some((key, tl)) = cur else {
+            self.slip_view = None;
+            return;
+        };
+        if let Some(v) = self.slip_view.as_mut() {
+            if v.key == key {
+                v.due = false;
+                return;
+            }
+            if !v.open() {
+                v.due = true;
+                return;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let Some((one, c)) = slip_clip_timeline(tl, key.0, key.1) else {
+            self.slip_view = None;
+            return;
+        };
+        let mut pair: [Option<Still>; 2] = [None, None];
+        for (i, t) in [c.at, c.end() - 1].into_iter().enumerate() {
+            pair[i] = match preview(&one, &self.sources, t) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.last_error = Some(format!("preview: {e}"));
+                    None
+                }
+            };
+        }
+        let still = slip_split(pair[0].as_ref(), pair[1].as_ref());
+        let ended = std::time::Instant::now();
+        self.slip_view = Some(SlipView { key, still, ended, took: ended - t0, due: false });
+    }
+    /// STRIASLIPVIEW (SR858): the pair the preview shows during a Slip drag (left the new first frame, right the new last).
+    pub fn slip_view(&self) -> Option<&Still> {
+        self.slip_view.as_ref().and_then(|v| v.still.as_ref())
+    }
+    /// STRIASLIPVIEW (SR858): a paint inside the throttle window kept a stale pair (the serve clock runs while true).
+    pub fn slip_due(&self) -> bool {
+        self.slip_view.as_ref().is_some_and(|v| v.due)
+    }
+    /// STRIASLIPVIEW (SR858): the serve clock's question: a stale pair whose window has passed (true: repaint).
+    pub fn slip_tick(&self) -> bool {
+        self.slip_view.as_ref().is_some_and(|v| v.due && v.open())
+    }
+}
+
+/// STRIASLIPVIEW (SR858): `tl` cut to the clip `idx` of track `track` alone (its transitions and the audio crossfades
+/// dropped): the clip's own pixels at its own ticks, whatever lies above or beside it.
+fn slip_clip_timeline(tl: &Timeline, track: usize, idx: usize) -> Option<(Timeline, Clip)> {
+    let mut one = tl.clone();
+    let mut tr = std::mem::take(&mut one.tracks).into_iter().nth(track)?;
+    let c = *tr.clips.get(idx)?;
+    tr.clips = vec![c];
+    tr.transitions.clear();
+    one.tracks = vec![tr];
+    one.audio_xfades.clear();
+    Some((one, c))
+}
+
+/// STRIASLIPVIEW (SR858): two frames side by side in one RGBA still, each cell the first present frame's size (FIELD
+/// filled): `a` letterboxed into the left cell and `b` into the right through `Canvas::blit_fit` (the one scaler). A
+/// missing side leaves its cell FIELD; both missing: `None`.
+pub fn slip_split(a: Option<&Still>, b: Option<&Still>) -> Option<Still> {
+    let first = a.or(b)?;
+    let (w, h) = (first.width, first.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut c = Canvas::new(w * 2, h, Order::Rgba);
+    c.rect(0, 0, (w * 2) as i64, h as i64, FIELD);
+    if let Some(a) = a {
+        c.blit_fit(a, 0, 0, w, h);
+    }
+    if let Some(b) = b {
+        c.blit_fit(b, w, 0, w, h);
+    }
+    Some(Still { width: w * 2, height: h, rgba: c.px })
+}
+
+#[cfg(test)]
+mod striaslipview_tests {
+    use super::*;
+
+    /// Rule: a repaint with the slip delta unchanged renders nothing (a planted pair survives it); a Move drag clears it.
+    #[test]
+    fn striaslipview_same_delta_keeps_the_cache() {
+        let (tl, src) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.state.select_at(0, 12).unwrap();
+        let (x, y) = face.layout().point(0, 15);
+        face.on(&SMessage::BrowserButton { down: true, x, y, mods: bandy::MOD_CONTROL, surface: 0 });
+        face.on(&SMessage::BrowserMouseMove(x + 40.0, y, 0));
+        face.paint();
+        assert!(face.slip_view().is_some());
+        let planted = Still { width: 2, height: 1, rgba: vec![7; 8] };
+        face.slip_view.as_mut().unwrap().still = Some(planted.clone());
+        face.paint();
+        assert_eq!(face.slip_view(), Some(&planted), "same shown clip: no second render");
+        face.on(&SMessage::BrowserKey("Escape".into()));
+        face.paint();
+        assert!(face.slip_view.is_none(), "no drag: cleared");
     }
 }
