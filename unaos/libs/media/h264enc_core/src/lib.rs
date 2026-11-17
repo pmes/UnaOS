@@ -187,6 +187,10 @@ pub struct Config {
     /// source-luma AC energy, re-centred to mean zero over the picture and clamped +-6 (then to [`Config::qp_floor`]..=51), under
     /// every rate mode (constant QP too); the rule is the file tail's H264ENCAQ block.
     pub aq: Option<u8>,
+    /// H264ENCAQVARIANCEMODE (LEDGER SR1072): x264's --aq-mode for [`Config::aq`]: 0 (the default) or 1 the log2 energy rule (every
+    /// pinned byte), 2 auto-variance (the 1/8 power of the energy scaled by its frame average), 3 and above auto-variance biased to
+    /// low-energy (dark) macroblocks; unread without `aq`. The rule is `aq_offsets`.
+    pub aq_mode: u8,
     /// H264ENCHRD (LEDGER SR699): signal the rate controller's bucket as the NAL HRD. false (the default) keeps every pinned byte;
     /// true under a CBR / VBR [`Config::rate`] writes the VUI timing_info + nal_hrd_parameters, a buffering_period SEI on every IDR,
     /// a pic_timing SEI on every picture and (CBR) filler NAL units where the bucket would underflow; unread under CRF / constant QP.
@@ -1183,7 +1187,7 @@ impl Encoder {
 // NEGATIVE offset (a finer QP: no banding), a textured one a positive offset. The MB's QP is its row's QP (`rc_row`'s, else SliceQPY)
 // plus its offset, clamped to [`Config::qp_floor`]..=51, set through `set_qp` before the MB is coded and written through the existing
 // mb_qp_delta / QPY,pred path (`write_mb`, `write_mb_cabac`, `note_mb`): no new syntax. Applied under constant QP too (x264 skips
-// AQ there; here it is an explicit opt-in and `nle export` defaults to constant QP). Owed: H264ENC-AQ-VARIANCE-MODE, H264ENC-AQ-CHROMA.
+// AQ there; here it is an explicit opt-in and `nle export` defaults to constant QP). aq-mode 2 / 3: H264ENCAQVARIANCEMODE SR1072. Owed: H264ENC-AQ-CHROMA.
 
 /// The C of x264's aq-mode 1 in Q4: round(14.427 x 16).
 const AQ_C_Q4: i64 = 231;
@@ -1204,8 +1208,8 @@ fn log2_q4(e: u32) -> i64 {
 
 /// The adaptive-quantisation offsets of a picture (H264ENCAQ SR693): one per macroblock in raster order over the luma plane `y`
 /// (`stride` samples per row, at least `mb_w` x 16 wide and `mb_h` x 16 high), strength `strength` in tenths (10 = x264's 1.0):
-/// x264's aq-mode 1 energy rule, re-centred to mean zero and clamped to +-[`AQ_STEP`].
-pub fn aq_offsets(y: &[u8], stride: usize, mb_w: usize, mb_h: usize, strength: u8) -> Vec<i8> {
+/// x264's aq-mode 1 energy rule, re-centred to mean zero and clamped to +-[`AQ_STEP`]; `mode` is [`Config::aq_mode`] (2 / 3: SR1072).
+pub fn aq_offsets(y: &[u8], stride: usize, mb_w: usize, mb_h: usize, strength: u8, mode: u8) -> Vec<i8> {
     let n = mb_w * mb_h;
     let mut raw = Vec::with_capacity(n);
     for mby in 0..mb_h {
@@ -1224,11 +1228,24 @@ pub fn aq_offsets(y: &[u8], stride: usize, mb_w: usize, mb_h: usize, strength: u
                 energy += ssq - ((sum * sum) >> 6);
             }
             // qp_adj x 256 = (k / 10) x (L - C) / 16 x 256.
-            raw.push(strength as i64 * (log2_q4(energy) - AQ_C_Q4) * 256 / 160);
+            raw.push(if mode < 2 { strength as i64 * (log2_q4(energy) - AQ_C_Q4) * 256 / 160 } else { root8_q8(energy) });
+        }
+    }
+    // H264ENCAQVARIANCEMODE (SR1072): raw holds P = (energy + 1)^(1/8) in Q8; mode 2: qp_adj x 256 = (k / 10) x avg x (P - avg) / 256
+    // (x264's avg_adj shift is a frame constant the re-centre removes); mode 3 adds (k / 10) x (1 - 14 / p^2) x 256 AFTER the re-centre.
+    let mut bias = Vec::new();
+    if mode >= 2 && n > 0 {
+        let avg = raw.iter().sum::<i64>() / n as i64;
+        for r in raw.iter_mut() {
+            let p = *r;
+            if mode >= 3 {
+                bias.push(strength as i64 * 256 * (p * p - 14 * 65536) / (10 * p * p));
+            }
+            *r = strength as i64 * avg * (p - avg) / 2560;
         }
     }
     let mean = if n == 0 { 0 } else { raw.iter().sum::<i64>().div_euclid(n as i64) };
-    raw.iter().map(|&r| ((r - mean + 128).div_euclid(256)).clamp(-AQ_STEP as i64, AQ_STEP as i64) as i8).collect()
+    raw.iter().enumerate().map(|(i, &r)| ((r - mean + bias.get(i).copied().unwrap_or(0) + 128).div_euclid(256)).clamp(-AQ_STEP as i64, AQ_STEP as i64) as i8).collect()
 }
 
 impl Encoder {
@@ -1238,7 +1255,7 @@ impl Encoder {
         let Some(k) = self.cfg.aq else { return };
         if mbx == 0 {
             if mby == 0 {
-                self.aq.off = aq_offsets(&self.src[0].data, self.src[0].w, self.mb_w, self.mb_h, k);
+                self.aq.off = aq_offsets(&self.src[0].data, self.src[0].w, self.mb_w, self.mb_h, k, self.cfg.aq_mode);
             }
             // The row's QP: `rc_row` set it (a rate-controlled row > 0), else SliceQPY (row 0, or rate None).
             if mby == 0 || self.rc.is_some() {
@@ -1463,4 +1480,27 @@ pub enum PicStruct {
     FrameDoubling = 7,
     /// 8: frame tripling (three frame periods), three clock timestamps.
     FrameTripling = 8,
+}
+
+// ---- H264ENCAQVARIANCEMODE (LEDGER SR1072): x264's aq-mode 2 / 3 1/8-power root (named tail block) ----
+// x264's `x264_adaptive_quant_frame` (encoder/ratecontrol.c; RECALLED, NOT READ): mode 2 p = powf(energy + 1, 0.125), strength =
+// aq_strength x mean(p), qp_adj = strength x (p - avg_adj); mode 3 adds aq_strength x (1 - 14 / p^2). Pinned as implemented in
+// `aq_offsets`: mode 2 re-centred to mean zero (SR693's), mode 3's bias added after the re-centre (the shift toward a lower QP on
+// low-energy content is the point). The root is an exact floor by bisection: no table, no exp2 (`rc::log2_q16` stays the ONE log2).
+
+/// floor((e + 1)^(1/8) x 256): the largest r with r^8 <= (e + 1) << 64, by bisection over 0..=4096 in u128 (absolute error < 1/256).
+pub fn root8_q8(e: u32) -> i64 {
+    let t = ((e as u128) + 1) << 64;
+    let (mut lo, mut hi) = (0u128, 4097u128);
+    while hi - lo > 1 {
+        let m = (lo + hi) / 2;
+        let m2 = m * m;
+        let m4 = m2 * m2;
+        if m4 * m4 <= t {
+            lo = m;
+        } else {
+            hi = m;
+        }
+    }
+    lo as i64
 }
