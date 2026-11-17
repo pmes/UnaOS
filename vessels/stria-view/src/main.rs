@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -929,5 +929,30 @@ mod striasnaptoggle_tests {
         assert_eq!(drive(&mut f, text), vec!["snap: on".to_string()]);
         assert!(f.snap_on());
         println!("striasnaptoggle witness: button {id} {label:?} -> snap: off, again -> snap: on");
+    }
+}
+
+// ---- STRIASNAPMORE (LEDGER SR952): the witness's drag snap default reading (named tail block) ----
+/// The witness's `"snap"` field, only while the drag snap default is off (`Face::snap_on`); the default line is unchanged.
+fn snap_json(face: &Face) -> String {
+    if face.snap_on() { String::new() } else { ",\"snap\":false".into() }
+}
+
+#[cfg(test)]
+mod striasnapmore_tests {
+    use super::*;
+
+    /// STRIASNAPMORE M3: the field is absent at the default; `key:n` turns the snap default off (the message line names
+    /// it) and the line carries `"snap":false`; the `snap` word turns it back on and the field is absent again.
+    #[test]
+    fn striasnapmore_snap_field_only_while_off() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(snap_json(&f), "");
+        assert_eq!(drive(&mut f, "key:n"), vec!["snap: off".to_string()]);
+        assert_eq!(snap_json(&f), ",\"snap\":false");
+        assert_eq!(drive(&mut f, "snap"), vec!["snap: on".to_string()]);
+        assert_eq!(snap_json(&f), "");
+        println!("striasnapmore witness: key:n -> \"snap\":false, snap -> absent");
     }
 }

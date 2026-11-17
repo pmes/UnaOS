@@ -387,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("n", "snap"), // STRIASNAPMORE (SR952): n flips the drag snap default through the snap word (text key)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2603,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("snap", "drag snap on / off (Alt: this drag only)"), // STRIASNAPMORE (SR952)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
