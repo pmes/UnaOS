@@ -8211,6 +8211,122 @@ mod tests {
         }
     }
 
+    // ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style / -thickness paint (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): one 20px serif row per probe (the face's thickness 2px), black
+    /// text, red decorations, rows 20px apart: `#ds` solid underline (the twin), `#dw` wavy, `#dd` double, `#do` dotted,
+    /// `#dk` `text-decoration-thickness: 4px`, `#dh` the shorthand `underline wavy red 2px`; `#ls` / `#lw` line-through
+    /// solid / wavy.
+    fn text_decoration_style_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px; text-decoration-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="ds" style="text-decoration-line:underline">Hgjx Hgjx</div>
+            <div id="dw" style="text-decoration-line:underline;text-decoration-style:wavy">Hgjx Hgjx</div>
+            <div id="dd" style="text-decoration-line:underline;text-decoration-style:double">Hgjx Hgjx</div>
+            <div id="do" style="text-decoration-line:underline;text-decoration-style:dotted">Hgjx Hgjx</div>
+            <div id="dk" style="text-decoration-line:underline;text-decoration-thickness:4px">Hgjx Hgjx</div>
+            <div id="dh" style="text-decoration:underline wavy red 2px">Hgjx Hgjx</div>
+            <div id="ls" style="text-decoration-line:line-through">Hgjx Hgjx</div>
+            <div id="lw" style="text-decoration-line:line-through;text-decoration-style:wavy">Hgjx Hgjx</div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 800));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the red pixels of element `id`'s rect extended 8px down, as
+    /// (the sorted distinct rows holding red, the sorted distinct columns holding red).
+    fn text_decoration_style_red(e: &mut crate::AetherEngine, id: &str) -> (Vec<usize>, Vec<usize>) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 8).min(sh));
+        let (mut rows, mut cols) = (Vec::new(), Vec::new());
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if css_wide_red(imgalt_px(e, x, y)) {
+                    rows.push(y);
+                    cols.push(x);
+                }
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        cols.sort_unstable();
+        cols.dedup();
+        (rows, cols)
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a wavy underline paints red above AND below the rows the solid
+    /// twin paints (the twin: one band of the face's thickness, 2 rows); the shorthand `underline wavy red 2px` the same.
+    #[test]
+    fn text_decoration_style_wavy_above_and_below() {
+        let mut e = text_decoration_style_engine();
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert_eq!(solid.len(), 2, "armed: the solid twin paints one 2-row band, got {solid:?}");
+        let solid_top = solid[0] as i64 - imgalt_rect(&mut e, "ds").1.floor() as i64;
+        let solid_bot = *solid.last().unwrap() as i64 - imgalt_rect(&mut e, "ds").1.floor() as i64;
+        for id in ["dw", "dh"] {
+            let (wavy, _) = text_decoration_style_red(&mut e, id);
+            assert!(!wavy.is_empty(), "#{id} paints red");
+            let top = imgalt_rect(&mut e, id).1.floor() as i64;
+            assert!((wavy[0] as i64 - top) < solid_top, "#{id} has red above the solid rows: {wavy:?} vs {solid:?}");
+            assert!((*wavy.last().unwrap() as i64 - top) > solid_bot, "#{id} has red below the solid rows: {wavy:?} vs {solid:?}");
+        }
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a double underline paints two bands with a red-free row between;
+    /// the solid twin's rows are contiguous.
+    #[test]
+    fn text_decoration_style_double_two_rows() {
+        let mut e = text_decoration_style_engine();
+        let gap = |r: &[usize]| r.windows(2).any(|w| w[1] > w[0] + 1);
+        let (double, _) = text_decoration_style_red(&mut e, "dd");
+        assert!(double.len() >= 4 && gap(&double), "#dd paints two separated bands: {double:?}");
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert!(!gap(&solid), "armed: the solid twin is one band: {solid:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a dotted underline leaves red-free columns between its dots; the
+    /// solid twin's columns are contiguous.
+    #[test]
+    fn text_decoration_style_dotted_gaps() {
+        let mut e = text_decoration_style_engine();
+        let gap = |c: &[usize]| c.windows(2).filter(|w| w[1] > w[0] + 1).count();
+        let (_, dotted) = text_decoration_style_red(&mut e, "do");
+        assert!(dotted.len() > 10 && gap(&dotted) > 5, "#do leaves gaps between dots: {} gaps", gap(&dotted));
+        let (_, solid) = text_decoration_style_red(&mut e, "ds");
+        assert!(solid.len() > 40 && gap(&solid) == 0, "armed: the solid twin has no gap column");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-thickness: 4px` paints a 4-row band (the solid
+    /// twin at the face's thickness: 2 rows).
+    #[test]
+    fn text_decoration_style_thickness_band() {
+        let mut e = text_decoration_style_engine();
+        let (thick, _) = text_decoration_style_red(&mut e, "dk");
+        assert_eq!(thick.len(), 4, "#dk paints 4 rows: {thick:?}");
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert_eq!(solid.len(), 2, "armed: the twin paints 2 rows: {solid:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a line-through takes the style the same way: wavy spans more rows
+    /// than the solid line-through, above and below it.
+    #[test]
+    fn text_decoration_style_line_through_wavy() {
+        let mut e = text_decoration_style_engine();
+        let (solid, _) = text_decoration_style_red(&mut e, "ls");
+        let (wavy, _) = text_decoration_style_red(&mut e, "lw");
+        assert_eq!(solid.len(), 2, "armed: the solid line-through is one 2-row band: {solid:?}");
+        let (ts, tw) = (imgalt_rect(&mut e, "ls").1.floor() as i64, imgalt_rect(&mut e, "lw").1.floor() as i64);
+        assert!(!wavy.is_empty(), "#lw paints red");
+        assert!((wavy[0] as i64 - tw) < (solid[0] as i64 - ts), "#lw reaches above: {wavy:?} vs {solid:?}");
+        assert!((*wavy.last().unwrap() as i64 - tw) > (*solid.last().unwrap() as i64 - ts), "#lw reaches below");
+    }
+
     // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending border colour paints only where a side exists (named tail block) ----
 
     /// AETHERCSSBORDERCOLORSTORED (SR1058): one 40x20 box per row, rows 12px apart, under a green parent: `#ca`

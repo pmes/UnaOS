@@ -95,6 +95,12 @@ pub struct PaintStyle<H: Host> {
     /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration-color` (css-text-decor-3 §2.3): `Some(Some(c))` a colour,
     /// `Some(None)` `currentcolor` (the initial value; the `text-decoration` shorthand resets to it), None unspecified.
     pub decoration_color: Option<Option<(u8, u8, u8)>>,
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-style` (css-text-decor-3 §2.2): 0 solid 1 double
+    /// 2 dotted 3 dashed 4 wavy ([`crate::css::deco_style_code`]); the shorthand resets it to solid; None unspecified.
+    pub decoration_style: Option<u8>,
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-thickness` (css-text-decor-4 §3.4) in the
+    /// decoration_color marker shape: `Some(Some(px))` a length, `Some(None)` auto / from-font (the face's), None unspecified.
+    pub decoration_thickness: Option<Option<f32>>,
     /// On TEXT nodes (set by the inline whitespace pass): a collapsible
     /// space survives before / after this run.
     pub ws_lead: Option<bool>,
@@ -301,7 +307,7 @@ impl<H: Host> Default for PaintStyle<H> {
             overflow_wrap: None,
             letter_spacing: None,
             line_through: None,
-            decoration_color: None,
+            decoration_color: None, decoration_style: None, decoration_thickness: None,
             ws_lead: None,
             ws_trail: None,
             display_kind: None,
