@@ -124,6 +124,8 @@ pub(crate) struct Rc {
     rmax: i64,
     bmax: i64,
     fmax: i64,
+    /// H264ENCHRDVBRUNDERFLOW (SR1050): VBR, the room bmax - fmax at the picture's start and the room term its rows reached.
+    room: (i64, i32),
     /// sum(bits) - R * pictures.
     err: i64,
     /// [I, P, B].
@@ -172,6 +174,7 @@ impl Rc {
             rmax: per(max),
             bmax: max as i64,
             fmax: 0,
+            room: (0, 0),
             err: 0,
             types: [Model::default(); 3],
             last_qp: start_qp,
@@ -224,7 +227,7 @@ impl Rc {
                     target = (target as i128 * s as i128 / avg as i128).clamp(target as i128 / 2, target as i128 * 4) as i64;
                 }
                 target -= self.err / 32;
-                target = target.min(self.bmax - self.fmax).max(self.r / 8);
+                target = target.min(self.bmax - self.fmax).max(self.r / 8); self.room = (self.bmax - self.fmax, 0); // H264ENCHRDVBRUNDERFLOW (SR1050): the room at the picture's start
             }
             // Constant quality never reaches the budget (rc_picture holds its QP, SR383).
             RcMode::Crf(_) => {}
@@ -258,7 +261,7 @@ impl Rc {
         let expect = self.target as i128 * cum as i128 / self.s.max(1) as i128;
         let dev = bits as i128 - expect;
         let off = (dev * 8 / self.target.max(1) as i128).clamp(-ROW_STEP as i128, ROW_STEP as i128) as i32;
-        let qp = (self.pic_qp + off).clamp(self.floor, QP_MAX);
+        let qp = (self.pic_qp + off + self.room_step(row, bits)).clamp(self.floor, QP_MAX); // H264ENCHRDVBRUNDERFLOW (SR1050): the VBR room term (0 otherwise)
         self.span = (self.span.0.min(qp), self.span.1.max(qp));
         qp
     }
@@ -1541,5 +1544,35 @@ mod firstp_prediction_tests {
         }
         println!("binding rows {binding}: within 2 QP of the oracle: c {} d {}", within[0], within[1]);
         assert_eq!((binding, within_t1, within), (14, [7, 2, 6, 7], [6, 7]), "binding rows; within 2 QP: T1 (a)..(d), T2 (c) (d)");
+    }
+}
+
+// ---- H264ENCHRDVBRUNDERFLOW (LEDGER SR1050): the VBR row-QP room term (named tail block) ----
+// A VBR picture whose bits pass the max bucket's room at its start (`room.0` = bmax - fmax, set in `picture`'s VBR arm) underflows
+// the CPB `hrd_au` signals (the bucket's mirror); `update` keeps the fill unclamped so the event stays visible. Before each row
+// (`row_qp`, rows > 0) the picture's bits are projected: the bits so far plus the rest at the rate so far by the rows' SAD share
+// (`row_qp`'s own share), each QP step of the term re-projecting the rest at the Qstep ratio (x264 `x264_ratecontrol_mb`'s VBV
+// loop); the term rises while the projection passes the room less 1/16 (the SPS / PPS / SEI, slice header and NAL bytes `bits`
+// does not count), never falls within the picture, at most [`VBV_ROW_STEP`]. CBR / two-pass / CRF: 0. Owed: H264ENC-HRD-VBR-REENCODE.
+
+/// The largest room term of a VBR picture's rows (SR1050).
+pub const VBV_ROW_STEP: i32 = 6;
+
+impl Rc {
+    /// The VBR room term of row `row` (> 0) after `bits` bits of slice data; 0 under any other mode.
+    fn room_step(&mut self, row: usize, bits: u64) -> i32 {
+        if !matches!(self.rate.mode, RcMode::Vbr { .. }) {
+            return 0;
+        }
+        let cum: u64 = self.rows[..row].iter().sum();
+        let rest = bits as i128 * self.s.saturating_sub(cum) as i128 / cum.max(1) as i128;
+        let limit = (self.room.0 - self.room.0 / 16) as i128;
+        let at = step16((self.pic_qp + self.room.1).min(QP_MAX)) as i128;
+        let mut v = self.room.1;
+        while v < VBV_ROW_STEP && bits as i128 + rest * at / step16((self.pic_qp + v).min(QP_MAX)) as i128 > limit {
+            v += 1;
+        }
+        self.room.1 = v;
+        v
     }
 }
