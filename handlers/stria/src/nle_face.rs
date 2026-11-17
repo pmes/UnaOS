@@ -529,7 +529,7 @@ impl Face {
                 Ok(())
             }
             "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" | "mark in" | "mark out" | "mark clear" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch; NLE5DRANGEKEYS (SR735): the export marks
-            "cancel" => return self.drag.take().is_some() || self.cancel_export(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
+            "cancel" => return self.drag.take().is_some() || self.cancel_export() || self.cancel_loudness(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
         if let Err(e) = r {
@@ -2595,7 +2595,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("delete", "delete the clip and close the gap"),
     ("home", "go to the start"),
     ("end", "go to the end"),
-    ("cancel", "cancel the drag or the export"),
+    ("cancel", "cancel the drag, the export or the loudness measure"),
     ("undo", "undo"),
     ("save", "save"),
     ("nudge-", "move the selection one frame earlier"),
@@ -3182,7 +3182,7 @@ impl Face {
             let tc = self.state.timeline.fps().map_or_else(|| ph.to_string(), |f| timeline_core::edl::timecode(ph, f));
             frame_path(self.doc_path.as_deref(), &tc)
         } else {
-            self.last_error = Some("frame: no file (no document path)".into());
+            self.cancel_loudnessframeno file (no document path)();
             self.frame_saved = None;
             return Some(true);
         };
@@ -3982,12 +3982,12 @@ impl Face {
 struct LoudnessJob {
     handle: Option<std::thread::JoinHandle<Result<Option<f64>, RenderError>>>,
     /// The marked range measured (`None`: the whole timeline), named in the line.
-    range: Option<std::ops::Range<i64>>,
+    range: Option<std::ops::Range<i64>>, watch: crate::nle::LoudnessWatch, total: u64, shown: String, // STRIALOUDNESSCANCEL (SR903): the stop flag and ticks done, the range's ticks, the progress line last put up (file tail)
 }
 
 impl Face {
     /// The `loudness` word: measure the export's range ([`Face::export_range`], else the whole timeline) through
-    /// `crate::nle::loudness` on its own thread. A running one refuses `loudness: busy`; a range past the end is
+    /// `crate::nle::loudness` on its own thread. A second word cancels a running one (SR903); a range past the end is
     /// [`Face::range_check`]'s refusal. View-only: no undo step, the document untouched. `None` for any other word.
     fn loudness_verb(&mut self, v: &str) -> Option<bool> {
         if v != "loudness" {
@@ -4003,9 +4003,9 @@ impl Face {
             return Some(true);
         }
         let span = range.clone().unwrap_or(0..self.state.timeline.end());
-        let (tl, sources) = (self.state.timeline.clone(), Arc::clone(&self.sources));
-        match std::thread::Builder::new().name("nle-loudness".into()).spawn(move || crate::nle::loudness(&tl, span, &sources)) {
-            Ok(h) => self.loudness = Some(LoudnessJob { handle: Some(h), range }),
+        let (tl, sources) = (self.state.timeline.clone(), Arc::clone(&self.sources)); let (watch, total) = (crate::nle::LoudnessWatch::new(&span), (span.end - span.start).max(0) as u64); let w = watch.clone(); // STRIALOUDNESSCANCEL (SR903)
+        match std::thread::Builder::new().name("nle-loudness".into()).spawn(move || crate::nle::loudness_watched(&tl, span, &sources, Some(w))) {
+            Ok(h) => self.loudness = Some(LoudnessJob { handle: Some(h), range, watch, total, shown: String::new() }),
             Err(e) => self.last_error = Some(format!("loudness: {e}")),
         }
         Some(true)
@@ -4017,7 +4017,7 @@ impl Face {
     /// One clock tick for the measure: a finished one's line goes to the message line; true when that happened.
     pub fn loudness_tick(&mut self) -> bool {
         if !self.loudness.as_ref().is_some_and(|j| j.handle.as_ref().is_some_and(|h| h.is_finished())) {
-            return false;
+            return self.loudness_progress(); // STRIALOUDNESSCANCEL (SR903): the running count on the message line (file tail)
         }
         self.finish_loudness();
         true
@@ -4033,7 +4033,7 @@ impl Face {
     fn finish_loudness(&mut self) {
         let Some(mut j) = self.loudness.take() else { return };
         self.last_error = Some(match j.handle.take().map(|h| h.join()) {
-            Some(Ok(r)) => loudness_line(&r, &j.range),
+            Some(Ok(_)) if j.watch.cancel.load(Relaxed) => "loudness: cancelled".to_string(), Some(Ok(r)) => loudness_line(&r, &j.range), // STRIALOUDNESSCANCEL (SR903): the job's own flag names the cancel, as the export's
             _ => "loudness: the measure thread panicked".to_string(),
         });
     }
@@ -4893,4 +4893,34 @@ fn striaexportaacbitrate_refusal(args: &mut Vec<&str>) -> Option<String> {
     let e = format!("aac rate \"{k}\": aac:KBPS takes a whole number of kb/s above 0; the words are {}", export_usage());
     args.pop();
     Some(e)
+}
+
+// ---- STRIALOUDNESSCANCEL (LEDGER SR903): Esc / a second `loudness` cancels the measure; its progress on the message line (named tail block) ----
+
+impl Face {
+    /// Esc's (and a second `loudness` word's) arm: ask the running measure to stop ([`crate::nle::LoudnessWatch`]'s flag,
+    /// read by `RenderSink::stop` before the next step's decode); false when none runs. The line `loudness: cancelled`
+    /// comes when the thread is joined ([`Face::loudness_tick`] / [`Face::wait_loudness`]).
+    pub fn cancel_loudness(&mut self) -> bool {
+        let Some(j) = self.loudness.as_ref() else { return false };
+        j.watch.cancel.store(true, Relaxed);
+        true
+    }
+    /// The running measure's count on the message line ([`loudness_progress_line`]); true (a repaint) only when the
+    /// line moved since the last one put up.
+    fn loudness_progress(&mut self) -> bool {
+        let Some(j) = self.loudness.as_mut() else { return false };
+        let line = loudness_progress_line(j.watch.done.load(Relaxed), j.total);
+        if line == j.shown {
+            return false;
+        }
+        j.shown = line.clone();
+        self.last_error = Some(line);
+        true
+    }
+}
+
+/// STRIALOUDNESSCANCEL (SR903): `loudness: measuring <ticks done>/<total>` (done clamped to the total).
+pub fn loudness_progress_line(done: u64, total: u64) -> String {
+    format!("loudness: measuring {}/{total}", done.min(total))
 }
