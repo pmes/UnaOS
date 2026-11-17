@@ -13202,3 +13202,41 @@ fn striafreezethree_face_title_style_and_lines() {
     assert_eq!(face.last_error.take().as_deref(), Some("title-style size=20: no such source"));
     println!("striafreezethree: title One\\nTwo -> two lines; title-style one step, TITLESTYLE kept; a media clip refused");
 }
+
+// ---- STRIATRACKSTHREE (LEDGER SR9038): the `headers` word, the header column and bare `track-`'s target (named tail block) ----
+
+/// `headers` shows the column through THE layout (view-only: no undo step, the timeline unchanged); a click on A2's header
+/// names it on the note and bare `track-` then removes that empty track; any other click drops the target (bare `track-`
+/// with nothing selected is refused as before); a second `headers` takes the column away. `headers` sits before `help`.
+#[test]
+fn striatracksthree_headers_toggle_target_track_minus() {
+    use timeline_core::view::HEADER_W;
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |w: &str| bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: w.into() };
+    let click = |x: f64, y: f64| bandy::SMessage::BrowserClick(x, y, 0);
+    assert_eq!((VERBS.len(), VERBS[VERBS.len() - 2], VERBS.last()), (30, "headers", Some(&"help")));
+    assert_eq!(face.layout().left, 0, "off by default");
+    let undo0 = face.state.undo_depth();
+    assert!(face.on(&input("headers")));
+    assert_eq!((face.layout().left, face.state.undo_depth(), face.state.timeline.clone()), (HEADER_W, undo0, tl0.clone()));
+    assert!(face.on(&input("track+ audio")));
+    let l = face.layout();
+    assert!(face.on(&click(5.0, l.row_y(2) as f64 + 1.0)));
+    assert_eq!(face.note.as_deref(), Some("headers: track- targets A2"));
+    face.state.deselect();
+    assert!(face.on(&input("track-")));
+    assert_eq!((face.last_error.clone(), face.note.as_deref()), (None, Some("track-: removed A2 (0 clips)")));
+    assert_eq!(face.state.timeline, tl0);
+    let l = face.layout();
+    assert!(face.on(&click(5.0, l.row_y(1) as f64 + 1.0)));
+    assert_eq!(face.note.as_deref(), Some("headers: track- targets A"));
+    face.on(&click(100.0, l.ruler_y as f64 + 1.0));
+    face.state.deselect();
+    assert!(face.on(&input("track-")));
+    assert!(face.last_error.take().is_some(), "the target went with the other click: nothing selected, refused");
+    assert_eq!(face.state.timeline, tl0);
+    assert!(face.on(&input("headers")));
+    assert_eq!(face.layout().left, 0);
+    println!("striatracksthree: headers on (left {HEADER_W}), A2's header -> bare track- removed A2; a ruler click drops the target");
+}
