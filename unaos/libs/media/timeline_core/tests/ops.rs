@@ -485,9 +485,9 @@ fn striaaudiocrossfade_paint_shows_the_bracket() {
     let mut st = striaaudiocrossfade_state();
     st.select(1, 1).unwrap();
     let l = Layout::of(320, 160, &st);
-    let before = paint_in(&st, l, Order::Rgba, None, None);
+    let before = paint_in(&st, l, Order::Rgba, None, None, None);
     assert_eq!(st.verb("xfade 8"), Some(Ok(())));
-    let after = paint_in(&st, l, Order::Rgba, None, None);
+    let after = paint_in(&st, l, Order::Rgba, None, None, None);
     let (x0, x1, y1) = (l.x_of(20), l.x_of(28), l.row_y(1) + 40 - 2);
     let y0 = y1 - 10;
     let mut moved = 0;
@@ -502,7 +502,7 @@ fn striaaudiocrossfade_paint_shows_the_bracket() {
     let at = |x: i64, y: i64| { let i = ((y * 320 + x) * 4) as usize; [after[i], after[i + 1], after[i + 2], after[i + 3]] };
     assert_eq!(at(x0, y0), TRANS);
     assert!(st.undo());
-    assert_eq!(paint_in(&st, l, Order::Rgba, None, None), before);
+    assert_eq!(paint_in(&st, l, Order::Rgba, None, None, None), before);
     println!("striaaudiocrossfade: bracket {x0}..{x1} x {y0}..{y1}, {moved} px moved");
 }
 
@@ -994,7 +994,7 @@ fn striaopacity_opacity_word_is_one_undo_step() {
 }
 
 // ---- STRIACLIPLINK (LEDGER SR863): the clip link group through the selection set (named tail block) ----
-use timeline_core::editor::{Edge, EditorState};
+use timeline_core::editor::Edge;
 
 /// V1 + A1 from one source each: A[0,10)@0 and B[20,30)@10 on both tracks (the picture and its sound).
 fn striacliplink_base() -> Timeline {

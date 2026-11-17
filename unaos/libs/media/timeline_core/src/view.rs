@@ -1641,14 +1641,14 @@ mod striaclipgainface_tests {
     #[test]
     fn gain_line_mid_at_unity_higher_at_plus_12_and_none_on_a_plain_clip() {
         let (st, l) = one(a(0));
-        let plain = paint_in(&st, l, Order::Rgba, None, None);
+        let plain = paint_in(&st, l, Order::Rgba, None, None, None);
         let xm = l.x_of(10);
         assert!(ink_rows(&plain, xm).is_empty(), "a unity clip with no fade shows no line");
         let (st, l) = one(a(0).faded(2, 0));
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         assert_eq!(ink_rows(&px, xm), alloc::vec![35], "0 dB at mid-height");
         let (st, l) = one(a(0).gained(1200));
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let rows = ink_rows(&px, xm);
         assert_eq!(rows, alloc::vec![26]);
         assert!(rows[0] < 35, "+12 dB sits higher");
@@ -1658,7 +1658,7 @@ mod striaclipgainface_tests {
     fn fade_in_of_half_the_clip_ramps_through_mid_at_a_quarter() {
         // +24 dB puts the gain line on the top row, so the ink near mid in the quarter column is the ramp.
         let (st, l) = one(a(0).gained(2400).faded(10, 0));
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let (x0, x1) = (l.x_of(0), l.x_of(20));
         let q = x0 + (x1 - x0) / 4;
         let rows = ink_rows(&px, q);
@@ -1751,10 +1751,10 @@ mod striatrackmutesolo_tests {
     fn striatrackmutesolo_badge_and_dim_paint() {
         let st0 = twins();
         let l = Layout::of(320, 120, &st0);
-        let px0 = paint_in(&st0, l, Order::Rgba, None, None);
+        let px0 = paint_in(&st0, l, Order::Rgba, None, None, None);
         let mut st = st0.clone();
         st.timeline = st.timeline.set_track_flags(0, true, false).unwrap();
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let at = |p: &[u8], x: i64, y: i64| -> [u8; 4] {
             let i = (y as usize * 320 + x as usize) * 4;
             [p[i], p[i + 1], p[i + 2], p[i + 3]]
@@ -1770,12 +1770,12 @@ mod striatrackmutesolo_tests {
         assert_eq!(at(&px, x, y0), [((live[0] as u16 + bg[0] as u16) / 2) as u8, ((live[1] as u16 + bg[1] as u16) / 2) as u8, ((live[2] as u16 + bg[2] as u16) / 2) as u8, 255]);
         let mut solo = st0.clone();
         solo.timeline = solo.timeline.set_track_flags(1, false, true).unwrap();
-        let ps = paint_in(&solo, l, Order::Rgba, None, None);
+        let ps = paint_in(&solo, l, Order::Rgba, None, None, None);
         assert_ne!(at(&ps, x, y0), live, "A1 not soloed while A2 is: dimmed");
         assert_eq!(at(&ps, x, y1), live, "the soloed row stays");
         let mut off = st.clone();
         off.timeline = off.timeline.set_track_flags(0, false, false).unwrap();
-        assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "no flag: the unflagged paint, byte for byte");
+        assert_eq!(paint_in(&off, l, Order::Rgba, None, None, None), px0, "no flag: the unflagged paint, byte for byte");
     }
 }
 
@@ -2607,10 +2607,10 @@ mod striatrackgainstep_tests {
     fn striatrackgainstep_badge_paint() {
         let st0 = twins();
         let l = Layout::of(320, 120, &st0);
-        let px0 = paint_in(&st0, l, Order::Rgba, None, None);
+        let px0 = paint_in(&st0, l, Order::Rgba, None, None, None);
         let mut st = st0.clone();
         st.timeline = st.timeline.set_track_gain(1, -600).unwrap();
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let at = |p: &[u8], x: i64, y: i64| -> [u8; 4] {
             let i = (y as usize * 320 + x as usize) * 4;
             [p[i], p[i + 1], p[i + 2], p[i + 3]]
@@ -2621,12 +2621,12 @@ mod striatrackgainstep_tests {
         assert_eq!(at(&px, 2, l.row_y(1) + 2), TGAIN, "the box at the left edge");
         let mut muted = st.clone();
         muted.timeline = muted.timeline.set_track_flags(1, true, false).unwrap();
-        let pm = paint_in(&muted, l, Order::Rgba, None, None);
+        let pm = paint_in(&muted, l, Order::Rgba, None, None, None);
         assert_eq!(at(&pm, 2, l.row_y(1) + 2), MUTE, "the M badge first");
         assert_eq!(at(&pm, 2 + BADGE + 2, l.row_y(1) + 2), TGAIN, "the gain box right of it");
         let mut off = st.clone();
         off.timeline = off.timeline.set_track_gain(1, 0).unwrap();
-        assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "0 dB: the unity paint, byte for byte");
+        assert_eq!(paint_in(&off, l, Order::Rgba, None, None, None), px0, "0 dB: the unity paint, byte for byte");
     }
 }
 
@@ -2785,7 +2785,7 @@ mod striaperfcanvasfill_tests {
 
     fn labels(st: &EditorState, l: Layout) -> (Vec<alloc::string::String>, Vec<u8>) {
         let mut rec = Rec(Vec::new());
-        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None, None);
         (rec.0, px)
     }
 

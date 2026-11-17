@@ -4838,7 +4838,7 @@ mod facegoldens_tests {
                 st.select_at(0, 8).unwrap();
                 st.seek(8);
                 let l = Layout::of_role(Role::Tracks, w, h, &st);
-                paint_in(&st, l, PixelOrder::Rgba, None, None)
+                paint_in(&st, l, PixelOrder::Rgba, None, None, None)
             }
             _ => panic!("striafacegoldens: no scene {name}"),
         }

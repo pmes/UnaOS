@@ -614,7 +614,7 @@ mod split_tests {
         let TetraNode::VStack(top) = split_tree() else { panic!("not a VStack") };
         let TetraNode::VStack(one) = editor_tree() else { panic!("not a VStack") };
         assert_eq!(format!("{:?}", top[1]), format!("{:?}", one[1]), "the one transport row");
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: false };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, keys: None, bin: false };
         let (tl, src) = nle_face::synth_fixture();
         let tl0 = tl.clone();
         let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
@@ -1939,7 +1939,7 @@ mod striaprojectbin_tests {
     use timeline_core::{Clip, Mode, SourceId};
 
     fn bin_cli() -> Cli {
-        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true }
+        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, keys: None, bin: true }
     }
 
     /// `--split --bin` numbers the bin Surface 2 (preview 0, tracks 1); `--split` alone is today's tree; the routed face

@@ -2669,6 +2669,7 @@ impl EditorState {
 
 #[cfg(test)]
 mod striainsertmarks_tests {
+    use alloc::string::ToString;
     use super::*;
     use crate::{Kind, Mode, SourceId};
 

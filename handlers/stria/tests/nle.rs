@@ -3773,7 +3773,7 @@ fn striawaveform_scan_peaks_reads_the_audio_road() {
     let took = t0.elapsed();
     assert_eq!((p.per_sec, p.buckets.len()), (100, 200));
     let max = p.buckets.iter().copied().max().unwrap();
-    assert!(max > 0 && p.buckets.iter().any(|&b| b != max) && face.last_error.take() == Some(format!("insert A 00:00:00:40 45: {}", EditError::InsertForm)), "a non-flat table: {:?}", &p.buckets[..10]);
+    assert!(max > 0 && p.buckets.iter().any(|&b| b != max), "a non-flat table: {:?}", &p.buckets[..10]);
     let mut sink = Collect::default();
     render(&tl, 0..50, &src, &mut sink).unwrap();
     assert_eq!(sink.pcm.len(), 2 * SYNTH_RATE as usize);
@@ -4709,7 +4709,7 @@ fn striainsertoverwrite_face_refusal_and_timecode_form() {
     assert_eq!(face.last_error.take(), Some(format!("insert Z 0 5: {}", EditError::NoSource)));
     assert_eq!(face.state.timeline, tl);
     face.state.seek(10);
-    assert!(!face.verb("insert A 00:00:00:40 45"), "a frame field past the rate is not this word");
+    assert!(face.verb("insert A 00:00:00:40 45") && face.last_error.take() == Some(format!("insert A 00:00:00:40 45: {}", EditError::InsertForm)), "a frame field past the rate is refused by name"); // STRIAINSERTMARKS (SR905)
     assert!(face.verb("insert A 00:00:01:15 00:00:01:20"));
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     let want = tl.place(0, Clip::new(SourceId(0), 40, 45, 10), timeline_core::Mode::Insert).unwrap();
