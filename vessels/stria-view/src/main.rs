@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("link", "Link"), button("unlink", "Unlink"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,36 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIACLIPLINK (LEDGER SR863): the `link` / `unlink` buttons through `--do` (named tail block) ----
+#[cfg(test)]
+mod striacliplink_tests {
+    use super::*;
+
+    /// `--do link` with nothing selected names its refusal; after two clips are selected `link` joins them and a click on
+    /// one member selects both; `unlink` parts them; both words are buttons before `help`.
+    #[test]
+    fn striacliplink_do_link_button() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "link");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("no such clip"), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        f.state.select_add(1, 0).unwrap();
+        let errors = drive(&mut f, "link");
+        assert!(errors.is_empty(), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        assert_eq!(f.state.set, vec![(0, 0), (1, 0)]);
+        let errors = drive(&mut f, "unlink");
+        assert!(errors.is_empty(), "{errors:?}");
+        f.state.select(0, 0).unwrap();
+        assert_eq!(f.state.set, vec![(0, 0)]);
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
+        assert_eq!(&ids[ids.len() - 3..], ["link", "unlink", "help"]);
     }
 }

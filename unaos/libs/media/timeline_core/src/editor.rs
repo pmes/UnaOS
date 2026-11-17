@@ -73,7 +73,7 @@ impl EditorState {
         }
         self.selection = Some((track, idx));
         self.set.clear();
-        self.set.push((track, idx));
+        self.set.push((track, idx)); self.add_mates(); // STRIACLIPLINK (SR863): a linked clip brings its group into the set (file tail)
         Ok(())
     }
     /// Select the clip on `track` showing tick `t`.
@@ -98,7 +98,7 @@ impl EditorState {
     /// Cut the selected track's clip at the playhead (`Timeline::split`); the right half is selected.
     pub fn split_at_playhead(&mut self) -> Result<(), EditError> {
         let (track, _) = self.selection.ok_or(EditError::NoClip)?;
-        let tl = self.timeline.split(track, self.playhead)?;
+        let tl = self.timeline.split_linked(track, self.playhead)?; // STRIACLIPLINK (SR863): the linked split, `split` for group 0 (lib.rs tail)
         self.commit(tl);
         self.select_at(track, self.playhead).unwrap_or_else(|_| self.deselect());
         Ok(())
@@ -193,7 +193,7 @@ impl EditorState {
         }
         self.selection = Some((track, idx));
         if !self.set.contains(&(track, idx)) {
-            self.set.push((track, idx));
+            self.set.push((track, idx)); self.add_mates(); // STRIACLIPLINK (SR863): a linked clip brings its group into the set (file tail)
             self.set.sort_unstable();
         }
         Ok(())
@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIACLIPLINK (SR863): `link` / `unlink` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -658,5 +658,49 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIACLIPLINK (LEDGER SR863): link selection and the `link` / `unlink` words (named tail block) ----
+// Selecting a clip selects its whole link group (`Timeline::mates`), so the set ops already carry it: a move is ONE
+// `move_many`, `delete` / `lift` take every member, `split` cuts them all (`Timeline::split_linked`); trims, slip and
+// slide stay the primary clip's. `link` gives the set (two or more clips) ONE fresh group, `unlink` gives it 0; ONE commit
+// each through THE verb dispatch both faces call. Refused `EditError::NoClip`: nothing selected, `link` of one clip.
+impl EditorState {
+    /// The set grown by every pick's link mates (sorted, deduped).
+    fn add_mates(&mut self) {
+        let more: Vec<(usize, usize)> = self.set.iter().flat_map(|&(t, i)| self.timeline.mates(t, i)).collect();
+        self.set.extend(more);
+        self.set.sort_unstable();
+        self.set.dedup();
+    }
+    /// Link the selected clips into one fresh group (one commit).
+    pub fn link_selected(&mut self) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        if self.set.len() < 2 {
+            return Err(EditError::NoClip);
+        }
+        let tl = self.timeline.set_group(&self.set, self.timeline.next_group())?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// Unlink the selected clips (one commit; none linked commits nothing).
+    pub fn unlink_selected(&mut self) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = &self.timeline;
+        if !self.set.iter().any(|&(t, i)| tl.tracks.get(t).and_then(|tr| tr.clips.get(i)).is_some_and(|c| c.group != 0)) {
+            return Ok(());
+        }
+        let tl = self.timeline.set_group(&self.set, 0)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `link` / `unlink` words of [`EditorState::verb`]; `None` for any other word.
+    fn link_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        match v {
+            "link" => Some(self.link_selected()),
+            "unlink" => Some(self.unlink_selected()),
+            _ => None,
+        }
     }
 }

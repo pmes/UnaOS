@@ -99,6 +99,7 @@ pub struct Clip {
     pub fade_in: i64,
     /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
     pub fade_out: i64,
+    pub group: u32, // STRIACLIPLINK (SR863): the link group (0 = none): clips sharing a nonzero id select, move, delete and split together
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -107,7 +108,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, group: 0 }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -1525,6 +1526,68 @@ impl Timeline {
         }
         let mut tl = self.clone();
         tl.marks = m;
+        Ok(tl)
+    }
+}
+
+// ---- STRIACLIPLINK (LEDGER SR863): the clip link group, its mates and the linked split (named tail block) ----
+// `Clip::group` links clips (0 = unlinked): the editor's selection takes a clip's whole group (`EditorState::select`), so
+// the set ops (`move_many`, `ripple_delete_many`, `lift_many`) carry it. `split_linked` cuts every member spanning the
+// tick: the heads keep the id, the new tails share ONE fresh id (two linked pairs, not one group of four). Every other op
+// carries the id through unchanged (`split` / `place` keep it on both halves).
+impl Timeline {
+    /// STRIACLIPLINK: a group id no clip carries (the largest + 1).
+    pub fn next_group(&self) -> u32 {
+        self.tracks.iter().flat_map(|t| t.clips.iter()).map(|c| c.group).max().unwrap_or(0).saturating_add(1)
+    }
+    /// STRIACLIPLINK: every `(track, idx)` sharing clip `idx` of `track`'s nonzero group, itself included, in order (the
+    /// clip alone for group 0; none for a bad pick).
+    pub fn mates(&self, track: usize, idx: usize) -> Vec<(usize, usize)> {
+        let Some(c) = self.tracks.get(track).and_then(|t| t.clips.get(idx)) else { return Vec::new() };
+        if c.group == 0 {
+            return alloc::vec![(track, idx)];
+        }
+        let mut v = Vec::new();
+        for (t, tr) in self.tracks.iter().enumerate() {
+            for (i, o) in tr.clips.iter().enumerate() {
+                if o.group == c.group {
+                    v.push((t, i));
+                }
+            }
+        }
+        v
+    }
+    /// STRIACLIPLINK: every clip in `picks` given group `g` (0 unlinks); refused `NoClip` / `NoTrack` like the set ops.
+    pub fn set_group(&self, picks: &[(usize, usize)], g: u32) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for (t, i) in picks_desc(self, picks)? {
+            tl.tracks[t].clips[i].group = g;
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+    /// STRIACLIPLINK: [`Timeline::split`] at `t` on `track`; when the clip spanning `t` there is linked, every track
+    /// holding a member of its group strictly spanning `t` is split too, and the new tails share one fresh group.
+    pub fn split_linked(&self, track: usize, t: i64) -> Result<Timeline, EditError> {
+        let g = self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.iter().find(|c| c.at < t && t < c.end()).map_or(0, |c| c.group);
+        if g == 0 {
+            return self.split(track, t);
+        }
+        let mut tl = self.split(track, t)?;
+        let mut cut = alloc::vec![track];
+        for (k, tr) in self.tracks.iter().enumerate() {
+            if k != track && tr.clips.iter().any(|c| c.group == g && c.at < t && t < c.end()) {
+                tl = tl.split(k, t)?;
+                cut.push(k);
+            }
+        }
+        let fresh = tl.next_group();
+        for k in cut {
+            if let Some(c) = tl.tracks[k].clips.iter_mut().find(|c| c.at == t && c.group == g) {
+                c.group = fresh;
+            }
+        }
+        tl.validate()?;
         Ok(tl)
     }
 }
