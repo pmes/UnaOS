@@ -3109,9 +3109,9 @@ impl Face {
     fn track_remove_verb(&mut self, v: &str) -> Option<bool> {
         let target = self.state.track_minus_target(v)?;
         let tl = &self.state.timeline;
-        let named = target.ok().and_then(|t| Some((tl.track_word(t)?, tl.tracks.get(t)?.clips.len())));
+        let named = target.ok().and_then(|t| tl.track_removed_note(t)); // STRIAKTRACKADD (SR9007): the note's one text, timeline_core's (lib.rs tail)
         match (self.state.verb(v)?, named) {
-            (Ok(()), Some((word, n))) => self.note = Some(format!("track-: removed {word} ({n} clip{})", if n == 1 { "" } else { "s" })),
+            (Ok(()), Some(note)) => self.note = Some(note),
             (Ok(()), None) => {}
             (Err(e), _) => self.last_error = Some(format!("{v}: {e}")),
         }

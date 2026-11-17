@@ -1593,3 +1593,15 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAKTRACKADD (LEDGER SR9007): the note a `track-` removal leaves, one text for both faces (named tail block) ----
+// A removal takes the track's clips with it, so each face names what went: the host face's `note` (nle_face.rs
+// `track_remove_verb`) and the kernel Player's `[nle] edit track-` line (vplay.rs `edit_track_note`) both print this text,
+// read BEFORE the one commit (the track's channel word and clip count as they stood).
+impl Timeline {
+    /// `track-: removed <ch> (<n> clip|clips)` for track `track` (`None`: no such track).
+    pub fn track_removed_note(&self, track: usize) -> Option<String> {
+        let (word, n) = (self.track_word(track)?, self.tracks.get(track)?.clips.len());
+        Some(alloc::format!("track-: removed {word} ({n} clip{})", if n == 1 { "" } else { "s" }))
+    }
+}
