@@ -417,7 +417,7 @@ impl Face {
         self.drag.as_ref()
     }
     /// The button went down: a drag may begin (a live one is dropped uncommitted). `mods`: the press's modifier bits
-    /// (Shift adds to the set, Alt / Option turns snapping off).
+    /// (Shift adds to the set, Alt / Option turns snapping off; STRIARIPPLETRIM SR850: Shift on the selected clip's trim handle ripples the trim, so a shift-drag begun on that handle no longer moves the set).
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
