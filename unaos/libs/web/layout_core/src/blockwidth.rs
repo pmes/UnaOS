@@ -13,6 +13,7 @@
 //! with a `max-width` the placeholder stays (100% clamped by max-width,
 //! the auto margins split the rest — §10.3.3's over-constrained case);
 //! without one, CSS resolves both auto margins to 0 and the box fills.
+//! A definite width wider than the container is over-constrained: [`auto_overflow`] (SR1065) zeroes its auto margins.
 //!
 //! ABSSHRINK (LEDGER SR420): an absolutely positioned / fixed box with no author width gets the same
 //! placeholder-to-`auto` turn ([`abs_shrink`]), so taffy's own abspos auto size answers CSS 2.2 §10.3.7.
@@ -113,4 +114,63 @@ fn abs_shrink<H: Host>(tree: &mut LayoutTree<H>, k: NodeId, block: bool, saved: 
     }
     saved.push((k, kst));
     let _ = tree.taffy.set_style(k, n);
+}
+
+// ---- AETHERMARGINAUTOOVERFLOW (LEDGER SR1065): an over-constrained auto margin is 0, the box overflows to the end side (named tail block) ----
+
+/// AETHERMARGINAUTOOVERFLOW (SR1065): CSS 2.2 §10.3.3: "if 'width' is not 'auto' and 'border-left-width' +
+/// 'padding-left' + 'width' + 'padding-right' + 'border-right-width' (plus any of 'margin-left' or 'margin-right'
+/// that are not 'auto') is larger than the width of the containing block, then any 'auto' values for 'margin-left'
+/// or 'margin-right' are, for the following rules, treated as zero". Aether's blocks are taffy flex columns, and
+/// taffy 0.15's `resolve_cross_axis_auto_margins` hands an auto cross margin the NEGATIVE free space: a 600px
+/// `margin: 0 auto` box in a 400px column sat at x = -100 (`margin-left: auto` alone at -200). The containing
+/// block's width is a layout output, so this runs after the first taffy pass(es) (`passes`, then one more
+/// `run_pass` when it returns true): each in-flow block kid of a block container with an auto horizontal margin
+/// whose outer width (its non-auto margins resolved by taffy) exceeds the container's content width gets every auto
+/// horizontal margin as 0. ltr: the box sits at its margin-left; rtl: `place_narrow_blocks`' align-self END, which
+/// taffy ignores while a margin is auto, now places it at its margin-right from the right edge (it overflows to the
+/// left). The original style joins the same [`Saved`], so [`restore`] and the kept-tree undo put the auto margins
+/// back. A table keeps its own road (AETHER-MARGIN-AUTO-OVERFLOW-TABLE owed).
+pub(crate) fn auto_overflow<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Saved) -> bool {
+    use crate::DomNode;
+    let mut changed = false;
+    let mut stack = vec![tree.root_node];
+    while let Some(id) = stack.pop() {
+        let kids = tree.taffy.children(id).unwrap_or_default();
+        stack.extend(kids.iter().copied());
+        let Ok(st) = tree.taffy.style(id).cloned() else { continue };
+        if !crate::collapse::is_block_container_pub(tree, id, &st) {
+            continue;
+        }
+        let Ok(pl) = tree.taffy.layout(id).copied() else { continue };
+        let cb = pl.size.width - pl.padding.left - pl.padding.right - pl.border.left - pl.border.right;
+        for k in kids {
+            let Ok(kst) = tree.taffy.style(k).cloned() else { continue };
+            let auto_l = kst.margin.left == LengthPercentageAuto::auto();
+            let auto_r = kst.margin.right == LengthPercentageAuto::auto();
+            if !(auto_l || auto_r)
+                || kst.position == Position::Absolute
+                || !crate::collapse::in_flow_block_pub(tree, k, &kst)
+                || tree.node_map.get(&k).and_then(|n| n.tag()).is_some_and(|t| t == "table")
+            {
+                continue;
+            }
+            let Ok(kl) = tree.taffy.layout(k).copied() else { continue };
+            let fixed = (if auto_l { 0.0 } else { kl.margin.left }) + (if auto_r { 0.0 } else { kl.margin.right });
+            if cb - kl.size.width - fixed >= -0.01 {
+                continue;
+            }
+            let mut n = kst.clone();
+            if auto_l {
+                n.margin.left = LengthPercentageAuto::length(0.0);
+            }
+            if auto_r {
+                n.margin.right = LengthPercentageAuto::length(0.0);
+            }
+            saved.push((k, kst));
+            let _ = tree.taffy.set_style(k, n);
+            changed = true;
+        }
+    }
+    changed
 }

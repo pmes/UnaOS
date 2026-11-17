@@ -8676,6 +8676,130 @@ b</div>
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
+    // ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+
+    /// AETHERCSSPLACESHORTHANDS (SR1074): 200 x 200 flex containers, one 50 x 50 child each, the rules in a sheet:
+    /// `place-content: center` on a wrapping container centres the child on both axes (75, 75; before, the declaration
+    /// was dropped and the child sat at 0, 0, the control's place); on a nowrap (single-line) container align-content
+    /// has no effect (css-flexbox §9.4), so only the justify half moves it (75, 0); `bogus` is refused by both arms.
+    #[test]
+    fn place_content_center_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 200px }
+            .w { flex-wrap: wrap }
+            .k { width: 50px; height: 50px }
+            .pc { place-content: center }
+            .b { place-content: bogus }
+            </style></head><body style="margin:0">
+            <div id="n" class="f w"><div id="nk" class="k"></div></div>
+            <div id="c" class="f w pc"><div id="ck" class="k"></div></div>
+            <div id="s" class="f pc"><div id="sk" class="k"></div></div>
+            <div id="b" class="f w b"><div id="bk" class="k"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 1000));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
+            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
+            (a.0 - b.0, a.1 - b.1)
+        };
+        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
+        let n = at(&mut e, "nk", "n");
+        assert!(near(n, (0.0, 0.0)), "control: no place-content sits at the start: {n:?}");
+        let c = at(&mut e, "ck", "c");
+        assert!(near(c, (75.0, 75.0)), "armed: place-content: center on a wrapping row at (75, 75): {c:?}");
+        let s = at(&mut e, "sk", "s");
+        assert!(near(s, (75.0, 0.0)), "single-line: the justify half only: {s:?}");
+        let b = at(&mut e, "bk", "b");
+        assert!(near(b, (0.0, 0.0)), "bogus: nothing written: {b:?}");
+        let snap = crate::ledger::snapshot();
+        assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-content-value:bogus"), "the align half's refusal is recorded");
+    }
+
+    /// AETHERCSSPLACESHORTHANDS (SR1074): `place-items: center` on a 200px-tall flex row puts its 50 x 50 child at
+    /// y 75 (x stays 0: SR1088 applies the justify-items half, which flex layout ignores, css-align-3 §6.1; the
+    /// `place-justify-dropped:` record is retired); `place-self: center` on an item the same.
+    #[test]
+    fn place_items_center_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 200px }
+            .k { width: 50px; height: 50px }
+            .pi { place-items: center }
+            .ps { place-self: center }
+            </style></head><body style="margin:0">
+            <div id="n" class="f"><div id="nk" class="k"></div></div>
+            <div id="i" class="f pi"><div id="ik" class="k"></div></div>
+            <div id="p" class="f"><div id="pk" class="k ps"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 1000));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
+            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
+            (a.0 - b.0, a.1 - b.1)
+        };
+        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
+        let n = at(&mut e, "nk", "n");
+        assert!(near(n, (0.0, 0.0)), "control: the child sits at the top: {n:?}");
+        let i = at(&mut e, "ik", "i");
+        assert!(near(i, (0.0, 75.0)), "armed: place-items: center at y 75, x 0: {i:?}");
+        let p = at(&mut e, "pk", "p");
+        assert!(near(p, (0.0, 75.0)), "place-self: center at y 75: {p:?}");
+        let snap = crate::ledger::snapshot();
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "place-justify-dropped:center"), "SR1088: the justify half is applied, not recorded");
+    }
+
+    // ---- AETHERCSSJUSTIFYITEMSSELF (LEDGER SR1088): css-align-3 §6.2 / §6.3 justify-items / justify-self (named tail block) ----
+
+    /// AETHERCSSJUSTIFYITEMSSELF (SR1088): (a) `justify-items: center` / `justify-self: end` on a 200 x 200 flex row are
+    /// parsed (no `property:` unhandled record) and ignored by flex layout (css-align-3 §6.1): the 50 x 50 child stays
+    /// at x 0; a bogus value is refused and recorded. (b) an abspos 50 x 50 box with `left: 0; right: 0` in a 200px
+    /// relative box is aligned by `justify-self: center` in its inset-modified containing block: x 75 (control: 0).
+    #[test]
+    fn justify_items_self_engine() {
+        crate::ledger::reset();
+        let html = r#"<!doctype html><html><head><style>
+            .f { display: flex; width: 200px; height: 200px }
+            .k { width: 50px; height: 50px }
+            .ji { justify-items: center }
+            .js { justify-self: end }
+            .jb { justify-items: bogus }
+            .r { position: relative; width: 200px; height: 100px }
+            .a { position: absolute; left: 0; right: 0; top: 0; width: 50px; height: 50px }
+            .jc { justify-self: center }
+            </style></head><body style="margin:0">
+            <div id="i" class="f ji"><div id="ik" class="k"></div></div>
+            <div id="s" class="f"><div id="sk" class="k js"></div></div>
+            <div id="b" class="f jb"><div id="bk" class="k"></div></div>
+            <div id="r" class="r"><div id="rk" class="a jc"></div></div>
+            <div id="c" class="r"><div id="ck" class="a"></div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 1000));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
+            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
+            (a.0 - b.0, a.1 - b.1)
+        };
+        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
+        for (k, row) in [("ik", "i"), ("sk", "s"), ("bk", "b")] {
+            let v = at(&mut e, k, row);
+            assert!(near(v, (0.0, 0.0)), "{k}: flex ignores justify-items / justify-self: {v:?}");
+        }
+        let c = at(&mut e, "ck", "c");
+        assert!(near(c, (0.0, 0.0)), "control: the abspos box without justify-self sits at x 0: {c:?}");
+        let r = at(&mut e, "rk", "r");
+        assert!(near(r, (75.0, 0.0)), "armed: justify-self: center centres the abspos box at x 75: {r:?}");
+        let snap = crate::ledger::snapshot();
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "property:justify-items"), "justify-items has an arm");
+        assert!(!snap.contains(crate::ledger::ApiCategory::Css, "property:justify-self"), "justify-self has an arm");
+        assert!(snap.contains(crate::ledger::ApiCategory::Css, "justify-items-value:bogus"), "the bogus value is refused and recorded");
+    }
 
     // ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color paints the focused text control's caret (named tail block) ----
 
@@ -9614,80 +9738,21 @@ b</div>
         assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-overflow:safe"), "the safe modifier is recorded");
     }
 
-    // ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+    // ---- AETHERMARGINAUTOOVERFLOW (LEDGER SR1065): an over-constrained auto margin is 0, the box overflows to the end side (named tail block) ----
 
-    /// AETHERCSSPLACESHORTHANDS (SR1074): 200 x 200 flex containers, one 50 x 50 child each, the rules in a sheet:
-    /// `place-content: center` on a wrapping container centres the child on both axes (75, 75; before, the declaration
-    /// was dropped and the child sat at 0, 0, the control's place); on a nowrap (single-line) container align-content
-    /// has no effect (css-flexbox §9.4), so only the justify half moves it (75, 0); `bogus` is refused by both arms.
+    /// AETHERMARGINAUTOOVERFLOW (SR1065): CSS 2.2 §10.3.3 through the host engine: a 600px `margin: 0 auto` block in a
+    /// 400px parent sits at x 0 and is 600 wide (taffy gave it x -100 before); in an rtl parent its right edge stays at
+    /// 400 (x -200: it overflows to the left); a 200px twin still centres at x 100.
     #[test]
-    fn place_content_center_engine() {
-        crate::ledger::reset();
-        let html = r#"<!doctype html><html><head><style>
-            .f { display: flex; width: 200px; height: 200px }
-            .w { flex-wrap: wrap }
-            .k { width: 50px; height: 50px }
-            .pc { place-content: center }
-            .b { place-content: bogus }
-            </style></head><body style="margin:0">
-            <div id="n" class="f w"><div id="nk" class="k"></div></div>
-            <div id="c" class="f w pc"><div id="ck" class="k"></div></div>
-            <div id="s" class="f pc"><div id="sk" class="k"></div></div>
-            <div id="b" class="f w b"><div id="bk" class="k"></div></div>
-        </body></html>"#;
-        let mut e = crate::AetherEngine::new();
-        e.handle_event(crate::api::events::Event::Resize(400, 1000));
-        e.load_html("https://example.com/", html, true);
-        e.render_frame();
-        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
-            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
-            (a.0 - b.0, a.1 - b.1)
-        };
-        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
-        let n = at(&mut e, "nk", "n");
-        assert!(near(n, (0.0, 0.0)), "control: no place-content sits at the start: {n:?}");
-        let c = at(&mut e, "ck", "c");
-        assert!(near(c, (75.0, 75.0)), "armed: place-content: center on a wrapping row at (75, 75): {c:?}");
-        let s = at(&mut e, "sk", "s");
-        assert!(near(s, (75.0, 0.0)), "single-line: the justify half only: {s:?}");
-        let b = at(&mut e, "bk", "b");
-        assert!(near(b, (0.0, 0.0)), "bogus: nothing written: {b:?}");
-        let snap = crate::ledger::snapshot();
-        assert!(snap.contains(crate::ledger::ApiCategory::Css, "align-content-value:bogus"), "the align half's refusal is recorded");
-    }
-
-    /// AETHERCSSPLACESHORTHANDS (SR1074): `place-items: center` on a 200px-tall flex row puts its 50 x 50 child at
-    /// y 75 (x stays 0: justify-items has no arm, its half is recorded); `place-self: center` on an item the same.
-    #[test]
-    fn place_items_center_engine() {
-        crate::ledger::reset();
-        let html = r#"<!doctype html><html><head><style>
-            .f { display: flex; width: 200px; height: 200px }
-            .k { width: 50px; height: 50px }
-            .pi { place-items: center }
-            .ps { place-self: center }
-            </style></head><body style="margin:0">
-            <div id="n" class="f"><div id="nk" class="k"></div></div>
-            <div id="i" class="f pi"><div id="ik" class="k"></div></div>
-            <div id="p" class="f"><div id="pk" class="k ps"></div></div>
-        </body></html>"#;
-        let mut e = crate::AetherEngine::new();
-        e.handle_event(crate::api::events::Event::Resize(400, 1000));
-        e.load_html("https://example.com/", html, true);
-        e.render_frame();
-        let at = |e: &mut crate::AetherEngine, k: &str, row: &str| {
-            let (a, b) = (imgalt_rect(e, k), imgalt_rect(e, row));
-            (a.0 - b.0, a.1 - b.1)
-        };
-        let near = |v: (f64, f64), want: (f64, f64)| (v.0 - want.0).abs() <= 0.5 && (v.1 - want.1).abs() <= 0.5;
-        let n = at(&mut e, "nk", "n");
-        assert!(near(n, (0.0, 0.0)), "control: the child sits at the top: {n:?}");
-        let i = at(&mut e, "ik", "i");
-        assert!(near(i, (0.0, 75.0)), "armed: place-items: center at y 75, x 0: {i:?}");
-        let p = at(&mut e, "pk", "p");
-        assert!(near(p, (0.0, 75.0)), "place-self: center at y 75: {p:?}");
-        let snap = crate::ledger::snapshot();
-        assert!(snap.contains(crate::ledger::ApiCategory::Css, "place-justify-dropped:center"), "the justify half is recorded");
+    fn test_margin_auto_overflow_kat() {
+        let t = laid_out(
+            r#"<html><body><div style="width:400px"><div id=a style="width:600px;margin:0 auto">a</div><div id=b style="width:200px;margin:0 auto">b</div></div><div style="width:400px;direction:rtl"><div id=c style="width:600px;margin:0 auto">c</div></div></body></html>"#,
+            "body{margin:0}",
+        );
+        let (a, b, c) = (rect_by_id(&t, "a").unwrap(), rect_by_id(&t, "b").unwrap(), rect_by_id(&t, "c").unwrap());
+        assert_eq!((a.0, a.2), (0.0, 600.0), "ltr over-constrained: the auto margins are 0 {a:?}");
+        assert_eq!((b.0, b.2), (100.0, 200.0), "a box that fits still centres {b:?}");
+        assert_eq!((c.0, c.2), (-200.0, 600.0), "rtl over-constrained: the right edge at 400 {c:?}");
     }
 
     // ---- AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (LEDGER SR1121): the text-decoration-line column reads the element's own underline / line-through / both (named tail block) ----
