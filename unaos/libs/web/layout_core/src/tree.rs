@@ -1131,7 +1131,7 @@ pub fn default_weight(tag: &str, inherited: u16) -> u16 {
 }
 
 /// The inherited direction unless the element's `dir` attribute sets it (HTML §3.2.6.4 → the UA sheet's
-/// `[dir=rtl] { direction: rtl }`).
+/// `[dir=rtl] { direction: rtl }`); `dir=auto` takes [`dir_auto_rtl`] (AETHERDIRAUTOFIRSTSTRONG SR1165).
 pub fn default_rtl<N: DomNode>(node: &N, inherited: bool) -> bool {
     if !node.is_element() {
         return inherited;
@@ -1139,7 +1139,7 @@ pub fn default_rtl<N: DomNode>(node: &N, inherited: bool) -> bool {
     match node.attr("dir").map(|d| d.trim().to_ascii_lowercase()) {
         Some(d) if d == "rtl" => true,
         Some(d) if d == "ltr" => false,
-        _ => inherited,
+        Some(d) if d == "auto" => dir_auto_rtl(node, inherited), _ => inherited,
     }
 }
 
@@ -4080,14 +4080,15 @@ pub fn plaintext_rtl<N: DomNode>(node: &N, ub: u8, rtl: bool) -> bool {
     if ub != 5 {
         return rtl;
     }
-    first_strong_rtl(node).unwrap_or(rtl)
+    first_strong_rtl(node, &|tag: &str, c: &N| matches!(tag, "script" | "style") || matches!(unicode_bidi_tag(tag, None, c), 2 | 4 | 5)).unwrap_or(rtl)
 }
 
 /// AETHERBIDIPLAINTEXT (SR1160): UAX #9 P2 over the DOM: the first character of Bidi_Class L (Some(false)) or R / AL
-/// (Some(true)) among `node`'s text descendants in tree order, stopping there; None when there is none. Descendants the
-/// UA tag road makes isolates (bdi, output, bdo, any `dir=`: [`unicode_bidi_tag`] 2 / 4 / 5 with no author value) are
-/// skipped as P2 skips isolate content, and so are script / style. Bidi_Class is font_core's UCD table.
-pub fn first_strong_rtl<N: DomNode>(node: &N) -> Option<bool> {
+/// (Some(true)) among `node`'s text descendants in tree order, stopping there; None when there is none. A descendant
+/// element for which `skip(tag, el)` holds is skipped whole: [`plaintext_rtl`] passes P2's isolates (bdi, output, bdo, any
+/// `dir=`: [`unicode_bidi_tag`] 2 / 4 / 5 with no author value, and script / style), [`dir_auto_rtl`] HTML's auto list
+/// (SR1165). Bidi_Class is font_core's UCD table.
+pub fn first_strong_rtl<N: DomNode>(node: &N, skip: &dyn Fn(&str, &N) -> bool) -> Option<bool> {
     use font_core::bidi::BidiClass;
     for c in node.children() {
         if c.is_text() {
@@ -4100,13 +4101,25 @@ pub fn first_strong_rtl<N: DomNode>(node: &N) -> Option<bool> {
             }
         } else if c.is_element() {
             let tag = c.tag().unwrap_or_default().to_ascii_lowercase();
-            if matches!(tag.as_str(), "script" | "style") || matches!(unicode_bidi_tag(&tag, None, &c), 2 | 4 | 5) {
+            if skip(tag.as_str(), &c) {
                 continue;
             }
-            if let Some(r) = first_strong_rtl(&c) {
+            if let Some(r) = first_strong_rtl(&c, skip) {
                 return Some(r);
             }
         }
     }
     None
+}
+
+// ---- AETHERDIRAUTOFIRSTSTRONG (LEDGER SR1165): dir=auto takes its direction from the first strong character (named tail block) ----
+
+/// AETHERDIRAUTOFIRSTSTRONG (SR1165): HTML §3.2.6.4, the directionality of an element in the auto state: the first strong
+/// character (Bidi_Class L ltr, R / AL rtl) of its text in tree order, skipping bdi, script, style and textarea
+/// descendants and any descendant whose `dir` is in a defined state (ltr / rtl / auto); none found: `parent_rtl`, the
+/// parent's direction (ltr at the root). Read through [`default_rtl`]'s `auto` arm, so pass 1, the painter, the computed
+/// `direction` column and [`is_rtl`]'s probe pair agree; ONE walk with SR1160's [`first_strong_rtl`]. A textarea scans its
+/// default text (its children); the live input / textarea value is not reachable from the node (AETHER-DIR-AUTO-INPUT-VALUE).
+pub fn dir_auto_rtl<N: DomNode>(node: &N, parent_rtl: bool) -> bool {
+    first_strong_rtl(node, &|tag: &str, c: &N| matches!(tag, "bdi" | "script" | "style" | "textarea") || c.attr("dir").is_some_and(|d| matches!(d.trim().to_ascii_lowercase().as_str(), "ltr" | "rtl" | "auto"))).unwrap_or(parent_rtl)
 }

@@ -12194,4 +12194,128 @@ b</div>
             assert_eq!(got, want, "#{id}: computed direction");
         }
     }
+
+    // ---- AETHERDIRAUTOFIRSTSTRONG (LEDGER SR1165): dir=auto takes its direction from the first strong character (named tail block) ----
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): 20px serif rows 12px apart in a 400px viewport: `dir=auto` paragraphs beside their
+    /// `dir=rtl` and ltr references (same text), one inside an rtl parent, neutral-only text, the HTML skip list (a nested
+    /// `dir=ltr` span, bdi, script), empty / invalid `dir` values, a paragraph the test mutates, 300px blocks holding a
+    /// 100px child block, and `<pre dir=auto>` beside `<pre dir=rtl>` / `<pre>`.
+    fn dir_auto_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>p, pre { margin: 0 0 12px }</style></head><body style="margin:0;font:20px serif">
+            <p id="a1" dir="auto">שלום world</p>
+            <p id="r1" dir="rtl">שלום world</p>
+            <p id="l1">שלום world</p>
+            <div dir="rtl"><p id="a2" dir="auto">hello שלום</p></div>
+            <p id="r2" dir="rtl">hello שלום</p>
+            <p id="l2">hello שלום</p>
+            <div dir="rtl"><p id="n1" dir="auto">123 !!</p></div>
+            <p id="n2" dir="auto">123 !!</p>
+            <p id="s1" dir="auto"><span dir="ltr">שלום</span> abc</p>
+            <p id="s2" dir="auto"><span dir="ltr">abc</span> שלום</p>
+            <p id="b1" dir="auto"><bdi>abc</bdi>שלום</p>
+            <p id="sc" dir="auto"><script>var abc = 1;</script>שלום</p>
+            <div dir="rtl"><p id="iv" dir="">abc</p><p id="ib" dir="bogus">abc</p></div>
+            <p id="m" dir="auto">שלום</p>
+            <p id="ml">abc</p>
+            <p id="mr" dir="rtl">abc</p>
+            <div id="k" dir="auto" style="width:300px">שלום<div id="kc" style="width:100px">x</div></div>
+            <div dir="rtl" style="width:300px">שלום<div id="kr" style="width:100px">x</div></div>
+            <div style="width:300px">שלום<div id="kl" style="width:100px">x</div></div>
+            <pre id="pa" dir="auto">שלום world</pre>
+            <pre id="pr" dir="rtl">שלום world</pre>
+            <pre id="pl">שלום world</pre>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 1000));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): `<p dir=auto>שלום world</p>` on an ltr page takes rtl from its first strong
+    /// character (R): it paints as the `dir=rtl` reference, its ink reaches the right half, and getComputedStyle(direction)
+    /// reads rtl (armed x3: before SR1165 dir=auto fell through to the inherited ltr).
+    #[test]
+    fn dir_auto_hebrew_first_rtl() {
+        let mut e = dir_auto_engine();
+        let (a, r, l) = (unicode_bidi_mask(&mut e, "a1"), unicode_bidi_mask(&mut e, "r1"), unicode_bidi_mask(&mut e, "l1"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr references differ");
+        assert!(unicode_bidi_diff(&a, &r) * 4 < far, "dir=auto Hebrew-first paints as dir=rtl: {} px off rtl, {} off ltr", unicode_bidi_diff(&a, &r), unicode_bidi_diff(&a, &l));
+        let w = a.first().map_or(0, |r| r.len());
+        assert!(bidi_plaintext_right_ink(&a) * 2 > w, "its ink reaches the right half ({} of {w})", bidi_plaintext_right_ink(&a));
+        assert_eq!(font_shorthand_cs(&mut e, "a1", "direction"), "rtl");
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): inside a `dir=rtl` parent, `<p dir=auto>hello שלום</p>` takes ltr from its first
+    /// strong character (L): it paints as the ltr reference and its computed direction reads ltr (armed: it inherited rtl).
+    #[test]
+    fn dir_auto_rtl_parent_latin_first() {
+        let mut e = dir_auto_engine();
+        let (a, r, l) = (unicode_bidi_mask(&mut e, "a2"), unicode_bidi_mask(&mut e, "r2"), unicode_bidi_mask(&mut e, "l2"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr references differ");
+        assert!(unicode_bidi_diff(&a, &l) * 4 < far, "dir=auto Latin-first in an rtl parent paints ltr: {} px off ltr, {} off rtl", unicode_bidi_diff(&a, &l), unicode_bidi_diff(&a, &r));
+        assert_eq!(font_shorthand_cs(&mut e, "a2", "direction"), "ltr");
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): with no strong character (`123 !!`) dir=auto takes the parent's direction: rtl
+    /// under a `dir=rtl` parent, ltr at the top level. An empty or invalid `dir` is no auto: it stays inherited (rtl) with
+    /// no scan, though its text (`abc`) is Latin.
+    #[test]
+    fn dir_auto_neutrals_take_parent() {
+        let mut e = dir_auto_engine();
+        for (id, want) in [("n1", "rtl"), ("n2", "ltr"), ("iv", "rtl"), ("ib", "rtl")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "direction"), want, "#{id}");
+        }
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): HTML's skip list: a descendant with its own `dir` (the Hebrew inside
+    /// `<span dir=ltr>` does not count, nor the Latin), a `<bdi>` and a `<script>`'s text are skipped by the scan.
+    #[test]
+    fn dir_auto_skips_dir_bdi_script() {
+        let mut e = dir_auto_engine();
+        for (id, want) in [("s1", "ltr"), ("s2", "rtl"), ("b1", "rtl"), ("sc", "rtl")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "direction"), want, "#{id}");
+        }
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): a text mutation re-runs the scan at the relayout: `<p dir=auto>שלום</p>` reads rtl,
+    /// and after `textContent = "abc"` it reads ltr and paints as the ltr `abc` reference (armed).
+    #[test]
+    fn dir_auto_text_mutation_flips() {
+        let mut e = dir_auto_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "m", "direction"), "rtl");
+        font_synth_eval(&mut e, "document.getElementById('m').textContent = 'abc'; 'ok'");
+        e.tick(); // the script's mutation relayouts at the shell's tick (`js::take_mutated`)
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "m", "direction"), "ltr");
+        let (m, r, l) = (unicode_bidi_mask(&mut e, "m"), unicode_bidi_mask(&mut e, "mr"), unicode_bidi_mask(&mut e, "ml"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr references differ");
+        assert!(unicode_bidi_diff(&m, &l) * 4 < far, "the mutated paragraph paints ltr: {} px off ltr, {} off rtl", unicode_bidi_diff(&m, &l), unicode_bidi_diff(&m, &r));
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): the box-level road (`is_rtl`, place_narrow_blocks): a 100px child block of a 300px
+    /// Hebrew-first dir=auto block sits at the dir=rtl reference's x (the inline-start right edge), not at the ltr x 0 (armed).
+    #[test]
+    fn dir_auto_box_side_is_rtl() {
+        let mut e = dir_auto_engine();
+        let (kc, kr, kl) = (imgalt_rect(&mut e, "kc"), imgalt_rect(&mut e, "kr"), imgalt_rect(&mut e, "kl"));
+        assert!(kr.0 - kl.0 > 150.0, "the rtl reference child sits right of the ltr one: {kr:?} vs {kl:?}");
+        assert!((kc.0 - kr.0).abs() <= 1.0, "the dir=auto block's child sits at the rtl x: {kc:?} vs {kr:?}");
+    }
+
+    /// AETHERDIRAUTOFIRSTSTRONG (SR1165): `<pre dir=auto>` Hebrew-first: both roads now say rtl: SR1160's plaintext paragraph
+    /// and the computed direction (pin: it paints as `<pre dir=rtl>`).
+    #[test]
+    fn dir_auto_pre_both_roads_rtl() {
+        let mut e = dir_auto_engine();
+        let (a, r, l) = (unicode_bidi_mask(&mut e, "pa"), unicode_bidi_mask(&mut e, "pr"), unicode_bidi_mask(&mut e, "pl"));
+        let far = unicode_bidi_diff(&l, &r);
+        assert!(far > 0, "the rtl and ltr pre references differ");
+        assert!(unicode_bidi_diff(&a, &r) * 4 < far, "pre dir=auto Hebrew-first paints as pre dir=rtl");
+        assert_eq!(font_shorthand_cs(&mut e, "pa", "direction"), "rtl");
+    }
 }
