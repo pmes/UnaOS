@@ -21,7 +21,7 @@ struct Inherited {
     /// The box whose `text-shadow` is in effect (inherited; `PaintStyle::text_shadows` holds the layers).
     text_shadow: Option<NodeId>,
     line_height: f32, // multiplier of font size
-    underline: bool,
+    underline: bool, deco_color: Option<(u8, u8, u8)>,
     nowrap: bool,
     white_space: u8,
     word_break: u8,
@@ -484,7 +484,7 @@ fn root_inherited() -> Inherited {
         rtl: false,
         text_shadow: None,
         line_height: 0.0, // natural
-        underline: false,
+        underline: false, deco_color: None,
         nowrap: false,
         white_space: 0,
         word_break: 0,
@@ -710,7 +710,7 @@ fn draw_decorations(
     if !(deco.underline || deco.line_through) || x1 <= x0 {
         return;
     }
-    let m = crate::fonts::decoration_metrics(face, size);
+    let m = crate::fonts::decoration_metrics(face, size); let color = deco.color.unwrap_or(color);
     let mut hline = |top: f32, thick: f32| {
         let yi = top.round() as i32;
         for dy in 0..thick.round().max(1.0) as i32 {
@@ -986,7 +986,7 @@ fn draw_text(
     damage_rects: &[(u32, u32, u32, u32)],
     clip: Clip,
 ) {
-    let deco = Deco { underline, line_through: false };
+    let deco = Deco { underline, line_through: false, color: None };
     draw_lines(
         text, origin_x, origin_y, max_width, adv, line_height_mult, color,
         &crate::fonts::lines::TextMode::default(), deco, &[], surface, width, height, damage_rects, clip,
@@ -1034,7 +1034,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if tag == "a" || tag == "u" {
         inherited.underline = true;
     }
-    if let Some(u) = spec.underline {
+    deco_ink(inherited, tag, spec); if let Some(u) = spec.underline {
         inherited.underline = u;
     }
     if let Some(nw) = spec.nowrap {
@@ -1168,7 +1168,7 @@ fn cell_valign_offset(layout: &LayoutTree, id: NodeId, content_h: f32) -> f32 {
 #[derive(Clone, Copy, Default)]
 struct Deco {
     underline: bool,
-    line_through: bool,
+    line_through: bool, color: Option<(u8, u8, u8)>,
 }
 
 /// Draws a run on the lines fonts::lines breaks it into — the same breaker
@@ -3459,7 +3459,7 @@ fn frame_walk(
                             inherited.line_height,
                             inherited.color,
                             &mode,
-                            Deco { underline: inherited.underline, line_through: inherited.line_through },
+                            Deco { underline: inherited.underline, line_through: inherited.line_through, color: inherited.deco_color },
                             inherited.shadows(layout),
                             surface,
                             width,
@@ -3828,7 +3828,7 @@ fn frame_walk(
                             }
                             continue;
                         }
-                        let deco = Deco { underline: i.underline, line_through: i.line_through };
+                        let deco = Deco { underline: i.underline, line_through: i.line_through, color: i.deco_color };
                         // AETHERRENDER3 (SR126): the caret of an editable vertical field — `layout_core::hit::caret_rect` maps the
                         // caret offset of this text box to the physical bar (a horizontal bar across the column), painted on the
                         // page once the staging buffer is composited.
@@ -4634,4 +4634,20 @@ pub(crate) fn list_style_of(tag: &str, inherited: u8, spec: &crate::layout::Pain
 /// still take the parent.
 pub(crate) fn control_tag(tag: &str) -> bool {
     matches!(tag, "button" | "input" | "select" | "textarea")
+}
+
+// ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): the decoration colour rides the Inherited underline road (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the decoration colour beside the inherited underline / line-through flags. An
+/// element that decorates on its own (the a / u tag, or a specified `text-decoration` line) paints its decoration in its
+/// own currentcolor, so the inherited colour resets to None (the run's text ink); then its `text-decoration-color` writes
+/// (`Some(None)` = currentcolor = None). A descendant that sets neither keeps its ancestor's colour, so the ancestor's
+/// decoration paints through the descendant's text in the ancestor's `text-decoration-color`.
+fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
+    if tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some() {
+        inherited.deco_color = None;
+    }
+    if let Some(c) = spec.decoration_color {
+        inherited.deco_color = c;
+    }
 }

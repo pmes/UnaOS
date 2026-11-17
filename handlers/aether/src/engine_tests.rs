@@ -7225,4 +7225,110 @@ mod tests {
         let mut e = css_wide_all_engine();
         assert_eq!(font_shorthand_cs(&mut e, "ag", "color"), "rgb(0, 128, 0)", "the later green wins");
     }
+
+    // ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color paints the decoration (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): one 20px serif row per probe, black text, rows 12px apart: `#tl`
+    /// `text-decoration: underline; text-decoration-color: red`; `#ts` `text-decoration: underline red`; `#tc` `color:
+    /// blue; text-decoration: underline red; text-decoration-color: currentcolor`; `#tp` a blue span under a parent with a
+    /// red underline; `#ti` `text-decoration: underline red; text-decoration-color: initial`; `#tg` `.d { text-decoration:
+    /// underline currentcolor } .d.g { color: rgb(0, 160, 0) }`; `#tn` a plain `text-decoration: underline` (control).
+    fn text_decoration_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .d { text-decoration: underline currentcolor }
+            .d.g { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="tl" style="text-decoration:underline;text-decoration-color:red">Hgjx Hgjx</div>
+            <div id="ts" style="text-decoration:underline red">Hgjx Hgjx</div>
+            <div id="tc" style="color:blue;text-decoration:underline red;text-decoration-color:currentcolor">Hgjx Hgjx</div>
+            <div style="text-decoration:underline;text-decoration-color:red"><span id="tp" style="color:blue">Hgjx Hgjx</span></div>
+            <div id="ti" style="text-decoration:underline red;text-decoration-color:initial">Hgjx Hgjx</div>
+            <div id="tg" class="d g">Hgjx Hgjx</div>
+            <div id="tn" style="text-decoration:underline">Hgjx Hgjx</div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the count of pixels passing `hue` in element `id`'s rect extended 4px down
+    /// (the underline sits at the line box's foot).
+    fn text_decoration_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 4).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn text_decoration_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 90 && c.1 < 90 && c.2 < 90
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration: underline; text-decoration-color: red` under black text
+    /// paints a red underline (a run of red pixels) and black glyphs; the plain underline control paints no red.
+    #[test]
+    fn text_decoration_color_longhand_paints_red() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tl", css_wide_red) > 40, "#tl paints a red underline");
+        assert!(text_decoration_ink(&mut e, "tl", text_decoration_black) > 40, "#tl's glyphs stay black");
+        assert_eq!(text_decoration_ink(&mut e, "tn", css_wide_red), 0, "the plain underline paints no red (armed)");
+        assert!(text_decoration_ink(&mut e, "tn", text_decoration_black) > 40, "the plain underline paints");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the shorthand's colour word `text-decoration: underline red` the same.
+    #[test]
+    fn text_decoration_color_shorthand_paints_red() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "ts", css_wide_red) > 40, "#ts paints a red underline");
+        assert!(text_decoration_ink(&mut e, "ts", text_decoration_black) > 40, "#ts's glyphs stay black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a later `text-decoration-color: currentcolor` paints the line in the text's
+    /// blue: no red.
+    #[test]
+    fn text_decoration_color_currentcolor() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tc", css_wide_blue) > 40, "#tc paints blue");
+        assert_eq!(text_decoration_ink(&mut e, "tc", css_wide_red), 0, "#tc paints no red");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a blue span under a parent whose underline is red paints the parent's red
+    /// underline through its own text, its glyphs blue (the colour rides the inherited underline road).
+    #[test]
+    fn text_decoration_color_child_span() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tp", css_wide_red) > 40, "#tp paints the parent's red underline");
+        assert!(text_decoration_ink(&mut e, "tp", css_wide_blue) > 40, "#tp's glyphs are blue");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration-color: initial` is currentcolor: the shorthand's red goes,
+    /// the line paints black.
+    #[test]
+    fn text_decoration_color_initial() {
+        let mut e = text_decoration_color_engine();
+        assert_eq!(text_decoration_ink(&mut e, "ti", css_wide_red), 0, "#ti paints no red");
+        assert!(text_decoration_ink(&mut e, "ti", text_decoration_black) > 40, "#ti paints black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `.d { text-decoration: underline currentcolor }` with a later `.d.g { color:
+    /// rgb(0, 160, 0) }` paints the line green with the text: no black, no red.
+    #[test]
+    fn text_decoration_color_later_color() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tg", css_wide_green) > 40, "#tg paints green");
+        assert_eq!(text_decoration_ink(&mut e, "tg", css_wide_red), 0, "#tg paints no red");
+        assert_eq!(text_decoration_ink(&mut e, "tg", text_decoration_black), 0, "#tg paints no black");
+    }
 }
