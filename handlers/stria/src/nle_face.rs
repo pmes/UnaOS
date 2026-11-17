@@ -502,7 +502,7 @@ impl Face {
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
-        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, (mods & bandy::MOD_ALT != 0) != self.snap_off);
+        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off));
         self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0).map(|d| d.rolled(&self.state, self.roll_tool)).map(|d| d.synced(self.ripple_all)); // STRIAROLLMORE (SR954): the roll tool turns a trim-handle drag into a roll of its cut // STRIARIPPLETHREE (SR9034): the ripple-all tool turns a ripple drag into the all-tracks ripple
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick); self.scrub_burst(ph); // STRIAAUDIOSCRUB (SR865): a ruler scrub step plays its frame through the play road (file tail)
@@ -2457,7 +2457,7 @@ impl Face {
     /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
     fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
         let l = self.layout();
-        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, (mods & bandy::MOD_ALT != 0) != self.snap_off).or_else(|| Drag::begin_xfade_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0))?; // STRIAXFADETHREE (SR9023): else an audio crossfade bracket's edge (timeline_core view.rs tail)
+        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off).or_else(|| Drag::begin_xfade_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0)))?; // STRIAXFADETHREE (SR9023): else an audio crossfade bracket's edge (timeline_core view.rs tail)
         self.drag = Some(d);
         Some(true)
     }

@@ -1895,6 +1895,7 @@ struct Edit {
     said: bool,
     view: Option<(i64, i64)>, // STRIAZOOMFITMORE (SR965): the fit's anchored view `(t0, the playhead it was anchored at)`, the kernel's `Face.view`
     fit: Option<(bool, (u32, u32), Option<(i64, i64)>)>, // STRIAZOOMFITTHREE (SR9040): the last fit (sel, scale, view), the kernel's `Face.zoom_fit` (file tail)
+    snap_off: bool, // STRIAKSNAP (LEDGER SR9063): the Player's drag snap default is off (`n` flips it; Option at the press inverts it) (file tail)
 }
 
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
@@ -1904,7 +1905,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 2021201920201920222022] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys)
+const EDIT_KEYS: [(u8, &str); 202120192020192022202219] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys)
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1937,6 +1938,7 @@ const EDIT_KEYS: [(u8, &str); 2021201920201920222022] = [ // STRIAXFADETHREE (SR
     (b'v', "gain-"), (b'V', "gain+"), (b':', "track-gain-"), (b'"', "track-gain+"), // STRIAKTRACKGAIN (LEDGER SR9016): the host KEYS' bytes and words for clip / track gain, on the top audio clip at the playhead (file tail)
     (b'c', "xfade"), (b'C', "xfade-curve"), // STRIAXFADETHREE (SR9023): the host KEYS' c / C, `EditorState::verb` words (SR860 / SR925)
     (b'w', "insert"), (b'd', "overwrite"), (b'W', "insert-marked"), (b'D', "overwrite-marked"), // STRIAKINSERT (SR9062): the host KEYS' four insert words (file tail)
+    (b'n', "snap"), // STRIAKSNAP (LEDGER SR9063): the host's `n` = `snap`, the Player's snap default flipped (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1950,7 +1952,7 @@ fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> ti
         return timeline_core::editor::EditorState::new(e.st.timeline.clone());
     }
     let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
-    *g = Some(Edit { path: String::from(path), st, said: false, view: None, fit: None });
+    *g = Some(Edit { path: String::from(path), st, said: false, view: None, fit: None, snap_off: false });
     fresh
 }
 
@@ -1981,7 +1983,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead; if timeline_core::editor::jump_word(verb).is_some() { return edit_jump(st, verb, at); } // STRIAKMARKERJUMP (LEDGER SR9064): a jump key neither reselects nor saves (file tail)
-        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { edit_fit_mark(&mut e.fit, r.is_some(), verb, st.scale(), e.view); return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { edit_fit_mark(&mut e.fit, r.is_some(), verb, st.scale(), e.view); return r; } if verb == "snap" { return edit_snap(&mut e.snap_off, at); } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = flag_targetedit_target(&st.timeline, verb, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail); STRIAKTRACKGAIN (LEDGER SR9016): the gain words take the top audio clip (file tail)
             match top {
                 Some((t, i)) => {
@@ -2336,7 +2338,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, crate::video::keymap::shift_held(), false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail)
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, crate::video::keymap::shift_held(), timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off), false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
@@ -3570,3 +3572,20 @@ fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -
 // `[nle] edit insert at=<tick> clips=<n> undo=<n> saved=<bytes>`, `[nle] edit overwrite-marked at=<tick> refused (no in /
 // out marks set)`. Host check: timeline_core editor.rs `striakinsert_tests`; the Player side is unexercised (owed
 // NLE-INSERT-KERNEL-WITNESS).
+
+// ---- STRIAKSNAP (LEDGER SR9063): the Player's snap default and the press's Option (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SNAP-TOGGLE-KERNEL / NLE-KERNEL-DRAG-MODS (the Alt half). The host face holds a drag snap default
+// (STRIASNAPTOGGLE SR892, the word `snap` on `n`); the Player now holds its own in its editor state (`Edit::snap_off`,
+// reset by a fresh EDL, kept across the job's restarts), flipped by `n` in [`EDIT_KEYS`] (the host's byte for the same
+// word), intercepted in [`edit_key`] before any verb: view-only, no undo step, no save, no seek. [`edit_press`] passes
+// timeline_core's ONE rule `view::press_nosnap(Option held, snap_off)` (keymap's `option_held`, the Option role), so Option
+// at the press inverts the default as on the host. Control (slip / slide) is owed: keymap.rs has no Control reader
+// (NLE-KERNEL-DRAG-CONTROL). Wire: `[nle] edit snap at=<tick> snap=<on|off>`; a drag pressed with snap off commits
+// `snapped=none`.
+
+/// `n`: flip the Player's snap default (`off`); nothing to save or seek, so `None`.
+fn edit_snap(off: &mut bool, at: i64) -> Option<u64> {
+    *off = !*off;
+    serial_println!("[nle] edit snap at={} snap={}", at, if *off { "off" } else { "on" });
+    None
+}
