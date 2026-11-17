@@ -79,11 +79,6 @@ fn idr(img: &Img, deblocking_disabled: bool) -> Vec<u8> {
     nal(19, &pcm_picture(e, img))
 }
 
-/// initType of a slice_type with cabac_init_flag 0: P 1, B 2.
-fn init_type(slice_type: u32) -> usize {
-    if slice_type == 1 { 1 } else { 2 }
-}
-
 fn decode_all(stream: &[u8]) -> Vec<Frame> {
     let mut d = Decoder::new();
     d.decode_annexb(stream).expect("decode");
@@ -102,50 +97,6 @@ fn assert_frame(f: &Frame, want: &Img, what: &str) {
             assert_eq!(got[i], want[i], "{what}: plane {c} sample ({}, {})", i % n, i / n);
         }
     }
-}
-
-/// The four CTBs as skip coding units with MaxNumMergeCand 1 (cu_skip_flag ctxInc 0, 1, 1, 2: the left / above
-/// neighbours were skipped).
-fn skip_picture(mut e: CabacEnc) -> Vec<u8> {
-    for (k, inc) in [0usize, 1, 1, 2].into_iter().enumerate() {
-        e.split_cu(0, false);
-        e.cu_skip(inc, true);
-        if k < 3 {
-            e.terminate(0);
-        }
-    }
-    e.finish().out
-}
-
-/// CTB 0 a 2Nx2N AMVP prediction unit (no neighbours, no TMVP: mvp 0, so mv = mvd), no residual; CTBs 1..3 skip
-/// coding units (MaxNumMergeCand 1) whose first merge candidate is CTB 0's motion (A1, B1, then CTB 2 by A1); the
-/// whole picture moves by `mvd`. cu_skip_flag ctxInc: 0 (CTB 0), 0 (CTB 1: CTB 0 not skipped), 0 (CTB 2), 2.
-fn amvp_then_merge(mut e: CabacEnc, mvd: [i32; 2]) -> Vec<u8> {
-    e.split_cu(0, false);
-    e.cu_skip(0, false);
-    e.pred_inter();
-    e.part_mode_2nx2n();
-    e.merge_flag(false);
-    e.mvd(mvd);
-    e.mvp_flag(0);
-    e.rqt_root_cbf(false);
-    for (inc, last) in [(0usize, false), (0, false), (2, true)] {
-        e.terminate(0);
-        e.split_cu(0, false);
-        e.cu_skip(inc, true);
-        if last {
-            break;
-        }
-    }
-    e.finish().out
-}
-
-fn p_slice(poc: u32, neg: Vec<(i32, bool)>) -> SliceCfg {
-    SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: poc, neg, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() }
-}
-
-fn picture(cfg: &SliceCfg, body: impl FnOnce(CabacEnc) -> Vec<u8>) -> Vec<u8> {
-    nal(cfg.nal_type, &body(CabacEnc::new(slice_header(cfg), init_type(cfg.slice_type), 26)))
 }
 
 /// The reference shifted by a full-sample luma vector (dx, dy) (chroma by (dx / 2, dy / 2)), edges clamped.
