@@ -8971,3 +8971,23 @@ fn striatrackgainkeys_help_rows_and_no_collision() {
     }
     println!("striatrackgainkeys: help rows={} keys={}", rows.len(), KEYS.len());
 }
+
+// ---- STRIALINKSLIDE (LEDGER SR927): the face's slide button carries the link mates (named tail block) ----
+#[test]
+fn strialinkslide_face_slide_word() {
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.clone();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 2).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    assert!(face.verb("link"));
+    face.state.deselect();
+    face.state.select(0, 2).unwrap();
+    assert!(face.verb("slide-"));
+    assert_eq!(face.last_error.take(), None);
+    let want = tl0.set_group(&[(0, 2), (1, 2)], 1).unwrap().slide(0, 2, -1).unwrap().slide(1, 2, -1).unwrap();
+    assert_eq!(face.state.timeline, want, "picture and sound slid together");
+    assert_eq!((face.state.timeline.tracks[0].clips[2].at, face.state.timeline.tracks[1].clips[2].at), (24, 24));
+    assert_eq!(face.state.undo_depth(), 2, "link, slide: one step each");
+    println!("strialinkslide: linked pair slid to {}", face.state.timeline.tracks[1].clips[2].at);
+}

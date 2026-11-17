@@ -524,7 +524,7 @@ impl EditorState {
     pub fn slide_selected(&mut self, delta: i64) -> Result<(), EditError> {
         let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.slide(track, idx, delta)?;
-        self.commit(tl);
+        let tl = tl.linked(track, idx, |t, k, i, _| t.slide(k, i, delta))?; self.commit(tl); // STRIALINKSLIDE (SR927): every link mate slides by the same timeline delta, all-or-nothing (lib.rs SR910 tail)
         Ok(())
     }
     /// The `slip` / `slide` words of [`EditorState::verb`].
@@ -1751,7 +1751,7 @@ impl EditorState {
 // ---- STRIACLIPLINK (LEDGER SR863): link selection and the `link` / `unlink` words (named tail block) ----
 // Selecting a clip selects its whole link group (`Timeline::mates`), so the set ops already carry it: a move is ONE
 // `move_many`, `delete` / `lift` take every member, `split` cuts them all (`Timeline::split_linked`); trims, slip and
-// slide: trims and slip carry every mate by the same source delta (STRIALINKTRIM SR910), slide stays the primary clip's. `link` gives the set (two or more clips) ONE fresh group, `unlink` gives it 0; ONE commit
+// slide: trims and slip carry every mate by the same source delta (STRIALINKTRIM SR910), slide carries every mate by the same timeline delta (STRIALINKSLIDE SR927). `link` gives the set (two or more clips) ONE fresh group, `unlink` gives it 0; ONE commit
 // each through THE verb dispatch both faces call. Refused `EditError::NoClip`: nothing selected, `link` of one clip.
 impl EditorState {
     /// The set grown by every pick's link mates (sorted, deduped).
