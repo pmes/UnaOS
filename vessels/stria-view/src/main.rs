@@ -266,7 +266,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &bin_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -2522,5 +2522,44 @@ mod striatransitionmore_tests {
         let before = face.state.clone();
         assert_eq!(drive(&mut face, "dur:00:00:00:25"), vec![format!("dur 00:00:00:25: {}", timeline_core::EditError::Transition)]);
         assert_eq!(face.state, before);
+    }
+}
+
+// ---- STRIAMETERSMORE (LEDGER SR962): the witness's "held" — the meters' standing peak holds (named tail block) ----
+/// The witness's `"held"` field: each standing peak hold (`Face::meter_held`) as `{"track":<index or "master">,
+/// "peak":<held dBFS>}`, in hold order, only while any hold stands; the default line is unchanged.
+fn held_json(face: &Face) -> String {
+    let held = face.meter_held();
+    if held.is_empty() {
+        return String::new();
+    }
+    let all: Vec<String> = held
+        .iter()
+        .map(|&(k, db)| format!("{{\"track\":{},\"peak\":{db:.2}}}", k.map(|t| t.to_string()).unwrap_or_else(|| "\"master\"".into())))
+        .collect();
+    format!(",\"held\":[{}]", all.join(","))
+}
+
+#[cfg(test)]
+mod striametersmore_tests {
+    use super::*;
+
+    /// STRIAMETERSMORE M3: no hold, no field; +24 dB on track 1 played two ticks holds track 1 and the master;
+    /// `meters-reset` (through `--do`) clears the field.
+    #[test]
+    fn held_field_only_while_held() {
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(held_json(&face), "");
+        let (mut tl, src) = nle_face::synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "play,tick:2");
+        assert!(errors.is_empty(), "{errors:?}");
+        let j = held_json(&face);
+        assert!(j.starts_with(",\"held\":[") && j.contains("{\"track\":1,\"peak\":") && j.contains("{\"track\":\"master\",\"peak\":"), "{j}");
+        let errors = drive(&mut face, "meters-reset");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(held_json(&face), "");
     }
 }

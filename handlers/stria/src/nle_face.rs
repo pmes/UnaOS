@@ -230,7 +230,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -437,6 +437,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("1", "bright-"), ("2", "bright+"), ("3", "contrast-"), ("4", "contrast+"), ("5", "sat-"), ("6", "sat+"), // STRIAGRADEMORE (SR957): the digits step the selected clip's grade (SR899's VERBS words, text keys)
     ("8", "opacity-"), ("9", "opacity+"), // STRIAOPACITYMORE (SR958): 8 / 9 (text keys) step the selection's opacity through the VERBS words
     ("Alt+Left", "pan-"), ("Alt+0", "pan"), ("Alt+Right", "pan+"), // STRIAPANMORE (SR959): Alt with Left / 0 / Right step / centre the selected clips' pan (SR897's face words; GTK names, AppKit owed)
+    ("Ctrl+Shift+M", "meters-reset"), ("Meta+Shift+M", "meters-reset"), // STRIAMETERSMORE (SR962): Ctrl / Cmd + Shift + M is the meters-reset word (GTK keeps the shifted keyval's Shift+)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
@@ -2678,6 +2679,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("bright-", "brightness down one step"), ("bright+", "brightness up one step"), ("contrast-", "contrast down one step"), ("contrast+", "contrast up one step"), ("sat-", "saturation down one step"), ("sat+", "saturation up one step"), // STRIAGRADEMORE (SR957): the grade keys' phrases
     ("opacity-", "selection 10 % more transparent"), ("opacity+", "selection 10 % more opaque"), // STRIAOPACITYMORE (SR958)
     ("pan-", "pan the clip one eighth left"), ("pan", "centre the clip's pan"), ("pan+", "pan the clip one eighth right"), // STRIAPANMORE (SR959): the Alt pan keys' phrases
+    ("meters-reset", "clear the meters' clip caps and peak holds"), // STRIAMETERSMORE (SR962)
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];
@@ -7523,5 +7525,120 @@ impl Face {
         let j = self.loudness.as_ref()?;
         let done = j.watch.done.load(Relaxed);
         Some(if j.total == 0 { 0.0 } else { (done.min(j.total) as f64 / j.total as f64).min(1.0) })
+    }
+}
+
+// ---- STRIAMETERSMORE (LEDGER SR962): the held peaks for the witness and the split preview's master latch click (named tail block) ----
+
+impl MeterHold {
+    /// The standing holds `(key, held dBFS)`, in hold order (the witness's `"held"`); empty with none.
+    pub fn held(&self) -> Vec<(Option<usize>, f64)> {
+        self.held.iter().map(|h| (h.0, h.1)).collect()
+    }
+}
+
+impl Face {
+    /// The meters' standing peak holds `(key, held dBFS)` (`None` the master), in hold order.
+    pub fn meter_held(&self) -> Vec<(Option<usize>, f64)> {
+        self.meter_hold.held()
+    }
+    /// A split face's preview Surface carries the master meter and its clip cap but takes no pointer message
+    /// ([`Face::takes`]); a press there on the latched master's bar ([`meter_rect`] on [`Face::layout_for`]`(Role::Preview)`)
+    /// is taken and begins nothing (`Some(false)`), a release or click there clears the master's latch
+    /// (`Some(unclipped)`). `None` for anything else: unsplit, another Surface, no master latch, or outside its bar.
+    fn preview_meter_input(&mut self, msg: &SMessage) -> Option<bool> {
+        let s = self.split?;
+        if msg.surface() != Some(s.preview) || !self.meter_hold.clipped().contains(&None) {
+            return None;
+        }
+        let (down, x, y) = match *msg {
+            SMessage::BrowserButton { down, x, y, .. } => (Some(down), x, y),
+            SMessage::BrowserClick(x, y, _) => (None, x, y),
+            _ => return None,
+        };
+        let (x0, y0, x1, y1) = meter_rect(self.layout_for(Role::Preview), None)?;
+        if !(x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64) {
+            return None;
+        }
+        match down {
+            Some(true) => Some(false),
+            _ => Some(self.meter_hold.unclip(None)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod striametersmore_tests {
+    use super::*;
+
+    fn clipping_face() -> Face {
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn latch(face: &mut Face) {
+        face.verb("play");
+        face.tick();
+        face.tick();
+        face.verb("play");
+        assert!(!face.playing);
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    }
+
+    /// M3: no hold, nothing held; two played ticks at +24 dB hold track 1 and the master (each at least its reading);
+    /// `2 * fps` idle ticks age every hold out.
+    #[test]
+    fn striametersmore_held_lists_holds_in_order() {
+        let mut face = clipping_face();
+        assert!(face.meter_held().is_empty());
+        latch(&mut face);
+        let held = face.meter_held();
+        let keys: Vec<Option<usize>> = held.iter().map(|h| h.0).collect();
+        assert!(keys.contains(&Some(1)) && keys.contains(&None), "{held:?}");
+        assert!(held.iter().all(|h| h.1 >= METER_VIEW_DB), "{held:?}");
+        for _ in 0..METER_HOLD_S * 25 {
+            face.tick();
+        }
+        assert!(face.meter_held().is_empty());
+    }
+
+    /// M3: Ctrl+Shift+M and Meta+Shift+M (BrowserKey) clear every latch and hold through `meters-reset`: no undo step,
+    /// the document not dirtied; the help names both chords on the meters-reset row.
+    #[test]
+    fn striametersmore_reset_key_clears() {
+        for k in ["Ctrl+Shift+M", "Meta+Shift+M"] {
+            let mut face = clipping_face();
+            latch(&mut face);
+            assert_eq!(face.meter_clipped(), &[Some(1), None]);
+            let (undo, dirty) = (face.state.undo_depth(), face.dirty());
+            assert!(face.on(&SMessage::BrowserKey(k.into())), "{k}");
+            assert!(face.meter_clipped().is_empty() && !face.meter_hold_pending(), "{k}");
+            assert_eq!((face.state.undo_depth(), face.dirty()), (undo, dirty));
+            assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        }
+        let rows = help_rows();
+        let row = rows.iter().find(|r| r.1 == help_phrase("meters-reset")).expect("a meters-reset help row");
+        assert!(row.0.split(" / ").any(|k| k == "Ctrl+Shift+M") && row.0.split(" / ").any(|k| k == "Meta+Shift+M"), "{:?}", row.0);
+    }
+
+    /// M3: split 0 / 1, the master latched: a press on the preview Surface's master bar is taken and begins nothing, its
+    /// release clears the master's latch only (track 1 stays), the timeline, playhead and selection unmoved; with no
+    /// master latch the same press is the preview Surface's untaken pointer message it always was.
+    #[test]
+    fn striametersmore_split_master_latch_clicks_off() {
+        let mut face = clipping_face().on_surfaces(0, 1);
+        latch(&mut face);
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        let (tl, ph, sel, undo) = (face.state.timeline.clone(), face.state.playhead, face.state.selection, face.state.undo_depth());
+        let (x, y) = (316.0, 10.0);
+        assert!(!face.on(&SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 }));
+        assert!(face.dragging().is_none());
+        assert!(face.on(&SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 0 }));
+        assert_eq!(face.meter_clipped(), &[Some(1)]);
+        assert!(!face.on(&SMessage::BrowserClick(x, y, 0)), "no master latch: the preview Surface takes no click");
+        assert_eq!((&face.state.timeline, face.state.playhead, face.state.selection, face.state.undo_depth()), (&tl, ph, sel, undo));
+        assert!(!face.on(&SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 }));
+        assert!(face.dragging().is_none());
     }
 }
