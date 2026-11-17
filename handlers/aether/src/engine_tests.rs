@@ -6624,7 +6624,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 21);
+        assert_eq!(crate::css::REPORT_COLS, 22); // SR1008 fold: unicode-bidi is the 22nd column (SR1036 appends three more)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7370,5 +7370,116 @@ mod tests {
         assert_eq!(css_wide_color_ink(&mut e, "gi", css_wide_blue), 0, "background-color: inherit beats the earlier blue");
         assert!(css_wide_color_ink(&mut e, "gi", css_wide_red) > 100, "and paints the parent's red");
         assert_eq!(font_shorthand_cs(&mut e, "gi", "backgroundColor"), "rgb(255, 0, 0)", "getComputedStyle reads red");
+    }
+
+    // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): unicode-bidi end to end: the override paints, the 22nd column reads (named tail block) ----
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): 20px serif rows 12px apart: a `bdo dir=rtl` (the UA's isolate-override), an author
+    /// `unicode-bidi: bidi-override; direction: rtl` span, the visual reference `cba`, the armed control `span dir=rtl`
+    /// (isolate, no override: paints abc), a bdo whose author `unicode-bidi: normal` beats the tag, and the cssom probes.
+    fn unicode_bidi_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:20px serif">
+            <div style="margin:0 0 12px"><bdo id="bdo" dir="rtl">abc</bdo></div>
+            <div style="margin:0 0 12px"><span id="ovr" style="unicode-bidi: bidi-override; direction: rtl">abc</span></div>
+            <div style="margin:0 0 12px"><span id="cba">cba</span></div>
+            <div style="margin:0 0 12px"><span id="ctl" dir="rtl">abc</span></div>
+            <div style="margin:0 0 12px"><bdo id="bdon" dir="rtl" style="unicode-bidi: normal">abc</bdo></div>
+            <div style="margin:0 0 12px"><span id="abc">abc</span></div>
+            <div id="plain" style="margin:0 0 12px"><bdi id="bdi">abc</bdi> <output id="out">1</output> <span id="sp">x</span>
+                <span id="spd" dir="ltr">x</span> <span id="up" style="unicode-bidi: BIDI-OVERRIDE">x</span>
+                <bdo id="bdo2" dir="ltr"><span id="kid">x</span></bdo> <span id="emb" style="unicode-bidi: embed">x</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): element `id`'s rect as a dark-pixel mask (rows x columns from its top-left).
+    fn unicode_bidi_mask(e: &mut crate::AetherEngine, id: &str) -> Vec<Vec<bool>> {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let e: &crate::AetherEngine = e;
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, y0) = (l.floor().max(0.0) as usize, t.floor().max(0.0) as usize);
+        let (x1, y1) = (((l + w).ceil() as usize).min(sw), ((t + h).ceil() as usize).min(sh));
+        (y0..y1).map(|y| (x0..x1).map(|x| { let (r, g, b) = imgalt_px(e, x, y); (r as u32 + g as u32 + b as u32) < 384 }).collect()).collect()
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): the count of pixels two masks disagree on over their common area (plus the area
+    /// only one covers).
+    fn unicode_bidi_diff(a: &[Vec<bool>], b: &[Vec<bool>]) -> usize {
+        let mut n = 0;
+        for y in 0..a.len().max(b.len()) {
+            let (ra, rb) = (a.get(y).map(|r| r.as_slice()).unwrap_or(&[]), b.get(y).map(|r| r.as_slice()).unwrap_or(&[]));
+            for x in 0..ra.len().max(rb.len()) {
+                if ra.get(x).copied().unwrap_or(false) != rb.get(x).copied().unwrap_or(false) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): `<bdo dir=rtl>abc</bdo>` paints c-b-a left to right (the UA's isolate-override: the
+    /// run between RLO and PDF, no reordering), the ink of a plain `cba`; the armed control `<span dir=rtl>abc</span>`
+    /// (rtl paragraph, L letters at level 2) still paints a-b-c, far from `cba`.
+    #[test]
+    fn unicode_bidi_bdo_paints_override() {
+        let mut e = unicode_bidi_engine();
+        let (bdo, cba, ctl, abc) = (unicode_bidi_mask(&mut e, "bdo"), unicode_bidi_mask(&mut e, "cba"), unicode_bidi_mask(&mut e, "ctl"), unicode_bidi_mask(&mut e, "abc"));
+        let ink: usize = cba.iter().flatten().filter(|&&p| p).count();
+        assert!(ink > 20, "the cba reference painted ({ink} dark px)");
+        let (d_bdo, d_ctl) = (unicode_bidi_diff(&bdo, &cba), unicode_bidi_diff(&ctl, &cba));
+        assert!(d_ctl > 0 && unicode_bidi_diff(&ctl, &abc) * 4 < d_ctl, "armed: dir=rtl alone paints abc (vs abc {}, vs cba {d_ctl})", unicode_bidi_diff(&ctl, &abc));
+        assert!(d_bdo * 4 < d_ctl, "bdo dir=rtl paints cba: {d_bdo} px off cba, the control {d_ctl}");
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): an author `unicode-bidi: bidi-override; direction: rtl` span paints like the bdo; a
+    /// bdo whose author `unicode-bidi: normal` beats the tag default loses the override (paints abc).
+    #[test]
+    fn unicode_bidi_css_override_and_author_normal() {
+        let mut e = unicode_bidi_engine();
+        let (ovr, cba, bdon, abc) = (unicode_bidi_mask(&mut e, "ovr"), unicode_bidi_mask(&mut e, "cba"), unicode_bidi_mask(&mut e, "bdon"), unicode_bidi_mask(&mut e, "abc"));
+        let d_far = unicode_bidi_diff(&abc, &cba);
+        assert!(d_far > 0, "abc and cba differ");
+        assert!(unicode_bidi_diff(&ovr, &cba) * 4 < d_far, "bidi-override + rtl paints cba");
+        assert!(unicode_bidi_diff(&bdon, &abc) * 4 < d_far, "unicode-bidi: normal on a bdo paints abc");
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): `unicode-bidi` is NOT inherited and isolate is by construction (every run is its own
+    /// paragraph; AETHER-BIDI-ISOLATE owed): `<bdi>` paints its text as a plain span would, pinned as today.
+    #[test]
+    fn unicode_bidi_bdi_pinned_as_today() {
+        let mut e = unicode_bidi_engine();
+        assert!(unicode_bidi_mask(&mut e, "bdi").iter().flatten().any(|&p| p), "the bdi's text paints");
+    }
+
+    fn cssom_unicode_bidi_cs(e: &mut crate::AetherEngine, id: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).unicodeBidi")).unwrap()
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): getComputedStyle(el).unicodeBidi reads the 22nd report column: the UA's
+    /// isolate-override on bdo, isolate on bdi / output / any dir= element, the author keyword (case-folded), normal on a
+    /// plain span and div, and normal on a bdo's child (not inherited).
+    #[test]
+    fn cssom_unicode_bidi_reads() {
+        let mut e = unicode_bidi_engine();
+        for (id, want) in [
+            ("bdo", "isolate-override"), ("bdo2", "isolate-override"), ("bdi", "isolate"), ("out", "isolate"), ("ctl", "isolate"),
+            ("spd", "isolate"), ("ovr", "bidi-override"), ("up", "bidi-override"), ("bdon", "normal"), ("emb", "embed"),
+            ("sp", "normal"), ("cba", "normal"), ("plain", "normal"), ("kid", "normal"),
+        ] {
+            assert_eq!(cssom_unicode_bidi_cs(&mut e, id), want, "#{id}: computed unicode-bidi");
+        }
+    }
+
+    /// AETHERCSSOMUNICODEBIDI (SR1008): unicode-bidi is the 22nd column, appended after SR1000's direction.
+    #[test]
+    fn cssom_unicode_bidi_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 22);
+        assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
+        assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
 }
