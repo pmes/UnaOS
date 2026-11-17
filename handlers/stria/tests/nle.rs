@@ -12669,3 +12669,111 @@ fn striaxfadethree_face_drags_the_xfade_bracket() {
     assert_eq!(face.state.timeline.audio_xfades, tl0.audio_xfades, "the middle is no edge drag");
     println!("striaxfadethree: the bracket 80..112 right edge +2 ticks -> 6, one undo step; the middle unchanged");
 }
+
+// ---- STRIANORMALIZETHREE (LEDGER SR9035): normalize at the mix's rate, its scan off the face's thread (named tail block) ----
+
+/// STRIANORMALIZETHREE (SR9035): a project rate that is not the synth's own.
+fn strianormalizethree_rate() -> u32 {
+    if stria::nle::SYNTH_RATE == 44_100 { 48_000 } else { 44_100 }
+}
+
+/// Rule: `peak_at(.., os, 0)` is SR963's `peak_over` exactly (os 1 and 4), and `peak_mix` with no project rate is too.
+#[test]
+fn strianormalizethree_peak_at_extends_peak_over() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    let ns = tl.tb.to_ns(13)..tl.tb.to_ns(33);
+    for os in [1, stria::nle::TRUE_PEAK_OS] {
+        let p = stria::nle::peak_over(&src, a, ns.clone(), os).unwrap().unwrap();
+        assert_eq!(stria::nle::peak_at(&src, a, ns.clone(), os, 0).unwrap().unwrap(), p, "os {os}");
+        assert_eq!(stria::nle::peak_mix(&src, a, ns.clone(), os).unwrap().unwrap(), p, "os {os}");
+    }
+}
+
+/// Rule: under a project rate `peak_mix` is the larger of the sample peak and the peak of the source through the mix's
+/// one `Sinc` at that rate, and within 3 dB of the sample peak (synth source A, whole: the stream starts at sample 0).
+#[test]
+fn strianormalizethree_peak_mix_reads_the_project_rate() {
+    let (tl, mut src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    let r2 = strianormalizethree_rate();
+    src.set_audio_rate(r2);
+    let ns = 0..tl.tb.to_ns(50);
+    let sample = stria::nle::peak_of(&src, a, ns.clone()).unwrap().unwrap();
+    let r = stria::nle::SYNTH_RATE as u64;
+    let pcm: Vec<f32> = (0..50 * r / 25).map(|i| stria::nle::synth_sample(0, i) as f32 / 32768.0).collect();
+    let mut s = gneiss_pal::dsp::audio::resample::Sinc::new(stria::nle::SYNTH_RATE, r2, 1);
+    let mut want = sample;
+    for chunk in pcm.chunks(stria::nle::SYNTH_RATE as usize) {
+        want = want.max(stria::nle::up_peak(&mut s, 1, chunk, false));
+    }
+    want = want.max(stria::nle::up_peak(&mut s, 1, &[], true));
+    let got = stria::nle::peak_mix(&src, a, ns, 1).unwrap().unwrap();
+    assert!((got - want).abs() < 1e-5, "mix peak {got} vs {want}");
+    assert!(got >= sample && got <= sample * 1.4126, "mix {got} vs sample {sample}");
+    println!("strianormalizethree: {r2} Hz mix peak {got}, sample peak {sample}");
+}
+
+/// Rule: a face over sources at a project rate normalizes against `peak_mix`, in one undo step.
+#[test]
+fn strianormalizethree_normalize_uses_the_mix_peak() {
+    let (mut tl, mut src) = stria::nle_face::synth_fixture();
+    let a = tl.source_by_reel("A").unwrap().id;
+    tl.tracks[1].clips = vec![timeline_core::Clip::new(a, 13, 33, 0)];
+    src.set_audio_rate(strianormalizethree_rate());
+    let peak = stria::nle::peak_mix(&src, a, tl.tb.to_ns(13)..tl.tb.to_ns(33), 1).unwrap().unwrap();
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    let depth = face.state.undo_depth();
+    assert!(face.verb("normalize"));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, stria::nle_face::normalize_gain_cdb(peak, -100).unwrap());
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+}
+
+/// STRIANORMALIZETHREE (SR9035): tick the scan until it reports (bounded: 2000 x 5 ms).
+fn strianormalizethree_wait(face: &mut stria::nle_face::Face) {
+    for _ in 0..2000 {
+        if face.normalize_tick() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the normalize scan never reported");
+}
+
+/// Rule: a served face (`scan.thread`) answers `measuring` at once with the gain unmoved, refuses a second word as
+/// `busy`, and its tick sets the synchronous gain with the synchronous line in one undo step.
+#[test]
+fn strianormalizethree_scan_runs_off_the_face_thread() {
+    let (mut sync, _) = strianormalize_face();
+    assert!(sync.verb("normalize"));
+    let (want_gain, want_line) = (sync.state.selected().unwrap().gain_cdb, sync.last_error.take());
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    let depth = face.state.undo_depth();
+    assert!(face.verb("normalize"));
+    assert_eq!(face.last_error.take(), Some(format!("normalize: {}", stria::nle_face::NORMALIZE_SCANNING)));
+    assert_eq!(face.state.selected().unwrap().gain_cdb, 0, "the gain waits for the scan");
+    assert!(face.normalizing());
+    assert!(face.verb("normalize"));
+    assert_eq!(face.last_error.take(), Some("normalize: busy".to_string()));
+    strianormalizethree_wait(&mut face);
+    assert!(!face.normalizing());
+    assert_eq!(face.state.selected().unwrap().gain_cdb, want_gain);
+    assert_eq!(face.last_error.take(), want_line);
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    assert!(!face.normalize_tick(), "nothing left to report");
+}
+
+/// Rule: a scan whose selection moved before its tick sets nothing and says so.
+#[test]
+fn strianormalizethree_scan_refuses_a_moved_selection() {
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    assert!(face.verb("normalize"));
+    face.state.select(0, 0).unwrap();
+    let tl = face.state.timeline.clone();
+    strianormalizethree_wait(&mut face);
+    assert_eq!(face.last_error.take(), Some("normalize: the selection moved".to_string()));
+    assert_eq!(face.state.timeline, tl, "the timeline unmoved");
+}

@@ -203,6 +203,7 @@ pub struct Face {
     proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, proxy_queue: Vec<(timeline_core::SourceId, String)>, proxy_hold: Option<u64>, // STRIAPROXYOFF (SR915): the `proxy all` queue and the job's hold seam (file tail); STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, note: Option<String>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
+    pub scan: NormalizeScan, // STRIANORMALIZETHREE (SR9035): the normalize scan (synchronous, or off the face's thread under `serve`; file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
     slip_view: Option<SlipView>, // STRIASLIPVIEW (SR858): a slip drag's first / last frame pair, cached and throttled (file tail)
@@ -236,7 +237,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -343,7 +344,7 @@ impl Face {
 /// fresh blit after each change; while playing, a clock at the timeline's frame rate steps the playhead.
 pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessage>, mut face: Face) {
     use tokio::sync::broadcast::error::RecvError; face.decode_off_thread(); // STRIATHUMBNAILSNEXT (SR997): the served face decodes heads and peak tables off its thread (file tail)
-    for m in face.frames() { bus.fire(m); }
+    face.scan.thread = true; for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
     let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
     loop {
@@ -360,8 +361,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.autosave_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() || face.proxying() || face.scrub_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAPROXYMEDIA (SR882): and a running proxy job; STRIAAUDIOSCRUBNEXT (SR988): and a refused scrub step owed its sound; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() | face.autosave_tick() | face.proxy_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock // STRIAPROXYMEDIA (SR882): a finished proxy attaches and repaints
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.normalizing() || face.autosave_pending() || face.info_pending() || face.meter_hold_pending() || face.loudness_pending() || face.slip_due() || face.thumbs_pending() || face.proxying() || face.scrub_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAPROXYMEDIA (SR882): and a running proxy job; STRIAAUDIOSCRUBNEXT (SR988): and a refused scrub step owed its sound; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.thumbs_pending() | face.slip_tick() | face.loudness_tick() | face.autosave_tick() | face.proxy_tick() | face.normalize_tick() { // STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock // STRIAPROXYMEDIA (SR882): a finished proxy attaches and repaints
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -5107,13 +5108,8 @@ impl Face {
             return Err("not an audio clip".to_string());
         }
         let tb = self.state.timeline.tb;
-        let peak = crate::nle::peak_over(&self.sources, c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), os)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "no audio".to_string())?;
-        let cdb = normalize_gain_cdb(peak, target).ok_or_else(|| "silent clip".to_string())?;
-        self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
-        let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
-        Ok(format!("{} {} -> gain {}", if os > 1 { "true peak" } else { "peak" }, db_words(peak_cdb), db_words(cdb)))
+        let Some(peak) = self.normalize_peak(track, c, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), target, os)? else { return Ok(NORMALIZE_SCANNING.to_string()) }; // STRIANORMALIZETHREE (SR9035): at the mix's rate, off the thread when served (file tail)
+        self.normalize_finish(peak, target, os) // STRIANORMALIZETHREE (SR9035): the gain and its line moved to `normalize_finish` (file tail)
     }
 }
 
@@ -9411,5 +9407,81 @@ mod striabinthree_tests {
         let laid = Clip::new(c, 25, 50, 15);
         assert_eq!(f.state.timeline, tl0.place(0, laid, Mode::Insert).unwrap().place(1, laid, Mode::Insert).unwrap());
         assert_eq!(f.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIANORMALIZETHREE (LEDGER SR9035): normalize at the mix's rate, its scan off the face's thread (named tail block) ----
+// The peak is measured at the rate the mix plays the source (nle.rs `peak_mix`: the project rate `with_audio` sets, so an
+// overshoot the mix's resample builds is seen), through SR963's one peak body. An unserved face (the tests, the stria-view
+// witness) scans synchronously; `serve` sets `scan.thread`, and the scan runs on its own thread over an `Arc` clone of the
+// sources (no lock held across the decode), `normalize_tick` on the clock joins it and sets the gain only if the
+// selection still stands (same track, index and clip). Every line rides the parent's road, `last_error`.
+
+/// STRIANORMALIZETHREE (SR9035): the line while a served face's scan runs (`normalize: measuring`).
+pub const NORMALIZE_SCANNING: &str = "measuring";
+
+/// STRIANORMALIZETHREE (SR9035): the face's normalize scan: `thread` false (the default) measures on the caller's thread.
+#[derive(Default)]
+pub struct NormalizeScan {
+    pub thread: bool,
+    job: Option<NormalizeJob>,
+}
+
+/// STRIANORMALIZETHREE (SR9035): one running scan: the clip it measures (re-checked at the join) and its target.
+struct NormalizeJob {
+    track: usize,
+    index: usize,
+    clip: Clip,
+    target: i32,
+    os: u32,
+    handle: std::thread::JoinHandle<Result<Option<f32>, String>>,
+}
+
+impl Face {
+    /// The peak of the selected clip `c` (track `track`) over source time `ns` at the mix's rate: `Ok(Some)` measured
+    /// here, `Ok(None)` a scan started on its own thread (served face), `Err` a refusal by name (`busy`, `no audio`, the decode error).
+    fn normalize_peak(&mut self, track: usize, c: Clip, ns: std::ops::Range<i64>, target: i32, os: u32) -> Result<Option<f32>, String> {
+        if !self.scan.thread {
+            return crate::nle::peak_mix(&self.sources, c.src, ns, os).map_err(|e| e.to_string())?.ok_or_else(|| "no audio".to_string()).map(Some);
+        }
+        if self.scan.job.is_some() {
+            return Err("busy".to_string());
+        }
+        let index = self.state.selection.map_or(0, |(_, i)| i);
+        let sources = self.sources.clone();
+        let handle = std::thread::spawn(move || crate::nle::peak_mix(&sources, c.src, ns, os).map_err(|e| e.to_string()));
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, handle });
+        Ok(None)
+    }
+    /// The gain from a measured `peak` set through SR838's one road, and its line (SR878's rule, moved here).
+    fn normalize_finish(&mut self, peak: f32, target: i32, os: u32) -> Result<String, String> {
+        let cdb = normalize_gain_cdb(peak, target).ok_or_else(|| "silent clip".to_string())?;
+        self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
+        let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
+        Ok(format!("{} {} -> gain {}", if os > 1 { "true peak" } else { "peak" }, db_words(peak_cdb), db_words(cdb)))
+    }
+    /// True while a scan's result has not been reported (the bus face's clock runs).
+    pub fn normalizing(&self) -> bool {
+        self.scan.job.is_some()
+    }
+    /// One clock tick for the scan: a finished scan is joined and its gain set if the selection still stands (else
+    /// `the selection moved`, the timeline unmoved); the line goes to the message row. True when that happened (repaint).
+    pub fn normalize_tick(&mut self) -> bool {
+        if !self.scan.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+            return false;
+        }
+        let Some(j) = self.scan.job.take() else { return false };
+        let got = j.handle.join().unwrap_or_else(|_| Err("scan failed".to_string()));
+        let stands = self.state.selection == Some((j.track, j.index)) && self.state.selected() == Some(j.clip);
+        let r = match got {
+            Err(e) => Err(e),
+            Ok(None) => Err("no audio".to_string()),
+            Ok(Some(_)) if !stands => Err("the selection moved".to_string()),
+            Ok(Some(peak)) => self.normalize_finish(peak, j.target, j.os),
+        };
+        self.last_error = Some(match r {
+            Ok(line) | Err(line) => format!("normalize: {line}"),
+        });
+        true
     }
 }
