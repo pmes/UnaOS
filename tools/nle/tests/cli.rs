@@ -353,7 +353,7 @@ fn cli_completions_scripts() {
             Some(l) => format!("complete -c nle -l {l}"),
             None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
         };
-        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa "))), "fish: {line:?} in {fish}"); /* SR847 */
+        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa ")) || x == format!("{line} -x")), "fish: {line:?} in {fish}"); /* SR847 */ /* SR1005 */
     }
     // Refusals by SR801's grammar, exit 1, nothing on stdout.
     let refused: [(&[&str], &str); 2] = [
@@ -406,7 +406,7 @@ fn cli_completions_values() {
         assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
     }
     // Exactly the table's flags carry values (no word list the owners' tables do not hold).
-    assert_eq!(bash.matches(") w=\"").count(), table.len(), "{bash}");
+    assert_eq!(bash.matches(") w=\"").count() - bash.matches(") w=\"\" ;;").count(), table.len(), "{bash}"); /* SR1005 */
     assert_eq!(zsh.matches(":(").count(), table.len() + 1, "{zsh}"); // + SR821's `1:verb:(..)`
     assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
     // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
@@ -423,5 +423,100 @@ fn cli_completions_values() {
             Err(e) if shell != "bash" => eprintln!("cli_completions_values: {shell} -n skipped: {shell} absent ({e})"),
             Err(e) => panic!("bash -n: {e}"),
         }
+    }
+}
+
+// ---- NLECLICOMPLETIONSFREE (LEDGER SR1005): FLAG_ARG pinned to the arms' reads, and what each shell offers after a flag (named tail block) ----
+/// NLECLICOMPLETIONSFREE (SR1005): main.rs `const FLAG_ARG: [Arg; N] = [..]`'s kinds, read from the source (`Arg::` stripped).
+fn flag_arg_src() -> Vec<&'static str> {
+    let src: &'static str = include_str!("../src/main.rs");
+    src.split_once("const FLAG_ARG: ")
+        .and_then(|(_, r)| r.split_once("= ["))
+        .and_then(|(_, r)| r.split_once("];"))
+        .map(|(b, _)| b.split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| t.trim_start_matches("Arg::")).collect())
+        .unwrap_or_default()
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): each [`const_words`]`("FLAGS")` word with what its arm reads — the arm's body is the span
+/// from its `"--x" =>` to the next FLAGS word's (the last to `_ => die(unknown_flag`); SR816's pin holds FLAGS == the arms,
+/// so this rides SR799's scan rather than walking the source again. `Opt` a peek (`it.clone().next()`), `Required` a
+/// `value(&mut it, "--x")` / `num(&mut it, "--x")`, else `Bare`.
+fn arm_kinds() -> Vec<(&'static str, &'static str)> {
+    let src: &'static str = include_str!("../src/main.rs");
+    let flags = const_words("FLAGS");
+    let at: Vec<usize> = flags.iter().map(|f| src.find(&format!("\"{f}\" =>")).unwrap_or_else(|| panic!("{f}: an arm of the option loop"))).collect();
+    let end = src[at[at.len() - 1]..].find("_ => die(unknown_flag").map(|e| at[at.len() - 1] + e).expect("the loop's unknown-flag arm");
+    let mut kinds = Vec::new();
+    for (i, f) in flags.iter().enumerate() {
+        let stop = at.get(i + 1).copied().unwrap_or(end);
+        assert!(at[i] < stop, "{f}: FLAGS is in arm order");
+        let body = &src[at[i]..stop];
+        let kind = if body.contains("it.clone().next()") {
+            "Opt"
+        } else if body.contains(&format!("value(&mut it, \"{f}\")")) || body.contains(&format!("num(&mut it, \"{f}\")")) {
+            "Required"
+        } else {
+            "Bare"
+        };
+        kinds.push((*f, kind));
+    }
+    kinds
+}
+
+#[test]
+fn cli_completions_free() {
+    let kinds = arm_kinds();
+    let arg = flag_arg_src();
+    assert_eq!(arg.len(), kinds.len(), "FLAG_ARG {arg:?} parallel to FLAGS");
+    let valued: Vec<&str> = completion_values().iter().map(|(f, _)| *f).collect();
+    // FLAG_ARG is exactly what each arm reads: a required value is Words iff SR847's owners' table holds it, else Free.
+    for ((f, kind), a) in kinds.iter().zip(&arg) {
+        let want = match *kind {
+            "Required" if valued.contains(f) => "Words",
+            "Required" => "Free",
+            k => k,
+        };
+        assert_eq!(*a, want, "{f}: FLAG_ARG vs its arm ({kind})");
+    }
+    let of = |k: &str| kinds.iter().zip(&arg).filter(|(_, a)| **a == k).map(|((f, _), _)| *f).collect::<Vec<&str>>();
+    let (free, opt, bare) = (of("Free"), of("Opt"), of("Bare"));
+    assert_eq!(
+        free,
+        ["--fps", "--out", "--qp", "--gop", "--bitrate", "--crf", "--min-keyint", "--pass", "--stats", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--src"],
+        "the free-value flags"
+    );
+    assert_eq!(opt, ["--scenecut", "--aq"], "the optional-K flags");
+    let script = |shell: &str| {
+        let (code, out, err) = nle(&["completions", shell]);
+        assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+        out
+    };
+    let (bash, zsh, fish) = (script("bash"), script("zsh"), script("fish"));
+    // bash: ONE empty arm naming every Free flag; no arm for an Opt or Bare flag (they fall through to the verb / flag words).
+    assert_eq!(bash.matches(") w=\"\" ;;").count(), 1, "{bash}");
+    assert!(bash.contains(&format!("        {}) w=\"\" ;;\n", free.join("|"))), "bash: the Free arm in {bash}");
+    for f in opt.iter().chain(&bare) {
+        assert!(!bash.contains(&format!("{f})")) && !bash.contains(&format!("{f}|")), "bash: no arm for {f} in {bash}");
+    }
+    // zsh: Free `:<name>: ` (message, no matches), Opt `::<name>: ` (optional), Bare a plain spec.
+    for f in &free {
+        let l = f.trim_start_matches('-');
+        assert!(zsh.contains(&format!(" '*{f}:{l}: '")), "zsh: {f} free in {zsh}");
+    }
+    for f in &opt {
+        let l = f.trim_start_matches('-');
+        assert!(zsh.contains(&format!(" '*{f}::{l}: '")), "zsh: {f} optional in {zsh}");
+    }
+    for f in &bare {
+        assert!(zsh.contains(&format!(" '*{f}' ")), "zsh: {f} bare in {zsh}");
+    }
+    // fish: Free `-x` (a value required, no files, no words); Opt and Bare a plain `-l` line.
+    for f in &free {
+        let line = format!("complete -c nle -l {} -x", f.trim_start_matches('-'));
+        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
+    }
+    for f in opt.iter().chain(&bare) {
+        let line = format!("complete -c nle -l {}", f.trim_start_matches('-'));
+        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
     }
 }
