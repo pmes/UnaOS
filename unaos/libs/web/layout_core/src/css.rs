@@ -1911,37 +1911,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // with the SAME value grammar. Only these are aliased: the old
         // `-webkit-box-*` flexbox properties (box-flex/box-align/box-pack)
         // take different values and stay honestly unimplemented.
-        other
-            if other
-                .strip_prefix("-webkit-")
-                .or_else(|| other.strip_prefix("-moz-"))
-                .or_else(|| other.strip_prefix("-ms-"))
-                .or_else(|| other.strip_prefix("-o-"))
-                .is_some_and(|base| {
-                    matches!(
-                        base,
-                        "box-sizing" | "background-size" | "background-position"
-                            | "background-repeat" | "align-items" | "align-content"
-                            | "align-self" | "justify-content" | "flex-direction"
-                            | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
-                            | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
-                            | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
-                            | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
-                            | "backface-visibility" | "perspective" | "perspective-origin"
-                            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
-                            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
-                            | "column-rule-style" | "column-rule-color" | "column-span" | "box-decoration-break"
-                            | "writing-mode" | "text-orientation"
-                    )
-                }) =>
-        {
-            let base = other
-                .trim_start_matches("-webkit-")
-                .trim_start_matches("-moz-")
-                .trim_start_matches("-ms-")
-                .trim_start_matches("-o-");
-            apply_declaration(base, value, style, cx);
-        }
+        other if vendor_alias_base(other).is_some() => apply_declaration(vendor_alias_base(other).unwrap_or(other), value, style, cx), // SR1039: the list is vendor_alias_base's
         other => {
             if !apply_logical(other, value, style, cx) {
                 H::record_css(&format!("property:{}", other));
@@ -3912,6 +3882,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
     "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
     "outline-style", "outline-width", "outline-color", "outline-offset",
+    "text-decoration-color", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color", // SR1039
     "cursor",
 ];
 
@@ -3944,7 +3915,6 @@ fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &
         _ => H::record_css(&format!("all-value:{}", clip(value))),
     }
 }
-}
 
 // ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color and the shorthand's colour word (named tail block) ----
 
@@ -3968,3 +3938,37 @@ fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>)
     }
     let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
     paint.decoration_color = Some(c.unwrap_or(None));
+}
+
+// ---- AETHERCSSSUPPORTSLIST (LEDGER SR1039): the vendor-alias spellings, ONE list the arm and @supports both ask (named tail block) ----
+
+/// AETHERCSSSUPPORTSLIST (SR1039): the unprefixed property a `-webkit-` / `-moz-` / `-ms-` / `-o-` spelling aliases,
+/// when this engine implements it with the SAME value grammar (moved out of [`apply_declaration`]'s alias arm, which
+/// calls it). Only these are aliased: the old `-webkit-box-*` flexbox properties (box-flex / box-align / box-pack) take
+/// different values and stay honestly unimplemented. None = not an alias spelling (aether's `@supports` asks this too).
+pub fn vendor_alias_base(prop: &str) -> Option<&str> {
+    let base = prop
+        .strip_prefix("-webkit-")
+        .or_else(|| prop.strip_prefix("-moz-"))
+        .or_else(|| prop.strip_prefix("-ms-"))
+        .or_else(|| prop.strip_prefix("-o-"))?;
+    if matches!(
+        base,
+        "box-sizing" | "background-size" | "background-position"
+            | "background-repeat" | "align-items" | "align-content"
+            | "align-self" | "justify-content" | "flex-direction"
+            | "flex-wrap" | "opacity" | "border-radius" | "flex" | "flex-grow"
+            | "flex-shrink" | "flex-basis" | "flex-flow" | "gap"
+            | "box-shadow" | "text-decoration" | "text-decoration-line" | "transform"
+            | "transform-origin" | "aspect-ratio" | "clip-path" | "transform-style"
+            | "backface-visibility" | "perspective" | "perspective-origin"
+            | "filter" | "backdrop-filter" | "columns" | "column-count" | "column-width"
+            | "column-gap" | "column-fill" | "column-rule" | "column-rule-width"
+            | "column-rule-style" | "column-rule-color" | "column-span" | "box-decoration-break"
+            | "writing-mode" | "text-orientation"
+    ) {
+        Some(base)
+    } else {
+        None
+    }
+}
