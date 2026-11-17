@@ -5113,10 +5113,10 @@ pub fn border_side_alpha<H: Host>(paint: &PaintStyle<H>, i: usize) -> f32 {
 /// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the render's ONE per-side alpha read: a side at alpha 0 is dropped from the
 /// paint (its width already sized the box at layout), and the answer is the stroke alpha of the sides left, the largest
 /// of theirs (exact when they agree; two different non-zero side alphas: AETHER-CSS-BORDER-SIDE-ALPHA-MIXED owed).
-pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>; 4]) -> f32 {
+pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>; 4], ink_alpha: f32) -> f32 {
     let mut a = 0.0f32;
     for (i, side) in sides.iter_mut().enumerate() {
-        let ai = border_side_alpha(paint, i);
+        let ai = border_side_alpha_ink(paint, i, ink_alpha);
         if ai <= 0.0 {
             *side = None;
         } else if side.is_some() {
@@ -5135,4 +5135,22 @@ pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>;
 /// numeric filter. Before SR1075 `thin` / `thick` were dropped and `border-width` took one value.
 fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
     crate::paint::outline_width_keyword(value).or_else(|| parse_px(value, cx))
+}
+
+// ---- AETHERCSSCURRENTCOLORALPHA (LEDGER SR1134): currentcolor carries the text colour's alpha to the border and background (named tail block) ----
+
+/// AETHERCSSCURRENTCOLORALPHA (SR1134): side `i`'s stroke alpha with css-color-4 §6's currentcolor: a side whose
+/// [`crate::paint::CC_SIDES`] bit is set paints the computed `color` INCLUDING its alpha, so its stored alpha (the 1.0
+/// carrier every currentcolor writer stores) is multiplied by `ink_alpha`; a declared colour cleared the bit and keeps
+/// its own alpha.
+pub fn border_side_alpha_ink<H: Host>(paint: &PaintStyle<H>, i: usize, ink_alpha: f32) -> f32 {
+    let a = border_side_alpha(paint, i);
+    if paint.currentcolor & (1 << i) != 0 { a * ink_alpha.clamp(0.0, 1.0) } else { a }
+}
+
+/// AETHERCSSCURRENTCOLORALPHA (SR1134): the background colour's alpha, `background-color: currentcolor` ([`crate::paint::CC_BG`])
+/// multiplying its stored 1.0 carrier by `ink_alpha`; any other colour keeps its own (None opaque).
+pub fn bg_alpha_ink<H: Host>(paint: &PaintStyle<H>, ink_alpha: f32) -> f32 {
+    let a = paint.bg_alpha.unwrap_or(1.0);
+    if paint.currentcolor & crate::paint::CC_BG != 0 { a * ink_alpha.clamp(0.0, 1.0) } else { a }
 }

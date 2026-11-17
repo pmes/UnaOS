@@ -9666,13 +9666,14 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "prc", "color"), "rgb(255, 0, 0)", "the child's own colour is opaque");
     }
 
-    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): a `currentcolor` border under half-alpha text still paints the opaque RGB
-    /// (pinned: AETHER-CSS-CURRENTCOLOR-ALPHA owed; Chromium paints it at half alpha).
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): a `currentcolor` border under half-alpha text paints at the text's half
+    /// alpha at the top edge's mid-x, as Chromium (flipped by AETHERCSSCURRENTCOLORALPHA SR1134: before, the opaque RGB (0, 0, 0)).
     #[test]
-    fn color_alpha_currentcolor_border_opaque_owed() {
+    fn color_alpha_currentcolor_border_half() {
         let mut e = color_alpha_engine();
-        let (l, t, _, _) = imgalt_rect(&mut e, "bd");
-        assert_eq!(imgalt_px(&e, l as usize + 1, t as usize + 1), (0, 0, 0), "owed: the currentcolor frame is opaque black");
+        let (l, t, w, _) = imgalt_rect(&mut e, "bd");
+        let c = imgalt_px(&e, (l + w / 2.0) as usize, t as usize + 1);
+        assert!([c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v)), "SR1134: the currentcolor frame is half-alpha grey: {c:?}");
     }
 
     // ---- AETHERCSSBORDERTHINTHICK (LEDGER SR1075): `thin` / `thick` paint 1px / 5px frames; border-width takes 1-4 values (named tail block) ----
@@ -9714,5 +9715,64 @@ b</div>
         }
         let (_, _, w, h) = imgalt_rect(&mut e, "tz");
         assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
+    }
+
+    // ---- AETHERCSSCURRENTCOLORALPHA (LEDGER SR1134): currentcolor carries the text colour's alpha to the border and background (named tail block) ----
+
+    /// AETHERCSSCURRENTCOLORALPHA (SR1134): 40x20 empty boxes on white, rows 12px apart: `#hb` half-alpha text in a
+    /// `4px solid` (currentcolor) frame, `#tb` transparent text in the same frame, `#rb` half-alpha text in a
+    /// `4px solid red` frame, `#cb` half-alpha text over `background-color: currentcolor`.
+    fn currentcolor_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { width: 40px; height: 20px; margin: 0 0 12px }
+            </style></head><body>
+            <div id="hb" style="color:rgba(0, 0, 0, 0.5);border:4px solid"></div>
+            <div id="tb" style="color:transparent;border:4px solid"></div>
+            <div id="rb" style="color:rgba(0, 0, 0, 0.5);border:4px solid red"></div>
+            <div id="cb" style="color:rgba(0, 0, 0, 0.5);background-color:currentcolor"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCURRENTCOLORALPHA (SR1134): the currentcolor frame under half-alpha text composites at 0.5 at the top edge's
+    /// mid-x (~127 grey on white; before SR1134 opaque black; a corner pixel takes the top and left strokes twice:
+    /// AETHER-CSS-BORDER-ALPHA-CORNER-OVERLAP owed) and cssom `borderLeftColor` reads `rgba(0, 0, 0, 0.5)` (before: `rgb(0, 0, 0)`);
+    /// a declared red frame under the same text stays opaque red.
+    #[test]
+    fn currentcolor_alpha_border_half() {
+        let mut e = currentcolor_alpha_engine();
+        let (l, t, w, _) = imgalt_rect(&mut e, "hb");
+        let c = imgalt_px(&e, (l + w / 2.0) as usize, t as usize + 1);
+        assert!([c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v)), "armed: the currentcolor frame is half-alpha grey: {c:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "hb", "borderLeftColor"), "rgba(0, 0, 0, 0.5)", "armed: the column reads the ink alpha");
+        let (l, t, _, _) = imgalt_rect(&mut e, "rb");
+        assert_eq!(imgalt_px(&e, l as usize + 1, t as usize + 1), (255, 0, 0), "a declared red frame stays opaque");
+        assert_eq!(font_shorthand_cs(&mut e, "rb", "borderLeftColor"), "rgb(255, 0, 0)", "the declared colour's column");
+    }
+
+    /// AETHERCSSCURRENTCOLORALPHA (SR1134): `color: transparent; border: 4px solid` paints no border (the currentcolor
+    /// sides drop at ink alpha 0) while the border still sizes the box: 48x28 (SR1112's width rule).
+    #[test]
+    fn currentcolor_alpha_transparent_no_border() {
+        let mut e = currentcolor_alpha_engine();
+        assert_eq!(color_alpha_ink(&mut e, "tb").1, 0, "armed: no border ink");
+        let (_, _, w, h) = imgalt_rect(&mut e, "tb");
+        assert_eq!((w, h), (48.0, 28.0), "the 4px border still sizes the box");
+    }
+
+    /// AETHERCSSCURRENTCOLORALPHA (SR1134): `background-color: currentcolor` under half-alpha text fills at 0.5 (~127 grey;
+    /// before SR1134 opaque black) and cssom `backgroundColor` reads `rgba(0, 0, 0, 0.5)`.
+    #[test]
+    fn currentcolor_alpha_background_half() {
+        let mut e = currentcolor_alpha_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "cb");
+        let c = imgalt_px(&e, (l + w / 2.0) as usize, (t + h / 2.0) as usize);
+        assert!([c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v)), "armed: the currentcolor fill is half-alpha grey: {c:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "cb", "backgroundColor"), "rgba(0, 0, 0, 0.5)", "armed: the column reads the ink alpha");
     }
 }
