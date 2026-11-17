@@ -7057,3 +7057,43 @@ fn striaautosave_older_autosave_is_not_offered() {
     assert!(face.last_error.is_none(), "an autosave older than the document is not offered: {:?}", face.last_error);
     assert_eq!(face.state.timeline, tl0);
 }
+
+// ---- STRIAUNDOHISTORY (LEDGER SR876): the face's `history` word on the message line (named tail block) ----
+
+/// `history` is the transport word before `help`; it puts the last undo entries, newest first, on the message line
+/// (`last_error`) and commits nothing (undo depth, timeline and `dirty` unchanged); a face word names its step with the
+/// face's word (`slip+`, not the `slip 1` it calls), and so do the face's own commit roads (a selected transition's `]`).
+#[test]
+fn striaundohistory_face_word() {
+    assert_eq!(VERBS[VERBS.len() - 2], "history");
+    assert_eq!(VERBS.last(), Some(&"help"));
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: nothing to undo"));
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    assert!(face.verb("delete"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let (tl1, depth, dirty) = (face.state.timeline.clone(), face.state.undo_depth(), face.dirty());
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 2 delete | 1 split"));
+    assert_eq!((face.state.timeline == tl1, face.state.undo_depth(), face.dirty()), (true, depth, dirty));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("slip+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 3 slip+ | 2 delete | 1 split"));
+
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.verb("]"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 1 ]"));
+    println!("striaundohistory: {line:?}");
+}

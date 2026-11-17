@@ -546,7 +546,7 @@ fn transport() -> TetraNode {
         button("bright-", "Bright -"), button("bright+", "Bright +"), button("contrast-", "Contrast -"), button("contrast+", "Contrast +"), button("sat-", "Sat -"), button("sat+", "Sat +"), // STRIAGRADEFACE (SR899): step the selected clip's grade (timeline_core's words)
         button("normalize", "Normalize"), // STRIANORMALIZE (SR878): the selected audio clip's gain to its exact peak at -1 dBFS
         button("recover", "Recover"), // STRIAAUTOSAVE (SR883): loads the document's newer autosave (`<stem>.autosave.edl`) as one undo step
-        button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
+        button("history", "History"), button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
 
@@ -1738,5 +1738,25 @@ mod striagradeface_tests {
         assert_eq!(color_json(&face), r#","color":[50,0,-50]"#);
         assert_eq!(face.state.undo_depth(), 2);
         println!("striagradeface witness: bright+,sat- -> \"color\":[50,0,-50]");
+    }
+}
+
+// ---- STRIAUNDOHISTORY (LEDGER SR876): the History button and the witness's history line (named tail block) ----
+#[cfg(test)]
+mod striaundohistory_tests {
+    use super::*;
+
+    /// The transport row carries `history` right before `help`; `--do ...,history` puts the undo history line on the
+    /// message (the witness's `errors`, THE message road) and commits nothing.
+    #[test]
+    fn striaundohistory_button_and_line() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().filter_map(|b| match b { TetraNode::Button { id, .. } => Some(id.as_str()), _ => None }).collect();
+        assert_eq!(&ids[ids.len() - 2..], &["history", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "at:12:0,split,history");
+        assert_eq!(errors, vec!["history: 1 split".to_string()]);
+        assert_eq!(f.state.undo_depth(), 1);
     }
 }

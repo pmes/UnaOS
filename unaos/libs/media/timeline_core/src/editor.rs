@@ -42,7 +42,7 @@ pub struct EditorState {
     /// Pixels per tick, `ZOOM_MIN..=ZOOM_MAX`.
     pub zoom: u32,
     undo: Vec<Timeline>,
-    redo: Vec<Timeline>,
+    redo: Vec<Timeline>, hist: UndoNames, // STRIAUNDOHISTORY (SR876): each undo / redo entry's word, moved with the stacks (file tail)
     /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
     pub transition: Option<(usize, usize)>,
     pub clipboard: Vec<(usize, crate::Kind, Clip)>, // STRIACOPYPASTE (SR854): the copied clips as (track, its kind, clip), replaced whole by `copy` / `cut` (file tail)
@@ -50,7 +50,7 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new() }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default() }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -137,7 +137,7 @@ impl EditorState {
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.undo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, prev);
-        self.redo.push(cur);
+        self.redo.push(cur); self.hist.undone();
         self.settle();
         true
     }
@@ -145,7 +145,7 @@ impl EditorState {
     pub fn redo(&mut self) -> bool {
         let Some(next) = self.redo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, next);
-        self.undo.push(cur);
+        self.undo.push(cur); self.hist.redone();
         self.settle();
         true
     }
@@ -160,7 +160,7 @@ impl EditorState {
     /// THE one edit path: the op's value replaces the timeline, the old one goes on the undo stack.
     fn commit(&mut self, tl: Timeline) {
         let old = core::mem::replace(&mut self.timeline, tl);
-        self.undo.push(old);
+        self.undo.push(old); self.hist.pushed();
         if self.undo.len() > UNDO_MAX {
             self.undo.remove(0);
         }
@@ -305,7 +305,7 @@ impl EditorState {
 /// face's, moved here unchanged. `None`: not an editor verb (the face's own transport, e.g. `play`, stays the face's).
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
-    pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+    fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail)
         Some(match v {
             "prev" => {
@@ -2089,5 +2089,100 @@ impl EditorState {
         }
         self.commit(tl);
         true
+    }
+}
+
+// ---- STRIAUNDOHISTORY (LEDGER SR876): op names on the undo entries and the history line (named tail block) ----
+// The undo stack holds whole-timeline snapshots and no op name; [`UndoNames`] is its parallel stack of words, moved at the
+// stack's three mutation sites (`commit` pushes, `undo` / `redo` move the top entry across), so it stays in lockstep through
+// the UNDO_MAX cap and through every commit road. The word is known in ONE place, a verb call: the public
+// [`EditorState::verb`] arms it, runs the dispatch (`verb_unnamed`), disarms; `commit` takes the armed word (a second
+// commit in one call is unnamed). The OUTERMOST armed word wins (a face word that calls this dispatch keeps its own word).
+// A commit outside any verb (a drag's `Drag::finish`, a direct method call) is an unnamed step. Bounded: at most UNDO_MAX
+// entries across both stacks, each word clipped to [`WORD_MAX`] bytes on a char boundary.
+
+/// How many entries the history line lists (newest first).
+pub const HISTORY_N: usize = 10;
+/// The longest word kept on an undo entry (bytes; clipped on a char boundary).
+pub const WORD_MAX: usize = 24;
+
+/// The words of the undo and redo entries (`None`: an unnamed step), and the word armed by the running verb call.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UndoNames {
+    undo: Vec<Option<alloc::string::String>>,
+    redo: Vec<Option<alloc::string::String>>,
+    word: Option<alloc::string::String>,
+}
+
+impl UndoNames {
+    /// `commit` pushed a snapshot: the armed word (taken) names it; the same cap; the redo words go with the redo stack.
+    fn pushed(&mut self) {
+        let w = self.word.take();
+        self.undo.push(w);
+        if self.undo.len() > UNDO_MAX {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+    /// `undo` moved the top snapshot to the redo stack.
+    fn undone(&mut self) {
+        let w = self.undo.pop().flatten();
+        self.redo.push(w);
+    }
+    /// `redo` moved the top snapshot back to the undo stack.
+    fn redone(&mut self) {
+        let w = self.redo.pop().flatten();
+        self.undo.push(w);
+    }
+}
+
+/// `v` clipped to [`WORD_MAX`] bytes on a char boundary.
+fn clip_word(v: &str) -> alloc::string::String {
+    let mut n = v.len().min(WORD_MAX);
+    while !v.is_char_boundary(n) {
+        n -= 1;
+    }
+    alloc::string::String::from(&v[..n])
+}
+
+impl EditorState {
+    /// THE verb dispatch both faces call (see `verb_unnamed`), with `v` armed as the name of any undo step it commits.
+    pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let armed = self.arm_word(v);
+        let r = self.verb_unnamed(v);
+        self.disarm_word(armed);
+        r
+    }
+    /// Arm `v` as the next commit's name; false (nothing armed) when a word is already armed (the outer word wins).
+    pub fn arm_word(&mut self, v: &str) -> bool {
+        if self.hist.word.is_some() {
+            return false;
+        }
+        self.hist.word = Some(clip_word(v));
+        true
+    }
+    /// Drop the armed word when this caller armed it ([`EditorState::arm_word`]'s result).
+    pub fn disarm_word(&mut self, armed: bool) {
+        if armed {
+            self.hist.word = None;
+        }
+    }
+    /// The top `n` undo entries, newest first: `(stack position, oldest kept = 1; its word, None when unnamed)`.
+    pub fn history(&self, n: usize) -> Vec<(usize, Option<&str>)> {
+        let depth = self.undo.len();
+        let names = &self.hist.undo;
+        (0..n.min(depth))
+            .map(|k| (depth - k, names.len().checked_sub(k + 1).and_then(|j| names[j].as_deref())))
+            .collect()
+    }
+    /// The message line: `history: 3 split | 2 (unnamed) | 1 mark in` (the top `n`, newest first), or
+    /// `history: nothing to undo`.
+    pub fn history_line(&self, n: usize) -> alloc::string::String {
+        let h = self.history(n);
+        if h.is_empty() {
+            return alloc::string::String::from("history: nothing to undo");
+        }
+        let items: Vec<alloc::string::String> = h.iter().map(|&(i, w)| alloc::format!("{i} {}", w.unwrap_or("(unnamed)"))).collect();
+        alloc::format!("history: {}", items.join(" | "))
     }
 }
