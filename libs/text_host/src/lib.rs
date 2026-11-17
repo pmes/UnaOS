@@ -116,8 +116,14 @@ fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
     b
 }
 
-type LoadedMap = HashMap<(PathBuf, u32, bool, bool, Vec<i16>), &'static Face>;
+type LoadedMap = HashMap<FaceKey, &'static Face>;
 
+/// The ONE loaded-face cache and its contract (TEXTHOSTFACECACHECONTRACT SR822): ONE `&'static Face` per [`FaceKey`]
+/// (built by `face_key` alone) for the process's life. The first loader wins (`load_face_synth`'s `or_insert`, the
+/// single guard of `load_face_instance` and `installed_twin`); an entry is never evicted, replaced or cleared, so a
+/// reader may hold the reference forever and a caller may compare faces by pointer (`std::ptr::eq`); `Face.id` is
+/// unique per key, which the glyph and shaping caches key on. Its writers: `load_face_synth`, `load_face_instance`,
+/// `installed_twin`; its reader by id: `is_installed`.
 fn faces_loaded() -> &'static Mutex<LoadedMap> {
     static F: OnceLock<Mutex<LoadedMap>> = OnceLock::new();
     F.get_or_init(|| Mutex::new(HashMap::new()))
@@ -140,10 +146,10 @@ pub fn load_face(info: &FaceInfo) -> Option<&'static Face> {
     load_face_synth(info, false, false)
 }
 
+/// A discovered face with synthesis flags, the one object per key of the loaded-face cache (`faces_loaded`: the contract; key `face_key`, no coords).
 pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'static Face> {
-    let key = (info.path.clone(), info.index, bold, oblique, Vec::new());
-    if let Some(f) = faces_loaded().lock().ok()?.get(&key) {
-        return Some(*f);
+    if let Some(f) = cache_get(&*faces_loaded().lock().ok()?, &info.path, info.index, bold, oblique, &[]) {
+        return Some(f);
     }
     let bytes = file_bytes(&info.path)?;
     let font = Font::parse_face(bytes, info.index).ok()?;
@@ -155,7 +161,7 @@ pub fn load_face_synth(info: &FaceInfo, bold: bool, oblique: bool) -> Option<&'s
         family: info.families.first().cloned().unwrap_or_default(),
         style: info.style,
     }));
-    let face: &'static Face = *faces_loaded().lock().ok()?.entry(key).or_insert(face); // TEXTHOST-FALLBACKSYNTH-PTR-FLAKE (SR813): first writer wins, so the cache's one object per key holds under parallel first loads
+    let face: &'static Face = *faces_loaded().lock().ok()?.entry(face_key(info.path.clone(), info.index, bold, oblique, Vec::new())).or_insert(face); // TEXTHOST-FALLBACKSYNTH-PTR-FLAKE (SR813): first writer wins, so the cache's one object per key holds under parallel first loads
     Some(face)
 }
 
@@ -224,17 +230,17 @@ pub fn axes_for(font: &Font, want: Style, size_px: Option<f32>) -> Vec<([u8; 4],
 /// otherwise one leaked [`Face`] per (file, index, synthesis, F2Dot14 coords as font_core normalized them), in the
 /// ONE loaded-face cache, so two requests for the same weight share it and the raster caches (keyed on the id) see
 /// a distinct face per instance.
+/// The cache's contract is `faces_loaded`'s (one object per `face_key`, first loader wins, never evicted).
 pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([u8; 4], f32)]) -> Option<&'static Face> {
     let base = load_face_synth(info, bold, oblique)?;
     let font = base.font.with_variations(axes);
     if !font.is_instanced() {
         return Some(base);
     }
-    let coords: Vec<i16> = font.coords().iter().map(|c| (c * 16384.0).round() as i16).collect();
-    let key = (info.path.clone(), info.index, bold, oblique, coords);
+    let coords: [i16; font_core::var::MAX_AXES] = std::array::from_fn(|i| font.coords().get(i).map_or(0, |c| (c * 16384.0).round() as i16));
     let mut m = faces_loaded().lock().ok()?;
-    if let Some(f) = m.get(&key) {
-        return Some(*f);
+    if let Some(f) = cache_get(&m, &info.path, info.index, bold, oblique, &coords[..font.coords().len()]) {
+        return Some(f);
     }
     let face: &'static Face = Box::leak(Box::new(Face {
         id: next_face_id(),
@@ -244,7 +250,7 @@ pub fn load_face_instance(info: &FaceInfo, bold: bool, oblique: bool, axes: &[([
         family: base.family.clone(),
         style: base.style,
     }));
-    m.insert(key, face);
+    m.insert(face_key(info.path.clone(), info.index, bold, oblique, coords[..font.coords().len()].to_vec()), face);
     Some(face)
 }
 
@@ -631,12 +637,12 @@ mod fallbacksynthstylematch_tests {
 /// ([`load_face_synth`] / [`load_face_instance`]'s), so it keeps fontconfig's per-face hinting ([`is_installed`]) and,
 /// with both flags false, is the very object an unsynthesized selection loads; built from the same (instanced) font
 /// when that key is not loaded yet. None when `face` is not an installed face (`@font-face`, a fallback twin).
+/// The cache's contract is `faces_loaded`'s; the twin's key is `face_key` of the face's own key with the new flags.
 pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<&'static Face> {
     let mut m = faces_loaded().lock().ok()?;
-    let (path, index, _, _, coords) = m.iter().find(|(_, f)| f.id == face.id)?.0.clone();
-    let key = (path, index, bold, oblique, coords);
-    if let Some(f) = m.get(&key) {
-        return Some(*f);
+    let (path, index, _, _, coords) = m.iter().find(|(_, f)| f.id == face.id)?.0;
+    if let Some(f) = cache_get(&m, path, *index, bold, oblique, coords) {
+        return Some(f);
     }
     let twin: &'static Face = Box::leak(Box::new(Face {
         id: next_face_id(),
@@ -646,6 +652,7 @@ pub fn installed_twin(face: &'static Face, bold: bool, oblique: bool) -> Option<
         family: face.family.clone(),
         style: face.style,
     }));
+    let key = face_key(path.clone(), *index, bold, oblique, coords.clone());
     m.insert(key, twin);
     Some(twin)
 }
@@ -680,5 +687,201 @@ mod facecache_identity_tests {
         let face = load_face_synth(&info, true, true).unwrap();
         assert!(got.iter().all(|&a| a == face as *const Face as usize), "one object per key: {got:?}");
         assert!(is_installed(face) && face.synth_bold && face.synth_oblique);
+    }
+}
+
+// ---- TEXTHOSTFACECACHECONTRACT (LEDGER SR822): the loaded-face cache's key in one place and its contract pinned on all three roads (named tail block) ----
+
+/// TEXTHOSTFACECACHECONTRACT (SR822): the loaded-face cache's key (`faces_loaded`, whose doc is the contract): the file,
+/// the face index, synthetic bold, synthetic oblique, and the instance's F2Dot14 coords as font_core normalized them
+/// (empty for the default instance). The three roads build the same shape, so it is one type.
+pub(crate) type FaceKey = (PathBuf, u32, bool, bool, Vec<i16>);
+
+/// TEXTHOSTFACECACHECONTRACT (SR822): the ONE builder of a [`FaceKey`]; `load_face_synth` (no coords),
+/// `load_face_instance` (the instance's coords) and `installed_twin` (the face's own key with new flags) call it.
+fn face_key(path: PathBuf, index: u32, bold: bool, oblique: bool, coords: Vec<i16>) -> FaceKey {
+    (path, index, bold, oblique, coords)
+}
+
+#[cfg(test)]
+mod facecache_contract_tests {
+    use super::*;
+
+    const STATIC: &str = "unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf";
+    const INTER: &str = "fonts/inter/InterVariable.ttf";
+
+    /// A tree fixture face through a path with a distinct `vessels/..` component, so every key this test loads is fresh
+    /// to it (PathBuf equality keeps `..`).
+    fn fresh_face(rel: &str) -> FaceInfo {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vessels/..").join(rel);
+        db::faces_in_file(&p).into_iter().next().unwrap_or_else(|| panic!("{rel}: the tree's fixture face"))
+    }
+
+    fn addr(f: &Face) -> usize {
+        f as *const Face as usize
+    }
+
+    /// The cache's contract on all three roads at once: two threads behind a Barrier each take the synth road
+    /// (`load_face_synth`), the instance road (`load_face_instance` at wght 700) and the twin road (`installed_twin`)
+    /// twice, and every call of a road returns ONE object, the cache's entry under `face_key`; where two roads' keys
+    /// coincide they return the same object (SR750: an installed face twinned with its own flags is itself).
+    #[test]
+    fn facecache_contract_three_roads() {
+        let (s, inter) = (fresh_face(STATIC), fresh_face(INTER));
+        let w700 = [(*b"wght", 700.0)];
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (s, inter, gate) = (s.clone(), inter.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let mut got = Vec::new();
+                    for _ in 0..2 {
+                        got.push(addr(load_face_synth(&s, true, false).expect("the static fixture loads")));
+                        got.push(addr(load_face_instance(&inter, false, false, &w700).expect("Inter loads at 700")));
+                        got.push(addr(installed_twin(load_face(&s).expect("the static fixture loads"), false, true).expect("an installed face twins")));
+                    }
+                    got
+                })
+            })
+            .collect();
+        let got: Vec<Vec<usize>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let plain = load_face(&s).unwrap();
+        let synth = load_face_synth(&s, true, false).unwrap();
+        let inst = load_face_instance(&inter, false, false, &w700).unwrap();
+        let twin = installed_twin(plain, false, true).unwrap();
+        for g in &got {
+            for k in 0..2 {
+                assert_eq!(g[3 * k], addr(synth), "synth road: one object per key");
+                assert_eq!(g[3 * k + 1], addr(inst), "instance road: one object per key");
+                assert_eq!(g[3 * k + 2], addr(twin), "twin road: one object per key");
+            }
+        }
+        assert!(inst.font.is_instanced() && twin.synth_oblique && !twin.synth_bold);
+        let coords: Vec<i16> = inst.font.coords().iter().map(|c| (c * 16384.0).round() as i16).collect();
+        {
+            let m = faces_loaded().lock().unwrap();
+            let entry = |k: FaceKey| m.get(&k).map(|f| addr(f));
+            assert_eq!(entry(face_key(s.path.clone(), s.index, true, false, Vec::new())), Some(addr(synth)), "face_key is the cache's key");
+            assert_eq!(entry(face_key(inter.path.clone(), inter.index, false, false, coords)), Some(addr(inst)));
+            assert_eq!(entry(face_key(s.path.clone(), s.index, false, true, Vec::new())), Some(addr(twin)));
+        }
+        assert!(std::ptr::eq(plain, installed_twin(plain, false, false).unwrap()), "a face twinned with its own flags is itself");
+        assert!(std::ptr::eq(inst, installed_twin(inst, false, false).unwrap()), "an instance twinned with its own flags is itself");
+        assert!(std::ptr::eq(synth, installed_twin(plain, true, false).unwrap()), "the twin road meets the synth road");
+        let inst_bold = installed_twin(inst, true, false).unwrap();
+        assert!(std::ptr::eq(inst_bold, load_face_instance(&inter, true, false, &w700).unwrap()), "the twin road meets the instance road");
+        assert!(std::ptr::eq(synth, load_face_instance(&s, true, false, &w700).unwrap()), "a static face's instance road is the synth road");
+        assert!(std::ptr::eq(load_face(&inter).unwrap(), load_face_instance(&inter, false, false, &[(*b"wght", 400.0)]).unwrap()), "the default instance is the synth road's");
+    }
+}
+
+// ---- TEXTHOSTFACECACHEKEYVARIATION (LEDGER SR826): the loaded-face cache looked up by its key's borrowed parts (named tail block) ----
+
+/// TEXTHOSTFACECACHEKEYVARIATION (SR826): a [`FaceKey`] seen as its parts, so the loaded-face cache (`faces_loaded`)
+/// is looked up by borrowed parts and a hit builds no PathBuf and no Vec: the owned key and the borrowed tuple both
+/// implement it and the owned key `Borrow`s as it; `Hash` / `Eq` on the trait object work on the parts tuple, which
+/// hashes exactly what the owned tuple hashes (std's PathBuf hashes as its Path, a Vec as its slice), as `Borrow`
+/// requires. The owned key is still built by `face_key` alone, on a miss.
+pub(crate) trait FaceKeyParts {
+    fn parts(&self) -> (&std::path::Path, u32, bool, bool, &[i16]);
+}
+
+impl FaceKeyParts for FaceKey {
+    fn parts(&self) -> (&std::path::Path, u32, bool, bool, &[i16]) {
+        (self.0.as_path(), self.1, self.2, self.3, &self.4)
+    }
+}
+
+impl FaceKeyParts for (&std::path::Path, u32, bool, bool, &[i16]) {
+    fn parts(&self) -> (&std::path::Path, u32, bool, bool, &[i16]) {
+        *self
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn FaceKeyParts + 'a> for FaceKey {
+    fn borrow(&self) -> &(dyn FaceKeyParts + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn FaceKeyParts + '_ {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::hash::Hash::hash(&self.parts(), h)
+    }
+}
+
+impl PartialEq for dyn FaceKeyParts + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn FaceKeyParts + '_ {}
+
+/// TEXTHOSTFACECACHEKEYVARIATION (SR826): the ONE lookup of the loaded-face cache by a key's borrowed parts (the
+/// three roads' hit path: `load_face_synth`, `load_face_instance`, `installed_twin`); the caller holds the guard.
+fn cache_get(m: &LoadedMap, path: &std::path::Path, index: u32, bold: bool, oblique: bool, coords: &[i16]) -> Option<&'static Face> {
+    let parts: &dyn FaceKeyParts = &(path, index, bold, oblique, coords);
+    m.get(parts).copied()
+}
+
+#[cfg(test)]
+mod facecache_key_variation_tests {
+    use super::*;
+    use std::hash::BuildHasher;
+
+    /// The borrowed parts find exactly their owned key (`Borrow`'s contract: they hash as the owned key and compare
+    /// equal only to it): keys differing in each field (path, index, bold, oblique, coords empty / one / MAX_AXES)
+    /// are each found by their parts, and each one-field variation of the fullest key misses. Two keys share a
+    /// bucket only if their hashes collide, which no test can force through std's RandomState: the bucket walk is
+    /// std's, not ours. On the real cache, `cache_get` returns the object a `load_face_synth` first load cached.
+    #[test]
+    fn facecache_key_borrowed_lookup_kat() {
+        let full: Vec<i16> = (0..font_core::var::MAX_AXES as i16).map(|k| k * 2048 - 8192).collect();
+        let a = || PathBuf::from("/fonts/a.ttf");
+        let keys: Vec<FaceKey> = vec![
+            face_key(a(), 0, false, false, Vec::new()),
+            face_key(a(), 1, false, false, Vec::new()),
+            face_key(a(), 0, true, false, Vec::new()),
+            face_key(a(), 0, false, true, Vec::new()),
+            face_key(PathBuf::from("/fonts/b.ttf"), 0, false, false, Vec::new()),
+            face_key(a(), 0, false, false, vec![16384]),
+            face_key(a(), 0, false, false, full.clone()),
+        ];
+        let mut m: HashMap<FaceKey, usize> = HashMap::new();
+        for (k, key) in keys.iter().enumerate() {
+            m.insert(key.clone(), k);
+        }
+        assert_eq!(m.len(), keys.len(), "every key distinct");
+        let s = m.hasher();
+        for (k, key) in keys.iter().enumerate() {
+            let parts: &dyn FaceKeyParts = &key.parts();
+            assert_eq!(s.hash_one(key), s.hash_one(parts), "the parts hash as the owned key ({k})");
+            assert_eq!(m.get(parts), Some(&k), "found by its borrowed parts ({k})");
+        }
+        let (p, i, b, o, c) = keys[6].parts();
+        let mut other = c.to_vec();
+        other[0] += 1;
+        let misses: [(&std::path::Path, u32, bool, bool, &[i16]); 6] = [
+            (std::path::Path::new("/fonts/c.ttf"), i, b, o, c),
+            (p, i + 2, b, o, c),
+            (p, i, !b, o, c),
+            (p, i, b, !o, c),
+            (p, i, b, o, &c[..c.len() - 1]),
+            (p, i, b, o, &other[..]),
+        ];
+        for (n, q) in misses.iter().enumerate() {
+            let parts: &dyn FaceKeyParts = q;
+            assert_eq!(m.get(parts), None, "a one-field variation misses ({n})");
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../handlers/..")
+            .join("unaos/libs/text/font_core/tests/data/fontbidi_synth.ttf");
+        let info = db::faces_in_file(&path).into_iter().next().expect("the tree's static fixture face");
+        let face = load_face_synth(&info, false, true).expect("the fixture loads");
+        let got = cache_get(&faces_loaded().lock().unwrap(), &info.path, info.index, false, true, &[]);
+        assert!(got.is_some_and(|g| std::ptr::eq(g, face)), "cache_get is the cache's entry");
+        assert!(std::ptr::eq(face, load_face_synth(&info, false, true).unwrap()), "the hit road returns the one object");
     }
 }
