@@ -374,6 +374,8 @@ pub struct Mp4Extras {
     pub colour: Vec<(u32, crate::colour::Colour)>,
     /// H264ENCHRDMP4 (SR720): per track id, the `btrt` (bufferSizeDB, maxBitrate, avgBitrate) its sample entry carries, the last child.
     pub btrt: Vec<(u32, (u32, u32, u32))>,
+    /// STRIACHAPTERSMP4 (SR9076): chapters as (start in ns from the movie's start, title): a Nero `moov/udta/chpl` (MP4 only; Matroska writes none).
+    pub chapters: Vec<(i64, alloc::string::String)>,
 }
 
 fn track_duration(t: &MediaTrack) -> u64 {
@@ -633,7 +635,7 @@ pub fn mp4_with(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras) -> Vec<
         for (i, t) in tracks.iter().enumerate() {
             m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true, None));
         }
-        bx(b"moov", &m)
+        m.extend_from_slice(&udta_chpl(&x.chapters)); bx(b"moov", &m) // STRIACHAPTERSMP4 (SR9076): the chapters, none when empty (file tail)
     };
     let nchunks: Vec<usize> = tracks.iter().map(|t| t.samples.len().div_ceil(chunk)).collect();
     let placeholder: Vec<Vec<u64>> = nchunks.iter().map(|&n| alloc::vec![0u64; n]).collect();
@@ -680,7 +682,7 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras, movie
         b.u32b(0x0101_0000); // default: depends on others, non-sync
         mvex.extend_from_slice(&fbx(b"trex", 0, 0, &b));
     }
-    moov.extend_from_slice(&bx(b"mvex", &mvex));
+    moov.extend_from_slice(&bx(b"mvex", &mvex)); moov.extend_from_slice(&udta_chpl(&x.chapters)); // STRIACHAPTERSMP4 (SR9076): the chapters, none when empty (file tail)
     let head = cat(&[&ftyp, &bx(b"moov", &moov)]);
     let mut out: Vec<u8> = Vec::new(); // the fragments, offsets relative to their first byte
     let mut frag_at: Vec<usize> = Vec::new();
@@ -2286,6 +2288,70 @@ mod synth_reel_kats {
         assert_eq!(pcm.len(), 30 * 1920);
         for (i, &v) in pcm.iter().enumerate() {
             assert_eq!(v, synth_sample(1000, i as u64), "sample {i}");
+        }
+    }
+}
+
+// ---- STRIACHAPTERSMP4 (LEDGER SR9076): Nero chapters as moov/udta/chpl (named tail block) ----
+// The `chpl` ffmpeg's movenc writes and mov_read_chpl reads (VLC and mp4v2 too): a FullBox version 1 flags 0, a u32 0, a
+// u8 count, then per chapter a u64 start in 100 ns units, a u8 title length and the title's UTF-8 bytes (cut to 255 bytes
+// at a char boundary). At most 255 chapters (the first 255). No chapter: no `udta` at all (every pinned file keeps its bytes).
+
+/// STRIACHAPTERSMP4 (SR9076): `udta` holding one `chpl` of `ch` ((start ns, title)), or nothing when `ch` is empty.
+fn udta_chpl(ch: &[(i64, alloc::string::String)]) -> Vec<u8> {
+    if ch.is_empty() {
+        return Vec::new();
+    }
+    let take = &ch[..ch.len().min(255)];
+    let mut b = Vec::new();
+    b.u32b(0);
+    b.push(take.len() as u8);
+    for (ns, title) in take {
+        b.u64b((*ns).max(0) as u64 / 100);
+        let mut n = title.len().min(255);
+        while !title.is_char_boundary(n) {
+            n -= 1;
+        }
+        b.push(n as u8);
+        b.extend_from_slice(&title.as_bytes()[..n]);
+    }
+    bx(b"udta", &fbx(b"chpl", 1, 0, &b))
+}
+
+#[cfg(test)]
+mod chpl_kats {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec;
+
+    /// STRIACHAPTERSMP4 M3: default extras = the file without a `udta`, byte for byte; two chapters = the exact `chpl`
+    /// inside the `moov` (a 300-byte title cut to 255), and the file still opens with the same samples.
+    #[test]
+    fn striachaptersmp4_chpl_bytes() {
+        let plain = synth_reel(1000, 30, 25, &Mp4Extras::default());
+        assert!(!plain.windows(4).any(|w| w == b"udta"));
+        let long: String = core::iter::repeat('x').take(300).collect();
+        let x = Mp4Extras { chapters: vec![(80_000_000, String::from("Act 1")), (400_000_000, long)], ..Default::default() };
+        let file = synth_reel(1000, 30, 25, &x);
+        let mut want = vec![0u8, 0, 0, 0, 2];
+        want.extend_from_slice(&800_000u64.to_be_bytes());
+        want.push(5);
+        want.extend_from_slice(b"Act 1");
+        want.extend_from_slice(&4_000_000u64.to_be_bytes());
+        want.push(255);
+        want.extend_from_slice(&[b'x'; 255]);
+        let chpl = fbx(b"chpl", 1, 0, &want);
+        let udta = bx(b"udta", &chpl);
+        let at = file.windows(udta.len()).position(|w| w == udta.as_slice()).expect("udta/chpl written");
+        let moov = file.windows(4).position(|w| w == b"moov").unwrap() - 4;
+        let moov_end = moov + u32::from_be_bytes([file[moov], file[moov + 1], file[moov + 2], file[moov + 3]]) as usize;
+        assert!(at > moov && at + udta.len() <= moov_end, "chpl inside the moov");
+        assert_eq!(udta_chpl(&[]), Vec::<u8>::new());
+        let (a, b) = (crate::Demuxer::open(plain).unwrap(), crate::Demuxer::open(file).unwrap());
+        assert_eq!(a.tracks().len(), b.tracks().len());
+        for i in 0..a.tracks().len() {
+            let rows = |d: &crate::Demuxer| d.track_samples(i).map(|s| d.sample_data(s).to_vec()).collect::<Vec<_>>();
+            assert_eq!(rows(&a), rows(&b), "track {i} samples unchanged");
         }
     }
 }
