@@ -9995,4 +9995,64 @@ b</div>
         assert_eq!(imgalt_rect(&mut e, "iq").2, 160.0, "#iq: 10em");
         assert_eq!(imgalt_rect(&mut e, "ic").2, 160.0, "#ic: 100cqw of the 160px container");
     }
+
+    // ---- AETHERHITSTICKYORIGIN (LEDGER SR1141): the hit test places a box through the painter's one origin fn (named tail block) ----
+
+    /// AETHERHITSTICKYORIGIN (SR1141): the id of the element `hit_test_at` finds at viewport (`x`, `y`) ("" for none).
+    fn hit_sticky_origin_id(e: &crate::AetherEngine, x: f64, y: f64) -> String {
+        e.hit_test_at(x, y)
+            .and_then(|(n, _)| n.as_element().map(|el| el.attributes.borrow().get("id").unwrap_or("").to_string()))
+            .unwrap_or_default()
+    }
+
+    /// AETHERHITSTICKYORIGIN (SR1141): scrolled 400px, SR1130's red `#d` is painted stuck at rows 20..39; a hit at
+    /// (10, 25) finds it. Before SR1141 the hit test placed it at its normal-flow document y 80 (off-screen) and hit the
+    /// id-less spacer.
+    #[test]
+    fn hit_sticky_origin_stuck_box_is_hit() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "#d is hit where it is painted (armed: the spacer before SR1141)");
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 38.0), "d", "#d's last painted rows are hit too");
+    }
+
+    /// AETHERHITSTICKYORIGIN (SR1141): scrolled 400px, `#d`'s normal-flow place (document y 90, viewport y -310) no
+    /// longer hits it: the box is not there. Before SR1141 it did.
+    #[test]
+    fn hit_sticky_origin_flow_place_misses() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_ne!(hit_sticky_origin_id(&e, 10.0, -310.0), "d", "#d's flow place is empty after the scroll (armed: #d before SR1141)");
+    }
+
+    /// AETHERHITSTICKYORIGIN (SR1141): unscrolled, each sticky box is hit at its normal-flow place: `#d` at y 90,
+    /// `#a` at y 25 (unchanged).
+    #[test]
+    fn hit_sticky_origin_unscrolled_is_flow_place() {
+        let e = sticky_em_inset_engine();
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 90.0), "d", "#d at its normal-flow y 80..99");
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "a", "#a at its normal-flow y 20..39");
+    }
+
+    /// AETHERHITSTICKYORIGIN (SR1141): a `position: fixed` box is still hit at its viewport place after a scroll (its
+    /// arm is now the painter's; the deleted hit-test copy was the same formula): (10, 10) hits `#f`, (10, 50) does not.
+    #[test]
+    fn hit_sticky_origin_fixed_unchanged() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="f" style="position:fixed;top:0;left:0;width:100px;height:30px"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 10.0), "f", "#f stays at the viewport's top-left");
+        assert_ne!(hit_sticky_origin_id(&e, 10.0, 50.0), "f", "below #f's 30px");
+    }
 }

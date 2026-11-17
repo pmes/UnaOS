@@ -2005,7 +2005,7 @@ fn backdrop_group(
 /// (the viewport; Aether has no inner scrollers), then holds at that edge, never leaving its containing
 /// block (the parent's content box).
 #[allow(clippy::too_many_arguments)]
-fn placed_origin(
+pub(crate) fn placed_origin(
     layout: &LayoutTree,
     node_id: NodeId,
     abs_x: f32,
