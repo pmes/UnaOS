@@ -391,7 +391,7 @@ fn under_layer(
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
 /// transition TO black spans tick `t`, with that transition.
-fn black_over(tl: &Timeline, t: i64, above: Option<usize>) -> Option<(usize, crate::Transition)> {
+pub(crate) fn black_over(tl: &Timeline, t: i64, above: Option<usize>) -> Option<(usize, crate::Transition)> { // STRIAKDUR (SR9089): pub(crate), the editor's gap pick reads the one rule
     tl.tracks
         .iter()
         .enumerate()

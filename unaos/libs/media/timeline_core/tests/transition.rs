@@ -1047,3 +1047,47 @@ fn striatransitionkernel_head_step() {
     while st.undo() {}
     assert_eq!(st.timeline, tl0);
 }
+
+// ---- STRIAKDUR (LEDGER SR9089): a selected clip's fade to black is a dur- / dur+ target (named tail block) ----
+
+/// `to_black`: A selected (no head transition) names its fade to black; `dur+` lengthens it, one undo step; a clip with
+/// both a head dissolve and a tail fade picks the head; past the handle is refused with the state as it was; with no clip
+/// at the playhead `gap_select` gives `dur-` / `dur+` the fade whose span covers it, and other words only deselect.
+#[test]
+fn striakdur_tail_black_step() {
+    let tl0 = to_black();
+    let mut st = timeline_core::editor::EditorState::new(tl0.clone());
+    st.select(0, 0).unwrap();
+    assert_eq!(st.head_transition(), Some((0, 0)));
+    assert_eq!(st.verb("dur+"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 6);
+    assert!(st.timeline.tracks[0].transitions[0].to_black);
+    assert_eq!((st.transition, st.selection, st.undo_depth()), (Some((0, 0)), None, 1));
+    assert_eq!(st.verb("dur 30"), Some(Ok(())));
+    st.select(0, 0).unwrap();
+    let before = st.clone();
+    assert_eq!(st.verb("dur+"), Some(Err(EditError::Handle)));
+    assert_eq!(st, before);
+    while st.undo() {}
+    assert_eq!(st.timeline, tl0);
+
+    let both = cuts().add_transition(0, 40, TransitionKind::Dissolve, 4).unwrap().add_transition_to_black(0, 60, TransitionKind::Dissolve, 3).unwrap();
+    let mut st = timeline_core::editor::EditorState::new(both);
+    st.select(0, 2).unwrap();
+    assert_eq!(st.head_transition(), Some((0, 0)), "the head wins over the tail fade");
+    st.select(0, 1).unwrap();
+    assert_eq!(st.head_transition(), None, "B: no head transition, its tail is a dissolve");
+
+    let mut st = timeline_core::editor::EditorState::new(tl0.clone());
+    assert_eq!((st.black_at(19), st.black_at(20), st.black_at(24), st.black_at(25)), (None, Some((0, 0)), Some((0, 0)), None));
+    st.select(0, 0).unwrap();
+    st.gap_select("dur+", 20);
+    assert_eq!((st.selection, st.transition), (None, Some((0, 0))));
+    assert_eq!(st.verb("dur-"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].transitions[0].dur, 4);
+    st.transition = None;
+    st.gap_select("split", 20);
+    assert_eq!((st.selection, st.transition), (None, None), "another word only deselects");
+    st.gap_select("dur+", 25);
+    assert_eq!(st.transition, None);
+}

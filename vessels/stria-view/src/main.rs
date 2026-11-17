@@ -590,6 +590,7 @@ fn transport() -> TetraNode {
         button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
         button("goto", "Go To"), // STRIADROPFRAMEFACE (SR9078): the bare press names `goto <timecode|frames>` (the witness: `goto=<tc>`)
         button("reverse", "Reverse"), // STRIASPEEDREVERSE (SR9067): the selected clip plays backwards / forwards (THE `reverse` verb)
+        button("dur-", "Trans -"), button("dur+", "Trans +"), // STRIAKDUR (SR9089): the clip's transition one frame shorter / longer (THE `dur-` / `dur+` words, like _ / *)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
