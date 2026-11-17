@@ -100,6 +100,8 @@ struct Sei {
     pt: Vec<(u32, u32)>,
     /// The VCL HRD's initial_cpb_removal_delay per buffering_period (H264ENCHRDVCL SR1060; empty without `Config::hrd_vcl`).
     vbp: Vec<u32>,
+    /// Per pic_timing carrying them, pic_struct and its clock_timestamp_flags (H264ENCHRDPICSTRUCT SR1066; read from the payload bits).
+    ps: Vec<(u8, Vec<bool>)>,
 }
 
 /// h264_core's decoder fed every access unit's SPS / PPS / SEI NAL units: its HRD notes, per access unit.
@@ -110,7 +112,7 @@ fn seis(aus: &[Access]) -> Vec<Sei> {
             for n in au.nals.iter().filter(|n| matches!(n[0] & 0x1f, NAL_SPS | NAL_PPS | NAL_SEI)) {
                 dec.decode_nal(n).unwrap();
             }
-            let mut s = Sei::default();
+            let mut s = Sei::default(); s.ps = pic_structs(au);
             for note in dec.take_hrd_notes() {
                 match note.kind {
                     HrdKind::BufferingPeriod { sps_id, nal, vcl } => {
@@ -347,4 +349,98 @@ fn l_vcl_hrd_off_is_byte_identical() {
     assert_eq!(bytes(Config { hrd: false, hrd_vcl: true, ..cbr400(30) }), bytes(Config { hrd: false, ..cbr400(30) }), "hrd_vcl without hrd moved bytes");
     assert_eq!(bytes(Config { hrd_vcl: false, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl false is the default's bytes");
     assert_ne!(bytes(Config { hrd_vcl: true, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl wrote nothing");
+}
+
+// ---- H264ENCHRDPICSTRUCT (LEDGER SR1066): pic_struct in the pic_timing SEI (named tail block) ----
+// h264_core reads pic_struct_present_flag and drops it, and its pic_timing note stops after the two delays (the message is
+// skipped by its size): the payload bits are read here (owed H264CORE-PICSTRUCT retires this reader).
+
+use h264enc_core::PicStruct;
+
+/// NumClockTS per pic_struct 0..=8 (D.2.3 Table D-1).
+const NUM_CLOCK_TS: [usize; 9] = [1, 1, 1, 2, 2, 3, 3, 2, 3];
+
+/// The pic_struct fields of every pic_timing message of the access unit's SEI NAL units.
+fn pic_structs(au: &Access) -> Vec<(u8, Vec<bool>)> {
+    au.nals.iter().filter(|n| n[0] & 0x1f == NAL_SEI).filter_map(|n| pic_struct_of(&rbsp(n))).collect()
+}
+
+/// One SEI RBSP's pic_timing (payloadType 1) pic_struct and clock_timestamp_flags, when the payload is longer than the six
+/// bytes of the two 24-bit delays (the SPS's HRD: tests a-c); the payload alignment after them is bit 1 then zeros (D.1.1).
+fn pic_struct_of(r: &[u8]) -> Option<(u8, Vec<bool>)> {
+    let mut i = 0usize;
+    while i + 1 < r.len() {
+        let mut field = || {
+            let mut v = 0usize;
+            while r[i] == 0xFF {
+                v += 255;
+                i += 1;
+            }
+            v += r[i] as usize;
+            i += 1;
+            v
+        };
+        let (ty, size) = (field(), field());
+        let body = &r[i..i + size];
+        i += size;
+        if ty != 1 || size <= 6 {
+            continue;
+        }
+        let bit = |k: usize| body[k / 8] >> (7 - k % 8) & 1 == 1;
+        let ps = (48..52).fold(0u8, |v, k| v << 1 | bit(k) as u8);
+        let n = NUM_CLOCK_TS[ps.min(8) as usize];
+        let flags: Vec<bool> = (52..52 + n).map(bit).collect();
+        assert!(bit(52 + n), "pic_timing: bit_equal_to_one after the pic_struct fields");
+        assert!((53 + n..size * 8).all(|k| !bit(k)), "pic_timing: zero alignment bits");
+        return Some((ps, flags));
+    }
+    None
+}
+
+/// Config::pic_struct under the CBR HRD: the SPS differs from the None twin's in exactly the pic_struct_present_flag (one bit,
+/// h264_core's parse otherwise equal, the bitstream restriction after it included), every pic_timing carries the code and
+/// NumClockTS clock_timestamp_flag 0, the delays are the twin's, the CPB replay holds, and h264_core decodes every picture.
+#[test]
+fn m_pic_struct_frame_doubling_signals() {
+    let twin = run(cbr400(6), N, false);
+    let twin_sps = rbsp(&twin[0].nals[0]);
+    let twin_notes = seis(&twin);
+    assert!(twin_notes.iter().all(|s| s.ps.is_empty()), "None: no pic_struct fields");
+    for (p, code, n) in [(PicStruct::FrameDoubling, 7u8, 2usize), (PicStruct::Frame, 0, 1), (PicStruct::FrameTripling, 8, 3)] {
+        let aus = run(Config { pic_struct: Some(p), ..cbr400(6) }, N, true);
+        assert_eq!(aus.len(), N);
+        let sps = rbsp(&aus[0].nals[0]);
+        assert_eq!(sps.len(), twin_sps.len(), "{p:?}: SPS length");
+        let diff: u32 = sps.iter().zip(&twin_sps).map(|(a, b)| (a ^ b).count_ones()).sum();
+        assert_eq!(diff, 1, "{p:?}: the SPS differs in the pic_struct_present_flag alone");
+        let (v, t) = (sps_of(&aus[0].nals[0]), sps_of(&twin[0].nals[0]));
+        assert_eq!(
+            (v.level_idc, v.timing_info, v.nal_hrd, v.vcl_hrd, v.low_delay_hrd, v.max_num_reorder, v.max_dec_frame_buffering),
+            (t.level_idc, t.timing_info, t.nal_hrd, t.vcl_hrd, t.low_delay_hrd, t.max_num_reorder, t.max_dec_frame_buffering),
+            "{p:?}: h264_core reads the same SPS"
+        );
+        let notes = seis(&aus);
+        for (k, (s, o)) in notes.iter().zip(&twin_notes).enumerate() {
+            assert_eq!(s.ps, vec![(code, vec![false; n])], "access unit {k}: {p:?} pic_struct {code} and {n} clock_timestamp_flag 0");
+            assert_eq!(s.pt, o.pt, "access unit {k}: the delays are the None twin's");
+            assert_eq!(s.bp.len(), o.bp.len(), "access unit {k}: buffering periods where the twin has them");
+        }
+        let (fillers, margin, peak) = replay(&aus, &v);
+        println!("hrd pic_struct {p:?}: code {code}, {n} clock_timestamp_flags, {N} access units, fillers {fillers}, replay margin {margin} peak {peak} / {} bits", v.nal_hrd.unwrap().cpb_size);
+    }
+}
+
+/// pic_struct off, or asked without a pic_timing carrier, moves no byte: d's constant-QP pin, hrd off, CRF; None is the default.
+#[test]
+fn n_pic_struct_off_is_byte_identical() {
+    let some = Some(PicStruct::FrameDoubling);
+    let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop: 30, hrd: true, pic_struct: some, ..Default::default() };
+    let samples: Vec<Vec<u8>> = run(cfg, 60, false).iter().map(Access::avcc_sample).collect();
+    assert_eq!(fnv(&samples), 0xd572_6ae5_9a9b_6d9c, "pic_struct without a bucket moved the constant-QP bytes");
+    let bytes = |cfg: Config| -> Vec<Vec<u8>> { run(cfg, N, false).iter().map(Access::annexb).collect() };
+    assert_eq!(bytes(Config { hrd: false, pic_struct: some, ..cbr400(30) }), bytes(Config { hrd: false, ..cbr400(30) }), "pic_struct without hrd moved bytes");
+    let crf = |pic_struct| Config { rate: Some(RateControl::crf(26, (FPS, 1))), pic_struct, ..cbr400(30) };
+    assert_eq!(bytes(crf(some)), bytes(crf(None)), "pic_struct under CRF moved bytes");
+    assert_eq!(bytes(Config { pic_struct: None, ..cbr400(6) }), bytes(cbr400(6)), "pic_struct None is the default's bytes");
+    assert_ne!(bytes(Config { pic_struct: some, ..cbr400(6) }), bytes(cbr400(6)), "pic_struct wrote nothing");
 }

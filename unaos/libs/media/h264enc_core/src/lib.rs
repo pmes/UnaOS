@@ -202,6 +202,10 @@ pub struct Config {
     /// pinned byte; Some(n) clamped to 1..=gop / 2 + 1 as x264's validate_parameters clamps. Read through [`Config::min_keyint()`];
     /// unread without `scenecut`.
     pub min_keyint: Option<u32>,
+    /// H264ENCHRDPICSTRUCT (LEDGER SR1066): the pic_struct of every pic_timing SEI (D.1.3, Table D-1): Some writes the VUI
+    /// pic_struct_present_flag 1 and, after each pic_timing's two delays, pic_struct and NumClockTS clock_timestamp_flag 0. None
+    /// (the default) keeps every pinned byte; read only under [`Config::hrd`] and a CBR / VBR bucket (the pic_timing's carrier).
+    pub pic_struct: Option<PicStruct>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -533,7 +537,7 @@ impl Encoder {
             (_, BiPred::Implicit) => 2,
             (_, BiPred::Explicit) => 1,
         };
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour, hrd: rc.as_ref().filter(|_| cfg.hrd).and_then(rc::Rc::hrd_params), hrd_vcl: cfg.hrd_vcl };
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour, hrd: rc.as_ref().filter(|_| cfg.hrd).and_then(rc::Rc::hrd_params), hrd_vcl: cfg.hrd_vcl, pic_struct: cfg.pic_struct.is_some() };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
         let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high, bipred_idc));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
@@ -1280,7 +1284,7 @@ impl Encoder {
         if idr {
             self.hrd_bp = dts;
         }
-        let sei = nal::nal_unit(0, h264_core::nal::NAL_SEI, &sps::sei_rbsp(bp, self.cfg.hrd_vcl, cpb_removal_delay, dpb_output_delay));
+        let sei = nal::nal_unit(0, h264_core::nal::NAL_SEI, &sps::sei_rbsp(bp, self.cfg.hrd_vcl, cpb_removal_delay, dpb_output_delay, self.cfg.pic_struct.map(|p| p as u8)));
         nals.insert(if idr { 2 } else { 0 }, sei);
         if cbr {
             let bits: i64 = nals.iter().map(|n| n.len() as i64 * 8).sum();
@@ -1443,4 +1447,20 @@ impl Config {
             Some(n) => n.clamp(1, self.gop / 2 + 1),
         }
     }
+}
+
+// ---- H264ENCHRDPICSTRUCT (LEDGER SR1066): pic_struct of the pic_timing SEI (named tail block) ----
+// D.2.3 Table D-1: the codes a frame-coding encoder can honestly signal. The field codes (1-6: top / bottom fields and their
+// pairs) need field coding (owed H264ENC-HRD-PICSTRUCT-FIELDS); clock timestamps are owed (H264ENC-HRD-CLOCK-TIMESTAMP).
+
+/// [`Config::pic_struct`]: the Table D-1 pic_struct value written in every pic_timing SEI.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PicStruct {
+    /// 0: a progressive frame, one clock timestamp.
+    Frame = 0,
+    /// 7: frame doubling (the frame shown for two frame periods), two clock timestamps.
+    FrameDoubling = 7,
+    /// 8: frame tripling (three frame periods), three clock timestamps.
+    FrameTripling = 8,
 }
