@@ -5879,4 +5879,92 @@ mod tests {
         let mut e = css_wide_controls_engine();
         assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
     }
+
+    // ---- AETHERCSSCONTROLUACOLOR (LEDGER SR1001): an unset control paints the UA ButtonText / FieldText black, not the parent's colour (named tail block) ----
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): one control per row under a red parent, rows 12px apart: an unstyled `<button>`,
+    /// `button.i { color: inherit }`, `button.u { color: unset }`, an unstyled `<select>` and `<input type=submit>`, a
+    /// `<button>` inside `a.ai { color: inherit }`, and a `<button>` with an author green.
+    fn control_ua_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            button.i { color: inherit }
+            button.u { color: unset }
+            a.ai { color: inherit }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><button id="b0">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bi" class="i">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bu" class="u">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><select id="s0"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="sub0" type="submit" value="Go"></div>
+            <div style="color:rgb(255, 0, 0)"><a class="ai" href="#"><button id="ba">Hello</button></a></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bg" style="color:rgb(0, 160, 0)">Hello</button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<button>` under a red parent paints its label black (Chromium's
+    /// ButtonText), no red.
+    #[test]
+    fn control_ua_color_button_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "b0", css_wide_controls_black) > 3, "the unstyled button paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "b0", css_wide_red), 0, "the unstyled button paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: inherit }` opts back into the parent: red.
+    #[test]
+    fn control_ua_color_button_inherit_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 3, "the inherit button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: unset }` is inherit for an inherited property: red.
+    #[test]
+    fn control_ua_color_button_unset_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bu", css_wide_red) > 3, "the unset button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<select>`'s label and `<input type=submit>`'s caption (SR840's
+    /// reads) stay black under the red parent: no red.
+    #[test]
+    fn control_ua_color_select_submit_black() {
+        let mut e = control_ua_color_engine();
+        for id in ["s0", "sub0"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_controls_black) > 3, "#{id} paints black (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+        }
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): getComputedStyle reads the UA black on the unstyled button and submit input
+    /// (Chromium: rgb(0, 0, 0)), and the parent's red on the inherit button.
+    #[test]
+    fn control_ua_color_cssom() {
+        let mut e = control_ua_color_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "b0", "color"), "rgb(0, 0, 0)", "the unstyled button reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "sub0", "color"), "rgb(0, 0, 0)", "the unstyled submit input reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "color"), "rgb(255, 0, 0)", "the inherit button reads the parent's red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): a `<button>` inside `a { color: inherit }` under red: the link takes red, the
+    /// button's own UA default beats it: black, no red.
+    #[test]
+    fn control_ua_color_in_inherit_link_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "ba", css_wide_controls_black) > 3, "the button in the link paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "ba", css_wide_red), 0, "the button in the link paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an author colour on the control wins as before: green, no red.
+    #[test]
+    fn control_ua_color_author_wins() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
+        assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
+    }
 }
