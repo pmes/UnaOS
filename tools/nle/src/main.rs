@@ -127,12 +127,12 @@ fn main() {
             "--bitrate" => bitrate = Some(num(&mut it, "--bitrate")),
             "--mkv" => container = Container::Mkv,
             "--crf" => crf = Some(num(&mut it, "--crf")),
-            "--scenecut" => scenecut = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 40 }),
+            "--scenecut" => scenecut = Some({ let (k, took) = stria::nle_export::knob_or_default("--scenecut", it.clone().next().map(String::as_str)); if took { it.next(); } k }), // NLEFACEEXPORTQPWORDS (SR1091): the optional value through the lib
             "--min-keyint" => min_keyint = Some(num(&mut it, "--min-keyint")), // H264ENCSCENECUTKEYINTMIN (SR757): x264's --min-keyint, h264enc_core's `Config::min_keyint`
             "--two-pass" => two_pass = TwoPass::InProcess, // H264ENCTWOPASS (SR698): two exports, the second planned from the first
             "--pass" => pass = Some(num(&mut it, "--pass")), // H264ENCTWOPASSFILE (SR719): x264's --pass 1|2
             "--stats" => stats = Some(value(&mut it, "--stats")), // H264ENCTWOPASSFILE (SR719): the first pass's records on disk
-            "--aq" => aq = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 10 }), // H264ENCAQ (SR693): h264enc_core's `Config::aq`
+            "--aq" => aq = Some({ let (k, took) = stria::nle_export::knob_or_default("--aq", it.clone().next().map(String::as_str)); if took { it.next(); } k }), // H264ENCAQ (SR693): h264enc_core's `Config::aq`
             "--hrd" => hrd = true, // H264ENCHRD (SR699): h264enc_core's `Config::hrd`
             "--qcomp" => p2.qcomp = Some({ let s = value(&mut it, "--qcomp"); qcomp_of(&s).unwrap_or_else(|| bad("--qcomp", &s, "not a fraction within 0..=1")) }), // H264ENCTWOPASSQCOMPCLI (SR753): x264's qcompress of the planned pass
             "--cplxblur" => p2.cplxblur = Some(num(&mut it, "--cplxblur")), // H264ENCTWOPASSQCOMPCLI (SR753): x264's complexity blur of the planned pass
@@ -275,13 +275,7 @@ fn planar_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, 
 /// directory removed; `nle: two-pass pass1 pictures=<n> bytes=<b>` on stderr. A refusal is printed, exit 1.
 #[allow(clippy::too_many_arguments)]
 fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Vec<stria::nle_export::PicStat> {
-    let pass1 = std::path::Path::new(dir).join("pass1");
-    std::fs::create_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
-    let enc = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(kbps, tl.tb.den as u32, tl.tb.num as u32);
-    let stats = enc.stats();
-    export_as(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container).unwrap_or_else(|e| die(e.to_string()));
-    std::fs::remove_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
-    let v = stats.borrow().clone();
+    let v = stria::nle_export::pass1_stats(tl, range, sources, std::path::Path::new(dir), qp, gop, kbps, scenecut, aq, container).unwrap_or_else(|e| die(e)); // H264ENCTWOPASSQCOMPFACE (SR1076): the one first pass, moved to the lib (the editor face runs it too)
     eprintln!("nle: two-pass pass1 pictures={} bytes={}", v.len(), v.iter().map(|p| p.bits).sum::<u64>() / 8);
     v
 }
@@ -366,11 +360,11 @@ fn value(it: &mut std::slice::Iter<'_, String>, flag: &str) -> String {
 /// missing `--out` of render / export (NLECLIREFUSALSREST SR814: `nle: <verb>: --out <stem|dir> is required`).
 fn what(flag: &str) -> String {
     match flag {
-        "--qp" | "--crf" => format!("not a whole number within 0..={}", u8::MAX),
+        "--qp" | "--crf" => stria::nle_export::knob_what(flag), // NLEFACEEXPORTQPWORDS (SR1091): the rate knobs' text, moved to the lib
         "--pass" => format!("not {}", PASS_WORDS.join(" or ")),
         "render --out" => "--out <stem> is required".to_string(), // NLECLIREFUSALSREST (SR814): the missing flag, by verb
         "export --out" => "--out <dir> is required".to_string(),
-        _ => format!("not a whole number within 0..={}", u32::MAX),
+        _ => stria::nle_export::knob_what(flag),
     }
 }
 

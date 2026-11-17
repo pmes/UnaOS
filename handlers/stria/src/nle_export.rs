@@ -1030,3 +1030,58 @@ pub fn pass2_words(cli: &Pass2Cli) -> String {
 pub fn export_total(tl: &Timeline, range: &std::ops::Range<i64>) -> u64 {
     if tl.tracks.iter().any(|t| t.kind == timeline_core::Kind::Video) { (range.end - range.start).max(0) as u64 } else { 0 }
 }
+
+// ---- H264ENCTWOPASSQCOMPFACE (LEDGER SR1076): the first pass in the lib, the CLI's and the editor face's one (named tail block) ----
+/// H264ENCTWOPASS (SR698)'s first pass, moved from tools/nle by H264ENCTWOPASSQCOMPFACE (SR1076) so `nle export --two-pass` and the
+/// editor face's `export .. two-pass` run ONE first pass: the same timeline exported once more through [`export_as`] as a CBR H.264
+/// stream at `kbps` into `<dir>/pass1/` (no audio), its per-picture records read through [`H264Encoder::stats`], the directory
+/// removed. A refusal is the text tools/nle prints (`<dir>/pass1: <io>`, or the export's own).
+#[allow(clippy::too_many_arguments)]
+pub fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &Path, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Result<Vec<PicStat>, String> {
+    let pass1 = dir.join("pass1");
+    std::fs::create_dir_all(&pass1).map_err(|e| format!("{}: {e}", pass1.display()))?;
+    let enc = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(kbps, tl.tb.den as u32, tl.tb.num as u32);
+    let stats = enc.stats();
+    export_as(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container).map_err(|e| e.to_string())?;
+    std::fs::remove_dir_all(&pass1).map_err(|e| format!("{}: {e}", pass1.display()))?;
+    let v = stats.borrow().clone();
+    Ok(v)
+}
+
+// ---- NLEFACEEXPORTQPWORDS (LEDGER SR1091): the H.264 rate knobs' ONE parse, moved from tools/nle (named tail block) ----
+// `nle export`'s rate knobs (`--qp` `--gop` `--crf` `--scenecut [K]` `--min-keyint` `--aq [K]`, SR218 / SR680 / SR693 / SR757)
+// were parsed inline in tools/nle; the editor face's `export` words read the same values, so the text of a bad whole number and
+// the optional value of `scenecut` / `aq` live here and both call them. Owed: NLE-FACE-EXPORT-WORDS-ONE-TABLE.
+
+/// What a rate knob's whole number takes (tools/nle `what`'s numeric arms, moved): `qp` / `crf` (with or without the `--`) a
+/// u8, every other knob a u32. The refusal reads `<flag> <s>: <knob_what(flag)>`.
+pub fn knob_what(flag: &str) -> String {
+    match flag.trim_start_matches('-') {
+        "qp" | "crf" => format!("not a whole number within 0..={}", u8::MAX),
+        _ => format!("not a whole number within 0..={}", u32::MAX),
+    }
+}
+
+/// `--scenecut [K]` / `--aq [K]`'s optional value (tools/nle's arms, moved): `next` when it parses as a u8 (`true`: the caller
+/// takes it), else x264's default (scenecut 40, aq 10) and `next` left unread (`false`).
+pub fn knob_or_default(flag: &str, next: Option<&str>) -> (u8, bool) {
+    match next.and_then(|s| s.parse().ok()) {
+        Some(k) => (k, true),
+        None => (if flag.trim_start_matches('-') == "aq" { 10 } else { 40 }, false),
+    }
+}
+
+/// One rate word's value onto `opts`: `qp` / `crf` / `scenecut` / `aq` a u8, `gop` / `min-keyint` a u32 (the CLI's field types);
+/// a bad value refused `<key> <s>: <knob_what(key)>` (tools/nle's `bad` grammar). None: `key` is no rate word.
+pub fn rate_word_into(key: &str, s: &str, opts: &mut H264Opts) -> Option<Result<(), String>> {
+    let r = match key {
+        "qp" => s.parse().map(|v| opts.qp = v),
+        "crf" => s.parse().map(|v| opts.crf = Some(v)),
+        "gop" => s.parse().map(|v| opts.gop = Some(v)),
+        "min-keyint" => s.parse().map(|v| opts.min_keyint = Some(v)),
+        "scenecut" => s.parse().map(|v| opts.scenecut = Some(v)),
+        "aq" => s.parse().map(|v| opts.aq = Some(v)),
+        _ => return None,
+    };
+    Some(r.map_err(|_| format!("{key} {s}: {}", knob_what(key))))
+}
