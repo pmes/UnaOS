@@ -3786,3 +3786,95 @@ mod striacropmore_tests {
         assert_eq!(at(150, 45), px[(45 * 320 + 150) * 4..(45 * 320 + 150) * 4 + 4].to_vec(), "inside untouched");
     }
 }
+
+// ---- STRIABINMORE (LEDGER SR976): the bin's scroll thumb (named tail block) ----
+// When the sources overflow the bin canvas, a [`TICK`] thumb [`BIN_THUMB_W`] px wide at the canvas's right edge shows the
+// shown rows' share of the list and where they sit ([`bin_thumb`], `top` clamped by SR939's `bin_clamp`). Paint only: a
+// click on its column is the row's click (NLE-BIN-SCROLLBAR-DRAG owed). Every row fitting paints `paint_bin_from`'s exact
+// bytes, so the default bin (the face sizes it to every row) is unchanged.
+
+/// The scroll thumb's width (px) at the bin canvas's right edge.
+pub const BIN_THUMB_W: i64 = 4;
+/// The thumb's least height (px), so a long list still shows one.
+pub const BIN_THUMB_MIN: i64 = 6;
+
+/// The thumb's `(y0, y1)` on a bin canvas `h` px tall with first-shown row `top`: `None` when every row fits.
+pub fn bin_thumb(tl: &Timeline, h: u32, top: usize) -> Option<(i64, i64)> {
+    if bin_top_max(tl, h) == 0 {
+        return None;
+    }
+    let (n, h) = (tl.sources.len() as i64, h as i64);
+    let shown = (h / BIN_ROW_H as i64).max(1);
+    let top = bin_clamp(tl, h as u32, top) as i64;
+    let y0 = h * top / n;
+    let y1 = (h * (top + shown) / n).max(y0 + BIN_THUMB_MIN).min(h);
+    Some((y0.min(h - BIN_THUMB_MIN).max(0), y1))
+}
+
+/// [`paint_bin_from`] with the scroll thumb painted over the right edge when the rows overflow.
+pub fn paint_bin_thumb(tl: &Timeline, w: u32, h: u32, top: usize, order: Order, labels: Option<&mut dyn Text>) -> Vec<u8> {
+    let px = paint_bin_from(tl, w, h, top, order, labels);
+    let Some((y0, y1)) = bin_thumb(tl, h, top) else { return px };
+    let mut c = Canvas { w, h, order, px };
+    c.rect(w as i64 - BIN_THUMB_W, y0, w as i64, y1, TICK);
+    c.px
+}
+
+#[cfg(test)]
+mod striabinmore_tests {
+    use super::*;
+    use crate::Timeline;
+
+    /// Four sources A..D at 25 fps, none on a track.
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        for r in ["A", "B", "C", "D"] {
+            tl.add_source(r, 25);
+        }
+        tl
+    }
+
+    fn px(c: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [c[i], c[i + 1], c[i + 2], c[i + 3]]
+    }
+
+    #[test]
+    fn striabinmore_thumb_geometry() {
+        let tl = tl();
+        let h = 2 * BIN_ROW_H;
+        assert_eq!(bin_thumb(&tl, 4 * BIN_ROW_H, 0), None, "every row fits: no thumb");
+        assert_eq!(bin_thumb(&Timeline::new(25), h, 0), None);
+        assert_eq!(bin_thumb(&tl, h, 0), Some((0, 18)), "two of four rows: half the canvas, at the top");
+        assert_eq!(bin_thumb(&tl, h, 2), Some((18, 36)), "the last rows: at the bottom");
+        assert_eq!(bin_thumb(&tl, h, 9), bin_thumb(&tl, h, 2), "top clamped");
+        let mut long = Timeline::new(25);
+        for i in 0..100 {
+            long.add_source(&alloc::format!("R{i}"), 25);
+        }
+        let (y0, y1) = bin_thumb(&long, h, 0).unwrap();
+        assert_eq!((y0, y1), (0, BIN_THUMB_MIN), "a long list keeps the least thumb");
+        let (y0, y1) = bin_thumb(&long, h, 99).unwrap();
+        assert_eq!((y0, y1), (h as i64 - BIN_THUMB_MIN, h as i64), "the least thumb stays on the canvas");
+    }
+
+    #[test]
+    fn striabinmore_thumb_paints_only_on_overflow() {
+        let tl = tl();
+        let w = 120u32;
+        let fit = 4 * BIN_ROW_H;
+        assert_eq!(paint_bin_thumb(&tl, w, fit, 0, Order::Rgba, None), paint_bin_from(&tl, w, fit, 0, Order::Rgba, None), "no overflow: byte-identical");
+        let h = 2 * BIN_ROW_H;
+        for top in 0..3 {
+            let base = paint_bin_from(&tl, w, h, top, Order::Rgba, None);
+            let got = paint_bin_thumb(&tl, w, h, top, Order::Rgba, None);
+            assert_eq!(got.len(), base.len());
+            let (y0, y1) = bin_thumb(&tl, h, top).unwrap();
+            for y in 0..h as i64 {
+                let on = y >= y0 && y < y1;
+                assert_eq!(px(&got, w, w as i64 - 1, y), if on { TICK } else { px(&base, w, w as i64 - 1, y) }, "top {top} y {y}");
+                assert_eq!(px(&got, w, w as i64 - BIN_THUMB_W - 1, y), px(&base, w, w as i64 - BIN_THUMB_W - 1, y), "left of the thumb unchanged");
+            }
+        }
+    }
+}

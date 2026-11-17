@@ -5699,7 +5699,7 @@ impl Face {
     fn paint_bin(&self) -> Vec<u8> {
         let (w, h) = self.bin().map(|b| b.canvas).unwrap_or(self.canvas);
         let mut lab = self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache)));
-        view::paint_bin_from(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text)) // STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail)
+        view::paint_bin_thumb(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text)) // STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail); STRIABINMORE (SR976): the scroll thumb on overflow (view.rs tail)
     }
     /// [`Face::frames`]' blits, with the bin's appended when the face has one.
     fn bin_blit(&mut self, mut v: Vec<SMessage>) -> Vec<SMessage> {
@@ -6931,8 +6931,8 @@ impl Face {
             return None;
         }
         let word = view::bin_word(&self.state.timeline, i)?;
-        let track = held.iter().find_map(|k| self.state.timeline.tracks.iter().position(|t| t.kind == *k));
-        let res = track.ok_or(EditError::NoTrack).and_then(|t| self.state.place_at_playhead(t, r.src, 0, r.duration, timeline_core::Mode::Insert));
+        let tracks: Vec<usize> = held.iter().filter_map(|k| self.state.timeline.tracks.iter().position(|t| t.kind == *k)).collect(); // STRIABINMORE (SR976): every held kind's first track (NLE-BIN-AVLINK)
+        let res = self.state.place_tracks_at_playhead(&tracks, r.src, 0, r.duration, timeline_core::Mode::Insert); // STRIABINMORE (SR976): all of them in ONE commit (timeline_core editor.rs tail)
         if let Err(e) = res {
             self.last_error = Some(format!("{word}: {e}"));
         }
@@ -6976,7 +6976,7 @@ mod striabinscroll_tests {
         assert_eq!(f.bin().unwrap().top, 1);
         assert!(!f.on(&wheel(WHEEL_STEP)), "clamped to the list");
         assert_eq!(f.bin().unwrap().top, 1);
-        let want = view::paint_bin_from(&f.state.timeline, 320, view::BIN_ROW_H, 1, Order::Rgba, None);
+        let want = view::paint_bin_thumb(&f.state.timeline, 320, view::BIN_ROW_H, 1, Order::Rgba, None);
         assert_eq!(f.paint_role(Role::Bin), want);
         let tl0 = f.state.timeline.clone();
         f.state.deselect();
@@ -6999,8 +6999,8 @@ mod striabinscroll_tests {
         f.state.seek(15);
         assert!(f.on(&click(2, view::bin_point(2))));
         assert!(f.last_error.is_none(), "{:?}", f.last_error);
-        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(c, 0, 50, 15), Mode::Insert).unwrap());
-        assert_eq!(f.state.timeline.tracks[1], tl0.tracks[1], "the video track only");
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(c, 0, 50, 15), Mode::Insert).unwrap().place(1, Clip::new(c, 0, 50, 15), Mode::Insert).unwrap());
+        assert_eq!(f.state.timeline.tracks[1].clips.iter().filter(|x| x.src == c).count(), 1, "the audio track too (STRIABINMORE SR976)");
         assert_eq!((f.state.selected(), f.state.playhead, f.state.undo_depth()), (Some(Clip::new(c, 0, 50, 15)), 65, 1));
         assert!(f.verb("undo"));
         assert_eq!(f.state.timeline, tl0);
@@ -8321,5 +8321,57 @@ impl Face {
     fn paint_help_query(&self, lab: &mut Labels<'_>, c: &mut Canvas, l: Layout, ascent: f32) {
         let Some(s) = self.help_query_text() else { return };
         view::Text::text(lab, c, &s, HELP_PAD, l.ruler_y as f32 + HELP_PAD + ascent, (0, l.w as i32));
+    }
+}
+
+// ---- STRIABINMORE (LEDGER SR976): the unused AV reel's lay on every kind its media holds, the bin's thumb (named tail block) ----
+// No fn of its own: `bin_unused` lays an unused reel on the first track of EVERY kind its media holds through timeline_core
+// `EditorState::place_tracks_at_playhead` (ONE commit, one undo step), and `paint_bin` paints view's `paint_bin_thumb`
+// (SR939's rows plus a scroll thumb only when they overflow). The laid V / A pair is not linked (NLE-BIN-AVLINK-GROUP owed).
+
+#[cfg(test)]
+mod striabinmore_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    fn click(n: u32, (x, y): (f64, f64)) -> SMessage {
+        SMessage::BrowserClick(x, y, n)
+    }
+
+    /// The fixture plus reel C (synth media: video and audio) on no track.
+    fn with_unused() -> (Face, SourceId) {
+        let (mut tl, mut src) = synth_fixture();
+        let c = tl.add_source("C", 50);
+        src.add(c, synth_source(2000, 50, 25)).expect("synthetic source opens");
+        (Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1).with_bin(2), c)
+    }
+
+    /// An unused AV reel lands on V1 and A1 at the playhead in ONE commit; one undo takes both away.
+    #[test]
+    fn striabinmore_unused_av_reel_lays_video_and_audio() {
+        let (mut f, c) = with_unused();
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.on(&click(2, view::bin_point(2))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        let laid = Clip::new(c, 0, 50, 15);
+        assert_eq!(f.state.timeline, tl0.place(0, laid, Mode::Insert).unwrap().place(1, laid, Mode::Insert).unwrap());
+        assert_eq!((f.state.selection.map(|p| p.0), f.state.selected(), f.state.playhead, f.state.undo_depth()), (Some(0), Some(laid), 65, 1));
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0, "one undo restores both tracks");
+    }
+
+    /// The bin paints a thumb at its right edge only when the rows overflow its canvas.
+    #[test]
+    fn striabinmore_bin_paint_carries_the_thumb_on_overflow() {
+        let (mut f, _) = with_unused();
+        let fit = f.paint_role(Role::Bin);
+        let (w, h) = f.bin().unwrap().canvas;
+        assert_eq!(fit, view::paint_bin_from(&f.state.timeline, w, h, 0, Order::Rgba, None), "every row fits: no thumb");
+        assert!(f.on(&SMessage::BrowserResize(320, view::BIN_ROW_H, 2)));
+        let got = f.paint_role(Role::Bin);
+        assert_eq!(got, view::paint_bin_thumb(&f.state.timeline, 320, view::BIN_ROW_H, 0, Order::Rgba, None));
+        assert_ne!(got, view::paint_bin_from(&f.state.timeline, 320, view::BIN_ROW_H, 0, Order::Rgba, None), "the thumb shows");
     }
 }

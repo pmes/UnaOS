@@ -984,12 +984,7 @@ impl EditorState {
     /// Lay source `src` ticks `src_in..src_out` at the playhead on `track` (`Timeline::place` in `mode`, ONE commit); the
     /// laid clip is selected and the playhead moves to its end.
     pub fn place_at_playhead(&mut self, track: usize, src: crate::SourceId, src_in: i64, src_out: i64, mode: crate::Mode) -> Result<(), EditError> {
-        let clip = Clip::new(src, src_in, src_out, self.playhead);
-        let tl = self.timeline.place(track, clip, mode)?;
-        self.commit(tl);
-        self.select_at(track, clip.at).unwrap_or_else(|_| self.deselect());
-        self.seek(clip.end());
-        Ok(())
+        self.place_tracks_at_playhead(&[track], src, src_in, src_out, mode) // STRIABINMORE (SR976): the one-track case of the several-track lay (file tail)
     }
     /// The selected clip's source range laid at the playhead on its own track.
     pub fn insert_selected(&mut self, mode: crate::Mode) -> Result<(), EditError> {
@@ -3470,5 +3465,84 @@ impl EditorState {
             Some(xf) => self.set_xform(xf),
             None => self.set_xform(cur).and(Err(EditError::Xform)),
         })
+    }
+}
+
+// ---- STRIABINMORE (LEDGER SR976): one source range laid on several tracks in ONE commit (named tail block) ----
+// THE placing road: `Timeline::place` on each named track in turn (each track's own Insert ripple / Overwrite hole, the
+// same clip on every one, so the tracks stay in sync) and the ONE `commit`, so one undo restores all of them; any refusal
+// commits nothing. SR852's `place_at_playhead` is its one-track case; the bin's unused AV reel lays its video and audio.
+impl EditorState {
+    /// Lay source `src` ticks `src_in..src_out` at the playhead on every track of `tracks` (`Timeline::place` in `mode`
+    /// on each, ONE commit); the clip on the first track is selected and the playhead moves to its end. No track:
+    /// `EditError::NoTrack`.
+    pub fn place_tracks_at_playhead(&mut self, tracks: &[usize], src: crate::SourceId, src_in: i64, src_out: i64, mode: crate::Mode) -> Result<(), EditError> {
+        let (&first, rest) = tracks.split_first().ok_or(EditError::NoTrack)?;
+        let clip = Clip::new(src, src_in, src_out, self.playhead);
+        let mut tl = self.timeline.place(first, clip, mode)?;
+        for &t in rest {
+            tl = tl.place(t, clip, mode)?;
+        }
+        self.commit(tl);
+        self.select_at(first, clip.at).unwrap_or_else(|_| self.deselect());
+        self.seek(clip.end());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod striabinmore_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// A 13..23 at 0 on V1 and A1; C (50 ticks) on no track.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_source("B", 50);
+        tl.add_source("C", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striabinmore_two_tracks_one_commit_one_undo() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.seek(5);
+        let c = Clip::new(SourceId(2), 0, 50, 5);
+        assert_eq!(st.place_tracks_at_playhead(&[0, 1], SourceId(2), 0, 50, Mode::Insert), Ok(()));
+        let want = tl0.place(0, c, Mode::Insert).unwrap().place(1, c, Mode::Insert).unwrap();
+        assert_eq!(st.timeline, want);
+        assert_eq!(st.timeline.tracks[0].clips, st.timeline.tracks[1].clips, "both tracks carry the same cut");
+        assert_eq!((st.selection, st.selected(), st.playhead, st.undo_depth()), (Some((0, 1)), Some(c), 55, 1));
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0, "ONE undo restores both tracks");
+    }
+
+    #[test]
+    fn striabinmore_one_track_is_place_at_playhead() {
+        let mut a = state();
+        let mut b = state();
+        a.seek(5);
+        b.seek(5);
+        assert_eq!(a.place_at_playhead(1, SourceId(1), 0, 10, Mode::Overwrite), Ok(()));
+        assert_eq!(b.place_tracks_at_playhead(&[1], SourceId(1), 0, 10, Mode::Overwrite), Ok(()));
+        assert_eq!((a.timeline.clone(), a.selection, a.playhead), (b.timeline.clone(), b.selection, b.playhead));
+    }
+
+    #[test]
+    fn striabinmore_refusals_commit_nothing() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.seek(5);
+        assert_eq!(st.place_tracks_at_playhead(&[], SourceId(2), 0, 50, Mode::Insert), Err(EditError::NoTrack));
+        assert_eq!(st.place_tracks_at_playhead(&[0, 7], SourceId(2), 0, 50, Mode::Insert), Err(EditError::NoTrack), "a missing second track");
+        assert_eq!(st.place_tracks_at_playhead(&[0, 1], SourceId(2), 0, 51, Mode::Insert), Err(EditError::OutOfSource));
+        assert_eq!((st.timeline.clone(), st.undo_depth(), st.playhead), (tl0, 0, 5));
     }
 }
