@@ -866,3 +866,67 @@ fn za_scene_cut_kinds_and_hold() {
     assert!((CUT_AT + 1..=CUT_AT + 2).all(|i| (held[i] - plan[i]).abs() <= step), "the post-cut P within 2 x qpstep of the plan by picture n + 2: {held:?} vs {plan:?}");
     assert!(past.len() <= 2, "the clamp never holds the post-cut P past 2 x qpstep from the plan for more than 2 pictures: {past:?}");
 }
+
+// ---- H264ENCTWOPASSQPSTEPONERULE (LEDGER SR1026): the plan clamp and the runtime clamp over one Q16 core (named tail block) ----
+// (zb) `rc::qpstep_bound` against the two pre-SR1026 bodies copied here as oracles (SR769's qpstep_clamp verbatim, SR763's clamp
+// line): every integer QP pair at qpstep 0 / 2 / 4 / 6 under the four wide pairs, and the plan's Q16 domain in 1/16-QP steps;
+// (zc) the binding plan pinned: spiked() under the sharp default (qpstep 4 holds P12 and ramps P44) captured on the tree BEFORE
+// SR1026 (test r asserts its bounds only).
+
+/// SR769's `qpstep_clamp` body, verbatim (the oracle).
+fn old_qpstep_clamp(qp: i32, last: Option<i32>, qpstep: u8, wide: (bool, bool)) -> i32 {
+    let Some(l) = last.filter(|_| qpstep > 0) else { return qp };
+    let s = qpstep as i32;
+    qp.clamp(l - s - if wide.0 { s } else { 0 }, l + s + if wide.1 { s } else { 0 })
+}
+
+/// SR763's `qpstep_limit` clamp line over one (q, last) pair (the oracle).
+fn old_qpstep_limit_pair(q: i64, last: i64, step: i64) -> i64 {
+    q.clamp(last - step, last + step)
+}
+
+#[test]
+fn zb_qpstep_one_rule_sweep() {
+    use h264enc_core::rc::qpstep_bound;
+    let pairs = [(false, false), (true, false), (false, true), (true, true)];
+    for qp in 0..=51i32 {
+        assert_eq!(qpstep_clamp(qp, None, 4, (true, true)), qp, "no last: unchanged");
+        for last in 0..=51i32 {
+            for qpstep in [0u8, 2, 4, 6] {
+                for wide in pairs {
+                    let got = qpstep_clamp(qp, Some(last), qpstep, wide);
+                    assert_eq!(got, old_qpstep_clamp(qp, Some(last), qpstep, wide), "qp {qp} last {last} qpstep {qpstep} wide {wide:?}");
+                    if qpstep > 0 {
+                        let core = qpstep_bound((qp as i64) << 16, (last as i64) << 16, (qpstep as i64) << 16, wide);
+                        assert_eq!(core & 0xffff, 0, "the runtime bound stays on the integer grid");
+                        assert_eq!((core >> 16) as i32, got, "the core is the runtime clamp");
+                    }
+                }
+            }
+        }
+    }
+    for q in (0..=51i64 * 16).map(|x| x << 12) {
+        for last in (0..=51i64).map(|x| x << 16) {
+            for step in [2i64, 4, 6].map(|s| s << 16) {
+                assert_eq!(qpstep_bound(q, last, step, (false, false)), old_qpstep_limit_pair(q, last, step), "q16 {q} last {last} step {step}");
+            }
+        }
+    }
+}
+
+#[test]
+fn zc_qpstep_plan_pinned() {
+    let stats = spiked();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    let sharp = Pass2Opts { cplxblur: 0, qblur_q8: 0, ..Pass2Opts::default() };
+    for (target, want) in [(first / 2, &ZC_SPIKE_PLAN[0]), (first, &ZC_SPIKE_PLAN[1])] {
+        assert_eq!(&pass2_qps(&stats, target, QP_MIN, &sharp)[..], &want[..], "spiked() at target {target}: the pre-SR1026 plan");
+    }
+}
+
+/// pass2_qps(spiked(), first / 2 = 131000 and first = 262000, QP_MIN, sharp qpstep 4), captured on the tree BEFORE SR1026 (test r's
+/// printed `qpstep=4` lines at 7b21faffe).
+const ZC_SPIKE_PLAN: [[i32; 60]; 2] = [
+    [26, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 33, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 30, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 33, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37],
+    [20, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 27, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 24, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 27, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31],
+];

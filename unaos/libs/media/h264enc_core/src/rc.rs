@@ -1107,7 +1107,7 @@ pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
         }
         if let Some(j) = next {
             if kinds[i] == kind && kinds[j] == kind && (kind != Pic::Idr || !next_p) {
-                q16[i] = q16[i].clamp(q16[j] - step, q16[j] + step);
+                q16[i] = qpstep_bound(q16[i], q16[j], step, (false, false));
             }
         }
         next_p = next.is_some_and(|j| kinds[j] == Pic::P);
@@ -1134,7 +1134,7 @@ pub fn qpstep_limit(q16: &mut [i64], kinds: &[Pic], qpstep: u8, kind: Pic) {
 pub fn qpstep_clamp(qp: i32, last: Option<i32>, qpstep: u8, wide: (bool, bool)) -> i32 {
     let Some(l) = last.filter(|_| qpstep > 0) else { return qp };
     let s = qpstep as i32;
-    qp.clamp(l - s - if wide.0 { s } else { 0 }, l + s + if wide.1 { s } else { 0 })
+    (qpstep_bound((qp as i64) << 16, (l as i64) << 16, (s as i64) << 16, wide) >> 16) as i32
 }
 
 impl Rc {
@@ -1328,4 +1328,21 @@ mod scenecut_rc_tests {
             assert_eq!(peak > buf, f == 'A' && kbps == 20, "{f} {kbps} {cut}: only A at 20 kbps overflows its bucket (measured)");
         }
     }
+}
+
+// ---- H264ENCTWOPASSQPSTEPONERULE (LEDGER SR1026): x264's get_diff_limited_q bound as one Q16 core (named tail block) ----
+// SR769's owed H264ENC-TWOPASS-QPSTEP-ONE-RULE. x264 holds a qscale within lstep = 2^(qpstep / 6) of its same-type neighbour in two
+// places: init_pass2's get_diff_limited_q over the plan ([`qpstep_limit`], SR763) and the ABR lmin / lmax at runtime
+// ([`qpstep_clamp`], SR769, its asymmetric widening on under / over-spend). Both bodies now call this ONE bound in the Q16 QP (log)
+// domain: the plan with wide (false, false) over its Q16 slice, the runtime with its integer QPs shifted to Q16 and back (exact:
+// every bound is then a multiple of 65536). The wrappers keep their signatures, callers and qpstep-0 / no-last guards; the plan's
+// QPs and the coded bytes are unmoved (tests/twopass.rs zb-zc). Owed: H264ENC-TWOPASS-QPSTEP-DOC.
+
+/// `q` (Q16 QP) held within `step_q16` of `last` (H264ENCTWOPASSQPSTEPONERULE SR1026), the low bound a further `step_q16` lower
+/// when `wide.0`, the high bound a further `step_q16` higher when `wide.1`. Equal to `clamp` for `step_q16 >= 0` (what both callers
+/// pass); a negative step never panics (max then min).
+pub fn qpstep_bound(q: i64, last: i64, step_q16: i64, wide: (bool, bool)) -> i64 {
+    let lo = last - step_q16 - if wide.0 { step_q16 } else { 0 };
+    let hi = last + step_q16 + if wide.1 { step_q16 } else { 0 };
+    q.max(lo).min(hi)
 }
