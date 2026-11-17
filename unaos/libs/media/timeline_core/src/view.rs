@@ -338,7 +338,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             paint_gain_fades(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip); // STRIACLIPGAINFACE (SR838): the gain line and fade ramps over the body (file tail)
         }
     }
-    paint_track_flags(&mut c, l, tl); // STRIATRACKMUTESOLO (SR837): the inactive rows dimmed, the M / S badges (file tail)
+    paint_track_flags(&mut c, l, tl); paint_track_gains(&mut c, l, tl); // STRIATRACKMUTESOLO (SR837): the inactive rows dimmed, the M / S badges (file tail); STRIATRACKGAINSTEP (SR901): the track gain readout badge (file tail)
     // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
     for &(row, i) in &st.set {
         if let Some(clip) = tl.tracks.get(row).and_then(|tr| tr.clips.get(i)) {
@@ -1425,5 +1425,107 @@ mod striaclipgainface_tests {
         assert!(rows.iter().any(|&y| (y - 35).abs() <= 1), "{rows:?}");
         assert!(ink_rows(&px, x0 + 1).contains(&53), "the ramp starts at the bottom corner");
         assert_eq!(ink_rows(&px, l.x_of(15)), alloc::vec![18], "past the fade only the line");
+    }
+}
+
+// ---- STRIATRACKGAINSTEP (LEDGER SR901): the track gain readout badge beside the M / S badges (named tail block) ----
+// A track whose gain is not unity shows it at its row's left edge in SR837's badge geometry: a blue box right of the
+// M / S badges it carries, the gain as [`db_text`] (`-6.0`, `+2.5`) in 3x5 pixel glyphs (no text hook is guaranteed:
+// the kernel and the headless faces pass none). Every track at 0 dB: nothing is touched (every golden unchanged).
+
+/// The track gain badge's colour (blue).
+pub const TGAIN: [u8; 4] = [0x50, 0x90, 0xff, 255];
+/// The readout glyphs, 3x5 (bit 2 the leftmost column), in the order of [`TGAIN_CHARS`].
+const TGAIN_GLYPHS: [[u8; 5]; 13] = [
+    [7, 5, 5, 5, 7], [2, 6, 2, 2, 7], [7, 1, 7, 4, 7], [7, 1, 7, 1, 7], [5, 5, 7, 1, 1], [7, 4, 7, 1, 7], [7, 4, 7, 5, 7],
+    [7, 1, 1, 1, 1], [7, 5, 7, 5, 7], [7, 5, 7, 1, 7], [0, 0, 7, 0, 0], [0, 2, 7, 2, 0], [0, 0, 0, 0, 2],
+];
+const TGAIN_CHARS: &[u8; 13] = b"0123456789-+.";
+
+/// A gain in centi-dB as its number of dB to the tenth: `+3.0`, `-3.5`, `0.0` (the tenth rounded half up on the
+/// magnitude). THE rule: the host face's `db_words` adds the unit to it.
+pub fn db_text(cdb: i32) -> alloc::string::String {
+    let tenths = (cdb.unsigned_abs() + 5) / 10;
+    let sign = if tenths == 0 { "" } else if cdb > 0 { "+" } else { "-" };
+    alloc::format!("{sign}{}.{}", tenths / 10, tenths % 10)
+}
+
+fn paint_track_gains(c: &mut Canvas, l: Layout, tl: &Timeline) {
+    if tl.tracks.iter().all(|t| t.gain_cdb == 0) {
+        return;
+    }
+    for (row, tr) in tl.tracks.iter().enumerate().take(l.rows) {
+        if tr.gain_cdb == 0 {
+            continue;
+        }
+        let y0 = l.row_y(row);
+        let x = 2 + (BADGE + 2) * (tr.muted as i64 + tr.solo as i64);
+        let text = db_text(tr.gain_cdb);
+        c.rect(x, y0 + 2, x + 3 + 4 * text.len() as i64, y0 + 2 + BADGE, TGAIN);
+        for (i, ch) in text.bytes().enumerate() {
+            let Some(g) = TGAIN_CHARS.iter().position(|&k| k == ch) else { continue };
+            for (dy, bits) in TGAIN_GLYPHS[g].iter().enumerate() {
+                for dx in 0..3i64 {
+                    if bits & (4 >> dx) != 0 {
+                        let (px, py) = (x + 2 + 4 * i as i64 + dx, y0 + 5 + dy as i64);
+                        c.rect(px, py, px + 1, py + 1, FIELD);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod striatrackgainstep_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// Two audio tracks, the same reel's clip on each, 320x120.
+    fn twins() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for _ in 0..2 {
+            let t = tl.add_track(Kind::Audio);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striatrackgainstep_db_text_pins() {
+        assert_eq!(db_text(-600), "-6.0");
+        assert_eq!(db_text(250), "+2.5");
+        assert_eq!(db_text(-350), "-3.5");
+        assert_eq!(db_text(4), "0.0");
+        assert_eq!(db_text(-14_400), "-144.0");
+    }
+
+    /// M3: A2 at -6 dB carries blue badge pixels on its row only, starting at x 2; with A2 also muted the box starts right
+    /// of the M badge; back at 0 dB the canvas is byte-equal to the unity paint.
+    #[test]
+    fn striatrackgainstep_badge_paint() {
+        let st0 = twins();
+        let l = Layout::of(320, 120, &st0);
+        let px0 = paint_in(&st0, l, Order::Rgba, None, None);
+        let mut st = st0.clone();
+        st.timeline = st.timeline.set_track_gain(1, -600).unwrap();
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let at = |p: &[u8], x: i64, y: i64| -> [u8; 4] {
+            let i = (y as usize * 320 + x as usize) * 4;
+            [p[i], p[i + 1], p[i + 2], p[i + 3]]
+        };
+        let blue = |p: &[u8], row: usize| (0..60i64).flat_map(|x| (0..ROW_H as i64).map(move |y| (x, y))).filter(|&(x, y)| at(p, x, l.row_y(row) + y) == TGAIN).count();
+        assert!(blue(&px, 1) > 0, "the gain badge on A2");
+        assert_eq!(blue(&px, 0), 0, "no badge on the unity row");
+        assert_eq!(at(&px, 2, l.row_y(1) + 2), TGAIN, "the box at the left edge");
+        let mut muted = st.clone();
+        muted.timeline = muted.timeline.set_track_flags(1, true, false).unwrap();
+        let pm = paint_in(&muted, l, Order::Rgba, None, None);
+        assert_eq!(at(&pm, 2, l.row_y(1) + 2), MUTE, "the M badge first");
+        assert_eq!(at(&pm, 2 + BADGE + 2, l.row_y(1) + 2), TGAIN, "the gain box right of it");
+        let mut off = st.clone();
+        off.timeline = off.timeline.set_track_gain(1, 0).unwrap();
+        assert_eq!(paint_in(&off, l, Order::Rgba, None, None), px0, "0 dB: the unity paint, byte for byte");
     }
 }

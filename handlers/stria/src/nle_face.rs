@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 34] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mute", "solo", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "help"]; // STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help
+pub const VERBS: [&str; 36] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mute", "solo", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "track-gain-", "track-gain+", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } if let Some(r) = self.track_gain_face_verb(v) { return r; } // STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); STRIATRACKGAINSTEP (SR901): the track gain words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3118,12 +3118,36 @@ impl Face {
 
 /// A gain in centi-dB as a person reads it: `+3.0 dB`, `-3.5 dB`, `0.0 dB` (the tenth rounded half up on the magnitude).
 pub fn db_words(cdb: i32) -> String {
-    let tenths = (cdb.unsigned_abs() + 5) / 10;
-    let sign = if tenths == 0 { "" } else if cdb > 0 { "+" } else { "-" };
-    format!("{sign}{}.{} dB", tenths / 10, tenths % 10)
+    format!("{} dB", view::db_text(cdb)) // STRIATRACKGAINSTEP (SR901): the rule lifted to timeline_core view (the badge reads it too)
 }
 
 /// The message line after a gain / fade word: `gain <db_words>` or `fade-in <n>, fade-out <m>` (ticks).
 fn audio_line(word: &str, c: &Clip) -> String {
     if word.starts_with("gain") { format!("gain {}", db_words(c.gain_cdb)) } else { format!("fade-in {}, fade-out {}", c.fade_in, c.fade_out) }
+}
+
+// ---- STRIATRACKGAINSTEP (LEDGER SR901): the track gain words' message line (named tail block) ----
+// `track-gain [<dB>]` / `track-gain-` / `track-gain+` ride timeline_core's ONE verb dispatch (SR864's
+// `set_selected_track_gain`); the face puts the outcome on its message line like SR838's gain words: `track-gain: A2
+// -6.0 dB` (the selected clip's track, [`db_words`]) after an edit, `<the word as typed>: <EditError>` for a refusal.
+impl Face {
+    /// The track gain words; `None` for any other word.
+    fn track_gain_face_verb(&mut self, v: &str) -> Option<bool> {
+        v.split_ascii_whitespace().next().filter(|w| matches!(*w, "track-gain" | "track-gain-" | "track-gain+"))?;
+        match self.state.verb(v) {
+            Some(Ok(())) => {
+                let tl = &self.state.timeline;
+                self.last_error = self.state.selection.and_then(|(t, _)| tl.tracks.get(t).map(|tr| format!("track-gain: {} {}", track_word(tl, t), db_words(tr.gain_cdb))));
+            }
+            Some(Err(e)) => self.last_error = Some(format!("{v}: {e}")),
+            None => return None,
+        }
+        Some(true)
+    }
+}
+
+/// A track as a person names it: its kind's letter and its 1-based number within the kind (`V1`, `A2`).
+fn track_word(tl: &Timeline, ti: usize) -> String {
+    let k = if tl.tracks.get(ti).is_some_and(|t| t.kind == Kind::Video) { "V" } else { "A" };
+    format!("{k}{}", tl.track_number(ti).unwrap_or(1))
 }

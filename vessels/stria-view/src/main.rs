@@ -520,7 +520,7 @@ fn transport() -> TetraNode {
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
         button("mute", "Mute"), button("solo", "Solo"), // STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (help stays the last button)
         button("gain-", "Gain -"), button("gain+", "Gain +"), button("gain", "0 dB"), button("fade-in", "Fade In"), button("fade-out", "Fade Out"), // STRIACLIPGAINFACE (SR838): the selected clip's gain (1 dB a press, bare `gain` unity) and fades to the playhead
-        button("track-gain", "Track 0 dB"), // STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
+        button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -924,14 +924,39 @@ mod striatrackgain_tests {
         let (tl, src) = nle_face::synth_fixture();
         let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
         let errors = drive(&mut face, "at:12:1,track-gain:-6");
-        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(errors, vec!["track-gain: A1 -6.0 dB".to_string()], "STRIATRACKGAINSTEP (SR901): the success line");
         assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.timeline.tracks[0].gain_cdb, face.state.undo_depth()), (-600, 0, 1));
         assert!(face.state.timeline.tracks[1].clips.iter().all(|c| c.gain_cdb == 0));
-        assert!(drive(&mut face, "track-gain").is_empty());
+        assert_eq!(drive(&mut face, "track-gain"), vec!["track-gain: A1 0.0 dB".to_string()]); // STRIATRACKGAINSTEP (SR901): the success line
         assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (0, 2));
         let (tl, src) = nle_face::synth_fixture();
         let mut none = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(drive(&mut none, "track-gain:-6"), vec![format!("track-gain -6: {}", timeline_core::EditError::NoTrack)]);
         println!("striatrackgain witness: track-gain:-6 -> A1 -600 cdB; Track 0 dB -> 0; no selection -> {}", timeline_core::EditError::NoTrack);
+    }
+}
+
+// ---- STRIATRACKGAINSTEP (LEDGER SR901): the Track - / Track + buttons and the success line (named tail block) ----
+
+#[cfg(test)]
+mod striatrackgainstep_tests {
+    use super::*;
+
+    /// M3: both step buttons are on the row (help still last); `at:12:1,track-gain-` steps A1 one dB down in one undo step
+    /// and the message road carries the success line; `track-gain+` brings it back to unity.
+    #[test]
+    fn striatrackgainstep_witness_buttons_and_line() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        for w in ["track-gain-", "track-gain+"] {
+            assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == w)), "{w}");
+        }
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut face, "at:12:1,track-gain-"), vec!["track-gain: A1 -1.0 dB".to_string()]);
+        assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (-100, 1));
+        assert_eq!(drive(&mut face, "track-gain+"), vec!["track-gain: A1 0.0 dB".to_string()]);
+        assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (0, 2));
+        println!("striatrackgainstep witness: track-gain- -> A1 -1.0 dB; track-gain+ -> 0.0 dB");
     }
 }
