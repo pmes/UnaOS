@@ -6702,4 +6702,313 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
         assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
     }
+
+    // ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor through the element's ink (named tail block) ----
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): one 40x20 box per row under a red parent, rows 12px apart: `#bb` `border: 2px
+    /// solid currentcolor`; `#bl` `border: 2px solid blue; border-left: 2px solid currentcolor`; `#bg` `color: blue;
+    /// background-color: currentcolor`; `#bc` `.x { border: 2px solid currentcolor } .x.y { color: rgb(0, 160, 0) }`;
+    /// `#bu` `border: 2px solid` (no colour: the initial currentcolor).
+    fn currentcolorrest_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .x { border: 2px solid currentcolor }
+            .x.y { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><div id="bb" style="width:40px;height:20px;margin:0;border:2px solid currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bl" style="width:40px;height:20px;margin:0;border:2px solid blue;border-left:2px solid currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bg" style="width:40px;height:20px;margin:0;color:blue;background-color:currentcolor"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bc" class="x y" style="width:40px;height:20px;margin:0"></div></div>
+            <div style="color:rgb(255, 0, 0)"><div id="bu" style="width:40px;height:20px;margin:0;border:2px solid"></div></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn currentcolorrest_grey(c: (u8, u8, u8)) -> bool {
+        c == (128, 128, 128)
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `border: 2px solid currentcolor` paints the red parent's ink (no grey), and so
+    /// does an uncoloured `border: 2px solid` (the initial currentcolor, as Chromium); cssom reads rgb(255, 0, 0).
+    #[test]
+    fn currentcolorrest_border_paints_ink() {
+        let mut e = currentcolorrest_engine();
+        for id in ["bb", "bu"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 40, "#{id} paints a red border");
+            assert_eq!(css_wide_color_ink(&mut e, id, currentcolorrest_grey), 0, "#{id} paints no grey");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderLeftColor"), "rgb(255, 0, 0)", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `border-left: 2px solid currentcolor` after `border: 2px solid blue`: the left
+    /// edge is red, the top edge stays blue; cssom borderLeftColor rgb(255, 0, 0).
+    #[test]
+    fn currentcolorrest_border_one_side() {
+        let mut e = currentcolorrest_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "bl");
+        let left = imgalt_px(&e, (l + 1.0) as usize, (t + h / 2.0) as usize);
+        let top = imgalt_px(&e, (l + w / 2.0) as usize, (t + 1.0) as usize);
+        assert!(css_wide_red(left), "the left edge is the element's red ink: {left:?}");
+        assert!(css_wide_blue(top), "the top edge stays blue: {top:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "bl", "borderLeftColor"), "rgb(255, 0, 0)", "#bl: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): `color: blue; background-color: currentcolor` fills blue (the fill is the
+    /// element's own text ink, css-color-4 §6.2), no red; cssom backgroundColor rgb(0, 0, 255).
+    #[test]
+    fn currentcolorrest_background_fill() {
+        let mut e = currentcolorrest_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "bg");
+        let mid = imgalt_px(&e, (l + w / 2.0) as usize, (t + h / 2.0) as usize);
+        assert!(css_wide_blue(mid), "the fill is blue: {mid:?}");
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_blue) > 400, "the box fills blue");
+        assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "no red");
+        assert_eq!(font_shorthand_cs(&mut e, "bg", "backgroundColor"), "rgb(0, 0, 255)", "#bg: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): paint-time resolution: `.x { border: 2px solid currentcolor }` with a later
+    /// `.x.y { color: rgb(0, 160, 0) }` paints a green border, no red; cssom borderLeftColor rgb(0, 160, 0).
+    #[test]
+    fn currentcolorrest_later_color_rule() {
+        let mut e = currentcolorrest_engine();
+        assert!(css_wide_color_ink(&mut e, "bc", css_wide_green) > 40, "#bc paints a green border");
+        assert_eq!(css_wide_color_ink(&mut e, "bc", css_wide_red), 0, "#bc paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "bc", "borderLeftColor"), "rgb(0, 160, 0)", "#bc: cssom");
+    }
+
+    /// AETHERCSSCURRENTCOLORREST (SR849): the canvas: `html { color: rgb(0, 160, 0); background-color: currentcolor }`
+    /// paints the canvas green far from the content (canvas_background through focusring's `current_color`).
+    #[test]
+    fn currentcolorrest_canvas() {
+        let html = r##"<!doctype html><html style="color:rgb(0, 160, 0);background-color:currentcolor"><body style="margin:0"><p>hi</p></body></html>"##;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let c = imgalt_px(&e, 390, 590);
+        assert!(css_wide_green(c), "the canvas is the root's green ink: {c:?}");
+    }
+
+    // ---- AETHERCSSWIDENONINHERITEDREST (LEDGER SR848): initial / unset on the rest of the non-inherited arms beat an earlier rule (named tail block) ---- // SR848 fold: helper renamed css_wide_noninherited_rest_engine (SR831 owns css_wide_rest_engine), as SR1014/SR1015/SR1016 did
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): one armed / reset pair per row at 400 px wide, each `.r` twin resetting
+    /// what its class's rule set: position absolute (initial), float left (unset), opacity 0.5 on red (initial), a
+    /// 100px translate (initial), overflow hidden on a 10px box with a 40px red child (initial), a column flexbox
+    /// (initial), and a relative box 30px down (top: initial).
+    fn css_wide_noninherited_rest_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div, section { margin: 0 0 12px }
+            .pa { position: absolute; top: 0; left: 200px; width: 50px; height: 30px }
+            .pa.r { position: initial }
+            .fl { float: left; width: 50px; height: 40px }
+            .fl.r { float: unset }
+            .op { opacity: 0.5; background-color: rgb(255, 0, 0); height: 20px }
+            .op.r { opacity: initial }
+            .tr { transform: translateX(100px); width: 50px; height: 20px; background-color: rgb(255, 0, 0) }
+            .tr.r { transform: initial }
+            .ov { overflow: hidden; height: 10px; margin-bottom: 50px }
+            .ov.r { overflow: initial }
+            .fd { display: flex; flex-direction: column }
+            .fd.r { flex-direction: initial }
+            .tp { position: relative; top: 30px }
+            .tp.r { top: initial }
+            </style></head><body style="margin:0;font:20px serif">
+            <section id="pasec"><div id="pa" class="pa"></div><div id="pas">B</div></section>
+            <section id="parsec"><div id="par" class="pa r"></div><div id="pars">B</div></section>
+            <section><div id="fl" class="fl"></div><span id="fls">Hi</span></section>
+            <section style="clear:both"><div id="flr" class="fl r"></div><span id="flrs">Hi</span></section>
+            <div id="op" class="op"></div>
+            <div id="opr" class="op r"></div>
+            <div id="tr" class="tr"></div>
+            <div id="trr" class="tr r"></div>
+            <div id="ov" class="ov"><div style="height:40px;background-color:rgb(255,0,0)"></div></div>
+            <div id="ovr" class="ov r"><div style="height:40px;background-color:rgb(255,0,0)"></div></div>
+            <div class="fd"><span id="fd1">A</span><span id="fd2">B</span></div>
+            <div class="fd r"><span id="fdr1">A</span><span id="fdr2">B</span></div>
+            <section><div id="tps">A</div><div id="tp" class="tp">B</div></section>
+            <section><div id="tprs">A</div><div id="tpr" class="tp r">B</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 1000));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): the red pixels in a surface rect (clamped).
+    fn css_wide_rest_red(e: &crate::AetherEngine, x0: usize, x1: usize, y0: usize, y1: usize) -> usize {
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let mut n = 0;
+        for y in y0.min(sh)..y1.min(sh) {
+            for x in x0.min(sw)..x1.min(sw) {
+                if css_wide_red(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `position: initial` after `absolute` lays the box in flow: its sibling
+    /// sits below it; the absolute twin (inset, so not tree.rs's static-position fallback) takes no space, so its
+    /// sibling is at the section's top (armed).
+    #[test]
+    fn css_wide_rest_position_in_flow() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (_, st, ..) = imgalt_rect(&mut e, "pasec");
+        let (_, sbt, ..) = imgalt_rect(&mut e, "pas");
+        assert!((sbt - st).abs() <= 1.0, "the absolute box takes no space (armed): {sbt} vs {st}");
+        let (_, rt, ..) = imgalt_rect(&mut e, "par");
+        let (_, rbt, ..) = imgalt_rect(&mut e, "pars");
+        assert!(rbt >= rt + 29.0, "position: initial is static: the sibling below the 30px box: {rbt} vs {rt}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `float: unset` after `left`: the text no longer wraps beside the 50px box
+    /// but sits below it (the floated twin's text starts right of it, armed).
+    #[test]
+    fn css_wide_rest_float_unset() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (sl, ..) = imgalt_rect(&mut e, "fls");
+        assert!(sl >= 49.0, "the float's text beside it (armed): {sl}");
+        let (_, ft, ..) = imgalt_rect(&mut e, "flr");
+        let (rl, rt, ..) = imgalt_rect(&mut e, "flrs");
+        assert!(rl < 5.0, "float: unset: the text at the line start: {rl}");
+        assert!(rt >= ft + 39.0, "float: unset: the text below the 40px box: {rt} vs {ft}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `opacity: initial` after 0.5 paints full red (the 0.5 twin is pink, armed).
+    #[test]
+    fn css_wide_rest_opacity_full_ink() {
+        let mut e = css_wide_noninherited_rest_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "op", css_wide_red), 0, "opacity 0.5 red is pink (armed)");
+        assert!(css_wide_color_ink(&mut e, "opr", css_wide_red) > 100, "opacity: initial paints full red");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `transform: initial` after `translateX(100px)` paints the 50px box at its
+    /// untransformed x (red at 0..50, none at 100..150; the translated twin the reverse, armed).
+    #[test]
+    fn css_wide_rest_transform_untransformed() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (_, t, _, h) = imgalt_rect(&mut e, "tr");
+        let (y0, y1) = (t.ceil() as usize + 2, (t + h).floor() as usize - 2);
+        assert!(css_wide_rest_red(&e, 102, 148, y0, y1) > 100, "the translated box at 100 (armed)");
+        assert_eq!(css_wide_rest_red(&e, 2, 48, y0, y1), 0, "nothing at 0 (armed)");
+        let (_, t, _, h) = imgalt_rect(&mut e, "trr");
+        let (y0, y1) = (t.ceil() as usize + 2, (t + h).floor() as usize - 2);
+        assert!(css_wide_rest_red(&e, 2, 48, y0, y1) > 100, "transform: initial: the box at 0");
+        assert_eq!(css_wide_rest_red(&e, 102, 148, y0, y1), 0, "transform: initial: nothing at 100");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `overflow: initial` after `hidden`: the 40px red child paints below its
+    /// 10px parent (the hidden twin clips it, armed).
+    #[test]
+    fn css_wide_rest_overflow_paints() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (_, t, ..) = imgalt_rect(&mut e, "ov");
+        let t = t.ceil() as usize;
+        assert_eq!(css_wide_rest_red(&e, 0, 400, t + 14, t + 36), 0, "overflow: hidden clips the child (armed)");
+        let (_, t, ..) = imgalt_rect(&mut e, "ovr");
+        let t = t.ceil() as usize;
+        assert!(css_wide_rest_red(&e, 0, 400, t + 14, t + 36) > 1000, "overflow: initial: the child paints below");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `flex-direction: initial` after `column` puts the items in a row (the
+    /// column twin stacks them, armed).
+    #[test]
+    fn css_wide_rest_flex_direction_row() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (_, t1, ..) = imgalt_rect(&mut e, "fd1");
+        let (_, t2, ..) = imgalt_rect(&mut e, "fd2");
+        assert!(t2 >= t1 + 10.0, "the column twin stacks (armed): {t2} vs {t1}");
+        let (l1, t1, w1, _) = imgalt_rect(&mut e, "fdr1");
+        let (l2, t2, ..) = imgalt_rect(&mut e, "fdr2");
+        assert!((t2 - t1).abs() <= 2.0, "flex-direction: initial: one row: {t2} vs {t1}");
+        assert!(l2 >= l1 + w1 - 1.0, "flex-direction: initial: the second item right of the first: {l2} vs {l1} + {w1}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDREST (SR848): `top: initial` on a relative box is auto: no offset (the twin is 30px
+    /// further down from its sibling, armed).
+    #[test]
+    fn css_wide_rest_top_no_offset() {
+        let mut e = css_wide_noninherited_rest_engine();
+        let (_, s, ..) = imgalt_rect(&mut e, "tps");
+        let (_, b, ..) = imgalt_rect(&mut e, "tp");
+        let (_, rs, ..) = imgalt_rect(&mut e, "tprs");
+        let (_, rb, ..) = imgalt_rect(&mut e, "tpr");
+        assert!(((b - s) - (rb - rs) - 30.0).abs() <= 1.0, "top: initial drops the 30px offset: {} vs {}", b - s, rb - rs);
+    }
+
+    // ---- AETHERCSSWIDEBACKGROUNDIMAGENONE (LEDGER SR1015): an explicit background-image none clears an earlier rule's image (named tail block) ----
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): one 20px row per probe at 400 px wide, rows 12px apart, the image a
+    /// 2x2 opaque red PNG data: URL (decoded synchronously, tiled): `.im` and its `.im.r { background-image: none }`
+    /// twin, `.ii.r { background-image: initial }`, a green-plus-image `.bi` and its `.bi.r { background: initial }`
+    /// twin, `.bn.r { background: none }`, `.im.r.u` (a later url after none), and a green-plus-image `.ic` whose
+    /// `.ic.r { background-image: none }` twin keeps the green.
+    fn css_wide_bgnone_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .im, .ii, .bn { background-image: url(PNG) }
+            .im.r { background-image: none }
+            .ii.r { background-image: initial }
+            .bn.r { background: none }
+            .im.r.u { background-image: url(PNG) }
+            .bi { background: rgb(0, 160, 0) url(PNG) }
+            .bi.r { background: initial }
+            .ic { background: rgb(0, 160, 0) url(PNG) }
+            .ic.r { background-image: none }
+            </style></head><body style="margin:0">
+            <div id="im" class="im"></div>
+            <div id="imr" class="im r"></div>
+            <div id="iir" class="ii r"></div>
+            <div id="bi" class="bi"></div>
+            <div id="bir" class="bi r"></div>
+            <div id="bnr" class="bn r"></div>
+            <div id="imu" class="im r u"></div>
+            <div id="ic" class="ic"></div>
+            <div id="icr" class="ic r"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=");
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background-image: none` / `initial` and `background: none` after an
+    /// image rule paint no image ink (the `.im` twin paints red, armed).
+    #[test]
+    fn css_wide_bgnone_image_cleared() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "im", css_wide_red) > 100, "the .im image paints red (armed)");
+        for id in ["imr", "iir", "bnr"] {
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no image");
+        }
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background: initial` after a green colour plus an image resets both:
+    /// no red, no green (the `.bi` twin paints the image, armed).
+    #[test]
+    fn css_wide_bgnone_shorthand_initial() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 100, "the .bi image paints (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "bir", css_wide_red), 0, "background: initial: no image");
+        assert_eq!(css_wide_color_ink(&mut e, "bir", css_wide_green), 0, "background: initial: transparent");
+    }
+
+    /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): a later url after none paints; `background-image: none` over a green
+    /// colour plus an image keeps the green (the `.ic` twin paints red over it, armed).
+    #[test]
+    fn css_wide_bgnone_later_url_and_colour() {
+        let mut e = css_wide_bgnone_engine();
+        assert!(css_wide_color_ink(&mut e, "imu", css_wide_red) > 100, "a later url after none paints");
+        assert!(css_wide_color_ink(&mut e, "ic", css_wide_red) > 100, "the .ic image covers the green (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "icr", css_wide_red), 0, "background-image: none: no image");
+        assert!(css_wide_color_ink(&mut e, "icr", css_wide_green) > 100, "the green colour stays");
+    }
 }
