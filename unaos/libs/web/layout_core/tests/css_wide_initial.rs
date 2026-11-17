@@ -998,3 +998,109 @@ fn color_scheme_prefers_for_table() {
         assert!(!scheme_dark_for(s, true), "{s:?} (unspecified / normal) stays light under a dark host");
     }
 }
+
+// ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): system colour keywords stored as slots, resolved against the color-scheme (named tail block) ----
+
+use layout_core::css::system_color_index;
+use layout_core::{system_color, SYSTEM_COLORS};
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): a parent `#p`, its child `#c`, the child's child `#g`, each with its own
+/// cascaded declarations; the paint_map entries after `apply_specs` (the system colours resolved).
+fn sys_lay(p: &[(&str, &str)], c: &[(&str, &str)], g: &[(&str, &str)]) -> (Tree, N) {
+    let doc = page(vec![el("div", &[("id", "p")], vec![el("div", &[("id", "c")], vec![el("div", &[("id", "g"), ("style", "height: 10px")], vec![])])])]);
+    let sheet = Sheet(vec![
+        (doc.by_id("p").id, std::rc::Rc::new(styled(p))),
+        (doc.by_id("c").id, std::rc::Rc::new(styled(c))),
+        (doc.by_id("g").id, std::rc::Rc::new(styled(g))),
+    ]);
+    let tree = lay_styled(&doc, &sheet, 400.0, 300.0);
+    (tree, doc)
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): `color: CanvasText` keeps css_core's light carrier AND stores the keyword's
+/// slot (any case); a plain colour stores no slot; a CSS-wide keyword leaves the slot.
+#[test]
+fn system_color_parse_slot() {
+    let k = system_color_index("canvastext");
+    assert!(k.is_some(), "canvastext is a system colour");
+    let s = styled(&[("color", "CanvasText")]);
+    assert_eq!(s.paint.color, Some((0, 0, 0)), "the light carrier");
+    assert_eq!(s.paint.sys_color, k, "the slot");
+    assert_eq!(styled(&[("color", "CANVASTEXT")]).paint.sys_color, k, "case-insensitive");
+    assert_eq!(styled(&[("color", "black")]).paint.sys_color, None, "a plain colour: no slot");
+    assert_eq!(styled(&[("color", "CanvasText"), ("color", "inherit")]).paint.sys_color, k, "inherit leaves the slot");
+    let s = styled(&[("background", "Canvas no-repeat")]);
+    assert_eq!((s.paint.background, s.paint.sys_background), (Some((255, 255, 255)), system_color_index("canvas")), "background shorthand");
+    let s = styled(&[("background-color", "Field")]);
+    assert_eq!(s.paint.sys_background, system_color_index("field"), "background-color");
+    let s = styled(&[("border", "2px solid ButtonBorder")]);
+    assert_eq!(s.paint.sys_border, system_color_index("buttonborder").map(|k| (k, 15)), "border: all four sides");
+    let s = styled(&[("border", "2px solid red"), ("border-color", "ButtonBorder")]);
+    assert_eq!(s.paint.sys_border, system_color_index("buttonborder").map(|k| (k, 15)), "border-color: all four sides");
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): a later plain colour clears the slot (merge_paint carries the slot with its
+/// field); a later block that does not write the field keeps it.
+#[test]
+fn system_color_later_plain_clears() {
+    let s = cascade(&[&[("color", "CanvasText")], &[("color", "red")]]);
+    assert_eq!((s.paint.color, s.paint.sys_color), (Some((255, 0, 0)), None), "color: red clears the slot");
+    let s = cascade(&[&[("color", "CanvasText")], &[("width", "10px")]]);
+    assert_eq!(s.paint.sys_color, system_color_index("canvastext"), "an unrelated later block keeps it (armed)");
+    let s = cascade(&[&[("background", "Canvas")], &[("background-color", "blue")]]);
+    assert_eq!((s.paint.background, s.paint.sys_background), (Some((0, 0, 255)), None), "background-color: blue clears it");
+    let s = cascade(&[&[("border", "1px solid ButtonBorder")], &[("border", "1px solid green")]]);
+    assert_eq!(s.paint.sys_border, None, "a later plain border clears it");
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): a side longhand with a plain colour drops its side from the mask (that side
+/// is not recoloured); with the same keyword it stays.
+#[test]
+fn system_color_border_side_mask() {
+    let k = system_color_index("buttonborder").unwrap();
+    let s = styled(&[("border", "2px solid ButtonBorder"), ("border-left-color", "black")]);
+    assert_eq!(s.paint.sys_border, Some((k, 0b0111)), "border-left-color: black leaves the left side out");
+    let s = styled(&[("border", "2px solid ButtonBorder"), ("border-left-color", "ButtonBorder")]);
+    assert_eq!(s.paint.sys_border, Some((k, 15)), "the same keyword keeps the side");
+    let s = styled(&[("border", "2px solid red"), ("border-top-color", "ButtonBorder")]);
+    assert_eq!(s.paint.sys_border, Some((k, 1)), "a side longhand alone: its one side");
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): under `color-scheme: dark` on the parent the child's CanvasText is white,
+/// Canvas #121212, ButtonBorder the dark frame #858585, LinkText #9e9eff; the light twin keeps css_core's values; a
+/// `background-color: inherit` grandchild copies the parent's RESOLVED colour (the pass runs before inherit_box_pass).
+#[test]
+fn system_color_resolves_dark_tree() {
+    let child = [("color", "CanvasText"), ("background-color", "Canvas"), ("border", "2px solid ButtonBorder")];
+    let grand = [("background-color", "inherit")];
+    let (tree, doc) = sys_lay(&[("color-scheme", "dark")], &child, &grand);
+    let c = &tree.paint_map[&id_of(&tree, &doc.by_id("c"))];
+    let g = &tree.paint_map[&id_of(&tree, &doc.by_id("g"))];
+    assert_eq!(c.color, Some((255, 255, 255)), "dark CanvasText is white");
+    assert_eq!(c.background, Some((18, 18, 18)), "dark Canvas is #121212");
+    assert_eq!(c.border.map(|b| b.map(|s| s.map(|x| x.1))), Some([Some((133, 133, 133)); 4]), "dark ButtonBorder");
+    assert_eq!(g.background, Some((18, 18, 18)), "background-color: inherit takes the resolved #121212");
+    let (tree, doc) = sys_lay(&[], &child, &grand);
+    let c = &tree.paint_map[&id_of(&tree, &doc.by_id("c"))];
+    assert_eq!(c.color, Some((0, 0, 0)), "light twin: black (armed)");
+    assert_eq!(c.background, Some((255, 255, 255)), "light twin: white");
+    assert_eq!(c.border.map(|b| b.map(|s| s.map(|x| x.1))), Some([Some((0, 0, 0)); 4]), "light twin: css_core's ButtonBorder");
+    let (tree, doc) = sys_lay(&[("color-scheme", "dark")], &[("color", "LinkText")], &[]);
+    assert_eq!(tree.paint_map[&id_of(&tree, &doc.by_id("c"))].color, Some((158, 158, 255)), "dark LinkText");
+    let (tree, doc) = sys_lay(&[("color-scheme", "dark")], &[("color-scheme", "normal"), ("color", "CanvasText")], &[]);
+    assert_eq!(tree.paint_map[&id_of(&tree, &doc.by_id("c"))].color, Some((0, 0, 0)), "normal on the element itself is light");
+}
+
+/// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the ONE table covers css_core's system words, and the light value is
+/// css_core's own.
+#[test]
+fn system_color_table() {
+    for (i, (name, _)) in SYSTEM_COLORS.iter().enumerate() {
+        let c = css_core::color::named(name).unwrap_or_else(|| panic!("{name} is css_core's"));
+        let rgb = (c.r as u8, c.g as u8, c.b as u8);
+        assert_eq!(system_color::<TH>(i as u8, None), Some(rgb), "{name}: light is css_core's");
+        assert_eq!(system_color_index(name), Some(i as u8));
+    }
+    assert_eq!(system_color::<TH>(system_color_index("canvas").unwrap(), Some(2)), Some((18, 18, 18)));
+    assert_eq!(system_color::<TH>(system_color_index("mark").unwrap(), Some(2)), Some((255, 255, 0)), "a None word keeps light");
+}

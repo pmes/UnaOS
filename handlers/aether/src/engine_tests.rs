@@ -8125,4 +8125,89 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
     }
 
+
+    // ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): the system colour keywords paint and read under the element's color-scheme (named tail block) ----
+
+    /// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): a red body (red ink, red ground, so black / white / #121212 all stand out)
+    /// under `:root { color-scheme: <scheme> }`: `#t` CanvasText text, `#bg` a Canvas box, `#bb` a 4px ButtonBorder frame,
+    /// `#lk` LinkText text, `#ch` a span with no colour of its own inside a CanvasText `#cp`.
+    fn system_color_engine(scheme: &str) -> crate::AetherEngine {
+        let html = format!(r##"<!doctype html><html><head><style>
+            :root {{ color-scheme: {scheme} }}
+            body {{ margin: 0; font: 20px serif; color: rgb(255, 0, 0); background: rgb(255, 0, 0) }}
+            div {{ margin: 0 0 12px }}
+            #t {{ color: CanvasText }}
+            #bg {{ background: Canvas; height: 20px }}
+            #bb {{ border: 4px solid; border-color: ButtonBorder; width: 100px; height: 20px }}
+            #lk {{ color: LinkText }}
+            #cp {{ color: CanvasText }}
+            </style></head><body>
+            <div id="t">Text</div>
+            <div id="bg"></div>
+            <div id="bb"></div>
+            <div id="lk">Link</div>
+            <div id="cp"><span id="ch">Kid</span></div>
+        </body></html>"##);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn system_color_white(c: (u8, u8, u8)) -> bool {
+        c.0 > 200 && c.1 > 200 && c.2 > 200
+    }
+
+    fn system_color_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 60 && c.1 < 60 && c.2 < 60
+    }
+
+    fn system_color_dark_canvas(c: (u8, u8, u8)) -> bool {
+        c == (18, 18, 18)
+    }
+
+    fn system_color_dark_frame(c: (u8, u8, u8)) -> bool {
+        c == (133, 133, 133)
+    }
+
+    fn system_color_dark_link(c: (u8, u8, u8)) -> bool {
+        c.2 > 230 && (140..176).contains(&c.0) && (140..176).contains(&c.1)
+    }
+
+    /// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): `color: CanvasText` under dark paints white text and getComputedStyle
+    /// reads `rgb(255, 255, 255)`; a child with no colour of its own inherits the white.
+    #[test]
+    fn system_color_dark_canvastext_ink() {
+        let mut e = system_color_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "t", system_color_white) > 3, "CanvasText is white under dark");
+        assert_eq!(css_wide_color_ink(&mut e, "t", system_color_black), 0, "no black text");
+        assert_eq!(font_shorthand_cs(&mut e, "t", "color"), "rgb(255, 255, 255)", "the CSSOM reads the resolved white");
+        assert!(css_wide_color_ink(&mut e, "ch", system_color_white) > 3, "the child inherits the white");
+    }
+
+    /// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): Canvas paints #121212, ButtonBorder the dark frame #858585, LinkText
+    /// #9e9eff under dark.
+    #[test]
+    fn system_color_dark_background_border_link() {
+        let mut e = system_color_engine("dark");
+        assert!(css_wide_color_ink(&mut e, "bg", system_color_dark_canvas) > 100, "Canvas is #121212 under dark");
+        assert!(css_wide_color_ink(&mut e, "bb", system_color_dark_frame) > 100, "ButtonBorder is #858585 under dark");
+        assert!(css_wide_color_ink(&mut e, "lk", system_color_dark_link) > 3, "LinkText is #9e9eff under dark");
+    }
+
+    /// AETHERCOLORSCHEMESYSTEMCOLORS (SR1046): the light twins (armed): css_core's light values, as before this arc.
+    #[test]
+    fn system_color_light_twins() {
+        for scheme in ["light", "normal", "light dark"] {
+            let mut e = system_color_engine(scheme);
+            assert!(css_wide_color_ink(&mut e, "t", system_color_black) > 3, "{scheme}: CanvasText is black");
+            assert_eq!(css_wide_color_ink(&mut e, "t", system_color_white), 0, "{scheme}: no white text");
+            assert_eq!(font_shorthand_cs(&mut e, "t", "color"), "rgb(0, 0, 0)", "{scheme}: the CSSOM reads black");
+            assert!(css_wide_color_ink(&mut e, "bg", system_color_white) > 100, "{scheme}: Canvas is white");
+            assert_eq!(css_wide_color_ink(&mut e, "bg", system_color_dark_canvas), 0, "{scheme}: no #121212");
+            assert_eq!(css_wide_color_ink(&mut e, "bb", system_color_dark_frame), 0, "{scheme}: no dark frame");
+            assert_eq!(css_wide_color_ink(&mut e, "lk", system_color_dark_link), 0, "{scheme}: no dark link blue");
+        }
+    }
 }
