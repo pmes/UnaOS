@@ -146,3 +146,28 @@ fn nlexfadepower_xfade_weight_tracks_sine_and_cosine() {
     // clamped past the end; linear the identity
     assert_eq!((xfade_weight(Curve::EqualPower, ENV_ONE + 9), xfade_weight(Curve::Linear, ENV_ONE + 9)), (ENV_ONE, ENV_ONE));
 }
+
+// ---- STRIAKMUTE (LEDGER SR9017): the schedule's winner, now pub, is the kernel Player's shown clip (named tail block) ----
+
+/// M3: `schedule::top` follows `Timeline::active_tracks`: unflagged -> the top video track; V2 muted -> V1; V1 solo -> V1;
+/// both video tracks muted -> none; the audio winner is A1; a gap tick -> none.
+#[test]
+fn striakmute_top_follows_active_tracks() {
+    use timeline_core::schedule::top;
+    let mut tl = Timeline::new(25);
+    let (a, b) = (tl.add_source("A", 50), tl.add_source("B", 50));
+    let (v1, v2, a1) = (tl.add_track(Kind::Video), tl.add_track(Kind::Video), tl.add_track(Kind::Audio));
+    tl.tracks[v1].clips = vec![Clip::new(a, 0, 10, 0)];
+    tl.tracks[v2].clips = vec![Clip::new(b, 0, 10, 0)];
+    tl.tracks[a1].clips = vec![Clip::new(a, 0, 10, 0)];
+    assert_eq!(top(&tl, Kind::Video, 3), Some((v2, 0)), "unflagged: the top track");
+    let m = tl.set_track_flags(v2, true, false).unwrap();
+    assert_eq!(top(&m, Kind::Video, 3), Some((v1, 0)), "V2 muted: V1 is shown");
+    let s = tl.set_track_flags(v1, false, true).unwrap();
+    assert_eq!(top(&s, Kind::Video, 3), Some((v1, 0)), "V1 solo: V1 is shown");
+    let none = m.set_track_flags(v1, true, false).unwrap();
+    assert_eq!(top(&none, Kind::Video, 3), None, "every video track muted: nothing shown");
+    assert_eq!(top(&tl, Kind::Audio, 3), Some((a1, 0)));
+    assert_eq!(top(&tl, Kind::Video, 12), None, "a gap");
+    println!("striakmute: top follows active_tracks");
+}
