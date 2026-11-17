@@ -780,7 +780,6 @@ fn css_wide_revert_all() {
     let s = cascade(&[armed, &[("all", "revert-layer")]]);
     assert_eq!(s.paint.color, Some(ALL_RED), "all: revert-layer is dropped (owed)");
 }
-
 // ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
 
 use layout_core::css::{parse_declaration_block, REVERT_BORDER, REVERT_DISPLAY, REVERT_MARGIN};
@@ -919,4 +918,120 @@ fn css_wide_revert_noninherited_all() {
     assert_eq!((s.display, s.paint.display_kind), (None, None), "all: revert: display");
     assert_eq!(s.paint.background, None, "all: revert: background colour");
     assert_eq!(s.paint.border, None, "all: revert: border");
+}
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the RGB a `border: 1px solid <c>` side parses to (the arm's own colour road).
+fn stored_rgb(c: &str) -> (u8, u8, u8) {
+    styled(&[("border", format!("1px solid {c}").as_str())]).paint.border.expect("border")[0].expect("side").1
+}
+
+const STORED_GREY: (u8, u8, u8) = (128, 128, 128);
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-color: red` alone builds no frame (style none: Chromium paints nothing);
+/// before SR1058 it built `Some([Some((1.0, red)); 4])`. The colour pends for the four sides; `currentcolor` pends the
+/// grey carrier with its currentcolor answer.
+#[test]
+fn border_color_stored_alone_no_frame() {
+    let red = stored_rgb("red");
+    let s = styled(&[("border-color", "red")]);
+    assert_eq!(s.paint.border, None, "no frame");
+    assert_eq!(s.paint.border_pending, Some([Some((red, false)); 4]), "red pends on four sides");
+    let s = styled(&[("border-color", "currentcolor")]);
+    assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some((STORED_GREY, true)); 4])));
+    let s = styled(&[("border-top-color", "red")]);
+    assert_eq!((s.paint.border, s.paint.currentcolor), (None, 0), "a lone longhand: no side, no bit");
+    assert_eq!(s.paint.border_pending, Some([Some((red, false)), None, None, None]), "the top pends");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-width` creates the absent sides from the pending colour (the bit from the
+/// entry), the rest at the grey carrier with the currentcolor bit, as before.
+#[test]
+fn border_color_stored_width_creates() {
+    let red = stored_rgb("red");
+    let s = styled(&[("border-color", "red"), ("border-width", "2px")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)); 4]));
+    assert_eq!(s.paint.currentcolor, 0);
+    let s = styled(&[("border-top-color", "red"), ("border-width", "2px")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((2.0, STORED_GREY)), Some((2.0, STORED_GREY)), Some((2.0, STORED_GREY))]));
+    assert_eq!(s.paint.currentcolor, 0b1110, "the top is red, the others the initial currentcolor");
+    let s = styled(&[("border-top-color", "currentcolor"), ("border-width", "2px")]);
+    assert_eq!(s.paint.currentcolor & 1, 1, "a pending currentcolor carries the SR849 bit");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): a style declaration creates the sides that have a pending colour (either order in
+/// the block keeps the 1px frame the fabricated road drew); a style alone still creates none (owed: SIDE-STYLE-WIDTH).
+#[test]
+fn border_color_stored_style_creates() {
+    let red = stored_rgb("red");
+    for d in [[("border-color", "red"), ("border-style", "solid")], [("border-style", "solid"), ("border-color", "red")]] {
+        assert_eq!(styled(&d).paint.border, Some([Some((1.0, red)); 4]), "{d:?}");
+    }
+    let s = styled(&[("border-top-color", "red"), ("border-top-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, red)), None, None, None]), "the top only");
+    assert_eq!(styled(&[("border-style", "solid")]).paint.border, None, "a style alone: none (owed)");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): an absent entry of an existing border is no longer fabricated when the block
+/// declared no style (before: three 1px red sides); with a style word in the block the absent sides are created at 1px
+/// (the in-block style rule: `border_style` is one array for the block, so which side declared it is not known:
+/// AETHER-CSS-BORDER-STYLE-PER-SIDE owed); an existing side is recoloured as before.
+#[test]
+fn border_color_stored_absent_entry_and_existing() {
+    let (red, blue) = (stored_rgb("red"), stored_rgb("blue"));
+    assert_ne!(red, blue, "armed: two colours");
+    let s = styled(&[("border-top", "2px blue"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), None, None, None]), "no style in the block: the top only");
+    let s = styled(&[("border-top", "2px solid"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((1.0, red)), Some((1.0, red)), Some((1.0, red))]), "a style word: created at 1px");
+    let s = styled(&[("border", "1px solid blue"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, red)); 4]), "the existing road");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): css-backgrounds-3 §3.4 / §3.5: the `border` and `border-<side>` shorthands set
+/// the colour longhand (omitted = the initial currentcolor), so a pending colour before them does not reach their
+/// sides (Chromium paints currentcolor).
+#[test]
+fn border_color_stored_shorthand_resets() {
+    use layout_core::paint::CC_SIDES;
+    let s = styled(&[("border-top-color", "red"), ("border-top", "1px solid")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((1.0, STORED_GREY)));
+    assert_eq!(s.paint.currentcolor & 1, 1, "the top is currentcolor");
+    let s = styled(&[("border-color", "red"), ("border", "1px solid")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, STORED_GREY)); 4]));
+    assert_eq!(s.paint.currentcolor, CC_SIDES);
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the merge road: a later rule's pending colour recolours the earlier rule's sides,
+/// width kept (before: the later block's fabricated 1px frame replaced the 3px border; a lone side longhand dropped);
+/// a later shorthand resets to currentcolor; a later currentcolor sets the side bit; an earlier style-only rule takes a
+/// later colour as a 1px frame (the in-block rule across rules; Chromium's medium 3px owed).
+#[test]
+fn border_color_stored_merge() {
+    let (red, blue) = (stored_rgb("red"), stored_rgb("blue"));
+    let s = cascade(&[&[("border", "3px solid blue")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((3.0, red)); 4]), "3px kept, red");
+    let s = cascade(&[&[("border", "2px solid blue")], &[("border-top-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((2.0, blue)), Some((2.0, blue)), Some((2.0, blue))]));
+    let s = cascade(&[&[("border-left-color", "red")], &[("border-left", "1px solid")]]);
+    assert_eq!(s.paint.border.expect("border")[3], Some((1.0, STORED_GREY)), "the later shorthand resets");
+    assert_eq!(s.paint.currentcolor & 8, 8);
+    let s = cascade(&[&[("border", "2px solid red")], &[("border-top-color", "currentcolor")]]);
+    assert_eq!(s.paint.currentcolor, 1, "the top bit from the pending entry");
+    let s = cascade(&[&[("border-style", "solid")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((1.0, red)); 4]), "style then colour across rules: the 1px frame");
+    let s = cascade(&[&[("border-color", "red")]]);
+    assert_eq!(s.paint.border, None, "a colour alone across the merge: no frame");
+    let s = cascade(&[&[("border-style", "none")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([None; 4]), "an explicit none is not revived");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `transparent` forgets a pending entry; `border: inherit` forgets the block's.
+#[test]
+fn border_color_stored_transparent_and_inherit() {
+    let s = styled(&[("border-top-color", "red"), ("border-top-color", "transparent"), ("border-width", "2px")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, STORED_GREY)));
+    assert_eq!(s.paint.currentcolor & 1, 1);
+    assert_eq!(styled(&[("border-color", "red"), ("border", "inherit")]).paint.border_pending, None);
 }

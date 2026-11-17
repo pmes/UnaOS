@@ -7967,4 +7967,66 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "hp", "fontSize"), "20px", "a hidden div the same");
         assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
     }
+
+    // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending border colour paints only where a side exists (named tail block) ----
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): one 40x20 box per row, rows 12px apart, under a green parent: `#ca`
+    /// `border-color: red` alone; `#cb` `border: 2px solid blue; border-color: red`; `#cc` the sheet's `.p { border: 2px
+    /// solid blue } .p.q { border-top-color: red }`; `#cd` `.p.r { border-color: red }` over `.p`; `#ce` `border-color: red;
+    /// border-width: 2px`; `#cf` a button with `border-color: red`; `#cg` a plain button (control).
+    fn border_color_stored_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .p { border: 2px solid blue }
+            .p.q { border-top-color: red }
+            .p.r { border-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="ca" style="width:40px;height:20px;border-color:red"></div>
+            <div id="cb" style="width:40px;height:20px;border:2px solid blue;border-color:red"></div>
+            <div id="cc" class="p q" style="width:40px;height:20px"></div>
+            <div id="cd" class="p r" style="width:40px;height:20px"></div>
+            <div id="ce" style="width:40px;height:20px;border-color:red;border-width:2px"></div>
+            <div><button id="cf" style="width:60px;height:24px;border-color:red"></button></div>
+            <div><button id="cg" style="width:60px;height:24px"></button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): `border-color: red` alone paints no red (style none, as Chromium; before SR1058
+    /// a 1px red frame); armed: `#cb` paints red and `#ce` (`border-width` creates the sides from the pending red) too.
+    #[test]
+    fn border_color_stored_alone_paints_nothing() {
+        let mut e = border_color_stored_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "ca", css_wide_red), 0, "#ca paints no red");
+        assert!(css_wide_color_ink(&mut e, "cb", css_wide_red) > 40, "armed: #cb paints a red frame");
+        assert!(css_wide_color_ink(&mut e, "ce", css_wide_red) > 40, "#ce: border-width takes the pending red");
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): the merge road: a later rule's `border-top-color` reaches the earlier rule's top
+    /// (before: dropped, the top stayed blue), the other edges stay blue; a later `border-color` recolours all four.
+    #[test]
+    fn border_color_stored_merge_paints() {
+        let mut e = border_color_stored_engine();
+        let edges = border_side_color_edges(&mut e, "cc");
+        assert!(css_wide_red(edges[0]), "#cc: the top is red: {:?}", edges[0]);
+        for (i, c) in edges.iter().enumerate().skip(1) {
+            assert!(css_wide_blue(*c), "#cc: side {i} stays blue: {c:?}");
+        }
+        for (i, c) in border_side_color_edges(&mut e, "cd").iter().enumerate() {
+            assert!(css_wide_red(*c), "#cd: side {i} is red: {c:?}");
+        }
+    }
+
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): a control's theme frame takes the pending colour (`pending_frame`): `#cf`
+    /// paints red; armed: the plain `#cg` paints none.
+    #[test]
+    fn border_color_stored_button_frame() {
+        let mut e = border_color_stored_engine();
+        assert!(css_wide_color_ink(&mut e, "cf", css_wide_red) > 20, "#cf: a red frame");
+        assert_eq!(css_wide_color_ink(&mut e, "cg", css_wide_red), 0, "armed: #cg paints no red");
+    }
 }

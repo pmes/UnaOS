@@ -2975,7 +2975,7 @@ fn frame_walk(
                 // outer edge of the (2px) UA border; checkboxes and radios
                 // are drawn whole below.
                 let mut border = spec.border.map(|b| layout_core::paint::border_ink(b, spec.currentcolor, inherited.color)).or(if is_control && !checkable && !image_input && !file_input {
-                    Some([Some((1.0, (118, 118, 118))); 4])
+                    Some(layout_core::paint::pending_frame(spec.border_pending, inherited.color))
                 } else {
                     None
                 });
