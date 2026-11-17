@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } match prop {
+    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } match prop { "all" => apply_css_wide_all(value, style, cx),
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -1598,7 +1598,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "text-decoration" | "text-decoration-line" => {
-            let v = value.trim(); deco_shorthand_color::<H>(prop, v, &mut style.paint);
+            let v = value.trim(); deco_shorthand_rest::<H>(prop, v, &mut style.paint, cx);
             if v.contains("underline") {
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
@@ -1612,6 +1612,26 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "text-decoration-color" => {
             if let Some(c) = deco_color_value::<H>(value) {
                 style.paint.decoration_color = Some(c);
+            }
+        }
+        "text-decoration-style" => {
+            if let Some(k) = deco_style_code(value) {
+                style.paint.decoration_style = Some(k);
+            }
+        }
+        "text-decoration-thickness" => {
+            if let Some(t) = deco_thickness_value(value, cx) {
+                style.paint.decoration_thickness = Some(t);
+            }
+        }
+        "text-underline-offset" => {
+            if let Some(o) = underline_offset_value(value, cx) {
+                style.paint.underline_offset = Some(o);
+            }
+        }
+        "text-underline-position" => {
+            if let Some(p) = underline_position_code(value) {
+                style.paint.underline_position = Some(p);
             }
         }
         "white-space" | "white-space-collapse" => {
@@ -2591,7 +2611,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
-        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, unicode_bidi, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
@@ -3692,10 +3712,11 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         }
         "background" | "background-image" => "none",
         "display" => "inline",
+        "color" if value.eq_ignore_ascii_case("initial") => "black", // SR1021: css-color-4 CanvasText (light scheme); unset stays inherit (css_wide)
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", // SR1014 fold: the branch's table row
+        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", "text-underline-offset" => "auto", // SR1014 fold: the branch's table row; SR1045 the offset's
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -3897,12 +3918,34 @@ fn deco_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8)>> {
 /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the `text-decoration` shorthand (css-text-decor-3 §2.4) sets its colour
 /// longhand: the first top-level token that is a colour (or `currentcolor`), else the initial currentcolor (the reset);
 /// `inherit` / `revert` leave it. `text-decoration-line` never touches it.
-fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>) {
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the same ONE pass reads the style word ([`deco_style_code`]) and the
+/// thickness (`auto` / `from-font` / a length, [`deco_thickness_value`]) in any order beside the colour; each the value
+/// omits resets to its initial (solid, auto).
+fn deco_shorthand_rest<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>, cx: &ParseCx) {
     if prop != "text-decoration" || v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("revert") {
         return;
     }
-    let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
+    let (mut c, mut style, mut thick) = (None, None, None);
+    for p in split_top_level(v) {
+        if style.is_none() && !p.eq_ignore_ascii_case("initial") && !p.eq_ignore_ascii_case("unset") {
+            if let Some(k) = deco_style_code(p) {
+                style = Some(k);
+                continue;
+            }
+        }
+        if thick.is_none() && !p.eq_ignore_ascii_case("initial") && !p.eq_ignore_ascii_case("unset") {
+            if let Some(t) = deco_thickness_value(p, cx) {
+                thick = Some(t);
+                continue;
+            }
+        }
+        if c.is_none() {
+            c = deco_color_value::<H>(p);
+        }
+    }
     paint.decoration_color = Some(c.unwrap_or(None));
+    paint.decoration_style = Some(style.unwrap_or(0));
+    paint.decoration_thickness = Some(thick.unwrap_or(None));
 }
 
 // ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property writes an explicit-inherit bit the layout resolves against the parent (named tail block) ----
@@ -4008,6 +4051,166 @@ fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>)
     }
     style.set_inherit_box(bit);
     true
+}
+
+// ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style and -thickness values (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a `text-decoration-style` keyword as [`PaintStyle::decoration_style`]'s
+/// code: 0 solid 1 double 2 dotted 3 dashed 4 wavy; `initial` / `unset` (not inherited) are solid; anything else None.
+pub fn deco_style_code(v: &str) -> Option<u8> {
+    let v = v.trim();
+    let is = |k: &str| v.eq_ignore_ascii_case(k);
+    if is("solid") || is("initial") || is("unset") {
+        Some(0)
+    } else if is("double") {
+        Some(1)
+    } else if is("dotted") {
+        Some(2)
+    } else if is("dashed") {
+        Some(3)
+    } else if is("wavy") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a `text-decoration-thickness` value in the
+/// [`PaintStyle::decoration_thickness`] marker shape: `auto`, `from-font` (the face's thickness either way:
+/// AETHER-CSS-TEXT-DECORATION-FROM-FONT owed), `initial` and `unset` are `Some(None)`; a non-negative length is
+/// `Some(Some(px))` through [`parse_px`] (em at the parse context's font); a bare non-zero number, a percentage
+/// (AETHER-CSS-TEXT-DECORATION-THICKNESS-PERCENT owed) or anything else None.
+fn deco_thickness_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("from-font") || v.eq_ignore_ascii_case("initial")
+        || v.eq_ignore_ascii_case("unset")
+    {
+        return Some(None);
+    }
+    if v.ends_with('%') || !v.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let bare = v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if bare && v.parse::<f32>().ok() != Some(0.0) {
+        return None;
+    }
+    parse_px(v, cx).filter(|px| *px >= 0.0).map(Some)
+}
+
+// ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
+
+/// AETHERCSSWIDEALL (SR1021): the longhands `all` resets (css-cascade-4 §3.1): every longhand arm of
+/// [`apply_declaration`] except `direction`. THE one list of the parsed longhand names; `css_wide_all_list_covers_arms`
+/// (tests/css_wide_initial.rs) pins that every arm name is here or in [`ALL_SKIPPED`], so a new arm reds the pin.
+pub const ALL_LONGHANDS: &[&str] = &[
+    "display", "list-style-type", "content", "counter-reset", "counter-set", "counter-increment", "quotes",
+    "flex-direction", "flex-wrap", "row-gap", "column-gap", "flex-grow", "flex-shrink", "flex-basis",
+    "width", "min-width", "max-width", "height", "min-height", "max-height",
+    "table-layout", "border-collapse", "caption-side", "border-spacing",
+    "overflow-x", "overflow-y", "scrollbar-gutter", "scroll-behavior", "scroll-snap-type", "scroll-snap-align", "scroll-snap-stop",
+    "scroll-padding-top", "scroll-padding-right", "scroll-padding-bottom", "scroll-padding-left",
+    "scroll-margin-top", "scroll-margin-right", "scroll-margin-bottom", "scroll-margin-left",
+    "padding-top", "padding-right", "padding-bottom", "padding-left",
+    "margin-top", "margin-right", "margin-bottom", "margin-left",
+    "position", "z-index", "top", "right", "bottom", "left",
+    "aspect-ratio", "transform", "translate", "rotate", "scale", "transform-origin", "transform-style", "backface-visibility", "perspective", "perspective-origin", "transform-box",
+    "clip-path", "will-change", "container-type", "container-name", "contain",
+    "writing-mode", "text-combine-upright", "text-orientation",
+    "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
+    "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
+    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content",
+    "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
+    "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
+    "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
+    "text-decoration-line", "white-space", "white-space-collapse", "word-break", "overflow-wrap", "box-sizing", "text-transform", "text-underline-offset", "text-underline-position", "text-decoration-color", "text-decoration-style", "text-decoration-thickness", // SR1045 (SR1018 / SR1038 arms)
+    "object-fit", "object-position", "mask-image", "mask-size", "mask-position", "mask-repeat",
+    "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+    "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
+    "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
+    "outline-style", "outline-width", "outline-color", "outline-offset",
+    "cursor",
+];
+
+/// AETHERCSSWIDEALL (SR1021): the arm names `all` does not iterate, by reason.
+pub const ALL_SKIPPED: &[&str] = &[
+    // css-cascade-4 §3.1: `all` leaves `direction` (and `unicode-bidi`, which has no arm); `all` is this arm.
+    "direction", "all",
+    // SHORTHANDS: reset through their longhands, which are listed (the `border-width` shorthand under initial / unset would write 3px into every side of `paint.border` and re-create the sides `border-*-style: none` cleared).
+    "list-style", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
+    // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
+    "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
+    // ALIAS spellings of a listed name (the same field, the same value grammar).
+    "grid-gap", "grid-row-gap", "grid-column-gap", "-webkit-text-combine", "-ms-text-combine-horizontal", "page-break-before", "page-break-after", "page-break-inside", "-webkit-column-break-before", "-webkit-column-break-after", "-webkit-column-break-inside", "-webkit-box-shadow", "word-wrap", "-webkit-mask", "-webkit-mask-image", "-webkit-mask-size", "-webkit-mask-position", "-webkit-mask-repeat",
+];
+
+/// AETHERCSSWIDEALL (SR1021): `all: inherit | initial | unset` applies the keyword to each of [`ALL_LONGHANDS`] through
+/// [`apply_declaration`] itself, so each rides its own road: the inherit bits (SR815 / SR823 / SR831) and SR832's
+/// [`noninherited_initial`] table; an arm with no keyword road drops it as when the keyword is written alone. The later
+/// declaration wins through the same field writes. `revert` / `revert-layer` are dropped as every arm drops them
+/// (AETHER-CSS-WIDE-REVERT owed); any other value is invalid: dropped and recorded.
+fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    let kw = value.trim().to_ascii_lowercase();
+    match kw.as_str() {
+        "inherit" | "initial" | "unset" => {
+            for &name in ALL_LONGHANDS {
+                apply_declaration(name, &kw, style, cx);
+            }
+        }
+        "revert" | "revert-layer" => {}
+        _ => H::record_css(&format!("all-value:{}", clip(value))),
+    }
+}
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset and text-underline-position values (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-position` value (css-text-decor-4 §2.5:
+/// `auto | [ from-font | under ] || [ left | right ]`) as [`PaintStyle::underline_position`]'s code: 0 auto (and
+/// `initial`), 1 from-font, 2 under. `left` / `right` place the line in VERTICAL writing only, so they keep the
+/// horizontal part (bare `left` / `right` = auto; AETHER-CSS-TEXT-UNDERLINE-POSITION-VERTICAL owed). Anything else None
+/// (`inherit` / `unset` never reach here: the inherit bit takes them in `css_wide`).
+pub fn underline_position_code(v: &str) -> Option<u8> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") {
+        return Some(0);
+    }
+    let (mut horiz, mut side) = (None, false);
+    for w in v.split_ascii_whitespace() {
+        let is = |k: &str| w.eq_ignore_ascii_case(k);
+        if (is("from-font") || is("under")) && horiz.is_none() {
+            horiz = Some(if is("under") { 2 } else { 1 });
+        } else if (is("left") || is("right")) && !side {
+            side = true;
+        } else {
+            return None;
+        }
+    }
+    if horiz.is_none() && !side {
+        return None;
+    }
+    Some(horiz.unwrap_or(0))
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): a `text-underline-offset` value (css-text-decor-4 §2.6) in the
+/// [`PaintStyle::underline_offset`] marker shape: `auto` (and `initial` / `unset`, which SR832's table rewrites to it)
+/// is `Some(None)`; a length, negative allowed, is `Some(Some(px))` through [`parse_px`] (em at the parse context's
+/// font); a percentage is of 1em (`N%` = `N/100 em`); a bare non-zero number, `inherit` or anything else None.
+fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
+        return Some(None);
+    }
+    if let Some(n) = v.strip_suffix('%') {
+        let pct = n.trim().parse::<f32>().ok()?;
+        return parse_px(&format!("{}em", pct / 100.0), cx).map(Some);
+    }
+    if !v.starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '-' || c == '+') {
+        return None;
+    }
+    let bare = v.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+');
+    if bare && v.parse::<f32>().ok() != Some(0.0) {
+        return None;
+    }
+    parse_px(v, cx).filter(|px| px.is_finite()).map(Some)
 }
 
 // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): css-writing-modes-4 §2.2 unicode-bidi keyword codes (named tail block) ----

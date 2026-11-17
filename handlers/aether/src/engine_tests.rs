@@ -7372,6 +7372,269 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "gi", "backgroundColor"), "rgb(255, 0, 0)", "getComputedStyle reads red");
     }
 
+    // ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style / -thickness paint (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): one 20px serif row per probe (the face's thickness 2px), black
+    /// text, red decorations, rows 20px apart: `#ds` solid underline (the twin), `#dw` wavy, `#dd` double, `#do` dotted,
+    /// `#dk` `text-decoration-thickness: 4px`, `#dh` the shorthand `underline wavy red 2px`; `#ls` / `#lw` line-through
+    /// solid / wavy.
+    fn text_decoration_style_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px; text-decoration-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="ds" style="text-decoration-line:underline">Hgjx Hgjx</div>
+            <div id="dw" style="text-decoration-line:underline;text-decoration-style:wavy">Hgjx Hgjx</div>
+            <div id="dd" style="text-decoration-line:underline;text-decoration-style:double">Hgjx Hgjx</div>
+            <div id="do" style="text-decoration-line:underline;text-decoration-style:dotted">Hgjx Hgjx</div>
+            <div id="dk" style="text-decoration-line:underline;text-decoration-thickness:4px">Hgjx Hgjx</div>
+            <div id="dh" style="text-decoration:underline wavy red 2px">Hgjx Hgjx</div>
+            <div id="ls" style="text-decoration-line:line-through">Hgjx Hgjx</div>
+            <div id="lw" style="text-decoration-line:line-through;text-decoration-style:wavy">Hgjx Hgjx</div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 800));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the red pixels of element `id`'s rect extended 8px down, as
+    /// (the sorted distinct rows holding red, the sorted distinct columns holding red).
+    fn text_decoration_style_red(e: &mut crate::AetherEngine, id: &str) -> (Vec<usize>, Vec<usize>) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 8).min(sh));
+        let (mut rows, mut cols) = (Vec::new(), Vec::new());
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if css_wide_red(imgalt_px(e, x, y)) {
+                    rows.push(y);
+                    cols.push(x);
+                }
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        cols.sort_unstable();
+        cols.dedup();
+        (rows, cols)
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a wavy underline paints red above AND below the rows the solid
+    /// twin paints (the twin: one band of the face's thickness, 2 rows); the shorthand `underline wavy red 2px` the same.
+    #[test]
+    fn text_decoration_style_wavy_above_and_below() {
+        let mut e = text_decoration_style_engine();
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert_eq!(solid.len(), 2, "armed: the solid twin paints one 2-row band, got {solid:?}");
+        let solid_top = solid[0] as i64 - imgalt_rect(&mut e, "ds").1.floor() as i64;
+        let solid_bot = *solid.last().unwrap() as i64 - imgalt_rect(&mut e, "ds").1.floor() as i64;
+        for id in ["dw", "dh"] {
+            let (wavy, _) = text_decoration_style_red(&mut e, id);
+            assert!(!wavy.is_empty(), "#{id} paints red");
+            let top = imgalt_rect(&mut e, id).1.floor() as i64;
+            assert!((wavy[0] as i64 - top) < solid_top, "#{id} has red above the solid rows: {wavy:?} vs {solid:?}");
+            assert!((*wavy.last().unwrap() as i64 - top) > solid_bot, "#{id} has red below the solid rows: {wavy:?} vs {solid:?}");
+        }
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a double underline paints two bands with a red-free row between;
+    /// the solid twin's rows are contiguous.
+    #[test]
+    fn text_decoration_style_double_two_rows() {
+        let mut e = text_decoration_style_engine();
+        let gap = |r: &[usize]| r.windows(2).any(|w| w[1] > w[0] + 1);
+        let (double, _) = text_decoration_style_red(&mut e, "dd");
+        assert!(double.len() >= 4 && gap(&double), "#dd paints two separated bands: {double:?}");
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert!(!gap(&solid), "armed: the solid twin is one band: {solid:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a dotted underline leaves red-free columns between its dots; the
+    /// solid twin's columns are contiguous.
+    #[test]
+    fn text_decoration_style_dotted_gaps() {
+        let mut e = text_decoration_style_engine();
+        let gap = |c: &[usize]| c.windows(2).filter(|w| w[1] > w[0] + 1).count();
+        let (_, dotted) = text_decoration_style_red(&mut e, "do");
+        assert!(dotted.len() > 10 && gap(&dotted) > 5, "#do leaves gaps between dots: {} gaps", gap(&dotted));
+        let (_, solid) = text_decoration_style_red(&mut e, "ds");
+        assert!(solid.len() > 40 && gap(&solid) == 0, "armed: the solid twin has no gap column");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): `text-decoration-thickness: 4px` paints a 4-row band (the solid
+    /// twin at the face's thickness: 2 rows).
+    #[test]
+    fn text_decoration_style_thickness_band() {
+        let mut e = text_decoration_style_engine();
+        let (thick, _) = text_decoration_style_red(&mut e, "dk");
+        assert_eq!(thick.len(), 4, "#dk paints 4 rows: {thick:?}");
+        let (solid, _) = text_decoration_style_red(&mut e, "ds");
+        assert_eq!(solid.len(), 2, "armed: the twin paints 2 rows: {solid:?}");
+    }
+
+    /// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a line-through takes the style the same way: wavy spans more rows
+    /// than the solid line-through, above and below it.
+    #[test]
+    fn text_decoration_style_line_through_wavy() {
+        let mut e = text_decoration_style_engine();
+        let (solid, _) = text_decoration_style_red(&mut e, "ls");
+        let (wavy, _) = text_decoration_style_red(&mut e, "lw");
+        assert_eq!(solid.len(), 2, "armed: the solid line-through is one 2-row band: {solid:?}");
+        let (ts, tw) = (imgalt_rect(&mut e, "ls").1.floor() as i64, imgalt_rect(&mut e, "lw").1.floor() as i64);
+        assert!(!wavy.is_empty(), "#lw paints red");
+        assert!((wavy[0] as i64 - tw) < (solid[0] as i64 - ts), "#lw reaches above: {wavy:?} vs {solid:?}");
+        assert!((*wavy.last().unwrap() as i64 - tw) > (*solid.last().unwrap() as i64 - ts), "#lw reaches below");
+    }
+
+    // ---- AETHERCSSWIDEALL (LEDGER SR1021): css-cascade-4 §3.1 the all shorthand over ONE longhand list (named tail block) ----
+
+    /// AETHERCSSWIDEALL (SR1021): a blue parent holding `.x` (red, margin-left 20px, bold, block) and its `.x.r` twin
+    /// (`all: unset`), each alone in a section and each after a span; a red parent holding an `all: initial` div and a
+    /// plain one; an `all: unset; color: green` div. 400 px wide, rows 12px apart.
+    fn css_wide_all_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            section { display: block; margin: 0 0 12px }
+            .x { color: rgb(255, 0, 0); margin-left: 20px; font-weight: bold; display: block }
+            .x.r { all: unset }
+            .i { all: initial }
+            .g { all: unset; color: green }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(0, 0, 255)">
+              <section><div id="ax" class="x">Hello</div></section>
+              <section><div id="axr" class="x r">Hello</div></section>
+              <section><span id="sx">Hi</span><div id="bx" class="x">World</div></section>
+              <section><span id="sxr">Hi</span><div id="bxr" class="x r">World</div></section>
+            </div>
+            <div style="color:rgb(255, 0, 0)"><div id="ai" class="i">Hello</div><div id="ai0">Hello</div></div>
+            <section><div id="ag" class="g">Hello</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `.x.r { all: unset }` after `.x`: color reads the blue parent, weight 400, the box at
+    /// x 0, and it is inline (on its sibling span's line); the `.x` twin reads red / 700, sits at 20 and starts a new line
+    /// (armed).
+    #[test]
+    fn css_wide_all_unset_resets() {
+        let mut e = css_wide_all_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "the .x twin is red (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "fontWeight"), "700", "the .x twin is bold (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "axr", "color"), "rgb(0, 0, 255)", "all: unset: color inherits the parent");
+        assert_eq!(font_shorthand_cs(&mut e, "axr", "fontWeight"), "400", "all: unset: weight inherits normal");
+        let (axl, ..) = imgalt_rect(&mut e, "ax");
+        let (axrl, ..) = imgalt_rect(&mut e, "axr");
+        assert!((axl - 20.0).abs() <= 0.5, "the .x box at 20 (armed): {axl}");
+        assert!(axrl.abs() <= 0.5, "all: unset: margin-left 0: {axrl}");
+        let (_, st, ..) = imgalt_rect(&mut e, "sx");
+        let (_, bt, ..) = imgalt_rect(&mut e, "bx");
+        assert!(bt > st + 5.0, "the block .x after a span is on a new line (armed): {bt} vs {st}");
+        let (_, srt, ..) = imgalt_rect(&mut e, "sxr");
+        let (_, brt, ..) = imgalt_rect(&mut e, "bxr");
+        assert!((brt - srt).abs() <= 5.0, "all: unset: display inline, on the span's line: {brt} vs {srt}");
+        assert!(css_wide_color_ink(&mut e, "axr", css_wide_blue) > 3, "the unset box paints the blue parent");
+        assert_eq!(css_wide_color_ink(&mut e, "axr", css_wide_red), 0, "no red");
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `all: initial` under a red parent paints CanvasText black (initial, not inherit); the
+    /// plain div beside it paints red (armed).
+    #[test]
+    fn css_wide_all_initial_black() {
+        let mut e = css_wide_all_engine();
+        assert!(css_wide_color_ink(&mut e, "ai0", css_wide_red) > 3, "the plain div is red (armed)");
+        assert!(css_wide_color_ink(&mut e, "ai", css_wide_controls_black) > 3, "all: initial paints black");
+        assert_eq!(css_wide_color_ink(&mut e, "ai", css_wide_red), 0, "all: initial paints no red");
+        assert_eq!(font_shorthand_cs(&mut e, "ai", "color"), "rgb(0, 0, 0)", "cssom reads black");
+    }
+
+    /// AETHERCSSWIDEALL (SR1021): `all: unset; color: green`: the later colour wins.
+    #[test]
+    fn css_wide_all_later_color_wins() {
+        let mut e = css_wide_all_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ag", "color"), "rgb(0, 128, 0)", "the later green wins");
+    }
+
+    // ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset / -position place the underline (named tail block) ----
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): 20px serif rows of "gyp gyp" (black text, red decorations, 20px apart): `#ua`
+    /// the auto underline (the twin), `#uo` `text-underline-offset: 4px`, `#uu` `text-underline-position: under`; `#pu` a
+    /// `text-underline-position: under` parent and `#po` a `text-underline-offset: 6px` parent, each holding an underlined
+    /// span (`#pus` / `#pos`) that sets neither.
+    fn text_underline_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            div, span { text-decoration-color: red }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="ua" style="text-decoration-line:underline">gyp gyp</div>
+            <div id="uo" style="text-decoration-line:underline;text-underline-offset:4px">gyp gyp</div>
+            <div id="uu" style="text-decoration-line:underline;text-underline-position:under">gyp gyp</div>
+            <div id="pu" style="text-underline-position:under"><span id="pus" style="text-decoration-line:underline">gyp gyp</span></div>
+            <div id="po" style="text-underline-offset:6px"><span id="pos" style="text-decoration-line:underline">gyp gyp</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the sorted distinct rows of element `id`'s rect, extended 8px down, holding a
+    /// pixel `hue` accepts.
+    fn text_underline_rows(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> Vec<usize> {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 8).min(sh));
+        let mut rows: Vec<usize> = (y0..y1).filter(|&y| (x0..x1).any(|x| hue(imgalt_px(e, x, y)))).collect();
+        rows.dedup();
+        rows
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-offset: 4px` paints the same band 4 rows lower than the auto
+    /// twin (each measured from its own box top).
+    #[test]
+    fn text_underline_offset_four_rows_lower() {
+        let mut e = text_underline_engine();
+        let auto = text_underline_rows(&mut e, "ua", css_wide_red);
+        let off = text_underline_rows(&mut e, "uo", css_wide_red);
+        assert!(!auto.is_empty() && !off.is_empty(), "both paint red: {auto:?} {off:?}");
+        let (ta, to) = (imgalt_rect(&mut e, "ua").1.floor() as i64, imgalt_rect(&mut e, "uo").1.floor() as i64);
+        assert_eq!(off[0] as i64 - to, auto[0] as i64 - ta + 4, "4 rows lower: {off:?} vs {auto:?}");
+        assert_eq!(off.len(), auto.len(), "the same band height");
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): `text-underline-position: under` paints below every row of the "gyp" glyph
+    /// ink; the auto twin's band runs through the descenders (armed).
+    #[test]
+    fn text_underline_position_under_clears_descenders() {
+        let mut e = text_underline_engine();
+        let (ink, red) = (text_underline_rows(&mut e, "ua", text_decoration_black), text_underline_rows(&mut e, "ua", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "armed: #ua paints text and an underline");
+        assert!(red[0] <= *ink.last().unwrap(), "armed: the auto underline cuts the descenders: red {red:?} ink to {}", ink.last().unwrap());
+        let (ink, red) = (text_underline_rows(&mut e, "uu", text_decoration_black), text_underline_rows(&mut e, "uu", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#uu paints text and an underline");
+        assert!(red[0] > *ink.last().unwrap(), "under is below the descenders: red {red:?} ink to {}", ink.last().unwrap());
+    }
+
+    /// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): text-underline-position is inherited: the span under the `under` parent paints
+    /// below its descenders; text-underline-offset is not: the span under the 6px parent paints at the auto rows, through
+    /// its descenders.
+    #[test]
+    fn text_underline_position_inherits_offset_not() {
+        let mut e = text_underline_engine();
+        let (ink, red) = (text_underline_rows(&mut e, "pus", text_decoration_black), text_underline_rows(&mut e, "pus", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#pus paints text and an underline");
+        assert!(red[0] > *ink.last().unwrap(), "the inherited under: red {red:?} ink to {}", ink.last().unwrap());
+        let (ink, red) = (text_underline_rows(&mut e, "pos", text_decoration_black), text_underline_rows(&mut e, "pos", css_wide_red));
+        assert!(!ink.is_empty() && !red.is_empty(), "#pos paints text and an underline");
+        assert!(red[0] <= *ink.last().unwrap(), "the parent's offset does not reach the span: red {red:?} ink to {}", ink.last().unwrap());
+    }
+
     // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): unicode-bidi end to end: the override paints, the 22nd column reads (named tail block) ----
 
     /// AETHERCSSOMUNICODEBIDI (SR1008): 20px serif rows 12px apart: a `bdo dir=rtl` (the UA's isolate-override), an author

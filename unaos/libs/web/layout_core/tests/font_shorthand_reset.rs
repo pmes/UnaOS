@@ -643,3 +643,140 @@ fn text_decoration_color_merge() {
     merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline blue")]).paint);
     assert_eq!(dst.paint.decoration_color, Some(Some((0, 0, 255))), "a later shorthand colour wins");
 }
+// ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style / -thickness and the shorthand's rest (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the style longhand: the five words as 0 solid 1 double 2 dotted
+/// 3 dashed 4 wavy; initial / unset are solid; an invalid value writes nothing and a later invalid one is dropped.
+#[test]
+fn text_decoration_style_longhand() {
+    for (v, k) in [("solid", 0u8), ("double", 1), ("dotted", 2), ("dashed", 3), ("wavy", 4), ("WAVY", 4), ("initial", 0), ("unset", 0)] {
+        assert_eq!(styled(&[("text-decoration-style", v)]).paint.decoration_style, Some(k), "{v}");
+    }
+    for v in ["inherit", "groove", "bogus", "2px"] {
+        assert_eq!(styled(&[("text-decoration-style", v)]).paint.decoration_style, None, "{v}");
+    }
+    let s = styled(&[("text-decoration-style", "wavy"), ("text-decoration-style", "bogus")]);
+    assert_eq!(s.paint.decoration_style, Some(4), "an invalid later value is dropped");
+    assert_eq!(styled(&[("text-decoration-line", "underline")]).paint.decoration_style, None, "armed: the line longhand writes none");
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the thickness longhand: a length in px (em at the parse context's
+/// font), 0 accepted; auto / from-font / initial / unset are `Some(None)` (the face's); a negative length, a bare non-zero
+/// number, a percentage and an invalid word write nothing.
+#[test]
+fn text_decoration_thickness_longhand() {
+    assert_eq!(styled(&[("text-decoration-thickness", "2px")]).paint.decoration_thickness, Some(Some(2.0)));
+    assert_eq!(styled(&[("text-decoration-thickness", "0")]).paint.decoration_thickness, Some(Some(0.0)));
+    let em = ParseCx::default().font.0 * 0.1;
+    let t = styled(&[("text-decoration-thickness", "0.1em")]).paint.decoration_thickness.flatten().expect("0.1em parses");
+    assert!((t - em).abs() < 1e-4, "0.1em = {t}, want {em}");
+    for v in ["auto", "from-font", "initial", "unset"] {
+        assert_eq!(styled(&[("text-decoration-thickness", v)]).paint.decoration_thickness, Some(None), "{v}");
+    }
+    for v in ["-1px", "3", "10%", "bogus", "inherit"] {
+        assert_eq!(styled(&[("text-decoration-thickness", v)]).paint.decoration_thickness, None, "{v}");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the shorthand reads line, style, colour and thickness in any order in
+/// its ONE pass; the omitted ones reset (solid, auto, currentcolor); `inherit` leaves all three; the line longhand none.
+#[test]
+fn text_decoration_shorthand_rest_any_order() {
+    for v in ["underline wavy red 2px", "2px red wavy underline", "red underline 2px wavy", "wavy 2px underline red"] {
+        let s = styled(&[("text-decoration", v)]);
+        assert_eq!(s.paint.underline, Some(true), "{v}");
+        assert_eq!(s.paint.decoration_style, Some(4), "{v}");
+        assert_eq!(s.paint.decoration_color, Some(Some((255, 0, 0))), "{v}");
+        assert_eq!(s.paint.decoration_thickness, Some(Some(2.0)), "{v}");
+    }
+    let s = styled(&[("text-decoration", "line-through dotted from-font")]);
+    assert_eq!(s.paint.line_through, Some(true));
+    assert_eq!(s.paint.decoration_style, Some(2));
+    assert_eq!(s.paint.decoration_thickness, Some(None));
+    let s = styled(&[("text-decoration-style", "wavy"), ("text-decoration-thickness", "3px"), ("text-decoration", "underline")]);
+    assert_eq!(s.paint.decoration_style, Some(0), "the shorthand resets the style to solid");
+    assert_eq!(s.paint.decoration_thickness, Some(None), "the shorthand resets the thickness to auto");
+    let s = styled(&[("text-decoration-style", "wavy"), ("text-decoration-thickness", "3px"), ("text-decoration-line", "underline")]);
+    assert_eq!(s.paint.decoration_style, Some(4), "the line longhand keeps the style");
+    assert_eq!(s.paint.decoration_thickness, Some(Some(3.0)), "the line longhand keeps the thickness");
+    let s = styled(&[("text-decoration-style", "dashed"), ("text-decoration", "inherit")]);
+    assert_eq!(s.paint.decoration_style, Some(3), "inherit leaves it");
+    let s = styled(&[("text-decoration", "underline double"), ("text-decoration-style", "dotted")]);
+    assert_eq!(s.paint.decoration_style, Some(2), "a later longhand wins");
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): merge_paint carries both later-wins; a rule without them keeps them.
+#[test]
+fn text_decoration_style_thickness_merge() {
+    let mut dst = styled(&[("text-decoration-style", "wavy"), ("text-decoration-thickness", "4px")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!((dst.paint.decoration_style, dst.paint.decoration_thickness), (Some(4), Some(Some(4.0))), "a rule without them keeps them");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline")]).paint);
+    assert_eq!((dst.paint.decoration_style, dst.paint.decoration_thickness), (Some(0), Some(None)), "a later shorthand resets both");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration-style", "double")]).paint);
+    assert_eq!(dst.paint.decoration_style, Some(1), "a later longhand wins");
+}
+
+// ---- AETHERCSSTEXTUNDERLINEOFFSET (LEDGER SR1045): text-underline-offset / -position arms (named tail block) ----
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the offset longhand: a length in px (negative and 0 accepted; em at the parse
+/// context's font), a percentage of 1em; auto / initial / unset are `Some(None)`; a bare non-zero number, an invalid
+/// word and `inherit` (not inherited, no bit) write nothing.
+#[test]
+fn text_underline_offset_longhand() {
+    assert_eq!(styled(&[("text-underline-offset", "3px")]).paint.underline_offset, Some(Some(3.0)));
+    assert_eq!(styled(&[("text-underline-offset", "-2px")]).paint.underline_offset, Some(Some(-2.0)));
+    assert_eq!(styled(&[("text-underline-offset", "0")]).paint.underline_offset, Some(Some(0.0)));
+    let em = ParseCx::default().font.0 * 0.2;
+    for v in ["0.2em", "20%"] {
+        let o = styled(&[("text-underline-offset", v)]).paint.underline_offset.flatten().expect("parses");
+        assert!((o - em).abs() < 1e-3, "{v} = {o}, want {em}");
+    }
+    for v in ["auto", "initial", "unset"] {
+        assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, Some(None), "{v}");
+    }
+    for v in ["3", "bogus", "inherit"] {
+        assert_eq!(styled(&[("text-underline-offset", v)]).paint.underline_offset, None, "{v}");
+    }
+    let s = styled(&[("text-underline-offset", "5px"), ("text-underline-offset", "initial")]);
+    assert_eq!(s.paint.underline_offset, Some(None), "initial resets an earlier length to auto");
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): the position longhand: auto / initial 0, from-font 1, under 2; left / right keep
+/// the horizontal part (bare = auto); invalid combinations write nothing; inherit / unset write the inherit bit and clear
+/// an earlier value, and a later value beats the bit.
+#[test]
+fn text_underline_position_longhand() {
+    use layout_core::paint::INHERIT_UNDERLINE_POSITION;
+    for (v, want) in [("auto", 0), ("initial", 0), ("from-font", 1), ("under", 2), ("under left", 2), ("right under", 2), ("from-font right", 1), ("left", 0), ("right", 0)] {
+        assert_eq!(styled(&[("text-underline-position", v)]).paint.underline_position, Some(want), "{v}");
+    }
+    for v in ["bogus", "under from-font", "left right", "under under"] {
+        assert_eq!(styled(&[("text-underline-position", v)]).paint.underline_position, None, "{v}");
+    }
+    for v in ["inherit", "unset"] {
+        let s = styled(&[("text-underline-position", "under"), ("text-underline-position", v)]);
+        assert_eq!(s.paint.underline_position, None, "{v} clears the earlier under");
+        assert!(s.paint.inherits(INHERIT_UNDERLINE_POSITION), "{v} writes the inherit bit");
+    }
+    let s = styled(&[("text-underline-position", "inherit"), ("text-underline-position", "under")]);
+    assert_eq!(s.paint.underline_position, Some(2));
+    assert!(!s.paint.inherits(INHERIT_UNDERLINE_POSITION), "a later value beats the bit");
+    assert!(!styled(&[("text-underline-position", "under")]).paint.inherits(INHERIT_UNDERLINE_POSITION), "armed");
+}
+
+/// AETHERCSSTEXTUNDERLINEOFFSET (SR1045): merge_paint carries both later-wins; the `text-decoration` shorthand (which does
+/// not include them) leaves both; a later `inherit` on the position clears it through the bit.
+#[test]
+fn text_underline_merge() {
+    let mut dst = styled(&[("text-underline-offset", "4px"), ("text-underline-position", "under")]);
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!((dst.paint.underline_offset, dst.paint.underline_position), (Some(Some(4.0)), Some(2)), "a rule without them keeps them");
+    merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline wavy")]).paint);
+    assert_eq!((dst.paint.underline_offset, dst.paint.underline_position), (Some(Some(4.0)), Some(2)), "the shorthand leaves them");
+    merge_paint(&mut dst.paint, &styled(&[("text-underline-offset", "auto")]).paint);
+    assert_eq!(dst.paint.underline_offset, Some(None), "a later auto wins");
+    merge_paint(&mut dst.paint, &styled(&[("text-underline-position", "inherit")]).paint);
+    assert_eq!(dst.paint.underline_position, None, "a later inherit clears it");
+    assert!(dst.paint.inherits(layout_core::paint::INHERIT_UNDERLINE_POSITION));
+}
