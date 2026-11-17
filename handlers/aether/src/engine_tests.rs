@@ -5785,4 +5785,361 @@ mod tests {
         }
     }
 
+    // ---- AETHERCSSWIDECOLOR (LEDGER SR823): an explicit color: inherit beats an earlier rule and the a tag's link blue (named tail block) ----
+
+    /// AETHERCSSWIDECOLOR (SR823): one row per probe at 20px serif, the rules in a sheet. Under a red parent: a plain
+    /// link (the UA link blue), `a.c { color: blue }` and its `a.c.x { color: inherit }` twin, `a.u { color: unset }`,
+    /// `a.l { color: inherit } a.l.k { color: rgb(0, 160, 0) }` and a same-block `color: inherit; color: rgb(0, 160, 0)`
+    /// link. Under a black-background yellow-text row (the dark theme): the reset sheet's `a.r { color: inherit }` and a
+    /// plain link. Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn css_wide_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            a.c { color: blue }
+            a.c.x { color: inherit }
+            a.r { color: inherit }
+            a.u { color: unset }
+            a.l { color: inherit }
+            a.l.k { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><a id="aref" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ac" class="c" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ax" class="c x" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="au" class="u" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ak" class="l k" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ai" href="#" style="color:inherit;color:rgb(0, 160, 0)">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="ar" class="r" href="#">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="aref2" href="#">Hello</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the count of pixels in element `id`'s rect whose (r, g, b) passes `hue`.
+    fn css_wide_color_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 1).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn css_wide_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 < 90 && c.2 < 90
+    }
+
+    fn css_wide_blue(c: (u8, u8, u8)) -> bool {
+        c.2 > 150 && c.0 < 90 && c.1 < 90
+    }
+
+    fn css_wide_green(c: (u8, u8, u8)) -> bool {
+        c.1 > 110 && c.0 < 90 && c.2 < 90
+    }
+
+    fn css_wide_yellow(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 > 150 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `a.c.x { color: inherit }` after `a.c { color: blue }` under a red parent paints red
+    /// (no blue ink); the `a.c` twin and the plain link paint blue (armed); cssom reads the parent's rgb(255, 0, 0).
+    #[test]
+    fn css_wide_color_cross_rule_red() {
+        let mut e = css_wide_color_engine();
+        for id in ["aref", "ac"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 3, "#{id} paints blue (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red (armed)");
+        }
+        assert!(css_wide_color_ink(&mut e, "ax", css_wide_red) > 3, "a.c.x takes the red parent past the earlier rule");
+        assert_eq!(css_wide_color_ink(&mut e, "ax", css_wide_blue), 0, "a.c.x paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "aref", "color"), "rgb(0, 0, 238)", "the plain link reads the UA link blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the reset sheet's `a { color: inherit }` under a dark (black, yellow-text) row paints
+    /// the row's yellow, not the UA link blue; the plain link beside it stays blue (armed).
+    #[test]
+    fn css_wide_color_reset_link_dark() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "aref2", css_wide_blue) > 3, "the plain link on the dark row is blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "ar", css_wide_yellow) > 3, "the reset link paints the row's yellow");
+        assert_eq!(css_wide_color_ink(&mut e, "ar", css_wide_blue), 0, "the reset link paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ar", "color"), "rgb(255, 255, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `color: unset` is inherit for an inherited property (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_color_unset_is_inherit() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "au", css_wide_red) > 3, "a.u takes the red parent");
+        assert_eq!(css_wide_color_ink(&mut e, "au", css_wide_blue), 0, "a.u paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "color"), "rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): a later `color: rgb(0, 160, 0)` beats an earlier inherit, across rules (`a.l.k`) and
+    /// in one block (the inline style): green, neither red nor blue.
+    #[test]
+    fn css_wide_color_later_value_wins() {
+        let mut e = css_wide_color_engine();
+        for id in ["ak", "ai"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_green) > 3, "#{id} paints the later green");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
+    }
+
+    // ---- AETHERCSSWIDEINHERITEDREST (LEDGER SR831): an explicit inherit beats the white-space / direction / list-style tag roads (named tail block) ----
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): one probe per row at 20px serif in a 400px viewport, the rules in a sheet: three
+    /// pre with one 100-character line (plain, `white-space: inherit`, `inherit` then `pre`), three `Hello` blocks (`dir=rtl`,
+    /// `dir=rtl` with `direction: inherit`, plain ltr), and lists nested one level inside a `ul` item: an ol with
+    /// `list-style-type: inherit`, one with `unset`, a disc-styled twin and a plain ol; a ul with `inherit`, a disc-styled
+    /// twin and a plain ul. Rows 12px apart, so one probe's ink window (its rect +- 2px) does not take a neighbour's.
+    fn css_wide_rest_engine() -> crate::AetherEngine {
+        let line = "the quick brown fox jumps over the lazy dog and keeps on running far past the edge of the box again";
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+            div, pre, ul, ol {{ margin: 0 0 12px }}
+            pre.w {{ white-space: inherit }}
+            pre.v {{ white-space: inherit; white-space: pre }}
+            div.d {{ direction: inherit }}
+            ol.i {{ list-style-type: inherit }}
+            ol.u {{ list-style-type: unset }}
+            ul ul.i {{ list-style-type: inherit }}
+            </style></head><body style="margin:0;font:20px serif">
+            <pre id="pp">{line}</pre>
+            <pre id="pw" class="w">{line}</pre>
+            <pre id="pv" class="v">{line}</pre>
+            <div id="rref" dir="rtl">Hello</div>
+            <div id="rd" dir="rtl" class="d">Hello</div>
+            <div id="lref">Hello</div>
+            <ul><li><ol class="i"><li id="oli">Hello</li></ol></li></ul>
+            <ul><li><ol class="u"><li id="olu">Hello</li></ol></li></ul>
+            <ul><li><ol style="list-style-type:disc"><li id="old">Hello</li></ol></li></ul>
+            <ul><li><ol><li id="olp">Hello</li></ol></li></ul>
+            <ul><li><ul class="i"><li id="uli">Hello</li></ul></li></ul>
+            <ul><li><ul style="list-style-type:disc"><li id="uld">Hello</li></ul></li></ul>
+            <ul><li><ul><li id="ulp">Hello</li></ul></li></ul>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the dark-pixel count of each column in [x0, x1) across element `id`'s rows (its
+    /// rect, 2 px of margin above and below).
+    fn css_wide_rest_columns(e: &mut crate::AetherEngine, id: &str, x0: usize, x1: usize) -> Vec<usize> {
+        let (_, t, _, h) = imgalt_rect(e, id);
+        let (y0, y1) = ((t - 2.0).max(0.0) as usize, (t + h + 2.0).ceil() as usize);
+        (x0..x1).map(|x| imgalt_ink(e, x, x + 1, y0, y1)).collect()
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the marker columns of list item `id`: the 36 px left of its box.
+    fn css_wide_rest_marker(e: &mut crate::AetherEngine, id: &str) -> Vec<usize> {
+        let l = imgalt_rect(e, id).0.max(0.0) as usize;
+        css_wide_rest_columns(e, id, l.saturating_sub(36), l)
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `pre.w { white-space: inherit }` under a `normal` body wraps its long line (more
+    /// than 1.5 x the plain pre's one-line height; the plain pre does not wrap, armed); a later `white-space: pre` in the
+    /// same block beats the inherit (one line, the plain pre's height).
+    #[test]
+    fn css_wide_rest_pre_wraps() {
+        let mut e = css_wide_rest_engine();
+        let h = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).3;
+        let (pp, pw, pv) = (h(&mut e, "pp"), h(&mut e, "pw"), h(&mut e, "pv"));
+        assert!(pp > 5.0 && pp < 40.0, "the plain pre is one line ({pp})");
+        assert!(pw > 1.5 * pp, "pre.w wraps like its normal parent ({pw} vs one line {pp})");
+        assert!((pv - pp).abs() <= 0.5, "the later pre beats the inherit ({pv} vs {pp})");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `div.d { direction: inherit }` on a `dir=rtl` block under an ltr body lays out
+    /// ltr: its ink is the plain ltr block's, starting in the left half; the plain `dir=rtl` block's starts in the right
+    /// half (armed).
+    #[test]
+    fn css_wide_rest_direction_ltr() {
+        let mut e = css_wide_rest_engine();
+        let first = |c: &[usize]| c.iter().position(|&n| n > 0).unwrap_or(usize::MAX);
+        let lref = css_wide_rest_columns(&mut e, "lref", 0, 400);
+        let rref = css_wide_rest_columns(&mut e, "rref", 0, 400);
+        let rd = css_wide_rest_columns(&mut e, "rd", 0, 400);
+        assert!(lref.iter().sum::<usize>() > 20, "the reference run paints");
+        assert!(first(&rref) > 200 && first(&rref) != usize::MAX, "the plain dir=rtl block starts right (armed)");
+        assert!(first(&rd) < 200, "the inheriting block starts left");
+        assert_eq!(rd, lref, "the inheriting block lays out as the ltr reference");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ol.i { list-style-type: inherit }` and `ol.u { list-style-type: unset }` inside
+    /// a `ul` item take the ul's disc past the ol's decimal tag road: their item's marker ink is the disc-styled ol twin's,
+    /// and the plain ol's "1." differs (armed).
+    #[test]
+    fn css_wide_rest_list_ol_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "old");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "olp"), disc, "the plain ol's decimal is not the disc (armed)");
+        for id in ["oli", "olu"] {
+            assert_eq!(css_wide_rest_marker(&mut e, id), disc, "#{id}: the parent's disc");
+        }
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ul ul.i { list-style-type: inherit }` takes the outer ul's disc past the depth
+    /// match's circle: the disc-styled twin's marker ink, not the plain nested ul's (armed).
+    #[test]
+    fn css_wide_rest_list_nested_ul_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "uld");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "ulp"), disc, "the plain nested ul's circle is not the disc (armed)");
+        assert_eq!(css_wide_rest_marker(&mut e, "uli"), disc, "the inheriting ul takes the outer disc");
+    }
+
+    // ---- AETHERCSSOMINHERITEDRESTREPORT (LEDGER SR842): getComputedStyle reads the resolved white-space / list-style-type (named tail block) ----
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): one probe per row; the rules in a sheet so SR831's inherit bits reach the
+    /// paint map the report reads.
+    fn cssom_inherited_rest_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            pre.w { white-space: inherit }
+            ul ol.i { list-style-type: inherit }
+            li.sq { list-style-type: square }
+            </style></head><body style="margin:0;font:16px serif">
+            <pre id="pre">a  b</pre>
+            <div><pre id="prew" class="w">a  b</pre></div>
+            <div id="nw" style="white-space:nowrap">a b</div>
+            <div id="prex" style="white-space:pre">a  b</div>
+            <div id="pw" style="white-space:pre-wrap">a b</div>
+            <div id="pl" style="white-space:pre-line">a b</div>
+            <div id="bs" style="white-space:break-spaces">a b</div>
+            <textarea id="ta">a</textarea>
+            <nobr id="nb">a b</nobr>
+            <ol id="ol"><li id="olli">a</li></ol>
+            <ul id="ul1"><li><ul id="ul2"><li><ul id="ul3"><li id="ul3li">a</li></ul></li></ul></li></ul>
+            <ul><li><ol id="oli" class="i"><li id="olili">a</li></ol></li></ul>
+            <ul><li id="sq" class="sq">a</li></ul>
+            <ul id="none" style="list-style-type:none"><li>a</li></ul>
+            <ol id="lr" style="list-style-type:lower-roman"><li>a</li></ol>
+            <div id="plain">a</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn cssom_inherited_rest_cs(e: &mut crate::AetherEngine, id: &str, p: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).{p}")).unwrap()
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): white-space reads the paint code the renderer resolves (render/mod.rs's
+    /// or_tag + `default_white_space`): `pre` is `pre` (was `normal`), an explicit `pre` is `pre` (was `nowrap`), SR831's
+    /// `pre { white-space: inherit }` under a normal div reads `normal`, `textarea` pre-wrap, `nobr` nowrap.
+    #[test]
+    fn cssom_inherited_rest_white_space() {
+        let mut e = cssom_inherited_rest_engine();
+        for (id, want) in [
+            ("pre", "pre"), ("prew", "normal"), ("nw", "nowrap"), ("prex", "pre"), ("pw", "pre-wrap"), ("pl", "pre-line"),
+            ("bs", "break-spaces"), ("ta", "pre-wrap"), ("nb", "nowrap"), ("plain", "normal"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, id, "whiteSpace"), want, "#{id}: computed white-space");
+        }
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): list-style-type reads `render::list_style_of` (the code the marker paints):
+    /// `ol` and its item decimal (was disc), `ul ul` circle, `ul ul ul` square, SR831's `ul ol { list-style-type: inherit }`
+    /// the outer ul's disc, a declared square / none / lower-roman, a plain div the initial disc.
+    #[test]
+    fn cssom_inherited_rest_list_style() {
+        let mut e = cssom_inherited_rest_engine();
+        for (id, want) in [
+            ("ol", "decimal"), ("olli", "decimal"), ("ul1", "disc"), ("ul2", "circle"), ("ul3", "square"), ("ul3li", "square"),
+            ("oli", "disc"), ("olili", "disc"), ("sq", "square"), ("none", "none"), ("lr", "lower-roman"), ("plain", "disc"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, id, "listStyleType"), want, "#{id}: computed list-style-type");
+        }
+    }
+
+    /// AETHERCSSOMINHERITEDRESTREPORT (SR842): the other columns of a plain div read as before the two emits changed.
+    #[test]
+    fn cssom_inherited_rest_other_columns_unchanged() {
+        let mut e = cssom_inherited_rest_engine();
+        for (p, want) in [
+            ("display", "block"), ("position", "static"), ("color", "rgb(0, 0, 0)"), ("backgroundColor", "rgba(0, 0, 0, 0)"),
+            ("fontSize", "16px"), ("fontWeight", "400"), ("fontStyle", "normal"), ("lineHeight", "normal"), ("textAlign", "start"),
+            ("textDecorationLine", "none"), ("visibility", "visible"), ("borderTopWidth", "0px"), ("borderTopStyle", "none"),
+            ("paddingTop", "0px"), ("marginTop", "0px"), ("flexDirection", "row"), ("direction", "ltr"),
+        ] {
+            assert_eq!(cssom_inherited_rest_cs(&mut e, "plain", p), want, "#plain: computed {p}");
+        }
+    }
+
+    // ---- AETHERCSSOMDIRECTIONCOLUMN (LEDGER SR1000): getComputedStyle direction reads the render's rtl as the 21st report column (named tail block) ----
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): a `dir=rtl` div and its children (a plain p, an inline `direction: ltr`, an
+    /// earlier `p.e { direction: ltr }` beaten by `p.e.i { direction: inherit }`, a `dir=ltr` child), an inline
+    /// `direction: rtl` div and its child, and a plain div.
+    fn cssom_direction_column_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            p.e { direction: ltr }
+            p.e.i { direction: inherit }
+            </style></head><body style="margin:0;font:16px serif">
+            <div id="r" dir="rtl"><p id="rc">a</p><p id="rl" style="direction:ltr">a</p><p id="re" class="e">a</p><p id="ri" class="e i">a</p><p id="rd" dir="ltr">a</p></div>
+            <div id="c" style="direction:rtl"><p id="cc">a</p></div>
+            <div id="plain">a</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): `getComputedStyle(el).direction` for element `id`.
+    fn cssom_direction_column_cs(e: &mut crate::AetherEngine, id: &str) -> String {
+        e.js_engine.as_mut().unwrap().eval_string(&format!("getComputedStyle(document.getElementById('{id}')).direction")).unwrap()
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): the `dir` attribute maps onto direction and inherits (was ltr everywhere); an
+    /// author `direction: ltr` and a `dir=ltr` child read ltr; SR831's `direction: inherit` beats the earlier ltr rule.
+    #[test]
+    fn cssom_direction_column_dir_attr() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("r", "rtl"), ("rc", "rtl"), ("rl", "ltr"), ("re", "ltr"), ("ri", "rtl"), ("rd", "ltr"), ("plain", "ltr")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): an author `direction: rtl` reads rtl and its child inherits it.
+    #[test]
+    fn cssom_direction_column_css() {
+        let mut e = cssom_direction_column_engine();
+        for (id, want) in [("c", "rtl"), ("cc", "rtl")] {
+            assert_eq!(cssom_direction_column_cs(&mut e, id), want, "#{id}: computed direction");
+        }
+    }
+
+    /// AETHERCSSOMDIRECTIONCOLUMN (SR1000): direction is the 21st column, appended at the END, so the twenty positions
+    /// the a11y tree indexes (display 0, visibility 12) and the style oracle's fixture prefix do not move.
+    #[test]
+    fn cssom_direction_column_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 21);
+        assert_eq!(crate::css::REPORT_PROPS[20], "direction");
+        assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
+    }
 }

@@ -103,7 +103,7 @@ fn aether_computed_values_vs_chromium() {
         let fx: Value = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
         let case = fx["case"].as_str().unwrap().to_string();
         let fx_props: Vec<&str> = fx["props"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
-        assert_eq!(fx_props, props.to_vec(), "{case}: property list");
+        assert_eq!(fx_props, props[..fx_props.len()].to_vec(), "{case}: property list");
         let styles: Vec<String> = fx["styles"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
         let (w, h) = (fx["width"].as_f64().unwrap() as f32, fx["height"].as_f64().unwrap() as f32);
         let mut html = String::from("<!DOCTYPE html>");

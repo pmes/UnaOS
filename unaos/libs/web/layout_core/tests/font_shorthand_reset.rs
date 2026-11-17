@@ -209,7 +209,7 @@ fn css_wide_longhand_sets_its_bit() {
     let s = styled(&[("font-variant", "small-caps"), ("font-variant", "inherit")]);
     assert!(s.paint.inherits(INHERIT_SMALL_CAPS) && s.paint.small_caps.is_none(), "font-variant: inherit reaches its caps half");
     let s = styled(&[("color", "inherit")]);
-    assert_eq!(s.paint.inherit, 0, "color is not a font field (AETHER-CSS-WIDE-COLOR owed)");
+    assert_eq!(s.paint.inherit, layout_core::paint::INHERIT_COLOR, "color: inherit sets the colour bit (AETHERCSSWIDECOLOR SR823)");
 }
 
 /// AETHERCSSWIDELONGHANDS (SR815): across rules, a later rule's explicit inherit clears the earlier rule's value (the
@@ -271,4 +271,139 @@ fn font_inherit_replay_keeps_bit() {
     merge_paint(&mut s.paint, &spec.paint);
     assert!(s.paint.inherits(INHERIT_LINE_HEIGHT), "the replay keeps line-height inherited");
     assert_eq!(s.paint.line_height, None);
+}
+
+// ---- AETHERCSSWIDECOLOR (LEDGER SR823): the explicit inherit bit for color (named tail block) ----
+
+use layout_core::paint::INHERIT_COLOR;
+
+/// AETHERCSSWIDECOLOR (SR823): `color: inherit` / `unset` (any case) clears an earlier colour in the block and sets the
+/// colour bit (css-cascade-4 §7.3.3: color is inherited, so unset == inherit); a later value in the block beats it.
+#[test]
+fn css_wide_color_sets_its_bit() {
+    for kw in ["inherit", "unset", "INHERIT"] {
+        let s = styled(&[("color", "blue"), ("color", kw)]);
+        assert_eq!(s.paint.inherit, INHERIT_COLOR, "color: {kw} sets the colour bit");
+        assert_eq!(s.paint.color, None, "color: {kw} clears the earlier colour");
+        assert!(s.paint.inherits(INHERIT_COLOR), "color: {kw} inherits");
+    }
+    let s = styled(&[("color", "inherit"), ("color", "green")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "a later value beats the bit");
+    assert!(s.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSWIDECOLOR (SR823): across rules, a later `color: inherit` clears the earlier rule's colour and sets the bit;
+/// a still later rule's colour clears the bit again (merge_paint's `merge_inherit`).
+#[test]
+fn merge_paint_color_inherit_beats_earlier_rule() {
+    let mut dst = styled(&[("color", "blue")]);
+    assert!(dst.paint.color.is_some(), "the earlier rule's colour");
+    merge_paint(&mut dst.paint, &styled(&[("color", "inherit")]).paint);
+    assert_eq!(dst.paint.color, None, "the later inherit cleared the earlier colour");
+    assert!(dst.paint.inherits(INHERIT_COLOR), "the later inherit set the bit");
+    merge_paint(&mut dst.paint, &styled(&[("padding", "1px")]).paint);
+    assert!(dst.paint.inherits(INHERIT_COLOR), "an unrelated later rule keeps the bit");
+    merge_paint(&mut dst.paint, &styled(&[("color", "green")]).paint);
+    assert!(!dst.paint.inherits(INHERIT_COLOR), "a later colour clears the bit");
+    assert_eq!(dst.paint.inherit & INHERIT_COLOR, 0);
+    assert!(dst.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSWIDECOLOR (SR823): `font: inherit` reaches the seven font fields only: an earlier colour survives and the
+/// colour bit stays clear (INHERIT_FONT is 127).
+#[test]
+fn font_inherit_leaves_color() {
+    let mut dst = styled(&[("color", "blue")]);
+    merge_paint(&mut dst.paint, &styled(&[("font", "inherit")]).paint);
+    assert!(dst.paint.color.is_some(), "font: inherit keeps the colour");
+    assert!(!dst.paint.inherits(INHERIT_COLOR), "font: inherit does not set the colour bit");
+    assert_eq!(dst.paint.inherit, INHERIT_FONT);
+}
+
+// ---- AETHERCSSWIDEINHERITEDREST (LEDGER SR831): the explicit inherit bit for white-space / direction / list-style-type (named tail block) ----
+
+use layout_core::paint::{INHERIT_DIRECTION, INHERIT_LIST_STYLE, INHERIT_WHITE_SPACE};
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): each property (and the alias or shorthand whose arm writes the same field) with a
+/// value it takes and the bit its explicit inherit sets.
+const REST_BITS: [(&str, &str, u32); 5] = [
+    ("white-space", "pre", INHERIT_WHITE_SPACE),
+    ("white-space-collapse", "pre", INHERIT_WHITE_SPACE),
+    ("direction", "rtl", INHERIT_DIRECTION),
+    ("list-style-type", "square", INHERIT_LIST_STYLE),
+    ("list-style", "square inside", INHERIT_LIST_STYLE),
+];
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): `inherit` / `unset` (any case) on each of the three inherited properties clears
+/// the earlier value in the block (white-space: its `nowrap` pair too) and sets exactly that property's bit.
+#[test]
+fn css_wide_inherited_rest_sets_its_bit() {
+    for (prop, value, bit) in REST_BITS {
+        let s = styled(&[(prop, value)]);
+        assert!(s.paint.valued() & bit != 0, "{prop}: {value} holds a value (armed)");
+        for kw in ["inherit", "unset", "INHERIT"] {
+            let s = styled(&[(prop, value), (prop, kw)]);
+            assert_eq!(s.paint.inherit, bit, "{prop}: {kw} sets its bit only");
+            assert!(s.paint.inherits(bit), "{prop}: {kw} inherits");
+            assert_eq!(s.paint.white_space, None, "{prop}: {kw}: no white-space value");
+            assert_eq!(s.paint.nowrap, None, "{prop}: {kw}: no nowrap value");
+            assert_eq!(s.paint.rtl, None, "{prop}: {kw}: no direction value");
+            assert_eq!(s.paint.list_style, None, "{prop}: {kw}: no list-style value");
+        }
+    }
+}
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): a later value in the same block beats the bit (`inherits` is false while the
+/// field holds one) and stands.
+#[test]
+fn css_wide_inherited_rest_later_value_wins() {
+    for (prop, value, bit) in REST_BITS {
+        let s = styled(&[(prop, "inherit"), (prop, value)]);
+        assert!(!s.paint.inherits(bit), "{prop}: the later {value} beats the bit");
+    }
+    let s = styled(&[("white-space", "inherit"), ("white-space", "pre")]);
+    assert_eq!((s.paint.white_space, s.paint.nowrap), (Some(2), Some(true)), "the later pre stands with its nowrap");
+    let s = styled(&[("direction", "inherit"), ("direction", "rtl")]);
+    assert_eq!(s.paint.rtl, Some(true));
+    let s = styled(&[("list-style-type", "inherit"), ("list-style-type", "square")]);
+    assert_eq!(s.paint.list_style, Some(3));
+}
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): across rules, a later inherit clears the earlier rule's value and sets the bit; an
+/// unrelated later rule keeps it; a still later value clears it (merge_paint's `merge_inherit`).
+#[test]
+fn css_wide_inherited_rest_merge_paint() {
+    for (prop, value, bit) in REST_BITS {
+        let mut dst = styled(&[(prop, value)]);
+        merge_paint(&mut dst.paint, &styled(&[(prop, "inherit")]).paint);
+        assert!(dst.paint.inherits(bit), "{prop}: the later inherit set the bit");
+        assert_eq!(dst.paint.valued() & bit, 0, "{prop}: the later inherit cleared the earlier value");
+        merge_paint(&mut dst.paint, &styled(&[("padding", "1px")]).paint);
+        assert!(dst.paint.inherits(bit), "{prop}: an unrelated later rule keeps the bit");
+        merge_paint(&mut dst.paint, &styled(&[(prop, value)]).paint);
+        assert!(!dst.paint.inherits(bit), "{prop}: a later value clears the bit");
+        assert_eq!(dst.paint.inherit & bit, 0);
+    }
+}
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): a `pre` rule's nowrap does not survive a later rule's `white-space: inherit`
+/// (the arm writes the pair, set_inherit clears the pair).
+#[test]
+fn css_wide_inherited_rest_white_space_clears_nowrap() {
+    let mut dst = styled(&[("white-space", "nowrap")]);
+    assert_eq!(dst.paint.nowrap, Some(true), "the earlier rule's nowrap (armed)");
+    merge_paint(&mut dst.paint, &styled(&[("white-space", "unset")]).paint);
+    assert_eq!((dst.paint.white_space, dst.paint.nowrap), (None, None));
+    assert!(dst.paint.inherits(INHERIT_WHITE_SPACE));
+}
+
+/// AETHERCSSWIDEINHERITEDREST (SR831): `font: inherit` reaches the seven font fields only: the three values survive
+/// and their bits stay clear (INHERIT_FONT is still 127).
+#[test]
+fn font_inherit_leaves_inherited_rest() {
+    let mut dst = styled(&[("white-space", "pre"), ("direction", "rtl"), ("list-style-type", "square")]);
+    merge_paint(&mut dst.paint, &styled(&[("font", "inherit")]).paint);
+    assert_eq!((dst.paint.white_space, dst.paint.rtl, dst.paint.list_style), (Some(2), Some(true), Some(3)));
+    assert_eq!(dst.paint.inherit, INHERIT_FONT);
+    assert_eq!(INHERIT_FONT & (INHERIT_WHITE_SPACE | INHERIT_DIRECTION | INHERIT_LIST_STYLE), 0);
 }

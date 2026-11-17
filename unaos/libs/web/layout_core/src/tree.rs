@@ -1306,7 +1306,7 @@ fn collapse_inline_whitespace<H: Host>(tree: &mut LayoutTree<H>) {
         let mut block = dom.is_none(); // anonymous boxes wrap block-level runs
         if let Some(n) = &dom {
             if let Some(tag) = n.tag() {
-                ws = tree.paint_map.get(&id).and_then(|p| p.white_space).unwrap_or_else(|| default_white_space(&tag, ws));
+                ws = tree.paint_map.get(&id).and_then(|p| p.white_space).unwrap_or_else(|| crate::paint::or_tag(tree.paint_map.get(&id), crate::paint::INHERIT_WHITE_SPACE, ws, |w| default_white_space(&tag, w)));
                 block = is_block_level(tree, id);
                 if !block && (tag == "br" || inline::is_atomic(tree, id)) {
                     // Atomic inline: content that is not a space.
@@ -1883,7 +1883,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 }
                 size.mode.white_space = paint
                     .and_then(|p| p.white_space)
-                    .unwrap_or_else(|| default_white_space(tag, inherited.mode.white_space));
+                    .unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_WHITE_SPACE, inherited.mode.white_space, |w| default_white_space(tag, w)));
                 if let Some(v) = paint.and_then(|p| p.word_break) {
                     size.mode.word_break = v;
                 }
@@ -1905,7 +1905,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 if let Some(st) = paint.and_then(|p| p.stretch) {
                     size.stretch = st;
                 }
-                size.mode.rtl = paint.and_then(|p| p.rtl).unwrap_or_else(|| default_rtl(dom_node, inherited.mode.rtl));
+                size.mode.rtl = paint.and_then(|p| p.rtl).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_DIRECTION, inherited.mode.rtl, |r| default_rtl(dom_node, r)));
                 if let Some(tt) = paint.and_then(|p| p.text_transform) {
                     size.text_transform = tt;
                 }
@@ -3276,7 +3276,7 @@ pub fn is_rtl<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId) -> bool {
         if let Some(r) = tree.paint_map.get(&b).and_then(|p| p.rtl) {
             return r;
         }
-        if let Some(n) = tree.node_map.get(&b) {
+        if let Some(n) = tree.node_map.get(&b).filter(|_| !tree.paint_map.get(&b).is_some_and(|p| p.inherits(crate::paint::INHERIT_DIRECTION))) { // AETHERCSSWIDEINHERITEDREST (SR831): or_tag's bit as a filter (an explicit `direction: inherit` box's `dir` does not count: walk on to the parent)
             let own = default_rtl(n, false);
             if own == default_rtl(n, true) {
                 return own;

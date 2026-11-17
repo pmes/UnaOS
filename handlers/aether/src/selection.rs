@@ -509,7 +509,7 @@ impl Collector<'_> {
                     return;
                 }
                 let spec = self.layout.paint_map.get(&tid);
-                let ws = spec.and_then(|p| p.white_space).unwrap_or_else(|| crate::layout::default_white_space(&tag, ws));
+                let ws = spec.and_then(|p| p.white_space).unwrap_or_else(|| layout_core::paint::or_tag(spec, layout_core::paint::INHERIT_WHITE_SPACE, ws, |w| crate::layout::default_white_space(&tag, w)));
                 let tt = spec.and_then(|p| p.text_transform).unwrap_or(tt);
                 if tag == "br" {
                     self.forced("\n");
