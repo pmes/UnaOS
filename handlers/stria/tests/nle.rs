@@ -3866,7 +3866,7 @@ fn striamarkerjump_face_words_move_only_the_playhead() {
     assert!(f.verb("cut+"));
     assert_eq!((f.state.playhead, f.state.undo_depth()), (10, 0));
     assert!(!f.dirty(), "a jump does not dirty the document");
-    assert_eq!(f.last_error.take(), None);
+    assert_eq!(f.last_error.take().as_deref(), Some("cut+: 00:00:00:10")); // STRIAMARKERJUMPKEYS (SR923): the message row names where the jump landed
     f.state.seek(12);
     assert!(f.verb("mark"));
     let _ = f.last_error.take();
@@ -3877,8 +3877,77 @@ fn striamarkerjump_face_words_move_only_the_playhead() {
     assert_eq!(f.state.playhead, 12);
     assert!(f.verb("marker-"));
     assert_eq!(f.state.playhead, 12, "no marker before 12: the playhead stays");
-    assert_eq!(f.last_error.take(), None);
+    assert_eq!(f.last_error.take().as_deref(), Some("marker-: M1 at 00:00:00:12")); // STRIAMARKERJUMPKEYS (SR923): the still jump sets nothing; the earlier move's message remains
     assert_eq!(f.state.timeline, tl0);
     assert_eq!(f.state.undo_depth(), 1, "only the mark is an undo step");
     println!("striamarkerjump: cut+ 0 -> 10, 12 -> 20; marker- 20 -> 12");
+}
+
+// ---- STRIAMARKERJUMPKEYS (LEDGER SR923): Up / Down and ; / ' jump; the message row names where the jump landed (named tail block) ----
+
+fn striamarkerjumpkeys_face() -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+}
+
+/// Down / Up (`BrowserKey`, and AppKit's U+F701 / U+F700 as text) step the clip edges; `'` / `;` (text) step the markers;
+/// every jump action has a help phrase and a help row naming its keys; `M` stays unbound.
+#[test]
+fn striamarkerjumpkeys_keys_jump_and_help_rows() {
+    let mut f = striamarkerjumpkeys_face();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Down".into())));
+    assert_eq!(f.state.playhead, 10);
+    assert!(f.on(&bandy::SMessage::BrowserKey("Up".into())));
+    assert_eq!(f.state.playhead, 0);
+    assert!(f.on(&bandy::SMessage::BrowserText("\u{f701}".into())));
+    assert_eq!(f.state.playhead, 10, "AppKit's Down is Down");
+    assert!(f.on(&bandy::SMessage::BrowserText("\u{f700}".into())));
+    assert_eq!(f.state.playhead, 0, "AppKit's Up is Up");
+    assert!(!f.on(&bandy::SMessage::BrowserKey(";".into())), "a one-char BrowserKey alone is not taken");
+    f.state.timeline = f.state.timeline.mark(5, "A").unwrap().mark(30, "B").unwrap();
+    assert!(f.on(&bandy::SMessage::BrowserText("'".into())));
+    assert_eq!(f.state.playhead, 5);
+    assert!(f.on(&bandy::SMessage::BrowserText("'".into())));
+    assert_eq!(f.state.playhead, 30);
+    assert!(f.on(&bandy::SMessage::BrowserText(";".into())));
+    assert_eq!(f.state.playhead, 5);
+    assert_eq!(f.state.undo_depth(), 0, "a jump key is not an undo step");
+    assert!(!f.on(&bandy::SMessage::BrowserText("M".into())), "M stays unbound");
+    let rows = help_rows();
+    for (keys, act) in [(["Up", "\u{f700}"], "cut-"), (["Down", "\u{f701}"], "cut+"), ([";", ";"], "marker-"), (["'", "'"], "marker+")] {
+        for k in keys {
+            assert!(KEYS.contains(&(k, act)), "{k:?} -> {act}");
+        }
+        assert!(VERBS.contains(&act), "{act} is a VERBS word");
+        let p = help_phrase(act);
+        assert!(!p.is_empty() && p != act, "{act}: a phrase, not the word");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == keys[0])).expect("a help row");
+        assert_eq!(row.1, p);
+    }
+    println!("striamarkerjumpkeys: Down 0 -> 10, Up -> 0, ' 0 -> 5 -> 30, ; -> 5; help rows={}", rows.len());
+}
+
+/// The message row names where a jump landed (`marker+: Intro at 00:00:01:05`, `cut+: 00:00:00:10`); a jump with nowhere to
+/// go says nothing; no jump is an undo step or dirties the document.
+#[test]
+fn striamarkerjumpkeys_message_names_where_it_landed() {
+    let mut f = striamarkerjumpkeys_face();
+    f.state.seek(30);
+    assert!(f.verb("mark Intro"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marked Intro at 00:00:01:05"));
+    let depth = f.state.undo_depth();
+    f.state.seek(0);
+    assert!(f.verb("marker+"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker+: Intro at 00:00:01:05"));
+    f.state.seek(0);
+    assert!(f.verb("cut+"));
+    assert_eq!(f.last_error.take().as_deref(), Some("cut+: 00:00:00:10"));
+    f.state.seek(0);
+    assert!(f.verb("cut-"));
+    assert_eq!(f.state.playhead, 0);
+    assert_eq!(f.last_error.take(), None, "nothing when the playhead did not move");
+    assert!(f.on(&bandy::SMessage::BrowserKey("Down".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("cut+: 00:00:00:10"), "the key words the same message");
+    assert_eq!(f.state.undo_depth(), depth, "a jump is not an undo step");
+    println!("striamarkerjumpkeys: marker+ -> Intro at 00:00:01:05, cut+ -> 00:00:00:10, still cut- -> no message");
 }

@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -388,6 +388,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
+    ("Up", "cut-"), // STRIAMARKERJUMPKEYS (SR923): Up / Down jump to the previous / next clip edge, ; / ' to the previous / next marker (text keys)
+    ("Down", "cut+"),
+    ("\u{f700}", "cut-"),
+    ("\u{f701}", "cut+"),
+    (";", "marker-"),
+    ("'", "marker+"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2605,6 +2611,10 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("mark", "drop a marker at the playhead"), // STRIAMARKERS (SR835)
+    ("marker-", "go to the previous marker"), // STRIAMARKERJUMPKEYS (SR923)
+    ("marker+", "go to the next marker"),
+    ("cut-", "go to the previous clip edge"),
+    ("cut+", "go to the next clip edge"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3146,6 +3156,37 @@ impl Face {
             (timeline_core::editor::MarkerWord::Unmark, Err(EditError::Marker), None) => format!("unmark: no marker at {tc}"),
             (_, Err(e), _) => format!("{}: {e}", v.trim()),
         });
+        Some(true)
+    }
+}
+
+// ---- STRIAMARKERJUMPKEYS (LEDGER SR923): the jump words' message line (named tail block) ----
+// `marker-` / `marker+` / `cut-` / `cut+` (the buttons, Up / Down, `;` / `'`) stay SR894's view words through THE dispatch
+// (`EditorState::verb`); the face only words THE message (`last_error`) when the playhead moved: `marker+: <name> at <tc>`,
+// `cut+: <tc>` (tc the new playhead's `HH:MM:SS:FF`, its tick when the rate is not an integer fps). A jump with nowhere to go
+// leaves the message untouched.
+
+impl Face {
+    /// The jump words (`timeline_core::editor::jump_word`) through the one dispatch, with their message; `None` for any other
+    /// word.
+    fn jump_verb(&mut self, v: &str) -> Option<bool> {
+        let (j, _) = timeline_core::editor::jump_word(v)?;
+        let ph = self.state.playhead;
+        if let Err(e) = self.state.verb(v).unwrap_or(Ok(())) {
+            self.last_error = Some(format!("{}: {e}", v.trim()));
+            return Some(true);
+        }
+        let now = self.state.playhead;
+        if now != ph {
+            let tc = self.state.timeline.fps().map_or_else(|| now.to_string(), |f| timeline_core::edl::timecode(now, f));
+            self.last_error = Some(match j {
+                timeline_core::editor::Jump::Marker => {
+                    let name = self.state.timeline.marker_at(now).map(|m| m.name.clone()).unwrap_or_default();
+                    format!("{}: {name} at {tc}", v.trim())
+                }
+                timeline_core::editor::Jump::Cut => format!("{}: {tc}", v.trim()),
+            });
+        }
         Some(true)
     }
 }
