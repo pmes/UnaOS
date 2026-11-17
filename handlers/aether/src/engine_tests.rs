@@ -5902,4 +5902,101 @@ mod tests {
         assert!((w - 100.0).abs() <= 0.5, "the .w box is 100 (armed): {w}");
         assert!((wr - 400.0).abs() <= 0.5, "width: unset fills the container: {wr}");
     }
+
+    // ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): one probe per relative road: em and % of the parent's size, smaller / larger
+    /// (layout_core's /1.2 and x1.2), `font: inherit` and em on a control, a plain control, and nested em.
+    fn font_size_rel_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:10px"><span id="em" style="font-size:2em">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="font-size:150%">Hello</span></div>
+            <div style="font-size:10px"><span id="sm" style="font-size:smaller">Hello</span></div>
+            <div style="font-size:10px"><span id="lg" style="font-size:larger">Hello</span></div>
+            <div style="font-size:20px"><button id="fib" style="font:inherit">Go</button></div>
+            <div style="font-size:20px"><button id="plain">Go</button></div>
+            <div style="font-size:10px"><button id="emb" style="font-size:2em">Go</button></div>
+            <div style="font-size:10px"><div style="font-size:2em"><span id="nest" style="font-size:1.5em">Hello</span></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `font-size: 2em` under 10px reads 20px and `150%` under 16px reads 24px (the
+    /// specified road read the parent's size: 10px / 16px).
+    #[test]
+    fn font_size_rel_cssom_em_percent() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "em", "fontSize"), "20px", "2em of 10px");
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
+    /// 4-decimal grammar.
+    #[test]
+    fn font_size_rel_cssom_smaller_larger() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
+        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
+    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
+    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
+    #[test]
+    fn font_size_rel_cssom_font_inherit_button() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
+        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
+    #[test]
+    fn font_size_rel_cssom_nested_em() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
+    }
+
+    // ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
+
+    /// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): in a 300px `dir=rtl` column a 100px block with margin-left 10
+    /// and margin-right 20 sits 20 from the right edge (CSS 2.2 §10.3.3: margin-left is the over-constrained one; SR711's
+    /// END), `margin-left: auto` takes the slack to the same place, `margin: 0 auto` centres, an ltr column keeps
+    /// margin-left; `style.direction` flips re-derive it.
+    #[test]
+    fn rtl_margin_over_constrained_ends_at_margin_right() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            .col { width: 300px; }
+            .col div { width: 100px; height: 10px; }
+        </style></head><body>
+        <div class="col" id="rc" dir="rtl">
+            <div id="a" style="margin-left: 10px; margin-right: 20px"></div>
+            <div id="b" style="margin-left: auto; margin-right: 20px"></div>
+            <div id="c" style="margin: 0 auto"></div>
+        </div>
+        <div class="col" id="lc"><div id="d" style="margin-left: 10px; margin-right: 20px"></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let off = |e: &mut crate::AetherEngine, col: &str, id: &str| {
+            js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().left - document.getElementById('{col}').getBoundingClientRect().left"))
+        };
+        assert_eq!(off(&mut engine, "rc", "a"), 180.0, "rtl 10 / 20: margin-right binds");
+        assert_eq!(off(&mut engine, "rc", "b"), 180.0, "rtl auto / 20: the auto margin takes the slack");
+        assert_eq!(off(&mut engine, "rc", "c"), 100.0, "rtl 0 auto: centred");
+        assert_eq!(off(&mut engine, "lc", "d"), 10.0, "ltr 10 / 20: margin-left binds");
+        for (dir, want) in [("ltr", 10.0), ("rtl", 180.0)] {
+            js_num(&mut engine, &format!("document.getElementById('rc').style.direction = '{dir}'; 0"));
+            engine.render_frame();
+            assert_eq!(off(&mut engine, "rc", "a"), want, "style.direction = {dir}: the 10 / 20 block's offset");
+        }
+    }
+
 }
