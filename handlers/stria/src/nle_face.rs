@@ -2185,6 +2185,13 @@ impl Face {
     fn export_frac(&self) -> Option<f64> {
         self.export_progress().map(|(d, t)| if t == 0 { 0.0 } else { (d as f64 / t as f64).min(1.0) })
     }
+    /// NLE5DEXPORTMESSAGEETA (SR796): the running export's remaining time from its rate so far ([`eta_of`] over the
+    /// [`Face::export_progress`] pair and the job's `started`, SR756); `None` with no export, before the first frame, or under 1 ms.
+    pub fn export_eta(&self) -> Option<Duration> {
+        let j = self.export.as_ref()?;
+        let (d, t) = self.export_progress()?;
+        eta_of(d, t, j.started.elapsed())
+    }
     /// One clock tick for the export: a finished job's result goes to the message line and the job is cleared; true when
     /// that happened or the reading moved (the band repaints).
     pub fn export_tick(&mut self) -> bool {
@@ -2891,5 +2898,41 @@ pub fn realtime_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<St
     } else {
         let h = q(100)?;
         format!("{}.{:02}x", h / 100, h % 100)
+    })
+}
+
+// ---- NLE5DEXPORTMESSAGEETA (LEDGER SR796): a running export's remaining time from the rate so far (named tail block) ----
+// `Face::export_eta` reads the job's `started` (SR756, face thread only) and the `export_progress` pair through ONE formula
+// (`eta_of`); the words and stria-view's `"eta_secs"` read ONE rounding (`eta_secs`). The band stays a bar. Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-BAND (a painted `~12 s` on the band or the message line), NLE5D-EXPORT-MESSAGE-ETA-SMOOTH (an EMA
+// of the rate so a slow start does not pin a long eta), NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The remaining time of an export `done` of `total` frames in after `elapsed`: `(total - done) x elapsed / done` in integer
+/// microseconds. `None` while `done` is 0 or `elapsed` is under 1 ms (no estimate yet), or on an overflow.
+fn eta_of(done: u64, total: u64, elapsed: Duration) -> Option<Duration> {
+    if done == 0 || elapsed < Duration::from_millis(1) {
+        return None;
+    }
+    let us = (total.saturating_sub(done) as u128).checked_mul(elapsed.as_micros())? / done as u128;
+    Some(Duration::from_micros(u64::try_from(us).ok()?))
+}
+
+/// A remaining time in whole seconds, rounded half up: THE rounding the words ([`eta_words`]) and the witness's
+/// `"eta_secs"` both read, so they never disagree.
+pub fn eta_secs(d: Duration) -> u64 {
+    ((d.as_micros() + 500_000) / 1_000_000) as u64
+}
+
+/// A running export's remaining time as a person reads it, the tilde saying estimate: under a minute whole seconds
+/// (`~12 s`, `~0 s` under half a second), under an hour minutes and seconds (`~1:05`), else hours (`~1:02:03`); the grade is
+/// chosen after the rounding ([`eta_secs`]), so 59.6 s reads `~1:00`. `None` while there is no estimate ([`eta_of`]).
+pub fn eta_words(done: u64, total: u64, elapsed: Duration) -> Option<String> {
+    let s = eta_secs(eta_of(done, total, elapsed)?);
+    Some(if s < 60 {
+        format!("~{s} s")
+    } else if s < 3600 {
+        format!("~{}:{:02}", s / 60, s % 60)
+    } else {
+        format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
     })
 }

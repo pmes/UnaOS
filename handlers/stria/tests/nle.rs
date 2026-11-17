@@ -3094,3 +3094,80 @@ fn nle5dexportmessageraterealtime_refusals_carry_none() {
     println!("nle5dexportmessageraterealtime: usage / unknown format / cancel carry no multiple");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- NLE5DEXPORTMESSAGEETA (LEDGER SR796): a running export's remaining time from the rate so far (named tail block) ----
+
+#[test]
+fn nle5dexportmessageeta_eta_words_kat() {
+    use stria::nle_face::{eta_secs, eta_words};
+    use std::time::Duration;
+    let (s, ms, us) = (Duration::from_secs, Duration::from_millis, Duration::from_micros);
+    let rows = [
+        (10, 35, s(2), "~5 s"),
+        (1, 100, s(1), "~1:39"),
+        (1, 10_000, s(1), "~2:46:39"),
+        (35, 35, s(2), "~0 s"),
+        (1, 2, ms(400), "~0 s"),
+        (1, 2, ms(600), "~1 s"),
+        (1, 2, ms(59_600), "~1:00"),
+        (1, 2, ms(3_599_500), "~1:00:00"),
+    ];
+    for (d, t, e, want) in rows {
+        assert_eq!(eta_words(d, t, e).as_deref(), Some(want), "eta_words({d}, {t}, {e:?})");
+    }
+    let nones = [(0, 35, s(2)), (10, 35, Duration::ZERO), (10, 35, us(999))];
+    for (d, t, e) in nones {
+        assert_eq!(eta_words(d, t, e), None, "eta_words({d}, {t}, {e:?}): no estimate yet");
+    }
+    assert_eq!(eta_secs(ms(1_500)), 2);
+    assert_eq!(eta_secs(ms(1_499)), 1);
+    println!("nle5dexportmessageeta: eta_words {} KAT rows, {} None, eta_secs half up", rows.len(), nones.len());
+}
+
+#[test]
+fn nle5dexportmessageeta_export_eta_runs_only_while_exporting() {
+    use stria::nle_face::eta_words;
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("eta-running");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert_eq!(face.export_eta(), None, "no export: no eta");
+    let t0 = std::time::Instant::now();
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let e1 = face.export_eta().expect("an eta while the paused job runs");
+    assert!(e1 >= Duration::from_millis(2) * 32 / 3, "{e1:?}: at least 32 frames x 2 ms / 3");
+    assert!(e1 <= t0.elapsed() * 32 / 3, "{e1:?}: at most the rate since before the job started");
+    assert!(eta_words(3, 35, t0.elapsed()).is_some_and(|w| w.starts_with('~')));
+    std::thread::sleep(Duration::from_millis(2));
+    let e2 = face.export_eta().expect("still running");
+    assert!(e2 >= e1, "{e2:?} < {e1:?}: paused, done is fixed and the elapsed grows");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    assert_eq!(face.export_eta(), None, "finished: no eta");
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    println!("nle5dexportmessageeta: paused at 3/35 the eta read {e1:?} then {e2:?}, none after");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageeta_labels_off_paint_is_unmoved() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("eta-paint");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let (e1, a) = (face.export_eta(), face.paint());
+    std::thread::sleep(Duration::from_millis(5));
+    let (e2, b) = (face.export_eta(), face.paint());
+    assert!(e1.is_some() && e2 > e1, "{e1:?} -> {e2:?}: the eta moved");
+    assert_eq!(a, b, "labels off: the eta paints nothing; the band is the fraction only");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    println!("nle5dexportmessageeta: labels-off paint byte-identical across eta {e1:?} -> {e2:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

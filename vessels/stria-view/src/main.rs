@@ -616,7 +616,7 @@ fn play_audio(c: &Cli, engine: &mut Option<Box<dyn std::any::Any>>, face: Face) 
 // ---- NLEFACEEXPORT (LEDGER SR694): the witness's export reading (named tail block) ----
 /// The witness's `"export"` field, only while an export runs (`Face::export_progress`); the default line is unchanged.
 fn export_json(face: &Face) -> String {
-    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"}}", face.export_audio().unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word
+    face.export_progress().map(|(d, t)| format!(",\"export\":{{\"done\":{d},\"total\":{t},\"audio\":\"{}\"{}}}", face.export_audio().unwrap_or_default(), face.export_eta().map(|e| format!(",\"eta_secs\":{}", nle_face::eta_secs(e))).unwrap_or_default())).unwrap_or_default() // NLE5DEXPORTMESSAGEAUDIO (SR756): the running job's audio word; NLE5DEXPORTMESSAGEETA (SR796): eta_secs while known
 }
 
 // ---- NLE5DEXPORTRANGE (LEDGER SR717): the witness's marked range (named tail block) ----
@@ -783,7 +783,7 @@ mod exportaudio_tests {
             assert!(t0.elapsed() < std::time::Duration::from_secs(60), "reading {:?}", face.export_progress());
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert_eq!(export_json(&face), r#","export":{"done":3,"total":35,"audio":"wav"}"#);
+        let j = export_json(&face); let (head, eta) = j.split_once(",\"eta_secs\":").expect("eta while it runs"); assert_eq!(head, r#","export":{"done":3,"total":35,"audio":"wav""#); assert!(eta.strip_suffix('}').is_some_and(|n| n.parse::<u64>().is_ok()), "{j}"); // NLE5DEXPORTMESSAGEETA (SR796): the eta tail is timing-dependent; the head stays byte-exact
         assert!(face.cancel_export());
         assert!(face.wait_export());
         assert_eq!(export_json(&face), "");
@@ -821,5 +821,40 @@ mod striainforeelhoverdelay_tests {
         assert!(reel_json(&face).starts_with(",\"reel\":\"A: "), "{}", reel_json(&face));
         assert_eq!(drive(&mut face, "tick:x"), vec!["bad token tick:x".to_string()]);
         println!("striainforeelhoverdelay witness: move over A + tick:{} -> A's reel", nle_face::HOVER_DWELL);
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEETA (LEDGER SR796): the witness's export object carries the remaining time while known (named tail block) ----
+#[cfg(test)]
+mod exporteta_tests {
+    use super::*;
+
+    /// NLE5DEXPORTMESSAGEETA (SR796): a job paused at frame 3 of 35 (`Face::export_paused_at`) carries `"eta_secs":<n>` after
+    /// `"audio"`, the head byte-exact and `n` the face's own reading through `nle_face::eta_secs`; once it is cancelled and
+    /// joined the field is gone with the object.
+    #[test]
+    fn nle5dexportmessageeta_witness_eta_secs_field() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let dir = exe.parent().expect("its directory").join("nle5dexportmessageeta-witness");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.export_paused_at(&dir, "png", 3).unwrap();
+        let t0 = std::time::Instant::now();
+        while face.export_progress() != Some((3, 35)) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(60), "reading {:?}", face.export_progress());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let j = export_json(&face);
+        let (head, eta) = j.split_once(",\"eta_secs\":").unwrap_or_else(|| panic!("no eta_secs in {j}"));
+        assert_eq!(head, r#","export":{"done":3,"total":35,"audio":"wav""#);
+        let n: u64 = eta.strip_suffix('}').and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{j}"));
+        assert!(face.export_eta().is_some_and(|e| nle_face::eta_secs(e) >= n), "{j}: the paused eta only grows");
+        assert!(face.cancel_export());
+        assert!(face.wait_export());
+        assert_eq!(export_json(&face), "");
+        println!("nle5dexportmessageeta witness: {j}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
