@@ -22,7 +22,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 4. STRIAMULTISELECT — shift-click adds to the selection, a marquee drag selects clips crossing the rectangle (`Layout::crossing` :110 EXISTS: wire it); every clip op applies to the whole selection (move / delete / gain).
 5. STRIACOPYPASTE — `copy` / `cut` / `paste` of the selection at the playhead (an in-face clipboard `Vec<Clip>`; paste on the selected track; overlaps refused by `validate`).
 6. STRIANUDGE — `,` / `.` move the selection by one frame, shift by ten (through move_clip + undo); the message row reads the new `at`.
-7. STRIACLIPLINK — audio and video clips from one source move together: a `group: u32` id on Clip (measure first; EDL `* UNA GROUP`).
+7. [SR863 started] STRIACLIPLINK — audio and video clips from one source move together: a `group: u32` id on Clip (measure first; EDL `* UNA GROUP`).
 8. STRIATRACKADDREMOVE — `track+ video|audio` / `track-` on the face (Timeline tracks Vec; EDL writes tracks by order already: measure).
 9. STRIATRACKREORDER — drag a track header up / down (needs SR837's badge column or a header column: name).
 10. STRIAGAPCLOSE — `close-gaps` removes every gap on the selected track (ripple); `gap <n>` inserts n frames of gap at the playhead.
