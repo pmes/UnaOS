@@ -1543,3 +1543,235 @@ mod firstp_prediction_tests {
         assert_eq!((binding, within_t1, within), (14, [7, 2, 6, 7], [6, 7]), "binding rows; within 2 QP: T1 (a)..(d), T2 (c) (d)");
     }
 }
+
+// ---- H264ENCRCFIRSTBOFFSET (LEDGER SR1010): the first B after an IDR, measured (named tail block) ----
+// With bframes 2 the display order I B B P after an IDR is coded I P B B (`group`: the P first, then the pyramid's Ref B, then its
+// Outer B), so at the first B `last_qp` is the first P's QP and SR844's `after_idr` is already cleared by that P. From the second GOP
+// on the B model is coded (the previous GOP's last B), so `picture`'s refq is that STALE B QP and its k; at the stream's first B the
+// model is uncoded and refq is `last_qp + B_QP_OFFSET`, the anchor + offset. This module drives SR834's fixtures through `push` /
+// `flush` and REPLAYS `Rc::picture` / `Rc::update` on a clone of the rate controller per push (I / P at their coded QP and bits, each
+// B on its true S': `rc_analyse`'s B branch over the reconstructions of its two references), asserting the replay faithful (each B's
+// QP == the coded one; the post-push bucket and B model == the encoder's). T2 re-runs with `types[2].qp` set to the first P's QP +
+// B_QP_OFFSET before the group's push: exactly the candidate arm (types[2].qp is read only by refq's coded arm).
+// MEASURED (SR1010): the arm fixes 2 of the 6 binding misses and worsens 5 of 12 rows, so `picture` is unchanged (the PINS doc).
+
+#[cfg(test)]
+mod firstb_offset_tests {
+    extern crate std;
+    use super::scenecut_rc_tests::{fixture, CUT};
+    use super::*;
+    use crate::{Config, Yuv420};
+    use alloc::vec::Vec;
+    use std::println;
+
+    const W: usize = 64;
+    const H: usize = 64;
+
+    /// One coded picture in coding order: type index, display index, reference (nal_ref_idc > 0), QP, bits, luma reconstruction.
+    struct Coded {
+        t: usize,
+        disp: u64,
+        refd: bool,
+        qp: i32,
+        bits: u64,
+        rec: Vec<u8>,
+    }
+
+    /// What the replay saw at one B: after_idr, the B model before it, last_qp, refq, S', target, predicted bits at the pick, the pick,
+    /// the coded bits, the floor.
+    #[derive(Debug, Clone, Copy)]
+    struct BRow {
+        after_idr: bool,
+        m: Model,
+        last: i32,
+        anchor: i32,
+        refq: i32,
+        s: u64,
+        target: i64,
+        pred: u64,
+        qp: i32,
+        bits: u64,
+        floor: i32,
+    }
+
+    /// SR844's oracle over [lo, hi]: the first QP whose bits (the coded bits moved by Qstep) fit the target, else hi.
+    fn oracle(b: &BRow, lo: i32, hi: i32) -> i32 {
+        let at = |q: i32| b.bits as u128 * step16(b.qp) as u128 / step16(q) as u128;
+        (lo.max(b.floor)..=hi.min(QP_MAX)).find(|&q| at(q) <= b.target as u128).unwrap_or(hi.min(QP_MAX))
+    }
+
+    /// One run's record: every coded picture, each B's [`BRow`] by coding index, the push index that coded each picture, the peak
+    /// CBR fullness (after every picture, from the faithful replay) and the bucket size.
+    struct Run {
+        coded: Vec<Coded>,
+        brows: Vec<(usize, BRow)>,
+        push_of: Vec<usize>,
+        peak: i64,
+        buf: i64,
+    }
+
+    /// Push `n` frames of `src` (then flush) at 64x64 CBR `kbps` 30 fps, bframes 2, `gop`, `scenecut`; `inject` = (push index, QP)
+    /// writes `types[2].qp` before that push.
+    fn run_b(kbps: u32, gop: u32, sc: Option<u8>, n: usize, src: &dyn Fn(usize) -> [Vec<u8>; 3], inject: Option<(usize, i32)>) -> Run {
+        let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop, bframes: 2, scenecut: sc, rate: Some(RateControl::cbr(kbps, (30, 1))), ..Default::default() };
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut run = Run { coded: Vec::new(), brows: Vec::new(), push_of: Vec::new(), peak: 0, buf: enc.rc.as_ref().unwrap().buf };
+        for step in 0..=n {
+            if let Some((at, q)) = inject {
+                if at == step {
+                    enc.rc.as_mut().unwrap().types[2].qp = q;
+                }
+            }
+            let before = enc.rc.clone().unwrap();
+            let k0 = enc.stats.len();
+            let out = if step < n {
+                let p = src(step);
+                enc.push(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap()
+            } else {
+                enc.flush().unwrap()
+            };
+            assert_eq!(out.len(), enc.reconstructions().len());
+            assert_eq!(enc.stats.len() - k0, out.len());
+            let first = run.coded.len();
+            for (i, au) in out.iter().enumerate() {
+                let st = enc.stats[k0 + i];
+                let t = match st.kind {
+                    Pic::Idr => 0,
+                    Pic::P => 1,
+                    Pic::B => 2,
+                };
+                let refd = au.nals.iter().any(|x| matches!(x[0] & 0x1f, 1 | 5) && (x[0] >> 5) & 3 != 0);
+                run.coded.push(Coded { t, disp: au.pts - 1, refd, qp: st.qp, bits: st.bits, rec: enc.reconstructions()[i][0].clone() });
+                run.push_of.push(step);
+            }
+            // The replay of this push on a clone of the rate controller.
+            let mut rp = before;
+            let mut saw_b = false;
+            for j in first..run.coded.len() {
+                let c = &run.coded[j];
+                if c.t != 2 {
+                    rp.picture(c.t, alloc::vec![1]);
+                    rp.pic_qp = c.qp;
+                    rp.update(c.bits);
+                    run.peak = run.peak.max(rp.full);
+                    continue;
+                }
+                saw_b = true;
+                let past = run.coded[..j].iter().filter(|r| r.refd && r.disp < c.disp).max_by_key(|r| r.disp).expect("a past reference");
+                let fut = run.coded[..j].iter().filter(|r| r.refd && r.disp > c.disp).min_by_key(|r| r.disp).expect("a future reference");
+                let frame = src(c.disp as usize);
+                let y = &frame[0];
+                let s = 64 * (W / 16 * H / 16) as u64
+                    + (0..W * H).map(|i| (y[i] as i32 - past.rec[i] as i32).unsigned_abs().min((y[i] as i32 - fut.rec[i] as i32).unsigned_abs()) as u64).sum::<u64>();
+                let m = rp.types[2];
+                let (after_idr, last, anchor) = (rp.after_idr, rp.last_qp, rp.types[1].qp);
+                let refq = if m.coded { m.qp } else { (last + B_QP_OFFSET).min(QP_MAX) };
+                let qp = rp.picture(2, alloc::vec![s]);
+                assert_eq!(qp, c.qp, "replay: the B at display {} picked {qp}, the encoder {}", c.disp, c.qp);
+                let pred = if m.coded { m.predict(s, qp) as u64 } else { 0 };
+                run.brows.push((j, BRow { after_idr, m, last, anchor, refq, s, target: rp.target, pred, qp, bits: c.bits, floor: rp.floor }));
+                rp.update(c.bits);
+                run.peak = run.peak.max(rp.full);
+            }
+            let rc = enc.rc.as_ref().unwrap();
+            assert_eq!((rp.full, rp.plan, rp.last_qp, rp.err), (rc.full, rc.plan, rc.last_qp, rc.err), "replay: the bucket after push {step}");
+            if saw_b {
+                let (a, b) = (rp.types[2], rc.types[2]);
+                assert_eq!((a.coded, a.bits, a.step, a.s, a.qp, a.avg_s), (b.coded, b.bits, b.step, b.s, b.qp, b.avg_s), "replay: the B model after push {step}");
+            }
+        }
+        run
+    }
+
+    /// The coding indices of the IDR at display CUT and of the first two Bs coded after it.
+    fn after_cut(run: &Run) -> (usize, usize, usize) {
+        let i = run.coded.iter().position(|c| c.t == 0 && c.disp == CUT as u64).expect("an IDR at CUT");
+        let mut bs = run.brows.iter().map(|b| b.0).filter(|&j| j > i);
+        (i, bs.next().expect("a first B after the IDR"), bs.next().expect("a second B after the IDR"))
+    }
+
+    fn brow(run: &Run, j: usize) -> BRow {
+        run.brows.iter().find(|b| b.0 == j).unwrap().1
+    }
+
+    /// The measured table (MEASURE SR1010), per run: (fixture, kbps, scenecut Some(40) at gop 30 (true) or the control scenecut None
+    /// at gop 10, B1 = the first B coded after the IDR at CUT [refq (the stale B QP), anchor (the first P's QP), QP, oracle_full,
+    /// T2 QP (the arm `types[1].qp + B_QP_OFFSET` injected), T2 oracle_full], B2 [QP, oracle_full], peak fullness). On the 12 binding
+    /// rows (kbps <= 100) B1 sits > PIC_STEP off oracle_full on 6 (A 50, C 100, C 50); the arm brings 2 within PIC_STEP (A 50), grows
+    /// |B1 - oracle| on 5 (B 100 cut 3 -> 16) and a later B by 7 (B 100 cut): MEASURED-NOT-NEEDED, `picture` unchanged; the misses
+    /// sit in the stale B prediction (pred / actual 0.13x..7.3x), owed with H264ENC-RC-CPLX-WINDOW.
+    const PINS: [(char, u32, bool, [i32; 6], [i32; 2], i64); 18] = [
+        ('A', 200, true, [16, 25, 16, 16, 21, 16], [16, 16], 93790),
+        ('A', 200, false, [16, 29, 16, 16, 25, 16], [16, 16], 93782),
+        ('A', 100, true, [16, 29, 16, 19, 25, 20], [16, 16], 47123),
+        ('A', 100, false, [16, 29, 16, 20, 25, 22], [16, 16], 47115),
+        ('A', 50, true, [16, 29, 16, 26, 25, 26], [21, 16], 32032),
+        ('A', 50, false, [16, 29, 16, 30, 25, 28], [22, 16], 28798),
+        ('B', 200, true, [16, 29, 16, 16, 25, 16], [16, 16], 109502),
+        ('B', 200, false, [16, 29, 16, 16, 25, 16], [16, 16], 108998),
+        ('B', 100, true, [17, 31, 23, 20, 36, 20], [20, 22], 77840),
+        ('B', 100, false, [20, 32, 26, 20, 33, 19], [20, 22], 67064),
+        ('B', 50, true, [25, 35, 31, 34, 43, 38], [33, 34], 45696),
+        ('B', 50, false, [25, 37, 31, 35, 42, 37], [34, 35], 39480),
+        ('C', 200, true, [22, 29, 16, 26, 25, 26], [21, 16], 118574),
+        ('C', 200, false, [23, 29, 17, 28, 25, 26], [23, 16], 114406),
+        ('C', 100, true, [32, 36, 36, 19, 36, 19], [30, 41], 72945),
+        ('C', 100, false, [35, 33, 37, 20, 37, 20], [31, 38], 69214),
+        ('C', 50, true, [43, 41, 37, 29, 37, 29], [31, 47], 47506),
+        ('C', 50, false, [43, 41, 37, 28, 37, 28], [31, 47], 46834),
+    ];
+
+    #[test]
+    fn firstb_offset_table() {
+        let n = CUT + 7;
+        let (mut binding, mut miss_today, mut fixed, mut grew, mut later_bad) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for &(f, kbps, cut, want1, want2, peak_want) in PINS.iter() {
+            let (gop, sc) = if cut { (30, Some(40)) } else { (CUT as u32, None) };
+            let name = alloc::format!("{f} {kbps:3} {}", if cut { "cut " } else { "ctrl" });
+            let base = run_b(kbps, gop, sc, n, &fixture(f), None);
+            assert!(base.peak <= base.buf, "{name}: the CBR bucket overflowed ({} > {})", base.peak, base.buf);
+            assert_eq!(base.peak, peak_want, "{name}: the peak bucket fullness");
+            // The stream's first B: the uncoded road, the first P's QP + B_QP_OFFSET.
+            let (j0, s0) = base.brows[0];
+            println!("FB0 {name}: disp={} coded_model={} last={} refq={} qp={}", base.coded[j0].disp, s0.m.coded, s0.last, s0.refq, s0.qp);
+            assert!(!s0.m.coded && s0.qp == (s0.anchor + B_QP_OFFSET).min(QP_MAX), "{name}: the stream's first B at the anchor + B_QP_OFFSET");
+            let (iidr, j1, j2) = after_cut(&base);
+            let order: Vec<(usize, u64)> = base.coded[iidr..=j2].iter().map(|c| (c.t, c.disp)).collect();
+            assert_eq!(order, [(0, CUT as u64), (1, CUT as u64 + 3), (2, CUT as u64 + 1), (2, CUT as u64 + 2)], "{name}: I B B P coded I P B B");
+            let (b1, b2) = (brow(&base, j1), brow(&base, j2));
+            assert!(!b1.after_idr && b1.m.coded && b1.refq == b1.m.qp && b1.last == b1.anchor, "{name}: B1 on the stale road, after_idr cleared by the P");
+            let (of1, of2) = (oracle(&b1, b1.floor, QP_MAX), oracle(&b2, b2.floor, QP_MAX));
+            println!(
+                "FB1 {name}: refq={} anchor={} qp={} oracle_win={} oracle_full={of1} pred={} actual={} target={} S'={} | FB2 qp={} oracle_full={of2}",
+                b1.refq, b1.anchor, b1.qp, oracle(&b1, b1.refq - PIC_STEP, b1.refq + PIC_STEP), b1.pred, b1.bits, b1.target, b1.s, b2.qp
+            );
+            // T2: the candidate arm (types[2].qp = the first P's QP + B_QP_OFFSET before the group's push).
+            let alt = (b1.anchor + B_QP_OFFSET).min(QP_MAX);
+            let inj = run_b(kbps, gop, sc, n, &fixture(f), Some((base.push_of[j1], alt)));
+            assert!(inj.peak <= inj.buf, "{name}: T2 overflowed ({} > {})", inj.peak, inj.buf);
+            let (_, k1, _) = after_cut(&inj);
+            let c1 = brow(&inj, k1);
+            assert_eq!((c1.anchor, c1.refq), (b1.anchor, alt), "{name}: T2 injected the arm");
+            let oc1 = oracle(&c1, c1.floor, QP_MAX);
+            println!("T2 {name}: B1 qp {}->{} oracle_full {of1}->{oc1} peak {}->{} / {}", b1.qp, c1.qp, base.peak, inj.peak, inj.buf);
+            assert_eq!(([b1.refq, b1.anchor, b1.qp, of1, c1.qp, oc1], [b2.qp, of2]), (want1, want2), "{name}: B1 / T2 / B2 measured");
+            if kbps <= 100 {
+                let (d0, d1) = ((b1.qp - of1).abs(), (c1.qp - oc1).abs());
+                // later Bs (coding order after B1): the largest growth of |qp - oracle_full| under the arm.
+                let mut grow = 0;
+                for (&(jb, bb), &(jc, bc)) in base.brows.iter().zip(inj.brows.iter()) {
+                    if jb > j1 && jc == jb {
+                        grow = grow.max((bc.qp - oracle(&bc, bc.floor, QP_MAX)).abs() - (bb.qp - oracle(&bb, bb.floor, QP_MAX)).abs());
+                    }
+                }
+                binding += 1;
+                miss_today += (d0 > PIC_STEP) as u32;
+                fixed += (d0 > PIC_STEP && d1 <= PIC_STEP) as u32;
+                grew += (d1 > d0) as u32;
+                later_bad += (grow > PIC_STEP) as u32;
+            }
+        }
+        println!("binding rows {binding}: B1 > PIC_STEP off oracle_full today {miss_today}; the arm brings within PIC_STEP {fixed}; grows |B1 - oracle| {grew}; a later B grows > PIC_STEP {later_bad}");
+        assert_eq!((binding, miss_today, fixed, grew, later_bad), (12, 6, 2, 5, 1), "the measured refutation of the first-B arm (SR1010)");
+    }
+}
