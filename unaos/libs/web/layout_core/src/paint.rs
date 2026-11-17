@@ -999,7 +999,7 @@ pub fn line_height_length_px(mult: f32) -> f32 {
 }
 
 /// AETHERLINEHEIGHTZERO (SR843): the arm's write for an author value: a RAW zero (`0`, `0px`, `0%`) is
-/// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (a negative keeps today's clamp to 0.0).
+/// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (SR1017: the arm refuses a negative before this call).
 pub fn line_height_zero_or(raw: f32, encoded: f32) -> f32 {
     if raw == 0.0 { LINE_HEIGHT_ZERO } else { encoded }
 }
