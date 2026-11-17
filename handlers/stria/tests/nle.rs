@@ -10798,3 +10798,38 @@ fn striaripplemore_a_straddler_reads_on_the_message_row() {
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
     println!("striaripplemore: rtrim-all out 1 over A1's 25..35 -> {}", EditError::Overlap);
 }
+
+// ---- STRIAMARKERSMORE (LEDGER SR966): `Alt+m` and the help row for `unmark all` (named tail block) ----
+
+/// `unmark all` is a VERBS word just before `help`; `Alt+m` (a named key, never text) removes every marker in ONE commit
+/// with SR895's message; with none it is refused by name and pushes no undo step; the help shows `Alt+m` with its phrase.
+#[test]
+fn striamarkersmore_alt_m_unmarks_all_and_help_row() {
+    use stria::nle_face::{HELP, KEYS, help_phrase, help_rows};
+    assert_eq!(VERBS[VERBS.len() - 2], "unmark all");
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert!(KEYS.contains(&("Alt+m", "unmark all")));
+    assert!(HELP.iter().any(|(a, _)| *a == "unmark all"));
+    let mut f = striamarkers_face();
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    f.state.seek(30);
+    assert!(f.verb("mark A"));
+    f.last_error = None;
+    let depth = f.state.undo_depth();
+    assert!(!f.on(&bandy::SMessage::BrowserText("Alt+m".into())), "a named key, not text");
+    assert!(f.on(&bandy::SMessage::BrowserKey("Alt+m".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmarked 2 markers"));
+    assert!(f.state.timeline.markers.is_empty());
+    assert_eq!(f.state.undo_depth(), depth + 1);
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline.markers.len(), 2, "one undo brings both back");
+    f.last_error = None;
+    assert!(f.verb("redo"));
+    let depth = f.state.undo_depth();
+    assert!(f.on(&bandy::SMessage::BrowserKey("Alt+m".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmark all: no markers"));
+    assert_eq!(f.state.undo_depth(), depth, "no undo step");
+    assert!(help_rows().iter().any(|(k, p)| k == "Alt+m" && *p == help_phrase("unmark all") && *p == "remove every marker"));
+    println!("striamarkersmore: Alt+m -> unmarked 2 markers; none -> refused; help row Alt+m -> {}", help_phrase("unmark all"));
+}

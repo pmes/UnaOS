@@ -200,6 +200,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
         ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
+        ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -568,6 +569,7 @@ fn transport() -> TetraNode {
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
         button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
+        button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal
     ])
 }
@@ -2590,5 +2592,34 @@ mod striaslipviewmore_tests {
         face.frames();
         assert_eq!(slip_json(&face), "");
         println!("striaslipviewmore witness: at:12:0,slip+ -> ,\"slip\":\"128x48\"; undo -> cleared");
+    }
+}
+
+// ---- STRIAMARKERSMORE (LEDGER SR966): the Unmark All button and the `mark:<name>` token (named tail block) ----
+// The button fires THE `unmark all` word; `mark:<name>` is the witness's spelling of `mark <name>` (a name holding `:` or
+// `,` cannot ride a token). Both land on SR835 / SR895's words through `Face::verb`.
+
+#[cfg(test)]
+mod striamarkersmore_tests {
+    use super::*;
+
+    /// STRIAMARKERSMORE M3: the Unmark All button sits after Title and before help; `mark:<name>` names a marker and, on a
+    /// taken tick, renames it; `unmark all` as a token clears them all; bare `mark` stays the VERBS word.
+    #[test]
+    fn striamarkersmore_button_and_mark_token() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let at = row.iter().position(|b| matches!(b, TetraNode::Button { id, .. } if id == "unmark all")).expect("an unmark all button");
+        assert!(matches!(&row[at - 1], TetraNode::Button { id, .. } if id == "title"));
+        assert!(matches!(&row[at + 1], TetraNode::Button { id, .. } if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(matches!(token(&face, "mark").as_deref(), Some([SMessage::Input { text, .. }]) if text == "mark"));
+        assert_eq!(drive(&mut face, "mark:Intro"), vec!["marked Intro at 00:00:00:00".to_string()]);
+        assert_eq!(drive(&mut face, "ruler:12,mark:Outro"), vec!["marked Outro at 00:00:00:12".to_string()]);
+        assert_eq!(drive(&mut face, "mark:Opening"), vec!["renamed Outro to Opening at 00:00:00:12".to_string()]);
+        assert_eq!(markers_json(&face), r#","markers":[{"t":0,"name":"Intro"},{"t":12,"name":"Opening"}]"#);
+        println!("striamarkersmore witness: {}", markers_json(&face));
+        assert_eq!(drive(&mut face, "unmark all"), vec!["unmarked 2 markers".to_string()]);
+        assert_eq!(markers_json(&face), "");
     }
 }
