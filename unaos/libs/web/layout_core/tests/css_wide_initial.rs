@@ -1110,3 +1110,65 @@ fn background_layer_props_cascade() {
     let s = cascade(&[&[("background-repeat", "no-repeat, repeat-x")], imgs]);
     assert_eq!(bg_layer_props(&s).iter().map(|l| l.1).collect::<Vec<_>>(), vec![Some(1), Some(2)], "the repeat list survives a later image list");
 }
+
+// ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): `color-scheme` parsed into PaintStyle::color_scheme; the ONE UA colour table (named tail block) ----
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 values as bits (bit 0 light, bit 1 dark): `normal`
+/// / `initial` Some(0) (a value, so it resets under a dark root), `only` and custom idents ignored.
+#[test]
+fn color_scheme_parses_bits() {
+    let cs = |v: &str| styled(&[("color-scheme", v)]).paint.color_scheme;
+    assert_eq!(cs("dark"), Some(2), "dark");
+    assert_eq!(cs("light"), Some(1), "light");
+    assert_eq!(cs("light dark"), Some(3), "light dark: both bits");
+    assert_eq!(cs("dark light"), Some(3), "dark light: both bits");
+    assert_eq!(cs("only dark"), Some(2), "only is ignored");
+    assert_eq!(cs("dark only"), Some(2), "only after the keyword");
+    assert_eq!(cs("foo dark"), Some(2), "a custom ident is ignored");
+    assert_eq!(cs("normal"), Some(0), "normal is the no-bit value, not None");
+    assert_eq!(cs("initial"), Some(0), "initial is normal");
+    assert_eq!(styled(&[]).paint.color_scheme, None, "unspecified is None (armed)");
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): an invalid value drops the declaration: an earlier value stands.
+#[test]
+fn color_scheme_invalid_dropped() {
+    for v in ["5px", "normal dark", "only", "only only dark", "dark, light" /* SR1031 fold: `revert` is SR1028's erase now (set_revert on INHERIT_COLOR_SCHEME), no longer a dropped value */] {
+        assert_eq!(styled(&[("color-scheme", v)]).paint.color_scheme, None, "{v:?} is invalid");
+        assert_eq!(styled(&[("color-scheme", "dark"), ("color-scheme", v)]).paint.color_scheme, Some(2), "{v:?} leaves the earlier dark");
+    }
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): `inherit` / `unset` (an inherited property) write the INHERIT_COLOR_SCHEME
+/// bit past an earlier rule's value; a later value beats the bit.
+#[test]
+fn color_scheme_inherit_bit() {
+    use layout_core::paint::{inherit_bit, INHERIT_COLOR_SCHEME};
+    assert_eq!(inherit_bit("color-scheme"), INHERIT_COLOR_SCHEME);
+    for kw in ["inherit", "unset"] {
+        let s = cascade(&[&[("color-scheme", "dark")], &[("color-scheme", kw)]]);
+        assert_eq!(s.paint.color_scheme, None, "color-scheme: {kw} drops the earlier dark");
+        assert!(s.paint.inherits(INHERIT_COLOR_SCHEME), "color-scheme: {kw} sets the inherit bit");
+    }
+    let s = cascade(&[&[("color-scheme", "inherit")], &[("color-scheme", "dark")]]);
+    assert_eq!(s.paint.color_scheme, Some(2), "a later dark beats the inherit");
+    assert!(!s.paint.inherits(INHERIT_COLOR_SCHEME), "the later value clears the bit");
+    let s = cascade(&[&[("color-scheme", "dark")], &[("color", "red")]]);
+    assert_eq!(s.paint.color_scheme, Some(2), "a later rule without color-scheme keeps it (merge_paint carries the field)");
+}
+
+/// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the ONE table: dark only for dark-and-not-light; `light dark`, `normal`
+/// and unspecified take the light row; BUTTON_FACE is the light row's face.
+#[test]
+fn color_scheme_ua_colours_rows() {
+    use layout_core::{scheme_dark, ua_colours, BUTTON_FACE, UA_DARK, UA_LIGHT};
+    assert_eq!(*ua_colours(Some(2)), UA_DARK);
+    for s in [Some(3), Some(1), Some(0), None] {
+        assert_eq!(*ua_colours(s), UA_LIGHT, "{s:?} is light");
+        assert!(!scheme_dark(s));
+    }
+    assert!(scheme_dark(Some(2)));
+    assert_eq!(BUTTON_FACE, UA_LIGHT.face);
+    assert_eq!(UA_LIGHT.face, (239, 239, 239));
+    assert_eq!((UA_DARK.face, UA_DARK.field, UA_DARK.canvas, UA_DARK.ink), ((107, 107, 107), (59, 59, 59), (18, 18, 18), (255, 255, 255)));
+}
