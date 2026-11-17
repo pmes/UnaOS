@@ -653,3 +653,33 @@ fn stack_under(
     }
     Ok(stack)
 }
+
+// ---- STRIASTACKTOOL (LEDGER SR9093): the visible layer count of a step and its stack text (named tail block) ----
+// NLE-STACK-TOOL / NLE-STACK-FACE. ONE pure reader of [`Step::stack`] for its two view-only consumers: tools/nle `schedule`
+// appends [`stack_line`] to a stack step's line, and Stria's face names [`Step::layers`] on its message row. A step with
+// [`NO_STACK`] prints and shows what it always did.
+
+impl Step {
+    /// STRIASTACKTOOL: the visible layers of this step: the winner, `vmix`'s layer, and each filled [`Step::stack`] entry.
+    pub fn layers(&self) -> usize {
+        1 + self.vmix.is_some() as usize + self.stack.iter().flatten().count()
+    }
+}
+
+/// STRIASTACKTOOL: `layers=<n> stack=<e>,..` bottom to top, each `<e>` = `<reel>:<src_t>@<num>/<den>` (`BL:0` for black,
+/// the EDL's own word); `None` for a step with [`NO_STACK`].
+pub fn stack_line(tl: &Timeline, s: &Step) -> Option<String> {
+    if s.stack == NO_STACK {
+        return None;
+    }
+    let es: Vec<String> = s
+        .stack
+        .iter()
+        .flatten()
+        .map(|m| match m.src {
+            Some(id) => format!("{}:{}@{}/{}", tl.source(id).map_or_else(|| id.0.to_string(), |x| x.reel.clone()), m.src_t, m.t.num, m.t.den),
+            None => format!("BL:0@{}/{}", m.t.num, m.t.den),
+        })
+        .collect();
+    Some(format!("layers={} stack={}", s.layers(), es.join(",")))
+}

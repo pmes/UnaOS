@@ -2363,7 +2363,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line()) // STRIAOPACITYNEXT (SR993): a standing note after the error (file tail)
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.stack_note()).or_else(|| self.reel_line()) // STRIASTACKTOOL (SR9093): the layer count under the playhead (file tail). STRIAOPACITYNEXT (SR993): a standing note after the error (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3141,5 +3141,24 @@ impl Face {
         if input {
             self.note = None;
         }
+    }
+}
+
+// ---- STRIASTACKTOOL (LEDGER SR9093): the message row names the layer count under the playhead (named tail block) ----
+// NLE-STACK-FACE. When the playhead's video step carries a stack ([`timeline_core::schedule::Step::layers`] above two),
+// `message_text` reads `stack: <n> layers` after `last_error`, the note and the export job line, before the reel line.
+// View-only: no commit, no dirty, no undo; two layers or fewer (or a timeline that does not schedule) say nothing, so every
+// golden and every message line is unchanged. One one-tick `schedule::schedule` per call (owed NLE-STACK-FACE-CACHE).
+
+impl Face {
+    /// STRIASTACKTOOL: `stack: <n> layers` when the step at the playhead shows more than two video layers, else `None`.
+    pub fn stack_note(&self) -> Option<String> {
+        let ph = self.state.playhead;
+        if ph < 0 {
+            return None;
+        }
+        let steps = timeline_core::schedule::schedule(&self.state.timeline, ph..ph + 1, &*self.sources).ok()?;
+        let n = steps.iter().find(|s| s.kind == Kind::Video)?.layers();
+        (n > 2).then(|| format!("stack: {n} layers"))
     }
 }

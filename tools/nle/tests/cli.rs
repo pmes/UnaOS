@@ -373,3 +373,48 @@ fn cli_completions_scripts() {
     assert_eq!(lines[1], USAGE_FIRST);
     assert_eq!(lines[6], "       nle completions bash|zsh|fish");
 }
+
+// ---- STRIASTACKTOOL (LEDGER SR9093): `schedule` prints a stack step's layers (named tail block) ----
+
+/// STRIASTACK's three layers as CMX text: V1 A opaque, V2 B at 40 %, V3 C[0,10)@10 at 50 % (`* UNA ALPHA`), 30 ticks.
+const STACK_EDL: &str = "TITLE: NLESTACK
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE A 00:00:02:00
+* UNA SOURCE B 00:00:02:00
+* UNA SOURCE C 00:00:02:00
+
+001  A        V     C        00:00:00:00 00:00:01:05 00:00:00:00 00:00:01:05
+002  B        V2    C        00:00:00:00 00:00:01:05 00:00:00:00 00:00:01:05
+* UNA ALPHA 40
+003  C        V3    C        00:00:00:00 00:00:00:10 00:00:00:10 00:00:00:20
+* UNA ALPHA 50
+";
+
+/// A stack step's line ends ` layers=3 stack=A:<t>@40/100` (bottom to top); a two-layer step's line is unchanged.
+#[test]
+fn striastacktool_schedule_prints_the_stack() {
+    let dir = scratch("stack");
+    let mut srcs = Vec::new();
+    for (reel, base) in [("A", "0"), ("B", "1000"), ("C", "2000")] {
+        let p = dir.join(format!("{reel}.mp4"));
+        let (code, _, err) = nle(&["--make-src", &s(&p), base, "50", "25"]);
+        assert_eq!(code, 0, "--make-src {base}: {err}");
+        srcs.push("--src".to_string());
+        srcs.push(format!("{reel}={}", s(&p)));
+    }
+    let edl = dir.join("stack.edl");
+    std::fs::write(&edl, STACK_EDL).unwrap();
+    let e = s(&edl);
+    let mut args: Vec<&str> = vec!["schedule", e.as_str()];
+    args.extend(srcs.iter().map(String::as_str));
+    let (code, out, err) = nle(&args);
+    assert_eq!(code, 0, "{err}");
+    let at = |t: i64| out.lines().find(|l| l.starts_with(&format!("out={t} "))).unwrap_or_else(|| panic!("no step {t}: {out}")).to_string();
+    let l12 = at(12);
+    assert!(l12.starts_with("out=12 kind=V track=V3 src=C src_t=2 len=1 "), "{l12}");
+    assert!(l12.ends_with(" layers=3 stack=A:12@40/100"), "{l12}");
+    let l5 = at(5);
+    assert!(l5.starts_with("out=5 kind=V track=V2 src=B src_t=5 len=1 seek_ns="), "{l5}");
+    assert!(!l5.contains("layers="), "two layers print what they always did: {l5}");
+}

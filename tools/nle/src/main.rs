@@ -162,7 +162,7 @@ fn main() {
                 let track = s.track.and_then(|t| tl.track_number(t)).map(|n| format!("{kind}{n}")).unwrap_or_else(|| "-".into());
                 let src = s.src.and_then(|id| tl.source(id)).map(|x| x.reel.as_str()).unwrap_or("-");
                 let seek = s.seek.map(|k| k.to_string()).unwrap_or_else(|| "-".into());
-                println!("out={} kind={kind} track={track} src={src} src_t={} len={} seek_ns={seek}", s.out_t, s.src_t, s.len);
+                println!("out={} kind={kind} track={track} src={src} src_t={} len={} seek_ns={seek}{}", s.out_t, s.src_t, s.len, timeline_core::schedule::stack_line(&tl, &s).map(|x| format!(" {x}")).unwrap_or_default()); // STRIASTACKTOOL (SR9093): a stack step's layers
             }
         }
         "render" => {
