@@ -1424,7 +1424,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             {
                 return;
             }
-            let mut rest = value;
+            let mut rest = value; let font_prior = reset_font_prefix(&mut style.paint);
             // Leading style / variant / weight / stretch keywords.
             loop {
                 let Some((head, tail)) = rest.split_once(char::is_whitespace) else { break };
@@ -1449,9 +1449,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             let family = rest[size_part.len()..].trim();
             let (size, line) = split_top_level_slash(size_part);
             match parse_font_size(size, cx) {
-                Some(px) => style.paint.font_size = Some(px),
+                Some(px) => { style.paint.font_size = Some(px); reset_font_shorthand_rest(size, style, cx) }
                 None => {
-                    H::record_css(&format!("font-shorthand:{}", clip(value)));
+                    restore_font_prefix(&mut style.paint, font_prior); H::record_css(&format!("font-shorthand:{}", clip(value)));
                     return;
                 }
             }
@@ -3586,4 +3586,38 @@ pub fn parse_font_variant_caps(prop: &str, value: &str) -> Option<bool> {
         }
     }
     caps
+}
+
+// ---- AETHERFONTSHORTHANDRESET (LEDGER SR805): css-fonts-4 §4.3 the font shorthand resets its omitted longhands (named tail block) ----
+
+/// AETHERFONTSHORTHANDRESET (SR805): the four longhands the `font` prefix loop writes (font-style, font-weight,
+/// font-stretch, font-variant-caps), as they stood before a `font` declaration.
+type FontPrefix = (Option<bool>, Option<FontWeight>, Option<u16>, Option<bool>);
+
+/// AETHERFONTSHORTHANDRESET (SR805): `font` is a reset-all shorthand (css-fonts-4 §4.3): before its prefix applies,
+/// the prefix longhands take their INITIAL values (Some, never None: None inherits): font-style normal, font-weight
+/// 400, font-stretch 100%, font-variant-caps normal. Returns what they were, for [`restore_font_prefix`] when the
+/// declaration turns out invalid. font-synthesis is not in the reset set and is not touched.
+fn reset_font_prefix<H: Host>(paint: &mut PaintStyle<H>) -> FontPrefix {
+    let prior = (paint.italic, paint.weight, paint.stretch, paint.small_caps);
+    paint.italic = Some(false);
+    paint.weight = Some(FontWeight::Abs(400));
+    paint.stretch = Some(100);
+    paint.small_caps = Some(false);
+    prior
+}
+
+/// AETHERFONTSHORTHANDRESET (SR805): an invalid `font` declaration (its size does not parse) is dropped whole: the
+/// prefix longhands go back to what they were before it (neither the reset nor the prefix leaks).
+fn restore_font_prefix<H: Host>(paint: &mut PaintStyle<H>, prior: FontPrefix) {
+    (paint.italic, paint.weight, paint.stretch, paint.small_caps) = prior;
+}
+
+/// AETHERFONTSHORTHANDRESET (SR805): once the size parsed, the shorthand's font-size goes through the `font-size` arm
+/// (its relative mark, so an earlier `font-size: 2em` does not survive) and line-height resets to `normal` through
+/// the `line-height` arm (its `font_rel` entry, so the font-relative replay does not bring an earlier line-height
+/// back); the arm's own `/line-height` applies after this and wins.
+fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    apply_declaration("font-size", size, style, cx);
+    apply_declaration("line-height", "normal", style, cx);
 }

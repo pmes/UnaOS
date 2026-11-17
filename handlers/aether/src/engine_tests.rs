@@ -5370,4 +5370,67 @@ mod tests {
         }
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('f')).getPropertyValue('font-variant-caps')"), "small-caps");
     }
+
+    // ---- AETHERFONTSHORTHANDRESET (LEDGER SR805): the font shorthand resets its omitted longhands (named tail block) ----
+
+    /// AETHERFONTSHORTHANDRESET (SR805): one line per probe at 16px serif: a longhand declared BEFORE `font: 16px serif`
+    /// on the same element (italic / bold / small-caps / line-height / font-synthesis), a longhand AFTER it, an italic
+    /// parent with a `font` child, a plain reference and an italic reference.
+    fn font_shorthand_reset_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div><span id="plain">Hello</span></div>
+            <div><span id="itref" style="font-style:italic">Hello</span></div>
+            <div><span id="it" style="font-style:italic;font:16px serif">Hello</span></div>
+            <div><span id="bd" style="font-weight:bold;font:16px serif">Hello</span></div>
+            <div><span id="sc" style="font-variant:small-caps;font:16px serif">Hello</span></div>
+            <div id="lh" style="line-height:3;font:16px serif">Hello</div>
+            <div><span id="late" style="font:16px serif;font-style:italic">Hello</span></div>
+            <div style="font-style:italic"><span id="kid" style="font:16px serif">Hello</span></div>
+            <div><span id="syn" style="font-synthesis:none;font:16px serif">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn font_shorthand_cs(e: &mut crate::AetherEngine, id: &str, prop: &str) -> String {
+        font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).{prop}"))
+    }
+
+    /// AETHERFONTSHORTHANDRESET (SR805): getComputedStyle after `font: 16px serif`: an earlier font-style / font-weight /
+    /// font-variant-caps / line-height reads its initial value, a later font-style wins, an italic parent's child reads
+    /// `normal` (the reset writes the initial, not inherit), and font-synthesis (not in the reset set) survives.
+    #[test]
+    fn font_shorthand_reset_cssom() {
+        let mut e = font_shorthand_reset_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "itref", "fontStyle"), "italic", "the reference is italic");
+        assert_eq!(font_shorthand_cs(&mut e, "it", "fontStyle"), "normal");
+        assert_eq!(font_shorthand_cs(&mut e, "bd", "fontWeight"), "400");
+        assert_eq!(font_shorthand_cs(&mut e, "sc", "fontVariantCaps"), "normal");
+        assert_eq!(font_shorthand_cs(&mut e, "lh", "lineHeight"), "normal");
+        assert_eq!(font_shorthand_cs(&mut e, "late", "fontStyle"), "italic", "a longhand after the shorthand wins");
+        assert_eq!(font_shorthand_cs(&mut e, "kid", "fontStyle"), "normal", "the child resets, it does not inherit");
+        assert_eq!(font_shorthand_cs(&mut e, "syn", "fontSynthesis"), "none", "font does not reset font-synthesis");
+    }
+
+    /// AETHERFONTSHORTHANDRESET (SR805): the reset reaches layout and paint: the italic-then-font run and the italic
+    /// parent's font child paint the plain run's ink (the italic reference does not), and the small-caps-then-font run
+    /// has the plain advance.
+    #[test]
+    fn font_shorthand_reset_ink() {
+        let mut e = font_shorthand_reset_engine();
+        let plain = small_caps_ink_columns(&mut e, "plain");
+        assert!(plain.iter().sum::<usize>() > 20, "the plain run paints");
+        assert_ne!(small_caps_ink_columns(&mut e, "itref"), plain, "the italic reference is not the plain ink (armed)");
+        for id in ["it", "kid"] {
+            assert_eq!(small_caps_ink_columns(&mut e, id), plain, "#{id}: upright, the plain run's ink");
+        }
+        let plain_w = imgalt_rect(&mut e, "plain").2;
+        for id in ["sc", "bd"] {
+            let w = imgalt_rect(&mut e, id).2;
+            assert!((w - plain_w).abs() < 0.01, "#{id}: the plain advance ({w} vs {plain_w})");
+        }
+    }
 }
