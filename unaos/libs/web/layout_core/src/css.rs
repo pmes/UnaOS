@@ -1841,7 +1841,6 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "border-width" => {
             if let Some(r) = parse_sides(value, |v| line_width(v, cx)) { for (i, w) in [r.top, r.right, r.bottom, r.left].into_iter().enumerate() { border_width_store(&mut style.paint, 1 << i, Some(w)); } } else { font_rel_undo(&mut style.paint, prop, &fr); } // SR1075
         }
-        "border-style" => {} // stroke style is uniform; nothing to record
         // css-ui-4 §5.1: `[<url> [<x> <y>]?,]* <keyword>` — images are not loaded, so the fallback
         // keyword (the last comma-separated item) is the cursor; `inherit`/`unset` leave it to the
         // parent (it is inherited), an unknown keyword invalidates the declaration.
