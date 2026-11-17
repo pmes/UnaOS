@@ -61,7 +61,7 @@ pub const PROPERTIES: &[&str] = &[
     "resize", "right", "rotate", "row-gap", "scale", "scroll-behavior", "stroke", "stroke-width", "tab-size",
     "table-layout", "text-align", "text-align-last", "text-decoration", "text-decoration-color",
     "text-decoration-line", "text-decoration-style", "text-decoration-thickness", "text-indent",
-    "text-overflow", "text-rendering", "text-shadow", "text-transform", "text-underline-offset", "text-wrap", "text-wrap-mode", "top",
+    "text-overflow", "text-rendering", "text-shadow", "text-transform", "text-underline-offset", "text-underline-position", "text-wrap", "text-wrap-mode", "top",
     "touch-action", "transform", "transform-origin", "transform-style", "transition", "transition-delay",
     "transition-duration", "transition-property", "transition-timing-function", "translate", "unicode-bidi",
     "user-select", "vertical-align", "visibility", "white-space", "white-space-collapse", "widows", "width", "will-change",
@@ -508,6 +508,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             let kw = |b: bool| (if b { "auto" } else { "none" }).to_string();
             Ok([("font-synthesis-weight", w), ("font-synthesis-style", s), ("font-synthesis-small-caps", c)].into_iter().filter_map(|(p, b)| Some((p.to_string(), kw(b?)))).collect())
         }
+        "text-decoration" => text_decoration_expand(v),
         "border-image" => expand_border_image(v).map(Vec::from),
         "word-wrap" => normalize_value("overflow-wrap", v).map(|x| vec![("overflow-wrap".into(), x)]).ok_or(()),
         _ => normalize_value(prop, v).map(|x| vec![(prop.to_string(), x)]).ok_or(()),
@@ -601,6 +602,7 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             }
             if color == "transparent" { "none".to_string() } else { color.to_string() }
         }
+        "text-decoration" => text_decoration_serialize(&vals),
         "border-image" => border_image_serialize(&vals)?,
         _ => return None,
     };
@@ -1141,7 +1143,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
-    if report_covered(prop) { if let Some(s) = shorthand_computed(el, prop) { return s; } } if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); }
+    if report_covered(prop) { if let Some(s) = shorthand_computed(el, prop) { return s; } } if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); } if prop == "text-decoration" { if let Some(v) = text_decoration_computed(el) { return v; } }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -1933,6 +1935,7 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
     ("place-content", &["align-content", "justify-content"]),
     ("place-items", &["align-items", "justify-items"]),
     ("place-self", &["align-self", "justify-self"]),
+    ("text-decoration", &["text-decoration-line", "text-decoration-style", "text-decoration-color", "text-decoration-thickness"]),
 ];
 
 #[cfg(test)]
@@ -1960,6 +1963,7 @@ flex=flex-grow flex-shrink flex-basis
 outline=outline-color outline-style outline-width
 border-radius=border-top-left-radius border-top-right-radius border-bottom-right-radius border-bottom-left-radius
 background=background-image background-position-x background-position-y background-size background-repeat background-attachment background-origin background-clip background-color
+text-decoration=text-decoration-line text-decoration-style text-decoration-color text-decoration-thickness
 background-attachment>background
 background-blend-mode>background
 background-clip>background
@@ -2024,6 +2028,10 @@ padding-right>padding
 padding-top>padding
 right>inset
 row-gap>gap
+text-decoration-color>text-decoration
+text-decoration-line>text-decoration
+text-decoration-style>text-decoration
+text-decoration-thickness>text-decoration
 top>inset";
 
     /// The ten names the old `shorthands_of` prefix rules mapped to a shorthand whose longhands do not include them;
@@ -2061,9 +2069,9 @@ top>inset";
                 old_of.insert(p, shs.split(' ').collect());
             }
         }
-        assert_eq!(keys + PLACE_SHORTHANDS.len(), SHORTHANDS.len(), "every old shorthand is a table row, plus SR1087's three place-* rows (19 + 3 = 22)");
+        assert_eq!(keys + PLACE_SHORTHANDS.len(), SHORTHANDS.len(), "every old shorthand is a table row, plus SR1087's three place-* rows (SR1113: text-decoration joins the capture: 20 + 3 = 23)");
         let names = universe();
-        assert_eq!(names.len(), 246) /* SR800 fold: + font-variant-caps; SR1109: + text-wrap, text-wrap-mode, white-space-collapse */;
+        assert_eq!(names.len(), 247) /* SR800 fold: + font-variant-caps; SR1109: + text-wrap, text-wrap-mode, white-space-collapse; SR1113: + text-underline-position */;
         for p in &names {
             let want = if let Some(sh) = PLACE_SHORTHANDS.iter().find(|sh| longhands(sh).unwrap().contains(p)) { vec![*sh] /* SR1087: a place-* longhand maps to its place row */ } else if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
@@ -2450,9 +2458,9 @@ mod shorthand_table_serialize_tests {
     use super::*;
 
     /// The rows whose serialization is a hand-written grammar arm in [`serialize_shorthand`].
-    const GRAMMAR: [&str; 10] = [
+    const GRAMMAR: [&str; 11] = [
         "border", "border-image", "border-top", "border-right", "border-bottom", "border-left", "font-synthesis", "flex",
-        "outline", "background",
+        "outline", "background", "text-decoration",
     ];
 
     fn get(css: &str, sh: &str) -> String {
@@ -2780,7 +2788,7 @@ mod cssom_place_tests {
 
     #[test]
     fn cssom_place_table_pins() {
-        assert_eq!(SHORTHANDS.len(), 22);
+        assert_eq!(SHORTHANDS.len(), 23);
         assert_eq!(PLAIN_N.len(), 12);
         for (sh, a, j) in [
             ("place-content", "align-content", "justify-content"),
@@ -2997,8 +3005,8 @@ mod shorthand_table_initial_tests {
 
     /// The rows whose longhands have no static initial row (colours resolve currentcolor per element; border-image-*
     /// and most background-* have no `initial_value` row), so they read "" (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS).
-    const NOT_DERIVED: [&str; 9] =
-        ["border", "border-image", "border-color", "border-top", "border-right", "border-bottom", "border-left", "outline", "background"];
+    const NOT_DERIVED: [&str; 10] =
+        ["border", "border-image", "border-color", "border-top", "border-right", "border-bottom", "border-left", "outline", "background", "text-decoration"];
 
     #[test]
     fn shorthand_table_initial_rows_derive() {
@@ -3144,7 +3152,7 @@ fn shorthand_from(sh: &str, value_of: impl Fn(&str) -> String) -> Option<String>
 /// read. None where a longhand has no computed value or the grammar does not serialize (border with no colour row;
 /// owed AETHER-CSSOM-BORDER-COMPUTED).
 fn shorthand_computed(el: usize, sh: &str) -> Option<String> {
-    if sh == "outline" { return outline_computed(el); } shorthand_from(sh, |l| computed_value(el, l))
+    if sh == "outline" { return outline_computed(el); } if sh == "text-decoration" { if let Some(v) = text_decoration_computed(el) { return Some(v); } } shorthand_from(sh, |l| computed_value(el, l)) // SR1113 (fold compose): the covered road reaches Chromium's composer first
 }
 
 #[cfg(test)]
@@ -3231,8 +3239,8 @@ mod shorthand_computed_before_cascade_tests {
     #[test]
     fn shorthand_computed_before_cascade_covered_rows() {
         let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
-        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding", "outline"]); // SR1124: outline too; SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
-        for sh in ["border", "gap", "inset", "overflow", "font-synthesis", "not-a-shorthand"] {
+        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding", "inset", "outline", "text-decoration"]); // SR1113: text-decoration; SR1127: inset; // SR1124: outline too; SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
+        for sh in ["border", "gap", "overflow", "font-synthesis", "not-a-shorthand"] {
             assert!(!report_covered(sh), "{sh}: not covered");
         }
     }
@@ -3324,4 +3332,96 @@ fn inside_scrollers(f: &Flushed, id: NodeId, x: f64, y: f64, scroll: (f64, f64))
 /// [`serialize_shorthand`]'s declared-block grammar, which drops medium / none / currentcolor and puts the width first.
 fn outline_computed(el: usize) -> Option<String> {
     Some(longhands("outline")?.iter().map(|l| computed_value(el, l)).collect::<Vec<_>>().join(" "))
+}
+
+// ---- AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (LEDGER SR1113): the text-decoration row's expand, specified serialization and computed composition (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): css-text-decor-3 §2.4 `text-decoration = <line> || <style> || <color> ||
+/// <thickness>` into its four [`SHORTHANDS`] longhands; an omitted part takes its initial (none, solid, currentcolor, auto).
+fn text_decoration_expand(v: &[CV]) -> Result<Vec<(String, String)>, ()> {
+    let (mut line, mut st, mut c, mut th): (Vec<String>, Option<String>, Option<String>, Option<String>) = (Vec::new(), None, None, None);
+    let parts = split_values(v);
+    for cv in &parts {
+        let id = ident_of(cv).map(|i| i.to_ascii_lowercase());
+        let l = id.as_deref().unwrap_or("");
+        let thick = if matches!(l, "auto" | "from-font") { Some(l.to_string()) } else if id.is_none() { normalize_length_token("text-decoration-thickness", cv) } else { None };
+        let color = normalize_color(std::slice::from_ref(cv));
+        if matches!(l, "underline" | "overline" | "line-through" | "blink" | "none") && !line.iter().any(|x| x == l) { line.push(l.to_string()); } else if matches!(l, "solid" | "double" | "dotted" | "dashed" | "wavy") && st.is_none() { st = Some(l.to_string()); } else if thick.is_some() && th.is_none() { th = thick; } else if color.is_some() && c.is_none() { c = color; } else { return Err(()); }
+    }
+    if parts.is_empty() || (line.len() > 1 && line.iter().any(|x| x == "none")) { return Err(()); }
+    let line = if line.is_empty() { "none".to_string() } else { line.join(" ") };
+    Ok(vec![("text-decoration-line".into(), line), ("text-decoration-style".into(), st.unwrap_or_else(|| "solid".into())), ("text-decoration-color".into(), c.unwrap_or_else(|| "currentcolor".into())), ("text-decoration-thickness".into(), th.unwrap_or_else(|| "auto".into()))])
+}
+
+/// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): the specified serialization (CSSOM: initial-valued components omitted,
+/// the line always written): `underline red`, `none`, `underline wavy red 3px`.
+fn text_decoration_serialize(v: &[&str]) -> String {
+    let mut parts = vec![v[0]];
+    parts.extend([(v[1], "solid"), (v[2], "currentcolor"), (v[3], "auto")].into_iter().filter(|&(x, i)| x != i).map(|(x, _)| x));
+    parts.join(" ")
+}
+
+/// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): getComputedStyle's textDecoration as Chromium reads it — the four
+/// longhands' report columns, `<line> <style> <color>` always and the thickness only when not `auto` (`none solid rgb(0, 0, 0)`).
+fn text_decoration_computed(el: usize) -> Option<String> {
+    let v: Vec<String> = longhands("text-decoration")?.iter().map(|l| computed_value(el, l)).collect();
+    if v.iter().any(|x| x.is_empty()) { return None; }
+    Some(if v[3] == "auto" { v[..3].join(" ") } else { v.join(" ") })
+}
+
+#[cfg(test)]
+mod text_decoration_shorthand_tests {
+    use super::*;
+
+    fn ex(v: &str) -> Result<Vec<(String, String)>, ()> {
+        expand("text-decoration", &css_core::parser::parse_component_values(v))
+    }
+
+    fn four(l: &str, s: &str, c: &str, t: &str) -> Result<Vec<(String, String)>, ()> {
+        Ok(["text-decoration-line", "text-decoration-style", "text-decoration-color", "text-decoration-thickness"]
+            .into_iter()
+            .zip([l, s, c, t])
+            .map(|(p, v)| (p.to_string(), v.to_string()))
+            .collect())
+    }
+
+    /// Each part lands on its longhand in any order; omitted parts take their initials.
+    #[test]
+    fn cssom_text_decoration_shorthand_expands() {
+        assert_eq!(ex("underline red"), four("underline", "solid", "red", "auto"));
+        assert_eq!(ex("underline overline wavy 2px blue"), four("underline overline", "wavy", "blue", "2px"));
+        assert_eq!(ex("from-font dotted"), four("none", "dotted", "currentcolor", "from-font"));
+        assert_eq!(ex("none"), four("none", "solid", "currentcolor", "auto"));
+        assert_eq!(ex("inherit"), four("inherit", "inherit", "inherit", "inherit"));
+    }
+
+    #[test]
+    fn cssom_text_decoration_shorthand_rejects() {
+        for v in ["underline underline", "none underline", "red blue", "wavy dotted", "bogus", "1px 2px"] {
+            assert_eq!(ex(v), Err(()), "{v}");
+        }
+        assert_eq!(Block::parse("text-decoration: underline underline").serialize(), "");
+    }
+
+    /// The specified serialization omits initial parts; cssText recomposes the shorthand; a later longhand joins it.
+    #[test]
+    fn cssom_text_decoration_shorthand_serializes() {
+        let b = Block::parse("text-decoration: underline red");
+        assert_eq!((b.get("text-decoration"), b.get("text-decoration-line"), b.get("text-decoration-color")), ("underline red".to_string(), "underline".to_string(), "red".to_string()));
+        assert_eq!(b.serialize(), "text-decoration: underline red;");
+        assert_eq!(Block::parse("text-decoration: none").get("text-decoration"), "none");
+        assert_eq!(Block::parse("text-decoration: underline wavy red; text-decoration-thickness: 3px").get("text-decoration"), "underline wavy red 3px");
+        assert_eq!(Block::parse("text-decoration: underline; text-decoration-color: red").get("text-decoration"), "underline red");
+    }
+
+    #[test]
+    fn cssom_text_decoration_shorthand_table() {
+        for l in ["text-decoration-line", "text-decoration-style", "text-decoration-color", "text-decoration-thickness"] {
+            assert_eq!(shorthands_of(l), vec!["text-decoration"], "{l}");
+        }
+        assert!(PROPERTIES.contains(&"text-underline-position"));
+        assert_eq!(camel("text-underline-position"), "textUnderlinePosition");
+        assert_eq!(prop_from_attr("textUnderlinePosition"), "text-underline-position");
+        assert!(PROPERTIES.windows(2).all(|w| w[0] < w[1]), "PROPERTIES stays sorted");
+    }
 }

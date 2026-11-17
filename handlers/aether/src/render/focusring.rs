@@ -219,16 +219,10 @@ fn band(
     }
 }
 
-/// The nearest specified `color` on `id` or an ancestor box (an outline's `currentColor`), else black.
+/// An outline's (and a canvas background's) `currentColor`: the colour the painter carries at `id`, UA tag colours
+/// included (AETHEROUTLINECURRENTCOLORUA SR1131: render's `inherited_at`; before, the nearest declared `color`, else black).
 pub(crate) fn current_color(layout: &LayoutTree, id: taffy::prelude::NodeId) -> (u8, u8, u8) {
-    let mut cur = Some(id);
-    while let Some(c) = cur {
-        if let Some(col) = layout.paint_map.get(&c).and_then(|p| p.color) {
-            return col;
-        }
-        cur = layout.taffy.parent(c);
-    }
-    (0, 0, 0)
+    super::inherited_at(layout, id).color
 }
 
 /// Not painted: inside a `display: none` box, or `visibility: hidden` by the nearest box that says.
