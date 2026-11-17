@@ -62,7 +62,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, kind:CODE, ease:NAME, meters, tick:N, aux:TOKEN)";
+const USAGE_HEAD: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute]  (SCRIPT: ";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -79,29 +79,29 @@ fn cli() -> Cli {
             "--two-surfaces" => c.two = true,
             "--split" => c.split = true,
             "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
-            "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
+            "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(usage())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
-                let (w, h) = v.split_once('x').unwrap_or_else(|| die(USAGE.into()));
+                let (w, h) = v.split_once('x').unwrap_or_else(|| die(usage()));
                 c.size = (w.parse().unwrap_or(960), h.parse().unwrap_or(540));
             }
             "--src" => {
-                let v = a.next().unwrap_or_else(|| die(USAGE.into()));
-                let (r, p) = v.split_once('=').unwrap_or_else(|| die(USAGE.into()));
+                let v = a.next().unwrap_or_else(|| die(usage()));
+                let (r, p) = v.split_once('=').unwrap_or_else(|| die(usage()));
                 c.srcs.push((r.to_string(), p.to_string()));
             }
             "--do" => c.script = a.next(),
             "--out" => c.out = a.next(),
             "--help" | "-h" => {
-                eprintln!("{USAGE}");
+                eprintln!("{}", usage());
                 std::process::exit(0);
             }
             _ if !arg.starts_with('-') => c.edl = Some(arg),
-            _ => die(USAGE.into()),
+            _ => die(usage()),
         }
     }
     if (c.edl.is_none() && !c.synth) || (c.two && c.split) {
-        die(USAGE.into());
+        die(usage());
     }
     c
 }
@@ -134,6 +134,7 @@ fn editor_tree_for(two: bool) -> TetraNode {
 
 /// A `--do` token as the messages the window would send.
 fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
+    if script_word(tok).is_none() && !nle_face::VERBS.contains(&tok) { return None; } // NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the table gates the word and its arity, the arms below parse the values (file tail)
     let num = |s: &str| s.parse::<i64>().ok();
     let px = |s: &str| s.parse::<f64>().ok();
     let l: Layout = face.layout();
@@ -1159,18 +1160,19 @@ mod witnessdocs_tests {
 
 // ---- NLEFACEWITNESSSCRIPTWORDSONETABLE (LEDGER SR1123): the --do words and the conditional keys, listed once (named tail block) ----
 /// The `--do` words besides the transport verbs (`nle_face::VERBS`): a word, or a prefix ending `:` that takes arguments, and
-/// its meaning. A PIN, not the parser: [`token`] / [`drive_on`] / [`tick_token`] keep their arms; the test below holds the three
-/// to this table, USAGE and docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md §4 (regenerated from it).
+/// its meaning, and its arity (the `:`-separated arguments after the word; [`NEST`]: the rest is a token). The gate, not the
+/// parser: [`script_word`] checks a token's word and arity here, the arms of [`token`] parse the values; [`usage`] renders
+/// the words, and the test below holds the parser to this table, the usage line and docs/dev/OS/05_USER_EXPERIENCE/stria-witness.md §4 (regenerated from it).
 #[cfg_attr(not(test), allow(dead_code))]
-pub const SCRIPT_WORDS: [(&str, &str); 16] = [
-    ("at:", "at:<tick>:<track>, a click on that track at that tick"), ("ruler:", "ruler:<tick>, a click on the ruler"),
-    ("press:", "press:<x>:<y>, a button press at surface pixels"), ("move:", "move:<x>:<y>, the pointer moves there"),
-    ("release", "the button up and the click, at the last pointer"), ("key:", "key:<name>, the key as GTK sends it (key:space; key:Ctrl+a / key:Meta+a select all)"),
-    ("wheel:", "wheel:<n>, n notches at the last pointer (n > 0 zooms in)"), ("marquee:", "marquee:<x0>:<y0>:<x1>:<y1>, a press, a move and the release"),
-    ("shift:", "shift:<token>, the token with MOD_SHIFT on its presses (add to the set)"), ("alt:", "alt:<token>, the token with MOD_ALT on its presses (no snapping)"),
-    ("transition:", "transition:<track>:<idx>, a click on that transition (selects it)"), ("kind:", "kind:<code>, the selected transition's kind (D, W007 ...)"),
-    ("ease:", "ease:<name>, the selected transition's ease (linear, in, out, inout)"), ("meters", "feeds the meters the tick at the playhead (the line gains meters)"),
-    ("tick:", "tick:<n>, the face clock n times (playback steps, the hover dwell)"), ("aux:", "aux:<token>, the token on the other Surface (--two-surfaces: aux; --split: preview)"),
+pub const SCRIPT_WORDS: [(&str, &str, u8); 16] = [
+    ("at:", "at:<tick>:<track>, a click on that track at that tick", 2), ("ruler:", "ruler:<tick>, a click on the ruler", 1),
+    ("press:", "press:<x>:<y>, a button press at surface pixels", 2), ("move:", "move:<x>:<y>, the pointer moves there", 2),
+    ("release", "the button up and the click, at the last pointer", 0), ("key:", "key:<name>, the key as GTK sends it (key:space; key:Ctrl+a / key:Meta+a select all)", 1),
+    ("wheel:", "wheel:<n>, n notches at the last pointer (n > 0 zooms in)", 1), ("marquee:", "marquee:<x0>:<y0>:<x1>:<y1>, a press, a move and the release", 4),
+    ("shift:", "shift:<token>, the token with MOD_SHIFT on its presses (add to the set)", NEST), ("alt:", "alt:<token>, the token with MOD_ALT on its presses (no snapping)", NEST),
+    ("transition:", "transition:<track>:<idx>, a click on that transition (selects it)", 2), ("kind:", "kind:<code>, the selected transition's kind (D, W007 ...)", 1),
+    ("ease:", "ease:<name>, the selected transition's ease (linear, in, out, inout)", 1), ("meters", "feeds the meters the tick at the playhead (the line gains meters)", 0),
+    ("tick:", "tick:<n>, the face clock n times (playback steps, the hover dwell)", 1), ("aux:", "aux:<token>, the token on the other Surface (--two-surfaces: aux; --split: preview)", NEST),
 ];
 /// The witness line's conditional keys in the order they follow [`WITNESS_KEYS`], each with the condition that adds it.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1191,17 +1193,17 @@ mod scriptwords_tests {
     /// and is in USAGE; every `VERBS` word is a token; `bogus` is the parser's `_ =>` refusal (the page's §4 is this table).
     #[test]
     fn nlefacewitnessscriptwordsonetable_words_parse() {
-        for (w, _) in SCRIPT_WORDS {
+        for (w, _, _) in SCRIPT_WORDS {
             let ex = match w { "at:" => "at:12:0", "ruler:" => "ruler:5", "press:" => "press:81:100", "move:" => "move:105:100", "release" => "release", "key:" => "key:j", "wheel:" => "wheel:1", "marquee:" => "marquee:316:85:1:155", "shift:" => "shift:press:228:100", "alt:" => "alt:release", "transition:" => "transition:0:0", "kind:" => "kind:W007", "ease:" => "ease:in", "meters" => "meters", "tick:" => "tick:1", "aux:" => "aux:release", _ => panic!("no example for {w}") };
             let errors = drive(&mut fresh(), ex);
             assert!(!errors.iter().any(|e| e.starts_with("bad token")), "{ex}: {errors:?}");
-            assert!(USAGE.contains(w), "{w} not in USAGE");
+            assert!(usage().contains(w), "{w} not in USAGE");
         }
         let face = fresh();
         for v in nle_face::VERBS { assert!(token(&face, v).is_some(), "{v}"); }
         assert!(token(&face, "bogus").is_none());
         assert_eq!(drive(&mut fresh(), "bogus"), vec!["bad token bogus".to_string()]);
-        let mut words: Vec<&str> = SCRIPT_WORDS.iter().map(|(w, _)| *w).collect();
+        let mut words: Vec<&str> = SCRIPT_WORDS.iter().map(|(w, _, _)| *w).collect();
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), SCRIPT_WORDS.len(), "a word listed twice");
@@ -1229,5 +1231,57 @@ mod scriptwords_tests {
         assert_eq!(super::witnessdocs_tests::top_keys(&line), want, "{line}");
         println!("nlefacewitnessscriptwordsonetable witness: {line}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- NLEFACEWITNESSTABLEDRIVENPARSER (LEDGER SR1129): the --do table gates the parser and renders the usage line (named tail block) ----
+/// A [`SCRIPT_WORDS`] arity: the rest after the word is a whole token (`shift:` / `alt:` / `aux:`).
+pub const NEST: u8 = u8::MAX;
+
+/// The [`SCRIPT_WORDS`] row whose word heads `tok` (`<word>:` through its first `:`, else the whole token) and its arity, when
+/// the token carries that many `:`-separated arguments (a [`NEST`] row takes any rest); None otherwise. The VERBS are not rows.
+pub fn script_word(tok: &str) -> Option<(&'static str, u8)> {
+    let head = tok.find(':').map_or(tok, |i| &tok[..=i]);
+    let &(w, _, n) = SCRIPT_WORDS.iter().find(|(w, _, _)| *w == head)?;
+    (n == NEST || tok.split(':').count() - 1 == n as usize).then_some((w, n))
+}
+
+/// The usage line: [`USAGE_HEAD`], then `verbs, ` and the table's words.
+fn usage() -> String {
+    format!("{USAGE_HEAD}verbs, {})", SCRIPT_WORDS.iter().map(|(w, _, _)| *w).collect::<Vec<_>>().join(", "))
+}
+
+#[cfg(test)]
+mod tabledriven_tests {
+    use super::*;
+
+    /// NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the table gates `token` by word and arity (the VERBS beside it); the arms parse values.
+    #[test]
+    fn nlefacewitnesstabledrivenparser_gate() {
+        assert_eq!(script_word("at:12:0"), Some(("at:", 2)));
+        assert!(script_word("at:12").is_none() && script_word("release:1").is_none());
+        assert_eq!(script_word("release"), Some(("release", 0)));
+        assert_eq!(script_word("shift:at:12:0"), Some(("shift:", NEST)));
+        assert_eq!(script_word("key:Ctrl+a"), Some(("key:", 1)));
+        assert!(script_word("key:a:b").is_none(), "a key name carries no `:` (the one behaviour change: was BrowserKey(a:b))");
+        assert_eq!(script_word("wheel:-2"), Some(("wheel:", 1)));
+        assert_eq!(script_word("marquee:1:2:3:4"), Some(("marquee:", 4)));
+        assert!(script_word("help").is_none() && script_word("bogus").is_none());
+        let (tl, src) = nle_face::synth_fixture();
+        let face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(token(&face, "help").is_some() && token(&face, "kind").is_some());
+        assert!(token(&face, "at:12").is_none() && token(&face, "shift:at:12").is_none() && token(&face, "bogus").is_none());
+        assert!(token(&face, "at:12:0").is_some() && token(&face, "shift:at:12:0").is_some());
+    }
+
+    /// NLEFACEWITNESSTABLEDRIVENPARSER (SR1129): the usage line's word list is the table; the head carries no script word.
+    #[test]
+    fn nlefacewitnesstabledrivenparser_usage() {
+        let u = usage();
+        assert!(u.starts_with(USAGE_HEAD) && u.contains("(SCRIPT: verbs, ") && u.ends_with(')'), "{u}");
+        for (w, _, _) in SCRIPT_WORDS {
+            assert!(u.contains(w), "{w} not in usage()");
+            assert!(!USAGE_HEAD.contains(w), "{w} in USAGE_HEAD");
+        }
     }
 }
