@@ -421,14 +421,14 @@ impl Dpb {
         let (w, h) = (pic.width as i32, pic.height as i32);
         let mut projected = false;
         let mut out: Vec<i32> = Vec::new();
-        for y in (0..h).step_by(8) {
-            for x in (0..w).step_by(8) {
+        for y in (0..h).step_by(CONCEAL_BLOCK) {
+            for x in (0..w).step_by(CONCEAL_BLOCK) {
                 let m = s.motion[s.idx4(x as usize, y as usize)];
                 let cand = forward_only(project_lists(&m, s.poc, pic.poc), &m, only);
                 if cand == [None, None] {
                     continue;
                 }
-                let (bw, bh) = ((w - x).min(8), (h - y).min(8));
+                let (bw, bh) = ((w - x).min(CONCEAL_BLOCK as i32), (h - y).min(CONCEAL_BLOCK as i32));
                 for c in 0..3 {
                     let (cx, cy, cw, ch, bd) = if c == 0 {
                         (x, y, bw, bh, pic.bit_depth)
@@ -521,8 +521,8 @@ fn conceal_pu(s_poc: i32, cand: &[Option<[i32; 2]>; 2]) -> crate::picture::PuMot
 /// (pred 3: written only by [`conceal_pu`]; a generated picture starts intra everywhere).
 fn bidir_blocks(pic: &Picture) -> u32 {
     let mut n = 0;
-    for y in (0..pic.height).step_by(8) {
-        for x in (0..pic.width).step_by(8) {
+    for y in (0..pic.height).step_by(CONCEAL_BLOCK) {
+        for x in (0..pic.width).step_by(CONCEAL_BLOCK) {
             if pic.motion[pic.idx4(x, y)].pred == 3 {
                 n += 1;
             }
@@ -618,8 +618,8 @@ fn forward_only(mut cand: [Option<[i32; 2]>; 2], m: &crate::picture::PuMotion, o
 /// ref_poc[0] the referencer's `c_poc` (written only by [`conceal_pu`] from [`Dpb::conceal_forward`]).
 fn forward_blocks(pic: &Picture, c_poc: i32) -> u32 {
     let mut n = 0;
-    for y in (0..pic.height).step_by(8) {
-        for x in (0..pic.width).step_by(8) {
+    for y in (0..pic.height).step_by(CONCEAL_BLOCK) {
+        for x in (0..pic.width).step_by(CONCEAL_BLOCK) {
             let m = pic.motion[pic.idx4(x, y)];
             if m.pred != 0 && m.ref_poc[0] == c_poc {
                 n += 1;
@@ -631,9 +631,15 @@ fn forward_blocks(pic: &Picture, c_poc: i32) -> u32 {
 
 // ---- HEVCCONCEALBI444 (LEDGER SR845): the concealment block's sample bound (named tail block) ----
 /// HEVCCONCEALBI444 (SR845): the most samples [`conceal_fetch`] fetches per plane per candidate, the size of its second
-/// candidate's stack buffer. [`Dpb::conceal_motion`] walks the picture in 8x8 blocks (`step_by(8)`, `min(8)`) on every
+/// candidate's stack buffer. [`Dpb::conceal_motion`] walks the picture in 8x8 blocks (`step_by(CONCEAL_BLOCK)`, `min(CONCEAL_BLOCK)`) on every
 /// chroma_format_idc, so a block is 8x8 = 64 luma samples and (8 / SubWidthC) x (8 / SubHeightC) chroma samples: 16 at
 /// 4:2:0, 32 at 4:2:2, 64 at 4:4:4 (idc 0 has no chroma plane). The bound is the decoder's block step, never a
 /// bitstream value (a CU's size does not enter), so a 4:4:4 bi-predicted block fills the whole buffer and no stream can
-/// exceed it. The step and this bound move together (HEVC-CONCEAL-BLOCK-STEP-CONST owed: one shared const).
-const CONCEAL_BLOCK_SAMPLES: usize = 64;
+/// exceed it. The step and this bound move together (HEVCCONCEALBLOCKSTEPCONST SR1003: both read [`CONCEAL_BLOCK`]).
+const CONCEAL_BLOCK_SAMPLES: usize = CONCEAL_BLOCK * CONCEAL_BLOCK;
+
+// ---- HEVCCONCEALBLOCKSTEPCONST (LEDGER SR1003): the concealment block's side (named tail block) ----
+/// HEVCCONCEALBLOCKSTEPCONST (SR1003): the side of the square block [`Dpb::conceal_motion`] walks and projects, and
+/// [`bidir_blocks`] / [`forward_blocks`] count, on every chroma_format_idc; [`CONCEAL_BLOCK_SAMPLES`] is its square, so
+/// the step and the stack buffer cannot drift (a 16x16 block is this one edit: HEVC-CONCEAL-BLOCK-16 owed).
+const CONCEAL_BLOCK: usize = 8;
