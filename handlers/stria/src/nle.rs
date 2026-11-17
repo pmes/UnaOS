@@ -914,7 +914,7 @@ fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>,
     if reel != (w, h) {
         return Err(RenderError::Size { src, width: now.0, height: now.1 });
     }
-    let rgba = src_rgba(sources, src, f, rt);
+    let rgba = src_rgba(sources, src, f, rt); let fit = proxy_fit(fit, rt, reel); // STRIAPROXYMORE (SR979): a proxied run's frame up-fits to the reel under Adopt (file tail)
     if fit == SizePolicy::Adopt {
         if last != Some(now) {
             log::info!("[STRIA] :: nle size switch reel={} {}x{} adopted", src.0, now.0, now.1);
@@ -1075,4 +1075,12 @@ impl Sources {
         v.retain(|(s, _)| *s != id);
         v.len() != before
     }
+}
+
+// ---- STRIAPROXYMORE (LEDGER SR979): an Adopt reel's proxy up-fits (named tail block) ----
+/// STRIAPROXYMORE (LEDGER SR979): the policy [`reel_rgba`] paints a frame by. A run whose track size is not the reel's is a
+/// proxied run (SR882: the proxy is a scaled stand-in of frames at the reel's size): Adopt fits it as Letterbox, so the
+/// preview shows the reel's size, not the proxy's. An original's run (its track IS the reel's) keeps `fit` unchanged.
+fn proxy_fit(fit: SizePolicy, run: Option<&Track>, reel: (u32, u32)) -> SizePolicy {
+    if fit == SizePolicy::Adopt && run.is_some_and(|t| (t.width, t.height) != reel) { SizePolicy::Letterbox } else { fit }
 }
