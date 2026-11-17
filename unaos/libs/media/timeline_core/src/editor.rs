@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -871,5 +871,61 @@ impl EditorState {
         let tl = self.timeline.set_rate(track, idx, rate_q16)?;
         self.commit(tl);
         Ok(())
+    }
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): drop / remove a named marker at the playhead through the one commit (named tail block) ----
+// `mark [<name>]` drops a marker at the playhead (default name `Timeline::marker_name`, the first free `M<n>`), `unmark`
+// removes the one at the playhead; each is ONE `commit` (undo-able, it dirties the document, `edl::write` keeps it as
+// `* UNA MARKER`), riding THE verb dispatch both faces call. SR723's export words `mark in` / `mark out` / `mark clear` keep
+// their meaning (`mark_words` takes them first), so a marker cannot be named exactly `in`, `out` or `clear`. Refused by
+// name: a taken tick or nothing to remove `EditError::Marker`.
+
+/// STRIAMARKERS (SR835): a marker word of [`EditorState::verb`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerWord<'a> {
+    /// `mark` (`None`: the default name) or `mark <name>`.
+    Mark(Option<&'a str>),
+    /// `unmark`.
+    Unmark,
+}
+
+/// STRIAMARKERS (SR835): `unmark`, `mark`, `mark <name>` (the rest trimmed); `None` for any other word, SR723's export
+/// words included.
+pub fn marker_word(v: &str) -> Option<MarkerWord<'_>> {
+    let v = v.trim();
+    match v {
+        "unmark" => return Some(MarkerWord::Unmark),
+        "mark" => return Some(MarkerWord::Mark(None)),
+        _ => {}
+    }
+    let rest = v.strip_prefix("mark")?;
+    if !rest.starts_with(char::is_whitespace) || mark_words(v).is_some() {
+        return None;
+    }
+    Some(MarkerWord::Mark(Some(rest.trim())))
+}
+
+impl EditorState {
+    /// A marker at the playhead named `name` (`None`: [`Timeline::marker_name`]): ONE commit. Refused: a marker already
+    /// there (`EditError::Marker`).
+    pub fn mark(&mut self, name: Option<&str>) -> Result<(), EditError> {
+        let name = name.map_or_else(|| self.timeline.marker_name(), alloc::string::String::from);
+        let tl = self.timeline.mark(self.playhead, &name)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The marker at the playhead removed: ONE commit. Refused: none there (`EditError::Marker`).
+    pub fn unmark(&mut self) -> Result<(), EditError> {
+        let tl = self.timeline.unmark(self.playhead).ok_or(EditError::Marker)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The marker words of [`EditorState::verb`]; `None` for any other word.
+    fn marker_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match marker_word(v)? {
+            MarkerWord::Mark(name) => self.mark(name),
+            MarkerWord::Unmark => self.unmark(),
+        })
     }
 }

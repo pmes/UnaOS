@@ -389,6 +389,6 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.timeline.marks, (Some(5), None), "undo takes the out mark back");
     assert_eq!(st.verb("mark clear"), Some(Ok(())));
     assert_eq!(st.timeline.marks, (None, None));
-    assert_eq!(st.verb("mark sideways"), None, "not a mark word");
+    assert_eq!(st.verb("mark sideways"), Some(Ok(())), "STRIAMARKERS (SR835): a marker named sideways"); assert!(st.undo());
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }

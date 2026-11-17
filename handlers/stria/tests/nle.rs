@@ -4491,3 +4491,61 @@ fn striaclipspeed_a_1x_timeline_schedules_as_before() {
     assert_eq!((vseeks, aseeks), (3, 3));
     println!("striaclipspeed: 1x fixture schedule = the old identity: {} steps, {} runs, seeks v={vseeks} a={aseeks}", steps.len(), runs.len());
 }
+
+// ---- STRIAMARKERS (LEDGER SR835): named markers from the face — the words, the message, undo, the m key (named tail block) ----
+
+fn striamarkers_face() -> Face {
+    let (tl, src) = synth_fixture();
+    Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+}
+
+/// `mark` drops M1 at the playhead (ONE commit, the face dirty) with its message; `mark` again is refused by name and
+/// changes nothing; `mark Intro` names one; `undo` removes it and `redo` restores it; `unmark` and unmark-of-nothing word
+/// their messages; `mark in` stays SR723's export mark (no marker made).
+#[test]
+fn striamarkers_face_words_messages_and_undo() {
+    let mut f = striamarkers_face();
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marked M1 at 00:00:00:12"));
+    assert_eq!(f.state.timeline.markers, vec![timeline_core::Marker { at: 12, name: "M1".into() }]);
+    assert_eq!(f.state.undo_depth(), 1);
+    assert!(f.dirty(), "a marker dirties the document");
+    assert!(f.verb("mark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("mark: M1 is already at 00:00:00:12"));
+    assert_eq!((f.state.timeline.markers.len(), f.state.undo_depth()), (1, 1));
+    f.state.seek(30);
+    assert!(f.verb("mark Intro \"one\""));
+    assert_eq!(f.last_error.take().as_deref(), Some("marked Intro \"one\" at 00:00:01:05"));
+    assert_eq!(f.state.timeline.marker_at(30).map(|m| m.name.as_str()), Some("Intro \"one\""));
+    assert!(f.verb("undo"));
+    assert!(f.state.timeline.marker_at(30).is_none(), "undo removes the marker");
+    assert!(f.verb("redo"));
+    assert!(f.state.timeline.marker_at(30).is_some(), "redo restores it");
+    assert!(f.verb("unmark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmarked Intro \"one\" at 00:00:01:05"));
+    assert!(f.verb("unmark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmark: no marker at 00:00:01:05"));
+    f.state.seek(5);
+    assert!(f.verb("mark in"));
+    assert_eq!((f.state.timeline.marks.0, f.state.timeline.markers.len()), (Some(5), 1), "mark in is the export mark");
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    let edl = edl::write(&f.state.timeline, "T").unwrap();
+    assert!(edl.contains("* UNA MARK 5 -\n* UNA MARKER 00:00:00:12 \"M1\"\n"), "{edl}");
+    println!("striamarkers: M1 at 12, Intro at 30 undone / redone / removed; EDL keeps `* UNA MARKER 00:00:00:12 \"M1\"`");
+}
+
+/// The `m` key (text) marks through the same word; the keys help shows its row; `M` stays unbound.
+#[test]
+fn striamarkers_m_key_and_help_row() {
+    let mut f = striamarkers_face();
+    assert!(f.on(&bandy::SMessage::BrowserText("m".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("marked M1 at 00:00:00:00"));
+    assert_eq!(f.state.timeline.markers.len(), 1);
+    assert!(!f.on(&bandy::SMessage::BrowserText("M".into())));
+    assert!(KEYS.contains(&("m", "mark")) && VERBS.contains(&"mark") && VERBS.contains(&"unmark"));
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert!(help_rows().iter().any(|(k, p)| k == "m" && *p == help_phrase("mark") && *p == "drop a marker at the playhead"));
+    assert!(HELP.iter().any(|(a, _)| *a == "mark"));
+    println!("striamarkers: m marks M1; help row m -> {}", help_phrase("mark"));
+}

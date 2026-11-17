@@ -339,6 +339,7 @@ pub struct Timeline {
     pub audio_xfades: Vec<AudioXfade>,
     /// NLE5DRANGESAVE (SR723): the export range's in / out marks (ticks; either may be unset), kept in the EDL as `* UNA MARK`.
     pub marks: (Option<i64>, Option<i64>),
+    pub markers: Vec<Marker>, // STRIAMARKERS (SR835): the named markers, sorted by `at`, one per tick; edl keeps them as `* UNA MARKER` (file tail)
 }
 
 /// How [`Timeline::place`] makes room.
@@ -384,6 +385,8 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    /// STRIAMARKERS (SR835): a marker already at that tick (or none there to remove; or markers out of tick order).
+    Marker,
 }
 
 impl core::fmt::Display for EditError {
@@ -404,6 +407,7 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "rate is not a positive speed (a dwell or reverse)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::Marker => "one marker per tick (one is already there, or none is there to remove)",
         })
     }
 }
@@ -421,7 +425,7 @@ pub trait SourceIndex {
 impl Timeline {
     /// An empty timeline at an integer frame rate (one tick = one frame).
     pub fn new(fps: u32) -> Timeline {
-        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new(), audio_xfades: Vec::new(), marks: (None, None) }
+        Timeline { tb: Timebase { num: 1, den: fps.max(1) as u64 }, sources: Vec::new(), tracks: Vec::new(), audio_xfades: Vec::new(), marks: (None, None), markers: Vec::new() }
     }
     /// The frame rate when the time base is `1/n`.
     pub fn fps(&self) -> Option<u32> {
@@ -487,7 +491,7 @@ impl Timeline {
             }
             self.validate_transitions(t)?;
         }
-        self.validate_audio_xfades()?;
+        self.validate_audio_xfades()?; self.validate_markers()?;
         Ok(())
     }
 
@@ -1821,5 +1825,112 @@ mod striaclipspeed_tests {
         for bad in ["", ".", "x", "-2", "1.2.3", "1e3", "+1"] {
             assert_eq!(speed_q16(bad, 1), None, "{bad}");
         }
+    }
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): named markers on the Timeline — the editor's notebook (named tail block) ----
+// A marker is a named tick of the document (`Timeline::markers`, sorted by `at`, at most one per tick, `at >= 0`), edited
+// only by the pure ops below (BP-handlers-14) through the editor's ONE commit (so undo / redo / dirty hold for free) and
+// kept in the EDL as `* UNA MARKER <tc> "<name>"` (edl.rs tail). Refused by name: a negative tick `EditError::Negative`,
+// a taken tick (or, to `validate`, markers out of tick order) `EditError::Marker`.
+
+/// STRIAMARKERS (SR835): one named marker at timeline tick `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marker {
+    pub at: i64,
+    pub name: String,
+}
+
+impl Timeline {
+    /// The timeline with a marker `name` at tick `at` (inserted in tick order). Refused: `at < 0` (`Negative`), a
+    /// marker already at `at` (`Marker`).
+    pub fn mark(&self, at: i64, name: &str) -> Result<Timeline, EditError> {
+        if at < 0 {
+            return Err(EditError::Negative);
+        }
+        let i = match self.markers.binary_search_by_key(&at, |m| m.at) {
+            Ok(_) => return Err(EditError::Marker),
+            Err(i) => i,
+        };
+        let mut tl = self.clone();
+        tl.markers.insert(i, Marker { at, name: String::from(name) });
+        Ok(tl)
+    }
+    /// The timeline without the marker at tick `at`; `None` when no marker stands there.
+    pub fn unmark(&self, at: i64) -> Option<Timeline> {
+        let i = self.markers.binary_search_by_key(&at, |m| m.at).ok()?;
+        let mut tl = self.clone();
+        tl.markers.remove(i);
+        Some(tl)
+    }
+    /// The marker at tick `at`.
+    pub fn marker_at(&self, at: i64) -> Option<&Marker> {
+        self.markers.binary_search_by_key(&at, |m| m.at).ok().map(|i| &self.markers[i])
+    }
+    /// The default name of a new marker: the first `M<n>` (n from 1) no marker carries.
+    pub fn marker_name(&self) -> String {
+        (1u32..).map(|n| alloc::format!("M{n}")).find(|n| !self.markers.iter().any(|m| &m.name == n)).expect("a free M<n> name")
+    }
+    /// Every marker at a tick `>= 0` and the ticks strictly ascending.
+    fn validate_markers(&self) -> Result<(), EditError> {
+        if self.markers.iter().any(|m| m.at < 0) {
+            return Err(EditError::Negative);
+        }
+        if self.markers.windows(2).any(|w| w[0].at >= w[1].at) {
+            return Err(EditError::Marker);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod striamarkers_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    /// STRIAMARKERS M3: `mark` inserts in tick order and validates; a taken tick and a negative tick are refused by name.
+    #[test]
+    fn striamarkers_mark_sorted_insert_and_refusals() {
+        let t = tl().mark(5, "B").unwrap().mark(2, "A").unwrap();
+        assert_eq!(t.markers, alloc::vec![Marker { at: 2, name: "A".into() }, Marker { at: 5, name: "B".into() }]);
+        assert_eq!(t.validate(), Ok(()));
+        assert_eq!(t.mark(5, "C"), Err(EditError::Marker));
+        assert_eq!(t.mark(-1, "C"), Err(EditError::Negative));
+        assert_eq!(t.marker_at(5).map(|m| m.name.as_str()), Some("B"));
+        assert_eq!(t.marker_at(4), None);
+        assert_eq!(tl().markers, alloc::vec![], "a fresh timeline has none");
+    }
+
+    /// STRIAMARKERS M3: `unmark` of nothing is `None`; of a marker removes only it.
+    #[test]
+    fn striamarkers_unmark_and_default_names() {
+        let t = tl().mark(5, "M1").unwrap();
+        assert!(t.unmark(4).is_none());
+        let u = t.unmark(5).expect("the marker at 5");
+        assert!(u.markers.is_empty());
+        assert_eq!(u, tl());
+        assert_eq!(tl().marker_name(), "M1");
+        assert_eq!(t.marker_name(), "M2");
+        let only2 = tl().mark(1, "M2").unwrap();
+        assert_eq!(only2.marker_name(), "M1", "the first free name");
+    }
+
+    /// STRIAMARKERS M3: `validate` refuses markers out of tick order, two at one tick, and a negative one.
+    #[test]
+    fn striamarkers_validate_refuses_disorder() {
+        let mut t = tl();
+        t.markers = alloc::vec![Marker { at: 5, name: "a".into() }, Marker { at: 2, name: "b".into() }];
+        assert_eq!(t.validate(), Err(EditError::Marker));
+        t.markers = alloc::vec![Marker { at: 2, name: "a".into() }, Marker { at: 2, name: "b".into() }];
+        assert_eq!(t.validate(), Err(EditError::Marker));
+        t.markers = alloc::vec![Marker { at: -2, name: "a".into() }];
+        assert_eq!(t.validate(), Err(EditError::Negative));
     }
 }

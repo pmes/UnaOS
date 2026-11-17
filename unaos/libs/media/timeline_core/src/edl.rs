@@ -216,7 +216,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
-            if l.starts_with("* UNA XFADE") {
+            marker_comment(l, fps, line, &mut tl)?; if l.starts_with("* UNA XFADE") {
                 xfade_comment(l, line, xq.map(|k| trans[k].5), &mut eq)?; // NLEXFADEPOWER (SR678)
             }
             continue;
@@ -399,9 +399,9 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         }
         s.push_str(&title_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail)
     }
-    s.push_str(&mark_line(tl)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
+    s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push('\n'); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     s.insert_str(s.len() - 1, &flag_lines(tl, "MUTE", |t| t.muted)); // STRIATRACKMUTESOLO (SR837): the muted tracks' `* UNA MUTE` lines, before the header's blank line (file tail)
-    s.insert_str(s.len() - 1, &flag_lines(tl, "SOLO", |t| t.solo)); // STRIATRACKMUTESOLO (SR837): the soloed tracks' `* UNA SOLO` lines (file tail)
+    s.insert_str(s.len() - 1, &flag_lines(tl, "SOLO", |t| t.solo)); // STRIATRACKMUTESOLO (SR837): the soloed tracks' `* UNA SOLO` lines (file tail); STRIAMARKERS (SR835): one `* UNA MARKER` line per marker after it (file tail)
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
     let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
@@ -979,5 +979,74 @@ mod striaclipspeed_tests {
         let junk = s.replacen(m2, "M2   A        fast 00:00:00:13\n", 1);
         assert!(matches!(parse(&junk, 25), Err(EdlError::Syntax { .. })), "unreadable speed");
         std::println!("striaclipspeed: M2 refusals: stray/reel/tc/junk Syntax, wrong speed Duration, -/0 Rate");
+    }
+}
+
+// ---- STRIAMARKERS (LEDGER SR835): the `* UNA MARKER` lines (named tail block) ----
+// `* UNA MARKER <HH:MM:SS:FF> "<name>"` is one named marker ([`crate::Timeline::markers`]), one line per marker in tick order,
+// written in the header right after the `* UNA MARK` line and only when markers exist, so an EDL with none writes as before
+// and a CMX reader skips them as comments. The name is quoted by STRIATITLECLIP's [`quote`] / [`unquote`] (the one quote
+// grammar). A bad timecode is `Timecode`; a missing or malformed quote (an unknown escape, no closing quote, words after it)
+// or a second marker at one tick ([`crate::Timeline::mark`] refuses) is a syntax error.
+
+/// STRIAMARKERS: a `* UNA MARKER` line applied to the timeline being read; any other line is left alone.
+fn marker_comment(l: &str, fps: u32, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA MARKER ") else { return Ok(()) };
+    let (tc, q) = r.split_once(' ').ok_or(EdlError::Syntax { line })?;
+    let at = parse_tc(tc, fps, line)?;
+    let name = unquote(q).ok_or(EdlError::Syntax { line })?;
+    *tl = tl.mark(at, &name).map_err(|_| EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAMARKERS: the header's `* UNA MARKER` lines (empty with no marker).
+fn marker_lines(tl: &Timeline, fps: u32) -> String {
+    tl.markers.iter().map(|m| format!("* UNA MARKER {} {}\n", timecode(m.at, fps), quote(&m.name))).collect()
+}
+
+#[cfg(test)]
+mod striamarkers_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    fn cut() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    /// STRIAMARKERS M3: two markers (one name with a quote and a backslash) round-trip byte for byte, right after the
+    /// `* UNA MARK` line; a timeline with none writes no MARKER line.
+    #[test]
+    fn striamarkers_markers_round_trip_after_the_mark_line() {
+        let plain = write(&cut(), "T").unwrap();
+        assert!(!plain.contains("UNA MARKER"), "{plain}");
+        assert_eq!(write(&parse(&plain, 25).unwrap(), "T").unwrap(), plain);
+        let tl = cut().set_marks((Some(2), Some(18))).unwrap().mark(37, "say \"hi\" \\ there").unwrap().mark(12, "M1").unwrap();
+        let s = write(&tl, "T").unwrap();
+        let want = "* UNA MARK 2 18\n* UNA MARKER 00:00:00:12 \"M1\"\n* UNA MARKER 00:00:01:12 \"say \\\"hi\\\" \\\\ there\"\n\n";
+        assert!(s.contains(want), "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back, tl);
+        assert_eq!(back.markers[1].name, "say \"hi\" \\ there");
+        assert_eq!(write(&back, "T").unwrap(), s);
+    }
+
+    /// STRIAMARKERS M3: a malformed MARKER line is refused by name.
+    #[test]
+    fn striamarkers_malformed_marker_lines_refused() {
+        let head = write(&cut(), "T").unwrap();
+        let with = |l: &str| head.replacen("* UNA FPS 25\n", &format!("* UNA FPS 25\n{l}\n"), 1);
+        assert_eq!(parse(&with("* UNA MARKER 00:00:00:12 M1"), 25), Err(EdlError::Syntax { line: 4 }));
+        assert_eq!(parse(&with("* UNA MARKER 00:00:00:12 \"M1"), 25), Err(EdlError::Syntax { line: 4 }));
+        assert_eq!(parse(&with("* UNA MARKER 00:00:00:12 \"M1\" x"), 25), Err(EdlError::Syntax { line: 4 }));
+        assert_eq!(parse(&with("* UNA MARKER 00:00:00:12"), 25), Err(EdlError::Syntax { line: 4 }));
+        assert_eq!(parse(&with("* UNA MARKER 00:00:0x:12 \"M1\""), 25), Err(EdlError::Timecode { line: 4 }));
+        let twice = head.replacen("* UNA FPS 25\n", "* UNA FPS 25\n* UNA MARKER 00:00:00:12 \"a\"\n* UNA MARKER 00:00:00:12 \"b\"\n", 1);
+        assert_eq!(parse(&twice, 25), Err(EdlError::Syntax { line: 5 }));
+        let ok = parse(&with("* UNA MARKER 00:00:00:12 \"M1\""), 25).unwrap();
+        assert_eq!(ok.markers, alloc::vec![crate::Marker { at: 12, name: "M1".into() }]);
     }
 }
