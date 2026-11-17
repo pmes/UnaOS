@@ -70,6 +70,8 @@ pub trait RenderSink {
     fn stop(&self) -> bool {
         false
     }
+    /// STRIALOUDNESSMORE (SR961): false when the sink does not want the video frame at output tick `out_t`: [`render`] asks it once per video step, after [`RenderSink::stop`], and then skips that step's decode (no `frame` call, nothing added to [`RenderReport::frames`]).
+    fn frame_wanted(&mut self, _out_t: i64) -> bool { true }
     /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
     fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
 }
@@ -524,7 +526,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
     let mut run_of = runs.iter(); let mut stand_in_audio: Vec<SourceId> = Vec::new(); // NLESTANDINAUDIOEDITOR (SR713): the reels whose audio drew the silent stand-in
     for s in &steps {
-        if sink.stop() { r.stopped = Some(s.out_t); break; } // NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
+        if sink.stop() { r.stopped = Some(s.out_t); break; } if s.kind == Kind::Video && !sink.frame_wanted(s.out_t) { continue; } // STRIALOUDNESSMORE (SR961): a sink that declines the frame costs no decode; NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
         match (s.kind, s.src) {
             (Kind::Video, None) => {
                 vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
@@ -999,7 +1001,7 @@ struct LoudnessSink {
 }
 
 impl RenderSink for LoudnessSink {
-    fn frame(&mut self, out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) { self.seen(out_t); } fn stop(&self) -> bool { self.cancelled() } // STRIALOUDNESSCANCEL (SR903): progress and the stop hook (file tail)
+    fn frame(&mut self, out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) { self.seen(out_t); } fn stop(&self) -> bool { self.cancelled() } fn frame_wanted(&mut self, out_t: i64) -> bool { self.seen(out_t); false } // STRIALOUDNESSMORE (SR961): the tick counted, the frame declined (no video decode); STRIALOUDNESSCANCEL (SR903): progress and the stop hook (file tail)
     fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
         self.seen(out_t); self.l.get_or_insert_with(|| gneiss_pal::dsp::audio::meter::Loudness::new(rate, channels as usize)).push(interleaved);
     }
@@ -1050,3 +1052,10 @@ pub fn loudness_watched(tl: &Timeline, range: std::ops::Range<i64>, sources: &So
     render(tl, range, sources, &mut sink)?;
     Ok(sink.l.map(|l| l.integrated()))
 }
+
+// ---- STRIALOUDNESSMORE (LEDGER SR961): the measure decodes no video (named tail block) ----
+// STRIALOUDNESSMORE (SR961): `LoudnessSink` answers [`RenderSink::frame_wanted`] false for every video step (raising
+// SR903's ticks-done count first), so [`render`] decodes, converts and letterboxes no frame for a loudness measure; its
+// audio path (`mix_run` over its own `auds` slots) never reads the video state, so the PCM, and the LUFS, are unchanged.
+// Every other sink keeps the default `true`. Owed: NLE-LOUDNESS-AUDIOONLY-NOSIZE (render's `NoSize` check, before the step
+// loop, still refuses a measure whose video steps have no sized reel).
