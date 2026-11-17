@@ -1367,3 +1367,214 @@ fn conceal_forward_bi_inverse_chroma_joins_both_lists() {
     assert_ne!(by_poc(&f, 5).planes[2], uni_inv_c(&back.cr[..], cwo[0][1]), "Cr is not L0's chroma uni inverse");
     assert_ne!(by_poc(&f, 5).planes[2], uni_inv_c(&back.cr[..], cwo[1][1]), "Cr is not L1's chroma uni inverse");
 }
+
+// ---- HEVCCONCEALWEIGHTEDCHROMA422 (LEDGER SR798): explicit chroma weights through the 4:2:2 concealment (named tail block) ----
+
+/// SR798: VPS, SPS ([`sps_cfg`] at chroma_format_idc `idc`, inter SPS `x`), PPS (`pi`, deblocking off) and IDR0: four 16x16
+/// pcm CTBs through the kit's `pcm_cu_fmt` over the non-linear pattern (x * 37 + y * 29 + seed) % 256 (seeds 0 / 90 / 170,
+/// SR758's: a linear ramp's filtered fractions round alike, so a wrong (SubWidthC, SubHeightC) arm could hide).
+fn head_fmt(idc: u32, x: &InterSps, pi: &PpsInter) -> Vec<u8> {
+    let (sw, sh) = match idc {
+        1 => (2usize, 2usize),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { chroma_format_idc: idc, ..sps_cfg() }, x)));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    for k in 0..4 {
+        let (bx, by) = (k % 2, k / 2);
+        let ctb = |seed: usize, w: usize, h: usize| (0..w * h).map(|i| (((bx * w + i % w) * 37 + (by * h + i / w) * 29 + seed) % 256) as u16).collect::<Vec<u16>>();
+        let (cw, ch) = (16 / sw, 16 / sh);
+        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, ch), &ctb(170, cw, ch), (sw, sh));
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    s.extend(nal(19, &e.finish().out));
+    s
+}
+
+/// SR798: every sample of the w x h plane `r` of component `c` fetched at `mv` (luma quarter-sample through [`hand_luma`],
+/// chroma eighth-sample through the kit's `hand_chroma_wh`), its 14-bit intermediate mapped by `f`, clipped to 8 bits.
+fn fetch_map(r: &[u8], c: usize, w: i32, h: i32, mv: [i32; 2], f: impl Fn(i32) -> i32) -> Vec<u8> {
+    let r16: Vec<u16> = r.iter().map(|&v| v as u16).collect();
+    (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let p = if c == 0 { hand_luma(r, x, y, mv) } else { hand_chroma_wh(&r16, w, h, x, y, mv) };
+            f(p).clamp(0, 255) as u8
+        })
+        .collect()
+}
+
+/// SR798: n / d rounded half away from zero (inter.rs `uni_explicit_inv` / `bi_explicit_inv`'s division).
+fn round_half_away(n: i64, d: i64) -> i64 {
+    let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+    if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) }
+}
+
+/// SR776's P shape at chroma_format_idc 2 (4:2:2: 16x32 chroma) with SR758's fractional vectors. The PPS carries
+/// weighted_pred_flag; IDR0 ([`head_fmt`]), P2 (references POC 0 with mv (6, 2)), P4 (skip-only, references the lost POC 3,
+/// keeps POC 2 unused; its one entry defaults: a copy), P5 (references POC 2 with mv (3, 1)). P2 and P5 carry SR741's luma
+/// fade (denom 6, LumaWeightL0[0] 32, offset 10) and SR776's chroma weights (ChromaLog2WeightDenom 7, Cb (96, +20), Cr
+/// (160, -30)). POC 3 is concealed from POC 2 along (6, 2) rescaled by td 2, tb 1 to (3, 1); dpb.rs `conceal_fetch` scales
+/// it to the chroma mvC (3 * 2 / 2, 1 * 2 / 1) = (3, 2) over 4x8 chroma blocks and weights planes 1 / 2 by their own
+/// (w, o, log2WD 13) through `explicit_weight_of`. So P4 (the concealed picture's copy) is exactly P5 on every plane and the
+/// hand 8-252 ((p * w + 4096) >> 13) + o over 8.5.3.3.3.2 at (3, 2); its chroma is neither the default weights nor the
+/// 4:2:0 arm's mvC (3, 1).
+#[test]
+fn conceal_weighted_chroma_422_l0() {
+    let fade = Some((6, vec![Some((-32, 10))]));
+    let chroma = Some((1, vec![Some([(-32, -12), (32, 2)])]));
+    let mut s = head_fmt(2, &inter_sps(false), &PpsInter { weighted_pred: true, ..Default::default() });
+    s.extend(picture(&SliceCfg { weights: fade.clone(), chroma_weights: chroma.clone(), ..p_slice(2, vec![(-2, true)]) }, |e| amvp_then_merge(e, [6, 2])));
+    s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), ..p_slice(4, vec![(-1, true), (-2, false)]) }, skip_picture));
+    s.extend(picture(&SliceCfg { weights: fade, chroma_weights: chroma, ..p_slice(5, vec![(-3, true)]) }, |e| amvp_then_merge(e, [3, 1])));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }]);
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5]);
+    let (p2, p4, p5) = (by_poc(&f, 2), by_poc(&f, 4), by_poc(&f, 5));
+    for c in 0..3 {
+        assert_eq!(p4.planes[c].len(), if c == 0 { 32 * 32 } else { 16 * 32 }, "plane {c}: the 4:2:2 sample count");
+        assert_eq!(p4.planes[c], p5.planes[c], "plane {c}: the concealed picture equals the decoder's own weighted MC of P2 at (3, 1)");
+    }
+    assert_eq!(p4.planes[0], fetch_map(&p2.planes[0], 0, 32, 32, [3, 1], |p| ((p * 32 + 2048) >> 12) + 10), "luma: 8-252 with P2's fade at (3, 1)");
+    for (k, (w, o)) in [(96, 20), (160, -30)].into_iter().enumerate() {
+        let (c, r) = (k + 1, &p2.planes[k + 1][..]);
+        let wt = move |p: i32| ((p * w + 4096) >> 13) + o;
+        assert_eq!(p4.planes[c], fetch_map(r, c, 16, 32, [3, 2], wt), "plane {c}: 8-252 with P2's chroma weights over 8.5.3.3.3.2 at mvC (3, 2)");
+        assert_ne!(p4.planes[c], fetch_map(r, c, 16, 32, [3, 2], |p| (p + 32) >> 6), "plane {c}: not the default-chroma-weight projection");
+        assert_ne!(p4.planes[c], fetch_map(r, c, 16, 32, [3, 1], wt), "plane {c}: not the 4:2:0 arm's mvC (3, 1)");
+    }
+}
+
+/// SR793's surviving-list fixture at chroma_format_idc 2: B2 (L0 = L1 = [POC 4, POC 0 long-term], every L0 entry luma
+/// (48, 5) Cb (96, +20) Cr (160, -30), every L1 entry luma (16, -3) Cb (64, -16) Cr (112, +22), ChromaLog2WeightDenom 7);
+/// PRED_BI with one list to the long-term POC 0 (mvd (32, 16)) and the other to POC 4 at (-6, -2) — SR793's (-64, 0) is
+/// horizontal only, its chroma (4, 0) at 4:2:0 and 4:2:2 alike. `project_lists` drops the long-term list, so POC 3 is
+/// concealed along the surviving list alone: (-6, -2) rescaled by td -2, tb 1 to (3, 1), chroma mvC (3, 2), weighted uni by
+/// THAT list's luma and chroma (w, o). P7 references POC 2 at (3, 1) with the surviving list's weights, so P6 (the concealed
+/// picture's skip copy) is exactly P7 on every plane and the hand 8-252; its chroma is neither the default weights, nor the
+/// other list's chroma, nor the 4:2:0 arm's mvC (3, 1). With L0 long-term (l1_lt false) this is the L1 chroma road.
+#[test]
+fn conceal_weighted_chroma_422_l1_surviving() {
+    let (lt, st) = ([32, 16], [-6, -2]);
+    // (w, o) of each list: L0 (64 - 16, 5), L1 (64 - 48, -3).
+    let wo = [(48, 5), (16, -3)];
+    // Per list [(delta_chroma_weight, delta_chroma_offset); Cb, Cr] and the 7-56 (w, o) they give.
+    let cd = [[(-32, -12), (32, 2)], [(-64, -80), (-16, 6)]];
+    let cwo = [[(96, 20), (160, -30)], [(64, -16), (112, 22)]];
+    let wt = |(w, o): (i32, i32)| move |p: i32| ((p * w + 4096) >> 13) + o;
+    for l1_lt in [false, true] {
+        let mut s = head_fmt(2, &InterSps { long_term_refs: true, ..inter_sps(false) }, &PpsInter { weighted_pred: true, weighted_bipred: true, ..Default::default() });
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(4, vec![(-4, true)]) }, skip_picture));
+        let b2 = SliceCfg {
+            nal_type: 1,
+            slice_type: 0,
+            poc_lsb: 2,
+            neg: vec![],
+            pos: vec![(2, true)],
+            lt_pocs: Some(vec![0]),
+            num_ref: Some((2, 2)),
+            weights: Some((6, vec![Some((-16, 5)), Some((-16, 5))])),
+            weights_l1: Some(vec![Some((-48, -3)), Some((-48, -3))]),
+            chroma_weights: Some((1, vec![Some(cd[0]), Some(cd[0])])),
+            chroma_weights_l1: Some(vec![Some(cd[1]), Some(cd[1])]),
+            five_minus_max_num_merge_cand: 4,
+            deblocking_disabled: true,
+            ..Default::default()
+        };
+        let (refs, m0, m1) = if l1_lt { ([0, 1], st, lt) } else { ([1, 0], lt, st) };
+        s.extend(picture(&b2, |e| bi_ref_body(e, 2, refs, m0, m1)));
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![None])), lt_pocs: Some(vec![]), ..p_slice(6, vec![(-3, true), (-4, false)]) }, skip_picture));
+        let (sl, dl) = if l1_lt { (0, 1) } else { (1, 0) };
+        let live = wo[sl];
+        s.extend(picture(&SliceCfg { weights: Some((6, vec![Some((live.0 - 64, live.1))])), chroma_weights: Some((1, vec![Some(cd[sl])])), lt_pocs: Some(vec![]), ..p_slice(7, vec![(-5, true)]) }, |e| amvp_then_merge(e, [3, 1])));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode past the lost picture");
+        d.flush();
+        let what = if l1_lt { "L1 long-term, L0 survives" } else { "L0 long-term, L1 survives" };
+        assert_eq!(d.take_generated_refs(), vec![3], "{what}");
+        assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "{what}: every block uni");
+        let f = d.take_frames();
+        assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 4, 2, 6, 7], "{what}: output in decoding order");
+        let (p2, p6, p7) = (by_poc(&f, 2), by_poc(&f, 6), by_poc(&f, 7));
+        for c in 0..3 {
+            assert_eq!(p6.planes[c].len(), if c == 0 { 32 * 32 } else { 16 * 32 }, "{what}: plane {c}: the 4:2:2 sample count");
+            assert_eq!(p6.planes[c], p7.planes[c], "{what}: plane {c}: the concealed picture equals the decoder's own uni weighted MC of B2 at (3, 1)");
+        }
+        assert_eq!(p6.planes[0], fetch_map(&p2.planes[0], 0, 32, 32, [3, 1], |p| ((p * live.0 + 2048) >> 12) + live.1), "{what}: luma 8-252 with the surviving list's weights");
+        for k in 0..2 {
+            let (c, r) = (k + 1, &p2.planes[k + 1][..]);
+            assert_eq!(p6.planes[c], fetch_map(r, c, 16, 32, [3, 2], wt(cwo[sl][k])), "{what}: plane {c}: 8-252 with the surviving list's chroma weights at mvC (3, 2)");
+            assert_ne!(p6.planes[c], fetch_map(r, c, 16, 32, [3, 2], |p| (p + 32) >> 6), "{what}: plane {c}: not the default-chroma-weight projection");
+            assert_ne!(p6.planes[c], fetch_map(r, c, 16, 32, [3, 2], wt(cwo[dl][k])), "{what}: plane {c}: not through the other list's chroma weights");
+            assert_ne!(p6.planes[c], fetch_map(r, c, 16, 32, [3, 1], wt(cwo[sl][k])), "{what}: plane {c}: not the 4:2:0 arm's mvC (3, 1)");
+        }
+    }
+}
+
+/// SR793's joint-inverse fixture at chroma_format_idc 2: C = B4 (L0 = L1 = [the lost POC 3], one reference per list; luma
+/// L0 (48, 5) L1 (16, -3) at denom 6; chroma L0 Cb (96, +20) Cr (160, -30), L1 Cb (64, -16) Cr (112, +22) at
+/// ChromaLog2WeightDenom 7) PRED_BI with BOTH lists to POC 3 at the equal fractional vector (6, 2). When C ends, the forward
+/// road refines POC 3 from C at -mv = (-6, -2) (chroma mvC (-6, -4) over 4x8 blocks), both fetches equal, through
+/// `bi_explicit_inv` per plane with that plane's two (w, o) from `explicit_weight_of`: p' = round half away
+/// (((p << (denom + 1)) - ((o0 + o1) << log2WD)) / (w0 + w1)), then (p' + 32) >> 6, clipped, on the 14-bit 8.5.3.3.3.2 fetch p.
+/// So P5 (the refined picture's skip copy) is that hand joint inverse on every plane; its chroma is neither the copy of C,
+/// nor either list's chroma uni inverse, nor the 4:2:0 arm's mvC (-6, -2).
+#[test]
+fn conceal_forward_bi_inverse_chroma_422_joins_both_lists() {
+    let st = [6, 2];
+    // (w, o) of each list: L0 (64 - 16, 5), L1 (64 - 48, -3).
+    let wo = [(48, 5), (16, -3)];
+    // Per list [(delta_chroma_weight, delta_chroma_offset); Cb, Cr] and the 7-56 (w, o) they give.
+    let cd = [[(-32, -12), (32, 2)], [(-64, -80), (-16, 6)]];
+    let cwo = [[(96, 20), (160, -30)], [(64, -16), (112, 22)]];
+    // `bi_explicit_inv` / `uni_explicit_inv` at 8 bits (shift1 6, log2WD = denom + 6) on the 14-bit fetch p.
+    let joint = |denom: u32, a: (i32, i32), b: (i32, i32)| move |p: i32| (round_half_away(((p as i64) << (denom + 1)) - (((a.1 + b.1) as i64) << (denom + 6)), (a.0 + b.0) as i64) as i32 + 32) >> 6;
+    let uni_inv = |denom: u32, (w, o): (i32, i32)| move |p: i32| (round_half_away(((p as i64) - ((o as i64) << 6)) << denom, w as i64) as i32 + 32) >> 6;
+    let mut s = head_fmt(2, &inter_sps(false), &PpsInter { weighted_bipred: true, ..Default::default() });
+    s.extend(picture(&p_slice(2, vec![(-2, true)]), |e| amvp_then_merge(e, [6, 2])));
+    let c4 = SliceCfg {
+        nal_type: 1,
+        slice_type: 0,
+        poc_lsb: 4,
+        neg: vec![(-1, true), (-2, false)],
+        pos: vec![],
+        num_ref: Some((1, 1)),
+        weights: Some((6, vec![Some((-16, 5))])),
+        weights_l1: Some(vec![Some((-48, -3))]),
+        chroma_weights: Some((1, vec![Some(cd[0])])),
+        chroma_weights_l1: Some(vec![Some(cd[1])]),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    s.extend(picture(&c4, |e| bi_body(e, 1, st, st)));
+    s.extend(picture(&p_slice(5, vec![(-2, true)]), skip_picture));
+    let mut d = Decoder::new();
+    d.decode_annexb(&s).expect("decode past the lost picture");
+    d.flush();
+    assert_eq!(d.take_generated_refs(), vec![3]);
+    assert_eq!(d.take_concealed(), vec![hevc_core::dpb::Concealed { poc: 3, src_poc: 2, projected: true, bidir_blocks: 0, forward_blocks: 16 }], "every block of C refines");
+    let f = d.take_frames();
+    assert_eq!(f.iter().map(|f| f.poc).collect::<Vec<_>>(), vec![0, 2, 4, 5], "output in decoding order");
+    let (c, p5) = (by_poc(&f, 4), by_poc(&f, 5));
+    assert_eq!(p5.planes[1].len(), 16 * 32, "the 4:2:2 chroma sample count");
+    assert_eq!(p5.planes[0], fetch_map(&c.planes[0], 0, 32, 32, [-6, -2], joint(6, wo[0], wo[1])), "luma: the joint inverse of both lists' weights of C at -mv");
+    for k in 0..2 {
+        let (pl, r) = (k + 1, &c.planes[k + 1][..]);
+        let want = fetch_map(r, pl, 16, 32, [-6, -4], joint(7, cwo[0][k], cwo[1][k]));
+        assert_eq!(p5.planes[pl], want, "plane {pl}: the joint inverse of both lists' chroma weights of C at mvC (-6, -4)");
+        assert_ne!(p5.planes[pl], fetch_map(r, pl, 16, 32, [-6, -4], |p| (p + 32) >> 6), "plane {pl}: not the copy of C");
+        assert_ne!(p5.planes[pl], fetch_map(r, pl, 16, 32, [-6, -4], uni_inv(7, cwo[0][k])), "plane {pl}: not L0's chroma uni inverse");
+        assert_ne!(p5.planes[pl], fetch_map(r, pl, 16, 32, [-6, -4], uni_inv(7, cwo[1][k])), "plane {pl}: not L1's chroma uni inverse");
+        assert_ne!(p5.planes[pl], fetch_map(r, pl, 16, 32, [-6, -2], joint(7, cwo[0][k], cwo[1][k])), "plane {pl}: not the 4:2:0 arm's mvC (-6, -2)");
+    }
+}

@@ -1204,3 +1204,23 @@ pub fn chroma_l0(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
 pub fn chroma_l1(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
     c.chroma_weights_l1.as_ref().and_then(|cw| cw.get(i).copied().flatten())
 }
+
+// ---- HEVCCONCEALWEIGHTEDCHROMA422 (LEDGER SR798): the 8.5.3.3.3.2 chroma oracle at any plane geometry (named tail block) ----
+
+/// HEVCCONCEALWEIGHTEDCHROMA422 (SR798): 8.5.3.3.3.2 written out for one chroma sample (x, y) of the w x h reference plane
+/// `r` (nearest-edge clamped) at the eighth-sample chroma vector `mv`, 8-bit (shift1 0, shift2 6): the 14-bit intermediate
+/// predSampleLX. ONE oracle for every chroma format (4:2:0 16x16, 4:2:2 16x32, 4:4:4 32x32 at the 32x32 fixtures); tests/rext.rs
+/// `hand_chroma` (SR758) is its twin and retires onto it (HEVC-TESTKIT-PBODY owed).
+pub fn hand_chroma_wh(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -> i32 {
+    let s = |x: i32, y: i32| r[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize] as i32;
+    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
+    let (xi, yi) = (x + (mv[0] >> 3), y + (mv[1] >> 3));
+    let hz = |yy: i32| (0..4).map(|i| CHROMA_FILTER[xf][i] * s(xi + i as i32 - 1, yy)).sum::<i32>();
+    if yf == 0 {
+        if xf == 0 { s(xi, yi) << 6 } else { hz(yi) }
+    } else if xf == 0 {
+        (0..4).map(|i| CHROMA_FILTER[yf][i] * s(xi, yi + i as i32 - 1)).sum()
+    } else {
+        (0..4).map(|n| CHROMA_FILTER[yf][n] * hz(yi + n as i32 - 1)).sum::<i32>() >> 6
+    }
+}
