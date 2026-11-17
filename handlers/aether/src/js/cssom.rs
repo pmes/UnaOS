@@ -2102,7 +2102,7 @@ top>inset";
         }
         assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
         let names = universe();
-        assert_eq!(names.len(), 242);
+        assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
         for p in &names {
             let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
