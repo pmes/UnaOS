@@ -3828,3 +3828,43 @@ fn striatcset_set_off_paint_is_byte_identical() {
     assert_eq!(face.paint(), off, "off: byte-identical");
     println!("striatcset: tc seconds inks, tc off fnv {:016x}", stria::nle_face::fnv1a(&off));
 }
+
+// ---- STRIATCMORE (LEDGER SR964): the readout reads the time base (named tail block) ----
+
+/// A 30000/1001 timeline's readout is drop-frame at the real rate (frames the tick, seconds at 1001/30000); a 1/25 base
+/// reads exactly `tc_text` at 25 as before.
+#[test]
+fn striatcmore_readout_reads_an_ntsc_time_base() {
+    use stria::nle_face::{TcUnit, tc_text};
+    let mut face = striatimecodedisplay_face(false);
+    face.state.timeline.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+    face.state.playhead = 1800;
+    assert!(face.verb("tc timecode"));
+    assert_eq!(face.tc_readout().as_deref(), Some("00:01:00;02"));
+    assert!(face.verb("tc frames"));
+    assert_eq!(face.tc_readout().as_deref(), Some("1800"));
+    assert!(face.verb("tc seconds"));
+    assert_eq!(face.tc_readout().as_deref(), Some("60.06 s"));
+    let mut plain = striatimecodedisplay_face(false);
+    plain.state.timeline.tb = timeline_core::Timebase { num: 1, den: 25 };
+    plain.state.seek(12);
+    for (w, u) in [("tc timecode", TcUnit::Timecode), ("tc frames", TcUnit::Frames), ("tc seconds", TcUnit::Seconds)] {
+        assert!(plain.verb(w));
+        assert_eq!(plain.tc_readout(), Some(tc_text(plain.state.playhead, 25, u)), "{w}");
+    }
+    assert!(face.last_error.is_none() && plain.last_error.is_none());
+    println!("striatcmore: 30000/1001 @ 1800 reads 00:01:00;02 / 1800 / 60.06 s");
+}
+
+/// With the readout off, an NTSC timeline paints byte-identical before and after `tc` / `tc off`.
+#[test]
+fn striatcmore_readout_off_ntsc_paint_is_unchanged() {
+    let mut face = striatimecodedisplay_face(true);
+    face.state.timeline.tb = timeline_core::Timebase { num: 1001, den: 30000 };
+    let off = face.paint();
+    assert!(face.verb("tc"));
+    assert_ne!(face.paint(), off, "the readout shows");
+    assert!(face.verb("tc off"));
+    assert_eq!(face.paint(), off, "off: byte-identical");
+    println!("striatcmore: ntsc off fnv {:016x}", stria::nle_face::fnv1a(&off));
+}

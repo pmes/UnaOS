@@ -392,3 +392,27 @@ fn nle5drangesave_the_editors_mark_words_commit_and_write() {
     assert_eq!(st.verb("mark sideways"), None, "not a mark word");
     assert_eq!(edl::write(&st.timeline, "CUT ONE").unwrap(), CUT);
 }
+
+// ---- STRIATCMORE (LEDGER SR964): drop-frame timecode text (named tail block) ----
+
+/// SMPTE drop-frame: two numbers skipped each minute but every tenth (four at 60), labels strictly increasing, other
+/// nominals non-drop, a negative tick reads as zero.
+#[test]
+fn striatcmore_timecode_drop_counts_smpte() {
+    use timeline_core::edl::{timecode, timecode_drop};
+    for (t, s) in [(0, "00:00:00;00"), (1799, "00:00:59;29"), (1800, "00:01:00;02"), (3597, "00:01:59;29"), (3598, "00:02:00;02"), (17981, "00:09:59;29"), (17982, "00:10:00;00"), (17983, "00:10:00;01"), (19782, "00:11:00;02"), (107892, "01:00:00;00"), (-5, "00:00:00;00")] {
+        assert_eq!(timecode_drop(t, 30), s, "30 @ {t}");
+    }
+    assert_eq!(timecode_drop(3599, 60), "00:00:59;59");
+    assert_eq!(timecode_drop(3600, 60), "00:01:00;04");
+    assert_eq!(timecode_drop(35964, 60), "00:10:00;00");
+    let mut last = timecode_drop(0, 30);
+    for t in 1..18000 {
+        let s = timecode_drop(t, 30);
+        assert!(s > last, "{t}: {s} after {last}");
+        last = s;
+    }
+    for (t, nom) in [(312, 25), (45, 24), (1800, 50)] {
+        assert_eq!(timecode_drop(t, nom), timecode(t, nom), "non-drop nominal {nom}");
+    }
+}

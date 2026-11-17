@@ -3162,7 +3162,7 @@ impl Face {
     /// The playhead in the readout's unit while it is on.
     pub fn tc_readout(&self) -> Option<String> {
         let fps = self.state.timeline.fps().unwrap_or(25).max(1);
-        self.tc.map(|u| tc_text(self.state.playhead, fps, u))
+        self.tc.map(|u| tc_text_tb(self.state.playhead, self.state.timeline.tb, fps, u)) // STRIATCMORE (SR964): an NTSC time base reads drop-frame at its real rate (file tail)
     }
     /// The message's left edge: 0 with the readout off, the row's middle with it on.
     fn tc_split(&self, l: Layout) -> u32 {
@@ -3243,6 +3243,52 @@ mod striatcset_tests {
         assert_eq!(tc_unit_of("off"), Some(None));
         for w in ["Frames", "", "fps", "tc"] {
             assert_eq!(tc_unit_of(w), None, "{w:?}");
+        }
+    }
+}
+
+// ---- STRIATCMORE (LEDGER SR964): the readout reads the time base (named tail block) ----
+// `Timeline::fps` is `Some` only for a `1/n` base, so a 30000/1001 timeline read at the fallback 25 fps. An NTSC base
+// `1001/(k*1000)` reads at its real rate: timecode drop-frame for k 30 / 60 (`edl::timecode_drop`), non-drop at k otherwise
+// (23.976 at 24); frames the tick count; seconds `t * 1001 / den`. Every other base is `tc_text` as before (byte-identical).
+// Owed: NLE-TC-DROPFRAME-MODEL (no road builds a 1001 timeline; the EDL refuses drop-frame), NLE-TC-DROPFRAME-RULER.
+
+/// STRIATCMORE (SR964): tick `t` in `unit` at the time base `tb`; `fps` is the rate for any base that is not NTSC.
+pub fn tc_text_tb(t: i64, tb: timeline_core::Timebase, fps: u32, unit: TcUnit) -> String {
+    let k = tb.den / 1000;
+    if tb.num != 1001 || tb.den % 1000 != 0 || k == 0 || k > u32::MAX as u64 {
+        return tc_text(t, fps, unit);
+    }
+    let t = t.max(0);
+    match unit {
+        TcUnit::Timecode if k == 30 || k == 60 => timeline_core::edl::timecode_drop(t, k as u32),
+        TcUnit::Timecode => timeline_core::edl::timecode(t, k as u32),
+        TcUnit::Frames => t.to_string(),
+        TcUnit::Seconds => {
+            let cs = (t as i128 * 1001 * 100 / tb.den as i128) as i64;
+            format!("{}.{:02} s", cs / 100, cs % 100)
+        }
+    }
+}
+
+#[cfg(test)]
+mod striatcmore_tests {
+    use super::*;
+    use timeline_core::Timebase;
+
+    /// NTSC bases read drop-frame (30, 60) or non-drop (24) at the real rate; a 1/n base and any other base are `tc_text`.
+    #[test]
+    fn striatcmore_tc_text_tb_units() {
+        let ntsc = Timebase { num: 1001, den: 30000 };
+        assert_eq!(tc_text_tb(1800, ntsc, 25, TcUnit::Timecode), "00:01:00;02");
+        assert_eq!(tc_text_tb(1800, ntsc, 25, TcUnit::Frames), "1800");
+        assert_eq!(tc_text_tb(1800, ntsc, 25, TcUnit::Seconds), "60.06 s");
+        assert_eq!(tc_text_tb(3600, Timebase { num: 1001, den: 60000 }, 25, TcUnit::Timecode), "00:01:00;04");
+        assert_eq!(tc_text_tb(48, Timebase { num: 1001, den: 24000 }, 25, TcUnit::Timecode), "00:00:02:00");
+        assert_eq!(tc_text_tb(-3, ntsc, 25, TcUnit::Timecode), "00:00:00;00");
+        for u in [TcUnit::Timecode, TcUnit::Frames, TcUnit::Seconds] {
+            assert_eq!(tc_text_tb(312, Timebase { num: 1, den: 25 }, 25, u), tc_text(312, 25, u));
+            assert_eq!(tc_text_tb(312, Timebase { num: 1, den: 1000 }, 25, u), tc_text(312, 25, u), "any other base: the fallback");
         }
     }
 }
