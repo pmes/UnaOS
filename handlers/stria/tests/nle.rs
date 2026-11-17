@@ -6252,3 +6252,76 @@ fn strialoudnesscancel_progress_line() {
     assert!(!face.loudness_pending());
     println!("strialoudnesscancel: progress line, then {finished}");
 }
+
+// ---- STRIAROLLKEYS (LEDGER SR893): the roll keys — ( / ) one frame, Ctrl / Cmd + Shift + ( / ) ten (named tail block) ----
+
+/// Rule: `)` / `(` (text keys, like [ / ]) are SR851's `roll+` / `roll-` on the cut at the selected clip's out edge, ONE
+/// undo step per key; a one-char key as `BrowserKey` alone is not taken.
+#[test]
+fn striarollkeys_paren_keys_roll_one_frame() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 0).unwrap();
+    assert!(!face.on(&bandy::SMessage::BrowserKey(")".into())), "a one-char BrowserKey alone is not taken");
+    assert_eq!(face.state.timeline, tl);
+    for _ in 0..3 {
+        assert!(face.on(&bandy::SMessage::BrowserText(")".into())));
+    }
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 3).unwrap());
+    assert!(face.on(&bandy::SMessage::BrowserText("(".into())));
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 2).unwrap());
+    assert_eq!(face.state.undo_depth(), 4);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striarollkeys: ) x3 then ( = Timeline::roll(0, 0, 2), four undo steps");
+}
+
+/// Rule: `Ctrl+Shift+parenright` rolls the cut SLIP_STEP frames later through slipslide_word's `roll+10` -> `roll 10`
+/// (A [13,23)@0 | B [0,20)@10 -> A [13,33)@0 | B [10,20)@20), `Meta+Shift+parenleft` ten back; a roll the ops refuse is
+/// taken and read on the message row as `roll+10: <err>` with the timeline kept.
+#[test]
+fn striarollkeys_chords_roll_ten_frames() {
+    let (mut tl, src) = synth_fixture();
+    tl.tracks[0].clips.truncate(2);
+    tl.tracks[0].clips[1] = Clip::new(SourceId(1), 0, 20, 10);
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 0).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+Shift+parenright".into())));
+    assert_eq!(face.state.timeline, tl.roll(0, 0, 10).unwrap());
+    assert_eq!(face.state.timeline.tracks[0].clips[..], [Clip::new(SourceId(0), 13, 33, 0), Clip::new(SourceId(1), 10, 20, 20)]);
+    assert!(face.on(&bandy::SMessage::BrowserKey("Meta+Shift+parenleft".into())));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let (plain, src) = synth_fixture();
+    let mut face = nlefaceexport_face(plain.clone(), src);
+    face.state.select(0, 0).unwrap();
+    let err = plain.roll(0, 0, 10).unwrap_err();
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+Shift+parenright".into())), "the key is taken");
+    assert_eq!(face.last_error.take(), Some(format!("roll+10: {err}")));
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&plain, 0));
+    println!("striarollkeys: Ctrl+Shift+parenright = roll 10; on synth_fixture -> roll+10: {err}");
+}
+
+/// Rule: the four roll actions are KEYS rows with HELP phrases (not the bare word); the help rows name `(`, `)` and both
+/// chords of each ten-frame word; the ten-frame words are keys only (not VERBS); other counts are not face words.
+#[test]
+fn striarollkeys_help_rows_and_not_verbs() {
+    let rows = help_rows();
+    for (keys, w) in [(&["("][..], "roll-"), (&[")"][..], "roll+"), (&["Ctrl+Shift+parenleft", "Meta+Shift+parenleft"][..], "roll-10"), (&["Ctrl+Shift+parenright", "Meta+Shift+parenright"][..], "roll+10")] {
+        let row = rows.iter().find(|r| r.1 == help_phrase(w)).expect("a help row");
+        assert!(HELP.iter().any(|(x, _)| *x == w), "no phrase for {w}");
+        assert!(!row.1.is_empty() && row.1 != w, "{w}: a phrase, not the word");
+        for k in keys {
+            assert!(KEYS.contains(&(*k, w)), "{k} -> {w}");
+            assert!(row.0.split(" / ").any(|x| x == *k), "{k} not in {:?}", row.0);
+        }
+    }
+    assert!(!VERBS.contains(&"roll-10") && !VERBS.contains(&"roll+10"), "keys only, no button");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 0).unwrap();
+    for v in ["roll+7", "roll10", "roll+10x"] {
+        assert!(!face.verb(v), "{v} is not a face word");
+    }
+    assert_eq!(face.state.timeline, tl);
+    println!("striarollkeys: help rows={} keys={}", rows.len(), KEYS.len());
+}

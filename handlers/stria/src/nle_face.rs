@@ -400,6 +400,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
     ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
+    ("(", "roll-"), (")", "roll+"), ("Ctrl+Shift+parenleft", "roll-10"), ("Meta+Shift+parenleft", "roll-10"), ("Ctrl+Shift+parenright", "roll+10"), ("Meta+Shift+parenright", "roll+10"), // STRIAROLLKEYS (SR893): ( / ) roll the cut at the selected clip's out edge one frame; Ctrl / Cmd + Shift + ( / ) SLIP_STEP frames (names by analogy to SR752)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2550,11 +2551,11 @@ mod transitionface_tests {
 pub const SLIP_STEP: i64 = 10;
 
 /// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks);
-/// `slip-10` -> `slip -10` ... (the count exactly [`SLIP_STEP`]); None for any other word.
+/// `slip-10` -> `slip -10` ... (the count exactly [`SLIP_STEP`]); None for any other word; roll-/roll+/roll-10/roll+10 -> roll <d> (STRIAROLLKEYS SR893).
 fn slipslide_word(v: &str) -> Option<String> {
     let (word, rest) = match v.strip_prefix("slip") {
         Some(r) => ("slip", r),
-        None => match v.strip_prefix("slide") { Some(r) => ("slide", r), None => ("nudge", v.strip_prefix("nudge")?) }, // STRIANUDGE (SR855): and `nudge±[10]` -> `nudge <d>`
+        None => match v.strip_prefix("slide") { Some(r) => ("slide", r), None => ("nudge", r), None => ("roll", v.strip_prefix("nudgeroll")?) }, // STRIANUDGE (SR855): and `nudge±[10]` -> `nudge <d>` // STRIAROLLKEYS (SR893): the roll words ride the same rewrite onto SR851's `roll <d>`
     };
     let (sign, count) = match rest.as_bytes().first().copied()? {
         b'-' => (-1i64, &rest[1..]),
@@ -2616,6 +2617,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
     ("mark", "drop a marker at the playhead"), // STRIAMARKERS (SR835)
+    ("roll-", "roll the cut one frame earlier"), ("roll+", "roll the cut one frame later"), ("roll-10", "roll the cut 10 frames earlier"), ("roll+10", "roll the cut 10 frames later"), // STRIAROLLKEYS (SR893)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
