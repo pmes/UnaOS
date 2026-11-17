@@ -3551,3 +3551,44 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIAZOOMTOFIT (LEDGER SR859): `zoom-fit` / `zoom-sel` on the face (named tail block) ----
+
+/// Over the synth fixture (35 ticks) at 320 px: `zoom-fit` is zoom 9 at origin 0 (the end inside the window), `zoom-sel`
+/// fits B (10..20) at 32 from 10, then the set {A@0, B} at 16 from 0; never an undo step, never dirty; `undo` after a fit
+/// leaves the zoom, `zoom-` halves it; a 20 px window takes zoom 1 at 0; nothing selected is refused by name.
+#[test]
+fn striazoomtofit_face_fits_the_window() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(VERBS.contains(&"zoom-fit") && VERBS.contains(&"zoom-sel"));
+    let clean = |f: &Face| (f.state.undo_depth(), f.dirty(), f.state.timeline == tl);
+    assert!(face.verb("zoom-sel"));
+    assert_eq!(face.last_error.take(), Some(format!("zoom-sel: {}", EditError::NoClip)));
+    assert_eq!(face.state.zoom, 8, "a refusal leaves the zoom");
+    assert!(face.verb("zoom-fit"));
+    let l = face.layout();
+    assert_eq!((face.state.zoom, l.t0), (9, 0));
+    assert!(l.x_of(tl.end()) <= l.w as i64, "the end inside the window");
+    assert_eq!(clean(&face), (0, false, true));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("zoom-sel"));
+    let l = face.layout();
+    assert_eq!((face.state.zoom, l.t0), (32, 10));
+    assert!(l.x_of(20) <= l.w as i64);
+    face.state.select_add(0, 0).unwrap();
+    assert!(face.verb("zoom-sel"));
+    assert_eq!((face.state.zoom, face.layout().t0), (16, 0));
+    assert_eq!(clean(&face), (0, false, true), "a view change, not an edit");
+    assert!(face.verb("zoom-fit"));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.zoom, 9, "undo is not a view step");
+    assert!(face.verb("zoom-"));
+    assert_eq!(face.state.zoom, 4);
+    face.canvas = (20, 160);
+    assert!(face.verb("zoom-fit"));
+    assert_eq!((face.state.zoom, face.layout().t0), (1, 0));
+    assert_eq!(face.last_error, None);
+    assert_eq!(clean(&face), (0, false, true));
+    println!("striazoomtofit: 320 px fit 9 @0, sel B 32 @10, set 16 @0; 20 px fit 1 @0; undo 0, clean");
+}
