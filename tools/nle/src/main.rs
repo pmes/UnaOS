@@ -275,13 +275,7 @@ fn planar_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, 
 /// directory removed; `nle: two-pass pass1 pictures=<n> bytes=<b>` on stderr. A refusal is printed, exit 1.
 #[allow(clippy::too_many_arguments)]
 fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Vec<stria::nle_export::PicStat> {
-    let pass1 = std::path::Path::new(dir).join("pass1");
-    std::fs::create_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
-    let enc = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(kbps, tl.tb.den as u32, tl.tb.num as u32);
-    let stats = enc.stats();
-    export_as(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container).unwrap_or_else(|e| die(e.to_string()));
-    std::fs::remove_dir_all(&pass1).unwrap_or_else(|e| die(format!("{}: {e}", pass1.display())));
-    let v = stats.borrow().clone();
+    let v = stria::nle_export::pass1_stats(tl, range, sources, std::path::Path::new(dir), qp, gop, kbps, scenecut, aq, container).unwrap_or_else(|e| die(e)); // H264ENCTWOPASSQCOMPFACE (SR1076): the one first pass, moved to the lib (the editor face runs it too)
     eprintln!("nle: two-pass pass1 pictures={} bytes={}", v.len(), v.iter().map(|p| p.bits).sum::<u64>() / 8);
     v
 }
