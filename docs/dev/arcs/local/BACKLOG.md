@@ -47,7 +47,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 25. STRIATRANSITIONLENGTH — drag a transition's edge to change its duration (`Layout::transition_rect` :402 EXISTS; the op through undo).
 26. STRIAEXPORTPRESETS — `export --preset web|archive|proxy` as named bundles of the existing knobs (nle_export.rs table; the face's export verb accepts the word; stria-view lists them).
 27. STRIAEXPORTQUEUE — queue several export jobs (ranges x presets) and run them in order off the face's thread (the export door SR694; `ExportJob` becomes a VecDeque: measure).
-28. STRIAPROXYMEDIA — a `proxy` verb renders a quarter-size H.264 of a source once; the face previews from it; export uses the original.
+28. [SR882 started] STRIAPROXYMEDIA — a `proxy` verb renders a quarter-size H.264 of a source once; the face previews from it; export uses the original.
 
 ## D. Document, project, face
 29. STRIAAUTOSAVE — write `<doc>.autosave.edl` every N edits or 60 s off the face's thread; reopen offers it on the message row.
