@@ -3678,3 +3678,30 @@ fn striagapclose_face_words_ride_the_one_dispatch() {
     assert_eq!(face.state.timeline.tracks[0].clips[1].at, 15);
     println!("striagapclose: VERBS[{i}] = close-gaps; V1 after gap 5 at 10: {:?}", face.state.timeline.tracks[0].clips);
 }
+
+// ---- STRIAGAPSBLACK (LEDGER SR909): close-gaps names the black fades it removed; the bare `gap` word (named tail block) ----
+
+/// The synth fixture's V1 with a 3-tick to-black at 20 (B's end, the 20..25 gap): `close-gaps` closes the gap, removes the
+/// fade in the same commit and names both on the message row; one undo brings the fade back. The bare `gap`
+/// word opens one second (25 ticks) at the playhead; `gap` sits right before `close-gaps` in VERBS.
+#[test]
+fn striagapsblack_face_names_the_removed_fades() {
+    let i = VERBS.iter().position(|&v| v == "gap").expect("gap in VERBS");
+    assert_eq!(VERBS[i + 1], "close-gaps");
+    let (tl, src) = synth_fixture();
+    let tl = tl.add_transition_to_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("close-gaps"));
+    assert_eq!(face.last_error.take().as_deref(), Some("close-gaps: closed 1 gap, removed 1 fade"));
+    assert_eq!(face.state.timeline, tl.close_gaps(0).unwrap());
+    assert!(face.state.timeline.tracks[0].transitions.is_empty());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.seek(10);
+    assert!(face.verb("gap"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl.insert_gap(0, 10, 25).unwrap());
+    println!("striagapsblack: VERBS[{i}] = gap; V1 after gap at 10: {:?}", face.state.timeline.tracks[0].clips);
+}

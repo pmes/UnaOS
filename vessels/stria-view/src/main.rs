@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("gap", "Gap"), // STRIAGAPSBLACK (SR909): opens one second of gap at the playhead on the selected clip's track (one undo step)
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
@@ -928,5 +929,26 @@ mod striagapclose_tests {
         let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
         assert_eq!(&ids[ids.len() - 2..], ["close-gaps".to_string(), "help".to_string()]);
         println!("striagapclose witness: close-gaps -> {:?}", face.state.timeline.tracks[0].clips);
+    }
+}
+
+// ---- STRIAGAPSBLACK (LEDGER SR909): the witness's bare `gap` button word (named tail block) ----
+#[cfg(test)]
+mod striagapsblack_tests {
+    use super::*;
+
+    /// The Gap button sits before Close Gaps (help stays last); its word `gap` (the `--do gap` token) opens one second at the
+    /// playhead: 25 ticks at the synth fixture's 25 fps, the timeline_core op by hand.
+    #[test]
+    fn striagapsblack_gap_button() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        assert_eq!(&ids[ids.len() - 3..], ["gap".to_string(), "close-gaps".to_string(), "help".to_string()]);
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,gap").is_empty());
+        assert_eq!(face.state.timeline, tl0.insert_gap(0, 12, 25).unwrap());
+        println!("striagapsblack witness: gap -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }

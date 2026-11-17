@@ -318,11 +318,11 @@ fn striagapclose_transitions_and_crossfades_move_with_their_clips() {
     k.add_track(Kind::Video);
     k.tracks[0].clips = vec![Clip::new(ka, 0, 10, 0), Clip::new(kb, 0, 10, 20)];
     let to = k.add_transition_to_black(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
-    assert_eq!(to.close_gaps(0), Err(EditError::Transition));
+    assert_eq!(to.close_gaps(0).map(|c| (c.tracks[0].clips[1].at, c.tracks[0].transitions.len())), Ok((10, 0))); // STRIAGAPSBLACK (SR909): the closed gap's to-black is removed, no longer refused
     let pushed = to.insert_gap(0, 12, 5).unwrap();
     assert_eq!((pushed.tracks[0].transitions[0].at, pushed.tracks[0].clips[1].at), (10, 25));
     let from = k.add_transition_from_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
-    assert_eq!(from.close_gaps(0), Err(EditError::Transition));
+    assert_eq!(from.close_gaps(0).map(|c| (c.tracks[0].clips[1].at, c.tracks[0].transitions.len())), Ok((10, 0))); // STRIAGAPSBLACK (SR909): the closed gap's from-black is removed, no longer refused
     // a from-black on the LEADING gap stays valid when it closes: nothing ends at 0
     let mut l = Timeline::new(25);
     let lb = l.add_source("B", 60);
@@ -375,4 +375,72 @@ fn striagapclose_editor_one_undo_step() {
     assert_eq!(st.verb("close-gaps"), Some(Err(EditError::NoClip)));
     assert_eq!(st.verb("gap 3"), Some(Err(EditError::NoClip)));
     assert_eq!(st.timeline, tl);
+}
+
+// ---- STRIAGAPSBLACK (LEDGER SR909): close-gaps removes a closed gap's black fades; a bare `gap` opens one second (named tail block) ----
+
+/// V1: A[0,10)@0 to black (3) at 10, gap 10..20, from black (3) at 20 on B[0,10)@20, a 2-tick dissolve on the cut at 30 into
+/// A[20,30)@30, gap 40..45, B[20,30)@45 to black (2) at 55 (trailing space). A1 untouched.
+fn striagapsblack_base() -> Timeline {
+    let mut k = Timeline::new(25);
+    let (a, b) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.add_track(Kind::Audio);
+    k.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 20), Clip::new(a, 20, 30, 30), Clip::new(b, 20, 30, 45)];
+    k.tracks[1].clips = vec![Clip::new(a, 0, 10, 0)];
+    let k = k.add_transition_to_black(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let k = k.add_transition_from_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let k = k.add_transition(0, 30, timeline_core::TransitionKind::Dissolve, 2).unwrap();
+    k.add_transition_to_black(0, 55, timeline_core::TransitionKind::Dissolve, 2).unwrap()
+}
+
+/// Both black fades of the closed gap go (one value); the dissolve after it moves with its cut; the to-black on the last
+/// clip's trailing space stays (trailing space is no gap); the document round-trips through the EDL.
+#[test]
+fn striagapsblack_close_gaps_removes_the_closed_gaps_black_fades() {
+    let k = striagapsblack_base();
+    let c = k.close_gaps(0).unwrap();
+    let ats: Vec<i64> = c.tracks[0].clips.iter().map(|x| x.at).collect();
+    assert_eq!(ats, vec![0, 10, 20, 30]);
+    let xs: Vec<(i64, bool, bool)> = c.tracks[0].transitions.iter().map(|x| (x.at, x.from_black, x.to_black)).collect();
+    assert_eq!(xs, vec![(20, false, false), (40, false, true)]);
+    assert_eq!(c.tracks[1], k.tracks[1]);
+    assert_eq!(c.validate(), Ok(()));
+    let text = timeline_core::edl::write(&c, "GAPSBLACK").unwrap();
+    let back = timeline_core::edl::parse(&text, 25).unwrap();
+    assert_eq!(timeline_core::edl::write(&back, "GAPSBLACK").unwrap(), text);
+    println!("striagapsblack: V1 {:?} transitions {:?}", ats, xs);
+}
+
+/// `gap_count` counts what `close_gaps` closes (the leading gap included); none after the close; a bad track is 0.
+#[test]
+fn striagapsblack_gap_count() {
+    let k = striagapsblack_base();
+    assert_eq!(k.gap_count(0), 2);
+    assert_eq!(k.close_gaps(0).unwrap().gap_count(0), 0);
+    assert_eq!(k.gap_count(1), 0);
+    assert_eq!(k.gap_count(9), 0);
+    let (tl, _, _) = striagapclose_base();
+    assert_eq!(tl.gap_count(0), 2);
+}
+
+/// A bare `gap` through THE verb dispatch opens one second (25 ticks at 25 fps) at the playhead: one commit, undo restores;
+/// nothing selected is `NoClip`; `close-gaps` that drops black fades is one undo step and undo brings them back.
+#[test]
+fn striagapsblack_editor_bare_gap_is_one_second() {
+    use timeline_core::editor::EditorState;
+    let k = striagapsblack_base();
+    let mut st = EditorState::new(k.clone());
+    st.select(0, 1).unwrap();
+    st.seek(20);
+    assert_eq!(st.verb("gap"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (k.insert_gap(0, 20, 25).unwrap(), 1));
+    assert!(st.undo());
+    assert_eq!(st.verb("close-gaps"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (k.close_gaps(0).unwrap(), 1));
+    assert!(st.undo());
+    assert_eq!(st.timeline, k);
+    st.deselect();
+    assert_eq!(st.verb("gap"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.timeline, k);
 }

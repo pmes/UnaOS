@@ -1553,7 +1553,7 @@ impl Timeline {
         let mut end = 0;
         for i in 0..n {
             let at = tl.tracks[track].clips[i].at;
-            if at > end {
+            if at > end { if i > 0 { tl.drop_gap_blacks(track, end, at); } // STRIAGAPSBLACK (SR909): the closed gap's black fades go in the same value (file tail)
                 tl.shift_from(track, at, end - at, None);
             }
             end = tl.tracks[track].clips[i].end();
@@ -1579,5 +1579,34 @@ impl Timeline {
         tl.shift_from(track, edge, n, None);
         tl.validate()?;
         Ok(tl)
+    }
+}
+
+// ---- STRIAGAPSBLACK (LEDGER SR909): close-gaps removes the black fades of a closed gap (named tail block) ----
+// A gap between two clips that `close_gaps` closes leaves no black to fade to or from: a to-black at the gap's start (the
+// outgoing's end) would gain an incoming clip, a from-black at its end (the incoming's start) an outgoing one. Both are
+// REMOVED in the same value, before the shift, so the cut becomes a plain cut (their audio fades are derived from them by
+// tick and go with them). The leading gap is not touched here: a from-black there stays valid at tick 0.
+impl Timeline {
+    /// STRIAGAPSBLACK: drop `track`'s to-black at `start` and from-black at `end` (the gap `start..end` is closing).
+    fn drop_gap_blacks(&mut self, track: usize, start: i64, end: i64) {
+        if let Some(t) = self.tracks.get_mut(track) {
+            t.transitions.retain(|x| !((x.to_black && x.at == start) || (x.from_black && x.at == end)));
+        }
+    }
+
+    /// STRIAGAPSBLACK: how many gaps [`Timeline::close_gaps`] would close on `track`: the clips starting after the previous
+    /// clip's end (0 for the first, so the leading gap counts). A bad track: 0.
+    pub fn gap_count(&self, track: usize) -> usize {
+        let Some(t) = self.tracks.get(track) else { return 0 };
+        let mut end = 0;
+        let mut n = 0;
+        for c in &t.clips {
+            if c.at > end {
+                n += 1;
+            }
+            end = end.max(c.end());
+        }
+        n
     }
 }
