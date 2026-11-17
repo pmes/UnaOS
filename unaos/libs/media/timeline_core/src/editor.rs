@@ -5583,3 +5583,100 @@ impl EditorState {
         (v == "reverse").then(|| self.reverse_selected())
     }
 }
+
+// ---- STRIASOURCEPLAY (LEDGER SR9080): the loaded source as a playable reel, its seek and the tick the preview shows (named tail block) ----
+// The face plays a loaded source through its ONE play road over [`EditorState::source_reel`] (the whole reel at tick 0, one
+// track per kind, so a reel tick is a timeline tick): a second playhead, never a second play road. The stopped preview
+// renders the same reel at the source playhead. [`EditorState::source_seek`] is the source ruler's seek; session state:
+// no commit, no undo step, no dirty, no EDL line.
+
+impl EditorState {
+    /// The loaded source as a timeline: the document's clone with its tracks, audio crossfades and marks cleared, then one
+    /// track per kind of `kinds` (none: one video track) carrying the whole reel `0..duration` at tick 0. `None` when
+    /// nothing is loaded or the reel is gone.
+    pub fn source_reel(&self) -> Option<Timeline> {
+        let m = self.source.as_ref()?;
+        let dur = self.timeline.source(m.src)?.duration;
+        let mut v = self.timeline.clone();
+        v.tracks.clear();
+        v.audio_xfades.clear();
+        v.marks = (None, None);
+        let kinds: Vec<crate::Kind> = if m.kinds.is_empty() { alloc::vec![crate::Kind::Video] } else { m.kinds.clone() };
+        for k in kinds {
+            let t = v.add_track(k);
+            v.tracks[t].clips.push(Clip::new(m.src, 0, dur, 0));
+        }
+        Some(v)
+    }
+    /// The source playhead moved to source tick `t`, clamped to the reel; nothing loaded: `EditError::NoSource`. Pushes
+    /// nothing.
+    pub fn source_seek(&mut self, t: i64) -> Result<(), EditError> {
+        let src = self.source.as_ref().ok_or(EditError::NoSource)?.src;
+        let dur = self.timeline.source(src).ok_or(EditError::NoSource)?.duration;
+        let m = self.source.as_mut().ok_or(EditError::NoSource)?;
+        m.at = t.clamp(0, (dur - 1).max(0));
+        Ok(())
+    }
+    /// The tick the preview shows: the source playhead while a source is loaded, else the timeline playhead.
+    pub fn shown_tick(&self) -> i64 {
+        self.source.as_ref().map_or(self.playhead, |m| m.at)
+    }
+}
+
+#[cfg(test)]
+mod striasourceplay_tests {
+    use super::*;
+    use crate::{Kind, SourceId};
+
+    /// A 13..23 at 0 on V1 and A1; B (40 ticks) on no track.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_source("B", 40);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0)];
+        }
+        tl.marks = (Some(2), Some(9));
+        EditorState::new(tl)
+    }
+
+    /// The reel: one track per loaded kind carrying the whole reel at 0, marks cleared; no kinds: one video track; nothing
+    /// loaded: `None`. The document is untouched.
+    #[test]
+    fn striasourceplay_reel_is_the_whole_source_per_kind() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.source_reel(), None);
+        assert_eq!(st.verb("source A"), Some(Ok(())));
+        let r = st.source_reel().unwrap();
+        assert_eq!(r.tracks.iter().map(|t| (t.kind, t.clips.clone())).collect::<Vec<_>>(), alloc::vec![(Kind::Video, alloc::vec![Clip::new(SourceId(0), 0, 50, 0)]), (Kind::Audio, alloc::vec![Clip::new(SourceId(0), 0, 50, 0)])]);
+        assert_eq!((r.marks, r.end(), r.sources.len()), ((None, None), 50, 2));
+        assert_eq!(st.verb("source B"), Some(Ok(())));
+        let r = st.source_reel().unwrap();
+        assert_eq!(r.tracks.iter().map(|t| (t.kind, t.clips.clone())).collect::<Vec<_>>(), alloc::vec![(Kind::Video, alloc::vec![Clip::new(SourceId(1), 0, 40, 0)])], "B on no track: one video track");
+        assert_eq!((st.timeline.clone(), st.undo_depth()), (tl0, 0));
+    }
+
+    /// The seek clamps to the reel and pushes nothing; the shown tick is the source playhead while loaded, else the
+    /// timeline's; nothing loaded: refused by name.
+    #[test]
+    fn striasourceplay_seek_clamps_and_shown_tick_follows() {
+        let mut st = state();
+        st.seek(7);
+        assert_eq!(st.source_seek(3), Err(EditError::NoSource));
+        assert_eq!(st.shown_tick(), 7);
+        assert_eq!(st.verb("source B"), Some(Ok(())));
+        assert_eq!(st.shown_tick(), 0);
+        assert_eq!(st.source_seek(12), Ok(()));
+        assert_eq!((st.shown_tick(), st.playhead), (12, 7));
+        assert_eq!(st.source_seek(400), Ok(()));
+        assert_eq!(st.shown_tick(), 39);
+        assert_eq!(st.source_seek(-5), Ok(()));
+        assert_eq!(st.shown_tick(), 0);
+        assert_eq!((st.undo_depth(), st.redo_depth()), (0, 0));
+        assert_eq!(st.verb("unload"), Some(Ok(())));
+        assert_eq!(st.shown_tick(), 7);
+    }
+}
