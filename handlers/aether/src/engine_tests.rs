@@ -6624,7 +6624,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24
+        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7832,7 +7832,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: three columns after unicode-bidi
+        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34)
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8594,12 +8594,12 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three
+        assert_eq!(crate::css::REPORT_COLS, 34); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34)
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
-        assert_eq!(&crate::css::REPORT_PROPS[22..], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]);
+        assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "25"); // SR1036 fold: 25 columns with unicode-bidi
-        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "34"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns)
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
 
@@ -8715,5 +8715,77 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "x", "color"), "rgb(0, 128, 0)", "the not (display: grid) fallback wins");
         assert!(css_wide_color_ink(&mut e, "x", css_wide_green) > 3, "#x paints green");
         assert_eq!(css_wide_color_ink(&mut e, "x", css_wide_red), 0, "#x paints no red");
+    }
+
+    // ---- AETHERCSSOMBOXSIDECOLUMNS (LEDGER SR1096): report columns for the right / bottom / left sides of margin, padding and border width (named tail block) ----
+
+    /// AETHERCSSOMBOXSIDECOLUMNS (SR1096): the nine box-side columns append after text-decoration-color (no earlier
+    /// index moves) and the computed declaration enumerates all 34.
+    #[test]
+    fn box_side_columns_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 34);
+        assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
+        assert_eq!(
+            &crate::css::REPORT_PROPS[25..],
+            &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
+        );
+        let mut e = box_side_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "34");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
+    }
+
+    fn box_side_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body id="bd">
+            <div id="d" style="margin: 1px 2px 3px 4px; padding: 5px 6px 7px 8px; border-top-width: 1px; border-right-width: 2px; border-bottom-width: 3px; border-left-width: 4px; border-style: solid">x</div>
+            <p id="p">p</p><h1 id="h">h</h1>
+            <div style="width: 300px"><div id="au" style="width: 100px; margin: 0 auto">a</div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBOXSIDECOLUMNS (SR1096): every side of margin / padding / border width reads its own px through
+    /// getComputedStyle (before SR1096 only the top side had a report column, so the UA body margin read `8px` on
+    /// top and `0px` on the other three, and SR1092's composed `margin` read `8px 0px 0px`).
+    #[test]
+    fn box_side_columns_reads() {
+        let mut e = box_side_engine();
+        for (prop, want) in [
+            ("margin-top", "1px"),
+            ("margin-right", "2px"),
+            ("margin-bottom", "3px"),
+            ("margin-left", "4px"),
+            ("padding-top", "5px"),
+            ("padding-right", "6px"),
+            ("padding-bottom", "7px"),
+            ("padding-left", "8px"),
+            ("border-top-width", "1px"),
+            ("border-right-width", "2px"),
+            ("border-bottom-width", "3px"),
+            ("border-left-width", "4px"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, "d", &format!("getPropertyValue('{prop}')")), want, "#d: {prop}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "d", "marginRight"), "2px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "paddingLeft"), "8px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "borderBottomWidth"), "3px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "getPropertyValue('padding')"), "5px 6px 7px 8px");
+        // The four widths are declared as longhands: layout_core's `border-width` arm parses one length only, so the
+        // four-value shorthand drops (owed AETHER-CSS-BORDER-WIDTH-MULTI); the composed read is SR1092's from the columns.
+        assert_eq!(font_shorthand_cs(&mut e, "d", "getPropertyValue('border-width')"), "1px 2px 3px 4px");
+        // The UA margins (html.css): body 8px all round, p 1em 0, h1 0.67em 0 at 32px.
+        assert_eq!(font_shorthand_cs(&mut e, "bd", "marginRight"), "8px", "body: margin-right");
+        assert_eq!(font_shorthand_cs(&mut e, "bd", "getPropertyValue('margin')"), "8px", "body: SR1092's composed margin");
+        assert_eq!(font_shorthand_cs(&mut e, "p", "getPropertyValue('margin')"), "16px 0px", "p: composed margin");
+        assert_eq!(font_shorthand_cs(&mut e, "h", "getPropertyValue('margin')"), "21.44px 0px", "h1: composed margin");
+        // The side columns mirror the top column's source, the specified style: `auto` reads `auto` (Chromium reads the
+        // used 100px; owed AETHER-CSSOM-MARGIN-AUTO-RESOLVED).
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginLeft"), "auto", "margin: 0 auto: margin-left");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
     }
 }
