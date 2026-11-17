@@ -2062,7 +2062,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let th = thumbs_band(&live, l); let px = pack(&help_over(band_meters(band_note_paint(view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref()), l), l, pts_ms.is_some(), e.st.timeline.fps()), l)); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail) // STRIAHELPTHREE (LEDGER SR9043): the keys help over the band, nothing while hidden (file tail) // STRIAKMETER (SR9058): the level meters over the band, timeline_core's strip (file tail) // STRIAKINSERTALL (SR9090): the band's note in the ruler row, nothing without one (file tail)
+    let th = thumbs_band(&live, l); let px = pack(&help_over(band_meters(band_note_paint(view::paint_snap_badge(view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref()), l), l, pts_ms.is_some(), e.st.timeline.fps()), l), l, view::Order::Rgba, e.snap_off)); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail) // STRIAHELPTHREE (LEDGER SR9043): the keys help over the band, nothing while hidden (file tail) // STRIAKMETER (SR9058): the level meters over the band, timeline_core's strip (file tail) // STRIAKINSERTALL (SR9090): the band's note in the ruler row, nothing without one (file tail) // STRIAKSNAPSHOW (SR9104): the snap-off badge, the host's painter (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -2352,7 +2352,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     }
     band_note_clear(); let d = { // STRIAKINSERTALL (SR9090): a band press ends the band's note (it marks BAND_DIRTY: the band repaints)
         let Some(mut g) = EDIT.try_lock() else { return false };
-        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
+        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false }; if e.snap_off && timeline_core::view::snap_badge_hit(&l, x as f64, (y - y0) as f64) { let at = e.st.playhead; edit_snap(&mut e.snap_off, at); return true; } // STRIAKSNAPSHOW (SR9104): a press on the snap-off badge turns snap on, no drag (file tail)
         let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, crate::video::keymap::shift_held(), timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off), false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail)
         d
     };
@@ -3749,7 +3749,7 @@ fn edit_jump(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -
 
 /// `n`: flip the Player's snap default (`off`); nothing to save or seek, so `None`.
 fn edit_snap(off: &mut bool, at: i64) -> Option<u64> {
-    *off = !*off;
+    *off = !*off; BAND_DIRTY.store(true, Ordering::Release); // STRIAKSNAPSHOW (SR9104): a paused band repaints its snap-off badge (file tail)
     serial_println!("[nle] edit snap at={} snap={}", at, if *off { "off" } else { "on" });
     None
 }

@@ -513,7 +513,7 @@ impl Face {
     /// (Shift adds to the set, Alt / Option turns snapping off; STRIARIPPLETRIM SR850: Shift on the selected clip's trim handle ripples the trim, so a shift-drag begun on that handle no longer moves the set).
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
-        self.pointer = Some((x, y));
+        self.pointer = Some((x, y)); if self.snap_off && view::snap_badge_hit(&self.layout(), x, y) { self.drag = None; return self.verb("snap"); } // STRIAKSNAPSHOW (SR9104): a press on the snap-off badge turns snap on, no scrub (timeline_core view.rs tail)
         if self.meter_clip_at(x, y).is_some() { return false; } if let Some(r) = self.press_source(x, y, mods) { return r; } if let Some(r) = self.press_transition_edge(x, y, mods) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; } // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview band begins the source drag (file tail) if let Some(r) = self.press_gain_env(x, y, mods) { return r; } // STRIAGAINENVDRAG (SR9082): the selected audio clip's envelope point or line (file tail)
         let l = self.layout();
         let dropped = self.drag.take().is_some();
@@ -528,7 +528,7 @@ impl Face {
     /// The button came up: a drag that moved commits once; otherwise it is the click it always was.
     fn release(&mut self, x: f64, y: f64) -> bool {
         self.pointer = Some((x, y));
-        let Some(mut d) = self.drag.take() else { return self.click(x, y) };
+        let Some(mut d) = self.drag.take() else { return if view::snap_badge_hit(&self.layout(), x, y) { true } else { self.click(x, y) } }; // STRIAKSNAPSHOW (SR9104): the badge press's release is no ruler click (a plain ruler press is a Scrub drag)
         d.update(&self.state, x, y);
         if !d.moved() {
             return if d.additive { d.release_still(&mut self.state); true } else { self.click(x, y) }; // STRIAMULTISELECTMORE (SR950): a shift-click on a set member takes it out (timeline_core view.rs `Drag::release_still`)
@@ -1666,7 +1666,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
-        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_drag(view::paint_roll_cue(self.paint_transition_still(px, l), l, vo(self.order), &self.state, self.roll_tool && self.drag.is_none()), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
+        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_snap_badge(view::paint_drag(view::paint_roll_cue(self.paint_transition_still(px, l), l, vo(self.order), &self.state, self.roll_tool && self.drag.is_none()), l, vo(self.order), self.drag.as_ref()), l, vo(self.order), self.snap_off), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {

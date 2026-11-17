@@ -6945,3 +6945,128 @@ mod striaktitlestyle_tests {
         assert_eq!(title_fit_styled(1000, 1000, 50, 0, &mut lin).0, 90.0);
     }
 }
+
+// ---- STRIAKSNAPSHOW (LEDGER SR9104): the snap-off badge on the ruler, one fn both faces call (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SNAP-TOGGLE-STATE / NLE-SNAP-BADGE-CLICK. The drag snap default is FACE state (the host's
+// `Face::snap_off`, the Player's `Edit::snap_off`, each flipped by the word `snap` on `n`) that no painter saw. Both faces
+// paint [`paint_snap_badge`] over `paint_drag`'s output: an 11 px box at the ruler's right end, FIELD framed in GUIDE (the
+// snap guide's token) holding the guide's line struck through, ONLY while snap is off; on, it paints nothing, so every
+// golden stays byte-identical. A press inside [`snap_badge_rect`] while the badge shows ([`snap_badge_hit`]) runs the
+// face's `snap` instead of scrubbing, so the click turns snap back on.
+
+/// STRIAKSNAPSHOW (SR9104): the badge's side (px).
+pub const SNAP_BADGE: i64 = 11;
+/// STRIAKSNAPSHOW (SR9104): the badge's 7x7 glyph (GLYPHS' bit order): the snap guide's vertical line struck by a diagonal.
+const SNAP_OFF_GLYPH: [u8; 7] = [0x48, 0x28, 0x18, 0x08, 0x0c, 0x0a, 0x09];
+
+/// STRIAKSNAPSHOW (SR9104): the badge's box `(x0, y0, x1, y1)`: [`SNAP_BADGE`] square, 2 px in from the ruler's right end and top.
+pub fn snap_badge_rect(l: &Layout) -> (i64, i64, i64, i64) {
+    let (x1, y0) = (l.w as i64 - 2, l.ruler_y as i64 + 2);
+    (x1 - SNAP_BADGE, y0, x1, y0 + SNAP_BADGE)
+}
+
+/// STRIAKSNAPSHOW (SR9104): `(x, y)` is inside the badge's box on a layout that has a ruler on its canvas (the caller asks
+/// only while the badge shows, i.e. snap is off).
+pub fn snap_badge_hit(l: &Layout, x: f64, y: f64) -> bool {
+    let (x0, y0, x1, y1) = snap_badge_rect(l);
+    l.ruler_y < l.h && x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64
+}
+
+/// STRIAKSNAPSHOW (SR9104): the snap-off badge over a painted canvas; snap on (`!snap_off`) or no ruler on the canvas
+/// (Role::Preview) paints nothing.
+pub fn paint_snap_badge(px: Vec<u8>, l: Layout, order: Order, snap_off: bool) -> Vec<u8> {
+    if !snap_off || l.ruler_y >= l.h {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x0, y0, x1, y1) = snap_badge_rect(&l);
+    c.rect(x0, y0, x1, y1, FIELD);
+    c.frame(x0, y0, x1, y1, GUIDE);
+    for (dy, bits) in SNAP_OFF_GLYPH.iter().enumerate() {
+        for dx in 0..7i64 {
+            if bits & (0x40 >> dx) != 0 {
+                let (gx, gy) = (x0 + 2 + dx, y0 + 2 + dy as i64);
+                c.rect(gx, gy, gx + 1, gy + 1, GUIDE);
+            }
+        }
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod striaksnapshow_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    fn fixture() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("BADGE", 100);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
+        EditorState::new(tl)
+    }
+
+    fn at(px: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    }
+
+    /// M3: snap on, the badge paints nothing (the Tracks role and the Whole layout): every golden stays.
+    #[test]
+    fn striaksnapshow_badge_paints_nothing_when_snap_is_on() {
+        let st = fixture();
+        for l in [Layout::of_role(Role::Tracks, 320, 56, &st), Layout::of(320, 160, &st)] {
+            let px = paint_in(&st, l, Order::Rgba, None, None);
+            assert_eq!(paint_snap_badge(px.clone(), l, Order::Rgba, false), px);
+        }
+    }
+
+    /// M3: snap off, the badge paints its frame and glyph in GUIDE on FIELD inside its box and nothing outside it; Bgra
+    /// swaps the token as `Canvas::put` does.
+    #[test]
+    fn striaksnapshow_badge_off_paints_inside_its_box() {
+        let st = fixture();
+        let l = Layout::of(320, 160, &st);
+        let (x0, y0, x1, y1) = snap_badge_rect(&l);
+        assert_eq!((x0, y0, x1, y1), (307, l.ruler_y as i64 + 2, 318, l.ruler_y as i64 + 13));
+        let plain = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_snap_badge(plain.clone(), l, Order::Rgba, true);
+        assert_eq!(at(&px, l.w, x0, y0), GUIDE, "the frame");
+        assert_eq!(at(&px, l.w, x0 + 2, y0 + 2), GUIDE, "the glyph's diagonal head");
+        assert_eq!(at(&px, l.w, x0 + 2 + 3, y0 + 2), GUIDE, "the glyph's guide line");
+        assert_eq!(at(&px, l.w, x0 + 2 + 6, y0 + 2), FIELD, "inside, off the glyph");
+        for y in 0..l.h as i64 {
+            for x in 0..l.w as i64 {
+                if !(x >= x0 && x < x1 && y >= y0 && y < y1) {
+                    assert_eq!(at(&px, l.w, x, y), at(&plain, l.w, x, y), "outside the box at {x},{y}");
+                }
+            }
+        }
+        let bgra = paint_snap_badge(paint_in(&st, l, Order::Bgra, None, None), l, Order::Bgra, true);
+        assert_eq!(at(&bgra, l.w, x0, y0), [GUIDE[2], GUIDE[1], GUIDE[0], GUIDE[3]]);
+    }
+
+    /// M3: a layout whose ruler is off its canvas (Role::Preview) paints no badge and hits none.
+    #[test]
+    fn striaksnapshow_badge_skips_a_layout_without_a_ruler() {
+        let st = fixture();
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(paint_snap_badge(px.clone(), l, Order::Rgba, true), px);
+        let (x0, y0, _, _) = snap_badge_rect(&l);
+        assert!(!snap_badge_hit(&l, x0 as f64 + 1.0, y0 as f64 + 1.0));
+    }
+
+    /// M3: the hit is the box: its corners in, one px past its right / bottom edge out, the ruler's left out.
+    #[test]
+    fn striaksnapshow_badge_hit_is_its_box() {
+        let st = fixture();
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (x0, y0, x1, y1) = snap_badge_rect(&l);
+        assert!(snap_badge_hit(&l, x0 as f64, y0 as f64));
+        assert!(snap_badge_hit(&l, x1 as f64 - 0.5, y1 as f64 - 0.5));
+        assert!(!snap_badge_hit(&l, x1 as f64, y0 as f64));
+        assert!(!snap_badge_hit(&l, x0 as f64, y1 as f64));
+        assert!(!snap_badge_hit(&l, 10.0, y0 as f64));
+    }
+}
