@@ -228,7 +228,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -6943,5 +6943,49 @@ mod striabinscroll_tests {
         assert!(g.on(&click(2, view::bin_point(2))));
         assert!(g.last_error.is_none(), "{:?}", g.last_error);
         assert_eq!(g.state.timeline, tl1.place(0, Clip::new(c, 0, 50, 0), Mode::Insert).unwrap(), "the audio track");
+    }
+}
+
+// ---- STRIAHELPSEARCHLIVE (LEDGER SR941): the help filter typed live, matching the action word (named tail block) ----
+// While the keys help shows, a typed character (BrowserText, one char, not `?`, not control, not an AppKit private-use key)
+// extends SR874's query and Backspace (BrowserKey, both platforms) shortens it, an empty query being the whole table; the
+// key is never applied. A char that would leave no row is refused by name on the one message line (`help: no key matches
+// "<q>"`) and not added. Backspace with no query is taken and ignored. Escape and `?` still close (SR744's `key` rule).
+// `help_matching` also matches the row's action word, recovered from its phrase through THE `HELP` table. View-only.
+// Owed: NLE5D-KEYS-HELP-SEARCH-BUTTON (a query field on the bar), NLE5D-KEYS-HELP-SEARCH-CURSOR (the query drawn on the band).
+
+/// STRIAHELPSEARCHLIVE (SR941): the KEYS action a help row's phrase names: the [`HELP`] entry with that phrase (the inverse
+/// of [`help_phrase`], HELP's phrases are distinct), else the phrase itself (an action with no HELP phrase shows its word).
+fn help_action(p: &str) -> &str {
+    HELP.iter().find(|(_, ph)| *ph == p).map_or(p, |&(a, _)| a)
+}
+
+impl Face {
+    /// While the help shows: a typed character narrows the query, Backspace widens it (`Some(repaint)`); `None` for every
+    /// other message (Escape and `?` reach [`Face::key`]'s dismiss), or with the help hidden.
+    fn help_type_input(&mut self, msg: &SMessage) -> Option<bool> {
+        if !self.help {
+            return None;
+        }
+        match msg {
+            SMessage::BrowserKey(k) if k.as_str() == "BackSpace" => {
+                let Some(q) = self.help_query.as_mut() else { return Some(false) };
+                q.pop();
+                if q.is_empty() {
+                    self.help_query = None;
+                }
+                Some(true)
+            }
+            SMessage::BrowserText(t) if t.as_str() != "?" && t.chars().count() == 1 && t.chars().all(|c| !c.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&c)) => {
+                let q = format!("{}{}", self.help_query.as_deref().unwrap_or(""), t);
+                if help_matching(&q).is_empty() {
+                    self.last_error = Some(format!("help: no key matches \"{q}\""));
+                    return Some(true);
+                }
+                self.help_query = Some(q);
+                Some(true)
+            }
+            _ => None,
+        }
     }
 }

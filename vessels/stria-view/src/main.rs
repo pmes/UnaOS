@@ -763,7 +763,7 @@ mod nle5dkeyshelp_tests {
     }
 
     /// NLE5DKEYSHELP M3: `--do help` shows the help and the line carries `"help":true`; a second `help` hides it (the field
-    /// absent); `key:?` shows it; a following `key:j` only dismisses it (no shuttle: not playing, rate 1).
+    /// absent); `key:?` shows it; a following `key:End` only dismisses it (no seek: not playing, rate 1).
     #[test]
     fn help_field_while_the_help_shows() {
         let mut f = face();
@@ -776,7 +776,7 @@ mod nle5dkeyshelp_tests {
         let errors = drive(&mut f, "key:?");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(f.help_shown());
-        let errors = drive(&mut f, "key:j");
+        let errors = drive(&mut f, "key:End");
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!((f.help_shown(), f.playing, f.rate), (false, false, 1));
         println!("nle5dkeyshelp witness: help -> ,\"help\":true; key:? shows; key:j dismisses unapplied");
@@ -2361,5 +2361,29 @@ mod striaxformpresets_tests {
         assert!(drive(&mut face, "pip:off").is_empty());
         assert_eq!(drive(&mut face, "scale+"), vec![format!("scale+: {}", timeline_core::EditError::Xform)]);
         assert_eq!(face.state.undo_depth(), 5);
+    }
+}
+
+// ---- STRIAHELPSEARCHLIVE (LEDGER SR941): the witness's live help filter (named tail block) ----
+#[cfg(test)]
+mod striahelpsearchlive_tests {
+    use super::*;
+
+    /// STRIAHELPSEARCHLIVE M3: with the help shown, `key:s` `key:l` narrow the help (the line carries `"help_query":"sl"`
+    /// and the shown count), `key:BackSpace` widens it to `"s"`; nothing is applied (not playing).
+    #[test]
+    fn striahelpsearchlive_witness_typed_query() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "help,key:s,key:l");
+        assert!(errors.is_empty(), "{errors:?}");
+        let n = nle_face::help_matching("sl").len();
+        assert_eq!(help_search_json(&f), format!(",\"help_query\":\"sl\",\"help_rows\":{n}"));
+        assert!(!f.playing);
+        let errors = drive(&mut f, "key:BackSpace");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(f.help_query(), Some("s"));
+        assert!(f.help_shown());
+        println!("striahelpsearchlive witness: help,key:s,key:l -> ,\"help_query\":\"sl\",\"help_rows\":{n}");
     }
 }

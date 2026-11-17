@@ -2204,7 +2204,7 @@ fn nle5dkeyshelp_rows_cover_every_key() {
     println!("nle5dkeyshelp: rows={} keys={}", rows.len(), KEYS.len());
 }
 
-/// `?` (text) shows the help; a following `j` only dismisses it (no shuttle, the playhead still); `?` while shown hides it;
+/// `?` (text) shows the help; a following `End` only dismisses it (no seek, the playhead still); `?` while shown hides it;
 /// a bare modifier and GTK's `Shift+question` are not taken and leave it shown; Escape dismisses; `help` is the one toggle.
 #[test]
 fn nle5dkeyshelp_keys_toggle_and_the_dismiss_is_not_applied() {
@@ -2214,7 +2214,7 @@ fn nle5dkeyshelp_keys_toggle_and_the_dismiss_is_not_applied() {
     assert!(!f.on(&bandy::SMessage::BrowserKey("?".into())), "a one-char BrowserKey alone is not taken");
     assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
     assert!(f.help_shown());
-    assert!(f.on(&bandy::SMessage::BrowserText("j".into())));
+    assert!(f.on(&bandy::SMessage::BrowserKey("End".into())));
     assert_eq!((f.help_shown(), f.playing, f.rate, f.state.playhead), (false, false, 1, ph));
     assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
     assert!(!f.on(&bandy::SMessage::BrowserKey("Shift+Shift_L".into())));
@@ -9643,4 +9643,121 @@ fn striaseqinfo_readd_forgets_kept_frame() {
     let mut got = StriaTitleFrames::default();
     render(&tl, 0..1, &src, &mut got).unwrap();
     assert!(got.0[0].3 == striaimportimagesequence_px(4, 4, [90, 90, 90]), "the re-added reel reads the rewritten file");
+}
+
+// ---- STRIAHELPSEARCHLIVE (LEDGER SR941): the help filter typed live, matching the action word (named tail block) ----
+
+fn striahelpsearchlive_type(f: &mut Face, s: &str) {
+    for c in s.chars() {
+        assert!(f.on(&bandy::SMessage::BrowserText(c.to_string())), "{c:?} taken");
+    }
+}
+
+fn striahelpsearchlive_backspace(f: &mut Face) -> bool {
+    f.on(&bandy::SMessage::BrowserKey("BackSpace".into()))
+}
+
+/// While shown, typed characters narrow the help (never applied: `l` does not shuttle, `i` marks nothing); Backspace
+/// widens it back to the whole table; Backspace with no query is taken and ignored, the help still shown.
+#[test]
+fn striahelpsearchlive_typing_narrows_backspace_widens() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (ph, tl) = (f.state.playhead, f.state.timeline.clone());
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    striahelpsearchlive_type(&mut f, "sli");
+    assert_eq!((f.help_shown(), f.help_query()), (true, Some("sli")));
+    assert_eq!(f.help_rows_shown(), stria::nle_face::help_matching("sli"));
+    assert!(f.help_rows_shown().len() < help_rows().len());
+    assert_eq!((f.playing, f.rate, f.state.playhead, &f.state.timeline), (false, 1, ph, &tl));
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert_eq!(f.help_query(), Some("sl"));
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    assert_eq!(f.help_rows_shown(), help_rows());
+    assert!(!striahelpsearchlive_backspace(&mut f), "no query: taken, nothing to repaint");
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    println!("striahelpsearchlive: sli -> {} rows, back to {}", stria::nle_face::help_matching("sli").len(), help_rows().len());
+}
+
+/// A character that would leave no row is refused by name on the message line and not added.
+#[test]
+fn striahelpsearchlive_no_match_keeps_the_filter() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help"));
+    striahelpsearchlive_type(&mut f, "slip");
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    assert!(f.on(&bandy::SMessage::BrowserText("z".into())));
+    assert_eq!(f.last_error.take().as_deref(), Some("help: no key matches \"slipz\""));
+    assert_eq!((f.help_shown(), f.help_query()), (true, Some("slip")));
+    println!("striahelpsearchlive: slipz refused, slip kept");
+}
+
+/// Escape and `?` still close a typed help; reopening by `?` shows the whole table.
+#[test]
+fn striahelpsearchlive_escape_and_question_close() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help"));
+    striahelpsearchlive_type(&mut f, "zo");
+    assert!(f.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(!f.help_shown());
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert_eq!((f.help_shown(), f.help_query()), (true, None));
+    striahelpsearchlive_type(&mut f, "zo");
+    assert!(f.on(&bandy::SMessage::BrowserText("?".into())));
+    assert!(!f.help_shown());
+    assert!(f.last_error.is_none(), "{:?}", f.last_error);
+    println!("striahelpsearchlive: Escape and ? close");
+}
+
+/// The action word matches too: `help nudge` (neither key nor phrase says nudge) shows the two nudge rows; typed `slip-`
+/// shows the slip- and slip-10 rows; HELP's phrases are distinct (the inverse the action match reads).
+#[test]
+fn striahelpsearchlive_matches_the_action_word() {
+    for (i, (_, a)) in HELP.iter().enumerate() {
+        assert!(HELP[i + 1..].iter().all(|(_, b)| b != a), "phrase {a:?} twice");
+    }
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert!(f.verb("help nudge"));
+    let rows = f.help_rows_shown();
+    assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![help_phrase("nudge-"), help_phrase("nudge+")]);
+    assert!(f.verb("help"));
+    assert!(!f.help_shown());
+    assert!(f.verb("help"));
+    striahelpsearchlive_type(&mut f, "slip-");
+    assert_eq!(f.help_query(), Some("slip-"));
+    assert_eq!(f.help_rows_shown().iter().map(|r| r.1).collect::<Vec<_>>(), vec![help_phrase("slip-"), help_phrase("slip-10")]);
+    println!("striahelpsearchlive: nudge -> {} rows, slip- -> 2 rows", rows.len());
+}
+
+/// View-only: typing and Backspace push no undo step and leave the document clean.
+#[test]
+fn striahelpsearchlive_view_only() {
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    let (tl, ph, depth) = (f.state.timeline.clone(), f.state.playhead, f.state.undo_depth());
+    assert!(f.verb("help"));
+    striahelpsearchlive_type(&mut f, "del");
+    assert!(striahelpsearchlive_backspace(&mut f));
+    assert_eq!((&f.state.timeline, f.state.playhead, f.state.undo_depth(), f.dirty()), (&tl, ph, depth, false));
+    println!("striahelpsearchlive: undo depth {depth} kept, clean");
+}
+
+/// A typed `slip` paints exactly the `help slip` frame on a labelled face; labels off stays byte-identical while typing.
+#[test]
+fn striahelpsearchlive_paint_matches_the_word_form() {
+    let mut word = nle5dkeyshelp_face(640, 480, true);
+    assert!(word.verb("help slip"));
+    let want = word.paint();
+    let mut typed = nle5dkeyshelp_face(640, 480, true);
+    assert!(typed.verb("help"));
+    striahelpsearchlive_type(&mut typed, "slip");
+    assert_eq!(typed.paint(), want);
+    let mut plain = nle5dkeyshelp_face(640, 480, false);
+    let a = plain.paint();
+    assert!(plain.verb("help"));
+    striahelpsearchlive_type(&mut plain, "slip");
+    assert_eq!(plain.paint(), a, "labels off: no overlay");
+    println!("striahelpsearchlive: typed slip fnv {:016x}", stria::nle_face::fnv1a(&want));
 }
