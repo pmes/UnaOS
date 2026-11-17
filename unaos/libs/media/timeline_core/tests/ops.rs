@@ -237,3 +237,108 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIAROLLEDIT (LEDGER SR851): the roll edit on one cut (named tail block) ----
+
+/// base() with a third clip butted: V1 A[0,10)@0 | B[20,30)@10 | A[50,60)@20, a 4-tick dissolve on the B|A cut at 20.
+fn striarolledit_three() -> Timeline {
+    let (mut tl, a, _b) = base();
+    tl.tracks[0].clips.push(Clip::new(a, 50, 60, 20));
+    tl.add_transition(0, 20, timeline_core::TransitionKind::Dissolve, 4).unwrap()
+}
+
+#[test]
+fn striarolledit_roll_moves_one_cut() {
+    let tl = striarolledit_three();
+    let (a, b) = (SourceId(0), SourceId(1));
+    // +3: A's out and B's in move together, the third clip and the later dissolve stay, the track's length stays
+    let s = tl.roll(0, 0, 3).unwrap();
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 13, 0), Clip::new(b, 23, 30, 13), Clip::new(a, 50, 60, 20)]);
+    assert_eq!(s.end(), tl.end());
+    assert_eq!(s.tracks[0].transitions, tl.tracks[0].transitions, "the dissolve past B is at its original tick");
+    assert_eq!(s.tracks[1], tl.tracks[1], "A1 does not move");
+    // -3: the mirror; a roll and its roll-back give the original
+    let m = tl.roll(0, 0, -3).unwrap();
+    assert_eq!(m.tracks[0].clips, vec![Clip::new(a, 0, 7, 0), Clip::new(b, 17, 30, 7), Clip::new(a, 50, 60, 20)]);
+    assert_eq!(m.tracks[0].transitions, tl.tracks[0].transitions);
+    assert_eq!(s.roll(0, 0, -3), Ok(tl.clone()));
+    // the EDL round-trips the rolled timeline
+    let text = timeline_core::edl::write(&s, "ROLL").unwrap();
+    let back = timeline_core::edl::parse(&text, 25).unwrap();
+    let video = |t: &Timeline| t.tracks.iter().find(|k| k.kind == Kind::Video).map(|k| (k.clips.clone(), k.transitions.clone()));
+    assert_eq!((video(&back), timeline_core::edl::write(&back, "ROLL").unwrap()), (video(&s), text));
+}
+
+#[test]
+fn striarolledit_refusals_by_name() {
+    let tl = striarolledit_three();
+    let before = tl.clone();
+    // B to nothing, A to nothing, A past its source (100 ticks), no track
+    assert_eq!(tl.roll(0, 0, 10), Err(EditError::Empty));
+    assert_eq!(tl.roll(0, 0, -10), Err(EditError::Empty));
+    assert_eq!(tl.roll(0, 0, 91), Err(EditError::OutOfSource));
+    assert_eq!(tl.roll(4, 0, 1), Err(EditError::NoTrack));
+    // the track's last clip has no next clip, no such clip at all
+    assert_eq!(tl.roll(0, 2, 1), Err(EditError::NoClip));
+    assert_eq!(tl.roll(0, 3, 1), Err(EditError::NoClip));
+    assert_eq!(tl, before);
+    // not butted: B two ticks after A's end
+    let (mut gap, a, b) = base();
+    gap.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 12)];
+    assert_eq!(gap.roll(0, 0, 1), Err(EditError::NoClip));
+    // B's in before its source's start
+    let (mut near, a, b) = base();
+    near.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 2, 12, 10)];
+    assert_eq!(near.roll(0, 0, -3), Err(EditError::Negative));
+    assert!(near.roll(0, 0, -2).is_ok());
+}
+
+#[test]
+fn striarolledit_dissolve_moves_with_the_cut_and_fits() {
+    use timeline_core::TransitionKind;
+    // V1: A[0,20)@0 of a 30-tick source (a 10-tick handle) -> B[10,30)@20 under a 9-tick dissolve
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 30);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 10, 30, 20)];
+    let tl = tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    let x = |t: &Timeline| (t.tracks[0].transitions[0].at, t.tracks[0].transitions[0].dur, t.tracks[0].transitions[0].want);
+    // +5: the dissolve moves with the cut and fits A's 5-tick handle (slide's rule), asking 9
+    let s = tl.roll(0, 0, 5).unwrap();
+    assert_eq!(s.tracks[0].clips, vec![Clip::new(a, 0, 25, 0), Clip::new(b, 15, 30, 25)]);
+    assert_eq!((x(&s), s.end()), ((25, 5, Some(9)), tl.end()));
+    // rolled back it grows to its ask: the original
+    assert_eq!(s.roll(0, 0, -5), Ok(tl.clone()));
+    // no handle left, past the source
+    assert_eq!(tl.roll(0, 0, 10), Err(EditError::Handle));
+    assert_eq!(tl.roll(0, 0, 11), Err(EditError::OutOfSource));
+    // -5: the dissolve at 15, whole
+    assert_eq!(x(&tl.roll(0, 0, -5).unwrap()), (15, 9, None));
+}
+
+#[test]
+fn striarolledit_the_editor_rolls_once_per_word() {
+    use timeline_core::editor::EditorState;
+    let tl = striarolledit_three();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 0).unwrap();
+    for _ in 0..3 {
+        assert_eq!(st.verb("roll+"), Some(Ok(())));
+    }
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.roll(0, 0, 3).unwrap(), 3));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.roll(0, 0, 2).unwrap());
+    assert_eq!(st.verb("roll -2"), Some(Ok(())));
+    assert_eq!(st.timeline, tl);
+    assert_eq!(st.verb("roll-"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.selection), (tl.roll(0, 0, -1).unwrap(), Some((0, 0))));
+    // refused: the state and the undo stack unchanged
+    let depth = st.undo_depth();
+    assert_eq!(st.verb("roll 20"), Some(Err(EditError::Empty)));
+    assert_eq!(st.undo_depth(), depth);
+    assert_eq!(st.verb("roll sideways"), None);
+    assert_eq!(st.verb("roll"), None);
+    st.deselect();
+    assert_eq!(st.verb("roll+"), Some(Err(EditError::NoClip)));
+}

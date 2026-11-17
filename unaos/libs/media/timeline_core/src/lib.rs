@@ -1528,3 +1528,23 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAROLLEDIT (LEDGER SR851): the roll edit on one cut (named tail block) ----
+// A ROLL moves ONE cut: the out of clip A and the in of the butted next clip B move together by `d` ticks, so A grows as
+// B shrinks (or the reverse) and the track's length and every other clip stay. It is the two ripple trims composed, with
+// no arithmetic of its own: `ripple_trim_out(A, src_out + d)` grows A and carries B, the cut's transition and everything
+// later on the track by +d; `ripple_trim_in(B, src_in + d)` shrinks B at its kept (moved) start and carries everything
+// past B's end back by -d. Each op fits the cut's transition to its room (`fit_trimmed`, NLE3ETRIMGROW's `fit_want`), as
+// `slide` does on its two cuts, so a roll and its roll-back give the original Timeline. The plain trims cannot compose
+// it (an `Overlap` or a gap between them, and `retarget_transitions` refuses a cut whose source edges moved). Refused by
+// the two ops' names (`OutOfSource`, `Empty`, `Negative`, `Handle`), and `NoClip` when no clip is butted at A's end.
+impl Timeline {
+    /// STRIAROLLEDIT: roll the cut at the out edge of clip `idx` of `track` by `d` ticks: A's `src_out` and the butted
+    /// next clip's `at` and `src_in` all move by `d`; nothing else on the timeline moves.
+    pub fn roll(&self, track: usize, idx: usize, d: i64) -> Result<Timeline, EditError> {
+        let t = self.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let a = *t.clips.get(idx).ok_or(EditError::NoClip)?;
+        let b = *t.clips.get(idx + 1).filter(|b| b.at == a.end()).ok_or(EditError::NoClip)?;
+        self.ripple_trim_out(track, idx, a.src_out.saturating_add(d))?.ripple_trim_in(track, idx + 1, b.src_in.saturating_add(d))
+    }
+}
