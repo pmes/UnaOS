@@ -1035,14 +1035,14 @@ pub fn export_total(tl: &Timeline, range: &std::ops::Range<i64>) -> u64 {
 /// H264ENCTWOPASS (SR698)'s first pass, moved from tools/nle by H264ENCTWOPASSQCOMPFACE (SR1076) so `nle export --two-pass` and the
 /// editor face's `export .. two-pass` run ONE first pass: the same timeline exported once more through [`export_as`] as a CBR H.264
 /// stream at `kbps` into `<dir>/pass1/` (no audio), its per-picture records read through [`H264Encoder::stats`], the directory
-/// removed. A refusal is the text tools/nle prints (`<dir>/pass1: <io>`, or the export's own).
+/// removed. A refusal is the text tools/nle prints (`<dir>/pass1: <io>`, or the export's own). `progress` is [`export_as_with`]'s (H264ENCTWOPASSFACEPROGRESS SR1093).
 #[allow(clippy::too_many_arguments)]
-pub fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &Path, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container) -> Result<Vec<PicStat>, String> {
+pub fn pass1_stats(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &Path, qp: u8, gop: u32, kbps: u32, scenecut: Option<u8>, aq: Option<u8>, container: Container, progress: &mut dyn FnMut(u64, u64) -> Result<(), ExportError>) -> Result<Vec<PicStat>, String> {
     let pass1 = dir.join("pass1");
     std::fs::create_dir_all(&pass1).map_err(|e| format!("{}: {e}", pass1.display()))?;
     let enc = H264Encoder::new(qp, gop).with_scenecut(scenecut).with_aq(aq).with_bitrate(kbps, tl.tb.den as u32, tl.tb.num as u32);
     let stats = enc.stats();
-    export_as(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container).map_err(|e| e.to_string())?;
+    export_as_with(tl, range, sources, &pass1, Box::new(enc), AudioOut::None, container, progress).map_err(|e| e.to_string())?; // H264ENCTWOPASSFACEPROGRESS (SR1093): the export's one progress road (`Ticked`), the face's band and cancel through pass 1
     std::fs::remove_dir_all(&pass1).map_err(|e| format!("{}: {e}", pass1.display()))?;
     let v = stats.borrow().clone();
     Ok(v)
