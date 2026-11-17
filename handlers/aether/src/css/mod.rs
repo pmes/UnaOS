@@ -1280,7 +1280,7 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 49; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 53; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
     "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
@@ -1289,6 +1289,7 @@ pub const REPORT_COLS: usize = 49; pub const REPORT_PROPS: [&str; REPORT_COLS] =
     "border-top-color", "border-right-color", "border-bottom-color", // SR1104
     "text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color", // SR1108
     "outline-width", "outline-style", "outline-color", "outline-offset", // SR1124
+    "top", "right", "bottom", "left", // SR1127
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1425,6 +1426,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 px(if side(i).is_some() || w > 0.0 { w } else { 0.0 })
             };
             let lh = line_height_used(&paint, me.line_height, me.font_size, layout_core::FontSel { family: me.family, weight: me.weight, italic: me.italic, ..Default::default() }).map(px).unwrap_or_else(|| "normal".to_string());
+            let iside = |i: usize| inset_font_rel(&paint, i, me.font_size, doc.document_element().and_then(|r| inh.get(&r)).map_or(me.font_size, |r| r.font_size)).or_else(|| spec.as_ref().and_then(|s| [s.inset_top, s.inset_right, s.inset_bottom, s.inset_left][i])).map_or_else(|| "auto".to_string(), |v| lpa_s(v)); // AETHERCSSOMINSETCOLUMNS (SR1127): the four inset columns from the cascade's SpecifiedStyle (the taffy inset is rewritten for table cells / fixed boxes and never written for sticky); AETHERCSSOMINSETFONTRELATIVE (SR1133): a font-relative inset re-resolved at the element font first
             let values = [
                 display.to_string(),
                 position.to_string(),
@@ -1455,6 +1457,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
                 me.ul_offset.map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), me.caret.map_or_else(|| rgb(me.color), |c| rgba((c.0, c.1, c.2), c.3 as f32 / 255.0)), // SR1108
                 px(layout_core::paint::outline_of(&paint).map_or(0.0, |o| o.width)), layout_core::css::outline_style_word(paint.outline_style.unwrap_or(0)).to_string(), paint.outline_color.flatten().map_or_else(|| rgb(me.color), |c| rgba((c.0, c.1, c.2), c.3 as f32 / 255.0)), px(paint.outline_offset.unwrap_or(0.0)), // SR1124
+                iside(0), iside(1), iside(2), iside(3), // SR1127
             ];
             out.insert(id, values);
             inh.insert(id, me);
@@ -1990,4 +1993,21 @@ fn rect_side<T: Copy>(r: &taffy::geometry::Rect<T>, i: usize) -> T {
 /// a through 8 bits as the shortest round-tripping decimal), so a half-alpha border side reads `rgba(255, 0, 0, 0.5)`.
 fn rgba(c: (u8, u8, u8), a: f32) -> String {
     css_core::color::Rgba { r: c.0 as f64, g: c.1 as f64, b: c.2 as f64, a: a as f64 }.serialize()
+}
+
+// ---- AETHERCSSOMINSETFONTRELATIVE (LEDGER SR1133): a font-relative inset re-resolved at the element's font for the report (named tail block) ----
+
+/// AETHERCSSOMINSETFONTRELATIVE (SR1133): the cascade parses `top: 1em` at the 16px basis, so [`computed_report`]'s inset
+/// column read `16px` under any font. This replays the node's LAST recorded declaration for `side` (the longhand or the
+/// `inset` shorthand, `PaintStyle::font_rel` in cascade order) through layout_core's own `reapply_declarations` (the
+/// replay `reresolve_font_relative` runs) at the element's used font `fs` and the root's `root_fs`; ex / ch at fs/2
+/// (owed AETHER-CSSOM-FONT-RELATIVE-EX-CH). `None` when that declaration is not font-relative: the spec road reads it.
+fn inset_font_rel(paint: &crate::layout::PaintStyle, side: usize, fs: f32, root_fs: f32) -> Option<LengthPercentageAuto> {
+    let last = paint.font_rel.as_ref()?.iter().rev().find(|(p, _)| p == ["top", "right", "bottom", "left"][side] || p == "inset")?;
+    if !layout_core::css::is_font_relative(&last.1) {
+        return None;
+    }
+    let cx = ParseCx { viewport: parse_cx().viewport, font: (fs, root_fs, fs * 0.5, fs * 0.5), container: (None, None) };
+    let s: SpecifiedStyle = layout_core::css::reapply_declarations(std::slice::from_ref(last), &cx);
+    [s.inset_top, s.inset_right, s.inset_bottom, s.inset_left][side]
 }
