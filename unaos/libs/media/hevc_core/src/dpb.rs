@@ -88,8 +88,8 @@ pub struct Dpb {
     pub conceal_misfit: u32,
     // ---- HEVCCONCEALFORWARD (LEDGER SR754): the concealed pictures awaiting their first referencer (named struct-tail block) ----
     /// HEVCCONCEALFORWARD (SR754): the PicOrderCntVal of every picture [`Dpb::conceal_from`] concealed, until
-    /// [`Dpb::conceal_forward`] drains it at the next picture end (refined from that picture's motion).
-    pub forward: Vec<i32>,
+    /// [`Dpb::conceal_forward`] refines it at each later picture end from that picture's motion; HEVCCONCEALFORWARDDEPTH (SR1073): with one refine count per 8x8 block, kept while it is in the DPB and some block's count < [`CONCEAL_FORWARD_DEPTH`].
+    pub forward: Vec<(i32, Vec<u8>)>,
 }
 
 impl Dpb {
@@ -379,7 +379,7 @@ impl Dpb {
             dst.data.copy_from_slice(&from.data);
         }
         let src_poc = s.poc;
-        let projected = self.conceal_motion(pic, src, None); let bidir_blocks = bidir_blocks(pic); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected, bidir_blocks, forward_blocks: 0 }); self.forward.push(pic.poc);
+        let projected = self.conceal_motion(pic, src, None, &mut []); let bidir_blocks = bidir_blocks(pic); self.concealed.push(Concealed { poc: pic.poc, src_poc, projected, bidir_blocks, forward_blocks: 0 }); self.forward.push((pic.poc, depth_counts(pic)));
     }
 }
 
@@ -394,7 +394,7 @@ pub struct Concealed {
     pub projected: bool,
     /// HEVCCONCEALBIDIR (SR721): the 8x8 blocks projected along BOTH lists of a bi-predicted source block (averaged).
     pub bidir_blocks: u32,
-    /// HEVCCONCEALFORWARD (SR754): the 8x8 blocks re-projected from the first referencer's motion by [`Dpb::conceal_forward`].
+    /// HEVCCONCEALFORWARD (SR754): the 8x8 blocks re-projected from the first referencer's motion by [`Dpb::conceal_forward`]; HEVCCONCEALFORWARDDEPTH (SR1073): refined by at least one referencer.
     pub forward_blocks: u32,
 }
 
@@ -409,7 +409,8 @@ impl Dpb {
     /// 8-262 (`conceal_fetch`), one unusable list falls back to the other. A projected block's motion becomes mv' to S, so a
     /// later picture's TMVP reads the projected vector. HEVCCONCEALWEIGHTED (SR741): a source coded with explicit weights (its
     /// slice's kept table, `Picture::slice_weights`, SR1067) weights each fetch by the source block's (w, o, log2WD) for that list and ref_idx. True when any block was projected.
-    fn conceal_motion(&self, pic: &mut Picture, src: usize, only: Option<i32>) -> bool {
+    /// HEVCCONCEALFORWARDDEPTH (SR1073): `depth` (empty: no count) holds one refine count per block: a block at [`CONCEAL_FORWARD_DEPTH`] is skipped, a block at 1 is averaged with its current samples ([`avg_with_current`]), each projected block counts one more.
+    fn conceal_motion(&self, pic: &mut Picture, src: usize, only: Option<i32>, depth: &mut [u8]) -> bool {
         let s = &self.pics[src].pic;
         if s.w4 != pic.w4 || s.h4 != pic.h4 || s.motion.len() != pic.motion.len() || s.width != pic.width || s.height != pic.height {
             return false;
@@ -424,8 +425,8 @@ impl Dpb {
         for y in (0..h).step_by(CONCEAL_BLOCK) {
             for x in (0..w).step_by(CONCEAL_BLOCK) {
                 let m = s.motion[s.idx4(x as usize, y as usize)];
-                let cand = forward_only(project_lists(&m, s.poc, pic.poc), &m, only);
-                if cand == [None, None] {
+                let cand = forward_only(project_lists(&m, s.poc, pic.poc), &m, only); let slot = depth_slot(x, y, w); let seen = depth.get(slot).copied().unwrap_or(0);
+                if cand == [None, None] || seen >= CONCEAL_FORWARD_DEPTH {
                     continue;
                 }
                 let (bw, bh) = ((w - x).min(CONCEAL_BLOCK as i32), (h - y).min(CONCEAL_BLOCK as i32));
@@ -446,14 +447,14 @@ impl Dpb {
                         for i in 0..cw {
                             let (px, py) = ((cx + i) as usize, (cy + j) as usize);
                             if px < plane.w && py < plane.h {
-                                plane.set(px, py, out[(j * cw + i) as usize] as u16);
+                                let v = avg_with_current(plane.at(px, py), out[(j * cw + i) as usize], seen); plane.set(px, py, v);
                             }
                         }
                     }
                 }
                 let pm = conceal_pu(s.poc, &cand);
                 pic.fill4(x as usize, y as usize, bw as usize, bh as usize, |p, i| p.motion[i] = pm);
-                projected = true;
+                projected = true; if let Some(n) = depth.get_mut(slot) { *n += 1; }
             }
         }
         projected
@@ -574,27 +575,28 @@ impl Dpb {
     /// whose list references L, [`Dpb::conceal_motion`] with `only` L fetches C's reconstructed planes at
     /// `scale_mv(mv, c - l, l - c)` = -mv (`project_lists`; distScaleFactor -256 for every td) and stores -mv to C as the
     /// block's motion; every other block of L keeps its projection from the source S. C is only read: its samples (which
-    /// read L's S-projection) never change, so only pictures decoded after C read the refined L. `forward` is drained, so
-    /// each L is refined once, by the first picture finished after its concealment (HEVC-CONCEAL-FORWARD-DEPTH owed). C's
+    /// read L's S-projection) never change, so only pictures decoded after C read the refined L. HEVCCONCEALFORWARDDEPTH (SR1073): `forward`
+    /// keeps L (one count per block) while L is in the DPB and a block is under [`CONCEAL_FORWARD_DEPTH`]: each later referencer refines the blocks it covers (the second averaged per block), a picture not referencing L leaves it waiting. C's
     /// explicit weights are inverted (they map L to C: HEVCCONCEALBIDIRECTFORWARD SR778, `conceal_fetch`'s `inv`). The untaken [`Concealed`]
-    /// note of L gets `forward_blocks` (a note taken before C's end keeps 0). Returns the blocks refined.
+    /// note of L gets `forward_blocks` (the blocks refined at least once; a note taken before C's end keeps 0). Returns the blocks refined.
     pub fn conceal_forward(&mut self) -> u32 {
         let Some(c) = self.pics.len().checked_sub(1) else {
             return 0;
         };
         let c_poc = self.pics[c].pic.poc;
         let mut total = 0;
-        for poc in core::mem::take(&mut self.forward) {
+        for (poc, mut counts) in core::mem::take(&mut self.forward) {
             let Some(l) = (0..c).find(|&i| self.pics[i].pic.poc == poc && self.pics[i].pic.slices.is_empty()) else {
                 continue;
             };
             let mut d = self.pics.remove(l);
-            let n = if self.conceal_motion(&mut d.pic, c - 1, Some(poc)) { forward_blocks(&d.pic, c_poc) } else { 0 };
+            let n = if self.conceal_motion(&mut d.pic, c - 1, Some(poc), &mut counts) { forward_blocks(&d.pic, c_poc) } else { 0 };
             self.pics.insert(l, d);
             if let Some(r) = self.concealed.iter_mut().rev().find(|r| r.poc == poc) {
-                r.forward_blocks = n;
+                r.forward_blocks = refined(&counts);
             }
             total += n;
+            if counts.iter().any(|&k| k < CONCEAL_FORWARD_DEPTH) { self.forward.push((poc, counts)); }
         }
         total
     }
@@ -723,4 +725,30 @@ pub fn exp2_q16(y: i64) -> u32 {
     } else {
         0
     }
+}
+
+// ---- HEVCCONCEALFORWARDDEPTH (LEDGER SR1073): a concealed picture refined by up to two referencers (named tail block) ----
+/// HEVCCONCEALFORWARDDEPTH (SR1073): how many referencers refine one 8x8 block of a concealed picture ([`Dpb::conceal_forward`]):
+/// the first takes its projection outright, the second is averaged with it, a third does nothing.
+const CONCEAL_FORWARD_DEPTH: u8 = 2;
+
+/// HEVCCONCEALFORWARDDEPTH (SR1073): one zero refine count per [`CONCEAL_BLOCK`] block of `pic` (ceil(w / 8) x ceil(h / 8)).
+fn depth_counts(pic: &Picture) -> Vec<u8> {
+    alloc::vec![0; pic.width.div_ceil(CONCEAL_BLOCK) * pic.height.div_ceil(CONCEAL_BLOCK)]
+}
+
+/// HEVCCONCEALFORWARDDEPTH (SR1073): the count slot of the block at luma (x, y) in a picture `w` samples wide.
+fn depth_slot(x: i32, y: i32, w: i32) -> usize {
+    (y as usize / CONCEAL_BLOCK) * (w as usize).div_ceil(CONCEAL_BLOCK) + x as usize / CONCEAL_BLOCK
+}
+
+/// HEVCCONCEALFORWARDDEPTH (SR1073): the sample a projection `new` writes over the current sample `cur` of a block refined
+/// `seen` times: `new` outright when unrefined, else the equal-weight average (cur + new + 1) >> 1 (both already clipped).
+fn avg_with_current(cur: u16, new: i32, seen: u8) -> u16 {
+    if seen == 0 { new as u16 } else { ((cur as i32 + new + 1) >> 1) as u16 }
+}
+
+/// HEVCCONCEALFORWARDDEPTH (SR1073): the blocks refined at least once.
+fn refined(counts: &[u8]) -> u32 {
+    counts.iter().filter(|&&k| k > 0).count() as u32
 }
