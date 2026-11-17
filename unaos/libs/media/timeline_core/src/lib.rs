@@ -405,6 +405,8 @@ pub enum EditError {
     Grade, // STRIACOLORLIFT (SR869): a grade value outside -1000..=1000, or the `color` word misshapen
     /// STRIAPOSITIONSCALE (SR879): a placement off the frame (`x + s` or `y + s` past 1000, `s` 0) or a malformed `pip` / `scale` word.
     Xform,
+    NoMarks, // STRIAINSERTMARKS (SR905): `insert-marked` / `overwrite-marked` with an export mark unset
+    InsertForm, // STRIAINSERTMARKS (SR905): an `insert` / `overwrite` word in a shape other than bare or `<reel> <in> <out>`
 }
 
 impl core::fmt::Display for EditError {
@@ -431,6 +433,8 @@ impl core::fmt::Display for EditError {
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
             EditError::Grade => "color is b c s, each in -1000..=1000",
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
+            EditError::NoMarks => "no in / out marks set", // STRIAINSERTMARKS (SR905)
+            EditError::InsertForm => "insert / overwrite take nothing or <reel> <in> <out>", // STRIAINSERTMARKS (SR905)
         })
     }
 }

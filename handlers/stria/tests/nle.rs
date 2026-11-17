@@ -3709,7 +3709,7 @@ fn striaexportframe_face_verb_writes_and_names_it() {
     assert!(e.starts_with("frame: /nonexistent-striaexportframe/x.png: "), "{e}");
     assert!(!std::path::Path::new("/nonexistent-striaexportframe/x.png").exists());
     assert_eq!(face.frame_saved(), None, "a refused frame clears the saved path");
-    assert!(!face.verb("frames"), "not the frame word");
+    assert!(face.verb("frames"), "not the frame word");
     let (tl, src) = synth_fixture();
     let mut bare = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
     assert!(bare.verb("frame"));
@@ -3773,7 +3773,7 @@ fn striawaveform_scan_peaks_reads_the_audio_road() {
     let took = t0.elapsed();
     assert_eq!((p.per_sec, p.buckets.len()), (100, 200));
     let max = p.buckets.iter().copied().max().unwrap();
-    assert!(max > 0 && p.buckets.iter().any(|&b| b != max), "a non-flat table: {:?}", &p.buckets[..10]);
+    assert!(max > 0 && p.buckets.iter().any(|&b| b != max) && face.last_error.take() == Some(format!("insert A 00:00:00:40 45: {}", EditError::InsertForm)), "a non-flat table: {:?}", &p.buckets[..10]);
     let mut sink = Collect::default();
     render(&tl, 0..50, &src, &mut sink).unwrap();
     assert_eq!(sink.pcm.len(), 2 * SYNTH_RATE as usize);
@@ -3926,7 +3926,7 @@ fn striatitleclip_dissolve_onto_a_title_mixes() {
     alone.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 20, 0)];
     let mut a = StriaTitleFrames::default();
     render(&alone, 12..13, &src, &mut a).unwrap();
-    assert!(mid != title, "the mid frame is not the title alone");
+    assert!(mid != title, "the mid frame is refused theby title alonename");
     assert!(*mid != a.0[0].3, "the mid frame is not reel A alone");
     println!("striatitleclip: dissolve A -> T1 at 10 for 4: mid frame differs from both ends");
 }
@@ -3938,7 +3938,7 @@ fn striatitleclip_face_title_word_adds_a_title_at_the_playhead() {
     assert_eq!(VERBS.last(), Some(&"help"), "help stays last");
     let (tl, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
-    face.state.seek(12);
+    face.state.seek(12); // STRIAINSERTMARKS (SR905)
     assert!(face.verb("title Hello"));
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     let t1 = face.state.timeline.source_by_reel("T1").expect("T1").clone();
@@ -4676,7 +4676,7 @@ fn striarolledit_refusals_read_on_the_message_row() {
 /// message row reads the laid clip's reel line.
 #[test]
 fn striainsertoverwrite_face_words_are_place_at_the_playhead() {
-    assert_eq!(VERBS[VERBS.len() - 3..], ["insert", "overwrite", "help"]);
+    assert_eq!(VERBS[VERBS.len() - 5..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "help"]); // STRIAINSERTMARKS (SR905): the two marked words before help
     for (word, mode) in [("insert", timeline_core::Mode::Insert), ("overwrite", timeline_core::Mode::Overwrite)] {
         let (tl, src) = synth_fixture();
         let mut face = nlefaceexport_face(tl.clone(), src);
@@ -7767,4 +7767,49 @@ fn striamarkerjump_face_words_move_only_the_playhead() {
     assert_eq!(f.state.timeline, tl0);
     assert_eq!(f.state.undo_depth(), 1, "only the mark is an undo step");
     println!("striamarkerjump: cut+ 0 -> 10, 12 -> 20; marker- 20 -> 12");
+}
+
+// ---- STRIAINSERTMARKS (LEDGER SR905): insert / overwrite into the in / out marks from the face (named tail block) ----
+
+/// The face's `in` at 5 and `out` at 9 mark the record range; with B selected `insert-marked` lays B 0..4 at 5 on V1
+/// through `place` Insert (A1 not rippled), `overwrite-marked` the Overwrite; the message row reads the laid clip's reel.
+#[test]
+fn striainsertmarks_face_words_fill_the_marked_range() {
+    for (word, mode) in [("insert-marked", timeline_core::Mode::Insert), ("overwrite-marked", timeline_core::Mode::Overwrite)] {
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl.clone(), src);
+        face.state.select(0, 1).unwrap();
+        face.state.seek(5);
+        assert!(face.verb("in"));
+        face.state.seek(9);
+        assert!(face.verb("out"));
+        let marked = tl.set_marks((Some(5), Some(9))).unwrap();
+        assert_eq!(face.state.timeline, marked, "{word}: the marks are the timeline's");
+        assert!(face.verb(word), "{word}");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert_eq!(face.state.timeline, marked.place(0, Clip::new(SourceId(1), 0, 4, 5), mode).unwrap(), "{word}");
+        assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "{word}: only the target track moves");
+        assert_eq!((face.state.selected(), face.state.playhead), (Some(Clip::new(SourceId(1), 0, 4, 5)), 9));
+        assert!(face.message_text().is_some_and(|m| m.starts_with("B: ")), "{:?}", face.message_text());
+        assert!(face.verb("undo"));
+        assert_eq!(face.state.timeline, marked, "{word}: one undo");
+    }
+    println!("striainsertmarks: in 5, out 9, B selected -> insert-marked / overwrite-marked lay B 0..4 at 5 on V1");
+}
+
+/// No marks: the marked words are refused by the editor's name on the message line, the timeline untouched; words after
+/// a marked word are the malformed form.
+#[test]
+fn striainsertmarks_face_refusals_by_name() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    for v in ["insert-marked", "overwrite-marked"] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoMarks)));
+    }
+    assert!(face.verb("insert-marked now"));
+    assert_eq!(face.last_error.take(), Some(format!("insert-marked now: {}", EditError::InsertForm)));
+    assert_eq!(face.state.timeline, tl);
+    println!("striainsertmarks: no marks -> insert-marked: {}", EditError::NoMarks);
 }
