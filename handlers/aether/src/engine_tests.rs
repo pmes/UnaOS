@@ -5102,4 +5102,76 @@ mod tests {
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('sw')).fontSynthesis"), "weight style");
     }
 
+    // ---- AETHERFILETYPECHANGE (LEDGER SR783): leaving type=file drops the selection (named tail block) ----
+
+    /// AETHERFILETYPECHANGE (SR783): file input `f` (multiple, two Files through SR706's DataTransfer helper), `fv`
+    /// (value="kept.txt", one File), text input `t` and a fresh multiple file input `fresh`; `input` / `change` on f, fv
+    /// and t count into `window.ev`.
+    fn file_type_change_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f" multiple></div>
+            <div><input type="file" id="fv" value="kept.txt"></div>
+            <div><input type="text" id="t"></div>
+            <div><input type="file" id="fresh" multiple></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("f").files = list(["a.txt", "b.txt"]);
+              document.getElementById("fv").files = list(["report.pdf"]);
+              window.ev = 0;
+              ["f", "fv", "t"].forEach(function (id) { ["input", "change"].forEach(function (k) { document.getElementById(id).addEventListener(k, function () { window.ev++; }); }); });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): `type = 'text'` on a file input holding a FileList drops the selection (Chromium
+    /// destroys FileInputType and its FileList): `files` reads null, `value` reads the value content attribute (HTML
+    /// §4.10.5 type change: "" with none, `kept.txt` on fv, never the fakepath), the FileList held before reads length
+    /// 0 with no index, and no `input` / `change` event fires, then or after a tick.
+    #[test]
+    fn file_type_change_leaving_clears() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"), fv = document.getElementById("fv"), k = f.files, n = k.length, fp = fv.value; f.type = "text"; fv.type = "text"; return [n, f.files === null, JSON.stringify(f.value), k.length, k[0] === undefined, fp, fv.value, fv.files === null, window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "2,true,\"\",0,true,C:\\fakepath\\report.pdf,kept.txt,true,0");
+        engine.tick();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("String(window.ev)").unwrap(), "0", "no event is queued by the type change");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a file input taken to text and back to file holds an empty FileList, `value` "",
+    /// no event fired, and its painted status is a fresh input's (SR715's probe), where two Files painted `2 files`.
+    #[test]
+    fn file_type_change_return_empty() {
+        let mut engine = file_type_change_page();
+        let before = file_value_clear_extent(&mut engine, "f");
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"); f.type = "text"; f.type = "file"; return [f.files.length, JSON.stringify(f.value), window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "0,\"\",0");
+        engine.tick(); engine.render_frame();
+        let (f, fresh) = (file_value_clear_extent(&mut engine, "f"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_ne!(before, fresh, "two Files painted `2 files` before the type change");
+        assert_eq!(f, fresh, "the returned input paints a fresh input's status");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a text input's `files` is null (HTML: null off the File Upload state); taken to
+    /// `file` it holds an empty FileList.
+    #[test]
+    fn file_type_change_text_to_file() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var t = document.getElementById("t"), was = t.files === null; t.type = "file"; return [was, t.files !== null, t.files.length].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "true,true,0");
+    }
+
 }
