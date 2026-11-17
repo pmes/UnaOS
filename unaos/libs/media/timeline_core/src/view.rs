@@ -290,11 +290,11 @@ pub trait Text {
 /// Paint the editor on a `w` x `h` canvas in `order`. `labels` names the clips (and the seconds on the ruler); `preview`
 /// is the frame at the playhead.
 pub fn paint(st: &EditorState, w: u32, h: u32, order: Order, labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
-    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+    paint_in(st, Layout::of(w, h, st), order, labels, preview, None)
 }
 
 /// [`paint`] in a given layout (a face's view, which a wheel zoom anchors at the pointer, or a Surface's role).
-pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
+pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>, peaks: Option<&dyn PeakSource>) -> Vec<u8> {
     let (w, h) = (l.w, l.h);
     let tl = &st.timeline;
     let mut c = Canvas::new(w, h, order);
@@ -331,10 +331,12 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
                 continue;
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
             }
+            paint_gain_fades(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip); // STRIACLIPGAINFACE (SR838): the gain line and fade ramps over the body (file tail)
         }
     }
     // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
@@ -489,7 +491,7 @@ mod tests {
         st.seek(8);
         let l = Layout::of_role(Role::Tracks, 320, 56, &st);
         assert_eq!((l.ruler_y, l.tracks_y, l.t0), (0, RULER_H, 0));
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let at = |x: usize, y: usize| &px[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
         assert_eq!(at(64, 30), PLAYHEAD, "the playhead at tick 8");
         assert_eq!(at(66, 30), HANDLE, "the right half's in handle");
@@ -510,7 +512,7 @@ mod tests {
     fn keys_labels(st: &EditorState) -> (Vec<(alloc::string::String, f32, f32, (i32, i32))>, u64) {
         let l = Layout::of_role(Role::Tracks, 320, 56, st);
         let mut rec = Rec(Vec::new());
-        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None, None);
         (rec.0, fnv1a(&px))
     }
 
@@ -953,10 +955,10 @@ mod snap_tests {
             [px[i], px[i + 1], px[i + 2], px[i + 3]]
         };
         let yi = y as i64;
-        let before = paint_in(&st, l, Order::Rgba, None, None);
+        let before = paint_in(&st, l, Order::Rgba, None, None, None);
         assert_eq!(at(&before, l.x_of(25), yi), ROW[0], "committed: nothing at tick 25");
         let shown = d.shown(&st).unwrap();
-        let px = paint_drag(paint_in(&shown, l, Order::Rgba, None, None), l, Order::Rgba, Some(&d));
+        let px = paint_drag(paint_in(&shown, l, Order::Rgba, None, None, None), l, Order::Rgba, Some(&d));
         assert_eq!(at(&px, l.x_of(25), yi), clip_colour(a.0, Kind::Video), "the preview's moved clip");
         assert_eq!(at(&px, l.x_of(30), yi), GUIDE, "the guide line");
         assert_eq!(at(&px, l.x_of(30), l.ruler_y as i64), GUIDE, "the guide from the ruler down");
@@ -1095,7 +1097,7 @@ mod message_row_tests {
         assert_eq!(m.hit(&st.timeline, 10.0, 55.0), Hit::None);
         assert_eq!(m.hit(&st.timeline, 10.0, 70.0), l.hit(&st.timeline, 10.0, 70.0));
         assert_eq!(m.hit(&st.timeline, 10.0, 100.0), l.hit(&st.timeline, 10.0, 100.0));
-        let (a, b) = (paint_in(&st, l, Order::Rgba, None, None), paint_in(&st, m, Order::Rgba, None, None));
+        let (a, b) = (paint_in(&st, l, Order::Rgba, None, None, None), paint_in(&st, m, Order::Rgba, None, None, None));
         let at = |px: &[u8], x: usize, y: usize| [px[(y * 320 + x) * 4], px[(y * 320 + x) * 4 + 1], px[(y * 320 + x) * 4 + 2], px[(y * 320 + x) * 4 + 3]];
         assert_eq!(at(&b, 10, 49), FIELD);
         assert_eq!(at(&b, 10, 50), BG);
@@ -1187,5 +1189,367 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAWAVEFORM (LEDGER SR827): an audio clip's peaks in its body (named tail block) ----
+// An audio clip's body shows its waveform: a per-source PEAK TABLE ([`Peaks`], one u8 per bucket: max |sample| over the
+// bucket, every channel folded by max) reduced by THE ONE [`peaks_of`], painted by THE ONE [`paint_peaks`] from
+// [`paint_in`]'s clip-body arm through the optional [`PeakSource`] hook (the [`Text`] shape). The bars are the audible
+// result: the clip gain through the hook's `gain_q16` (the mix's ONE curve, audio_core `ramp::gain_q16`, which this core
+// does not link: the face answers it) and the fades through `schedule::env_q16` (the mix's envelope). No hook, no table or
+// an empty table: the body exactly as before (every golden byte-identical). The table is the face's (the EDL carries no
+// pixels); Stria's `nle::scan_peaks` builds it through the render's own audio decoder. Owed: NLE-WAVEFORM-STEREO,
+// NLE-WAVEFORM-ZOOM-LOD, NLE-WAVEFORM-KERNEL, NLE-WAVEFORM-CACHE-FILE, NLE-WAVEFORM-ENV-SUBTICK, NLE-WAVEFORM-SCAN-THREAD.
+
+/// The peak table's resolution: buckets per source second (a 10 ms bucket; an hour-long source is 360 000 bytes).
+pub const PEAKS_PER_SEC: u32 = 100;
+/// The waveform's ink: the audio clip's body colour lifted by this much per channel (saturating), the body under it.
+pub const WAVE_LIFT: u8 = 0x30;
+
+/// One source's peak table: `buckets[b]` is the max |sample| (0..=255 for 0.0..=1.0) over source time
+/// `b / per_sec .. (b + 1) / per_sec` s.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Peaks {
+    pub per_sec: u32,
+    pub buckets: Vec<u8>,
+}
+
+/// The waveform hook: a source's peak table (none: the body stays flat) and the clip gain's Q16 factor by the mix's ONE
+/// curve (audio_core `ramp::gain_q16`; the face that links it answers).
+pub trait PeakSource {
+    fn peaks(&self, src: crate::SourceId) -> Option<&Peaks>;
+    fn gain_q16(&self, cdb: i32) -> i64;
+}
+
+/// THE ONE reduction: `interleaved` (`channels` per frame at `rate` Hz) to `ceil(frames * per_sec / rate)` buckets, bucket
+/// `b` the frames `floor(b * rate / per_sec) .. floor((b + 1) * rate / per_sec)` (so whole seconds fed one after another
+/// give the same bytes as one call), its value `round(min(max |x|, 1) * 255)` over every channel (NaN ignored).
+/// `rate` or `per_sec` 0: no buckets.
+pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> Peaks {
+    let ch = channels.max(1) as usize;
+    let frames = interleaved.len() / ch;
+    if rate == 0 || per_sec == 0 {
+        return Peaks { per_sec, buckets: Vec::new() };
+    }
+    let (r, p) = (rate as u64, per_sec as u64);
+    let n = (frames as u64 * p).div_ceil(r) as usize;
+    let mut buckets = Vec::with_capacity(n);
+    for b in 0..n as u64 {
+        let (f0, f1) = ((b * r / p) as usize, (((b + 1) * r / p) as usize).min(frames));
+        let m = interleaved[f0 * ch..f1 * ch].iter().fold(0.0f32, |m, &x| {
+            let a = if x < 0.0 { -x } else { x };
+            if a > m { a } else { m }
+        });
+        buckets.push((m.min(1.0) * 255.0 + 0.5) as u8);
+    }
+    Peaks { per_sec, buckets }
+}
+
+/// THE ONE waveform painter: inside `body` (`x0, y0, x1, y1`, the clip body rect [`paint_in`] filled) a vertical bar per
+/// canvas column, centred on the body's midline: the max of the buckets the column covers ([`Layout::x_of`] inverted at
+/// sub-tick precision, source tick = `src_in + (t - at)`, seconds through `tb`), x the clip gain (`src.gain_q16`) x the
+/// fade envelope at the column's tick (`schedule::env_q16`, the mix's), half-height `round(v * (body_h / 2) / 255)`,
+/// inked in the audio clip colour + [`WAVE_LIFT`]. No table for the clip's source (or an empty one): nothing painted.
+pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource) {
+    let Some(p) = src.peaks(clip.src) else { return };
+    if p.buckets.is_empty() || p.per_sec == 0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = body;
+    let half = (y1 - y0) / 2;
+    if half <= 0 {
+        return;
+    }
+    let mid = y0 + half;
+    let g = src.gain_q16(clip.gain_cdb);
+    let base = clip_colour(clip.src.0, Kind::Audio);
+    let ink = [base[0].saturating_add(WAVE_LIFT), base[1].saturating_add(WAVE_LIFT), base[2].saturating_add(WAVE_LIFT), 255];
+    let z = l.zoom.max(1) as i64;
+    let at_x = l.x_of(clip.at);
+    let (k, d) = (tb.num as i128 * p.per_sec as i128, tb.den.max(1) as i128 * z as i128);
+    let bucket = |dx: i64| ((clip.src_in as i128 * z as i128 + dx as i128) * k).div_euclid(d);
+    let len = p.buckets.len() as i128;
+    for x in x0.max(0)..x1.min(c.w as i64) {
+        let dx = x - at_x;
+        let b0 = bucket(dx);
+        let b1 = bucket(dx + 1).max(b0 + 1);
+        let (b0, b1) = (b0.clamp(0, len) as usize, b1.clamp(0, len) as usize);
+        if b0 >= b1 {
+            continue;
+        }
+        let peak = p.buckets[b0..b1].iter().copied().max().unwrap_or(0) as i64;
+        let e = crate::schedule::env_q16(clip, clip.at + dx.max(0) / z) as i64;
+        let v = ((((peak * g) >> 16) * e) >> 16).clamp(0, 255);
+        let hh = (v * half + 127) / 255;
+        if hh > 0 {
+            c.rect(x, mid - hh, x + 1, mid + hh, ink);
+        }
+    }
+}
+
+#[cfg(test)]
+mod waveform_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// A test hook: one table for every source; the gain by ramp.rs's formula (`round(10^(cdb / 2000) * 65536)`).
+    struct Fixed(Peaks);
+    impl PeakSource for Fixed {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, cdb: i32) -> i64 {
+            if cdb == 0 { 65536 } else { libm::round(libm::pow(10.0, cdb as f64 / 2000.0) * 65536.0) as i64 }
+        }
+    }
+
+    /// 25 fps, one track of `kind` holding `clip` (a 2-s source), the playhead at 0.
+    fn one_clip(kind: Kind, clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    /// The clip body rect of row 0 (x clipped to the canvas, the playhead column 0 left out).
+    fn body(l: &Layout) -> (i64, i64, i64, i64) {
+        let y0 = l.row_y(0);
+        (1, y0 + 2, l.w as i64, y0 + ROW_H as i64 - 2)
+    }
+
+    fn colours(buf: &[u8], l: &Layout) -> usize {
+        let (x0, y0, x1, y1) = body(l);
+        let mut seen: Vec<[u8; 4]> = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = px(buf, l.w, x, y);
+                if !seen.contains(&c) {
+                    seen.push(c);
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// The inked pixels of column `x` inside the body.
+    fn bar(buf: &[u8], l: &Layout, x: i64) -> i64 {
+        let (_, y0, _, y1) = body(l);
+        let b = clip_colour(0, Kind::Audio);
+        let ink = [b[0] + WAVE_LIFT, b[1] + WAVE_LIFT, b[2] + WAVE_LIFT, 255];
+        (y0..y1).filter(|&y| px(buf, l.w, x, y) == ink).count() as i64
+    }
+
+    #[test]
+    fn peaks_of_sine_silence_click_stereo() {
+        let sine: Vec<f32> = (0..48_000).map(|i| 0.5 * libm::sinf(2.0 * core::f32::consts::PI * 1000.0 * i as f32 / 48_000.0)).collect();
+        let p = peaks_of(48_000, 1, &sine, PEAKS_PER_SEC);
+        assert_eq!((p.per_sec, p.buckets.len()), (100, 100));
+        assert!(p.buckets.iter().all(|&b| (127..=129).contains(&b)), "{:?}", p.buckets);
+        let silence = alloc::vec![0.0f32; 48_000];
+        assert_eq!(peaks_of(48_000, 1, &silence, PEAKS_PER_SEC).buckets, alloc::vec![0u8; 100]);
+        let mut click = silence.clone();
+        click[4810] = 1.0;
+        let c = peaks_of(48_000, 1, &click, PEAKS_PER_SEC).buckets;
+        assert_eq!(c[10], 255);
+        assert_eq!(c.iter().filter(|&&b| b != 0).count(), 1, "one bucket holds the click");
+        let stereo: Vec<f32> = (0..9_600).map(|i| if i % 2 == 0 { 0.25 } else { -0.75 }).collect();
+        assert!(peaks_of(48_000, 2, &stereo, PEAKS_PER_SEC).buckets.iter().all(|&b| b == 191), "stereo folds by max");
+        assert_eq!(peaks_of(48_000, 1, &silence[..4_801], PEAKS_PER_SEC).buckets.len(), 11);
+        assert!(peaks_of(0, 1, &silence, PEAKS_PER_SEC).buckets.is_empty());
+        // whole seconds one after another == one call (the scan's streaming)
+        let two: Vec<f32> = sine.iter().chain(click.iter()).copied().collect();
+        let mut fed = peaks_of(48_000, 1, &two[..48_000], PEAKS_PER_SEC).buckets;
+        fed.extend(peaks_of(48_000, 1, &two[48_000..], PEAKS_PER_SEC).buckets);
+        assert_eq!(fed, peaks_of(48_000, 1, &two, PEAKS_PER_SEC).buckets);
+        let rate_441: Vec<f32> = (0..44_100 * 2).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut fed = peaks_of(44_100, 1, &rate_441[..44_100], PEAKS_PER_SEC).buckets;
+        fed.extend(peaks_of(44_100, 1, &rate_441[44_100..], PEAKS_PER_SEC).buckets);
+        assert_eq!(fed, peaks_of(44_100, 1, &rate_441, PEAKS_PER_SEC).buckets);
+    }
+
+    #[test]
+    fn waveform_body_not_flat_and_video_unchanged() {
+        let ramp = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() });
+        let empty = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: Vec::new() });
+        let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let flat = paint_in(&st, l, Order::Rgba, None, None, None);
+        let wave = paint_in(&st, l, Order::Rgba, None, None, Some(&ramp));
+        let (cf, cw) = (colours(&flat, &l), colours(&wave, &l));
+        assert_eq!(cf, 1, "no hook: one body colour");
+        assert!(cw > 1, "the peaks paint over the body: {cw} colours");
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&empty)), flat, "an empty table paints the flat body");
+        let v = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 0));
+        assert_eq!(paint_in(&v, l, Order::Rgba, None, None, Some(&ramp)), paint_in(&v, l, Order::Rgba, None, None, None), "video bodies have no peaks");
+        let bgra = paint_in(&st, l, Order::Bgra, None, None, Some(&ramp));
+        assert!(wave.chunks(4).zip(bgra.chunks(4)).all(|(a, b)| a == [b[2], b[1], b[0], b[3]]), "the BGRA paint is the same picture");
+        std::println!("striawaveform: golden fnv={:016x} body_colours flat={cf} wave={cw}", fnv1a(&wave));
+        assert_eq!(alloc::format!("{:016x}", fnv1a(&wave)), GOLDEN_WAVE);
+    }
+
+    /// `waveform_body_not_flat_and_video_unchanged`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA
+    /// paint of a 2-s audio clip under a ramp table).
+    const GOLDEN_WAVE: &str = "923f68ef86d1a44d";
+
+    #[test]
+    fn waveform_gain_minus_6db_halves_the_bars() {
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let at = |cdb: i32| {
+            let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).gained(cdb));
+            let l = Layout::of(320, 160, &st);
+            bar(&paint_in(&st, l, Order::Rgba, None, None, Some(&full)), &l, 160)
+        };
+        let (h0, h6, h12) = (at(0), at(-600), at(-1200));
+        std::println!("striawaveform: bar_full={h0} bar_minus6db={h6} bar_minus12db={h12}");
+        assert_eq!(h0, 36, "a full-scale bar fills the body");
+        assert_eq!(h6, 18, "-6 dB halves");
+        assert!((h12 - 9).abs() <= 1, "-12 dB quarters: {h12}");
+    }
+
+    #[test]
+    fn waveform_fade_in_tapers() {
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).faded(25, 0));
+        let l = Layout::of(320, 160, &st);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&full));
+        let z = l.zoom as i64;
+        let (q1, q3) = (bar(&buf, &l, l.x_of(12) + z / 2), bar(&buf, &l, l.x_of(37) + z / 2));
+        std::println!("striawaveform: fade_in=25/50 bar25={q1} bar75={q3} first={}", bar(&buf, &l, 1));
+        assert!(q1 < q3, "the fade tapers the first half: {q1} vs {q3}");
+        assert_eq!(q3, 36);
+        assert_eq!(bar(&buf, &l, 1), 0, "silent at the clip's first tick");
+    }
+}
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the gain line and the fade ramps on the clip body (named tail block) ----
+// A clip that carries a gain or a fade shows it on its body: a 1-px gain line on a dB scale (0 dB at mid-height,
+// `GAIN_MAX_CDB` at the top, `GAIN_MIN_CDB` pinned to the bottom, through the meters' ONE dB map [`db_frac`]) and, over
+// the fade columns, a 1-px ramp at the mix's own envelope (`schedule::env_q16`). A unity clip with no fade paints
+// nothing, so every golden and the kernel view pin are unchanged. Painted last in the body arm: over the peaks and the label.
+
+/// STRIACLIPGAINFACE (SR838): the gain line's and the fade ramps' ink.
+pub const GAIN_INK: [u8; 4] = [0xff, 0xf0, 0xa0, 255];
+
+/// The ONE dB map (the meters' strip, lifted from stria `paint_meters`): `db` on a linear scale from `floor_db` (0) to
+/// 0 dB (1), clamped.
+pub fn db_frac(db: f64, floor_db: f64) -> f64 {
+    ((db - floor_db) / -floor_db).clamp(0.0, 1.0)
+}
+
+/// The row of the gain line for `cdb` centi-dB in a body spanning rows `top..=bottom`: 0 dB at mid-height, the top at
+/// `GAIN_MAX_CDB`, the bottom at `GAIN_MIN_CDB` (each half through [`db_frac`]).
+pub fn gain_y(cdb: i32, top: i64, bottom: i64) -> i64 {
+    let mid = (top + bottom) / 2;
+    let db = cdb as f64 / 100.0;
+    let (max_db, min_db) = (crate::GAIN_MAX_CDB as f64 / 100.0, crate::GAIN_MIN_CDB as f64 / 100.0);
+    if cdb >= 0 {
+        mid - (db_frac(db - max_db, -max_db) * (mid - top) as f64 + 0.5) as i64
+    } else {
+        bottom - (db_frac(db, min_db) * (bottom - mid) as f64 + 0.5) as i64
+    }
+}
+
+/// THE gain / fade painter: inside `body` (`x0, y0, x1, y1`, the clip body rect [`paint_in`] filled) the gain line at
+/// [`gain_y`] across the body, and over the columns whose tick lies in the fade-in or the fade-out a ramp at
+/// `env_q16(clip, t)` (bottom = silence, top = full), each column joined to the last by a vertical run. Nothing for a
+/// clip with no gain and no fade, or a body under 2 px.
+pub fn paint_gain_fades(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip) {
+    let (x0, y0, x1, y1) = body;
+    if (clip.gain_cdb == 0 && clip.fade_in <= 0 && clip.fade_out <= 0) || x1 - x0 < 2 || y1 - y0 < 2 {
+        return;
+    }
+    let (top, bottom) = (y0, y1 - 1);
+    let gy = gain_y(clip.gain_cdb, top, bottom);
+    c.rect(x0, gy, x1, gy + 1, GAIN_INK);
+    let (xa, z) = (l.x_of(clip.at), l.zoom.max(1) as i64);
+    let one = crate::schedule::ENV_ONE as i64;
+    let mut prev: Option<i64> = None;
+    for x in x0.max(0)..x1.min(c.w as i64) {
+        let t = clip.at + (x - xa).max(0) / z;
+        if !(t < clip.at + clip.fade_in || t >= clip.end() - clip.fade_out) {
+            prev = None;
+            continue;
+        }
+        let y = bottom - crate::schedule::env_q16(clip, t) as i64 * (bottom - top) / one;
+        let (a, b) = match prev {
+            Some(p) => (p.min(y), p.max(y)),
+            None => (y, y),
+        };
+        c.rect(x, a, x + 1, b + 1, GAIN_INK);
+        prev = Some(y);
+    }
+}
+
+#[cfg(test)]
+mod striaclipgainface_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timeline};
+
+    /// One audio track, `clip` on it, the tracks band of a 320x56 canvas (body rows 18..54: top 18, bottom 53, mid 35).
+    fn one(clip: Clip) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![clip];
+        let st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    /// The rows of `GAIN_INK` in column `x`.
+    fn ink_rows(px: &[u8], x: i64) -> Vec<i64> {
+        (0..56i64).filter(|&y| px[((y * 320 + x) * 4) as usize..((y * 320 + x) * 4 + 4) as usize] == GAIN_INK).collect()
+    }
+
+    fn a(at: i64) -> Clip {
+        Clip::new(crate::SourceId(0), 0, 20, at)
+    }
+
+    #[test]
+    fn gain_y_and_db_frac_pins() {
+        assert_eq!(db_frac(-30.0, -60.0), 0.5);
+        assert_eq!(db_frac(-90.0, -60.0), 0.0);
+        assert_eq!(db_frac(6.0, -60.0), 1.0);
+        assert_eq!(gain_y(0, 18, 53), 35);
+        assert_eq!(gain_y(2400, 18, 53), 18);
+        assert_eq!(gain_y(-14_400, 18, 53), 53);
+        assert_eq!(gain_y(1200, 18, 53), 26);
+    }
+
+    #[test]
+    fn gain_line_mid_at_unity_higher_at_plus_12_and_none_on_a_plain_clip() {
+        let (st, l) = one(a(0));
+        let plain = paint_in(&st, l, Order::Rgba, None, None);
+        let xm = l.x_of(10);
+        assert!(ink_rows(&plain, xm).is_empty(), "a unity clip with no fade shows no line");
+        let (st, l) = one(a(0).faded(2, 0));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(ink_rows(&px, xm), alloc::vec![35], "0 dB at mid-height");
+        let (st, l) = one(a(0).gained(1200));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let rows = ink_rows(&px, xm);
+        assert_eq!(rows, alloc::vec![26]);
+        assert!(rows[0] < 35, "+12 dB sits higher");
+    }
+
+    #[test]
+    fn fade_in_of_half_the_clip_ramps_through_mid_at_a_quarter() {
+        // +24 dB puts the gain line on the top row, so the ink near mid in the quarter column is the ramp.
+        let (st, l) = one(a(0).gained(2400).faded(10, 0));
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let (x0, x1) = (l.x_of(0), l.x_of(20));
+        let q = x0 + (x1 - x0) / 4;
+        let rows = ink_rows(&px, q);
+        assert!(rows.iter().any(|&y| (y - 35).abs() <= 1), "{rows:?}");
+        assert!(ink_rows(&px, x0 + 1).contains(&53), "the ramp starts at the bottom corner");
+        assert_eq!(ink_rows(&px, l.x_of(15)), alloc::vec![18], "past the fade only the line");
     }
 }

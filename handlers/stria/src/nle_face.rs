@@ -89,14 +89,14 @@ impl view::Text for Labels<'_> {
 /// Paint the editor on a `w` x `h` canvas in `order` (see the module docs). `labels` names the clips (and the
 /// seconds on the ruler) through text_host; `preview` is the frame at the playhead.
 pub fn paint(st: &EditorState, w: u32, h: u32, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
-    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+    paint_in(st, Layout::of(w, h, st), order, labels, preview, None)
 }
 
 /// [`paint`] in a given layout (the face's view, which a wheel zoom anchors at the pointer: [`Face::layout`]): timeline_core's
 /// `view::paint_in`, the labels through [`Labels`].
-pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
+pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
     let mut lab = labels.map(Labels);
-    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview)
+    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview, peaks)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "loudness", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 33] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "loudness", "gain-", "gain+", "gain", "fade-in", "fade-out", "normalize", "help"]; // STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,15 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub scan: NormalizeScan, // STRIANORMALIZETHREE (SR9035): the normalize scan (synchronous, or off the face's thread under `serve`; file tail)
+    peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, loudness: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, loudness: None, peaks: WavePeaks::default(), scan: NormalizeScan::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -235,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.normalize_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.loudness_verb(v) { return r; } if let Some(r) = self.clip_audio_verb(v) { return r; } // STRIANORMALIZE (SR878): the normalize word (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words and their message (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -305,7 +307,7 @@ impl Face {
 /// fresh blit after each change; while playing, a clock at the timeline's frame rate steps the playhead.
 pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessage>, mut face: Face) {
     use tokio::sync::broadcast::error::RecvError;
-    for m in face.frames() { bus.fire(m); }
+    face.scan.thread = true; for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
     let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
     loop {
@@ -322,8 +324,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.loudness_pending() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.loudness_tick() {
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.loudness_pending() || face.normalizing() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.loudness_tick() | face.normalize_tick() {
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1353,7 +1355,7 @@ fn paint_meters(px: Vec<u8>, l: Layout, order: PixelOrder, levels: &[MeterLevel]
     }
     let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
     let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
-    let frac = |db: f64| ((db - METER_VIEW_DB) / -METER_VIEW_DB).clamp(0.0, 1.0);
+    let frac = |db: f64| view::db_frac(db, METER_VIEW_DB); // STRIACLIPGAINFACE (SR838): the ONE dB map, lifted to timeline_core view
     for lv in levels {
         let (y0, y1) = match lv.track {
             Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
@@ -1587,7 +1589,7 @@ impl Face {
     /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
-        let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
+        let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
@@ -1600,7 +1602,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3227,5 +3229,226 @@ pub fn loudness_reading_line(r: &Result<Option<crate::nle::LoudnessReading>, Ren
         Ok(Some(x)) => loudness_line(&Ok(Some(x.lufs)), range).replacen("LUFS integrated", &format!("LUFS integrated, LRA {:.1} LU, true peak {:.1} dBTP", x.range_lu, x.true_peak_db), 1),
         Ok(None) => loudness_line(&Ok(None), range),
         Err(e) => loudness_line(&Err(e.clone()), range),
+    }
+}
+
+// ---- STRIAWAVEFORM (LEDGER SR827): the face's peak tables, scanned once per source (named tail block) ----
+// An audio clip's body shows its waveform (timeline_core view.rs `paint_peaks`, through `paint_in`'s `PeakSource` hook). The
+// tables live here, beside `sources`, never in the EDL. LAZY: `paint_role`'s first line calls `wave_fill`, which scans each
+// source on an audio track the first time a paint sees it (`nle::scan_peaks`, the render's own decoder) and never again: the
+// tables are immutable, so no paint invalidates them. The scan runs on the face's thread, so the first paint that shows a long
+// source waits for its whole decode (owed NLE-WAVEFORM-SCAN-THREAD). A source that fails to scan stays flat (logged at debug,
+// never in `last_error`, so no message row changes).
+
+/// STRIAWAVEFORM (SR827): every scanned source's table (`None`: scanned, no audio or refused) and the scans made.
+#[derive(Default)]
+pub struct WavePeaks {
+    map: std::collections::BTreeMap<timeline_core::SourceId, Option<view::Peaks>>,
+    scans: u32,
+}
+
+impl view::PeakSource for WavePeaks {
+    fn peaks(&self, src: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.map.get(&src).and_then(|p| p.as_ref())
+    }
+    /// The mix's ONE gain curve (nle.rs `mix_into`'s).
+    fn gain_q16(&self, cdb: i32) -> i64 {
+        gneiss_pal::dsp::audio::ramp::gain_q16(cdb)
+    }
+}
+
+impl Face {
+    /// STRIAWAVEFORM (SR827): scan every audio-track source not scanned yet (once per source for the face's life).
+    fn wave_fill(&mut self) {
+        let mut want: Vec<timeline_core::SourceId> = Vec::new();
+        for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
+            for c in &tr.clips {
+                if !self.peaks.map.contains_key(&c.src) && !want.contains(&c.src) {
+                    want.push(c.src);
+                }
+            }
+        }
+        for id in want {
+            let p = match crate::nle::scan_peaks(&self.sources, id, view::PEAKS_PER_SEC) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("[nle-face] waveform {id:?}: {e}");
+                    None
+                }
+            };
+            self.peaks.map.insert(id, p);
+            self.peaks.scans += 1;
+        }
+    }
+    /// STRIAWAVEFORM (SR827): the peak scans this face has made.
+    pub fn wave_scans(&self) -> u32 {
+        self.peaks.scans
+    }
+    /// STRIAWAVEFORM (SR827): source `id`'s peak table, once a paint has scanned it.
+    pub fn wave_peaks(&self, id: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.peaks.map.get(&id).and_then(|p| p.as_ref())
+    }
+}
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the gain / fade words and their message line (named tail block) ----
+// `gain-` / `gain+` / `gain [<dB>]` / `fade-in [<frames|tc>]` / `fade-out [<frames|tc>]` ride timeline_core's ONE verb
+// dispatch (`EditorState::verb`: `Timeline::set_gain` / `set_fades` through the one commit). The face puts the outcome on
+// its message line: `gain -3.0 dB` / `fade-in 10, fade-out 0` after an edit (finish_export's precedent for a success
+// line), `<word>: <EditError>` for a refusal (the edit dropped).
+impl Face {
+    /// The gain / fade words; `None` for any other word.
+    fn clip_audio_verb(&mut self, v: &str) -> Option<bool> {
+        let word = v.split_ascii_whitespace().next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
+        match self.state.verb(v) {
+            Some(Ok(())) => self.last_error = self.state.selected().map(|c| audio_line(word, &c)),
+            Some(Err(e)) => self.last_error = Some(format!("{word}: {e}")),
+            None => return None,
+        }
+        Some(true)
+    }
+}
+
+/// A gain in centi-dB as a person reads it: `+3.0 dB`, `-3.5 dB`, `0.0 dB` (the tenth rounded half up on the magnitude).
+pub fn db_words(cdb: i32) -> String {
+    let tenths = (cdb.unsigned_abs() + 5) / 10;
+    let sign = if tenths == 0 { "" } else if cdb > 0 { "+" } else { "-" };
+    format!("{sign}{}.{} dB", tenths / 10, tenths % 10)
+}
+
+/// The message line after a gain / fade word: `gain <db_words>` or `fade-in <n>, fade-out <m>` (ticks).
+fn audio_line(word: &str, c: &Clip) -> String {
+    if word.starts_with("gain") { format!("gain {}", db_words(c.gain_cdb)) } else { format!("fade-in {}, fade-out {}", c.fade_in, c.fade_out) }
+}
+
+// ---- STRIANORMALIZE (LEDGER SR878): the normalize word over the clip's exact peak (named tail block) ----
+// `normalize [<dBFS>]` (default -1 dBFS) sets the selected audio clip's gain so its peak lands on the target, never above
+// it: the peak is EXACT (nle.rs `peak_of`, the render's own audio road over the clip's source range, beside SR827's
+// `scan_peaks`; the u8 waveform table clamps at full scale, rounds to nearest and straddles the clip's edges), the gain
+// absolute (the clip's current gain ignored; fades only lower the level) and set through SR838's ONE road
+// (`EditorState::set_selected_gain`: `Timeline::set_gain`'s validate, one commit, one undo step; the same gain commits
+// nothing). A host-face word: the editor holds no media, so the kernel Player never sees it (the gain it writes is the
+// `* UNA GAIN` the kernel already reads). Every outcome is on the message line; a refusal leaves the timeline.
+
+/// STRIANORMALIZE (SR878): the word's default target, centi-dB (-1 dBFS).
+pub const NORMALIZE_TARGET_CDB: i32 = -100;
+
+impl Face {
+    /// The `normalize [<dBFS>]` word; `None` for any other word.
+    fn normalize_verb(&mut self, v: &str) -> Option<bool> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|w| *w == "normalize")?;
+        let toks: Vec<&str> = w.collect(); let os = if toks.contains(&"tp") { crate::nle::TRUE_PEAK_OS } else { 1 }; let mut rest = toks.into_iter().filter(|t| *t != "tp"); let (arg, extra) = (rest.next(), rest.next()); // STRIANORMALIZEMORE (SR963): a `tp` token measures the true (oversampled) peak (file tail)
+        self.last_error = Some(match self.normalize(arg, extra, os) {
+            Ok(line) | Err(line) => format!("normalize: {line}"),
+        });
+        Some(true)
+    }
+    /// The rule behind [`Face::normalize_verb`]: `Ok` the success line, `Err` the refusal (the timeline unmoved).
+    fn normalize(&mut self, arg: Option<&str>, extra: Option<&str>, os: u32) -> Result<String, String> {
+        if let Some(x) = extra {
+            return Err(format!("{x} is not a dBFS level"));
+        }
+        let target = match arg {
+            None => NORMALIZE_TARGET_CDB,
+            Some(a) => timeline_core::editor::cdb_of(a).ok_or_else(|| format!("{a} is not a dBFS level"))?,
+        };
+        if target > 0 {
+            return Err("target above 0 dBFS".to_string());
+        }
+        let (track, _) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?;
+        let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
+        if self.state.timeline.tracks.get(track).map(|t| t.kind) != Some(Kind::Audio) {
+            return Err("not an audio clip".to_string());
+        }
+        let tb = self.state.timeline.tb;
+        let Some(peak) = self.normalize_peak(track, c, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), target, os)? else { return Ok(NORMALIZE_SCANNING.to_string()) }; // STRIANORMALIZETHREE (SR9035): at the mix's rate, off the thread when served (file tail)
+        self.normalize_finish(peak, target, os) // STRIANORMALIZETHREE (SR9035): the gain and its line moved to `normalize_finish` (file tail)
+    }
+}
+
+/// STRIANORMALIZE (SR878): the gain (centi-dB) that brings a linear `peak` (full scale 1.0) to `target_cdb`, rounded DOWN
+/// so the result is never above the target: `floor(target_cdb - 2000 log10 peak)`. `None` for a peak that is not a
+/// positive finite number (a silent clip). The cast saturates; `validate` refuses an out-of-range gain by name.
+pub fn normalize_gain_cdb(peak: f32, target_cdb: i32) -> Option<i32> {
+    let p = peak as f64;
+    if !(p.is_finite() && p > 0.0) {
+        return None;
+    }
+    Some((target_cdb as f64 - 2000.0 * p.log10()).floor() as i32)
+}
+
+// ---- STRIANORMALIZETHREE (LEDGER SR9035): normalize at the mix's rate, its scan off the face's thread (named tail block) ----
+// The peak is measured at the rate the mix plays the source (nle.rs `peak_mix`: the project rate `with_audio` sets, so an
+// overshoot the mix's resample builds is seen), through SR963's one peak body. An unserved face (the tests, the stria-view
+// witness) scans synchronously; `serve` sets `scan.thread`, and the scan runs on its own thread over an `Arc` clone of the
+// sources (no lock held across the decode), `normalize_tick` on the clock joins it and sets the gain only if the
+// selection still stands (same track, index and clip). Every line rides the parent's road, `last_error`.
+
+/// STRIANORMALIZETHREE (SR9035): the line while a served face's scan runs (`normalize: measuring`).
+pub const NORMALIZE_SCANNING: &str = "measuring";
+
+/// STRIANORMALIZETHREE (SR9035): the face's normalize scan: `thread` false (the default) measures on the caller's thread.
+#[derive(Default)]
+pub struct NormalizeScan {
+    pub thread: bool,
+    job: Option<NormalizeJob>,
+}
+
+/// STRIANORMALIZETHREE (SR9035): one running scan: the clip it measures (re-checked at the join) and its target.
+struct NormalizeJob {
+    track: usize,
+    index: usize,
+    clip: Clip,
+    target: i32,
+    os: u32,
+    handle: std::thread::JoinHandle<Result<Option<f32>, String>>,
+}
+
+impl Face {
+    /// The peak of the selected clip `c` (track `track`) over source time `ns` at the mix's rate: `Ok(Some)` measured
+    /// here, `Ok(None)` a scan started on its own thread (served face), `Err` a refusal by name (`busy`, `no audio`, the decode error).
+    fn normalize_peak(&mut self, track: usize, c: Clip, ns: std::ops::Range<i64>, target: i32, os: u32) -> Result<Option<f32>, String> {
+        if !self.scan.thread {
+            return crate::nle::peak_mix(&self.sources, c.src, ns, os).map_err(|e| e.to_string())?.ok_or_else(|| "no audio".to_string()).map(Some);
+        }
+        if self.scan.job.is_some() {
+            return Err("busy".to_string());
+        }
+        let index = self.state.selection.map_or(0, |(_, i)| i);
+        let sources = self.sources.clone();
+        let handle = std::thread::spawn(move || crate::nle::peak_mix(&sources, c.src, ns, os).map_err(|e| e.to_string()));
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, handle });
+        Ok(None)
+    }
+    /// The gain from a measured `peak` set through SR838's one road, and its line (SR878's rule, moved here).
+    fn normalize_finish(&mut self, peak: f32, target: i32, os: u32) -> Result<String, String> {
+        let cdb = normalize_gain_cdb(peak, target).ok_or_else(|| "silent clip".to_string())?;
+        self.state.set_selected_gain(cdb).map_err(|e| e.to_string())?;
+        let peak_cdb = (2000.0 * (peak as f64).log10()).round() as i32;
+        Ok(format!("{} {} -> gain {}", if os > 1 { "true peak" } else { "peak" }, db_words(peak_cdb), db_words(cdb)))
+    }
+    /// True while a scan's result has not been reported (the bus face's clock runs).
+    pub fn normalizing(&self) -> bool {
+        self.scan.job.is_some()
+    }
+    /// One clock tick for the scan: a finished scan is joined and its gain set if the selection still stands (else
+    /// `the selection moved`, the timeline unmoved); the line goes to the message row. True when that happened (repaint).
+    pub fn normalize_tick(&mut self) -> bool {
+        if !self.scan.job.as_ref().is_some_and(|j| j.handle.is_finished()) {
+            return false;
+        }
+        let Some(j) = self.scan.job.take() else { return false };
+        let got = j.handle.join().unwrap_or_else(|_| Err("scan failed".to_string()));
+        let stands = self.state.selection == Some((j.track, j.index)) && self.state.selected() == Some(j.clip);
+        let r = match got {
+            Err(e) => Err(e),
+            Ok(None) => Err("no audio".to_string()),
+            Ok(Some(_)) if !stands => Err("the selection moved".to_string()),
+            Ok(Some(peak)) => self.normalize_finish(peak, j.target, j.os),
+        };
+        self.last_error = Some(match r {
+            Ok(line) | Err(line) => format!("normalize: {line}"),
+        });
+        true
     }
 }

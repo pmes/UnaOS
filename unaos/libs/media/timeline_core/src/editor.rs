@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -658,5 +658,154 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIACLIPGAINFACE (LEDGER SR838): the selected clip's gain and fades from the editor through the one commit (named tail block) ----
+// The NLE4 model and EDL already hold a clip's gain and fades; these words ride THE verb dispatch both faces call:
+// `gain-` / `gain+` step the selected clip's gain by [`GAIN_STEP_CDB`], bare `gain` puts it back to unity, `gain <dB>`
+// sets it; `fade-in <frames|tc>` / `fade-out <frames|tc>` set one fade keeping the other (`0` clears), bare `fade-in` /
+// `fade-out` run the fade to the playhead. Each is ONE commit through `Timeline::set_gain` / `Timeline::set_fades` (their
+// `validate`): a refusal (`EditError::Gain` out of range, `EditError::Fade` longer than the clip) leaves the state.
+/// STRIACLIPGAINFACE (SR838): one press of `gain-` / `gain+`, centi-dB (1 dB).
+pub const GAIN_STEP_CDB: i32 = 100;
+
+impl EditorState {
+    /// The selected clip's gain set to `cdb` centi-dB (`Timeline::set_gain`, ONE commit; the same gain commits nothing).
+    pub fn set_selected_gain(&mut self, cdb: i32) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if c.gain_cdb == cdb {
+            return Ok(());
+        }
+        let tl = self.timeline.set_gain(track, idx, cdb)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The selected clip's fades set to `fade_in` / `fade_out` ticks (`Timeline::set_fades`, ONE commit; the same fades
+    /// commit nothing).
+    pub fn set_selected_fades(&mut self, fade_in: i64, fade_out: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if (c.fade_in, c.fade_out) == (fade_in, fade_out) {
+            return Ok(());
+        }
+        let tl = self.timeline.set_fades(track, idx, fade_in, fade_out)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `gain` / `fade` words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn gain_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let word = w.next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
+        let (arg, extra) = (w.next(), w.next());
+        Some(self.gain_word(word, arg, extra.is_some()))
+    }
+    fn gain_word(&mut self, word: &str, arg: Option<&str>, extra: bool) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let refused = if word.starts_with("gain") { EditError::Gain } else { EditError::Fade };
+        if extra {
+            return Err(refused);
+        }
+        let fps = self.timeline.fps().unwrap_or(25);
+        let ph = self.playhead;
+        match (word, arg) {
+            ("gain-", None) => self.set_selected_gain(c.gain_cdb.saturating_sub(GAIN_STEP_CDB)),
+            ("gain+", None) => self.set_selected_gain(c.gain_cdb.saturating_add(GAIN_STEP_CDB)),
+            ("gain", None) => self.set_selected_gain(0),
+            ("gain", Some(db)) => match cdb_of(db) {
+                Some(cdb) => self.set_selected_gain(cdb),
+                None => Err(refused),
+            },
+            ("fade-in", None) => self.set_selected_fades(ph - c.at, c.fade_out),
+            ("fade-out", None) => self.set_selected_fades(c.fade_in, c.end() - ph),
+            ("fade-in", Some(n)) => match ticks_of(n, fps) {
+                Some(n) => self.set_selected_fades(n, c.fade_out),
+                None => Err(refused),
+            },
+            ("fade-out", Some(n)) => match ticks_of(n, fps) {
+                Some(n) => self.set_selected_fades(c.fade_in, n),
+                None => Err(refused),
+            },
+            _ => Err(refused),
+        }
+    }
+}
+
+/// A gain word in dB (`-3`, `2.5`) as centi-dB, rounded half away from zero; `None` for a word that is not a finite
+/// number. The cast saturates, so an absurd value is refused by `validate`'s `EditError::Gain`.
+pub fn cdb_of(s: &str) -> Option<i32> {
+    let db = s.parse::<f64>().ok().filter(|x| x.is_finite())?;
+    let v = db * 100.0;
+    Some((if v < 0.0 { v - 0.5 } else { v + 0.5 }) as i32)
+}
+
+/// A fade length: a timecode `HH:MM:SS:FF` (through `edl::parse_tc`, the EDL's one parser) or a whole number of frames.
+fn ticks_of(s: &str, fps: u32) -> Option<i64> {
+    if s.contains(':') { edl::parse_tc(s, fps, 0).ok() } else { s.parse::<i64>().ok() }
+}
+
+#[cfg(test)]
+mod striaclipgainface_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// One audio track: A 0..20 at 0 (a 20-tick clip), selected.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st
+    }
+
+    #[test]
+    fn gain_words_step_set_and_refuse_through_one_commit() {
+        let mut st = state();
+        assert_eq!(st.verb("gain+"), Some(Ok(())));
+        assert_eq!(st.verb("gain+"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().gain_cdb, 200);
+        assert_eq!(st.verb("gain-"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().gain_cdb, 100);
+        assert_eq!(st.verb("gain -3.5"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().gain_cdb, -350);
+        assert_eq!(st.undo_depth(), 4);
+        assert_eq!(st.verb("gain -200"), Some(Err(EditError::Gain)));
+        assert_eq!(st.verb("gain loud"), Some(Err(EditError::Gain)));
+        assert_eq!(st.verb("gain+ 3"), Some(Err(EditError::Gain)));
+        assert_eq!((st.selected().unwrap().gain_cdb, st.undo_depth()), (-350, 4));
+        assert_eq!(st.verb("gain"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().gain_cdb, 0);
+        assert_eq!(st.verb("gain"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 5, "the same gain commits nothing");
+        assert!(st.undo());
+        assert_eq!(st.selected().unwrap().gain_cdb, -350);
+        assert_eq!(st.verb("gainx"), None);
+        st.deselect();
+        assert_eq!(st.verb("gain+"), Some(Err(EditError::NoClip)));
+    }
+
+    #[test]
+    fn fade_words_frames_timecode_playhead_and_refusal() {
+        let mut st = state();
+        assert_eq!(st.verb("fade-in 10"), Some(Ok(())));
+        assert_eq!(st.verb("fade-out 15"), Some(Err(EditError::Fade)));
+        assert_eq!((st.selected().unwrap().fade_in, st.selected().unwrap().fade_out), (10, 0));
+        assert_eq!(st.verb("fade-out 00:00:00:05"), Some(Ok(())));
+        assert_eq!((st.selected().unwrap().fade_in, st.selected().unwrap().fade_out), (10, 5));
+        assert_eq!(st.verb("fade-in 0"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().fade_in, 0);
+        st.seek(4);
+        assert_eq!(st.verb("fade-in"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().fade_in, 4);
+        st.seek(12);
+        assert_eq!(st.verb("fade-out"), Some(Ok(())));
+        assert_eq!(st.selected().unwrap().fade_out, 8);
+        assert_eq!(st.verb("fade-in -1"), Some(Err(EditError::Fade)));
+        assert_eq!(st.verb("fade-in soon"), Some(Err(EditError::Fade)));
+        assert_eq!(st.verb("fade-in 1 2"), Some(Err(EditError::Fade)));
+        assert_eq!((st.selected().unwrap().fade_in, st.selected().unwrap().fade_out), (4, 8));
     }
 }
