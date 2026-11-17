@@ -521,6 +521,7 @@ fn transport() -> TetraNode {
         button("title", "Title"), // STRIATITLECLIP (SR828): a 5 s title card at the playhead (THE `title` verb)
         button("freeze", "Freeze"), // STRIAFREEZEFRAME (SR880): a 2 s hold of the playhead's frame (THE `freeze` verb)
         button("freeze-all", "Freeze all"), // STRIAFREEZELEN (SR916): a 2 s hold that ripples every track (THE `freeze-all` verb)
+        button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }

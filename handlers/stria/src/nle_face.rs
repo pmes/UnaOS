@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "speed", "title", "freeze", "freeze-all", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIACLIPSPEED (SR829): speed (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`)
+pub const VERBS: [&str; 34] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "speed", "title", "freeze", "freeze-all", "title-size-", "title-size+", "title-align", "title-ink", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIACLIPSPEED (SR829): speed (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIATITLESTYLEFACE (SR9077): the title step words (timeline_core `title_step`)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -193,14 +193,14 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
-    hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    hover_ticks: Option<((usize, usize), u16)>, pub note: Option<String>, // STRIATITLESTYLEFACE (SR9077): the message row's note, cleared by the next input (file tail); STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +208,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIATITLESTYLEFACE (SR9077): an input clears the note (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -251,7 +251,7 @@ impl Face {
                 None => return false,
             },
         };
-        if let Err(e) = r {
+        if r.is_ok() { self.title_style_note(v); } if let Err(e) = r { // STRIATITLESTYLEFACE (SR9077): a title step word's note (file tail)
             self.last_error = Some(format!("{v}: {e}"));
         }
         true
@@ -2362,7 +2362,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3150,4 +3150,36 @@ pub fn speed_verb(st: &mut EditorState, v: &str) -> Result<(), EditError> {
         None => return Err(EditError::NoClip),
     };
     st.set_speed(q)
+}
+
+// ---- STRIATITLESTYLEFACE (LEDGER SR9077): the title step words' note on the message row (named tail block) ----
+// The four title step words (timeline_core `editor::TITLE_STEP_WORDS`, the transport's Title - / Title + / Align / Ink
+// buttons) reach timeline_core's ONE verb dispatch through `Face::verb`'s fall-through; after an Ok step the message row reads
+// `title style: <size> <align> <RRGGBB>` from `note`, right after `last_error` in `message_text`. The next input clears it.
+
+impl Face {
+    /// STRIATITLESTYLEFACE: after an Ok word `v`, a title step word's note (`title style: 15 centre FFFFFF`); any other word
+    /// leaves the note alone.
+    fn title_style_note(&mut self, v: &str) {
+        if !timeline_core::editor::TITLE_STEP_WORDS.contains(&v) {
+            return;
+        }
+        if let Ok(s) = self.state.selected_title_style() {
+            self.note = Some(format!("title style: {}", s.words()));
+        }
+    }
+    /// STRIATITLESTYLEFACE: the note is cleared by the next input (a word, a click, a press, select-all, a named key, a typed
+    /// character); a release, a move, a scroll or a resize keeps it.
+    fn clear_note(&mut self, msg: &SMessage) {
+        let input = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserButton { down, .. } => *down,
+            SMessage::BrowserKey(k) => !k.is_empty(),
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if input {
+            self.note = None;
+        }
+    }
 }
