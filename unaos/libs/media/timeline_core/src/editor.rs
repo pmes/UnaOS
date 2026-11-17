@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        if let Some(r) = self.freeze_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -691,5 +691,24 @@ impl EditorState {
         let tl = self.timeline.set_rate(track, idx, rate_q16)?;
         self.commit(tl);
         Ok(())
+    }
+}
+
+// ---- STRIAFREEZEFRAME (LEDGER SR880): `freeze` holds the playhead's frame for FREEZE_SECS as ONE commit (named tail block) ----
+impl EditorState {
+    /// Hold the frame the preview shows at the playhead for `FREEZE_SECS * fps` ticks through `Timeline::freeze` (a rated
+    /// one-tick clip laid by `place` Insert): ONE commit, so undo restores the whole pre-op timeline; the hold is selected.
+    /// Refused by name: a time base that is not `1/fps` `EditError::Rate`; the op's own refusals leave the state.
+    pub fn freeze(&mut self) -> Result<(), EditError> {
+        let fps = self.timeline.fps().ok_or(EditError::Rate)?;
+        let ph = self.playhead;
+        let (tl, track) = self.timeline.freeze(ph, crate::FREEZE_SECS * fps as i64)?;
+        self.commit(tl);
+        let _ = self.select_at(track, ph);
+        Ok(())
+    }
+    /// STRIAFREEZEFRAME: the `freeze` word (`None` for any other word).
+    fn freeze_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        (v == "freeze").then(|| self.freeze())
     }
 }

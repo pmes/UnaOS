@@ -3932,3 +3932,35 @@ fn striaclipspeed_a_1x_timeline_schedules_as_before() {
     assert_eq!((vseeks, aseeks), (3, 3));
     println!("striaclipspeed: 1x fixture schedule = the old identity: {} steps, {} runs, seeks v={vseeks} a={aseeks}", steps.len(), runs.len());
 }
+
+// ---- STRIAFREEZEFRAME (LEDGER SR880): `freeze` holds the playhead's frame through the one frame road (named tail block) ----
+
+/// synth_fixture (V1 A[13,23)@0 | B@10 | A@25, 25 fps): `freeze` at tick 5 lays a 50-tick hold of source tick 18; the
+/// preview (`nle_face::preview`, THE frame road) shows tick 5's old frame on every hold tick and after it; one undo.
+#[test]
+fn striafreezeframe_face_holds_the_playhead_frame() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, preview, synth_fixture};
+    assert_eq!(VERBS.iter().position(|v| *v == "freeze").map(|i| VERBS[i + 1]), Some("help"), "freeze sits right before help");
+    let (tl, src) = synth_fixture();
+    let (_, frames) = synth_fixture();
+    let before = preview(&tl, &frames, 5).unwrap().expect("a frame at 5");
+    assert_ne!(Some(&before), preview(&tl, &frames, 6).unwrap().as_ref(), "the fixture moves: a hold is visible");
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.seek(5);
+    assert!(face.verb("freeze"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let fr = face.state.timeline.clone();
+    assert_eq!(fr.end(), tl.end() + 50, "a 2 s hold at 25 fps");
+    let h = fr.tracks[0].clips[1];
+    assert_eq!((h.src_in, h.src_out, h.at, h.len()), (18, 19, 5, 50));
+    assert_eq!(fr.tracks[1], tl.tracks[1], "the audio track does not ripple (NLE-FREEZE-SYNC owed)");
+    for t in [5, 6, 30, 54, 55] {
+        assert_eq!(preview(&fr, &frames, t).unwrap().as_ref(), Some(&before), "tick {t} shows the frozen frame");
+    }
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.state.undo());
+    assert_eq!(face.state.timeline, tl, "one undo step");
+    let text = edl::write(&fr, "FREEZE").unwrap();
+    assert_eq!(edl::parse(&text, 25).unwrap(), fr, "the hold reopens through its M2 line");
+    println!("striafreezeframe: freeze at 5 -> hold of A:18 over 5..55, preview equal on 5 / 30 / 54 / 55; one undo");
+}

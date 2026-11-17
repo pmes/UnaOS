@@ -1715,3 +1715,146 @@ mod striaclipspeed_tests {
         }
     }
 }
+
+// ---- STRIAFREEZEFRAME (LEDGER SR880): a one-frame hold as a rated one-tick clip — hold_rate, Timeline::freeze (named tail block) ----
+// A freeze is NOT a new clip kind: it is SR829's rated clip over a ONE-tick source span `f..f+1` at `hold_rate(n)` =
+// `ceil(0x1_0000 / n)`. Its `len()` (`rated_len`) is `ceil(0x1_0000 / r)`, exactly `n` whenever `n * (n - 1) <= 0x1_0000`
+// (n <= 256: a 2 s hold at any fps <= 128), and for EVERY rate >= 1 `(len - 1) * r < 0x1_0000`, so `src_at` is `f` on every
+// covered tick: the schedule names one source tick, `seek_for` sees the run continue, `Vid::show` holds the decoded frame.
+// The longest hold is 65536 ticks (rate 1). `freeze` lays it by `place` (`Mode::Insert`), which already splits the clip
+// under the playhead (`split_at`, `cut_clean`) and ripples the rest of that track; the EDL keeps it as the hold's `M2` line.
+// The kernel Player refuses a rated clip by name (`rate-unsupported`, SR829), so a frozen EDL is refused there, never shown wrong.
+
+/// STRIAFREEZEFRAME: the length of the `freeze` word's hold, seconds.
+pub const FREEZE_SECS: i64 = 2;
+
+/// STRIAFREEZEFRAME: the Q16.16 rate at which a one-tick source span covers `ticks` timeline ticks: `ceil(0x1_0000 / ticks)`,
+/// at least 1 (so a hold is never longer than 65536 ticks); `ticks < 1` gives 1x (callers refuse it first).
+pub fn hold_rate(ticks: i64) -> u32 {
+    if ticks < 1 {
+        return 0x1_0000;
+    }
+    if ticks >= 0x1_0000 {
+        return 1;
+    }
+    ((0x1_0000 + ticks - 1) / ticks) as u32
+}
+
+impl Timeline {
+    /// STRIAFREEZEFRAME: hold the frame shown at tick `t` for `ticks` ticks: on the topmost video track with a clip covering
+    /// `t` (`schedule::top`, what the preview shows), that clip's source tick `f = src_at(t)` laid as `f..f+1` at
+    /// [`hold_rate`] by `place` (`Mode::Insert`) at `t`. Returns the new timeline and the track. Refused by name: `ticks < 1`
+    /// `Empty`; no video clip covers `t` `NoClip`; a rated clip under `t` off its frame grid `Rate` (`place`'s own); any
+    /// transition / `validate` refusal is `place`'s. Only that track ripples (other tracks stay: NLE-FREEZE-SYNC owed).
+    pub fn freeze(&self, t: i64, ticks: i64) -> Result<(Timeline, usize), EditError> {
+        if ticks < 1 {
+            return Err(EditError::Empty);
+        }
+        let (track, ci) = crate::schedule::top(self, Kind::Video, t).ok_or(EditError::NoClip)?;
+        let c = self.tracks[track].clips[ci];
+        let f = c.src_at(t);
+        let hold = Clip::new(c.src, f, f + 1, t).at_rate(hold_rate(ticks));
+        Ok((self.place(track, hold, Mode::Insert)?, track))
+    }
+}
+
+#[cfg(test)]
+mod striafreezeframe_tests {
+    extern crate std;
+    use super::*;
+
+    /// V1: A[0,20)@0 and B[0,10)@30; A1: A[0,20)@0.
+    fn fixture() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 30)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    #[test]
+    fn striafreezeframe_hold_rate_exact() {
+        for fps in [24i64, 25, 30, 50, 60, 120] {
+            let n = FREEZE_SECS * fps;
+            let h = Clip::new(SourceId(0), 7, 8, 0).at_rate(hold_rate(n));
+            assert_eq!(h.len(), n, "fps {fps}");
+            assert!((h.at..h.end()).all(|t| h.src_at(t) == 7), "fps {fps}: a pure hold");
+        }
+        let h = Clip::new(SourceId(0), 7, 8, 0).at_rate(hold_rate(1000));
+        assert_eq!((hold_rate(1000), h.len()), (66, 993), "past n = 256 the hold rounds, still a hold");
+        assert!((h.at..h.end()).all(|t| h.src_at(t) == 7));
+        assert_eq!((hold_rate(50), hold_rate(1 << 20), hold_rate(0)), (1311, 1, 0x1_0000));
+        std::println!("striafreezeframe: hold_rate(50) = 1311 -> len 50; hold_rate(1000) = 66 -> len 993");
+    }
+
+    #[test]
+    fn striafreezeframe_inserts_and_ripples() {
+        let tl = fixture();
+        let (a, b) = (SourceId(0), SourceId(1));
+        let (fr, track) = tl.freeze(7, 50).unwrap();
+        assert_eq!(track, 0);
+        let v = &fr.tracks[0].clips;
+        assert_eq!(v.len(), 4);
+        assert_eq!((v[0].src, v[0].src_in, v[0].src_out, v[0].at), (a, 0, 7, 0));
+        assert_eq!((v[1].src, v[1].src_in, v[1].src_out, v[1].at, v[1].rate_q16, v[1].len()), (a, 7, 8, 7, 1311, 50));
+        assert!((7..57).all(|t| v[1].src_at(t) == 7), "every hold tick shows source tick 7");
+        assert_eq!((v[2].src, v[2].src_in, v[2].src_out, v[2].at), (a, 7, 20, 57));
+        assert_eq!((v[3].src, v[3].at), (b, 80), "a later clip moves by the hold");
+        assert_eq!(fr.tracks[1], tl.tracks[1], "the audio track does not ripple (NLE-FREEZE-SYNC owed)");
+        let (on_cut, _) = tl.freeze(30, 50).unwrap();
+        assert_eq!((on_cut.tracks[0].clips[1].src, on_cut.tracks[0].clips[1].src_in, on_cut.tracks[0].clips[1].at), (b, 0, 30), "on a cut: the incoming first frame");
+        let mut two = tl.clone();
+        two.add_track(Kind::Video);
+        two.tracks[2].clips = alloc::vec![Clip::new(b, 20, 30, 5)];
+        let (top, track) = two.freeze(7, 50).unwrap();
+        assert_eq!((track, top.tracks[2].clips[1].src_in), (2, 22), "the topmost video track wins, as in the preview");
+        assert_eq!(top.tracks[0], two.tracks[0]);
+        std::println!("striafreezeframe: freeze at 7 -> A 0..7 | A 7..8 @7 len 50 | A 7..20 @57 | B @80");
+    }
+
+    #[test]
+    fn striafreezeframe_refusals() {
+        let tl = fixture();
+        assert_eq!(tl.freeze(tl.end(), 50), Err(EditError::NoClip), "at the end");
+        assert_eq!(tl.freeze(25, 50), Err(EditError::NoClip), "in a video gap");
+        assert_eq!(tl.freeze(7, 0), Err(EditError::Empty));
+        let mut audio = tl.clone();
+        audio.tracks.remove(0);
+        assert_eq!(audio.freeze(7, 50), Err(EditError::NoClip), "an audio clip is not a picture");
+        let mut slow = tl.clone();
+        slow.tracks[0].clips[0] = Clip::new(SourceId(0), 0, 10, 0).at_rate(0x8000);
+        assert_eq!(slow.freeze(3, 50), Err(EditError::Rate), "mid-hold of a 0.5x clip");
+        assert!(slow.freeze(2, 50).is_ok(), "on the 0.5x clip's frame grid");
+    }
+
+    #[test]
+    fn striafreezeframe_one_undo_step() {
+        let tl = fixture();
+        let mut st = crate::editor::EditorState::new(tl.clone());
+        st.seek(7);
+        assert_eq!(st.verb("freeze"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selection, st.timeline.end()), (1, Some((0, 1)), tl.end() + 50));
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl, "one undo restores the whole timeline");
+        st.seek(st.timeline.end());
+        assert_eq!(st.verb("freeze"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.undo_depth(), 0, "a refusal pushes no undo step");
+    }
+
+    #[test]
+    fn striafreezeframe_edl_round_trip() {
+        let mut tl = fixture();
+        tl.tracks.remove(1);
+        let (fr, _) = tl.freeze(7, 50).unwrap();
+        let s = crate::edl::write(&fr, "FREEZE").unwrap();
+        assert_eq!(s.matches("M2 ").count(), 1, "{s}");
+        assert!(s.contains("M2   A        000.5001068115234375 00:00:00:07\n"), "{s}");
+        let back = crate::edl::parse(&s, 25).unwrap();
+        assert_eq!(back, fr);
+        assert_eq!(crate::edl::write(&back, "FREEZE").unwrap(), s, "write(parse(write)) byte-identical");
+    }
+}
+
