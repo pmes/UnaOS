@@ -9274,12 +9274,13 @@ b</div>
 
     /// AETHERCSSBORDERCOLORSTORED (SR1058): `border-color: red` alone paints no red (style none, as Chromium; before SR1058
     /// a 1px red frame); armed: `#cb` paints red and `#ce` (`border-width` creates the sides from the pending red) too.
+    /// SR1069 (flipped in place): `#ce` declares no style, so it paints nothing (Chromium; `border-width` stores only).
     #[test]
     fn border_color_stored_alone_paints_nothing() {
         let mut e = border_color_stored_engine();
         assert_eq!(css_wide_color_ink(&mut e, "ca", css_wide_red), 0, "#ca paints no red");
         assert!(css_wide_color_ink(&mut e, "cb", css_wide_red) > 40, "armed: #cb paints a red frame");
-        assert!(css_wide_color_ink(&mut e, "ce", css_wide_red) > 40, "#ce: border-width takes the pending red");
+        assert_eq!(css_wide_color_ink(&mut e, "ce", css_wide_red), 0, "SR1069: #ce has no style, no red (was a 2px red frame)");
     }
 
     /// AETHERCSSBORDERCOLORSTORED (SR1058): the merge road: a later rule's `border-top-color` reaches the earlier rule's top
@@ -9439,5 +9440,98 @@ b</div>
         assert_eq!(got, "under|under");
         e.render_frame();
         assert_eq!(font_shorthand_cs(&mut e, "u", "textUnderlinePosition"), "under");
+    }
+
+    // ---- AETHERCSSBORDERSIDESTYLEWIDTH (LEDGER SR1069): a style alone paints a medium frame; a width alone paints nothing (named tail block) ----
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): under a green body colour, `#sa` a 40x20 box with `border-style: solid`
+    /// alone, `#sb` the armed twin with `border-width: 3px` alone, and `#pp` an open `dialog` popover (displayed by the UA
+    /// sheet's `:not(dialog[open])`) whose border is the UA `[popover] { border: solid }`.
+    fn border_side_style_width_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="sa" style="width:40px;height:20px;border-style:solid"></div>
+            <div id="sb" style="width:40px;height:20px;border-width:3px"></div>
+            <dialog popover open id="pp" style="width:40px;height:20px;padding:0"></dialog>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `#sa` (style alone) is a 46x26 border box with a 3px frame in the ink colour
+    /// (rows 0-2 at mid-x green, row 3 not; before SR1069 no frame and 40x20); armed: `#sb` (width alone) is 40x20 and
+    /// paints no green (before SR1069 a 3px frame).
+    #[test]
+    fn border_side_style_width_paints_medium() {
+        let mut e = border_side_style_width_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "sa");
+        assert_eq!((w, h), (46.0, 26.0), "#sa: the 3px sides size the box");
+        let x = (l + w / 2.0) as usize;
+        for dy in 0..3 {
+            let c = imgalt_px(&mut e, x, t as usize + dy);
+            assert!(css_wide_green(c), "#sa: row {dy} is the ink: {c:?}");
+        }
+        let c = imgalt_px(&mut e, x, t as usize + 3);
+        assert!(!css_wide_green(c), "#sa: row 3 is inside the frame: {c:?}");
+        let (_, _, w, h) = imgalt_rect(&mut e, "sb");
+        assert_eq!((w, h), (40.0, 20.0), "#sb: a width alone makes no border box");
+        assert_eq!(css_wide_color_ink(&mut e, "sb", css_wide_green), 0, "#sb: paints nothing");
+    }
+
+    /// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the UA `[popover] { border: solid }` is Chromium's medium 3px (the shorthand
+    /// without a width part; before SR1069 1px): the 40x20 popover's border box is 46x26.
+    #[test]
+    fn border_side_style_width_popover_medium() {
+        let mut e = border_side_style_width_engine();
+        let (_, _, w, h) = imgalt_rect(&mut e, "pp");
+        assert_eq!((w, h), (46.0, 26.0), "#pp: the popover's medium border");
+    }
+
+    // ---- AETHERCSSOMLINEHEIGHTNORMALPX (LEDGER SR1063): the used line-height px, `normal` included (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): Chromium pin: `getComputedStyle(el).lineHeight` for `line-height: normal`
+    /// is the keyword `normal` (CSSOM resolved values: line-height resolves to the used value only when it is not
+    /// `normal`); the px road `css::line_height_used_px` does not change the string.
+    #[test]
+    fn line_height_normal_px_cssom_pin() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal", "Chromium keeps the keyword");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): `normal` (mult 0) is the serif face's ascent + descent + line gap at the used
+    /// size, at 16px and at the control font's 40/3 px (no face on the host: the size, HostFonts' fallback).
+    #[test]
+    fn line_height_normal_px_metrics() {
+        let sel = layout_core::FontSel { family: crate::fonts::SERIF, ..Default::default() };
+        let face = crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SERIF, 400, false));
+        for size in [16.0f32, layout_core::CONTROL_FONT_PX] {
+            let want = face.map(|f| {
+                let (a, d, g) = crate::fonts::line_metrics(f, size);
+                a + d + g
+            }).unwrap_or(size);
+            let got = crate::css::line_height_used_px(&crate::layout::PaintStyle::default(), 0.0, size, sel);
+            assert_eq!(got, want, "normal at {size}px is the metrics sum");
+            assert!(got > 0.0, "normal at {size}px is a positive px");
+        }
+    }
+
+    /// AETHERCSSOMLINEHEIGHTNORMALPX (SR1063): the non-`normal` roads: `1.5` at 16px is 24, a 20px length (mult -20) is 20,
+    /// the used font size (20px) wins over the specified 16px (1.5 x 20 = 30); and `line_height_used` routes through the
+    /// px fn: the report's string for `num` (1.5 under 20px) and `len` (24px) is the px fn's value.
+    #[test]
+    fn line_height_used_px_roads() {
+        let sel = layout_core::FontSel { family: crate::fonts::SERIF, ..Default::default() };
+        let plain = crate::layout::PaintStyle::default();
+        assert_eq!(crate::css::line_height_used_px(&plain, 1.5, 16.0, sel), 24.0, "1.5 x 16px");
+        assert_eq!(crate::css::line_height_used_px(&plain, -20.0, 16.0, sel), 20.0, "a 20px length");
+        let used = crate::layout::PaintStyle { used_font_size: Some(20.0), ..Default::default() };
+        assert_eq!(crate::css::line_height_used_px(&used, 1.5, 16.0, sel), 30.0, "1.5 x the used 20px");
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&used, 1.5, 16.0, sel)));
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), format!("{}px", crate::css::line_height_used_px(&plain, -24.0, 16.0, sel)));
     }
 }

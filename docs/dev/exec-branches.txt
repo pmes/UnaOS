@@ -1861,3 +1861,6 @@ exec-rmbp-aethercssomtextdecorationcolumns|cd3b4a3b5|cut126h
 exec-rmbp-aethercssomwhitespacelonghandsaccessor|cd3b4a3b5|cut126h
 exec-rmbp-nlefaceexportjsonzero|cd3b4a3b5|cut126h
 exec-rmbp-h264encrcdocwindow|cd3b4a3b5|cut126h
+exec-rmbp-aethercssborderpendingtransparent|06efcde6c|cut127h
+exec-rmbp-aethercssomtextdecorationshorthandcomputed|06efcde6c|cut127h
+exec-rmbp-h264encrcdoctwopass|06efcde6c|cut127h
