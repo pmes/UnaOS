@@ -3716,3 +3716,83 @@ fn face_export_twopass_plans_from_a_first_pass() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("face_export_twopass: planned export {line}");
 }
+
+// ---- NLEFACEEXPORTQPWORDS (LEDGER SR1091): the face's export takes the CLI's rate words (named tail block) ----
+
+#[test]
+fn face_export_qp_words_parse_as_the_lib() {
+    use stria::nle_export::{H264Opts, knob_or_default, rate_word_into};
+    use stria::nle_face::export_plan_of;
+    let p = export_plan_of("out/ h264 crf 23").expect("crf");
+    assert_eq!(p.opts.crf, Some(23));
+    assert_eq!(p.opts.qp, 26, "qp stays the Default's under crf (the CLI's rule)");
+    assert_eq!(export_plan_of("qp 30").expect("qp").opts.qp, 30);
+    assert_eq!(export_plan_of("gop 48").expect("gop").opts.gop, Some(48));
+    let s = export_plan_of("scenecut 40 min-keyint 12").expect("scenecut + min-keyint");
+    assert_eq!((s.opts.scenecut, s.opts.min_keyint), (Some(40), Some(12)));
+    assert_eq!(export_plan_of("aq 2").expect("aq").opts.aq, Some(2));
+    let h = export_plan_of("bitrate 400 hrd").expect("hrd");
+    assert!(h.opts.hrd && h.opts.bitrate == Some(400));
+    let bare = export_plan_of("scenecut aq").expect("bare scenecut / aq");
+    assert_eq!((bare.opts.scenecut, bare.opts.aq), (Some(40), Some(10)), "x264's defaults");
+    assert_eq!(knob_or_default("aq", Some("h264")), (10, false), "a non-number next word is left unread");
+    // Each face word equals the lib's parse of the same word (the CLI's `num` / `what` and its optional arms are these fns).
+    for (k, v) in [("qp", "30"), ("crf", "23"), ("gop", "48"), ("min-keyint", "12"), ("scenecut", "55"), ("aq", "2")] {
+        let mut want = H264Opts { scenecut: Some(40), ..H264Opts::default() };
+        rate_word_into(k, v, &mut want).expect("a rate word").expect("a good value");
+        let face = export_plan_of(&format!("scenecut 40 {k} {v}")).expect(k).opts;
+        assert_eq!((face.qp, face.crf, face.gop, face.min_keyint, face.scenecut, face.aq), (want.qp, want.crf, want.gop, want.min_keyint, want.scenecut, want.aq), "{k} {v}");
+    }
+    for k in ["scenecut", "aq"] {
+        assert_eq!(knob_or_default(k, Some("7")), (7, true));
+        assert_eq!(knob_or_default(&format!("--{k}"), None), knob_or_default(k, None), "the CLI's flag and the face's word");
+    }
+    assert!(rate_word_into("bitrate", "400", &mut H264Opts::default()).is_none(), "bitrate is not a rate knob of the lib's");
+    assert_eq!(export_plan_of("crf bogus").unwrap_err(), "crf bogus: not a whole number within 0..=255");
+    assert_eq!(export_plan_of("gop x").unwrap_err(), "gop x: not a whole number within 0..=4294967295");
+    assert_eq!(export_plan_of("crf").unwrap_err(), "crf: a value is required");
+    assert_eq!(export_plan_of("crf 23 bitrate 400").unwrap_err(), "bitrate and crf are exclusive");
+    assert_eq!(export_plan_of("hrd").unwrap_err(), "hrd needs bitrate");
+    assert_eq!(export_plan_of("min-keyint 12").unwrap_err(), "min-keyint needs scenecut");
+    println!("face_export_qp_words: crf 23 = {:?}, bare scenecut / aq = {:?}", p.opts.crf, (bare.opts.scenecut, bare.opts.aq));
+}
+
+#[test]
+fn face_export_qp_words_refused_by_name_exports_nothing() {
+    let root = nlefaceexport_dir("qpwords-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    for (words, want) in [
+        ("h264 crf 23 bitrate 400", "export: bitrate and crf are exclusive"),
+        ("h264 hrd", "export: hrd needs bitrate"),
+        ("h264 min-keyint 12", "export: min-keyint needs scenecut"),
+        ("h264 crf bogus", "export: crf bogus: not a whole number within 0..=255"),
+        ("png crf 23", "export: crf needs h264"),
+        ("y4m gop 12", "export: gop needs h264"),
+    ] {
+        assert!(face.verb(&format!("export {} {words}", root.display())));
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{words}");
+        assert!(!face.exporting() && !root.exists(), "{words}: a refused word makes nothing");
+    }
+    assert!(face.verb(&format!("export {} h264 x y z", root.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    for w in ["qp N", "gop N", "crf N", "scenecut [K]", "min-keyint N", "aq [K]", "[hrd]", "bitrate <kbps>", "two-pass"] {
+        assert!(usage.starts_with("export: usage: ") && usage.contains(w), "{w}: {usage}");
+    }
+    println!("face_export_qp_words: refused by name, nothing exported; {usage}");
+}
+
+#[test]
+fn face_export_qp_words_constant_quality_export() {
+    let dir = nlefaceexport_dir("qpwords-crf");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} h264 crf 23 gop 12 scenecut aq 2", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.take().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, "), "{line}");
+    assert!(dir.join("video.mp4").is_file(), "{line}");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_qp_words: constant-quality export {line}");
+}

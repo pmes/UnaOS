@@ -2072,7 +2072,7 @@ mod playaudio_tests {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
-use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, H264Opts, Pass2Cli, VIDEO_NAMES, VideoEncoder, export_as_with, pass1_stats, pass2_cli_of, video_named_with};
+use crate::nle_export::{AudioOut, Container, ExportError, ExportReport, H264Opts, Pass2Cli, VIDEO_NAMES, VideoEncoder, export_as_with, knob_or_default, pass1_stats, pass2_cli_of, rate_word_into, video_named_with};
 
 /// NLE5d (SR694): the export band's height (px), painted over the ruler's foot while an export runs.
 pub const EXPORT_BAND_H: u32 = 2;
@@ -2744,7 +2744,7 @@ fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64, fps: 
 /// refusal both name it.
 fn export_usage() -> String {
     let audio: Vec<&str> = crate::nle_export::AUDIO_NAMES.iter().map(|w| if *w == "aac" { "aac[:KBPS]" } else { *w }).collect();
-    format!("export [--all] [<dir>] [{}] [{}] [bitrate <kbps> [two-pass [qcomp F] [cplxblur N] [qblur F] [qpstep N]]]", VIDEO_NAMES.join("|"), audio.join("|")) // H264ENCTWOPASSQCOMPFACE (SR1076): the rate and plan words
+    format!("export [--all] [<dir>] [{}] [{}] [qp N] [gop N] [bitrate <kbps> [hrd] [two-pass [qcomp F] [cplxblur N] [qblur F] [qpstep N]] | crf N] [scenecut [K] [min-keyint N]] [aq [K]]", VIDEO_NAMES.join("|"), audio.join("|")) // H264ENCTWOPASSQCOMPFACE (SR1076): the rate and plan words; NLEFACEEXPORTQPWORDS (SR1091): the CLI's rate words
 }
 
 impl Face {
@@ -3117,8 +3117,9 @@ pub struct ExportPlan {
 }
 
 /// The export verb's word-and-value options (`two-pass` is a lone word): `bitrate <kbps>` and the planned pass's four, x264's names
-/// as `nle export --pass2`'s keys ([`crate::nle_export::PASS2_KEYS`]).
-pub const EXPORT_PLAN_KEYS: [&str; 5] = ["bitrate", "qcomp", "cplxblur", "qblur", "qpstep"];
+/// as `nle export --pass2`'s keys ([`crate::nle_export::PASS2_KEYS`]), then the CLI's rate words (NLEFACEEXPORTQPWORDS SR1091: `hrd` a lone
+/// word and `scenecut` / `aq`'s optional value taken before the valued arm).
+pub const EXPORT_PLAN_KEYS: [&str; 12] = ["bitrate", "qcomp", "cplxblur", "qblur", "qpstep", "qp", "gop", "crf", "scenecut", "min-keyint", "aq", "hrd"];
 
 /// The rate and plan words stripped from the export verb's words before the positional match (the `--all` shape): `bitrate <kbps>`
 /// (a positive integer), `two-pass`, `qcomp F` `cplxblur N` `qblur F` `qpstep N` (each through `pass2_cli_of`'s own parse and text).
@@ -3129,6 +3130,8 @@ fn export_plan_words(args: Vec<&str>) -> (Vec<&str>, Result<ExportPlan, String>)
     while let Some(w) = it.next() {
         match w {
             "two-pass" => plan.two_pass = true,
+            "hrd" => plan.opts.hrd = true, // NLEFACEEXPORTQPWORDS (SR1091): the flag road, the lone word's shape
+            "scenecut" | "aq" => { let (k, took) = knob_or_default(w, it.as_slice().first().copied()); if took { it.next(); } if w == "aq" { plan.opts.aq = Some(k) } else { plan.opts.scenecut = Some(k) } } // NLEFACEEXPORTQPWORDS (SR1091): the optional value
             k if EXPORT_PLAN_KEYS.contains(&k) => {
                 let Some(v) = it.next() else { return (rest, Err(format!("{k}: a value is required"))) };
                 if k == "bitrate" {
@@ -3136,7 +3139,7 @@ fn export_plan_words(args: Vec<&str>) -> (Vec<&str>, Result<ExportPlan, String>)
                         Some(b) => plan.opts.bitrate = Some(b),
                         None => return (rest, Err(format!("bitrate {v}: not a positive integer"))),
                     }
-                } else {
+                } else if let Some(r) = rate_word_into(k, v, &mut plan.opts) { if let Err(e) = r { return (rest, Err(e)) } } else { // NLEFACEEXPORTQPWORDS (SR1091): qp / gop / crf / min-keyint
                     match pass2_cli_of(&format!("{k}={v}")) {
                         Ok(p) => p2 = p.over(p2),
                         Err(e) => return (rest, Err(e)),
@@ -3153,7 +3156,7 @@ fn export_plan_words(args: Vec<&str>) -> (Vec<&str>, Result<ExportPlan, String>)
     if let (false, Some(k)) = (plan.two_pass, plan_word) {
         return (rest, Err(format!("{k} needs two-pass")));
     }
-    plan.opts = p2.into_opts(plan.opts);
+    if let Err(e) = rate_words_check(&plan.opts) { return (rest, Err(e)) } plan.opts = p2.into_opts(plan.opts); // NLEFACEEXPORTQPWORDS (SR1091): the rate words' refusals
     (rest, Ok(plan))
 }
 
@@ -3162,7 +3165,7 @@ fn plan_check(plan: &ExportPlan, fmt: &str) -> Result<(), String> {
     match (plan.two_pass, plan.opts.bitrate.is_some(), fmt == "h264") {
         (true, _, false) => Err("two-pass needs h264".to_string()),
         (false, true, false) => Err("bitrate needs h264".to_string()),
-        _ => Ok(()),
+        _ => rate_needs_h264(&plan.opts, fmt), // NLEFACEEXPORTQPWORDS (SR1091): every rate word is H.264's
     }
 }
 
@@ -3184,4 +3187,32 @@ fn face_video(fmt: &str, tl: &Timeline, span: std::ops::Range<i64>, sources: &So
 /// the positional words are ignored, a refusal is the verb's text after `export: `.
 pub fn export_plan_of(words: &str) -> Result<ExportPlan, String> {
     export_plan_words(words.split_whitespace().collect()).1
+}
+
+// ---- NLEFACEEXPORTQPWORDS (LEDGER SR1091): the CLI's rate words on the face's export (named tail block) ----
+// SR1076 gave the face's export the two-pass plan words; `nle export`'s rate knobs (`--qp` `--gop` `--crf` `--scenecut [K]`
+// `--min-keyint` `--aq [K]` `--hrd`) stayed CLI-only. They are words of `export_plan_words` now, each value through the lib's ONE
+// parse (`nle_export::rate_word_into` / `knob_or_default`, moved from tools/nle), onto the ONE table's options. Owed:
+// NLE-FACE-EXPORT-COMPLETIONS, H264ENC-TWOPASS-FACE-PROGRESS, NLE-FACE-EXPORT-PRESETS, NLE-FACE-EXPORT-WORDS-ONE-TABLE.
+
+/// The rate words against each other, whatever the video word: `bitrate` and `crf` are exclusive (`nle export`'s own words),
+/// `hrd` signals the CBR bucket (needs `bitrate`), `min-keyint` bounds the scene cut (needs `scenecut`). The CLI ignores the last
+/// two silently (owed NLE-FACE-EXPORT-WORDS-ONE-TABLE).
+fn rate_words_check(o: &H264Opts) -> Result<(), String> {
+    match (o.bitrate.is_some(), o.crf.is_some(), o.hrd, o.min_keyint.is_some() && o.scenecut.is_none()) {
+        (true, true, _, _) => Err("bitrate and crf are exclusive".to_string()),
+        (false, _, true, _) => Err("hrd needs bitrate".to_string()),
+        (_, _, _, true) => Err("min-keyint needs scenecut".to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// A rate word on a video word other than `h264` refused by name (`<word> needs h264`, SR1076's `bitrate needs h264`): the first
+/// set of `qp` (other than the Default's), `gop`, `crf`, `scenecut`, `min-keyint`, `aq`, `hrd`, in that order.
+fn rate_needs_h264(o: &H264Opts, fmt: &str) -> Result<(), String> {
+    let set = [("qp", o.qp != H264Opts::default().qp), ("gop", o.gop.is_some()), ("crf", o.crf.is_some()), ("scenecut", o.scenecut.is_some()), ("min-keyint", o.min_keyint.is_some()), ("aq", o.aq.is_some()), ("hrd", o.hrd)];
+    match set.iter().find(|(_, on)| *on) {
+        Some((w, _)) if fmt != "h264" => Err(format!("{w} needs h264")),
+        _ => Ok(()),
+    }
 }
