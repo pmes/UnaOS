@@ -279,6 +279,8 @@ pub struct PaintStyle<H: Host> {
     pub currentcolor: u8,
     /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `color-scheme` (inherited): None unspecified (the parent's), Some(bits) bit 0 light, bit 1 dark, Some(0) `normal`; read through `tree::ua_colours`.
     pub color_scheme: Option<u8>, pub sys_color: Option<u8>, pub sys_background: Option<u8>, pub sys_border: Option<(u8, u8)>, // SR1046: system colour keyword slots (index into SYSTEM_COLORS; border = (index, side mask)), resolved by tree::system_color_pass
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): a border colour declared on a side with no entry (style none here), kept per side [top, right, bottom, left] as (colour or the grey carrier, currentcolor) for the road that creates the side later (`border-width`, a style longhand, the merge onto an earlier rule's sides).
+    pub border_pending: Option<[Option<((u8, u8, u8), bool)>; 4]>,
 }
 
 
@@ -392,6 +394,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_offset: None,
             currentcolor: 0,
             color_scheme: None, sys_color: None, sys_background: None, sys_border: None,
+            border_pending: None,
         }
     }
 }
@@ -1198,4 +1201,21 @@ impl<H: Host> PaintStyle<H> {
             repeat: bg_list_at(self.bg_repeat, self.bg_repeat_more.as_deref().unwrap_or(&[]).iter().copied(), k),
         }
     }
+}
+
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a control's theme frame takes the pending border colour (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the 1px theme frame a control paints when the author gave it no side: each side
+/// takes its pending colour (`PaintStyle::border_pending`; the element's ink when the entry is currentcolor), else
+/// the scheme's theme frame (`frame`: Chromium's #767676 in light). Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
+pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8), frame: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] { // SR1058 fold: `frame` is the scheme's theme frame (SR1031 ua_colours), light #767676
+    let p = pending.unwrap_or([None; 4]);
+    let mut sides = [Some((1.0, frame)); 4];
+    for (i, side) in sides.iter_mut().enumerate() {
+        if let Some((c, cc)) = p[i] {
+            *side = Some((1.0, if cc { ink } else { c }));
+        }
+    }
+    sides
 }
