@@ -77,7 +77,7 @@ pub struct AetherEngine {
     sel_gen: u64,
     /// Bumped whenever the layout tree is replaced; `painted_epoch` is the one the last full frame drew
     /// (the frame whose text fragments a pointer is hit-tested against).
-    layout_epoch: u64,
+    layout_epoch: u64, holders: (u64, Vec<taffy::prelude::NodeId>), // AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): (epoch, the fixed / sticky boxes), `holder_damage`
     painted_epoch: u64,
     /// AETHERPAINTPERF (SR130): the layout epoch the paint index (`render::subtree_ink`) was last built for.
     index_epoch: u64,
@@ -163,7 +163,7 @@ impl AetherEngine {
             last_press: None,
             shift_held: false,
             sel_gen: selection::generation(),
-            layout_epoch: 1,
+            layout_epoch: 1, holders: (0, Vec::new()),
             painted_epoch: 0,
             index_epoch: 0,
             last_snap: None,
@@ -873,17 +873,17 @@ impl AetherEngine {
                     let w = self.width as usize;
                     let h = self.height as usize;
                     
-                    if idy > 0 && idy < h as i32 && !holds_against_scroll(self.layout_tree.as_ref()) {
+                    if idy > 0 && idy < h as i32 {
                         // Scrolling down, document moves up, shift pixels UP
                         let shift = idy as usize * w * 4;
                         self.surface.copy_within(shift.., 0);
-                        self.damage_rects.push((0, (h as i32 - idy) as u32, self.width, idy as u32));
-                    } else if idy < 0 && -idy < h as i32 && !holds_against_scroll(self.layout_tree.as_ref()) {
+                        self.damage_rects.push((0, (h as i32 - idy) as u32, self.width, idy as u32)); self.holder_damage(old_sy as i32); // AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139)
+                    } else if idy < 0 && -idy < h as i32 {
                         // Scrolling up, document moves down, shift pixels DOWN
                         let shift = (-idy) as usize * w * 4;
                         let src_len = (h - (-idy) as usize) * w * 4;
                         self.surface.copy_within(0..src_len, shift);
-                        self.damage_rects.push((0, 0, self.width, (-idy) as u32));
+                        self.damage_rects.push((0, 0, self.width, (-idy) as u32)); self.holder_damage(old_sy as i32); // AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139)
                     } else {
                         self.damage_rects.push((0, 0, self.width, self.height));
                     }
@@ -2658,7 +2658,55 @@ fn present_rect(src: &[u8], (sw, sh): (usize, usize), out: &mut [u8], (dw, dh): 
 
 // ---- AETHERCSSSTICKYSCROLLBLITDAMAGE (LEDGER SR1135): a box that holds its place against the scroll (named tail block) ----
 /// A `position: fixed` or `sticky` box paints at a viewport place the scroll blit does not move (render's `placed_origin`):
-/// with one present a short scroll repaints the whole viewport. An unstuck sticky box counts (this scroll can stick it).
-fn holds_against_scroll(layout: Option<&layout::LayoutTree>) -> bool {
-    layout.is_some_and(|l| l.paint_map.values().any(|p| matches!(p.position_kind, Some(3 | 4))))
+/// the boxes the blitted scroll repairs (SR1139: `holder_damage`, cached per layout epoch). An unstuck sticky box counts.
+fn scroll_holders(layout: Option<&layout::LayoutTree>) -> Vec<taffy::prelude::NodeId> {
+    layout.map_or_else(Vec::new, |l| l.paint_map.iter().filter(|(_, p)| matches!(p.position_kind, Some(3 | 4))).map(|(id, _)| *id).collect())
+}
+
+// ---- AETHERCSSSTICKYSCROLLDAMAGERECTS (LEDGER SR1139): a blitted scroll damages each fixed / sticky box's old and new place (named tail block) ----
+impl AetherEngine {
+    /// After a blitted scroll from `old_sy`: each holder's last-frame subtree ink (`render::subtree_ink`, the paint index
+    /// `animation_damage` reads) with that ink moved by the blit (its stale pixels). A sticky box moves 0..=idy against
+    /// the scroll (`placed_origin`'s terms have slope 0 or -1 in sy), so ONE hull covers its ghost and new place; a fixed
+    /// box stays (the hull, or two rects when apart). The viewport (SR1135) when the index is not this layout's and
+    /// scroll's, an ink is unbounded, or the damage would pass half the viewport.
+    fn holder_damage(&mut self, old_sy: i32) {
+        if self.holders.0 != self.layout_epoch {
+            self.holders = (self.layout_epoch, scroll_holders(self.layout_tree.as_ref()));
+        }
+        if self.holders.1.is_empty() {
+            return;
+        }
+        let (w, h, idy) = (self.width as f32, self.height as f32, (self.scroll_y as i32 - old_sy) as f32);
+        let fresh = crate::perf::scoped() && self.index_epoch == self.layout_epoch;
+        let mut rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        for &id in &self.holders.1 {
+            let (ink, scroll) = render::subtree_ink(&[id]);
+            let Some(r) = ink.filter(|_| fresh && scroll == (self.scroll_x as i32, old_sy)) else {
+                rects = vec![(0.0, 0.0, w, h)];
+                break;
+            };
+            if r.2 <= r.0 || r.3 <= r.1 {
+                continue; // not painted by the last frame
+            }
+            let sticky = self.layout_tree.as_ref().and_then(|l| l.paint_map.get(&id)).and_then(|p| p.position_kind) == Some(4);
+            let g = (r.0, r.1 - idy, r.2, r.3 - idy);
+            if sticky || (g.1 < r.3 && r.1 < g.3) {
+                rects.push((r.0, r.1.min(g.1), r.2, r.3.max(g.3)));
+            } else {
+                rects.extend([r, g]);
+            }
+        }
+        let clip = |r: (f32, f32, f32, f32)| {
+            let (x0, y0, x1, y1) = (r.0.floor().max(0.0), r.1.floor().max(0.0), r.2.ceil().min(w), r.3.ceil().min(h));
+            (x1 > x0 && y1 > y0).then(|| (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+        };
+        let mut out: Vec<(u32, u32, u32, u32)> = rects.into_iter().filter_map(clip).collect();
+        let area = out.iter().map(|r| r.2 as u64 * r.3 as u64).sum::<u64>() + idy.abs() as u64 * self.width as u64;
+        if area * 2 > self.width as u64 * self.height as u64 {
+            self.damage_rects.pop(); // the strip the caller pushed just before: SR1135's damage is the viewport alone
+            out = vec![(0, 0, self.width, self.height)];
+        }
+        self.damage_rects.extend(out);
+    }
 }
