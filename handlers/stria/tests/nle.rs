@@ -12053,3 +12053,67 @@ fn striamultiselectnext_shift_click_member_keeps_primary() {
     assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 0), (0, 2)]), "B out, the primary kept");
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0), "view-only");
 }
+
+// ---- STRIATHUMBNAILSNEXT (LEDGER SR997): heads and peak tables decoded off the face's thread (named tail block) ----
+
+/// STRIATHUMBNAILSNEXT (SR997): a face decoding off its thread paints its first frame with no head (the jobs queued, the face
+/// pending); once the worker settles it holds the three heads (the preview road's frames) and its next paint is a synchronous
+/// face's first paint, byte for byte.
+#[test]
+fn striathumbnailsnext_heads_decode_off_the_face_thread() {
+    let (tl, src) = synth_fixture();
+    let expect = striathumbnails_expected(&tl, &src, SourceId(0), 13);
+    let (tl2, src2) = synth_fixture();
+    let mut sync = Face::new(EditorState::new(tl2), src2, (320, 160), PixelOrder::Rgba, false);
+    let want = sync.paint();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.decode_off_thread();
+    assert!(face.bg_running());
+    let first = face.paint();
+    assert_eq!(face.thumb_decodes(), 0, "the first paint decodes no head on the face's thread");
+    assert!(face.thumb(SourceId(0), 13).is_none(), "the placeholder holds the bar");
+    assert!(face.thumbs_pending(), "jobs out: serve's clock keeps running");
+    face.bg_settle();
+    assert_eq!(face.thumb_decodes(), 3, "the worker decoded the three heads once");
+    assert_eq!(face.thumb(SourceId(0), 13), Some(&expect), "the worker's head is the preview road's src_in frame");
+    let second = face.paint();
+    assert!(!face.thumbs_pending());
+    assert_ne!(first, second, "the heads and peaks landed");
+    assert_eq!(second, want, "the settled face paints the synchronous face's frame");
+    println!("striathumbnailsnext: first paint decodes=0 pending=1, settled decodes={} second==sync", face.thumb_decodes());
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): the peak scans go to the worker too: none after the first paint, then the synchronous face's
+/// scans and tables once settled.
+#[test]
+fn striathumbnailsnext_peaks_scan_off_the_face_thread() {
+    let (tl2, src2) = synth_fixture();
+    let mut sync = Face::new(EditorState::new(tl2), src2, (320, 160), PixelOrder::Rgba, false);
+    let _ = sync.paint();
+    assert!(sync.wave_scans() > 0);
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.decode_off_thread();
+    let _ = face.paint();
+    assert_eq!(face.wave_scans(), 0, "no scan on the face's thread");
+    assert!(face.wave_peaks(SourceId(0)).is_none());
+    face.bg_settle();
+    assert_eq!(face.wave_scans(), sync.wave_scans());
+    for id in [SourceId(0), SourceId(1)] {
+        assert_eq!(face.wave_peaks(id), sync.wave_peaks(id), "source {id:?}'s table");
+    }
+    println!("striathumbnailsnext: settled scans={}", face.wave_scans());
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): a face nobody serves starts no worker and decodes inside the paint as before.
+#[test]
+fn striathumbnailsnext_unserved_face_stays_synchronous() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(!face.bg_running());
+    let _ = face.paint();
+    assert_eq!(face.thumb_decodes(), 3);
+    assert!(!face.thumbs_pending());
+    face.bg_settle();
+    assert_eq!(face.thumb_decodes(), 3, "settling a face with no worker is a no-op");
+}
