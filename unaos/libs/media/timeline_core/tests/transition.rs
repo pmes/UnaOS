@@ -833,3 +833,62 @@ fn nle3etrimgrow_the_want_line_round_trips_byte_exact_and_refuses_by_name() {
     let orphan = NLE3ETRIMGROW_EDL.replace(first, &format!("{first}* UNA WANT 9\n"));
     assert_eq!(edl::parse(&orphan, 25), Err(EdlError::Syntax { line: 9 }));
 }
+
+// ---- STRIATRANSITIONLENGTH (LEDGER SR870): the `dur <n>` word (named tail block) ----
+
+/// `cuts` with a 4-tick dissolve into B at 20, eased In, selected.
+fn striatransitionlength_state() -> timeline_core::editor::EditorState {
+    let tl = cuts().add_transition(0, 20, TransitionKind::Dissolve, 4).unwrap();
+    let mut st = timeline_core::editor::EditorState::new(tl);
+    st.select_transition(0, 0).unwrap();
+    st.set_transition_ease(timeline_core::Ease::In).unwrap();
+    st
+}
+
+#[test]
+fn striatransitionlength_dur_word_sets_the_length() {
+    let mut st = striatransitionlength_state();
+    let (tl0, depth) = (st.timeline.clone(), st.undo_depth());
+    assert_eq!(st.verb("dur 7"), Some(Ok(())));
+    let want = tl0.add_transition(0, 20, TransitionKind::Dissolve, 7).unwrap();
+    assert_eq!(st.timeline, want, "the add op at the same cut, the ease kept");
+    assert_eq!(st.timeline.tracks[0].transitions[0].ease, timeline_core::Ease::In);
+    assert_eq!((st.transition, st.undo_depth()), (Some((0, 0)), depth + 1), "one undo step, the selection kept");
+    assert_eq!(st.verb("dur 7"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), depth + 1, "the same length commits nothing");
+    let text = edl::write(&st.timeline, "SR870").unwrap();
+    assert!(text.contains(" D    007 "), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap().tracks[0].transitions, st.timeline.tracks[0].transitions);
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl0);
+    // from black: the length change keeps `from_black`
+    let fb = cuts().add_transition_from_black(0, 0, TransitionKind::Dissolve, 4).unwrap();
+    let mut st = timeline_core::editor::EditorState::new(fb.clone());
+    st.select_transition(0, 0).unwrap();
+    assert_eq!(st.verb("dur 6"), Some(Ok(())));
+    assert_eq!(st.timeline, fb.add_transition_from_black(0, 0, TransitionKind::Dissolve, 6).unwrap());
+    assert!(st.timeline.tracks[0].transitions[0].from_black);
+}
+
+#[test]
+fn striatransitionlength_dur_refusals_by_name() {
+    let mut none = timeline_core::editor::EditorState::new(cuts().add_transition(0, 20, TransitionKind::Dissolve, 4).unwrap());
+    let before = none.clone();
+    assert_eq!(none.verb("dur 7"), Some(Err(EditError::Transition)), "no transition selected");
+    assert_eq!(none, before);
+    let mut st = striatransitionlength_state();
+    for (v, e) in [
+        ("dur", EditError::Transition),
+        ("dur x", EditError::Transition),
+        ("dur 7 8", EditError::Transition),
+        ("dur 0", EditError::Transition),
+        ("dur -3", EditError::Transition),
+        ("dur 21", EditError::Handle),
+    ] {
+        let before = st.clone();
+        assert_eq!(st.verb(v), Some(Err(e)), "{v}");
+        assert_eq!(st, before, "{v}");
+    }
+    assert_eq!(st.verb("durx 3"), None);
+    assert_eq!(st.verb("play"), None);
+}

@@ -3551,3 +3551,28 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIATRANSITIONLENGTH (LEDGER SR870): the face reaches `dur <n>` through timeline_core's verb (named tail block) ----
+
+/// M3: typed `dur 6` (the surface's Input) with no transition selected is refused by name; selected, the dissolve is 6
+/// ticks in ONE undo step and the thumbnail's key carries it; `[` then steps the new length (the face's existing road).
+#[test]
+fn striatransitionlength_face_dur_input() {
+    use bandy::SMessage;
+    use stria::nle_face::SURFACE;
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |t: &str| SMessage::Input { target: SURFACE.into(), text: t.into() };
+    assert!(face.on(&input("dur 6")));
+    assert_eq!(face.last_error.take(), Some(format!("dur 6: {}", timeline_core::EditError::Transition)));
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select_transition(0, 0).unwrap();
+    assert!(face.on(&input("dur 6")));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline, tl0.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 6).unwrap());
+    assert_eq!(face.state.undo_depth(), 1);
+    assert_eq!(face.transition_key().map(|k| k.2), Some(6));
+    assert!(face.verb("["));
+    assert_eq!(face.state.selected_transition().map(|x| x.dur), Some(5));
+}
