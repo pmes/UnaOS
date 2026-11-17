@@ -517,7 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
-        button("link", "Link"), button("unlink", "Unlink"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
+        button("link", "Link"), button("unlink", "Unlink"), button("unlink-all", "Unlink all"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -933,6 +933,25 @@ mod striacliplink_tests {
         let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let ids: Vec<&str> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => "" }).collect();
-        assert_eq!(&ids[ids.len() - 3..], ["link", "unlink", "help"]);
+        assert_eq!(&ids[ids.len() - 4..], ["link", "unlink", "unlink-all", "help"]); // STRIALINKAUTO (SR911): `unlink-all` before help
+    }
+}
+
+// ---- STRIALINKAUTO (LEDGER SR911): the `unlink-all` button through `--do` (named tail block) ----
+#[cfg(test)]
+mod strialinkauto_tests {
+    use super::*;
+
+    /// `--do unlink-all` parts every link of the face's timeline in one step; the button sits just before `help`.
+    #[test]
+    fn strialinkauto_do_unlink_all_button() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl.link_av()), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "unlink-all");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.state.timeline.clone(), f.state.undo_depth()), (tl, 1));
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        assert_eq!(row.len(), nle_face::VERBS.len());
     }
 }
