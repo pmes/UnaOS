@@ -576,11 +576,11 @@ fn css_wide_all_keeps_direction() {
     }
 }
 
-/// AETHERCSSWIDEALL (SR1021): a non-CSS-wide value is invalid and `revert` is dropped (owed): the style is untouched.
+/// AETHERCSSWIDEALL (SR1021): a non-CSS-wide value is invalid and `revert-layer` is dropped (owed): the style is untouched.
 #[test]
 fn css_wide_all_bogus_dropped() {
     let before = styled(&all_armed());
-    for v in ["bogus", "revert", "revert-layer", "red", ""] {
+    for v in ["bogus", /* SR1028: revert built */ "revert-layer", "red", ""] {
         let mut d = all_armed().to_vec();
         d.push(("all", v));
         let s = styled(&d);
@@ -672,4 +672,111 @@ fn css_wide_all_list_covers_arms() {
         assert!(names.iter().any(|x| x == n), "{n:?} is listed but no arm parses it");
     }
     assert!(!ALL_LONGHANDS.contains(&"direction"), "direction is excluded (css-cascade-4 §3.1)");
+}
+
+// ---- AETHERCSSWIDEREVERT (LEDGER SR1028): css-cascade-4 §7.3.2 revert rolls an inherit-bit field back to the tag road (named tail block) ----
+
+use layout_core::paint::{INHERIT_FONT, INHERIT_LINE_HEIGHT, INHERIT_WHITE_SPACE};
+
+/// AETHERCSSWIDEREVERT (SR1028): `color: revert` in a later rule erases the earlier red through the merge (None, no
+/// inherit bit: the tag road: the `a` link blue, a control's black, else the parent); the armed twin keeps red.
+#[test]
+fn css_wide_revert_color_erases_earlier_rule() {
+    assert_eq!(cascade(&[&[("color", "red")]]).paint.color, Some(ALL_RED), "armed: red");
+    for kw in ["revert", "REVERT"] {
+        let s = cascade(&[&[("color", "red")], &[("color", kw)]]);
+        assert_eq!(s.paint.color, None, "color: {kw} after red: the field goes");
+        assert!(!s.paint.inherits(INHERIT_COLOR), "color: {kw}: no inherit bit, the tag road");
+        assert_eq!(s.paint.revert & INHERIT_COLOR, INHERIT_COLOR, "color: {kw}: the mark carries the erase");
+    }
+    let s = cascade(&[&[("color", "red")], &[("color", "revert")], &[("font-weight", "bold")]]);
+    assert_eq!(s.paint.color, None, "an unrelated later rule keeps the erase");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): in one block and across rules the later of value / revert wins.
+#[test]
+fn css_wide_revert_order() {
+    let s = styled(&[("color", "revert"), ("color", "red")]);
+    assert_eq!(s.paint.color, Some(ALL_RED), "a later value in the block wins");
+    let s = cascade(&[&[("color", "revert")], &[("color", "red")]]);
+    assert_eq!(s.paint.color, Some(ALL_RED), "a later rule's value wins");
+    assert_eq!(s.paint.revert & INHERIT_COLOR, 0, "the value clears the mark");
+    let s = cascade(&[&[("color", "blue")], &[("color", "red"), ("color", "revert")]]);
+    assert_eq!(s.paint.color, None, "red then revert in a later block erases the earlier blue");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): inherit and revert: the later wins, in a block and across rules.
+#[test]
+fn css_wide_revert_inherit_both_orders() {
+    let s = cascade(&[&[("color", "inherit")], &[("color", "revert")]]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "revert after inherit drops the bit");
+    let s = cascade(&[&[("color", "revert")], &[("color", "inherit")]]);
+    assert!(s.paint.inherits(INHERIT_COLOR), "inherit after revert sets the bit");
+    assert_eq!(s.paint.revert & INHERIT_COLOR, 0, "and clears the mark");
+    let s = styled(&[("color", "inherit"), ("color", "revert")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR) && s.paint.color.is_none(), "one block: revert last");
+    let s = styled(&[("color", "revert"), ("color", "inherit")]);
+    assert!(s.paint.inherits(INHERIT_COLOR), "one block: inherit last");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): `white-space: revert` clears the arm's pair (white_space and nowrap), so `pre` takes
+/// `default_white_space` again; `line-height: revert` is None (was `normal`, SR843's pin flipped).
+#[test]
+fn css_wide_revert_white_space_and_line_height() {
+    let armed = cascade(&[&[("white-space", "normal")]]);
+    assert!(armed.paint.white_space.is_some(), "armed: normal is a value");
+    let s = cascade(&[&[("white-space", "normal")], &[("white-space", "revert")]]);
+    assert_eq!((s.paint.white_space, s.paint.nowrap), (None, None), "white-space: revert clears both fields");
+    assert!(!s.paint.inherits(INHERIT_WHITE_SPACE), "the tag road, not inherit");
+    let s = cascade(&[&[("line-height", "2")], &[("line-height", "revert")]]);
+    assert_eq!(s.paint.line_height, None, "line-height: revert erases the 2");
+    assert!(!s.paint.inherits(INHERIT_LINE_HEIGHT), "no bit");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): the six sizes have no tag road, so revert == initial: auto, beating the earlier rule.
+#[test]
+fn css_wide_revert_sizes_auto() {
+    let s = cascade(&[&[("width", "100px")], &[("width", "revert")]]);
+    assert_eq!(s.width, styled(&[("width", "auto")]).width, "width: revert is auto");
+    assert_ne!(cascade(&[&[("width", "100px")]]).width, s.width, "the earlier 100px (armed)");
+    for prop in ["height", "min-width", "min-height", "max-width", "max-height"] {
+        let s = cascade(&[&[(prop, "100px")], &[(prop, "revert")]]);
+        let auto = styled(&[(prop, "auto")]);
+        let got = match prop { "height" => s.height, "min-width" => s.min_width, "min-height" => s.min_height, "max-width" => s.max_width, _ => s.max_height };
+        let want = match prop { "height" => auto.height, "min-width" => auto.min_width, "min-height" => auto.min_height, "max-width" => auto.max_width, _ => auto.max_height };
+        assert_eq!(got, want, "{prop}: revert is auto");
+    }
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): owed AETHER-CSS-WIDE-REVERT-NONINHERITED: margin / display revert stay dropped (their
+/// UA value is the tag road, `ua_margin` / the display table, which no Some reaches): pinned as today.
+#[test]
+fn css_wide_revert_noninherited_dropped_owed() {
+    let before = cascade(&[&[("margin-left", "20px"), ("display", "block")]]);
+    let s = cascade(&[&[("margin-left", "20px"), ("display", "block")], &[("margin-left", "revert"), ("display", "revert")]]);
+    assert_eq!(s.margin[3], before.margin[3], "margin-left: revert keeps 20px (owed)");
+    assert_eq!(s.paint.display_kind, before.paint.display_kind, "display: revert keeps block (owed)");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): `font: revert` reverts the seven font fields (no bits, the mark set).
+#[test]
+fn css_wide_revert_font_shorthand() {
+    let s = cascade(&[&[("font-style", "italic"), ("font-size", "20px"), ("font-family", "serif"), ("font-weight", "bold")], &[("font", "revert")]]);
+    assert_eq!((s.paint.italic, s.paint.font_size, s.paint.family, s.paint.weight.is_some()), (None, None, None, false), "font: revert clears the fields");
+    assert_eq!(s.paint.inherit & INHERIT_FONT, 0, "no inherit bits");
+    assert_eq!(s.paint.revert & INHERIT_FONT, INHERIT_FONT, "the seven marks");
+}
+
+/// AETHERCSSWIDEREVERT (SR1028): `all: revert` rides SR1021's loop: colour / weight reverted, width auto, direction kept;
+/// `all: revert-layer` stays dropped (AETHER-CSS-WIDE-REVERT-LAYER owed).
+#[test]
+fn css_wide_revert_all() {
+    let armed: &[(&str, &str)] = &[("color", "red"), ("font-weight", "bold"), ("width", "10px"), ("direction", "rtl")];
+    let s = cascade(&[armed, &[("all", "revert")]]);
+    assert_eq!(s.paint.color, None, "all: revert: colour");
+    assert!(s.paint.weight.is_none() && !s.paint.inherits(INHERIT_WEIGHT), "all: revert: weight to the tag road");
+    assert_eq!(s.width, styled(&[("width", "auto")]).width, "all: revert: width auto");
+    assert_eq!(s.paint.rtl, Some(true), "direction survives all: revert");
+    let s = cascade(&[armed, &[("all", "revert-layer")]]);
+    assert_eq!(s.paint.color, Some(ALL_RED), "all: revert-layer is dropped (owed)");
 }

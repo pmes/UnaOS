@@ -25,7 +25,7 @@ fn author_zero_is_the_zero_marker() {
 
 #[test]
 fn normal_keeps_zero_point_zero() {
-    for v in ["normal", "initial", "revert"] {
+    for v in ["normal", "initial" /* SR1028: revert is the tag road, None */] {
         assert_eq!(lh(&[("line-height", v)]), Some(0.0), "line-height: {v}");
     }
     assert_ne!(LINE_HEIGHT_ZERO, 0.0, "the marker is not the normal sentinel");

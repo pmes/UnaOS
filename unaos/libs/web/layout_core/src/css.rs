@@ -3631,7 +3631,7 @@ fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>,
 /// line-height back) then None, font-family None; the size takes the parent-relative road `smaller` / `larger` use
 /// (font_size None, font_size_rel (0, 1.0)), because a None size is the tag's code default (13.333 px on a control),
 /// not the parent's. `initial` is SR805's reset ([`reset_font_prefix`], [`reset_font_shorthand_rest`] at `medium`)
-/// plus the standard family. `revert` (no UA cascade layer is modelled) and the system fonts are dropped as before.
+/// plus the standard family. `revert` (SR1028) reverts the seven fields to their tag roads; the system fonts are dropped.
 /// AETHERCSSWIDELONGHANDS (SR815): inherit / unset write the seven explicit inherit bits (`PaintStyle::set_inherit`).
 fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     match kw {
@@ -3644,7 +3644,7 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
             reset_font_shorthand_rest("medium", style, cx);
             style.paint.family = Some(crate::STANDARD);
         }
-        _ => {} // revert and the six system fonts: dropped (AETHER-CSS-WIDE-REVERT, AETHER-FONT-SHORTHAND-SYSTEM owed)
+        "revert" => { apply_declaration("line-height", "revert", style, cx); style.paint.set_revert(crate::paint::INHERIT_FONT); } _ => {} // SR1028: revert -> each font field's tag road; the six system fonts: dropped (AETHER-FONT-SHORTHAND-SYSTEM owed)
     }
 }
 
@@ -3657,7 +3657,7 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
 /// AETHERCSSWIDECOLOR (SR823): renamed from `font_css_wide`: every property with an inherit bit (`color` too); each is
 /// inherited, so `unset` == `inherit` (css-cascade-4 §7.3.3).
 fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool {
-    let bit = crate::paint::inherit_bit(prop);
+    let bit = crate::paint::inherit_bit(prop); if bit != 0 && value.eq_ignore_ascii_case("revert") { paint.set_revert(bit); return true; } // AETHERCSSWIDEREVERT (SR1028): revert -> the tag road
     if bit == 0 || !(value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") || (bit == crate::paint::INHERIT_COLOR && value.eq_ignore_ascii_case("currentcolor"))) { // AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2 color: currentcolor == inherit
         return false;
     }
@@ -3675,13 +3675,13 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
 /// Some: margin / padding / background-color from `anim::initial_value` (its table not widened); `display` inline;
 /// the sizes `auto` (max-width / max-height too: taffy's auto max is no maximum, `parse_dimension_str` has no `none`);
 /// the border family and border styles `none`; `border-width` 3px (medium); `background` transparent (its image,
-/// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is not
-/// rewritten (author-origin revert rolls back to the UA origin, which Aether keeps on the tag road:
-/// AETHER-CSS-WIDE-REVERT-UA owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
+/// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is
+/// rewritten for the six sizes only (no tag road: SR1028); elsewhere the UA value is the tag road, which no Some
+/// reaches, so it stays dropped (AETHER-CSS-WIDE-REVERT-NONINHERITED owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
 /// AETHERCSSWIDENONINHERITEDREST (SR848): opacity / transform / flex-grow / flex-shrink through the same anim call; position static, float / clear none, overflow visible, z-index and the insets auto, flex-direction row, flex-wrap nowrap, flex-flow `row nowrap`, flex-basis auto, flex `0 1 auto`, align-items / justify-content normal, gap / row-gap 0px, background-repeat / -position / -size repeat / `0% 0%` / auto; not column-gap (AETHER-CSS-WIDE-COLUMN-GAP-NORMAL), align-content (AETHER-CSS-ALIGN-CONTENT-FIELD) or the background shorthand's image layers (AETHER-CSS-WIDE-BACKGROUND-IMAGE-NONE).
 /// AETHERCSSWIDEBACKGROUNDIMAGENONE (SR1015): `background` and `background-image` rewrite to `none`, which the arms now write as an explicit no-image (`bg_image_clear`, `bg_shorthand_none`), so `background: initial` resets the image, the colour and the repeat / position / size layers.
 fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
-    if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset")) {
+    if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset") || (value.eq_ignore_ascii_case("revert") && matches!(prop, "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height"))) { // SR1028: no tag road for the sizes, so revert == initial
         return value;
     }
     match prop {
@@ -4080,17 +4080,17 @@ pub const ALL_SKIPPED: &[&str] = &[
 /// AETHERCSSWIDEALL (SR1021): `all: inherit | initial | unset` applies the keyword to each of [`ALL_LONGHANDS`] through
 /// [`apply_declaration`] itself, so each rides its own road: the inherit bits (SR815 / SR823 / SR831) and SR832's
 /// [`noninherited_initial`] table; an arm with no keyword road drops it as when the keyword is written alone. The later
-/// declaration wins through the same field writes. `revert` / `revert-layer` are dropped as every arm drops them
-/// (AETHER-CSS-WIDE-REVERT owed); any other value is invalid: dropped and recorded.
+/// declaration wins through the same field writes. `revert` (SR1028) rides the same loop (`css_wide`'s revert road);
+/// `revert-layer` is dropped (AETHER-CSS-WIDE-REVERT-LAYER owed); any other value is invalid: dropped and recorded.
 fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     let kw = value.trim().to_ascii_lowercase();
     match kw.as_str() {
-        "inherit" | "initial" | "unset" => {
+        "inherit" | "initial" | "unset" | "revert" => {
             for &name in ALL_LONGHANDS {
                 apply_declaration(name, &kw, style, cx);
             }
         }
-        "revert" | "revert-layer" => {}
+        "revert-layer" => {}
         _ => H::record_css(&format!("all-value:{}", clip(value))),
     }
 }
