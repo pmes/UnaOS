@@ -596,7 +596,7 @@ fn draw_shaped(
 ) -> f32 {
     // AETHERPAINTPERF (SR130): the same run at the same pen (exact bits), size, spacing, direction, colour and font
     // set draws the same coverage: replay the pixels the rasterizer emitted, through the same clip, in order.
-    if adv.small_caps { return small_caps_shaped(text, adv, origin_x, baseline_y, color, surface, width, height, damage_rects, clip); } let key = crate::perf::scoped().then(|| glyphcache::key(text, adv, origin_x, baseline_y, color));
+    if adv.small_caps != 0 { return small_caps_shaped(text, adv, origin_x, baseline_y, color, surface, width, height, damage_rects, clip); } let key = crate::perf::scoped().then(|| glyphcache::key(text, adv, origin_x, baseline_y, color));
     if let Some(run) = key.as_ref().and_then(glyphcache::get) {
         crate::perf::add_glyph(true);
         for &(px, py, a) in &run.px {
@@ -650,7 +650,7 @@ fn draw_text_shadows(
     text: &str, adv: &Advancer, origin_x: f32, baseline_y: f32, shadows: &[effects::Shadow],
     surface: &mut [u8], width: u32, height: u32, damage_rects: &[(u32, u32, u32, u32)], clip: Clip,
 ) {
-    if adv.small_caps { return small_caps_shadows(text, adv, origin_x, baseline_y, shadows, surface, width, height, damage_rects, clip); } if shadows.is_empty() {
+    if adv.small_caps != 0 { return small_caps_shadows(text, adv, origin_x, baseline_y, shadows, surface, width, height, damage_rects, clip); } if shadows.is_empty() {
         return;
     }
     let placed = adv.place(text);
