@@ -305,16 +305,16 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.blit_fit(s, 0, 0, w, l.preview_h);
     }
     // The ruler: a short mark per tick when they are 4 px apart, a long one per second.
-    let fps = tl.fps().unwrap_or(25).max(1) as i64;
+    let fps = tl.fps().or(edl::ntsc_nominal(tl.tb)).unwrap_or(25).max(1) as i64; // STRIATCTHREE (SR9030): an NTSC base rules at its nominal (file tail)
     let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
     c.rect(0, ry, w as i64, ty, RULER);
     let t_end = l.tick_at(w as f64) + 1;
     for t in l.t0..=t_end {
         let x = l.x_of(t);
-        if t % fps == 0 {
+        if ruler_second(tl, t, fps) { // STRIATCTHREE (SR9030): a drop-frame base marks where the label's second changes (file tail)
             c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
             if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60) {
-                text.text(&mut c, &edl::timecode(t, fps as u32), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32));
+                text.text(&mut c, &ruler_tc(tl, t, fps), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32)); // STRIATCTHREE (SR9030): drop-frame labels on a drop-frame base (file tail)
             }
         } else if l.zoom >= 4 {
             c.rect(x, ty - 3, x + 1, ty, TICK);
@@ -1187,5 +1187,67 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIATCTHREE (LEDGER SR9030): the ruler reads a drop-frame base (named tail block) ----
+// `paint_in` rules a 30000/1001 or 60000/1001 timeline at its nominal: a long mark (and label) where the drop-frame label's
+// whole second changes (`edl::drop_number`), so the marks sit on `;00` (or `;02` / `;04` past a minute) labels, the text
+// through `edl::timecode_drop`. A `1/n` base takes today's expressions (`t % fps == 0`, `edl::timecode`): every golden holds.
+
+/// STRIATCTHREE (SR9030): whether tick `t` takes the ruler's long mark (`fps` the rate `paint_in` rules at).
+fn ruler_second(tl: &Timeline, t: i64, fps: i64) -> bool {
+    match edl::ntsc_nominal(tl.tb).filter(|k| tl.fps().is_none() && (*k == 30 || *k == 60)) {
+        Some(k) => t == 0 || edl::drop_number(t, k) / k as i64 != edl::drop_number(t - 1, k) / k as i64,
+        None => t % fps == 0,
+    }
+}
+
+/// STRIATCTHREE (SR9030): the ruler's label at tick `t`: drop-frame on a drop-frame base, else `edl::timecode`.
+fn ruler_tc(tl: &Timeline, t: i64, fps: i64) -> alloc::string::String {
+    match edl::ntsc_nominal(tl.tb).filter(|k| tl.fps().is_none() && (*k == 30 || *k == 60)) {
+        Some(k) => edl::timecode_drop(t, k),
+        None => edl::timecode(t, fps as u32),
+    }
+}
+
+#[cfg(test)]
+mod striatcthree_tests {
+    use super::*;
+    use crate::{Clip, Kind, Timebase};
+
+    struct Rec(Vec<(alloc::string::String, f32)>);
+    impl Text for Rec {
+        fn text(&mut self, _: &mut Canvas, s: &str, x: f32, _: f32, _: (i32, i32)) {
+            self.0.push((alloc::string::String::from(s), x));
+        }
+    }
+
+    /// STRIATCTHREE (SR9030) M3: a 30000/1001 timeline's ruler labels read drop-frame, and the long mark past the first minute
+    /// is tick 1800 labelled `00:01:00;02` (no mark on the skipped `;00` / `;01`); the same ticks on 1/30 read non-drop.
+    #[test]
+    fn striatcthree_ruler_reads_drop_frame() {
+        let mut tl = Timeline::new(30);
+        let a = tl.add_source("A", 4000);
+        let v = tl.add_track(Kind::Video);
+        tl.tracks[v].clips.push(Clip::new(a, 0, 4000, 0));
+        let mut st = EditorState::new(tl.clone());
+        let mut l = Layout::of(640, 200, &st);
+        l.zoom = 4;
+        l.t0 = 1770;
+        let labels = |st: &EditorState| {
+            let mut r = Rec(Vec::new());
+            paint_in(st, l, Order::Rgba, Some(&mut r as &mut dyn Text), None);
+            r.0.into_iter().map(|x| x.0).filter(|s| s.len() == 11 && s.as_bytes()[2] == b':').collect::<Vec<_>>()
+        };
+        let ndf = labels(&st);
+        assert!(ndf.contains(&alloc::string::String::from("00:01:00:00")), "{ndf:?}");
+        st.timeline.tb = Timebase { num: 1001, den: 30000 };
+        let df = labels(&st);
+        assert_eq!(df.first().map(|s| s.as_str()), Some("00:00:59;00"), "{df:?}");
+        assert!(df.contains(&alloc::string::String::from("00:01:00;02")), "{df:?}");
+        assert!(df.iter().all(|s| s.as_bytes()[8] == b';'), "{df:?}");
+        assert!(ruler_second(&st.timeline, 1800, 30) && !ruler_second(&st.timeline, 1799, 30) && !ruler_second(&st.timeline, 1801, 30));
+        assert!(ruler_second(&st.timeline, 1770, 30), "00:00:59;00 is a whole second");
     }
 }

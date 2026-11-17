@@ -308,7 +308,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
     use tokio::sync::broadcast::error::RecvError;
     for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
-    let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
+    let mut clock = tokio::time::interval(Duration::from_nanos(clock_ns(face.state.timeline.tb, fps))); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst); STRIATCTHREE (SR9030): `clock_ns` plays an NTSC base at its real rate (file tail)
     loop {
         tokio::select! {
             m = rx.recv() => match m {
@@ -3290,5 +3290,30 @@ mod striatcmore_tests {
             assert_eq!(tc_text_tb(312, Timebase { num: 1, den: 25 }, 25, u), tc_text(312, 25, u));
             assert_eq!(tc_text_tb(312, Timebase { num: 1, den: 1000 }, 25, u), tc_text(312, 25, u), "any other base: the fallback");
         }
+    }
+}
+
+// ---- STRIATCTHREE (LEDGER SR9030): the play clock reads an NTSC time base (named tail block) ----
+// `serve`'s clock stepped a 30000/1001 timeline (now read from a drop-frame EDL) at the fallback 25 fps. An NTSC base
+// `1001/(k*1000)` ticks every `tb.to_ns(1)`; every other base is `1_000_000_000 / fps` as before (byte-identical).
+
+/// STRIATCTHREE (SR9030): the face clock's period (ns) for time base `tb`; `fps` is the rate for any base that is not NTSC.
+pub fn clock_ns(tb: timeline_core::Timebase, fps: u32) -> u64 {
+    if timeline_core::edl::ntsc_nominal(tb).is_some() { tb.to_ns(1).max(1) as u64 } else { 1_000_000_000 / fps.max(1) as u64 }
+}
+
+#[cfg(test)]
+mod striatcthree_tests {
+    use super::*;
+    use timeline_core::Timebase;
+
+    /// STRIATCTHREE (SR9030) M3: 30000/1001 ticks every 33_366_667 ns, 60000/1001 every 16_683_333 ns; a 1/n base is today's
+    /// `1_000_000_000 / fps`.
+    #[test]
+    fn striatcthree_clock_reads_ntsc() {
+        assert_eq!(clock_ns(Timebase { num: 1001, den: 30000 }, 25), 33_366_667);
+        assert_eq!(clock_ns(Timebase { num: 1001, den: 60000 }, 25), 16_683_333);
+        assert_eq!(clock_ns(Timebase { num: 1, den: 25 }, 25), 40_000_000);
+        assert_eq!(clock_ns(Timebase { num: 1, den: 30 }, 30), 1_000_000_000 / 30);
     }
 }
