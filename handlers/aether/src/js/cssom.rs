@@ -3144,7 +3144,7 @@ fn shorthand_from(sh: &str, value_of: impl Fn(&str) -> String) -> Option<String>
 /// read. None where a longhand has no computed value or the grammar does not serialize (border with no colour row;
 /// owed AETHER-CSSOM-BORDER-COMPUTED).
 fn shorthand_computed(el: usize, sh: &str) -> Option<String> {
-    shorthand_from(sh, |l| computed_value(el, l))
+    if sh == "outline" { return outline_computed(el); } shorthand_from(sh, |l| computed_value(el, l))
 }
 
 #[cfg(test)]
@@ -3198,7 +3198,7 @@ mod shorthand_computed_tests {
             // have a longhand with no computed row, so they read "".
             ("a", "border", ""),
             ("a", "border-color", "rgb(0, 0, 0)"), // SR1104: the four colour longhands are report columns, so border-color composes
-            ("a", "outline", ""),
+            ("a", "outline", "rgb(0, 0, 0) none 0px"), // SR1124: the three outline longhands are report columns; Chromium's computed form
             ("a", "background", ""),
             ("o", "overflow", "hidden visible"),
             // SR1100: a fully declared box shorthand composes from its report columns before the cascaded road (Chromium's resolved px).
@@ -3231,7 +3231,7 @@ mod shorthand_computed_before_cascade_tests {
     #[test]
     fn shorthand_computed_before_cascade_covered_rows() {
         let covered: Vec<&str> = SHORTHANDS.iter().map(|(s, _)| *s).filter(|s| report_covered(s)).collect();
-        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding"]); // SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
+        assert_eq!(covered, vec!["border-width", "border-style", "border-color", "border-top", "border-right", "border-bottom", "border-left", "margin", "padding", "outline"]); // SR1124: outline too; SR1103 / SR1104 (fold compose): the side style and colour columns cover the three four-value rows and the four side rows
         for sh in ["border", "gap", "inset", "overflow", "font-synthesis", "not-a-shorthand"] {
             assert!(!report_covered(sh), "{sh}: not covered");
         }
@@ -3315,4 +3315,13 @@ fn inside_scrollers(f: &Flushed, id: NodeId, x: f64, y: f64, scroll: (f64, f64))
             x >= bx + b.0 as f64 && x < bx + bw - b.2 as f64 && y >= by + b.1 as f64 && y < by + bh - b.3 as f64
         })
     })
+}
+
+// ---- AETHERCSSOMOUTLINECOLUMNS (LEDGER SR1124): the computed `outline` in Chromium's form (named tail block) ----
+
+/// AETHERCSSOMOUTLINECOLUMNS (SR1124): getComputedStyle's `outline` is its three longhands' computed values in the
+/// [`SHORTHANDS`] row's order (color style width), every one written (Chromium: `rgb(0, 0, 0) none 0px` unset), never
+/// [`serialize_shorthand`]'s declared-block grammar, which drops medium / none / currentcolor and puts the width first.
+fn outline_computed(el: usize) -> Option<String> {
+    Some(longhands("outline")?.iter().map(|l| computed_value(el, l)).collect::<Vec<_>>().join(" "))
 }

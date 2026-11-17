@@ -6625,7 +6625,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7833,7 +7833,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8669,11 +8669,11 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "45"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "49"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
@@ -9749,6 +9749,69 @@ b</div>
         assert_eq!(css_wide_color_ink(&mut e, "oa", css_wide_red), 0, "armed: #oa's alpha-0 outline-color paints no red");
         assert_eq!(css_wide_color_ink(&mut e, "ob", css_wide_red), 0, "#ob: the alpha-0 shorthand paints no red");
         assert_eq!(font_shorthand_cs(&mut e, "oa", "outlineColor"), "rgba(255, 0, 0, 0)", "#oa: cssom");
+    }
+
+    // ---- AETHERCSSOMOUTLINECOLUMNS (LEDGER SR1124): four outline report columns and the computed `outline` (named tail block) ----
+
+    /// AETHERCSSOMOUTLINECOLUMNS (SR1124): one div per case: `#o1` `outline: 2px solid red`, `#o2` `thick double
+    /// transparent` offset 3px, `#o3` plain, `#o4` `outline-style: dotted` alone, `#o5` `outline: 0px solid`, `#o6`
+    /// `outline-width: 4px` alone, `#o7` `color: blue; outline: 1px solid`, `#o8` colour and style without a width.
+    fn outline_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="o1" style="outline:2px solid red">a</div>
+            <div id="o2" style="outline:thick double transparent;outline-offset:3px">b</div>
+            <div id="o3">c</div>
+            <div id="o4" style="outline-style:dotted">d</div>
+            <div id="o5" style="outline:0px solid">e</div>
+            <div id="o6" style="outline-width:4px">f</div>
+            <div id="o7" style="color:blue;outline:1px solid">g</div>
+            <div id="o8" style="outline-color:red;outline-style:solid">h</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    fn outline_columns_of(e: &mut crate::AetherEngine, id: &str) -> [String; 4] {
+        ["outlineWidth", "outlineStyle", "outlineColor", "outlineOffset"].map(|p| font_shorthand_cs(&mut *e, id, p))
+    }
+
+    /// AETHERCSSOMOUTLINECOLUMNS (SR1124): the four columns read the box's own paint as the painter does (width 0px when
+    /// the style is none or the width 0, medium 3px; colour through SR1115's rgba, currentcolor the color column).
+    #[test]
+    fn outline_columns_read_paint() {
+        let mut e = outline_columns_engine();
+        assert_eq!(outline_columns_of(&mut e, "o1"), ["2px", "solid", "rgb(255, 0, 0)", "0px"], "armed: #o1 (cascaded text and \"\" before)");
+        assert_eq!(outline_columns_of(&mut e, "o2"), ["5px", "double", "rgba(0, 0, 0, 0)", "3px"], "#o2: thick, transparent, offset");
+        assert_eq!(outline_columns_of(&mut e, "o3"), ["0px", "none", "rgb(0, 0, 0)", "0px"], "armed: #o3 unset (\"\" before)");
+        assert_eq!(outline_columns_of(&mut e, "o4")[..2], ["3px", "dotted"], "#o4: medium");
+        assert_eq!(outline_columns_of(&mut e, "o5")[..2], ["0px", "solid"], "#o5: a zero width keeps its style");
+        assert_eq!(outline_columns_of(&mut e, "o6")[..2], ["0px", "none"], "#o6: a width alone computes to 0px");
+        assert_eq!(font_shorthand_cs(&mut e, "o7", "outlineColor"), "rgb(0, 0, 255)", "#o7: currentcolor is the color column");
+    }
+
+    /// AETHERCSSOMOUTLINECOLUMNS (SR1124): the computed `outline` composes color style width, all three written
+    /// (Chromium's form); a fully declared shorthand keeps its cascaded text (owed AETHER-CSSOM-OUTLINE-SHORTHAND-CASCADED).
+    #[test]
+    fn outline_columns_shorthand_computed() {
+        let mut e = outline_columns_engine();
+        let get = |e: &mut crate::AetherEngine, id: &str| font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('outline')"));
+        assert_eq!(get(&mut e, "o3"), "rgb(0, 0, 0) none 0px", "armed: #o3 unset (\"\" before)");
+        assert_eq!(get(&mut e, "o8"), "rgb(255, 0, 0) solid 3px", "#o8: the width composes from its column");
+        assert_eq!(get(&mut e, "o1"), "rgb(255, 0, 0) solid 2px", "#o1: SR1100 (fold compose): a report-covered shorthand composes before the cascaded road, Chromium's form");
+    }
+
+    /// AETHERCSSOMOUTLINECOLUMNS (SR1124): the four columns sit at 45..49, after SR1108's.
+    #[test]
+    fn outline_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 49);
+        assert_eq!(&crate::css::REPORT_PROPS[45..], &["outline-width", "outline-style", "outline-color", "outline-offset"]);
+        let mut e = outline_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('o3')).length)"), "49");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('o3')).item(48)"), "outline-offset");
     }
 
     // ---- AETHERCSSSTICKYSCROLLBLITDAMAGE (LEDGER SR1135): a short scroll repaints the whole viewport when a box holds its place (named tail block) ----
@@ -11467,14 +11530,14 @@ b</div>
     #[test]
     fn box_side_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
         assert_eq!(
             &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
             &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
         );
         let mut e = box_side_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "45"); // SR1103; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "49"); // SR1103; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
     }
 
@@ -11724,11 +11787,11 @@ b</div>
     #[test]
     fn border_side_style_columns_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]); // SR1104: the three colour columns follow at 37..40
         let mut e = border_side_style_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "49"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
     }
 
@@ -11782,12 +11845,12 @@ b</div>
     #[test]
     fn border_side_color_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(crate::css::REPORT_PROPS[16], "border-left-color");
         assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]);
         assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]); // SR1108: five text-decoration / caret columns, 45
         let mut e = border_side_color_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "49"); // SR1108: five text-decoration / caret columns, 45; SR1124: four outline columns, 49
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('nc')).item(39)"), "border-bottom-color");
     }
 
@@ -11847,14 +11910,14 @@ b</div>
     #[test]
     fn text_decoration_columns_layout() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 45);
+        assert_eq!(crate::css::REPORT_COLS, 49); // SR1124: four outline columns, 49
         assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]);
         assert_eq!(
-            &crate::css::REPORT_PROPS[40..],
+            &crate::css::REPORT_PROPS[40..45], // SR1124: four outline columns follow at 45..49
             &["text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color"]
         );
         let mut e = text_decoration_columns_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "45");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "49"); // SR1124: four outline columns, 49
         assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('pd')).item(44)"), "caret-color");
     }
 
@@ -12020,6 +12083,6 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "ta", "borderTopColor"), "rgba(255, 0, 0, 0.5)", "#ta: 128/255");
         assert_eq!(font_shorthand_cs(&mut e, "nb", "backgroundColor"), "rgba(0, 0, 0, 0)", "#nb backgroundColor");
         assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "45");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "49"); // SR1124: four outline columns, 49
     }
 }
