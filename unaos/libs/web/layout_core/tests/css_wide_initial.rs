@@ -2425,3 +2425,19 @@ fn border_color_sides_system_colors() {
     assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red CanvasText")]), Some((k, 0b1010)), "the earlier keyword goes");
     assert_eq!(sys(&[("border", "2px solid ButtonBorder"), ("border-color", "red blue")]), None, "plain colours clear the slot");
 }
+
+// ---- AETHERCSSBORDERSTYLEDEADARM (LEDGER SR1137): no property names two unguarded arms of apply_declaration (named tail block) ----
+
+/// AETHERCSSBORDERSTYLEDEADARM (SR1137): a second arm for a property is unreachable (rustc `unreachable pattern`) unless
+/// the first is guarded; the only twins are the two `-gradient(`-guarded background arms. The dead `"border-style" => {}`
+/// twin (its comment said the style is not recorded) is gone: the live arm records it per side.
+#[test]
+fn apply_declaration_no_duplicate_arm() {
+    let names = apply_declaration_arm_names(include_str!("../src/css.rs"));
+    let mut dups: Vec<&str> = names.iter().enumerate().filter(|(i, n)| names[..*i].contains(n)).map(|(_, n)| n.as_str()).collect();
+    dups.sort_unstable();
+    dups.dedup();
+    assert_eq!(dups, ["background", "background-image"], "only the -gradient( guarded twins may repeat an arm name");
+    assert_eq!(styled(&[("border-style", "dashed")]).paint.border_style, Some([1; 4]), "the live arm records the style");
+    assert_eq!(styled(&[("border-style", "dotted solid")]).paint.border_style, Some([2, 0, 2, 0]), "per side");
+}
