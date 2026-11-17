@@ -1396,6 +1396,7 @@ mod snd {
         span: bool,
         cut: bool,
         done: bool, pan_w: [i64; 2], // STRIAKPAN (LEDGER SR9015): the playing layer's per-channel pan factor (Q16, timeline_core's pan_mix_q16)
+        meter_gain: (i64, i64, u64), // STRIAKMETER (SR9058): the run's mixer ramp `(e0, e1, cnt)` (Q8), so the level meter reads what the mixer plays (file tail)
     }
 
     /// A reel's sound: its demuxer share when audio_core plays its audio track, and the track's format.
@@ -1432,12 +1433,12 @@ mod snd {
     }
 
     fn slot(track: usize, under: bool, id: u32, rate: u32, ch: u8, ri: usize) -> Slot {
-        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false, pan_w: [65536; 2] }
+        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false, pan_w: [65536; 2], meter_gain: (0, 0, 0) }
     }
 
     /// The EDL's sound (see the section head); a refusal leaves the pictures playing silent.
     pub fn open(reels: &Reels, tl: &timeline_core::Timeline, seek_ms: u64) {
-        *SND.lock() = None;
+        *SND.lock() = None; super::meter_open(); // STRIAKMETER (SR9058): the meters start from silence at a seek / restart (file tail)
         let runs = match timeline_core::schedule::audio_runs(tl, 0..tl.end(), reels) {
             Ok(r) => r,
             Err(e) => {
@@ -1539,7 +1540,7 @@ mod snd {
 
     /// Close every source (on every path of the job) and fold the account into the report.
     pub fn close(rep: &mut EdlReport) {
-        let Some(mut s) = SND.lock().take() else { return };
+        super::meter_open(); let Some(mut s) = SND.lock().take() else { return }; // STRIAKMETER (SR9058): no readings once the sound is gone (file tail)
         let mut ids: Vec<u32> = s.slots.iter().filter(|x| !x.under || !x.done).map(|x| x.id).collect();
         ids.extend(s.retiring.iter().copied());
         for id in ids {
@@ -1670,7 +1671,7 @@ mod snd {
                 let (e0, e1) = (audio_core::ramp::layer_q8(l.gain_cdb, env[0]) as i64, audio_core::ramp::layer_q8(l.gain_cdb, env[1]) as i64);
                 let from = audio_core::ramp::at(e0, e1, s0 as i64, cnt as i64) as u16;
                 let n48 = ((cnt - s0) * mixer::RATE as u64 / rate.max(1) as u64) as u32;
-                if !mixer::set_gain_ramp(id, from, e1 as u16, n48) {
+                self.slots[i].meter_gain = (e0, e1, cnt); if !mixer::set_gain_ramp(id, from, e1 as u16, n48) { // STRIAKMETER (SR9058): the ramp the level meter applies (file tail)
                     self.refuse("ramp-queue");
                 }
                 play = self.seat(i, l.src, l.src_t, l.seek.is_some(), s0, self.q.get(self.slots[i].ri).and_then(|r| r.get(li)).copied().unwrap_or(0x1_0000)); // STRIAKSPEED (SR9012): the layer's speed
@@ -1774,7 +1775,7 @@ mod snd {
             let got = a.dec.next_i32(&mut buf).unwrap_or(0);
             a.pos += got as u64;
         }
-        super::snd_pan(&mut buf, sl.pan_w, ch); sl.pend.reserve(buf.len() * 2); // STRIAKPAN (SR9015): the clip's pan per channel (file tail)
+        super::snd_pan(&mut buf, sl.pan_w, ch); super::meter_feed(sl.track, sl.under, sl.rate, sl.ch, sl.off, sl.meter_gain, &buf); sl.pend.reserve(buf.len() * 2); // STRIAKPAN (SR9015): the clip's pan per channel (file tail) // STRIAKMETER (SR9058): the track's level from the frames already decoded (file tail)
         for v in &buf {
             sl.pend.extend_from_slice(&((*v >> 16) as i16).to_le_bytes());
         }
@@ -2026,7 +2027,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HELP_SHOWN.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); shuttle_close(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. STRIAKSHUTTLE (SR9061): the Player closed, 1x (file tail). NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HELP_SHOWN.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); shuttle_close(); meter_clear(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. STRIAKSHUTTLE (SR9061): the Player closed, 1x (file tail). STRIAKMETER (SR9058): holds and latches go with the editor state (file tail). NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2053,7 +2054,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let th = thumbs_band(&live, l); let px = pack(&help_over(view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref()), l)); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail) // STRIAHELPTHREE (LEDGER SR9043): the keys help over the band, nothing while hidden (file tail)
+    let th = thumbs_band(&live, l); let px = pack(&help_over(band_meters(view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref()), l), l, pts_ms.is_some(), e.st.timeline.fps())); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail) // STRIAHELPTHREE (LEDGER SR9043): the keys help over the band, nothing while hidden (file tail) // STRIAKMETER (SR9058): the level meters over the band, timeline_core's strip (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -3810,4 +3811,88 @@ fn title_card(reels: &Reels, id: timeline_core::SourceId, w: usize, h: usize, sl
         }
     });
     Some((w, h, px.into(), None))
+}
+
+// ---- STRIAKMETER (LEDGER SR9058): the Player's level meters (named tail block) ----
+//
+// The band shows a level meter per audio track, painted by timeline_core's ONE strip (`view::paint_meters`,
+// `view::paint_meter_clips`, `view::meter_rect`: the host face's fns) and held by its ONE `view::MeterHold` (2 s peak
+// hold, clip latch). The reading is audio_core's ONE `meter::Meter` (the host's `MixMeters` meter), fed by `snd`'s
+// `make` with each TOP slot's frames it already decoded (no second decode) times the run's mixer ramp
+// (`audio_core::ramp::at`, the Q8 the mixer applies). Not metered (owed): the master (the mixer's sum has no tap, and the
+// band has no preview rect: `meter_rect(None)` is None there), a crossfade's under slot, the ring's lead. The hold steps
+// once per presented frame while not paused; a latch clears when the Player's editor state closes (`edit_close`).
+// Lock: `snd` takes SND then KMETERS; the present takes EDIT then KMETERS by try; nothing is taken under KMETERS.
+// Wire: `[nle] meters tracks=<n> hold=<ticks>` once per job, when the band first paints levels.
+
+struct KMeters {
+    tracks: Vec<(usize, audio_core::meter::Meter)>,
+    hold: timeline_core::view::MeterHold,
+    said: bool,
+}
+
+static KMETERS: crate::sync::Mutex<Option<KMeters>> = crate::sync::Mutex::new(None);
+
+/// `snd`'s frames for audio track `track` (a top slot; an under slot is skipped): PCM16 in the high half of `buf`'s i32,
+/// `ch` interleaved at `rate`, frame `off + j` of a run of `gain.2` frames scaled by its ramp `gain.0 .. gain.1` (Q8).
+#[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))]
+fn meter_feed(track: usize, under: bool, rate: u32, ch: u8, off: u64, gain: (i64, i64, u64), buf: &[i32]) {
+    if under || buf.is_empty() {
+        return;
+    }
+    let ch = ch.max(1) as usize;
+    let mut f: Vec<f32> = Vec::with_capacity(buf.len());
+    for (j, fr) in buf.chunks(ch).enumerate() {
+        let g = audio_core::ramp::at(gain.0, gain.1, (off + j as u64) as i64, gain.2 as i64) as f32 / 256.0;
+        for v in fr {
+            f.push((*v >> 16) as f32 / 32768.0 * g);
+        }
+    }
+    let mut g = KMETERS.lock();
+    let k = g.get_or_insert_with(|| KMeters { tracks: Vec::new(), hold: timeline_core::view::MeterHold::default(), said: false });
+    let i = match k.tracks.binary_search_by_key(&track, |(t, _)| *t) {
+        Ok(i) => i,
+        Err(i) => {
+            k.tracks.insert(i, (track, audio_core::meter::Meter::new(rate)));
+            i
+        }
+    };
+    if k.tracks[i].1.rate() != rate.max(1) {
+        k.tracks[i].1 = audio_core::meter::Meter::new(rate);
+    }
+    k.tracks[i].1.push(&f, ch);
+}
+
+/// The readings start from silence (a job's sound opened or closed); holds and latches stay.
+#[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))]
+fn meter_open() {
+    if let Some(k) = KMETERS.lock().as_mut() {
+        k.tracks.clear();
+        k.said = false;
+    }
+}
+
+/// Every reading, hold and latch gone (the Player's editor state closed).
+fn meter_clear() {
+    *KMETERS.lock() = None;
+}
+
+/// The meters over the band's painted RGBA `px` on layout `l`: on a newly presented frame (`fresh`) while not paused the
+/// hold steps (`view::meter_hold_ticks(fps)`); the strip shows the readings while not paused, the clip caps always.
+/// Nothing to read (or the lock busy) paints nothing.
+fn band_meters(px: Vec<u8>, l: timeline_core::view::Layout, fresh: bool, fps: Option<u32>) -> Vec<u8> {
+    use timeline_core::view;
+    let Some(mut g) = KMETERS.try_lock() else { return px };
+    let Some(k) = g.as_mut() else { return px };
+    let playing = !PAUSED.load(Ordering::Acquire);
+    let levels: Vec<view::MeterLevel> = k.tracks.iter().map(|(t, m)| view::MeterLevel { track: Some(*t), peak_db: m.peak_db(), rms_db: m.rms_db() }).collect();
+    if fresh && playing {
+        k.hold.step(Some(&levels), view::meter_hold_ticks(fps));
+    }
+    if !k.said && !levels.is_empty() {
+        k.said = true;
+        serial_println!("[nle] meters tracks={} hold={}", levels.len(), view::meter_hold_ticks(fps));
+    }
+    let shown = k.hold.strip(playing, levels);
+    view::paint_meter_clips(view::paint_meters(px, l, view::Order::Rgba, &shown), l, view::Order::Rgba, k.hold.clipped())
 }

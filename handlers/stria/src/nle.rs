@@ -790,12 +790,7 @@ fn tap_tracks(tl: &Timeline, sink: &mut dyn RenderSink, out_t: i64, rate: u32, c
 }
 
 /// NLE4C: one meter's reading. `track` is the audio track's index in [`Timeline::tracks`], `None` the master.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MeterLevel {
-    pub track: Option<usize>,
-    pub peak_db: f64,
-    pub rms_db: f64,
-}
+pub use timeline_core::view::MeterLevel; // STRIAKMETER (SR9058): the reading type lives in timeline_core::view, both faces paint it
 
 /// NLE4C (SR301): the editor's meters, per audio track and the master, fed by [`render`] itself: the master reads the
 /// PCM [`RenderSink::pcm`] is handed (what is sent), each track its own sum from `mix_run` ([`RenderSink::track_pcm`]).

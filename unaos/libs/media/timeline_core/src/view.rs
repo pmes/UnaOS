@@ -5799,3 +5799,221 @@ mod striaktitle_tests {
         assert_eq!((px, n), (8.0, 1));
     }
 }
+
+// ---- STRIAKMETER (LEDGER SR9058): the one meter strip, its hold and clip latch, both faces (named tail block) ----
+//
+// Moved from Stria's nle_face.rs (NLE4C SR301, STRIAMETERSCLIPHOLD SR862, STRIAMETERCLIPVERB SR902, STRIAMETERSMORE
+// SR962, STRIAMETERSNEXT SR996) and nle.rs (`MeterLevel`), so the host face and the kernel Player's band paint ONE strip
+// by ONE layout and hold ONE peak rule. The readings are audio_core's `meter::Meter` on both faces (not linked here).
+
+/// One meter's reading. `track` is the audio track's index in [`Timeline::tracks`], `None` the master.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterLevel {
+    pub track: Option<usize>,
+    pub peak_db: f64,
+    pub rms_db: f64,
+}
+
+/// The meter strip's width (px), at the canvas's right edge.
+pub const METER_W: u32 = 6;
+/// The strip's bottom: readings at or below this are an empty bar (linear in dB up to 0 dBFS).
+pub const METER_VIEW_DB: f64 = -60.0;
+pub const METER_BG: [u8; 4] = [0x10, 0x10, 0x14, 255];
+pub const METER_RMS: [u8; 4] = [0x40, 0xd0, 0x60, 255];
+pub const METER_PEAK: [u8; 4] = [0xff, 0xe0, 0x40, 255];
+/// How long the strip's peak line stands at the highest reading, in seconds of the face clock (`2 * fps` ticks).
+pub const METER_HOLD_S: u32 = 2;
+/// A reading at or above this latches the clip cap: between the 16-bit rail (32767 / 32768 = -0.000265 dBFS, what
+/// `render` clamps a sum to) and the next code below it (32766 / 32768 = -0.00053 dBFS).
+pub const METER_CLIP_DB: f64 = -0.0003;
+pub const METER_CLIP: [u8; 4] = [0xff, 0x30, 0x30, 255];
+/// The clip cap's height (px) at the top of a latched meter.
+pub const METER_CLIP_H: i64 = 3;
+
+/// The hold's length in face-clock ticks for a timeline at `fps` (25 when it has none): `METER_HOLD_S * fps`.
+pub fn meter_hold_ticks(fps: Option<u32>) -> u32 {
+    METER_HOLD_S * fps.unwrap_or(25).max(1)
+}
+
+/// The face's display rule over the meters' readings: a held peak per meter (`(key, held dBFS, ticks left)`, the key
+/// `MeterLevel::track`) and the meters that reached the rail (latched until a click on that meter). One owner thread.
+#[derive(Debug, Clone, Default)]
+pub struct MeterHold {
+    /// `(key, held dBFS, ticks left)`; pub so Stria's SR862 test still reads the ticks left after the move (write through
+    /// [`MeterHold::step`] / [`MeterHold::clear`]).
+    pub held: Vec<(Option<usize>, f64, u32)>,
+    pub clipped: Vec<Option<usize>>,
+}
+
+impl MeterHold {
+    /// One face-clock tick: every hold ages by one (dropped at 0); then, when `levels` are given (playing), a reading
+    /// above its hold (or with none) holds for `ticks`, and a reading at [`METER_CLIP_DB`] latches its meter.
+    pub fn step(&mut self, levels: Option<&[MeterLevel]>, ticks: u32) {
+        self.held.retain_mut(|h| {
+            h.2 = h.2.saturating_sub(1);
+            h.2 > 0
+        });
+        for lv in levels.unwrap_or(&[]) {
+            match self.held.iter_mut().find(|h| h.0 == lv.track) {
+                Some(h) if lv.peak_db > h.1 => (h.1, h.2) = (lv.peak_db, ticks),
+                Some(_) => {}
+                None if ticks > 0 => self.held.push((lv.track, lv.peak_db, ticks)),
+                None => {}
+            }
+            if lv.peak_db >= METER_CLIP_DB && !self.clipped.contains(&lv.track) {
+                self.clipped.push(lv.track);
+            }
+        }
+    }
+    /// The readings as the strip shows them: each peak raised to its meter's standing hold (the identity with none).
+    pub fn shown(&self, mut levels: Vec<MeterLevel>) -> Vec<MeterLevel> {
+        for lv in &mut levels {
+            if let Some(h) = self.held.iter().find(|h| h.0 == lv.track) {
+                lv.peak_db = lv.peak_db.max(h.1);
+            }
+        }
+        levels
+    }
+    /// What the strip paints: the readings through the hold while playing, nothing when stopped (never a frozen reading).
+    pub fn strip(&self, playing: bool, levels: Vec<MeterLevel>) -> Vec<MeterLevel> {
+        if playing { self.shown(levels) } else { Vec::new() }
+    }
+    /// A hold still stands (the face clock must keep counting).
+    pub fn pending(&self) -> bool {
+        !self.held.is_empty()
+    }
+    /// The latched meters, in latch order.
+    pub fn clipped(&self) -> &[Option<usize>] {
+        &self.clipped
+    }
+    /// Clear one meter's latch; false when it was not latched.
+    pub fn unclip(&mut self, key: Option<usize>) -> bool {
+        let n = self.clipped.len();
+        self.clipped.retain(|k| *k != key);
+        self.clipped.len() != n
+    }
+    /// Drop every peak hold and every clip latch (Stria's `meters-reset` word, SR902).
+    pub fn clear(&mut self) {
+        self.held.clear();
+        self.clipped.clear();
+    }
+    /// The standing holds `(key, held dBFS)`, in hold order (the witness's `"held"`, SR962); empty with none.
+    pub fn held(&self) -> Vec<(Option<usize>, f64)> {
+        self.held.iter().map(|h| (h.0, h.1)).collect()
+    }
+}
+
+/// The rect `(x0, y0, x1, y1)` of meter `key` on `l`, as [`paint_meters`] lays it out (a track's inside its row, the
+/// master down the preview band); `None` where that meter has no bar (the master on a layout with no preview band).
+pub fn meter_rect(l: Layout, key: Option<usize>) -> Option<(i64, i64, i64, i64)> {
+    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
+    let (y0, y1) = match key {
+        Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
+        Some(_) => return None,
+        None => (1, l.preview_h as i64 - 1),
+    };
+    (y1 - y0 >= 2).then_some((x0, y0, x1, y1))
+}
+
+/// The meter strip over a painted canvas: each audio track's bar inside its row, the master's down the preview band, at
+/// x `w - METER_W - 1 .. w - 1`; the RMS filled from the bottom, the peak a 1 px line, both linear in dB over
+/// [`METER_VIEW_DB`]..0. No levels paint nothing.
+pub fn paint_meters(px: Vec<u8>, l: Layout, order: Order, levels: &[MeterLevel]) -> Vec<u8> {
+    if levels.is_empty() {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
+    let frac = |db: f64| ((db - METER_VIEW_DB) / -METER_VIEW_DB).clamp(0.0, 1.0);
+    for lv in levels {
+        let Some((_, y0, _, y1)) = meter_rect(l, lv.track) else { continue };
+        let span = (y1 - y0) as f64;
+        c.rect(x0, y0, x1, y1, METER_BG);
+        let fill = libm::round(frac(lv.rms_db) * span) as i64;
+        c.rect(x0, y1 - fill, x1, y1, METER_RMS);
+        let pk = libm::round(frac(lv.peak_db) * span) as i64;
+        if pk > 0 {
+            let y = (y1 - pk).max(y0);
+            c.rect(x0, y, x1, y + 1, METER_PEAK);
+        }
+    }
+    c.px
+}
+
+/// The clip caps over a painted canvas: [`METER_CLIP`] across the top [`METER_CLIP_H`] px of each latched meter's rect,
+/// playing or stopped. No latch paints nothing.
+pub fn paint_meter_clips(px: Vec<u8>, l: Layout, order: Order, clipped: &[Option<usize>]) -> Vec<u8> {
+    if clipped.is_empty() {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    for &key in clipped {
+        if let Some((x0, y0, x1, y1)) = meter_rect(l, key) {
+            c.rect(x0, y0, x1, (y0 + METER_CLIP_H).min(y1), METER_CLIP);
+        }
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod striakmeter_tests {
+    use super::*;
+    use crate::{Clip, SourceId};
+
+    /// Two tracks (video 0, audio 1), one clip each, 25 fps: the band's layout the kernel Player paints.
+    fn st() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let v = tl.add_track(Kind::Video);
+        let a = tl.add_track(Kind::Audio);
+        tl.tracks[v].clips.push(Clip::new(SourceId(1), 0, 50, 0));
+        tl.tracks[a].clips.push(Clip::new(SourceId(1), 0, 50, 0));
+        EditorState::new(tl)
+    }
+
+    /// M3: on the Player's band (`Role::Tracks`: no preview band) each track has its bar inside its row and the master
+    /// has none; a full reading fills the track's rect, no level paints nothing.
+    #[test]
+    fn striakmeter_tracks_band_has_track_bars_no_master() {
+        let st = st();
+        let l = Layout::of_role(Role::Tracks, 320, RULER_H + 2 * ROW_H, &st);
+        assert_eq!(meter_rect(l, None), None, "no master bar without a preview band");
+        let (x0, y0, x1, y1) = meter_rect(l, Some(1)).expect("track 1's bar");
+        assert_eq!((x0, x1), (320 - 1 - METER_W as i64, 319));
+        assert_eq!((y0, y1), (l.row_y(1) + 2, l.row_y(1) + ROW_H as i64 - 2));
+        assert_eq!(meter_rect(l, Some(2)), None);
+        let base = vec![0u8; 320 * l.h as usize * 4];
+        assert_eq!(paint_meters(base.clone(), l, Order::Rgba, &[]), base);
+        assert_eq!(paint_meter_clips(base.clone(), l, Order::Rgba, &[]), base);
+        let full = [MeterLevel { track: Some(1), peak_db: 0.0, rms_db: 0.0 }, MeterLevel { track: None, peak_db: 0.0, rms_db: 0.0 }];
+        let px = paint_meters(base.clone(), l, Order::Rgba, &full);
+        let at = |x: i64, y: i64| px[((y as usize) * 320 + x as usize) * 4..((y as usize) * 320 + x as usize) * 4 + 4].to_vec();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                assert!(at(x, y) == METER_RMS.to_vec() || at(x, y) == METER_PEAK.to_vec(), "({x}, {y})");
+            }
+        }
+        assert_eq!(at(x0, 0), vec![0u8; 4], "the master paints nothing on the band");
+    }
+
+    /// M3: the strip rule: nothing when stopped, the hold's raised peaks while playing, the identity with no hold.
+    #[test]
+    fn striakmeter_strip_rule() {
+        let lv = |db: f64| MeterLevel { track: Some(1), peak_db: db, rms_db: -40.0 };
+        let mut h = MeterHold::default();
+        assert_eq!(h.strip(true, vec![lv(-20.0)]), vec![lv(-20.0)], "no hold: identity");
+        assert!(h.strip(false, vec![lv(-20.0)]).is_empty(), "stopped: nothing");
+        h.step(Some(&[lv(-6.0)]), 10);
+        assert_eq!(h.strip(true, vec![lv(-20.0)])[0].peak_db, -6.0, "the held peak");
+        assert!(h.pending());
+        h.clear();
+        assert!(!h.pending() && h.clipped().is_empty() && h.held().is_empty());
+    }
+
+    /// M3: the hold's length is `METER_HOLD_S` seconds of ticks, 25 fps with no rate, never zero.
+    #[test]
+    fn striakmeter_hold_ticks() {
+        assert_eq!(meter_hold_ticks(Some(30)), METER_HOLD_S * 30);
+        assert_eq!(meter_hold_ticks(None), METER_HOLD_S * 25);
+        assert_eq!(meter_hold_ticks(Some(0)), METER_HOLD_S);
+    }
+}
