@@ -537,7 +537,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
-                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; let rgba = graded(tl.grade_at(s.track, s.out_t, false), rgba); // STRIACOLORLIFT (SR869): the clip's grade on the frame it holds (file tail); NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
                 sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
@@ -721,7 +721,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            graded(tl.grade_at(s.track, s.out_t, true), reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0) // STRIACOLORLIFT (SR869): the outgoing clip's grade (file tail); NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -987,4 +987,14 @@ impl Sources {
         let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
+}
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the step's clip grade on the RGBA the render holds (named tail block) ----
+/// The frame `rgba` (straight RGBA) through timeline_core's ONE per-pixel pass [`timeline_core::Grade::apply`]; an
+/// IDENTITY grade hands the frame back untouched (no pass: an ungraded timeline renders byte-identically).
+fn graded(g: timeline_core::Grade, mut rgba: Vec<u8>) -> Vec<u8> {
+    if g != timeline_core::Grade::IDENTITY {
+        g.apply(&mut rgba);
+    }
+    rgba
 }

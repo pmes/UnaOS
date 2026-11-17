@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIACOLORLIFT (SR869): `color` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -657,6 +657,39 @@ impl EditorState {
                 None => Err(EditError::Transition),
             },
             _ => Err(EditError::Transition),
+        })
+    }
+}
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the `color` word through the one commit (named tail block) ----
+// `color <b> <c> <s>` (three integers in 1/1000, each -1000..=1000) grades the selected clip ([`crate::Grade`]) through
+// `Timeline::set_grade` and the ONE `commit` (undo-able; `edl::write` saves it as `* UNA COLOR`); bare `color` clears it.
+// It rides THE verb dispatch both faces call. Refused by name: no clip selected `EditError::NoClip`; a misshapen word or a
+// value out of range `EditError::Grade`; a graded audio clip `EditError::Kind`. The same grade again commits nothing.
+impl EditorState {
+    /// The selected clip graded `g` (one commit; the same grade again commits nothing).
+    pub fn set_grade(&mut self, g: crate::Grade) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if c.grade == g {
+            return Ok(());
+        }
+        let tl = self.timeline.set_grade(track, idx, g)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `color` words of [`EditorState::verb`]; `None` when `v` is not one.
+    fn grade_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("color") {
+            return None;
+        }
+        let n: Vec<&str> = w.collect();
+        let vals: Option<Vec<i16>> = n.iter().map(|x| x.parse::<i16>().ok()).collect();
+        Some(match (n.len(), vals) {
+            (0, _) => self.set_grade(crate::Grade::IDENTITY),
+            (3, Some(x)) => self.set_grade(crate::Grade { brightness: x[0], contrast: x[1], saturation: x[2] }),
+            _ => Err(EditError::Grade),
         })
     }
 }

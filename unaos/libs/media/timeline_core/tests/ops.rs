@@ -237,3 +237,110 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the per-clip grade, its op, its word and THE per-pixel pass (named tail block) ----
+
+fn striacolorlift_px(g: timeline_core::Grade, p: [u8; 4]) -> [u8; 4] {
+    let mut v = p;
+    g.apply(&mut v);
+    v
+}
+
+/// KAT: identity at 0/0/0 is byte-identical over a grid of r / g / b (every step of 5, 0 and 255 in) with alpha varied.
+#[test]
+fn striacolorlift_identity_is_byte_identical() {
+    let mut rgba = Vec::new();
+    for r in (0..=255u8).step_by(5) {
+        for g in (0..=255u8).step_by(5) {
+            for b in (0..=255u8).step_by(5) {
+                rgba.extend_from_slice(&[r, g, b, r ^ b]);
+            }
+        }
+    }
+    let before = rgba.clone();
+    timeline_core::Grade::IDENTITY.apply(&mut rgba);
+    assert_eq!(rgba, before);
+}
+
+/// KAT: brightness +100/1000 lifts mid grey by round(25.5) = 26; the ends clamp; alpha is untouched.
+#[test]
+fn striacolorlift_brightness_on_mid_grey() {
+    let g = |b| timeline_core::Grade { brightness: b, ..timeline_core::Grade::IDENTITY };
+    assert_eq!(striacolorlift_px(g(100), [128, 128, 128, 255]), [154, 154, 154, 255]);
+    assert_eq!(striacolorlift_px(g(-100), [128, 128, 128, 7]), [102, 102, 102, 7]);
+    assert_eq!(striacolorlift_px(g(1000), [128, 128, 128, 255]), [255, 255, 255, 255]);
+    assert_eq!(striacolorlift_px(g(-1000), [128, 128, 128, 255]), [0, 0, 0, 255]);
+}
+
+/// KAT: saturation -1000 gives luma grey by yuv_core's ONE RGB -> Y' weights (the export converter's), and grey stays grey.
+#[test]
+fn striacolorlift_saturation_off_is_the_trees_luma() {
+    let (ky, _, _, _) = yuv_core::rgb_coeffs(yuv_core::KR_KB_601, true);
+    assert_eq!(ky, [19595, 38470, 7471]);
+    let g = timeline_core::Grade { saturation: -1000, ..timeline_core::Grade::IDENTITY };
+    for p in [[200u8, 100, 50, 255], [255, 0, 0, 9], [0, 255, 0, 255], [0, 0, 255, 255], [128, 128, 128, 255], [13, 200, 77, 1]] {
+        let y = ((ky[0] * p[0] as i64 + ky[1] * p[1] as i64 + ky[2] * p[2] as i64 + 32768) >> 16) as u8;
+        assert_eq!(striacolorlift_px(g, p), [y, y, y, p[3]], "{p:?}");
+    }
+    assert_eq!(striacolorlift_px(g, [200, 100, 50, 255]), [124, 124, 124, 255]);
+}
+
+/// KAT: contrast -1000 flattens to 128, +1000 doubles the distance from 128 (clamped).
+#[test]
+fn striacolorlift_contrast_about_mid_grey() {
+    let g = |c| timeline_core::Grade { contrast: c, ..timeline_core::Grade::IDENTITY };
+    assert_eq!(striacolorlift_px(g(-1000), [0, 77, 255, 255]), [128, 128, 128, 255]);
+    assert_eq!(striacolorlift_px(g(1000), [64, 100, 192, 255]), [0, 72, 255, 255]);
+}
+
+/// The op: set_grade refuses by name (and leaves the timeline), a split keeps the grade on both halves, `grade_at` reads the
+/// covering clip and a transition's outgoing one.
+#[test]
+fn striacolorlift_set_grade_refusals_and_lookup() {
+    let (tl, _, _) = base();
+    let g = timeline_core::Grade { brightness: 100, contrast: -200, saturation: 300 };
+    assert_eq!(tl.set_grade(0, 1, timeline_core::Grade { saturation: 1001, ..g }), Err(EditError::Grade));
+    assert_eq!(tl.set_grade(0, 1, timeline_core::Grade { brightness: -1001, ..g }), Err(EditError::Grade));
+    assert_eq!(tl.set_grade(0, 9, g), Err(EditError::NoClip));
+    assert_eq!(tl.set_grade(7, 0, g), Err(EditError::NoTrack));
+    let mut au = tl.clone();
+    au.tracks[1].clips = vec![Clip::new(au.tracks[0].clips[0].src, 0, 10, 0)];
+    assert_eq!(au.set_grade(1, 0, g), Err(EditError::Kind));
+    assert_eq!(EditError::Grade.to_string(), "color is b c s, each in -1000..=1000");
+    let t2 = tl.set_grade(0, 1, g).unwrap();
+    assert_eq!(t2.tracks[0].clips[1].grade, g);
+    assert_eq!(t2.tracks[0].clips[0].grade, timeline_core::Grade::IDENTITY);
+    let t3 = t2.split(0, 15).unwrap();
+    assert_eq!((t3.tracks[0].clips[1].grade, t3.tracks[0].clips[2].grade), (g, g));
+    assert_eq!(t2.grade_at(Some(0), 12, false), g);
+    assert_eq!(t2.grade_at(Some(0), 5, false), timeline_core::Grade::IDENTITY);
+    assert_eq!(t2.grade_at(Some(0), 25, true), g, "the last clip ending at or before 25 is B");
+    assert_eq!(t2.grade_at(Some(0), 12, true), timeline_core::Grade::IDENTITY, "A is the outgoing at 12");
+    assert_eq!(t2.grade_at(None, 12, false), timeline_core::Grade::IDENTITY);
+}
+
+/// The word: `color b c s` grades the selection in ONE undo step, the same grade again pushes none, bare `color` clears,
+/// each refusal by name leaves the state.
+#[test]
+fn striacolorlift_color_word_is_one_commit() {
+    let (tl, _, _) = base();
+    let mut st = timeline_core::editor::EditorState::new(tl.clone());
+    assert_eq!(st.verb("color 100 0 0"), Some(Err(EditError::NoClip)));
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("color 100 -200 300"), Some(Ok(())));
+    let g = timeline_core::Grade { brightness: 100, contrast: -200, saturation: 300 };
+    assert_eq!((st.timeline.tracks[0].clips[1].grade, st.undo_depth()), (g, 1));
+    assert_eq!(st.verb("color 100 -200 300"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1, "the same grade commits nothing");
+    for bad in ["color 1 2", "color 1 2 3 4", "color a 0 0", "color 40000 0 0", "color 1001 0 0"] {
+        assert_eq!(st.verb(bad), Some(Err(EditError::Grade)), "{bad}");
+    }
+    assert_eq!(st.undo_depth(), 1);
+    assert_eq!(st.verb("color"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.clone(), 2));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline.tracks[0].clips[1].grade, g);
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, tl);
+    assert_eq!(st.verb("colour 1 2 3"), None, "not the word");
+}

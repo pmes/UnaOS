@@ -3551,3 +3551,89 @@ fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
 }
+
+// ---- STRIACOLORLIFT (LEDGER SR869): the clip grade on the render's RGBA, its golden and its word (named tail block) ----
+
+/// Every video frame of `tl` over 0..35 (NLE1's reels).
+fn striacolorlift_frames(tl: &Timeline) -> Vec<Vec<u8>> {
+    let mut sink = Collect::default();
+    render(tl, 0..35, &sources(tl), &mut sink).unwrap();
+    sink.frames.into_iter().map(|f| f.1).collect()
+}
+
+/// An ungraded timeline renders with no pass: NLE1's EDL text + its frame fnv is nle_export.rs's pinned
+/// `NLE6UTP1_NLE_EXPORT_PIN` (0xe149_8435_238b_ff8e), re-computed here byte for byte.
+#[test]
+fn striacolorlift_identity_render_is_the_pinned_golden() {
+    let tl = timeline();
+    let mut bytes = edl::write(&tl, "NLE1").unwrap().into_bytes();
+    bytes.extend(stria::nle_face::fnv1a(&striacolorlift_frames(&tl).concat()).to_le_bytes());
+    let got = stria::nle_face::fnv1a(&bytes);
+    assert_eq!(got, 0xe149_8435_238b_ff8e, "{got:#018x}");
+}
+
+/// B's two clips (ticks 10..20) graded: their frames are `Grade::apply` of the ungraded frames, every other frame is
+/// byte-identical.
+#[test]
+fn striacolorlift_render_grades_the_clip() {
+    let tl = timeline();
+    let g = timeline_core::Grade { brightness: 50, contrast: 200, saturation: -1000 };
+    let graded = tl.set_grade(0, 1, g).unwrap().set_grade(0, 2, g).unwrap();
+    let (plain, got) = (striacolorlift_frames(&tl), striacolorlift_frames(&graded));
+    let mut changed = 0;
+    for (t, (p, f)) in plain.iter().zip(&got).enumerate() {
+        if (10..20).contains(&t) {
+            let mut want = p.clone();
+            g.apply(&mut want);
+            assert_eq!(f, &want, "tick {t}");
+            assert!(f.chunks(4).all(|q| q[0] == q[1] && q[1] == q[2]), "tick {t} grey");
+            changed += (f != p) as usize;
+        } else {
+            assert_eq!(f, p, "tick {t} untouched");
+        }
+    }
+    assert_eq!(changed, 10);
+    println!("striacolorlift: 10 graded frames == Grade::apply of the plain render, 25 byte-identical");
+}
+
+/// A W001 wipe on the cut at 10 with every video clip graded alike: a wipe copies per pixel, so each frame is the ungraded
+/// frame through `Grade::apply` only when the transition's OUTGOING frame was graded too (nle.rs `vmix_frame`'s line).
+#[test]
+fn striacolorlift_wipe_grades_both_sides() {
+    use timeline_core::{TransitionKind, WipeDir};
+    let tl = timeline().add_transition(0, 10, TransitionKind::Wipe(WipeDir::LeftToRight), 4).unwrap();
+    let g = timeline_core::Grade { saturation: -1000, ..timeline_core::Grade::IDENTITY };
+    let mut graded = tl.clone();
+    for i in 0..graded.tracks[0].clips.len() {
+        graded = graded.set_grade(0, i, g).unwrap();
+    }
+    let (plain, got) = (striacolorlift_frames(&tl), striacolorlift_frames(&graded));
+    for (t, (p, f)) in plain.iter().zip(&got).enumerate() {
+        let mut want = p.clone();
+        g.apply(&mut want);
+        assert_eq!(f, &want, "tick {t}");
+    }
+    assert_ne!(plain[11], got[11], "the wipe's frame is graded");
+}
+
+/// The face speaks `color b c s` through THE dispatch: one undo step, the preview grey; a value out of range lands on the
+/// message row by EditError::Grade's name and changes nothing; undo gives the exact preview bytes back.
+#[test]
+fn striacolorlift_face_word_grades_the_preview() {
+    let (tl, src) = synth_fixture();
+    let (_, src2) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let before = stria::nle_face::preview(&face.state.timeline, &src2, 12).unwrap().unwrap().rgba;
+    let input = |text: &str| bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: text.into() };
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&input("color 0 0 -1000")));
+    assert_eq!(face.state.undo_depth(), 1);
+    let grey = stria::nle_face::preview(&face.state.timeline, &src2, 12).unwrap().unwrap().rgba;
+    assert_ne!(grey, before);
+    assert!(grey.chunks(4).all(|q| q[0] == q[1] && q[1] == q[2]));
+    assert!(face.on(&input("color 5000 0 0")));
+    assert_eq!(face.last_error.take(), Some(format!("color 5000 0 0: {}", timeline_core::EditError::Grade)));
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.on(&input("undo")));
+    assert_eq!(stria::nle_face::preview(&face.state.timeline, &src2, 12).unwrap().unwrap().rgba, before);
+}
