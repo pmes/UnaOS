@@ -12085,4 +12085,114 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "nb", "borderTopColor"), "rgb(0, 0, 0)", "#nb: opaque stays rgb");
         assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nb')).length)"), "49"); // SR1124: four outline columns, 49
     }
+
+    // ---- AETHERSCROLLBLITNESTEDSCROLLERPIXELS (LEDGER SR1163): a new document starts with no offset of the last one (named tail block) ----
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): an 80px spacer, the 200px `overflow: auto` panel `#p` (flow y 80..280)
+    /// holding 20 coloured 20px rows, then a 2000px spacer.
+    fn nested_pixels_body() -> String {
+        let mut body = String::from(r#"<div style="height:80px"></div><div id="p" style="overflow:auto;height:200px">"#);
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:20px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        body.push_str(r#"</div><div style="height:2000px"></div>"#);
+        body
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): the panel's vertical offset as the engine's tree holds it (the
+    /// fixture's one scroll container; 0 when nothing is scrolled).
+    fn nested_pixels_panel_off(e: &crate::AetherEngine) -> f32 {
+        e.layout_tree.as_ref().map_or(0.0, |t| t.scroll.values().map(|o| o.1).fold(0.0, f32::max))
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): a wheel of `dy` over the panel (pointer at (10, 150)): the panel takes
+    /// it and the frame repaints; then the pointer leaves for the spacer below it (10, 290), so later wheels scroll the page.
+    fn nested_pixels_wheel_panel(e: &mut crate::AetherEngine, dy: f64) {
+        e.handle_event(crate::api::events::Event::MouseMove(10.0, 150.0));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 0.0, "the panel took the wheel, not the page");
+        e.handle_event(crate::api::events::Event::MouseMove(10.0, 290.0));
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): the panel wheeled `panel_dy` first (0: not), then each page wheel
+    /// `(dy, to)`: the blit is kept, and the blitted frame equals a control engine built the same way, wheeled to `to` and
+    /// repainted whole, byte for byte.
+    fn nested_pixels_check(panel_dy: f64, steps: &[(f64, i32)]) {
+        let body = nested_pixels_body();
+        let mut e = damage_rects_engine(&body);
+        if panel_dy != 0.0 {
+            nested_pixels_wheel_panel(&mut e, panel_dy);
+        }
+        for &(dy, to) in steps {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "page to {to}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            if panel_dy != 0.0 {
+                nested_pixels_wheel_panel(&mut c, panel_dy);
+            }
+            assert_eq!(nested_pixels_panel_off(&c), panel_dy as f32, "page to {to}: the control's panel holds its own wheel only (armed)");
+            c.handle_event(crate::api::events::Event::Scroll(0.0, to as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, to as f64, "the page scrolled to {to}");
+            assert!(e.surface() == c.surface(), "page to {to}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): the unscrolled panel, page +50, +50, -30: the blitted frame equals a
+    /// full repaint after each (the panel's scrollbar rides the blit with its box).
+    #[test]
+    fn scroll_blit_nested_scroller_pixels_page_scrolls() {
+        nested_pixels_check(0.0, &[(50.0, 50), (50.0, 100), (-30.0, 70)]);
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): the panel wheeled 60 first, then page +50, +50, -30: equal at each
+    /// (armed: each control engine's first cascade restored the last engine's panel offset, 60 + 60 = 120, and its thumb
+    /// stood 30 rows lower than the blitted one's).
+    #[test]
+    fn scroll_blit_nested_scroller_pixels_panel_scrolled_first() {
+        nested_pixels_check(60.0, &[(50.0, 50), (50.0, 100), (-30.0, 70)]);
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): the panel wheeled 60, then page +100, +80 (the panel's top at -100,
+    /// half off the viewport), -30: equal at each (armed as above).
+    #[test]
+    fn scroll_blit_nested_scroller_pixels_panel_half_off_top() {
+        nested_pixels_check(60.0, &[(100.0, 100), (80.0, 180), (-30.0, 150)]);
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): a page with no panel: a +50 wheel damages the exposed strip alone
+    /// (the fix adds no damage).
+    #[test]
+    fn scroll_blit_nested_scroller_pixels_plain_page_strip() {
+        let mut e = damage_rects_engine(r#"<div style="height:2000px"></div>"#);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "the strip alone");
+    }
+
+    /// AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): THE cause pin. The panel wheeled 60 keeps 60 across a same-document
+    /// relayout (SR103's restore); a reload of the same URL starts it at 0 and paints a fresh engine's first frame; a
+    /// SECOND engine on the same thread loading the page while the first one's panel sits at 60 starts at 0 (armed: the
+    /// reload and the second engine both started at 60: `load_impl`'s first cascade ran `restore_scroll` before
+    /// `forget_scroll`).
+    #[test]
+    fn scroll_blit_nested_scroller_pixels_new_document_starts_unscrolled() {
+        let body = nested_pixels_body();
+        let html = format!(r#"<!doctype html><html><body style="margin:0">{body}</body></html>"#);
+        let mut a = damage_rects_engine(&body);
+        nested_pixels_wheel_panel(&mut a, 60.0);
+        assert_eq!(nested_pixels_panel_off(&a), 60.0, "the panel took the wheel");
+        a.relayout();
+        assert_eq!(nested_pixels_panel_off(&a), 60.0, "a same-document relayout restores the panel's offset (SR103)");
+        a.load_html("https://example.com/", &html, true);
+        assert_eq!(nested_pixels_panel_off(&a), 0.0, "a reload of the same URL forgets the offset (armed: 60)");
+        a.render_frame();
+        let fresh = damage_rects_engine(&body);
+        assert!(a.surface() == fresh.surface(), "the reloaded frame is a fresh engine's first frame");
+        nested_pixels_wheel_panel(&mut a, 60.0);
+        let b = damage_rects_engine(&body);
+        assert_eq!(nested_pixels_panel_off(&b), 0.0, "a second engine's new document starts unscrolled (armed: 60)");
+    }
 }
