@@ -4023,3 +4023,73 @@ fn striawavvalidbits_refusals_by_name() {
     let e = refusal(striawavvalidbits_rf64(b"BW64", Some(2 * payload.len() as u64), &payload, &[]));
     assert!(e.contains("wav: data chunk runs past the end of the file"), "{e}");
 }
+
+// ---- STRIAWAVVALIDBITSNEXT (LEDGER SR982): RF64 / BW64 ds64 table sizes (named tail block) ----
+
+/// STRIAWAVVALIDBITSNEXT (SR982): a mono 48 kHz PCM16 `magic` (RF64 / BW64) file: a `ds64` chunk first carrying `table`
+/// (chunkId, chunkSize) entries and dataSize = the payload, `fmt `, a `JUNK` chunk whose size field is 0xFFFFFFFF with
+/// `junk_len` bytes, then `data` (size field 0xFFFFFFFF) and the payload.
+fn striawavvalidbitsnext_rf64(magic: &[u8; 4], table: &[([u8; 4], u64)], junk_len: usize, payload: &[u8]) -> Vec<u8> {
+    let ds64_len = 28 + 12 * table.len() as u32;
+    let mut w = Vec::new();
+    w.extend_from_slice(magic);
+    w.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"ds64");
+    w.extend_from_slice(&ds64_len.to_le_bytes());
+    w.extend_from_slice(&(4 + 8 + ds64_len as u64 + 24 + 8 + junk_len as u64 + 8 + payload.len() as u64).to_le_bytes());
+    w.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    w.extend_from_slice(&(payload.len() as u64 / 2).to_le_bytes());
+    w.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    for (id, n) in table {
+        w.extend_from_slice(id);
+        w.extend_from_slice(&n.to_le_bytes());
+    }
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&48_000u32.to_le_bytes());
+    w.extend_from_slice(&96_000u32.to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"JUNK");
+    w.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    w.extend(std::iter::repeat(0u8).take(junk_len));
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    w.extend_from_slice(payload);
+    w
+}
+
+#[test]
+fn striawavvalidbitsnext_rf64_table_sizes_a_chunk() {
+    let payload = striaimportwavwide_payload(16, false, 96_000);
+    for magic in [b"RF64", b"BW64"] {
+        let wav = striawavvalidbitsnext_rf64(magic, &[(*b"JUNK", 6)], 6, &payload);
+        let d = gneiss_pal::dsp::demux::Demuxer::open_wav(wav.clone()).expect("open_wav");
+        assert_eq!(d.samples().iter().map(|s| s.duration).sum::<u64>(), 96_000, "{magic:?}");
+        let (src, s) = striaimportwav_render(wav, (0, 50), 50);
+        assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50));
+        assert_eq!(s.pcm.len(), 96_000);
+        for (j, got) in s.pcm.iter().enumerate() {
+            assert_eq!(*got, q(striaimportwav_sample(j) as i32), "{magic:?} sample {j}");
+        }
+    }
+}
+
+#[test]
+fn striawavvalidbitsnext_rf64_table_refusal_by_name() {
+    let refusal = |bytes: Vec<u8>| {
+        let tl = Timeline::new(25);
+        let mut src = Sources::new(&tl);
+        src.add(SourceId(0), bytes).expect_err("refused").to_string()
+    };
+    let payload = striaimportwavwide_payload(16, false, 2400);
+    // No table entry at all, and an entry for another chunk id: the JUNK chunk's 0xFFFFFFFF size is not given.
+    let tables: [&[([u8; 4], u64)]; 2] = [&[], &[(*b"LIST", 6)]];
+    for table in tables {
+        let e = refusal(striawavvalidbitsnext_rf64(b"RF64", table, 6, &payload));
+        assert!(e.contains("wav: RF64 chunk size not in the ds64 table"), "{e}");
+    }
+}

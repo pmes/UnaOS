@@ -1040,10 +1040,10 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let mt = crate::shell::vfs_mount_table();
     let mut reels = Reels { tb: tl.tb, reels: Vec::new() };
     for s in &tl.sources {
-        let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
-            return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV)", s.reel, dir, s.reel))));
+        let Some(rp) = [".MP4", ".WEBM", ".MKV", ".WAV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
+            return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV|.WAV)", s.reel, dir, s.reel))));
         };
-        let mut d = Demuxer::open(read_all(&rp).map_err(|e| ("read-refused", Some(e)))?).map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?;
+        let mut d = { let b = read_all(&rp).map_err(|e| ("read-refused", Some(e)))?; if demux_core::wav::is_wav(&b) { Demuxer::open_wav(b) } else { Demuxer::open(b) } }.map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?; // STRIAWAVVALIDBITSNEXT (SR982): a WAV reel by its own door, the host editor's Media::open rule (Demuxer::open stays WAV-blind); snd plays its PCM track
         open_colour(&mut d, true); let v = d.video_track().and_then(|t| d.track_index(t.id).map(|i| (i, t.clone()))).map(|(i, t)| (i, t, origin(&d, i)));
         let a = d.audio_track().and_then(|t| d.track_index(t.id)).map(|i| (i, origin(&d, i)));
         serial_println!(
