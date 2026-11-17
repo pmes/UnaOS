@@ -117,7 +117,7 @@ impl core::fmt::Display for ScheduleError {
 }
 
 /// The winner at tick `t` for `kind`: (track index, clip index).
-fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
+pub(crate) fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> { // STRIAFREEZEFRAME (SR880): pub(crate), `Timeline::freeze` reads the same winner
     tl.active_tracks().rev().filter(|&i| tl.tracks[i].kind == kind).find_map(|i| tl.clip_at(i, t).map(|c| (i, c))) // STRIATRACKMUTESOLO (SR837): a muted / unsoloed track never wins
 }
 
