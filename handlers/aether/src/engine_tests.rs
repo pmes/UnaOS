@@ -9826,4 +9826,98 @@ b</div>
         assert_ne!(imgalt_px(&e, 10, 9), (255, 0, 0), "row 9 is above it");
         assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
     }
+
+    // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
+    /// `rgba(0, 0, 0, 0.5)` with an inheriting span `#hfs`, `#tr` `transparent`, `#pr` a half-alpha parent of a
+    /// `color: red` span `#prc`, `#bd` half-alpha text in a `4px solid currentcolor` frame, `#sh` transparent text with
+    /// a red `text-shadow`.
+    fn color_alpha_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { font-size: 20px; line-height: 30px; margin: 0 0 10px; width: 300px }
+            </style></head><body>
+            <div id="op" style="color:#000"><span id="ops">MMMM</span></div>
+            <div id="hf" style="color:rgba(0, 0, 0, 0.5)"><span id="hfs">MMMM</span></div>
+            <div id="tr" style="color:transparent"><span id="trs">MMMM</span></div>
+            <div id="pr" style="color:rgba(0, 0, 0, 0.5)"><span id="prc" style="color:red">MMMM</span></div>
+            <div id="bd" style="color:rgba(0, 0, 0, 0.5);border:4px solid currentcolor"><span>MMMM</span></div>
+            <div id="sh" style="color:transparent;text-shadow:2px 2px 0 red"><span id="shs">MMMM</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the darkest channel of any pixel in element `id`'s rect, and the count of
+    /// pixels in it that are not white.
+    fn color_alpha_ink(e: &mut crate::AetherEngine, id: &str) -> (u8, usize) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize).min(sh));
+        let (mut dark, mut n) = (255u8, 0usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (r, g, b) = imgalt_px(e, x, y);
+                dark = dark.min(r.min(g).min(b));
+                if (r, g, b) != (255, 255, 255) {
+                    n += 1;
+                }
+            }
+        }
+        (dark, n)
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): half-alpha text paints at half ink (its darkest pixel ~127 where the opaque
+    /// control's is ~0; before SR1126 both were opaque), and transparent text paints no ink while its span keeps the
+    /// control's box (the run is measured and laid out; only the glyph pixels are skipped).
+    #[test]
+    fn color_alpha_paints_half_and_none() {
+        let mut e = color_alpha_engine();
+        let (op_dark, op_n) = color_alpha_ink(&mut e, "ops");
+        assert!(op_n > 20 && op_dark < 30, "the opaque control paints black ink: darkest {op_dark}, {op_n} px");
+        let (hf_dark, hf_n) = color_alpha_ink(&mut e, "hfs");
+        assert!(hf_n > 20, "the half-alpha text paints ink: {hf_n} px");
+        assert!((110..=150).contains(&hf_dark), "armed: the half-alpha text's darkest pixel is half ink: {hf_dark}");
+        assert_eq!(color_alpha_ink(&mut e, "trs").1, 0, "armed: transparent text paints no ink");
+        let (ow, oh) = (imgalt_rect(&mut e, "ops").2, imgalt_rect(&mut e, "ops").3);
+        let (tw, th) = (imgalt_rect(&mut e, "trs").2, imgalt_rect(&mut e, "trs").3);
+        assert_eq!((tw, th), (ow, oh), "transparent text keeps its laid-out box");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): `color: red` under a half-alpha parent is opaque red (the alpha is part of
+    /// the colour value, so the child's own colour resets it), and transparent text keeps its text-shadow (the shadow
+    /// paints from its own mask in its own colour, as Chromium's blur-text idiom).
+    #[test]
+    fn color_alpha_child_reset_and_shadow() {
+        let mut e = color_alpha_engine();
+        assert!(css_wide_color_ink(&mut e, "prc", css_wide_red) > 10, "the red child paints opaque red");
+        assert!(css_wide_color_ink(&mut e, "shs", css_wide_red) > 10, "transparent text keeps its red shadow");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): the `color` column reads the alpha (Chromium's strings): `rgba(0, 0, 0,
+    /// 0.5)`, the inheriting span the same, `rgba(0, 0, 0, 0)` for transparent, `rgb(255, 0, 0)` for the reset child
+    /// (before SR1126 `rgb(0, 0, 0)` for the first three).
+    #[test]
+    fn color_alpha_cssom_column() {
+        let mut e = color_alpha_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "op", "color"), "rgb(0, 0, 0)", "the opaque control");
+        assert_eq!(font_shorthand_cs(&mut e, "hf", "color"), "rgba(0, 0, 0, 0.5)", "armed: the half alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "hfs", "color"), "rgba(0, 0, 0, 0.5)", "armed: the span inherits the alpha");
+        assert_eq!(font_shorthand_cs(&mut e, "tr", "color"), "rgba(0, 0, 0, 0)", "armed: transparent");
+        assert_eq!(font_shorthand_cs(&mut e, "prc", "color"), "rgb(255, 0, 0)", "the child's own colour is opaque");
+    }
+
+    /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): a `currentcolor` border under half-alpha text still paints the opaque RGB
+    /// (pinned: AETHER-CSS-CURRENTCOLOR-ALPHA owed; Chromium paints it at half alpha).
+    #[test]
+    fn color_alpha_currentcolor_border_opaque_owed() {
+        let mut e = color_alpha_engine();
+        let (l, t, _, _) = imgalt_rect(&mut e, "bd");
+        assert_eq!(imgalt_px(&e, l as usize + 1, t as usize + 1), (0, 0, 0), "owed: the currentcolor frame is opaque black");
+    }
 }
