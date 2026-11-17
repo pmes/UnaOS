@@ -1765,7 +1765,7 @@ mod snd {
             let got = a.dec.next_i32(&mut buf).unwrap_or(0);
             a.pos += got as u64;
         }
-        super::meter_feed(sl.track, sl.under, sl.rate, sl.ch, sl.off, sl.meter_gain, &buf); sl.pend.reserve(buf.len() * 2); // STRIAKMETER (SR9058): the track's level from the frames already decoded (file tail)
+        super::meter_feed(sl.track, sl.under, sl.span && !sl.cut, sl.id, sl.rate, sl.ch, sl.off, sl.meter_gain, &buf); sl.pend.reserve(buf.len() * 2); // STRIAKMETER (SR9058): the track's level from the frames already decoded (file tail); STRIAKMETERRESET (SR9101): a span's top and under summed (file tail)
         for v in &buf {
             sl.pend.extend_from_slice(&((*v >> 16) as i16).to_le_bytes());
         }
@@ -1843,7 +1843,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 19] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,7 +1861,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'=', "zoom+"),
     (b'-', "zoom-"),
     (b'0', "zoom0"),
-    (b'f', "size"),
+    (b'f', "size"), (b'!', "meters-reset"), // STRIAKMETERRESET (SR9101): `!` clears every clip latch and peak hold, the host KEYS' `!` too (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1906,7 +1906,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if verb == "meters-reset" { return meter_reset(at); } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
@@ -2674,7 +2674,7 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 // hold, clip latch). The reading is audio_core's ONE `meter::Meter` (the host's `MixMeters` meter), fed by `snd`'s
 // `make` with each TOP slot's frames it already decoded (no second decode) times the run's mixer ramp
 // (`audio_core::ramp::at`, the Q8 the mixer applies). Not metered (owed): the master (the mixer's sum has no tap, and the
-// band has no preview rect: `meter_rect(None)` is None there), a crossfade's under slot, the ring's lead. The hold steps
+// band has no preview rect: `meter_rect(None)` is None there), the ring's lead; a crossfade's under slot is summed with its top (SR9101). The hold steps
 // once per presented frame while not paused; a latch clears when the Player's editor state closes (`edit_close`).
 // Lock: `snd` takes SND then KMETERS; the present takes EDIT then KMETERS by try; nothing is taken under KMETERS.
 // Wire: `[nle] meters tracks=<n> hold=<ticks>` once per job, when the band first paints levels.
@@ -2682,16 +2682,16 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 struct KMeters {
     tracks: Vec<(usize, audio_core::meter::Meter)>,
     hold: timeline_core::view::MeterHold,
-    said: bool,
+    said: bool, pairs: Vec<(usize, timeline_core::view::MeterPair)>, // STRIAKMETERRESET (SR9101): each audio track's crossfade pairing (file tail)
 }
 
 static KMETERS: crate::sync::Mutex<Option<KMeters>> = crate::sync::Mutex::new(None);
 
-/// `snd`'s frames for audio track `track` (a top slot; an under slot is skipped): PCM16 in the high half of `buf`'s i32,
+/// `snd`'s frames for audio track `track` (a top slot, `paired` in a span; or its `under` slot `id`, SR9101): PCM16 in the high half of `buf`'s i32,
 /// `ch` interleaved at `rate`, frame `off + j` of a run of `gain.2` frames scaled by its ramp `gain.0 .. gain.1` (Q8).
-#[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))]
-fn meter_feed(track: usize, under: bool, rate: u32, ch: u8, off: u64, gain: (i64, i64, u64), buf: &[i32]) {
-    if under || buf.is_empty() {
+#[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))] #[allow(clippy::too_many_arguments)]
+fn meter_feed(track: usize, under: bool, paired: bool, id: u32, rate: u32, ch: u8, off: u64, gain: (i64, i64, u64), buf: &[i32]) {
+    if buf.is_empty() {
         return;
     }
     let ch = ch.max(1) as usize;
@@ -2703,7 +2703,7 @@ fn meter_feed(track: usize, under: bool, rate: u32, ch: u8, off: u64, gain: (i64
         }
     }
     let mut g = KMETERS.lock();
-    let k = g.get_or_insert_with(|| KMeters { tracks: Vec::new(), hold: timeline_core::view::MeterHold::default(), said: false });
+    let k = g.get_or_insert_with(|| KMeters { tracks: Vec::new(), hold: timeline_core::view::MeterHold::default(), said: false, pairs: Vec::new() }); let f = meter_pair(k, track, under, paired, id, rate, ch as u8, f); if f.is_empty() { return; } // STRIAKMETERRESET (SR9101): the span's two sources summed first, so an under never rebuilds the top's meter (file tail)
     let i = match k.tracks.binary_search_by_key(&track, |(t, _)| *t) {
         Ok(i) => i,
         Err(i) => {
@@ -2721,7 +2721,7 @@ fn meter_feed(track: usize, under: bool, rate: u32, ch: u8, off: u64, gain: (i64
 #[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))]
 fn meter_open() {
     if let Some(k) = KMETERS.lock().as_mut() {
-        k.tracks.clear();
+        k.tracks.clear(); k.pairs.clear(); // STRIAKMETERRESET (SR9101): a seek / restart opens no span (file tail)
         k.said = false;
     }
 }
@@ -2749,4 +2749,44 @@ fn band_meters(px: Vec<u8>, l: timeline_core::view::Layout, fresh: bool, fps: Op
     }
     let shown = k.hold.strip(playing, levels);
     view::paint_meter_clips(view::paint_meters(px, l, view::Order::Rgba, &shown), l, view::Order::Rgba, k.hold.clipped())
+}
+
+// ---- STRIAKMETERRESET (LEDGER SR9101): the meters-reset byte and the crossfade's summed reading (named tail block) ----
+//
+// RESET: `!` in [`EDIT_KEYS`] names the host's `meters-reset` word (its KEYS bind `!` too): [`meter_reset`] drops every
+// clip latch and peak hold through timeline_core's ONE rule (`view::MeterHold::clear`, the host word's own call), arms
+// [`BAND_DIRTY`] so a paused band repaints, and neither seeks, saves nor pushes an undo step (a view word). XFADE: a span's
+// under slot is no longer skipped: [`meter_pair`] hands each side's gained frames to the track's ONE
+// `view::MeterPair`, which returns the per-sample sum of the frames both sources have written (an under at another
+// rate / channel count is dropped and counted: owed NLE-METER-KERNEL-XFADE-RATE). Lock: the key takes EDIT then KMETERS
+// (as the present does); `snd` SND then KMETERS. Wire: `[nle] edit meters-reset at=<tick> cleared=<latches>+<holds>`
+// (serial only; the band note is SR9090's `band_note_set`, not on this cut: fold note).
+
+/// Track `track`'s pairing over one side's gained frames `f` (see `view::MeterPair::take`): the frames its meter takes now.
+#[cfg_attr(not(any(feature = "uvc", feature = "hda-tone")), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn meter_pair(k: &mut KMeters, track: usize, under: bool, paired: bool, id: u32, rate: u32, ch: u8, f: Vec<f32>) -> Vec<f32> {
+    let i = match k.pairs.binary_search_by_key(&track, |(t, _)| *t) {
+        Ok(i) => i,
+        Err(i) => {
+            k.pairs.insert(i, (track, timeline_core::view::MeterPair::default()));
+            i
+        }
+    };
+    k.pairs[i].1.take(under, paired, id, rate, ch, f)
+}
+
+/// The `meters-reset` key at tick `at`: every clip latch and peak hold gone, the band repainted; `None` (no seek).
+fn meter_reset(at: i64) -> Option<u64> {
+    let (latches, holds) = match KMETERS.lock().as_mut() {
+        Some(k) => {
+            let n = (k.hold.clipped().len(), k.hold.held.len());
+            k.hold.clear();
+            n
+        }
+        None => (0, 0),
+    };
+    BAND_DIRTY.store(true, Ordering::Release);
+    serial_println!("[nle] edit meters-reset at={} cleared={}+{}", at, latches, holds);
+    None
 }

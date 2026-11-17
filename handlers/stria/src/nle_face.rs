@@ -387,7 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
-    ("Ctrl+Shift+M", "meters-reset"), ("Meta+Shift+M", "meters-reset"), // STRIAMETERSMORE (SR962): Ctrl / Cmd + Shift + M is the meters-reset word (GTK keeps the shifted keyval's Shift+)
+    ("Ctrl+Shift+M", "meters-reset"), ("Meta+Shift+M", "meters-reset"), ("!", "meters-reset"), // STRIAKMETERRESET (SR9101): `!` (text) is the word too, the kernel Player's byte. STRIAMETERSMORE (SR962): Ctrl / Cmd + Shift + M is the meters-reset word (GTK keeps the shifted keyval's Shift+)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -3449,5 +3449,35 @@ mod striakmeter_tests {
         let h: view::MeterHold = MeterHold::default();
         assert!(h.strip(false, levels.to_vec()).is_empty());
         assert_eq!(view::meter_hold_ticks(st.timeline.fps()), METER_HOLD_S * st.timeline.fps().unwrap_or(25).max(1));
+    }
+}
+
+// ---- STRIAKMETERRESET (LEDGER SR9101): `!` is the meters-reset word on both faces (named tail block) ----
+
+#[cfg(test)]
+mod striakmeterreset_tests {
+    use super::*;
+
+    /// M3: `!` (text) is a KEYS row for `meters-reset` (the kernel Player's EDIT_KEYS byte): it clears every latch and
+    /// hold, pushes no undo step, does not dirty the document, and the help names it on the meters-reset row.
+    #[test]
+    fn striakmeterreset_bang_is_meters_reset() {
+        assert!(KEYS.contains(&("!", "meters-reset")));
+        let (mut tl, src) = synth_fixture();
+        tl.tracks[1].clips.iter_mut().for_each(|c| *c = c.gained(2400));
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        face.verb("play");
+        face.tick();
+        face.tick();
+        face.verb("play");
+        assert_eq!(face.meter_clipped(), &[Some(1), None]);
+        let (undo, dirty) = (face.state.undo_depth(), face.dirty());
+        assert!(face.on(&SMessage::BrowserText("!".into())));
+        assert!(face.meter_clipped().is_empty() && !face.meter_hold_pending());
+        assert_eq!((face.state.undo_depth(), face.dirty()), (undo, dirty));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        let rows = help_rows();
+        let row = rows.iter().find(|r| r.1 == help_phrase("meters-reset")).expect("a meters-reset help row");
+        assert!(row.0.split(" / ").any(|k| k == "!"), "{:?}", row.0);
     }
 }
