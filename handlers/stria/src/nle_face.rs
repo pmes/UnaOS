@@ -118,8 +118,7 @@ impl RenderSink for OneFrame {
 /// The frame tick `t` shows: `stria::nle::render` of `t..t+1` over the video tracks (the audio is not this face's).
 /// `None` when nothing on the timeline sizes a frame there.
 pub fn preview(tl: &Timeline, sources: &Sources, t: i64) -> Result<Option<Still>, RenderError> {
-    let mut video = tl.clone();
-    video.tracks.retain(|tr| tr.kind == Kind::Video);
+    let video = video_of(tl); // STRIAPERFMORE (SR974): the one video projection the still depends on (file tail)
     if video.tracks.is_empty() {
         return Ok(None);
     }
@@ -1953,7 +1952,7 @@ impl Face {
         let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0, stretch: self.play.stretch.as_mut(), rev: None }; // STRIAJKLTRANSPORT (SR873); STRIAJKLMORE (SR945): forward pushes as it renders
         let r = render(&self.state.timeline, ph..end, &self.sources, &mut sink);
         let (still, pushed) = (sink.still, sink.pushed);
-        self.play.renders += 1;
+        self.play.renders += 1; self.pcache.played(&self.state.timeline, ph, end); // STRIAPERFMORE (SR974): a one-tick render may seed the preview key (file tail)
         self.play.pushed += pushed;
         match r {
             Ok(_) => self.play.pending = Some((ph, still)),
@@ -5957,6 +5956,7 @@ use timeline_core::SourceId;
 struct PreviewCache {
     key: Option<(Timeline, i64)>,
     renders: u64,
+    played: Option<(Timeline, i64)>, // STRIAPERFMORE (SR974): the last played render's (timeline, playhead) when it rendered one tick (file tail)
     summaries: std::sync::Mutex<(Vec<(SourceId, Option<String>)>, u64)>,
 }
 
@@ -5964,14 +5964,14 @@ impl PreviewCache {
     /// `taken`: a played tick's still was taken; it drops the key. Returns `taken`.
     fn taken(&mut self, taken: bool) -> bool {
         if taken {
-            self.key = None;
+            self.key = self.played.take(); // STRIAPERFMORE (SR974): a taken one-tick still is preview's for that key (file tail)
         }
         taken
     }
     /// True when the still was rendered for `(tl, t)`; otherwise the key becomes `(tl, t)`, one render is counted, and the
     /// caller renders `preview`.
     fn hit(&mut self, tl: &Timeline, t: i64) -> bool {
-        if self.key.as_ref().is_some_and(|(k, kt)| *kt == t && k == tl) {
+        if self.key.as_ref().is_some_and(|(k, kt)| *kt == t && k == tl) || self.video_hit(tl, t) { // STRIAPERFMORE (SR974): an audio-only change keeps the still (file tail)
             return true;
         }
         self.key = Some((tl.clone(), t));
@@ -8133,5 +8133,119 @@ impl Face {
             None => return Some(false),
         }
         Some(true)
+    }
+}
+
+// ---- STRIAPERFMORE (LEDGER SR974): the preview key on the video projection, seeded by a one-tick played render (named tail block) ----
+// SR918's key compared the whole timeline, so an audio-only edit re-rendered the unchanged video still, and a taken played
+// still dropped the key, so the first idle paint after a played tick (a stop, a select, a hover) re-rendered the frame it had
+// just shown. `preview` renders only the video projection of the timeline ([`video_of`], its one copy): a whole-timeline miss
+// at the same playhead whose projection equals the key's keeps the still. A rate-1 played render is `preview`'s frame for the
+// timeline the tick read (the NLEPLAYAUDIO pins), so a taken one-tick still seeds the key with THAT timeline (an edit made
+// between the tick and its paint then misses on the next paint); a shuttle's still (tick end-1, tagged ph) seeds nothing.
+// Owed: NLE-PERF-PREVIEW-SCALE, NLE-PERF-DAMAGE, NLE-PERF-LABEL-STRING, NLE-PERF-HELP-COLS.
+
+/// STRIAPERFMORE (SR974): the timeline `preview` renders: `tl` with its video tracks only.
+fn video_of(tl: &Timeline) -> Timeline {
+    let mut video = tl.clone();
+    video.tracks.retain(|tr| tr.kind == Kind::Video);
+    video
+}
+
+impl PreviewCache {
+    /// STRIAPERFMORE (SR974): true when the key is at `t` and its video projection is `tl`'s (the still is the one a render
+    /// would give); the key then becomes `(tl, t)` so the next paint is the whole-timeline hit.
+    fn video_hit(&mut self, tl: &Timeline, t: i64) -> bool {
+        let Some((k, kt)) = self.key.as_ref() else { return false };
+        if *kt != t || video_of(k) != video_of(tl) {
+            return false;
+        }
+        self.key = Some((tl.clone(), t));
+        true
+    }
+    /// STRIAPERFMORE (SR974): a played render of `tl` over `ph..end`: its (timeline, playhead) when it rendered one tick,
+    /// else none (a shuttle's still is not `preview`'s at `ph`).
+    fn played(&mut self, tl: &Timeline, ph: i64, end: i64) {
+        self.played = (end == ph + 1).then(|| (tl.clone(), ph));
+    }
+}
+
+#[cfg(test)]
+mod striaperfmore_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 240), PixelOrder::Rgba, false)
+    }
+
+    fn pixels(blits: Vec<SMessage>) -> Vec<u8> {
+        match blits.into_iter().last() {
+            Some(SMessage::SurfaceBlit { pixels, .. }) => pixels,
+            _ => panic!("a blit"),
+        }
+    }
+
+    /// STRIAPERFMORE M3: an audio-only edit keeps the still; a video edit renders.
+    #[test]
+    fn striaperfmore_audio_edit_keeps_still() {
+        let mut f = face();
+        f.state.playhead = 3;
+        f.frames();
+        assert_eq!(f.preview_renders(), 1);
+        assert_eq!(f.state.timeline.tracks[1].kind, Kind::Audio);
+        f.state.timeline.tracks[1].clips.pop();
+        f.frames();
+        f.frames();
+        assert_eq!(f.preview_renders(), 1, "an A1 edit: the video projection is unchanged");
+        let want = preview(&f.state.timeline, &f.sources, 3).expect("renders");
+        assert_eq!(f.still().cloned(), want);
+        f.state.timeline.tracks[0].clips.pop();
+        f.frames();
+        assert_eq!(f.preview_renders(), 2, "a V1 edit renders");
+    }
+
+    /// STRIAPERFMORE M3: a taken one-tick played still seeds the key: the stopped repaint renders nothing and paints the bytes
+    /// a fresh face paints.
+    #[test]
+    fn striaperfmore_played_tick_seeds_key() {
+        let mut f = face();
+        assert!(f.verb("play"));
+        assert!(f.tick());
+        f.frames();
+        assert_eq!(f.preview_renders(), 0, "the paint took the played still");
+        assert!(f.verb("play"));
+        assert!(!f.playing);
+        let got = pixels(f.frames());
+        assert_eq!(f.preview_renders(), 0, "the seeded key holds");
+        assert_eq!(f.state.playhead, 0);
+        let want = preview(&f.state.timeline, &f.sources, 0).expect("renders");
+        assert_eq!(f.still().cloned(), want);
+        let mut fresh = face();
+        assert_eq!(got, pixels(fresh.frames()));
+    }
+
+    /// STRIAPERFMORE M3: a shuttle's still seeds nothing, and an edit between a tick and its paint misses on the next paint.
+    #[test]
+    fn striaperfmore_shuttle_and_stale_do_not_seed() {
+        let mut f = face();
+        f.on(&SMessage::BrowserText("l".into()));
+        f.on(&SMessage::BrowserText("l".into()));
+        assert_eq!((f.playing, f.rate), (true, 2));
+        assert!(f.tick());
+        f.frames();
+        f.frames();
+        assert_eq!(f.preview_renders(), 1, "a rate-2 still is not preview's: the next paint renders");
+
+        let mut g = face();
+        assert!(g.verb("play"));
+        assert!(g.tick());
+        g.state.timeline.tracks[0].clips.remove(0);
+        g.frames();
+        assert_eq!(g.preview_renders(), 0, "the taken still, as before");
+        g.frames();
+        assert_eq!(g.preview_renders(), 1, "the seeded key is the timeline the tick read");
+        let want = preview(&g.state.timeline, &g.sources, g.state.playhead).expect("renders");
+        assert_eq!(g.still().cloned(), want);
     }
 }
