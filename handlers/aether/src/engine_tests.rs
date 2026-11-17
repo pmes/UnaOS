@@ -5802,4 +5802,81 @@ mod tests {
             assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
         }
     }
+
+    // ---- AETHERCSSWIDECOLORCONTROLS (LEDGER SR840): the form-control ink roads take color: inherit / unset (named tail block) ----
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): one control per row under a red parent: `.i { color: inherit }` on an input
+    /// value, a textarea, a select, a file input, a placeholder-only input and a `<button>`; `.u { color: unset }` on an
+    /// input; and the unstyled input / textarea / select / file twins (the UA black). Rows 12px apart.
+    fn css_wide_controls_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .i { color: inherit }
+            .u { color: unset }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><input id="inp" class="i" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><input id="inpu" class="u" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><textarea id="ta" class="i">Hello</textarea></div>
+            <div style="color:rgb(255, 0, 0)"><select id="sel" class="i"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="fi" class="i" type="file"></div>
+            <div style="color:rgb(255, 0, 0)"><input id="ph" class="i" placeholder="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><button id="btn" class="i">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><input id="inp0" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><textarea id="ta0">Hello</textarea></div>
+            <div style="color:rgb(255, 0, 0)"><select id="sel0"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="fi0" type="file"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 700));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn css_wide_controls_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 90 && c.1 < 90 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `color: inherit` on an input value, a textarea, a select (label and arrow) and
+    /// a file input's caption / status paints the red parent; the input's cssom reads rgb(255, 0, 0).
+    #[test]
+    fn css_wide_controls_inherit_red() {
+        let mut e = css_wide_controls_engine();
+        for id in ["inp", "ta", "sel", "fi"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 3, "#{id} takes the red parent");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "inp", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `color: unset` on a control is inherit (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_controls_unset_red() {
+        let mut e = css_wide_controls_engine();
+        assert!(css_wide_color_ink(&mut e, "inpu", css_wide_red) > 3, "the unset input takes the red parent");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): with no colour rule a control keeps the UA FieldText / ButtonText black under
+    /// the red parent (Chromium's light scheme): black ink, no red.
+    #[test]
+    fn css_wide_controls_unstyled_black() {
+        let mut e = css_wide_controls_engine();
+        for id in ["inp0", "ta0", "sel0", "fi0"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_controls_black) > 3, "#{id} paints black (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+        }
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): a placeholder stays the placeholder's grey under `color: inherit`: no red.
+    #[test]
+    fn css_wide_controls_placeholder_grey() {
+        let mut e = css_wide_controls_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "ph", css_wide_red), 0, "the placeholder paints no red");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `<button class=i>`'s label (child text on `inherit_element`'s road) is red.
+    #[test]
+    fn css_wide_controls_button_inherit_red() {
+        let mut e = css_wide_controls_engine();
+        assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
+    }
 }
