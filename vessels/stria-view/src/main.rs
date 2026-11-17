@@ -2712,3 +2712,28 @@ mod striafreezemore_tests {
         println!("striafreezemore witness: title:Hello world -> T1, retitle:Bye: now -> {:?}", text(&face));
     }
 }
+
+// ---- STRIACROPMORE (LEDGER SR960): the witness's crop drag on the preview picture (named tail block) ----
+#[cfg(test)]
+mod striacropmore_tests {
+    use super::*;
+
+    /// STRIACROPMORE (SR960): `press` on the preview picture's left edge, `move` a tenth of the picture right, `release`:
+    /// the selected clip's left side is cropped 100 (one undo step), through the witness's existing pointer tokens.
+    #[test]
+    fn striacropmore_witness_crop_drag() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        let _ = face.paint();
+        let s = face.still().expect("a preview still").clone();
+        let l = face.layout();
+        let q = timeline_core::SizePolicy::Letterbox.place(s.width as usize, s.height as usize, l.w as usize, l.preview_h as usize).dst;
+        let (x, y, dx) = (q.x as f64, (q.y + q.h / 2) as f64, q.w as f64 / 10.0);
+        let errors = drive(&mut face, &format!("press:{x}:{y},move:{}:{y},release", x + dx));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 100, t: 0, r: 0, b: 0 }));
+        assert_eq!(face.state.undo_depth(), 1);
+        assert!(face.crop_dragging().is_none());
+    }
+}

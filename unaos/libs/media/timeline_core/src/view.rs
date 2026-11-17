@@ -3573,3 +3573,216 @@ impl Layout {
         self
     }
 }
+
+// ---- STRIACROPMORE (LEDGER SR960): the crop drag on the preview (named tail block) ----
+// NLE-CROP-DRAG: a press in the preview band within [`CROP_GRAB`] px of an edge of the picture rect `q` (the still letterboxed
+// into the band: `Canvas::blit_fit`'s ONE geometry, `SizePolicy::Letterbox.place`; a corner takes two sides) begins a
+// [`CropDrag`] when the primary is a video clip at the playhead that the schedule shows (`schedule::top`). A crop side is
+// 1/1000 of the output frame (stria's `cropped` crops the frame placed at the output size), so the pointer maps through `q`
+// exactly: each dragged side moves by its delta in 1/1000 of `q` (l / t with +x / +y, r / b with -x / -y), clamped 0..=999.
+// While live the face paints [`CropDrag::shown`] (the clip uncropped) and [`paint_crop_drag`] (the dragged rect in
+// [`CROP_BADGE`]); the release commits ONCE through `EditorState::crop_set` (every selected video clip's dragged sides by the
+// same delta: SR900's step words with a free count). The kernel Player never builds one (it refuses a cropped timeline).
+
+/// STRIACROPMORE (SR960): how near (px) a press must come to an edge of the preview picture to grab it.
+pub const CROP_GRAB: f64 = 6.0;
+
+/// STRIACROPMORE (SR960): one crop drag on the preview picture (begun by a press, updated by moves, committed ONCE).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropDrag {
+    pub track: usize,
+    pub idx: usize,
+    /// The picture rect in the preview band at the press (canvas px).
+    pub q: yuv_core::scale::Rect,
+    /// The sides grabbed: 1 left, 2 top, 4 right, 8 bottom.
+    pub sides: u8,
+    /// The press and the pointer now (canvas px).
+    pub origin: (f64, f64),
+    pub at: (f64, f64),
+    /// The primary's crop at the press.
+    pub crop0: crate::Crop,
+}
+
+impl CropDrag {
+    /// A press at `(x, y)` on layout `l` whose preview still is `sw x sh`: a crop drag when the press is in the preview band
+    /// within [`CROP_GRAB`] of the picture's edge and the primary is the video clip shown at the playhead; else `None`.
+    pub fn begin(st: &EditorState, l: Layout, sw: u32, sh: u32, x: f64, y: f64) -> Option<CropDrag> {
+        let (track, idx) = st.selection?;
+        let clip = st.selected()?;
+        if sw == 0 || sh == 0 || l.w == 0 || l.preview_h == 0 || x < 0.0 || y < 0.0 || x >= l.w as f64 || y >= l.preview_h as f64 {
+            return None;
+        }
+        if st.timeline.tracks.get(track)?.kind != Kind::Video || !clip.covers(st.playhead) {
+            return None;
+        }
+        if crate::schedule::top(&st.timeline, Kind::Video, st.playhead) != Some((track, idx)) {
+            return None;
+        }
+        let q = crate::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
+        let (x0, y0, x1, y1) = (q.x as f64, q.y as f64, (q.x + q.w) as f64, (q.y + q.h) as f64);
+        if x < x0 - CROP_GRAB || x >= x1 + CROP_GRAB || y < y0 - CROP_GRAB || y >= y1 + CROP_GRAB {
+            return None;
+        }
+        let near = |p: f64, e: f64| (p - e).abs() < CROP_GRAB;
+        let mut sides = near(x, x0) as u8 | (near(y, y0) as u8) << 1 | (near(x, x1) as u8) << 2 | (near(y, y1) as u8) << 3;
+        if sides & 5 == 5 {
+            sides &= if (x - x0).abs() <= (x1 - x).abs() { !4 } else { !1 };
+        }
+        if sides & 10 == 10 {
+            sides &= if (y - y0).abs() <= (y1 - y).abs() { !8 } else { !2 };
+        }
+        if sides == 0 {
+            return None;
+        }
+        Some(CropDrag { track, idx, q, sides, origin: (x, y), at: (x, y), crop0: clip.crop })
+    }
+    /// The pointer is at `(x, y)`.
+    pub fn update(&mut self, x: f64, y: f64) {
+        self.at = (x, y);
+    }
+    /// Each side's change since the press, 1/1000 of the picture: `[l, t, r, b]` (0 for a side not grabbed).
+    pub fn deltas(&self) -> [i32; 4] {
+        let (dx, dy) = (self.at.0 - self.origin.0, self.at.1 - self.origin.1);
+        let fx = (dx * 1000.0 / self.q.w.max(1) as f64).round() as i32;
+        let fy = (dy * 1000.0 / self.q.h.max(1) as f64).round() as i32;
+        let on = |b: u8| self.sides & b != 0;
+        [if on(1) { fx } else { 0 }, if on(2) { fy } else { 0 }, if on(4) { -fx } else { 0 }, if on(8) { -fy } else { 0 }]
+    }
+    /// The drag would change a side.
+    pub fn moved(&self) -> bool {
+        self.deltas() != [0; 4]
+    }
+    /// `c` with the dragged sides moved by [`CropDrag::deltas`], each clamped to 0..=999.
+    pub fn apply(&self, c: crate::Crop) -> crate::Crop {
+        let d = self.deltas();
+        let s = |v: u16, d: i32| (v as i32 + d).clamp(0, 999) as u16;
+        crate::Crop { l: s(c.l, d[0]), t: s(c.t, d[1]), r: s(c.r, d[2]), b: s(c.b, d[3]) }
+    }
+    /// The primary's crop as the drag stands.
+    pub fn crop(&self) -> crate::Crop {
+        self.apply(self.crop0)
+    }
+    /// The dragged crop's rect over the picture `q`: `(x0, y0, x1, y1)` canvas px.
+    pub fn rect(&self) -> (i64, i64, i64, i64) {
+        let c = self.crop();
+        let (qx, qy, qw, qh) = (self.q.x as i64, self.q.y as i64, self.q.w as i64, self.q.h as i64);
+        (qx + qw * c.l as i64 / 1000, qy + qh * c.t as i64 / 1000, qx + qw - qw * c.r as i64 / 1000, qy + qh - qh * c.b as i64 / 1000)
+    }
+    /// THE commit of the gesture: ONE `EditorState::crop_set` (nothing when nothing moved); `NoClip` when the primary changed.
+    pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
+        if !self.moved() {
+            return Ok(());
+        }
+        if st.selection != Some((self.track, self.idx)) {
+            return Err(EditError::NoClip);
+        }
+        st.crop_set(|c| self.apply(c))
+    }
+    /// The state the face paints while the drag is live: a scratch state (no undo stacks) with the clip uncropped.
+    pub fn shown(&self, st: &EditorState) -> Option<EditorState> {
+        let mut s = EditorState::new(st.timeline.set_crop(self.track, self.idx, crate::Crop::NONE).ok()?);
+        s.selection = st.selection;
+        s.set = st.set.clone();
+        s.playhead = st.playhead;
+        s.zoom = st.zoom;
+        Some(s)
+    }
+}
+
+/// STRIACROPMORE (SR960): the live crop drag's rect as a 1 px [`CROP_BADGE`] outline over the painted canvas; `None` (or a
+/// canvas of another size) comes back untouched.
+pub fn paint_crop_drag(px: Vec<u8>, l: Layout, order: Order, drag: Option<&CropDrag>) -> Vec<u8> {
+    let Some(d) = drag else { return px };
+    if px.len() != l.w as usize * l.h as usize * 4 {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x0, y0, x1, y1) = d.rect();
+    c.frame(x0, y0, x1.max(x0 + 1), y1.max(y0 + 1), CROP_BADGE);
+    c.px
+}
+
+#[cfg(test)]
+mod striacropmore_tests {
+    use super::*;
+    use crate::{Clip, Crop, Timeline};
+
+    /// V1: A 0..20 at 0; A1: A 0..20 at 0; V1's clip selected, playhead 5; the preview band 320 x 90 over a 160 x 90 still,
+    /// so the picture `q` is 160 x 90 at (80, 0).
+    fn fixture() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.playhead = 5;
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        (st, l)
+    }
+
+    #[test]
+    fn striacropmore_left_edge_drag_commits_once() {
+        let (mut st, l) = fixture();
+        let mut d = CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).expect("the left edge");
+        assert_eq!((d.q, d.sides), (yuv_core::scale::Rect { w: 160, h: 90, x: 80, y: 0 }, 1));
+        d.update(96.0, 45.0);
+        assert_eq!(d.crop(), Crop { l: 100, t: 0, r: 0, b: 0 });
+        assert_eq!(d.rect(), (96, 0, 240, 90));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((st.timeline.tracks[0].clips[0].crop, st.undo_depth()), (Crop { l: 100, t: 0, r: 0, b: 0 }, 1));
+        assert!(st.undo());
+        assert_eq!(st.timeline.tracks[0].clips[0].crop, Crop::NONE);
+    }
+
+    #[test]
+    fn striacropmore_corner_right_bottom_and_clamp() {
+        let (mut st, l) = fixture();
+        let mut d = CropDrag::begin(&st, l, 160, 90, 238.0, 88.0).expect("the bottom-right corner");
+        assert_eq!(d.sides, 4 | 8);
+        d.update(222.0, 79.0);
+        assert_eq!(d.crop(), Crop { l: 0, t: 0, r: 100, b: 100 });
+        d.update(260.0, 100.0);
+        assert_eq!(d.crop(), Crop::NONE, "clamped at 0");
+        assert!(d.moved());
+        assert_eq!((d.finish(&mut st), st.undo_depth()), (Ok(()), 0), "no change commits nothing");
+    }
+
+    #[test]
+    fn striacropmore_begin_refusals() {
+        let (mut st, l) = fixture();
+        assert!(CropDrag::begin(&st, l, 160, 90, 160.0, 45.0).is_none(), "off the edges");
+        assert!(CropDrag::begin(&st, l, 160, 90, 20.0, 45.0).is_none(), "outside the picture");
+        assert!(CropDrag::begin(&st, l, 160, 90, 80.0, 95.0).is_none(), "below the band");
+        st.playhead = 30;
+        assert!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).is_none(), "the clip not at the playhead");
+        st.playhead = 5;
+        st.select(1, 0).unwrap();
+        assert!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).is_none(), "an audio primary");
+        st.select(0, 0).unwrap();
+        let v2 = st.timeline.add_track(Kind::Video);
+        st.timeline.tracks[v2].clips = alloc::vec![Clip::new(crate::SourceId(0), 0, 20, 0)];
+        assert!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).is_none(), "a higher video track is shown");
+        st.deselect();
+        assert!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).is_none(), "no selection");
+    }
+
+    #[test]
+    fn striacropmore_paint_none_untouched_and_the_frame_inset() {
+        let (st, l) = fixture();
+        let px = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(paint_crop_drag(px.clone(), l, Order::Rgba, None), px, "no drag: byte-identical");
+        let mut d = CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).unwrap();
+        d.update(96.0, 45.0);
+        let shown = d.shown(&st).unwrap();
+        assert_eq!((shown.undo_depth(), shown.selection), (0, st.selection));
+        let out = paint_crop_drag(px.clone(), l, Order::Rgba, Some(&d));
+        let at = |x: usize, y: usize| out[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4].to_vec();
+        assert_eq!(at(96, 45), CROP_BADGE.to_vec());
+        assert_eq!(at(239, 45), CROP_BADGE.to_vec());
+        assert_eq!(at(150, 0), CROP_BADGE.to_vec());
+        assert_eq!(at(150, 45), px[(45 * 320 + 150) * 4..(45 * 320 + 150) * 4 + 4].to_vec(), "inside untouched");
+    }
+}
