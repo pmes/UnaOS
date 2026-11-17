@@ -2807,7 +2807,7 @@ fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String 
 /// one decimal digit), no leading zeros.
 fn nle5dexportmessagerate_grammar(r: &str) -> bool {
     let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
-    let Some(n) = r.strip_suffix(" fps") else { return false };
+    let Some(n) = nle5dexportmessageraterealtime_unmultiplied(r).strip_suffix(" fps") else { return false }; // NLE5DEXPORTMESSAGERATEREALTIME (SR794): an optional `, <m>x` tail
     match n.split_once('.') {
         Some((a, d)) => num(a) && a.parse::<u32>().is_ok_and(|v| v < 100) && d.len() == 1 && num(d),
         None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 100),
@@ -2839,12 +2839,12 @@ fn nle5dexportmessagerate_rate_words_kat() {
         (1, ms(1), "1000 fps"),
     ];
     for (f, d, want) in rows {
-        assert_eq!(rate_words(f, d).as_deref(), Some(want), "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)).as_deref(), Some(want), "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794): no rate, no multiple
         assert!(nle5dexportmessagerate_grammar(want), "{want}");
     }
     let nones = [(0, ms(800)), (10, ms(0)), (10, us(999))];
     for (f, d) in nones {
-        assert_eq!(rate_words(f, d), None, "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)), None, "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794)
     }
     let bad = ["044 fps", "99 fps", "100.0 fps", "3 fps", "3.25 fps", "43.8fps"];
     for b in bad {
@@ -2991,4 +2991,106 @@ fn striainforeelhoverdelay_a_select_under_the_pointer_leaves_no_stale_count() {
     assert_eq!(face.hover_dwelt(), None, "the count was cleared at the tick that saw no hover");
     assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
     assert!(striainforeelhoverdelay_dwell(&mut face), "the dwell counts again from 1");
+}
+
+// ---- NLE5DEXPORTMESSAGERATEREALTIME (LEDGER SR794): the export's speed as a multiple of real time (named tail block) ----
+
+/// The multiple grammar of `stria::nle_face::realtime_words`: `Nx` (a whole number, 10 or more), `A.Dx` (A 1..9, one
+/// decimal digit) or `0.DDx` (two decimal digits), no leading zeros.
+fn nle5dexportmessageraterealtime_grammar(m: &str) -> bool {
+    let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    let Some(n) = m.strip_suffix('x') else { return false };
+    match n.split_once('.') {
+        None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 10),
+        Some((a, d)) if d.len() == 1 => num(a) && a.parse::<u32>().is_ok_and(|v| (1..10).contains(&v)) && digits(d),
+        Some((a, d)) => a == "0" && d.len() == 2 && digits(d),
+    }
+}
+
+/// A rate with its optional `, <m>x` tail split off when the tail is in the grammar; else the rate as given.
+fn nle5dexportmessageraterealtime_unmultiplied(r: &str) -> &str {
+    match r.split_once(", ") {
+        Some((h, m)) if nle5dexportmessageraterealtime_grammar(m) => h,
+        _ => r,
+    }
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_kat() {
+    use stria::nle_face::{rate_words, realtime_words};
+    use std::time::Duration;
+    let (ms, us) = (Duration::from_millis, Duration::from_micros);
+    let rows = [
+        (35, ms(800), (25, 1), "1.8x"),
+        (1000, ms(2_000), (25, 1), "20x"),
+        (10, ms(1_000), (25, 1), "0.40x"),
+        (30, ms(1_001), (30_000, 1_001), "1.0x"),
+        (19, ms(2_000), (1, 1), "9.5x"),
+        (999, ms(100_000), (1, 1), "10x"),
+    ];
+    for (f, d, fps, want) in rows {
+        assert_eq!(realtime_words(f, d, fps).as_deref(), Some(want), "{f} frames in {d:?} at {fps:?}");
+        assert!(nle5dexportmessageraterealtime_grammar(want), "{want}");
+    }
+    let nones = [(0, ms(800), (25, 1)), (35, ms(800), (25, 0)), (35, ms(800), (0, 1)), (35, us(999), (25, 1))];
+    for (f, d, fps) in nones {
+        assert_eq!(realtime_words(f, d, fps), None, "{f} frames in {d:?} at {fps:?}");
+    }
+    assert_eq!(rate_words(35, ms(800), (25, 1)).as_deref(), Some("43.8 fps, 1.8x"));
+    assert_eq!(rate_words(35, ms(800), (25, 0)).as_deref(), Some("43.8 fps"), "no rate: the fps alone");
+    let bad = ["01.8x", "1.80x", "10.0x", "9x", "0.4x", "1.8 x"];
+    for b in bad {
+        assert!(!nle5dexportmessageraterealtime_grammar(b), "{b}");
+    }
+    assert!(nle5dexportmessagerate_grammar("43.8 fps, 1.8x") && !nle5dexportmessagerate_grammar("43.8 fps, 1.80x"));
+    assert!(nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 1.8x)") && !nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 9x)"));
+    println!("nle5dexportmessageraterealtime: realtime_words {} KAT rows, {} None, {} refused shapes", rows.len(), nones.len(), bad.len());
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_finished_line_names_its_multiple() {
+    let dir = nlefaceexport_dir("realtime-png");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.clone().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" bytes, png + wav in "), "{line}");
+    let arrow = line.rfind(" -> ").expect("the dir");
+    let head = &line[..arrow];
+    let t = &head[head.rfind(" in ").expect("the time") + 4..];
+    let (wall, paren) = t.split_once(" (").unwrap_or_else(|| panic!("no ` (<r> fps, <m>x)` in {line}"));
+    let (rate, m) = paren.strip_suffix(')').and_then(|p| p.split_once(", ")).unwrap_or_else(|| panic!("no `, <m>x` in {line}"));
+    assert!(nle5dexportmessagerate_grammar(rate) && rate.ends_with(" fps"), "{rate:?} is not a rate in {line}");
+    assert!(nle5dexportmessageraterealtime_grammar(m), "{m:?} is not a multiple in {line}");
+    assert!(nle5dexportmessageduration_grammar(wall), "{wall:?} in {line}");
+    assert!(nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}");
+    let standing = face.paint();
+    face.last_error = None;
+    assert_eq!(face.paint(), standing, "labels off: the message paints nothing");
+    println!("nle5dexportmessageraterealtime: {line}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_refusals_carry_none() {
+    let dir = nlefaceexport_dir("realtime-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png wav extra", dir.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    assert!(usage.starts_with("export: usage: ") && !usage.contains("x)"), "{usage}");
+    assert!(face.verb(&format!("export {} gif", dir.display())));
+    let fmt = face.last_error.take().expect("the format refusal");
+    assert!(fmt.starts_with("export: unknown format gif") && !fmt.contains("x)"), "{fmt}");
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    println!("nle5dexportmessageraterealtime: usage / unknown format / cancel carry no multiple");
+    let _ = std::fs::remove_dir_all(&dir);
 }

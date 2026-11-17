@@ -2218,7 +2218,7 @@ impl Face {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames), j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames, (self.state.timeline.tb.den, self.state.timeline.tb.num)), j.dir.display()),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -2724,11 +2724,11 @@ impl Face {
 
 // ---- NLE5DEXPORTMESSAGEAUDIO (LEDGER SR756): the result line and the refusal name the words (named tail block) ----
 /// The result line's words for what was written: `<video> + <audio>` (the audio as the table spells it,
-/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775), and ` (<r> fps)` ([`rate_words`], NLE5DEXPORTMESSAGERATE SR785).
-fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64) -> String {
+/// [`crate::nle_export::audio_word`]: `wav`, `mp4`, `aac`, `aac:K`), or `<video>, no audio` under `AudioOut::None`; then ` in <t>`, the job's wall time ([`wall_words`], NLE5DEXPORTMESSAGEDURATION SR775), and ` (<r> fps, <m>x)` ([`rate_words`], NLE5DEXPORTMESSAGERATE SR785; the multiple of real time at the timeline's frame rate `fps` as (num, den), [`realtime_words`], SR794).
+fn export_words(video: &str, audio: AudioOut, wall: Duration, frames: u64, fps: (u64, u64)) -> String {
     match audio {
-        AudioOut::None => format!("{video}, no audio in {}{}", wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
-        a => format!("{video} + {} in {}{}", crate::nle_export::audio_word(&a), wall_words(wall), rate_words(frames, wall).map(|r| format!(" ({r})")).unwrap_or_default()),
+        AudioOut::None => format!("{video}, no audio in {}{}", wall_words(wall), rate_words(frames, wall, fps).map(|r| format!(" ({r})")).unwrap_or_default()),
+        a => format!("{video} + {} in {}{}", crate::nle_export::audio_word(&a), wall_words(wall), rate_words(frames, wall, fps).map(|r| format!(" ({r})")).unwrap_or_default()),
     }
 }
 
@@ -2855,11 +2855,41 @@ pub fn wall_words(d: Duration) -> String {
 /// An export's speed as a person reads it (every encoder prints one: x264's `42.1 fps`): `frames` over `wall`, rounded
 /// half up in integer arithmetic on microseconds; 100 or more a whole number (`120 fps`, `500 fps`), below that one
 /// decimal (`43.8 fps`, `3.0 fps`, `0.3 fps`). `None` for 0 frames or a wall under 1 ms: such an export says nothing of speed.
-pub fn rate_words(frames: u64, wall: Duration) -> Option<String> {
+pub fn rate_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<String> {
     if frames == 0 || wall < Duration::from_millis(1) {
         return None;
     }
     let (f, us) = (frames as u128, wall.as_micros());
     let tenths = (f * 20_000_000 + us) / (2 * us);
-    Some(if tenths >= 1000 { format!("{} fps", (f * 2_000_000 + us) / (2 * us)) } else { format!("{}.{} fps", tenths / 10, tenths % 10) })
+    Some(format!("{}{}", if tenths >= 1000 { format!("{} fps", (f * 2_000_000 + us) / (2 * us)) } else { format!("{}.{} fps", tenths / 10, tenths % 10) }, realtime_words(frames, wall, fps).map(|m| format!(", {m}")).unwrap_or_default()))
+}
+
+// ---- NLE5DEXPORTMESSAGERATEREALTIME (LEDGER SR794): the export's speed as a multiple of real time (named tail block) ----
+// `rate_words` takes the timeline's frame rate as (num, den) — `(tb.den, tb.num)` from the face's `Timeline.tb` (seconds
+// per tick; written only by `Timeline::new`, so the face's timeline carries the exported clone's rate) — and appends
+// `, <m>x` inside its parenthesis. Owed: NLE5D-EXPORT-MESSAGE-ETA (a running export's remaining time from the multiple so
+// far, on the progress band and stria-view's export JSON), NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// An export's speed as a multiple of real time (`1.8x`: it ran 1.8 times faster than the timeline plays; `0.40x`:
+/// slower): `frames` over `wall`, divided by the frame rate `fps` = (num, den) frames per second, each grade rounded half up
+/// in integer arithmetic on microseconds (the [`rate_words`] road); 10 or more a whole number (`12x`, `20x`), 1 to 10 one
+/// decimal (`1.8x`), below 1 two decimals (`0.40x`). `None` for 0 frames, a wall under 1 ms, a rate with a zero term (a
+/// timeline without a rate), or an overflow.
+pub fn realtime_words(frames: u64, wall: Duration, fps: (u64, u64)) -> Option<String> {
+    let (num, den) = fps;
+    if frames == 0 || num == 0 || den == 0 || wall < Duration::from_millis(1) {
+        return None;
+    }
+    let top = (frames as u128).checked_mul(den as u128)?;
+    let bot = wall.as_micros().checked_mul(num as u128)?;
+    let q = |k: u128| -> Option<u128> { Some(top.checked_mul(k * 2_000_000)?.checked_add(bot)? / bot.checked_mul(2)?) };
+    let tenths = q(10)?;
+    Some(if tenths >= 100 {
+        format!("{}x", q(1)?)
+    } else if tenths >= 10 {
+        format!("{}.{}x", tenths / 10, tenths % 10)
+    } else {
+        let h = q(100)?;
+        format!("{}.{:02}x", h / 100, h % 100)
+    })
 }
