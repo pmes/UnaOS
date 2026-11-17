@@ -334,9 +334,8 @@ impl CabacEnc {
     }
     /// A 2^log2 coding unit with pcm_flag 1 (its quadtree split flag `split_inc` 0 coded first) holding `y` / `cb` /
     /// `cr` samples (row-major), the engine restarted after them.
-    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u8], cb: &[u8], cr: &[u8]) {
-        let w = |p: &[u8]| p.iter().map(|&v| v as u16).collect::<Vec<u16>>();
-        self.pcm_cu_bits(split_inc, log2, 8, 8, &w(y), &w(cb), &w(cr));
+    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
+        self.pcm_cu_bits(split_inc, log2, 8, 8, y, cb, cr);
     }
     /// HEVCMAIN10 (SR311): [`CabacEnc::pcm_cu`] with PcmBitDepthY / PcmBitDepthC of `luma_bits` / `chroma_bits`.
     pub fn pcm_cu_bits(&mut self, split_inc: usize, log2: u32, luma_bits: u32, chroma_bits: u32, y: &[u16], cb: &[u16], cr: &[u16]) {
