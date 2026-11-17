@@ -1064,3 +1064,15 @@ impl Sources {
         self.proxy.lock().ok()?.iter().find(|(s, _)| *s == id).map(|(_, m)| Arc::clone(m))
     }
 }
+
+// ---- STRIAPROXYOFF (LEDGER SR915): detach a source's proxy (named tail block) ----
+impl Sources {
+    /// Detach source `id`'s proxy (the preview reads the original again); false when none was attached. One retain under
+    /// the slot's lock; a render already running keeps its own `Arc` of the proxy until its run ends.
+    pub fn clear_proxy(&self, id: SourceId) -> bool {
+        let Ok(mut v) = self.proxy.lock() else { return false };
+        let before = v.len();
+        v.retain(|(s, _)| *s != id);
+        v.len() != before
+    }
+}

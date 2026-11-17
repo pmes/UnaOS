@@ -194,7 +194,7 @@ pub struct Face {
     export: Option<ExportJob>,
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
-    proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, // STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
+    proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, proxy_queue: Vec<(timeline_core::SourceId, String)>, proxy_hold: Option<u64>, // STRIAPROXYOFF (SR915): the `proxy all` queue and the job's hold seam (file tail); STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
 }
 
@@ -202,7 +202,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new(), proxy_queue: Vec::new(), proxy_hold: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -237,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.proxy_words(v) { return r; } if let Some(r) = self.proxy_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -517,7 +517,7 @@ impl Face {
                 Ok(())
             }
             "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" | "mark in" | "mark out" | "mark clear" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch; NLE5DRANGEKEYS (SR735): the export marks
-            "cancel" => return self.drag.take().is_some() || self.cancel_export(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
+            "cancel" => return self.drag.take().is_some() || self.cancel_export() || self.cancel_proxy(), // STRIAPROXYOFF (SR915): then a running proxy job (file tail); NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
         if let Err(e) = r {
@@ -3120,6 +3120,7 @@ pub struct ProxyJob {
     done: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<Result<u64, String>>>,
+    cancel: Arc<AtomicBool>, // STRIAPROXYOFF (SR915): Esc's ask to stop (`Face::cancel_proxy`)
 }
 
 /// STRIAPROXYMEDIA (LEDGER SR882): the proxy, its stamp and its transient export directory beside source file `src`
@@ -3145,7 +3146,7 @@ pub fn proxy_fresh(src: &std::path::Path) -> bool {
 impl Face {
     /// Each reel's source file (reel name, path), the files `proxy` renders from and writes beside.
     pub fn with_reel_paths(mut self, paths: Vec<(String, std::path::PathBuf)>) -> Face {
-        self.reel_paths = paths;
+        self.reel_paths = paths; self.proxy_auto(); // STRIAPROXYOFF (SR915): a fresh proxy beside a reel attaches at open (file tail)
         self
     }
     /// True while a proxy job's result has not been reported.
@@ -3196,8 +3197,8 @@ impl Face {
         let t = tl.add_track(Kind::Video);
         tl.tracks[t].clips = vec![Clip::new(src, 0, n, 0)];
         std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-        let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(n.max(0) as u64)));
-        let (d, tt, sources, out, dir) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&self.sources), proxy.clone(), work.clone());
+        let (done, total) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(n.max(0) as u64))); let cancel = Arc::new(AtomicBool::new(false)); // STRIAPROXYOFF (SR915): the job's cancel flag
+        let (d, tt, sources, out, dir) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&self.sources), proxy.clone(), work.clone()); let (c, hold) = (Arc::clone(&cancel), self.proxy_hold); // STRIAPROXYOFF (SR915): the flag and the hold the closure reads
         let handle = std::thread::Builder::new()
             .name("nle-proxy".into())
             .spawn(move || -> Result<u64, String> {
@@ -3205,16 +3206,16 @@ impl Face {
                 let mut progress = |k: u64, of: u64| -> Result<(), ExportError> {
                     d.store(k, Relaxed);
                     tt.store(of, Relaxed);
-                    Ok(())
+                    proxy_gate(&c, hold, k) // STRIAPROXYOFF (SR915): the hold, then Esc's refusal (file tail)
                 };
-                let r = export_as_with(&tl, 0..n, &sources, &dir, video, AudioOut::None, Container::Mp4, &mut progress).map_err(|e| e.to_string())?;
+                let r = export_as_with(&tl, 0..n, &sources, &dir, video, AudioOut::None, Container::Mp4, &mut progress).map_err(|e| { let _ = std::fs::remove_dir_all(&dir); e.to_string() })?; // STRIAPROXYOFF (SR915): a failed or cancelled job leaves no work dir
                 std::fs::rename(dir.join("video.mp4"), &out).map_err(|e| format!("{}: {e}", out.display()))?;
                 std::fs::write(&stamp, now).map_err(|e| format!("{}: {e}", stamp.display()))?;
                 let _ = std::fs::remove_dir_all(&dir);
                 Ok(r.frames)
             })
             .map_err(|e| format!("{}: {e}", work.display()))?;
-        self.proxy = Some(ProxyJob { src, reel: reel.to_string(), path: proxy.clone(), done, total, handle: Some(handle) });
+        self.proxy = Some(ProxyJob { src, reel: reel.to_string(), path: proxy.clone(), done, total, handle: Some(handle), cancel });
         Ok(format!("building ({why}) -> {}", proxy.display()))
     }
     /// One clock tick for the proxy job: a finished job attaches its proxy and reports; true then (the preview repaints).
@@ -3242,9 +3243,136 @@ impl Face {
                 .map_err(|e| format!("{}: {e}", j.path.display()))
                 .and_then(|b| self.sources.set_proxy(j.src, b).map_err(|e| e.to_string()))
                 .map(|()| format!("{frames} frames -> {}", j.path.display())),
-            Some(Ok(Err(e))) => Err(e),
+            Some(Ok(Err(e))) => Err(if j.cancel.load(Relaxed) { format!("cancelled at {}/{} frames", j.done.load(Relaxed), j.total.load(Relaxed)) } else { e }), // STRIAPROXYOFF (SR915): Esc's stop by name
             _ => Err("the proxy thread panicked".to_string()),
         };
-        self.last_error = Some(format!("proxy: {}: {}", j.reel, r.unwrap_or_else(|e| e)));
+        self.last_error = Some(format!("proxy: {}: {}", j.reel, r.unwrap_or_else(|e| e))); self.proxy_next(); // STRIAPROXYOFF (SR915): `proxy all` chains the next reel (file tail)
+    }
+}
+
+// ---- STRIAPROXYOFF (LEDGER SR915): proxy off / all / cancel / auto-attach (named tail block) ----
+// The proxy's other words, every build on SR882's ONE road (`Face::proxy_start`): `proxy off` detaches the selected clip's
+// source's proxy (`Sources::clear_proxy`: the preview reads the original again; the files stay on disk); `proxy all` queues
+// every reel with a source path, in source order, and runs them one job at a time (`finish_proxy` chains `proxy_next`);
+// Esc (after the drag and the export) cancels the running job and drops the queue, refused inside the job with the export's
+// own `Interrupted` shape; a FRESH proxy beside a reel attaches at open (`with_reel_paths`), a stale one is left alone.
+// View-only: no undo step, the document clean. Owed: NLE-PROXY-BUTTONS, NLE-PROXY-PURGE.
+
+/// STRIAPROXYOFF (LEDGER SR915): the proxy job's progress gate after frame `k`: hold while `hold == Some(k)` until
+/// cancelled (the test seam, [`Face::hold_proxy_at`]), then refuse with `Interrupted "cancelled"` once Esc asked.
+fn proxy_gate(c: &AtomicBool, hold: Option<u64>, k: u64) -> Result<(), ExportError> {
+    if hold == Some(k) {
+        while !c.load(Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if c.load(Relaxed) {
+        return Err(ExportError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")));
+    }
+    Ok(())
+}
+
+impl Face {
+    /// `proxy off` / `proxy all` / `proxy <other>` (the usage); the bare word is SR882's [`Face::proxy_verb`] (None here).
+    fn proxy_words(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("proxy") {
+            return None;
+        }
+        let args: Vec<&str> = words.collect();
+        match args.as_slice() {
+            [] => return None,
+            ["off"] => self.proxy_off(),
+            ["all"] => self.proxy_all(),
+            _ => self.last_error = Some("proxy: usage: proxy [off|all]".into()),
+        }
+        Some(true)
+    }
+    /// `proxy off` on the selected clip's source: `proxy: <reel>: off (the preview reads the original)` or `.. no proxy
+    /// attached`; refused while that source's own proxy is building.
+    fn proxy_off(&mut self) {
+        let Some(c) = self.state.selected() else {
+            self.last_error = Some("proxy: no clip selected".into());
+            return;
+        };
+        let reel = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |s| s.reel.clone());
+        if let (Some(j), Some((d, t))) = (self.proxy.as_ref(), self.proxy_progress()) {
+            if j.src == c.src {
+                self.last_error = Some(format!("proxy: {reel}: busy ({d}/{t}): Esc cancels the build"));
+                return;
+            }
+        }
+        let line = if self.sources.clear_proxy(c.src) { "off (the preview reads the original)" } else { "no proxy attached" };
+        self.last_error = Some(format!("proxy: {reel}: {line}"));
+    }
+    /// `proxy all`: every source whose reel has a path, in source order, through [`Face::proxy_next`].
+    fn proxy_all(&mut self) {
+        if let Some((d, t)) = self.proxy_progress() {
+            self.last_error = Some(format!("proxy: busy ({d}/{t})"));
+            return;
+        }
+        let queue: Vec<(timeline_core::SourceId, String)> = self.state.timeline.sources.iter().filter(|s| self.reel_paths.iter().any(|(r, _)| *r == s.reel)).map(|s| (s.id, s.reel.clone())).collect();
+        if queue.is_empty() {
+            self.last_error = Some("proxy: all: no reel has a source path".into());
+            return;
+        }
+        self.last_error = Some(format!("proxy: all: {} reels", queue.len()));
+        self.proxy_queue = queue;
+        self.proxy_next();
+    }
+    /// Run the queue's next reels through SR882's `proxy_start` until one starts a job or the queue empties; each step is
+    /// appended to the message line as `; <reel>: <outcome>` (`proxy: <reel>: <outcome>` when the line is empty).
+    fn proxy_next(&mut self) {
+        let mut line = self.last_error.take();
+        while self.proxy.is_none() && !self.proxy_queue.is_empty() {
+            let (src, reel) = self.proxy_queue.remove(0);
+            let r = self.proxy_start(src, &reel).unwrap_or_else(|e| e);
+            line = Some(match line {
+                Some(l) => format!("{l}; {reel}: {r}"),
+                None => format!("proxy: {reel}: {r}"),
+            });
+        }
+        self.last_error = line;
+    }
+    /// Esc's proxy arm: ask the running job to stop (its next frame refuses) and drop the `proxy all` queue; false when
+    /// no job runs.
+    pub fn cancel_proxy(&mut self) -> bool {
+        let Some(j) = self.proxy.as_ref() else { return false };
+        j.cancel.store(true, Relaxed);
+        self.proxy_queue.clear();
+        true
+    }
+    /// The test seam (the export's `pause_at` shape): the next proxy job holds after frame `k` until it is cancelled.
+    pub fn hold_proxy_at(&mut self, k: Option<u64>) {
+        self.proxy_hold = k;
+    }
+    /// Source `src` has an attached proxy (the preview reads it).
+    pub fn has_proxy(&self, src: timeline_core::SourceId) -> bool {
+        self.sources.has_proxy(src)
+    }
+    /// At open: attach each reel's FRESH proxy (stamp matches the file, the file is the one opened); a stale or absent
+    /// proxy is left alone. Message only when something attached or refused: `proxy: attached A, B` (`; C: <refusal>`).
+    fn proxy_auto(&mut self) {
+        let (mut attached, mut refused) = (Vec::new(), Vec::new());
+        for (reel, path) in self.reel_paths.clone() {
+            let Some(src) = self.state.timeline.source_by_reel(&reel).map(|s| s.id) else { continue };
+            if !proxy_fresh(&path) || std::fs::metadata(&path).map(|m| m.len()).ok() != self.sources.byte_len(src) {
+                continue;
+            }
+            let (proxy, _, _) = proxy_paths(&path);
+            match std::fs::read(&proxy).map_err(|e| format!("{}: {e}", proxy.display())).and_then(|b| self.sources.set_proxy(src, b).map_err(|e| e.to_string())) {
+                Ok(()) => attached.push(reel),
+                Err(e) => refused.push(format!("{reel}: {e}")),
+            }
+        }
+        if attached.is_empty() && refused.is_empty() {
+            return;
+        }
+        let mut line = format!("proxy: attached {}", if attached.is_empty() { "none".to_string() } else { attached.join(", ") });
+        for r in refused {
+            line.push_str("; ");
+            line.push_str(&r);
+        }
+        self.last_error = Some(line);
     }
 }

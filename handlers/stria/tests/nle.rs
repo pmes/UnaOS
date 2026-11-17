@@ -3752,3 +3752,126 @@ fn striaproxymedia_verb_refusals() {
     assert_eq!(VERBS.last(), Some(&"help"));
     println!("striaproxymedia refusals: no clip selected; A: no source path; VERBS[{}] = proxy", VERBS.len() - 2);
 }
+
+// ---- STRIAPROXYOFF (LEDGER SR915): proxy off / all / cancel / auto-attach (named tail block) ----
+
+/// Reels A and B written into a fresh scratch dir (the bytes `synth_fixture` opened), and a face over them with their paths.
+fn striaproxyoff_face(case: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, Face, Timeline) {
+    let dir = common::scratch_dir("striaproxyoff", case);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (pa, pb) = (dir.join("A.mp4"), dir.join("B.mp4"));
+    std::fs::write(&pa, synth_source(0, 50, 25)).unwrap();
+    std::fs::write(&pb, synth_source(1000, 50, 25)).unwrap();
+    let (tl, src) = synth_fixture();
+    let face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false).with_reel_paths(vec![("A".into(), pa.clone()), ("B".into(), pb.clone())]);
+    (dir, pa, pb, face, tl)
+}
+
+/// `proxy off` detaches the selected clip's source's proxy (the files stay); again: nothing attached. View-only.
+#[test]
+fn striaproxyoff_off_detaches() {
+    let (dir, pa, _, mut face, tl) = striaproxyoff_face("off");
+    let a = tl.sources[0].id;
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    assert!(face.has_proxy(a));
+    assert!(face.verb("proxy off"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: off (the preview reads the original)"));
+    assert!(!face.has_proxy(a) && stria::nle_face::proxy_paths(&pa).0.is_file(), "detached; the file stays");
+    assert!(face.verb("proxy off"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: no proxy attached"));
+    assert_eq!(face.state.timeline, tl, "view-only");
+    assert!(!face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyoff off: A detached, then no proxy attached");
+}
+
+/// `proxy all` builds every reel with a path, one job at a time in source order (finish chains the next); again: both reused.
+#[test]
+fn striaproxyoff_all_builds_in_order_then_reuses() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("all");
+    let (a, b) = (tl.sources[0].id, tl.sources[1].id);
+    let (xa, xb) = (stria::nle_face::proxy_paths(&pa).0, stria::nle_face::proxy_paths(&pb).0);
+    assert!(face.verb("proxy all"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: all: 2 reels; A: building (new) -> {}", xa.display())));
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: 50 frames -> {}; B: building (new) -> {}", xa.display(), xb.display())));
+    assert!(face.proxying(), "B's job runs after A's");
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: B: 50 frames -> {}", xb.display())));
+    assert!(!face.proxying() && face.has_proxy(a) && face.has_proxy(b));
+    assert!(stria::nle_face::proxy_fresh(&pa) && stria::nle_face::proxy_fresh(&pb));
+    assert!(face.verb("proxy all"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: all: 2 reels; A: reused {}; B: reused {}", xa.display(), xb.display())));
+    assert!(!face.proxying() && !face.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyoff all: A then B built, then both reused");
+}
+
+/// Esc cancels a running proxy job (held after frame 3): the message names it, no proxy file or work dir is left, nothing
+/// attaches; under `proxy all` the queue is dropped.
+#[test]
+fn striaproxyoff_esc_cancels_the_job() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("cancel");
+    let a = tl.sources[0].id;
+    let (xa, _, work) = stria::nle_face::proxy_paths(&pa);
+    face.hold_proxy_at(Some(3));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.proxying());
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running proxy job");
+    assert!(face.wait_proxy());
+    let line = face.last_error.take().unwrap_or_default();
+    assert!(line.starts_with("proxy: A: cancelled at 3/"), "{line}");
+    assert!(!xa.exists() && !work.exists() && !face.has_proxy(a));
+    assert!(!face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc with nothing running takes nothing");
+    assert!(face.verb("proxy all") && face.proxying());
+    assert!(face.cancel_proxy());
+    assert!(face.wait_proxy());
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("proxy: A: cancelled at 3/")), "the queue is dropped: B never starts");
+    assert!(!face.proxying() && !stria::nle_face::proxy_paths(&pb).0.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyoff cancel: {line}");
+}
+
+/// A FRESH proxy beside a reel attaches when a face opens with the reel's path; a stale one is left alone (not attached,
+/// the file untouched); no proxy on disk = no message.
+#[test]
+fn striaproxyoff_fresh_proxy_attaches_at_open() {
+    let (dir, pa, pb, mut face, tl) = striaproxyoff_face("auto");
+    let a = tl.sources[0].id;
+    assert_eq!(face.last_error.take(), None, "nothing on disk: no message");
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy") && face.wait_proxy());
+    let paths = vec![("A".into(), pa.clone()), ("B".into(), pb.clone())];
+    let (t2, s2) = synth_fixture();
+    let mut fresh = Face::new(EditorState::new(t2), s2, (320, 160), PixelOrder::Rgba, false).with_reel_paths(paths.clone());
+    assert!(fresh.has_proxy(a));
+    assert_eq!(fresh.last_error.take().as_deref(), Some("proxy: attached A"));
+    let (xa, stamp, _) = stria::nle_face::proxy_paths(&pa);
+    let before = std::fs::read(&xa).unwrap();
+    std::fs::write(&stamp, "0 0\n").unwrap();
+    let (t3, s3) = synth_fixture();
+    let mut stale = Face::new(EditorState::new(t3), s3, (320, 160), PixelOrder::Rgba, false).with_reel_paths(paths);
+    assert!(!stale.has_proxy(a) && !stale.proxying());
+    assert_eq!(stale.last_error.take(), None);
+    assert_eq!(std::fs::read(&xa).unwrap(), before, "a stale proxy is left alone");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxyoff auto: fresh A attached at open; stale left alone");
+}
+
+/// `proxy <other>` prints the usage; `proxy off` / `proxy all` without a selection / a path refuse by name. No VERBS word added.
+#[test]
+fn striaproxyoff_usage_and_refusals() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("proxy foo"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: usage: proxy [off|all]"));
+    assert!(face.verb("proxy off"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: no clip selected"));
+    assert!(face.verb("proxy all"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: all: no reel has a source path"));
+    assert!(!face.proxying() && !face.dirty());
+    assert!(!VERBS.contains(&"proxy off") && !VERBS.contains(&"proxy all"));
+    println!("striaproxyoff usage: proxy [off|all]");
+}
