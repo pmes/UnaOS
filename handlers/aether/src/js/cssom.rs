@@ -458,6 +458,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
         }
         "gap" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("row-gap", c)),
         "overflow" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"))),
+        "place-content" | "place-items" | "place-self" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase())),
         "flex" => {
             let parts = split_values(v);
             let num_of = |c: &CV| match c {
@@ -946,6 +947,10 @@ struct Flushed {
     /// pins to the viewport — its rects do not move with the scroll on those axes (applied at read time,
     /// [`client_rect`]: this cache is keyed by DOM version, not by scroll).
     pinned: HashMap<NodeId, (bool, bool)>,
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): every element in a `position: sticky` box's subtree, with its (outermost) sticky
+    /// root and the root's parent document origin — the root's hold for the current scroll is applied at read time
+    /// ([`client_rect`] through `render::placed_origin`), like `pinned`.
+    held: HashMap<NodeId, (taffy::NodeId, (f32, f32))>,
 }
 
 thread_local! {
@@ -970,8 +975,8 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
             let mut tree = crate::layout::build_tree(&doc, w, h);
             crate::css::apply_stylesheets(&mut tree, &sheets);
             let report = crate::css::computed_report(&tree);
-            let (boxes, pinned) = element_boxes(&tree);
-            Flushed { version, tree, report, boxes, pinned }
+            let (boxes, pinned, held) = element_boxes(&tree);
+            Flushed { version, tree, report, boxes, pinned, held }
         }
     };
     let r = f(&flushed);
@@ -984,10 +989,11 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
 /// fixed box takes its origin from `LayoutTree::fixed_at` (the one viewport-origin map the painter reads) on each
 /// pinned axis, and its subtree inherits the pin.
 #[allow(clippy::type_complexity)]
-fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>) {
+fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>, HashMap<NodeId, (taffy::NodeId, (f32, f32))>) {
     use crate::layout::inline::Frag;
     let mut out: HashMap<NodeId, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut pinned: HashMap<NodeId, (bool, bool)> = HashMap::new();
+    let (mut held, mut hold_of) = (HashMap::new(), HashMap::new()); // AETHERCSSOMBOUNDINGSTICKY (SR1144)
     let mut work: Vec<(taffy::NodeId, f32, f32, (bool, bool))> = vec![(tree.root_node, 0.0, 0.0, (false, false))];
     let elem_of = |t: taffy::NodeId| tree.node_map.get(&t).filter(|n| n.is_element()).map(|n| n.id());
     // The root's own location.
@@ -996,6 +1002,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
     }
     while let Some((t, mut x, mut y, mut pin)) = work.pop() {
         let Ok(l) = tree.taffy.layout(t) else { continue };
+        let hold = sticky_hold(tree, t, x, y, l, pin, tree.fixed_at.contains_key(&t), &mut hold_of); // AETHERCSSOMBOUNDINGSTICKY (SR1144): before the fixed origin replaces (x, y)
         if let Some(&(fx, fy)) = tree.fixed_at.get(&t) {
             if let Some(fx) = fx {
                 x = fx;
@@ -1008,6 +1015,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
         }
         if let Some(id) = elem_of(t) {
             out.entry(id).or_default().push((x, y, l.size.width, l.size.height));
+            if let Some(hd) = hold { held.insert(id, hd); }
             if pin != (false, false) {
                 pinned.insert(id, pin);
             }
@@ -1020,6 +1028,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
                     Frag::Box { node, x: fx, y: fy, w, h, .. } => {
                         if let Some(id) = elem_of(*node) {
                             out.entry(id).or_default().push((cx + fx, cy + fy, *w, *h));
+                            if let Some(hd) = hold { held.insert(id, hd); }
                             if pin != (false, false) {
                                 pinned.insert(id, pin);
                             }
@@ -1045,7 +1054,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
             }
         }
     }
-    (out, pinned)
+    (out, pinned, held)
 }
 
 /// AETHERFIT2 (SR191): a document-space rect of element `id` in viewport coordinates — the scroll is subtracted
@@ -1054,6 +1063,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
 fn client_rect(f: &Flushed, id: NodeId, r: (f32, f32, f32, f32), scroll: (f64, f64)) -> (f64, f64, f64, f64) {
     let (px, py) = f.pinned.get(&id).copied().unwrap_or((false, false));
     let (x, y, w, h) = r;
+    let (x, y) = sticky_held_at(f, id, x, y, scroll);
     (x as f64 - if px { 0.0 } else { scroll.0 }, y as f64 - if py { 0.0 } else { scroll.1 }, w as f64, h as f64)
 }
 
@@ -1922,6 +1932,9 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
             "background-repeat", "background-attachment", "background-origin", "background-clip", "background-color",
         ],
     ),
+    ("place-content", &["align-content", "justify-content"]),
+    ("place-items", &["align-items", "justify-items"]),
+    ("place-self", &["align-self", "justify-self"]),
 ];
 
 #[cfg(test)]
@@ -2050,11 +2063,11 @@ top>inset";
                 old_of.insert(p, shs.split(' ').collect());
             }
         }
-        assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
+        assert_eq!(keys + PLACE_SHORTHANDS.len(), SHORTHANDS.len(), "every old shorthand is a table row, plus SR1087's three place-* rows (19 + 3 = 22)");
         let names = universe();
         assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
         for p in &names {
-            let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
+            let want = if let Some(sh) = PLACE_SHORTHANDS.iter().find(|sh| longhands(sh).unwrap().contains(p)) { vec![*sh] /* SR1087: a place-* longhand maps to its place row */ } else if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
         }
         for p in FIXED {
@@ -2419,6 +2432,9 @@ const PLAIN_N: &[(&str, u8)] = &[
     ("border-radius", 4),
     ("gap", 2),
     ("overflow", 2),
+    ("place-content", 2),
+    ("place-items", 2),
+    ("place-self", 2),
 ];
 
 /// The plain n-value serialization of a [`PLAIN_N`] shorthand's longhand values (in [`SHORTHANDS`] order).
@@ -2541,6 +2557,7 @@ mod shorthand_table_expand_tests {
             "border-color" => ["red", "lime", "blue", "yellow"],
             "gap" => ["5px", "10px", "", ""],
             "overflow" => ["hidden", "auto", "", ""],
+            "place-content" | "place-items" | "place-self" => ["center", "start", "", ""],
             _ => ["1px", "2px", "3px", "4px"],
         }
     }
@@ -2667,4 +2684,159 @@ mod shorthand_table_expand_tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "border-radius");
     }
+}
+
+// ---- AETHERCSSOMPLACEEXPAND (LEDGER SR1087): place-* as PLAIN_N n = 2 rows (named tail block) ----
+
+/// AETHERCSSOMPLACEEXPAND (SR1087): css-align-3 §6.4 / §7.4 / §8.3's two-longhand shorthands (align-* then justify-*),
+/// the [`SHORTHANDS`] rows past SR786's capture; each is a [`PLAIN_N`] n = 2 row expanded through [`plain_expand`].
+#[cfg(test)]
+const PLACE_SHORTHANDS: [&str; 3] = ["place-content", "place-items", "place-self"];
+
+#[cfg(test)]
+mod cssom_place_tests {
+    use super::*;
+
+    fn cv(value: &str) -> Vec<CV> {
+        css_core::parser::parse_component_values(value)
+    }
+
+    #[test]
+    fn cssom_place_items_one_value_sets_both() {
+        let b = Block::parse("place-items: center");
+        assert_eq!(b.get("align-items"), "center");
+        assert_eq!(b.get("justify-items"), "center");
+        assert_eq!(b.get("place-items"), "center");
+    }
+
+    #[test]
+    fn cssom_place_content_two_values() {
+        let b = Block::parse("place-content: start end");
+        assert_eq!(b.get("align-content"), "start");
+        assert_eq!(b.get("justify-content"), "end");
+        assert_eq!(b.get("place-content"), "start end");
+    }
+
+    #[test]
+    fn cssom_place_self_two_values() {
+        let b = Block::parse("place-self: center start");
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("center".to_string(), "start".to_string()));
+        assert_eq!(b.get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_camel_case_setter_expands() {
+        assert_eq!(prop_from_attr("placeSelf"), "place-self");
+        assert_eq!(prop_from_attr("placeItems"), "place-items");
+        assert_eq!(prop_from_attr("placeContent"), "place-content");
+        let mut b = Block::default();
+        assert!(b.set(&prop_from_attr("placeSelf"), &cv("auto"), false));
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("auto".to_string(), "auto".to_string()));
+        assert_eq!(b.get("place-self"), "auto");
+    }
+
+    #[test]
+    fn cssom_place_remove_removes_both() {
+        let mut b = Block::parse("place-content: center; color: red");
+        assert!(b.remove("place-content"));
+        assert_eq!(b.get("align-content"), "");
+        assert_eq!(b.get("justify-content"), "");
+        assert_eq!(b.serialize(), "color: red;");
+    }
+
+    #[test]
+    fn cssom_place_three_values_refused() {
+        let mut b = Block::parse("color: red");
+        let before = b.serialize();
+        assert!(!b.set("place-items", &cv("center start end"), false));
+        assert_eq!(b.serialize(), before);
+    }
+
+    /// No alignment keyword list on the align-* longhand road (normalize_value stores any identifier), so an unknown
+    /// identifier is stored to both longhands, as `align-items: bogus` is; a non-identifier token refuses.
+    #[test]
+    fn cssom_place_ident_only_validator() {
+        let b = Block::parse("place-items: bogus");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("bogus".to_string(), "bogus".to_string()));
+        let mut b = Block::default();
+        assert!(!b.set("place-items", &cv("10px"), false));
+        assert!(!b.set("place-self", &cv("center 7"), false));
+        assert_eq!(b.serialize(), "");
+    }
+
+    #[test]
+    fn cssom_place_css_wide_and_case() {
+        let b = Block::parse("place-items: inherit");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("inherit".to_string(), "inherit".to_string()));
+        assert_eq!(b.get("place-items"), "inherit");
+        assert_eq!(Block::parse("place-self: CENTER Start").get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_css_text_round_trip() {
+        assert_eq!(Block::parse("align-items: center; justify-items: center").serialize(), "place-items: center;");
+        assert_eq!(Block::parse("place-self: auto start").serialize(), "place-self: auto start;");
+        assert_eq!(Block::parse("align-items: center").serialize(), "align-items: center;");
+        assert_eq!(Block::parse("place-content: center; justify-content: end").serialize(), "place-content: center end;");
+    }
+
+    #[test]
+    fn cssom_place_table_pins() {
+        assert_eq!(SHORTHANDS.len(), 22);
+        assert_eq!(PLAIN_N.len(), 12);
+        for (sh, a, j) in [
+            ("place-content", "align-content", "justify-content"),
+            ("place-items", "align-items", "justify-items"),
+            ("place-self", "align-self", "justify-self"),
+        ] {
+            assert!(PLACE_SHORTHANDS.contains(&sh));
+            assert_eq!(plain_n(sh), Some(2), "{sh}");
+            assert_eq!(longhands(sh), Some(vec![a.to_string(), j.to_string()]), "{sh}");
+            assert_eq!(shorthands_of(a), vec![sh]);
+            assert_eq!(shorthands_of(j), vec![sh]);
+        }
+    }
+}
+
+// ---- AETHERCSSOMBOUNDINGSTICKY (LEDGER SR1144): a stuck sticky box's CSSOM rects read at its held place (named tail block) ----
+
+/// AETHERCSSOMBOUNDINGSTICKY (SR1144): the sticky root that moves box `t` (border-box origin (`x`, `y`) in document space,
+/// before any fixed origin), and the root's parent document origin (`placed_origin`'s `abs`): a fixed box drops the hold
+/// (the painter places it against the viewport); otherwise the parent's hold is inherited (the painter places
+/// descendants from the parent's placed origin, so the OUTERMOST sticky root owns its subtree: an inner root's own
+/// extra hold is owed AETHER-CSSOM-BOUNDING-STICKY-NESTED); otherwise a sticky box outside any pinned subtree starts one.
+/// Records `t`'s hold in `hold_of` for its children (the walk pops a parent before its children).
+#[allow(clippy::too_many_arguments)]
+fn sticky_hold(
+    tree: &crate::layout::LayoutTree,
+    t: taffy::NodeId,
+    x: f32,
+    y: f32,
+    l: &taffy::Layout,
+    pin: (bool, bool),
+    fixed: bool,
+    hold_of: &mut HashMap<taffy::NodeId, (taffy::NodeId, (f32, f32))>,
+) -> Option<(taffy::NodeId, (f32, f32))> {
+    if fixed {
+        return None;
+    }
+    let inherited = tree.taffy.parent(t).and_then(|p| hold_of.get(&p).copied());
+    let sticky = pin == (false, false) && tree.paint_map.get(&t).and_then(|p| p.position_kind) == Some(4);
+    let hold = inherited.or(if sticky { Some((t, (x - l.location.x, y - l.location.y))) } else { None });
+    if let Some(h) = hold {
+        hold_of.insert(t, h);
+    }
+    hold
+}
+
+/// AETHERCSSOMBOUNDINGSTICKY (SR1144): element `id`'s flow origin (`x`, `y`) shifted by its sticky root's hold for the
+/// current `scroll` — the root's place from the painter's ONE origin fn (`render::placed_origin`, with the painter's
+/// truncated scroll and viewport size, as the shell's `hit_origin` calls it) minus its flow place. Unchanged for an
+/// element outside every sticky subtree.
+fn sticky_held_at(f: &Flushed, id: NodeId, x: f32, y: f32, scroll: (f64, f64)) -> (f32, f32) {
+    let Some(&(root, (ax, ay))) = f.held.get(&id) else { return (x, y) };
+    let Ok(l) = f.tree.taffy.layout(root) else { return (x, y) };
+    let (vw, vh) = page(|p| p.viewport);
+    let (hx, hy) = crate::render::placed_origin(&f.tree, root, ax, ay, l, vw as u32, vh as u32, scroll.0 as i32, scroll.1 as i32);
+    (x + hx - (ax + l.location.x), y + hy - (ay + l.location.y))
 }
