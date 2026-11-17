@@ -941,3 +941,21 @@ mod striasourceinfo_tests {
         println!("striasourceinfo witness: at:12:0,info -> {j}; tick:{n} -> absent");
     }
 }
+
+// ---- STRIASOURCEINFOKEY (LEDGER SR942): the witness reads the Ctrl+i chord (named tail block) ----
+#[cfg(test)]
+mod striasourceinfokey_tests {
+    use super::*;
+
+    /// STRIASOURCEINFOKEY M3: `at:12:0,key:Ctrl+i` stands reel B's line on `"info"` (the `key:` token, no new code).
+    #[test]
+    fn striasourceinfokey_key_field() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut f, "at:12:0,key:Ctrl+i");
+        assert!(errors.is_empty(), "{errors:?}");
+        let j = info_json(&f);
+        assert!(j.starts_with(",\"info\":\"info: B: utp1 64x48 ~") && j.ends_with(" kb/s\""), "{j}");
+        println!("striasourceinfokey witness: at:12:0,key:Ctrl+i -> {j}");
+    }
+}
