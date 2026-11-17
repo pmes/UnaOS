@@ -3692,7 +3692,7 @@ fn strialoudnessreadout_face_line_is_the_render_measure() {
 }
 
 /// Rule: with both marks set the measure takes `in..out` only and names its ticks; marks past the end are refused by
-/// `range_check`'s name (no thread); a second word while one runs is `busy`.
+/// `range_check`'s name (no thread); a second word while one runs cancels it (STRIALOUDNESSCANCEL SR903, its own test).
 #[test]
 fn strialoudnessreadout_marked_range_and_refusals() {
     let (tl, src) = synth_fixture();
@@ -3701,8 +3701,6 @@ fn strialoudnessreadout_marked_range_and_refusals() {
     face.state.set_marks((Some(5), Some(30))).unwrap();
     let want = stria::nle::loudness(&tl2, 5..30, &src2);
     assert!(face.verb("loudness"));
-    assert!(face.verb("loudness"));
-    assert_eq!(face.last_error.take().as_deref(), Some("loudness: busy"));
     assert!(face.wait_loudness());
     let line = face.last_error.take().expect("the line");
     assert_eq!(line, stria::nle_face::loudness_line(&want, &Some(5..30)));
@@ -3728,4 +3726,79 @@ fn strialoudnessreadout_no_audio_and_the_floor() {
     let floor = stria::nle_face::loudness_line(&Ok(Some(gneiss_pal::dsp::audio::meter::LUFS_FLOOR)), &None);
     assert_eq!(floor, "loudness: -70.0 LUFS integrated (nothing above the -70 LUFS gate)");
     println!("strialoudnessreadout: video-only -> no audio; {floor}");
+}
+
+// ---- STRIALOUDNESSCANCEL (LEDGER SR903): Esc / a second `loudness` cancels the measure; its progress on the message line (named tail block) ----
+
+/// Rule: a watch whose flag is set before the start stops `render` at its first step (`RenderSink::stop`, before any
+/// decode): no PCM reached the meter, so the measure is `None` and nothing was counted.
+#[test]
+fn strialoudnesscancel_stop_before_start_measures_nothing() {
+    let (tl, src) = synth_fixture();
+    let range = 0..tl.end();
+    let w = stria::nle::LoudnessWatch::new(&range);
+    w.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let got = stria::nle::loudness_watched(&tl, range, &src, Some(w.clone())).unwrap();
+    assert_eq!(got, None);
+    assert_eq!(w.done.load(std::sync::atomic::Ordering::Relaxed), 0);
+    println!("strialoudnesscancel: preset stop -> {got:?}, done 0");
+}
+
+/// Rule: an unset watch changes nothing about the measure (the same LUFS as `nle::loudness`) and its count ends inside
+/// the range: more than nothing, never past the range's ticks.
+#[test]
+fn strialoudnesscancel_progress_counts_the_range() {
+    let (tl, src) = synth_fixture();
+    let range = 0..tl.end();
+    let total = (range.end - range.start) as u64;
+    let w = stria::nle::LoudnessWatch::new(&range);
+    let got = stria::nle::loudness_watched(&tl, range.clone(), &src, Some(w.clone())).unwrap();
+    assert_eq!(got, stria::nle::loudness(&tl, range, &src).unwrap());
+    let done = w.done.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(done > 0 && done <= total, "done {done} of {total}");
+    println!("strialoudnesscancel: done {done}/{total} -> {got:?}");
+}
+
+/// Rule: a second `loudness` word and Esc (the `cancel` key action) each cancel the running measure; its line is
+/// `loudness: cancelled` (the job's own flag, as the export's), no undo step, the document clean, nothing left pending.
+#[test]
+fn strialoudnesscancel_second_word_and_escape_cancel() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let undo = face.state.undo_depth();
+    assert!(face.verb("loudness"));
+    assert!(face.verb("loudness"));
+    assert!(face.wait_loudness());
+    assert_eq!(face.last_error.take().as_deref(), Some("loudness: cancelled"));
+    assert!(!face.loudness_pending());
+    assert!(face.verb("loudness"));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc cancels the running measure");
+    assert!(face.wait_loudness());
+    assert_eq!(face.last_error.take().as_deref(), Some("loudness: cancelled"));
+    assert!(!face.loudness_pending());
+    assert!(!face.cancel_loudness(), "nothing to cancel");
+    assert_eq!((face.state.undo_depth(), face.dirty(), &face.state.timeline), (undo, false, &tl));
+    println!("strialoudnesscancel: second word and Esc -> loudness: cancelled");
+}
+
+/// Rule: the running line is `loudness: measuring <done>/<total>`, done clamped to the total; a face tick while the
+/// measure runs puts that line up (or, when the thread already ended, the finished line).
+#[test]
+fn strialoudnesscancel_progress_line() {
+    assert_eq!(stria::nle_face::loudness_progress_line(3, 10), "loudness: measuring 3/10");
+    assert_eq!(stria::nle_face::loudness_progress_line(12, 10), "loudness: measuring 10/10");
+    let (tl, src) = synth_fixture();
+    let (tl2, src2) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb("loudness"));
+    let finished = stria::nle_face::loudness_line(&stria::nle::loudness(&tl2, 0..tl2.end(), &src2), &None);
+    if face.loudness_tick() {
+        let line = face.last_error.take().expect("a line");
+        assert!(line.starts_with("loudness: measuring ") || line == finished, "{line}");
+    }
+    if face.wait_loudness() {
+        assert_eq!(face.last_error.take(), Some(finished.clone()));
+    }
+    assert!(!face.loudness_pending());
+    println!("strialoudnesscancel: progress line, then {finished}");
 }

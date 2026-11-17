@@ -995,20 +995,58 @@ impl Sources {
 /// at the first PCM's rate and channel count (`render` fixes both for the whole range).
 #[derive(Debug, Default)]
 struct LoudnessSink {
-    l: Option<gneiss_pal::dsp::audio::meter::Loudness>,
+    l: Option<gneiss_pal::dsp::audio::meter::Loudness>, watch: Option<LoudnessWatch>, // STRIALOUDNESSCANCEL (SR903): the stop flag and the ticks-done count (file tail)
 }
 
 impl RenderSink for LoudnessSink {
-    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {}
-    fn pcm(&mut self, _out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
-        self.l.get_or_insert_with(|| gneiss_pal::dsp::audio::meter::Loudness::new(rate, channels as usize)).push(interleaved);
+    fn frame(&mut self, out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) { self.seen(out_t); } fn stop(&self) -> bool { self.cancelled() } // STRIALOUDNESSCANCEL (SR903): progress and the stop hook (file tail)
+    fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        self.seen(out_t); self.l.get_or_insert_with(|| gneiss_pal::dsp::audio::meter::Loudness::new(rate, channels as usize)).push(interleaved);
     }
 }
 
 /// STRIALOUDNESSREADOUT (SR866): the BS.1770 integrated loudness (LUFS) of `range` of `tl` as [`render`] mixes it (the
 /// PCM an export of that range sends); `None` when the range sent no PCM (no audio track, or no audio in its sources).
 pub fn loudness(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources) -> Result<Option<f64>, RenderError> {
-    let mut sink = LoudnessSink::default();
+    loudness_watched(tl, range, sources, None) // STRIALOUDNESSCANCEL (SR903): the one measure body (file tail)
+}
+
+// ---- STRIALOUDNESSCANCEL (LEDGER SR903): the measure's stop and progress through RenderSink (named tail block) ----
+
+/// STRIALOUDNESSCANCEL (SR903): what a running measure shares with its face: `cancel` read by [`RenderSink::stop`] once
+/// per step (the export's road: no decode past it), `done` the ticks of the range rendered so far (raised by the sink's
+/// own callbacks). Relaxed atomics: a display count and a stop flag, as the export job's.
+#[derive(Debug, Clone)]
+pub struct LoudnessWatch {
+    pub start: i64,
+    pub done: Arc<std::sync::atomic::AtomicU64>,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LoudnessWatch {
+    /// A fresh watch over `range`: nothing done, not cancelled.
+    pub fn new(range: &std::ops::Range<i64>) -> LoudnessWatch {
+        LoudnessWatch { start: range.start, done: Arc::new(std::sync::atomic::AtomicU64::new(0)), cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+}
+
+impl LoudnessSink {
+    /// The step at `out_t` was sent: raise the ticks-done count (monotonic).
+    fn seen(&self, out_t: i64) {
+        if let Some(w) = &self.watch {
+            w.done.fetch_max((out_t - w.start).max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// True once the watch's cancel flag is set.
+    fn cancelled(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| w.cancel.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// STRIALOUDNESSCANCEL (SR903): [`loudness`] with an optional watch: progress through `done`, a stop at the next step
+/// once `cancel` is set (the partial range's measure is returned; the face names it cancelled by its own flag).
+pub fn loudness_watched(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, watch: Option<LoudnessWatch>) -> Result<Option<f64>, RenderError> {
+    let mut sink = LoudnessSink { l: None, watch };
     render(tl, range, sources, &mut sink)?;
     Ok(sink.l.map(|l| l.integrated()))
 }
