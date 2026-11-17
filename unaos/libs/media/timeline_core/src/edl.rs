@@ -204,7 +204,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
-            title_comment(l, line, &mut tl)?; titlestyle_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+            title_comment(l, line, &mut tl)?; titlestyle_comment(l, line, &mut tl)?; seqrate_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
@@ -395,7 +395,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if src.size_policy != SizePolicy::Letterbox {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
-        s.push_str(&title_line(src)); s.push_str(&titlestyle_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail); STRIAFREEZETHREE (SR9029): its `* UNA TITLESTYLE` line after it (file tail)
+        s.push_str(&title_line(src)); s.push_str(&titlestyle_line(src)); s.push_str(&seqrate_line(src)); // STRIASEQRATEEDL (SR9053): a sequence reel's `* UNA SEQRATE` line after its TITLE line; STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail); STRIAFREEZETHREE (SR9029): its `* UNA TITLESTYLE` line after it (file tail)
     }
     s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push_str(&marker_style_lines(tl, fps)); s.push('\n'); s.insert_str(s.len() - 1, &tracks_line(tl)); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     s.insert_str(s.len() - 1, &flag_lines(tl, "MUTE", |t| t.muted)); // STRIATRACKMUTESOLO (SR837): the muted tracks' `* UNA MUTE` lines, before the header's blank line (file tail)
@@ -1763,4 +1763,49 @@ fn pankeys_line(c: &Clip, fps: u32) -> String {
     }
     let w: Vec<String> = c.pan_keys.points().iter().map(|&(s, p)| format!("{}={}", timecode(s, fps), p)).collect();
     format!("* UNA PANKEYS {}\n", w.join(" "))
+}
+
+// ---- STRIASEQRATEEDL (LEDGER SR9053): the `* UNA SEQRATE` line (named tail block) ----
+// `* UNA SEQRATE <reel> <n>[/<d>]` is an image-sequence reel's own rate in frames a second ([`crate::Source::seq_rate`],
+// reduced), written right after that reel's SOURCE (SIZE, TITLE) lines and only when set, so an EDL with no sequence rate
+// writes as before. Wrong word count, a reel no SOURCE line above it declared, a second SEQRATE for one reel, a titled reel
+// (a title has no file), or a rate that is not `N` / `N/D` digits above 0 is a syntax error.
+
+/// STRIASEQRATEEDL: a `* UNA SEQRATE` line applied to its (already declared) source; any other line is left alone.
+fn seqrate_comment(l: &str, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA SEQRATE ") else { return Ok(()) };
+    let w: Vec<&str> = r.split_whitespace().collect();
+    if w.len() != 2 {
+        return Err(EdlError::Syntax { line });
+    }
+    let rate = seqrate_q(w[1]).ok_or(EdlError::Syntax { line })?;
+    let src = tl.sources.iter_mut().find(|s| s.reel == w[0]).filter(|s| s.seq_rate.is_none() && s.title.is_none()).ok_or(EdlError::Syntax { line })?;
+    src.seq_rate = Some(rate);
+    Ok(())
+}
+
+/// STRIASEQRATEEDL: a source's `* UNA SEQRATE` line: `n` for a whole rate, `n/d` otherwise (empty when unset).
+fn seqrate_line(src: &crate::Source) -> String {
+    match src.seq_rate {
+        Some((n, 1)) => format!("* UNA SEQRATE {} {n}\n", src.reel),
+        Some((n, d)) => format!("* UNA SEQRATE {} {n}/{d}\n", src.reel),
+        None => String::new(),
+    }
+}
+
+/// STRIASEQRATEEDL: a rate word `N` or `N/D` (digits only, both above 0) as reduced `(n, d)`; `None` for anything else.
+fn seqrate_q(r: &str) -> Option<(u64, u64)> {
+    let num = |t: &str| if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) { t.parse::<u64>().ok() } else { None };
+    let (n, d) = match r.split_once('/') {
+        Some((a, b)) => (num(a)?, num(b)?),
+        None => (num(r)?, 1),
+    };
+    if n == 0 || d == 0 {
+        return None;
+    }
+    let (mut x, mut y) = (n, d);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    Some((n / x, d / x))
 }

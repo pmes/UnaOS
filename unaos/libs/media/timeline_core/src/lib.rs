@@ -85,7 +85,7 @@ pub struct Source {
     /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
     pub size_policy: SizePolicy,
     /// STRIATITLECLIP (SR828): a generated title card's text (`None`: a media reel; an LF is a line break, STRIAFREEZETHREE SR9029); `edl` keeps it as `* UNA TITLE`.
-    pub title: Option<String>, pub title_style: TitleStyle, // STRIAFREEZETHREE (SR9029): the title's size / alignment / ink (DEFAULT: today's look; `* UNA TITLESTYLE`)
+    pub title: Option<String>, pub title_style: TitleStyle, // STRIAFREEZETHREE (SR9029): the title's size / alignment / ink (DEFAULT: today's look; `* UNA TITLESTYLE`) pub seq_rate: Option<(u64, u64)>, // STRIASEQRATEEDL (SR9053): an image-sequence reel's own frames a second as reduced (n, d) (`None`: unset); `edl` keeps it as `* UNA SEQRATE`
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -477,7 +477,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None, title_style: TitleStyle::DEFAULT });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None, title_style: TitleStyle::DEFAULT, seq_rate: None }); // STRIASEQRATEEDL (SR9053): no sequence rate
         id
     }
     /// Add an empty track (builder); returns its index.
