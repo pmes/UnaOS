@@ -2440,8 +2440,8 @@ impl Timeline {
 // ---- STRIAPAN (LEDGER SR861): per-clip pan (named tail block) ----
 // A clip carries [`Clip::pan_cq8`] (0 = centre, the default every constructor gives); `set_pan` is `set_gain`'s shape, the
 // editor's `pan <x>` word commits it, the EDL writes it as `* UNA PAN <cq8>`, and `schedule::audio_runs` copies it onto
-// each [`schedule::Layer`]. The ONE law is [`schedule::pan_q16`]; Stria's render applies it (the kernel Player plays it
-// centred: NLE-PAN-KERNEL).
+// each [`schedule::Layer`]. The ONE law is [`schedule::pan_q16`]; Stria's render and the kernel Player apply it through
+// [`schedule::pan_mix_q16`] (STRIAKPAN SR9015).
 impl Timeline {
     /// STRIAPAN: set a clip's pan (`pan_cq8`, -128..=127; every i8 is a pan, so only the clip's address is refused).
     pub fn set_pan(&self, track: usize, idx: usize, pan_cq8: i8) -> Result<Timeline, EditError> {

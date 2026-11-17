@@ -610,3 +610,25 @@ fn striapannext_pan_drag_on_the_grip() {
     assert_eq!(Drag::begin_with(&mut vs, vl, x, vy, false, false, false).map(|d| d.kind), Some(DragKind::Move), "no grip on a video clip");
     println!("striapannext: grip drag +{} px -> pan 64, far left -> -127", half / 2.0);
 }
+
+// ---- STRIAKPAN (LEDGER SR9015): the per-channel pan factor both faces apply (named tail block) ----
+
+/// The lifted rule: on two channels the constant-power law over its centre (centre unity, hard side +3.01 dB, the other
+/// silent); one channel or more than two: unity for every pan.
+#[test]
+fn striakpan_pan_mix_q16_is_the_compensated_law() {
+    use timeline_core::schedule::pan_mix_q16;
+    assert_eq!(pan_mix_q16(0, 2), [65536, 65536]);
+    assert_eq!(pan_mix_q16(127, 2), [0, 92681]);
+    assert_eq!(pan_mix_q16(-128, 2), [92681, 0]);
+    assert_eq!(pan_mix_q16(-127, 2), [92681, 0]);
+    let c = pan_q16(0)[0] as i64;
+    assert_eq!(c, 46341);
+    let w = pan_q16(-64);
+    assert_eq!(pan_mix_q16(-64, 2), [w[0] as i64 * 65536 / c, w[1] as i64 * 65536 / c]);
+    for p in [-128i8, -64, -1, 0, 1, 64, 127] {
+        assert_eq!(pan_mix_q16(p, 1), [65536, 65536], "mono ignores pan");
+        assert_eq!(pan_mix_q16(p, 6), [65536, 65536], "surround ignores pan");
+    }
+    println!("striakpan: hard right {:?}, -64 {:?}", pan_mix_q16(127, 2), pan_mix_q16(-64, 2));
+}
