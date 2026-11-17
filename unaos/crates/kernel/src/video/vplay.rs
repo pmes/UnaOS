@@ -1842,7 +1842,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 22] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1861,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'w', "insert"), (b'd', "overwrite"), (b'W', "insert-marked"), (b'D', "overwrite-marked"), // STRIAKINSERT (SR9062): the host KEYS' four insert words (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1928,7 +1929,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
             None => return None,
         }
         let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
-        (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(at).max(0) as u64) / 1_000_000)
+        (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(if timeline_core::editor::lays(verb) { st.playhead } else { at }).max(0) as u64) / 1_000_000) // STRIAKINSERT (SR9062): a laying word restarts at the laid end, where the host's playhead lands (file tail)
     };
     let saved = edit_save(path, &tl); // NLE6FACEDRAG (rmbp-ledger B975): the ONE save, shared with the drag door (file tail)
     serial_println!("[nle] edit {} at={} clips={} undo={} saved={}", verb, at, clips, undo, saved);
@@ -2665,3 +2666,15 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
     }
     Some((dw, dh))
 }
+
+// ---- STRIAKINSERT (LEDGER SR9062): the Player's insert / overwrite keys (named tail block) ----
+// `w` / `d` / `W` / `D` in [`EDIT_KEYS`] name the host KEYS' words `insert` / `overwrite` / `insert-marked` /
+// `overwrite-marked` (one character, one word on both faces). [`edit_key`] runs them unchanged: the playhead at the shown
+// frame, the shown clip selected (`shown_clip`), the word through timeline_core's ONE dispatch (`EditorState::verb` ->
+// SR852 `place_at_playhead` / SR905 `place_marked`, `Timeline::place`, the one `commit`: one undo step), the save through
+// `edl::write`. W / D read the export marks the EDL carries (`* UNA MARK`). The restart: for a laying word
+// (timeline_core `editor::lays`, the list held once) the seek door goes to the editor's playhead, the laid clip's end, as
+// the host's does; every other key keeps the pre-verb playhead. The all-tracks words and `target` take no byte. Wire:
+// `[nle] edit insert at=<tick> clips=<n> undo=<n> saved=<bytes>`, `[nle] edit overwrite-marked at=<tick> refused (no in /
+// out marks set)`. Host check: timeline_core editor.rs `striakinsert_tests`; the Player side is unexercised (owed
+// NLE-INSERT-KERNEL-WITNESS).

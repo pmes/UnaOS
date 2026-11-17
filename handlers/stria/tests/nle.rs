@@ -3857,3 +3857,19 @@ fn striainsertmarkskeysnext_face_target_steers_and_notes() {
     assert_eq!(face.last_error.take(), Some("target V9: no such track".to_string()));
     println!("striainsertmarkskeysnext: target V2 -> insert on V2; target A1 -> insert refused by kind");
 }
+
+// ---- STRIAKINSERT (LEDGER SR9062): the keys the kernel Player shares name the laying words (named tail block) ----
+
+/// The host's `w` / `d` / `W` / `D` (the bytes the kernel Player's EDIT_KEYS binds to the same words) each name a laying word
+/// of timeline_core's ONE list (`editor::lays`), which the face's laid line and the Player's restart both read.
+#[test]
+fn striakinsert_face_keys_name_the_laying_words() {
+    for k in ["w", "d", "W", "D"] {
+        let &(_, w) = KEYS.iter().find(|(name, _)| *name == k).expect("a host key");
+        assert!(timeline_core::editor::lays(w), "{k} -> {w}");
+    }
+    for w in ["split", "delete", "undo", "target", "help"] {
+        assert!(!timeline_core::editor::lays(w), "{w}");
+    }
+    println!("striakinsert: KEYS w d W D -> laying words (the Player's bytes, the same words)");
+}
