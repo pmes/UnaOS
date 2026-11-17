@@ -483,21 +483,127 @@ fn verb_hint(args: &[String]) {
 fn completions(shell: &str) -> Option<String> {
     let words = || VERBS.iter().chain(FLAGS.iter()).copied();
     Some(match shell {
-        "bash" => format!("complete -o default -W \"{}\" nle\n", words().collect::<Vec<_>>().join(" ")),
+        "bash" => bash_script(&words().collect::<Vec<_>>().join(" ")),
         "zsh" => {
             let mut s = format!("#compdef nle\n_arguments '1:verb:({})'", VERBS.join(" "));
             for f in FLAGS {
-                s.push_str(&format!(" '*{f}'"));
+                s.push_str(&format!(" '*{f}{}'", zsh_value(f)));
             }
-            s.push_str(" '*:file:_files'\n");
+            s.push_str(&format!("{} '*:file:_files'\n", zsh_size()));
             s
         }
         "fish" => words()
             .map(|w| match w.strip_prefix("--") {
-                Some(l) => format!("complete -c nle -l {l}\n"),
+                Some(l) => format!("complete -c nle -l {l}{}\n", fish_value(w)),
                 None => format!("complete -c nle -n __fish_use_subcommand -a {w}\n"),
             })
-            .collect(),
+            .chain(std::iter::once(fish_size())).collect(),
         _ => return None,
     })
+}
+
+// ---- NLECLICOMPLETIONSVALUES (LEDGER SR847): the words a flag's value takes, from the parser's own tables (named tail block) ----
+/// NLECLICOMPLETIONSVALUES (SR847): THE value table of `nle completions` — each valued flag with the words its parse takes,
+/// read from the parser's own tables (stria's `VIDEO_NAMES` / `AUDIO_NAMES` + `aac:` for `aac:KBPS` / `PASS2_KEYS` as `k=`),
+/// so a new codec / audio / pass2 word reaches every script with no second list.
+fn flag_values() -> [(&'static str, Vec<String>); 3] {
+    let own = |t: &[&str]| t.iter().map(|w| w.to_string()).collect::<Vec<String>>();
+    let mut audio = own(&stria::nle_export::AUDIO_NAMES[..]);
+    audio.push("aac:".to_string());
+    [
+        ("--video", own(&VIDEO_NAMES[..])),
+        ("--audio", audio),
+        ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect()),
+    ]
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): `nle size <edl> <reel> <policy>`'s words, timeline_core's `SizePolicy::ALL` by `name`.
+fn size_words() -> String {
+    timeline_core::SizePolicy::ALL.map(timeline_core::SizePolicy::name).join(" ")
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): a flag's value words from [`flag_values`] joined by spaces; `None` for a flag with no table.
+fn values_of(flag: &str) -> Option<String> {
+    flag_values().into_iter().find(|(f, _)| *f == flag).map(|(_, v)| v.join(" "))
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): bash's script — ONE `_nle` fn (a `-W` list cannot see the previous word): the verbs and
+/// flags by default, a valued flag's words after it, the size policies at `nle size <edl> <reel> _`; filenames still when
+/// nothing matches (`-o default`).
+fn bash_script(words: &str) -> String {
+    let mut s = format!("_nle() {{\n    local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} w=\"{words}\"\n    case $prev in\n");
+    for (f, v) in flag_values() {
+        s.push_str(&format!("        {f}) w=\"{}\" ;;\n", v.join(" ")));
+    }
+    s.push_str(&bash_free()); s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
+    s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
+    s
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): zsh's `_arguments` argument of a valued flag, `:<name>:(<words>)`; empty for any other.
+fn zsh_value(flag: &str) -> String {
+    values_of(flag).map(|v| format!(":{}:({v})", flag.trim_start_matches('-'))).unwrap_or_else(|| zsh_arg(flag))
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): zsh's fourth positional — the size policies after `nle size <edl> <reel>`, files otherwise.
+fn zsh_size() -> String {
+    format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {}; else _files; fi}}'", size_words())
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): fish's ` -xa "<words>"` on a valued `-l` line (a value required, these words); empty for any other.
+fn fish_value(word: &str) -> String {
+    values_of(word).map(|v| format!(" -xa \"{v}\"")).unwrap_or_else(|| fish_arg(word))
+}
+
+/// NLECLICOMPLETIONSVALUES (SR847): fish's size line — the policies as the fourth word after `nle size`.
+fn fish_size() -> String {
+    format!("complete -c nle -n \"__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{}\"\n", size_words())
+}
+
+// ---- NLECLICOMPLETIONSFREE (LEDGER SR1005): what a flag word takes after it, parallel to FLAGS (named tail block) ----
+/// NLECLICOMPLETIONSFREE (SR1005): what the option loop reads after a flag word — `Bare` nothing, `Free` a required value with
+/// no word table (`value` / `num`), `Opt` an optional K (`--scenecut [K]` / `--aq [K]`: a peeked word taken only when it
+/// parses), `Words` a required value from [`flag_values`] (SR847).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arg {
+    Bare,
+    Free,
+    Opt,
+    Words,
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): THE kind of each [`FLAGS`] word, in FLAGS order (FLAGS stays the one word list). tests/cli.rs
+/// `cli_completions_free` pins it to each arm's own read (`value(&mut it, ..)` / `num(&mut it, ..)` / `it.clone().next()`).
+const FLAG_ARG: [Arg; 24] = [
+    Arg::Free, Arg::Free, Arg::Words, Arg::Words, Arg::Bare, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Bare, Arg::Free, Arg::Opt,
+    Arg::Free, Arg::Bare, Arg::Free, Arg::Free, Arg::Opt, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Free, Arg::Words, Arg::Free,
+];
+
+/// NLECLICOMPLETIONSFREE (SR1005): `flag`'s [`Arg`] by its place in [`FLAGS`]; `Bare` for a word not in it.
+fn arg_of(flag: &str) -> Arg {
+    FLAGS.iter().position(|f| *f == flag).map_or(Arg::Bare, |i| FLAG_ARG[i])
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): bash's `case $prev` arm of every `Free` flag — an empty word list (`-o default` still
+/// gives readline's filenames); empty when no flag is `Free`.
+fn bash_free() -> String {
+    let free: Vec<&str> = FLAGS.iter().copied().filter(|f| arg_of(f) == Arg::Free).collect();
+    if free.is_empty() { String::new() } else { format!("        {}) w=\"\" ;;\n", free.join("|")) }
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): zsh's argument of a flag with no word table — `Free` `:<name>: ` (a space action: the
+/// message, no matches), `Opt` `::<name>: ` (an optional argument); empty for a `Bare` flag.
+fn zsh_arg(flag: &str) -> String {
+    let name = flag.trim_start_matches('-');
+    match arg_of(flag) {
+        Arg::Free => format!(":{name}: "),
+        Arg::Opt => format!("::{name}: "),
+        Arg::Bare | Arg::Words => String::new(),
+    }
+}
+
+/// NLECLICOMPLETIONSFREE (SR1005): fish's ` -x` on a `Free` flag's `-l` line (a value required, no files, no `-a` words);
+/// empty otherwise (fish cannot say an optional value for a separate word, so `Opt` is a plain `-l`).
+fn fish_arg(word: &str) -> String {
+    if arg_of(word) == Arg::Free { " -x".to_string() } else { String::new() }
 }
