@@ -1868,6 +1868,7 @@ const EDIT_KEYS: [(u8, &str); 20] = [
     (b'\\', "zoom-fit"), (b'|', "zoom-sel"), // STRIAZOOMFITMORE (SR965): the host's `\` / `|` fit the timeline / the selection (file tail)
     (b'(', "nudge-"), (b')', "nudge+"), // STRIANUDGENEXT (LEDGER SR986): `(` / `)` (Shift+9 / Shift+0) nudge the shown clip one frame (STRIANUDGE SR855's words, `EditorState::move_set`, one undo step); `<` / `>` are the host face's slide keys
     (b',', "slip-"), (b'.', "slip+"), // STRIAKSLIP (LEDGER SR9002): `,` / `.` slip the shown clip one frame back / on (timeline_core's step words, the host KEYS' bytes)
+    (b'm', "mark"), (b'M', "unmark"), // STRIAKMARKERS (SR9001): a marker at / off the playhead (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -2728,3 +2729,12 @@ fn edl_grade(g: timeline_core::Grade, px: Px) -> Px {
     }
     pack(&edl_graded(g, unpack(px.rgb()))).into()
 }
+
+// ---- STRIAKMARKERS (LEDGER SR9001): the Player's marker keys (named tail block) ----
+// `m` / `M` in [`EDIT_KEYS`] name timeline_core's marker words `mark` / `unmark` (`EditorState::verb` -> `marker_verb`, the
+// ONE dispatch the host face calls; the host's KEYS binds `m` to the same word and leaves `M` unbound). [`edit_key`] does the
+// rest unchanged: the playhead at the shown frame, the word through the one `commit` (one undo step), the save through
+// `edl::write` (`* UNA MARKER`), the seek door re-presents. The band needs nothing: [`view_band`]'s `view::paint_in` already
+// paints every marker on the ruler, and the schedule never reads them. Wire: `[nle] edit mark|unmark at=<tick> clips=<n>
+// undo=<n> saved=<bytes>`, or `[nle] edit mark|unmark at=<tick> refused (one marker per tick (...))`. Host check:
+// timeline_core tests/edl.rs `striakmarkers_*`; the Player side is unexercised (owed NLE-MARKERS-KERNEL-WITNESS).
