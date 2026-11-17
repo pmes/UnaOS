@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail)
+        if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -2783,5 +2783,82 @@ impl EditorState {
             EditError::Handle => Some("the crossfade is longer than the incoming clip or the outgoing clip's handle"),
             _ => None,
         }
+    }
+}
+
+// ---- STRIATRACKGAINSTEP (LEDGER SR901): `track-gain-` / `track-gain+` step the selected clip's track by one dB (named tail block) ----
+// The step words ride THE verb dispatch: each is SR864's `set_selected_track_gain` of the track's gain one
+// [`GAIN_STEP_CDB`] down / up (SR838's step), so it is ONE commit, NoTrack with nothing selected, and a step past the
+// clip range is refused by `validate`'s `EditError::Gain` with the state kept. An extra word is refused `EditError::Gain`.
+impl EditorState {
+    /// The `track-gain-` / `track-gain+` words of [`EditorState::verb`]; `None` for any other word.
+    fn track_gain_step_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let up = match w.next()? {
+            "track-gain-" => false,
+            "track-gain+" => true,
+            _ => return None,
+        };
+        let Some(g) = self.selection.and_then(|(t, _)| self.timeline.tracks.get(t)).map(|t| t.gain_cdb) else {
+            return Some(Err(EditError::NoTrack));
+        };
+        if w.next().is_some() {
+            return Some(Err(EditError::Gain));
+        }
+        Some(self.set_selected_track_gain(if up { g.saturating_add(GAIN_STEP_CDB) } else { g.saturating_sub(GAIN_STEP_CDB) }))
+    }
+}
+
+#[cfg(test)]
+mod striatrackgainstep_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// A1: A 0..20 at 0, A2: A 0..20 at 0; the clip on A2 selected.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for _ in 0..2 {
+            let t = tl.add_track(Kind::Audio);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        let mut st = EditorState::new(tl);
+        st.select(1, 0).unwrap();
+        st
+    }
+
+    /// M3: each step moves the selected clip's track one dB in ONE undo step (not the other track, not the clip); undo
+    /// walks them back.
+    #[test]
+    fn striatrackgainstep_steps_one_db_each() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("track-gain-"), Some(Ok(())));
+        assert_eq!(st.verb("track-gain-"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[1].gain_cdb, st.timeline.tracks[0].gain_cdb, st.timeline.tracks[1].clips[0].gain_cdb, st.undo_depth()), (-200, 0, 0, 2));
+        assert_eq!(st.verb("track-gain+"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[1].gain_cdb, st.undo_depth()), (-100, 3));
+        st.undo();
+        st.undo();
+        st.undo();
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// M3: each refusal by name, the state and the undo depth untouched; a step past the clip range is `Gain`.
+    #[test]
+    fn striatrackgainstep_refusals() {
+        let mut none = state();
+        none.selection = None;
+        let tl0 = none.timeline.clone();
+        assert_eq!(none.verb("track-gain-"), Some(Err(EditError::NoTrack)));
+        assert_eq!(none.verb("track-gain+"), Some(Err(EditError::NoTrack)));
+        let mut st = state();
+        assert_eq!(st.verb("track-gain+ 3"), Some(Err(EditError::Gain)));
+        assert_eq!((&st.timeline, st.undo_depth(), &none.timeline), (&tl0, 0, &tl0));
+        assert_eq!(st.verb("track-gain 24"), Some(Ok(())));
+        let top = st.timeline.clone();
+        assert_eq!(st.verb("track-gain+"), Some(Err(EditError::Gain)));
+        assert_eq!((&st.timeline, st.undo_depth()), (&top, 1));
+        assert_eq!(st.verb("track-gain-x"), None, "not this word");
     }
 }

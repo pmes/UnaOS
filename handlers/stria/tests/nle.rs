@@ -5459,7 +5459,7 @@ fn striatrackgain_face_word_and_refusal() {
     assert_eq!(face.state.timeline, tl);
     face.state.select(1, 0).unwrap();
     assert!(face.verb("track-gain -6"));
-    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.last_error.take().as_deref(), Some("track-gain: A1 -6.0 dB")); // STRIATRACKGAINSTEP (SR901): the success line
     assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (-600, 1));
     let text = edl::write(&face.state.timeline, "T").unwrap();
     assert!(text.contains("* UNA TGAIN A -600\n"), "{text}");
@@ -7915,4 +7915,28 @@ fn striazoomfitkeys_resize_refits_only_after_a_fit() {
     assert_eq!(face.last_error, None, "reported once");
     assert_eq!(clean(&face), (0, false, true));
     println!("striazoomfitkeys: fit 640->18 480->13; zoom+ / wheel end it; sel 64 -> 32; refusal once");
+}
+
+// ---- STRIATRACKGAINSTEP (LEDGER SR901): the track gain step words and their message line on the face (named tail block) ----
+
+/// M3: `track-gain-` / `track-gain+` are transport words before help; each steps the selected clip's track one dB in one
+/// undo step and puts `track-gain: A1 <db_words>` on the message line; with nothing selected the refusal names the word.
+#[test]
+fn striatrackgainstep_face_steps_and_line() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert_eq!(&VERBS[VERBS.len() - 3..], &["track-gain-", "track-gain+", "help"]);
+    assert!(face.verb("track-gain-"));
+    assert_eq!(face.last_error.take(), Some(format!("track-gain-: {}", EditError::NoTrack)));
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("track-gain-"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-gain: A1 -1.0 dB"));
+    assert!(face.verb("track-gain+"));
+    assert!(face.verb("track-gain+"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-gain: A1 +1.0 dB"));
+    assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (100, 3));
+    assert!(face.verb("track-gain+ 2"));
+    assert_eq!(face.last_error.take(), Some(format!("track-gain+ 2: {}", EditError::Gain)));
+    assert_eq!(stria::nle_face::db_words(-350), "-3.5 dB");
+    println!("striatrackgainstep face: track-gain- -> A1 -1.0 dB, two track-gain+ -> +1.0 dB; no selection -> {}", EditError::NoTrack);
 }
