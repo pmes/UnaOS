@@ -275,7 +275,7 @@ impl FontDb {
             walk_dir(d, &mut files, 0);
         }
         files.dedup();
-        let (cached, seeds, cache) = crate::db_cache::load(&config, &files); // AETHERFONTDBCACHE (SR684): a hit skips the header reads
+        let (cached, seeds, cache, dups) = crate::db_cache::load(&config, &files); // AETHERFONTDBCACHE (SR684): a hit skips the header reads
         let mut faces = Vec::new();
         let mut bytes_read = 0u64;
         for f in files.iter().filter(|_| cached.is_none()) {
@@ -283,14 +283,15 @@ impl FontDb {
             faces.extend(v);
             bytes_read += n;
         }
-        let mut swept = 0; let faces = cached.unwrap_or_else(|| { swept = crate::db_cache::store(&config, &files, &faces, cache); faces }); // AETHERFONTDBCACHE (SR684); AETHERFONTDBCACHESWEEP (SR770): the swept count
+        let mut swept = 0; let faces = cached.unwrap_or_else(|| { swept = crate::db_cache::store(&config, &files, &faces, cache, &[]); faces }); // AETHERFONTDBCACHE (SR684); AETHERFONTDBCACHESWEEP (SR770): the swept count
+        let compacted = crate::db_cache::compact(&config, &files, &faces, cache, dups, &seeds, &mut swept); // AETHERFONTDBCACHECOMPACT (SR791): the hit arm's one rewrite
         eprintln!(
             "[fonts] discover files={} bytes_read={} faces={} ms={} cache={}",
             files.len(),
             bytes_read / 1024,
             faces.len(),
             t0.elapsed().as_millis(),
-            crate::db_cache::cache_word(cache, swept)
+            crate::db_cache::compact_word(crate::db_cache::cache_word(cache, swept), compacted)
         );
         let (cmaps, scan_bytes) = (crate::db_cache::seed(faces.len(), seeds), AtomicU64::new(0)); // AETHERFONTDBFALLBACK (SR425); AETHERFONTDBCACHECMAP (SR697) seeds
         FontDb { faces, config, resolved: Mutex::new(HashMap::new()), fallback: OnceLock::new(), bytes_read, cmaps, scan_bytes, cache }
