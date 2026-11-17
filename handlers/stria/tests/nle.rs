@@ -4572,3 +4572,110 @@ fn striaexportrange_marker_queues_behind_a_running_export() {
     let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&dir));
     println!("striaexportrange: queued behind the running export, dropped by Esc");
 }
+
+// ---- STRIAEXPORTRANGEBAND (LEDGER SR9099): the running entry's name and the queue depth on the band (named tail block) ----
+
+fn striaexportrangeband_name(d: &std::path::Path) -> String {
+    d.file_name().expect("a named dir").to_string_lossy().into_owned()
+}
+
+/// A plain `export` while one runs queues behind it (SR881, no new road); the running row then names the running entry
+/// (` -> <name>` before the waiting count); cleared, a lone plain export reads as before (no name).
+#[test]
+fn striaexportrangeband_plain_export_queues_and_the_row_names_the_running() {
+    let (a, b) = (nlefaceexport_dir("band-a"), nlefaceexport_dir("band-b"));
+    let mut face = striaexportqueue_paused(&a);
+    let line = face.message_text().expect("the running line");
+    assert!(!line.contains(" -> ") && face.export_running_name().is_none(), "a lone plain export is unnamed: {line}");
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"), "queued, not refused");
+    let line = face.message_text().expect("the running line");
+    assert!(line.starts_with("export: 3 / 35") && line.ends_with(&format!(" -> {} (1 waiting)", striaexportrangeband_name(&a))), "{line}");
+    assert!(face.verb("export-clear"));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: dropped 1 waiting"));
+    let line = face.message_text().expect("the running line");
+    assert!(!line.contains(" -> ") && !line.contains("waiting"), "{line}");
+    assert!(face.cancel_export() && face.wait_export());
+    assert!(!b.exists());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportrangeband: plain export queued; the row named {}", striaexportrangeband_name(&a));
+}
+
+/// The last queued entry, running alone after a skip, stays named on the row (a queued start), with no waiting count.
+#[test]
+fn striaexportrangeband_last_queued_entry_stays_named() {
+    let (a, b) = (nlefaceexport_dir("bandlast-a"), nlefaceexport_dir("bandlast-b"));
+    let mut face = striaexportqueue_paused(&a);
+    assert!(face.verb(&format!("export {} png", b.display())));
+    assert_eq!(face.last_error.take().as_deref(), Some("export: queued (1 waiting)"));
+    assert!(face.verb("export-skip"));
+    let t0 = std::time::Instant::now();
+    while face.export_queued() > 0 {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(60), "the skipped job was never reported");
+        face.export_tick();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(face.exporting(), "B started from the queue and is not reported yet");
+    assert_eq!(face.export_running_name(), Some(striaexportrangeband_name(&b)));
+    assert!(face.last_error.take().is_some_and(|l| l.starts_with("export: cancelled at 3/35")));
+    let line = face.message_text().expect("B's running line");
+    assert!(line.ends_with(&format!(" -> {}", striaexportrangeband_name(&b))) && !line.contains("waiting"), "{line}");
+    assert!(face.wait_export());
+    assert!(face.export_running_name().is_none());
+    for d in [&a, &b] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    println!("striaexportrangeband: the last queued entry ran named: {line}");
+}
+
+/// A lone `export marker` started idle is named on the running row by its marker (NLE-EXPORT-QUEUE-LONE-NAME).
+#[test]
+fn striaexportrangeband_lone_marker_entry_is_named() {
+    let dir = striaexportrange_dir("bandlone");
+    let mut f = striaexportrange_face("M2");
+    f.state.seek(14);
+    assert!(f.verb(&format!("export marker {} png", dir.display())));
+    assert!(f.note.take().is_some_and(|n| n.starts_with("export marker: M1 ticks 12..20 started")));
+    assert!(f.exporting() && f.export_queued() == 0);
+    assert_eq!(f.export_running_name().as_deref(), Some("M1"));
+    let line = f.message_text().expect("the running line");
+    assert!(line.starts_with("export: ") && line.ends_with(" -> M1"), "{line}");
+    assert!(f.wait_export());
+    assert!(f.export_running_name().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaexportrangeband: the lone marker entry ran named: {line}");
+}
+
+/// The band notches the queue depth: one `view::TICK` notch per waiting request at the band's right end, nothing else
+/// moves; none waiting paints exactly as before.
+#[test]
+fn striaexportrangeband_band_paints_depth_only_while_queued() {
+    let (a, b, c) = (nlefaceexport_dir("banddepth-a"), nlefaceexport_dir("banddepth-b"), nlefaceexport_dir("banddepth-c"));
+    let mut face = striaexportqueue_paused(&a);
+    let l = face.layout();
+    let none = face.paint();
+    let band = (l.tracks_y - stria::nle_face::EXPORT_BAND_H)..l.tracks_y;
+    let notched = |px: &[u8], n: u32| {
+        for y in 0..l.h {
+            for x in 0..l.w {
+                let i = ((y * l.w + x) * 4) as usize;
+                let k = (l.w - x).div_ceil(4);
+                let notch = band.contains(&y) && k >= 1 && k <= n && (l.w - x) > 4 * (k - 1) + 2;
+                if notch {
+                    assert_eq!(&px[i..i + 4], &timeline_core::view::TICK, "notch pixel ({x},{y}) of {n}");
+                } else {
+                    assert_eq!(&px[i..i + 4], &none[i..i + 4], "pixel ({x},{y}) outside the {n} notches");
+                }
+            }
+        }
+    };
+    assert!(face.verb(&format!("export {} png", b.display())));
+    notched(&face.paint(), 1);
+    assert!(face.verb(&format!("export {} png", c.display())));
+    notched(&face.paint(), 2);
+    assert!(face.verb("export-clear"));
+    assert_eq!(stria::nle_face::fnv1a(&face.paint()), stria::nle_face::fnv1a(&none), "none waiting: no notch");
+    assert!(face.cancel_export() && face.wait_export());
+    let _ = std::fs::remove_dir_all(&a);
+    println!("striaexportrangeband: 1 then 2 notches, none once cleared");
+}
