@@ -7274,4 +7274,101 @@ mod tests {
         assert_eq!(text_decoration_ink(&mut e, "tg", css_wide_red), 0, "#tg paints no red");
         assert_eq!(text_decoration_ink(&mut e, "tg", text_decoration_black), 0, "#tg paints no black");
     }
+
+    // ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property takes the parent's resolved value (named tail block) ----
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): one parent per family at 400 px wide, each with a plain child (its own
+    /// earlier value, the armed twin) and an `.i` child whose later rule says `inherit`: padding 20px over 5px, display
+    /// flex over block (two 30px kids), width 120px over 50px, margin-left 15px, a 4px red border, a red background over
+    /// the children's blue.
+    fn inherit_box_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .p { padding: 20px }
+            .p > .c { padding: 5px }
+            .p > .c.i { padding: inherit }
+            .f { display: flex }
+            .f > .c { display: block }
+            .f > .c.i { display: inherit }
+            .k { width: 30px; height: 10px }
+            .w { width: 120px }
+            .w > .c { width: 50px; height: 10px }
+            .w > .c.i { width: inherit }
+            .m { margin-left: 15px }
+            .m > .c { height: 10px }
+            .m > .c.i { margin: inherit }
+            .b { border: 4px solid rgb(255, 0, 0); padding: 4px }
+            .b > .c { height: 20px }
+            .b > .c.i { border: inherit }
+            .bg { background-color: rgb(255, 0, 0); padding: 4px }
+            .bg > .c { background-color: rgb(0, 0, 255); height: 20px }
+            .bg > .c.i { background-color: inherit }
+            </style></head><body style="margin:0;font:20px serif">
+            <div class="p"><div id="pc" class="c"><span id="pcs">Hi</span></div></div>
+            <div class="p"><div id="pi" class="c i"><span id="pis">Hi</span></div></div>
+            <div class="f"><div id="fc" class="c"><div id="fc1" class="k"></div><div id="fc2" class="k"></div></div></div>
+            <div class="f"><div id="fi" class="c i"><div id="fi1" class="k"></div><div id="fi2" class="k"></div></div></div>
+            <div class="w"><div id="wc" class="c"></div></div>
+            <div class="w"><div id="wi" class="c i"></div></div>
+            <div class="m"><div id="mc" class="c"></div></div>
+            <div class="m"><div id="mi" class="c i"></div></div>
+            <div class="b"><div id="bc" class="c"></div></div>
+            <div class="b"><div id="bi" class="c i"></div></div>
+            <div class="bg"><div id="gc" class="c"></div></div>
+            <div class="bg"><div id="gi" class="c i"></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `padding: inherit` puts the span 20px in and reads `paddingTop` 20px
+    /// (the 5px twin, armed); `width: inherit` is the parent's 120 (the 50 twin); `margin: inherit` is the parent's 15.
+    #[test]
+    fn inherit_box_engine_padding_width_margin() {
+        let mut e = inherit_box_engine();
+        let ((cl, ..), (sl, ..)) = (imgalt_rect(&mut e, "pc"), imgalt_rect(&mut e, "pcs"));
+        assert!((sl - cl - 5.0).abs() <= 0.5, "the plain child's own 5px (armed): {sl} vs {cl}");
+        assert_eq!(font_shorthand_cs(&mut e, "pc", "paddingTop"), "5px", "armed");
+        let ((cl, ..), (sl, ..)) = (imgalt_rect(&mut e, "pi"), imgalt_rect(&mut e, "pis"));
+        assert!((sl - cl - 20.0).abs() <= 0.5, "padding: inherit is the parent's 20px: {sl} vs {cl}");
+        assert_eq!(font_shorthand_cs(&mut e, "pi", "paddingTop"), "20px", "getComputedStyle reads the parent's 20px");
+        let (_, _, wc, _) = imgalt_rect(&mut e, "wc");
+        let (_, _, wi, _) = imgalt_rect(&mut e, "wi");
+        assert!((wc - 50.0).abs() <= 0.5, "the plain child is 50 (armed): {wc}");
+        assert!((wi - 120.0).abs() <= 0.5, "width: inherit is the parent's 120: {wi}");
+        let (mcl, ..) = imgalt_rect(&mut e, "mc");
+        let (mil, ..) = imgalt_rect(&mut e, "mi");
+        assert!((mcl - 15.0).abs() <= 0.5, "the plain child sits at the parent's 15 (armed): {mcl}");
+        assert!((mil - 30.0).abs() <= 0.5, "margin: inherit adds the parent's 15: {mil}");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `display: inherit` under a flex parent makes the child a flex container:
+    /// its two 30px kids share a row and `display` reads flex (the block twin stacks them and reads block, armed).
+    #[test]
+    fn inherit_box_engine_display_flex() {
+        let mut e = inherit_box_engine();
+        let ((_, y1, ..), (_, y2, ..)) = (imgalt_rect(&mut e, "fc1"), imgalt_rect(&mut e, "fc2"));
+        assert!((y2 - y1 - 10.0).abs() <= 0.5, "display: block stacks (armed): {y1} {y2}");
+        assert_eq!(font_shorthand_cs(&mut e, "fc", "display"), "block", "armed");
+        let ((x1, y1, ..), (x2, y2, ..)) = (imgalt_rect(&mut e, "fi1"), imgalt_rect(&mut e, "fi2"));
+        assert!((y2 - y1).abs() <= 0.5 && (x2 - x1 - 30.0).abs() <= 0.5, "display: inherit is a flex row: ({x1}, {y1}) ({x2}, {y2})");
+        assert_eq!(font_shorthand_cs(&mut e, "fi", "display"), "flex", "getComputedStyle reads flex");
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `border: inherit` paints the parent's red border on the child and reads
+    /// 4px (the plain twin paints none, armed); `background-color: inherit` paints the parent's red over the earlier blue
+    /// and reads rgb(255, 0, 0) (the twin is blue, armed).
+    #[test]
+    fn inherit_box_engine_border_background() {
+        let mut e = inherit_box_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "bc", css_wide_red), 0, "the plain child paints no border (armed)");
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 20, "border: inherit paints the parent's red border");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "borderTopWidth"), "4px", "getComputedStyle reads 4px");
+        assert!(css_wide_color_ink(&mut e, "gc", css_wide_blue) > 100, "the plain child is blue (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "gi", css_wide_blue), 0, "background-color: inherit beats the earlier blue");
+        assert!(css_wide_color_ink(&mut e, "gi", css_wide_red) > 100, "and paints the parent's red");
+        assert_eq!(font_shorthand_cs(&mut e, "gi", "backgroundColor"), "rgb(255, 0, 0)", "getComputedStyle reads red");
+    }
 }

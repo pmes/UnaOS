@@ -131,7 +131,7 @@ fn css_wide_initial_border_width_medium() {
 #[test]
 fn css_wide_initial_leaves_the_rest() {
     let before = cascade(&[&[("margin", "20px")]]);
-    for kw in ["revert", "inherit"] {
+    for kw in ["revert" /* SR1007 */] {
         let s = cascade(&[&[("margin", "20px")], &[("margin", kw)]]);
         assert_eq!(s.margin, before.margin, "margin: {kw} is unchanged by this arc");
     }
@@ -403,4 +403,109 @@ fn column_gap_explicit_normal() {
     assert_eq!(gap(&[base]), 40.0, "the 40px gutter (armed)");
     assert_eq!(gap(&[base, &[("column-gap", "normal")]]), 20.0, "a later normal: 1em");
     assert_eq!(gap(&[base, &[("column-gap", "initial")]]), 20.0, "a later initial: 1em");
+}
+
+// ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property takes the parent's resolved value (named tail block) ----
+
+use layout_core::css::{INHERIT_BOX_PADDING, INHERIT_BOX_MARGIN};
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): one parent / child / grandchild fixture, the parent's and the child's
+/// cascaded styles given (the grandchild a 10px tall block, or two 30px boxes when `pair`).
+fn inherit_box_lay(parent: &[(&str, &str)], child: &[&[(&str, &str)]], pair: bool) -> (Tree, N) {
+    let kids = if pair {
+        vec![el("div", &[("id", "g"), ("style", "width: 30px; height: 10px")], vec![]), el("div", &[("id", "g2"), ("style", "width: 30px; height: 10px")], vec![])]
+    } else {
+        vec![el("div", &[("id", "g"), ("style", "height: 10px")], vec![])]
+    };
+    let doc = page(vec![el("div", &[("id", "p")], vec![el("div", &[("id", "c")], kids)])]);
+    let sheet = Sheet(vec![
+        (doc.by_id("p").id, std::rc::Rc::new(styled(parent))),
+        (doc.by_id("c").id, std::rc::Rc::new(cascade(child))),
+    ]);
+    let tree = lay_styled(&doc, &sheet, 400.0, 300.0);
+    (tree, doc)
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `padding: inherit` clears an earlier rule's padding and writes the four
+/// padding bits; a later `padding-top` (same block or a later rule) beats its side's bit; margin likewise per side.
+#[test]
+fn inherit_box_bits_clear_and_lose_to_later() {
+    let s = cascade(&[&[("padding", "20px")], &[("padding", "inherit")]]);
+    assert_eq!(s.padding, [None; 4], "padding: inherit clears the earlier 20px");
+    assert_eq!(s.inherits_box(), INHERIT_BOX_PADDING, "the four padding bits");
+    let s = styled(&[("padding", "inherit"), ("padding-top", "3px")]);
+    assert!(s.padding[0].is_some(), "the later padding-top holds its value");
+    assert_eq!(s.inherits_box(), INHERIT_BOX_PADDING & !16, "padding-top's bit is beaten in the same block");
+    let s = cascade(&[&[("padding", "inherit")], &[("padding-top", "3px")]]);
+    assert_eq!(s.inherits_box(), INHERIT_BOX_PADDING & !16, "and by a later rule (merge_specified)");
+    let s = cascade(&[&[("margin", "20px")], &[("margin-left", "inherit")]]);
+    assert_eq!(s.margin[3], None, "margin-left: inherit clears its side");
+    assert!(s.margin[0].is_some(), "margin-top keeps 20px");
+    assert_eq!(s.inherits_box(), 8 & INHERIT_BOX_MARGIN, "the left side's bit only");
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): an unlisted non-inherited property's `inherit` is dropped as before
+/// (z-index: AETHER-CSS-WIDE-NONINHERITED-INHERIT-REST owed, pinned).
+#[test]
+fn inherit_box_unlisted_dropped() {
+    let s = cascade(&[&[("z-index", "5")], &[("z-index", "inherit")]]);
+    assert_eq!(s.paint.z_index, Some(Some(5)), "z-index: inherit keeps the earlier 5 (owed)");
+    assert_eq!(s.inherit_box, 0, "no bit");
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `.p { padding: 20px } .p > .c { padding: inherit }` (after an earlier
+/// 5px): the grandchild sits 20px into the child's box (the 5px twin, armed, 5px).
+#[test]
+fn inherit_box_padding_layout() {
+    let (tree, doc) = inherit_box_lay(&[("padding", "20px")], &[&[("padding", "5px")]], false);
+    let (cx, cy, ..) = box_of(&tree, &doc.by_id("c"));
+    let (gx, gy, ..) = box_of(&tree, &doc.by_id("g"));
+    assert_eq!((gx - cx, gy - cy), (5.0, 5.0), "the child's own 5px (armed)");
+    let (tree, doc) = inherit_box_lay(&[("padding", "20px")], &[&[("padding", "5px")], &[("padding", "inherit")]], false);
+    let (cx, cy, ..) = box_of(&tree, &doc.by_id("c"));
+    let (gx, gy, ..) = box_of(&tree, &doc.by_id("g"));
+    assert_eq!((gx - cx, gy - cy), (20.0, 20.0), "padding: inherit is the parent's 20px");
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `width: inherit` is the parent's 120px (after an earlier 50px);
+/// `margin: inherit` is the parent's 15px.
+#[test]
+fn inherit_box_width_margin_layout() {
+    let (tree, doc) = inherit_box_lay(&[("width", "120px")], &[&[("width", "50px")], &[("width", "inherit")]], false);
+    let (_, _, w, _) = box_of(&tree, &doc.by_id("c"));
+    assert_eq!(w, 120.0, "width: inherit is the parent's 120px");
+    let (tree, doc) = inherit_box_lay(&[("margin", "15px")], &[&[("margin", "inherit")]], false);
+    let (px, ..) = box_of(&tree, &doc.by_id("p"));
+    let (cx, ..) = box_of(&tree, &doc.by_id("c"));
+    assert_eq!((px, cx - px), (15.0, 15.0), "margin: inherit is the parent's 15px");
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `display: inherit` under a flex parent makes the child a flex container:
+/// its two 30px kids share a row (the block twin, armed, stacks them).
+#[test]
+fn inherit_box_display_flex_layout() {
+    let (tree, doc) = inherit_box_lay(&[("display", "flex")], &[&[("display", "block")]], true);
+    let (_, y1, ..) = box_of(&tree, &doc.by_id("g"));
+    let (_, y2, ..) = box_of(&tree, &doc.by_id("g2"));
+    assert_eq!(y2 - y1, 10.0, "display: block stacks (armed)");
+    let (tree, doc) = inherit_box_lay(&[("display", "flex")], &[&[("display", "block")], &[("display", "inherit")]], true);
+    let (x1, y1, ..) = box_of(&tree, &doc.by_id("g"));
+    let (x2, y2, ..) = box_of(&tree, &doc.by_id("g2"));
+    assert_eq!((y1, x2 - x1), (y2, 30.0), "display: inherit is flex: one row");
+    assert_eq!(tree.paint_map[&id_of(&tree, &doc.by_id("c"))].flex_container, Some(true), "the resolved paint says flex");
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): border / background-color / position: inherit carry the parent's resolved
+/// paint into the child's (the child's earlier blue background beaten).
+#[test]
+fn inherit_box_paint_families() {
+    let parent = [("border", "4px solid rgb(255, 0, 0)"), ("background-color", "rgb(255, 0, 0)"), ("position", "relative")];
+    let child: &[&[(&str, &str)]] = &[&[("background-color", "rgb(0, 0, 255)")], &[("border", "inherit"), ("background-color", "inherit"), ("position", "inherit")]];
+    let (tree, doc) = inherit_box_lay(&parent, child, false);
+    let p = &tree.paint_map[&id_of(&tree, &doc.by_id("p"))];
+    let c = &tree.paint_map[&id_of(&tree, &doc.by_id("c"))];
+    assert!(p.border.is_some_and(|b| b[0].is_some()), "the parent's border (armed)");
+    assert_eq!(c.border, p.border, "border: inherit");
+    assert_eq!(c.background, Some((255, 0, 0)), "background-color: inherit beats the earlier blue");
+    assert_eq!(c.position_kind, Some(1), "position: inherit is relative");
 }

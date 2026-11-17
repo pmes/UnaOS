@@ -1387,7 +1387,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             let display = match (&st, &spec) {
                 (None, _) => "none",
                 (Some(s), _) if s.display == Display::None => "none",
-                (_, Some(sp)) if sp.flex_container == Some(true) => "flex",
+                _ if paint.flex_container == Some(true) || spec.as_ref().is_some_and(|sp| sp.flex_container == Some(true)) => "flex",
                 _ if crate::layout::is_inline(tag) => "inline",
                 _ => "block",
             };

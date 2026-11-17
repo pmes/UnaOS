@@ -102,7 +102,7 @@ pub struct SpecifiedStyle<H: Host> {
     /// between, and the base value of an implicit keyframe.
     pub transition: crate::anim::TransitionLists,
     pub animation: crate::anim::AnimationLists,
-    pub animatable: Vec<(String, String)>,
+    pub animatable: Vec<(String, String)>, pub inherit_box: u32, // fold seam SR1007: AETHERCSSWIDENONINHERITEDINHERIT's explicit-inherit bits (tail block)
 }
 
 /// The generated-content properties of one element or pseudo-element, as specified: `content`
@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } match prop {
+    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -2741,7 +2741,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
           inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_content, align_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
-    merge_paint(&mut dst.paint, &src.paint);
+    merge_paint(&mut dst.paint, &src.paint); dst.merge_inherit_box(src);
     dst.transition.merge(&src.transition);
     dst.animation.merge(&src.animation);
     for (p, v) in &src.animatable {
@@ -3902,4 +3902,109 @@ fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>)
     }
     let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
     paint.decoration_color = Some(c.unwrap_or(None));
+}
+
+// ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property writes an explicit-inherit bit the layout resolves against the parent (named tail block) ----
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): css-cascade-4 §7.3.2: `inherit` on a NON-inherited property is the
+/// parent's computed value. The arms dropped it, so an earlier rule's value stood (`td { padding: inherit }` kept its
+/// earlier padding). Eight families carry an explicit-inherit bit on [`SpecifiedStyle::inherit_box`], SR815's shape
+/// (`PaintStyle::inherit`): the bit clears the family's earlier value, a later value beats the bit (`valued_box`), and
+/// `merge_specified` carries later-wins both ways (`merge_inherit_box`). layout_core's `apply_specs` resolves each set
+/// bit against the parent's resolved style (tree.rs `inherit_box_pass`). Margin and padding: one bit per side.
+pub const INHERIT_BOX_MARGIN: u32 = 0xF;
+pub const INHERIT_BOX_PADDING: u32 = 0xF0;
+pub const INHERIT_BOX_DISPLAY: u32 = 256;
+pub const INHERIT_BOX_WIDTH: u32 = 512;
+pub const INHERIT_BOX_HEIGHT: u32 = 1024;
+pub const INHERIT_BOX_POSITION: u32 = 2048;
+/// The `border` shorthand only (its longhands: AETHER-CSS-WIDE-NONINHERITED-INHERIT-REST owed).
+pub const INHERIT_BOX_BORDER: u32 = 4096;
+pub const INHERIT_BOX_BACKGROUND_COLOR: u32 = 8192;
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): THE table: the explicit-inherit bit(s) of a non-inherited property,
+/// else 0 (its `inherit` is dropped as before).
+pub fn inherit_box_bit(prop: &str) -> u32 {
+    match prop {
+        "margin" => INHERIT_BOX_MARGIN,
+        "margin-top" => 1,
+        "margin-right" => 2,
+        "margin-bottom" => 4,
+        "margin-left" => 8,
+        "padding" => INHERIT_BOX_PADDING,
+        "padding-top" => 16,
+        "padding-right" => 32,
+        "padding-bottom" => 64,
+        "padding-left" => 128,
+        "display" => INHERIT_BOX_DISPLAY,
+        "width" => INHERIT_BOX_WIDTH,
+        "height" => INHERIT_BOX_HEIGHT,
+        "position" => INHERIT_BOX_POSITION,
+        "border" => INHERIT_BOX_BORDER,
+        "background-color" => INHERIT_BOX_BACKGROUND_COLOR,
+        _ => 0,
+    }
+}
+
+impl<H: Host> SpecifiedStyle<H> {
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): the box bits whose family holds a value here.
+    pub fn valued_box(&self) -> u32 {
+        let on = |v: bool, bit: u32| if v { bit } else { 0 };
+        let mut bits = 0;
+        for i in 0..4 {
+            bits |= on(self.margin[i].is_some(), 1 << i) | on(self.padding[i].is_some(), 16 << i);
+        }
+        bits | on(self.display.is_some() || self.paint.display_kind.is_some(), INHERIT_BOX_DISPLAY)
+            | on(self.width.is_some(), INHERIT_BOX_WIDTH)
+            | on(self.height.is_some(), INHERIT_BOX_HEIGHT)
+            | on(self.position.is_some() || self.paint.position_kind.is_some(), INHERIT_BOX_POSITION)
+            | on(self.paint.border.is_some(), INHERIT_BOX_BORDER)
+            | on(self.paint.background.is_some() || self.paint.bg_alpha.is_some(), INHERIT_BOX_BACKGROUND_COLOR)
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): the families this style explicitly inherits (bit set, no later value).
+    pub fn inherits_box(&self) -> u32 {
+        self.inherit_box & !self.valued_box()
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): writes the explicit inherit of `bits`: their families lose any
+    /// earlier value.
+    pub fn set_inherit_box(&mut self, bits: u32) {
+        for i in 0..4 {
+            if bits & (1 << i) != 0 { self.margin[i] = None; }
+            if bits & (16 << i) != 0 { self.padding[i] = None; }
+        }
+        if bits & INHERIT_BOX_DISPLAY != 0 {
+            (self.display, self.flex_container) = (None, None);
+            (self.paint.display_kind, self.paint.flex_container, self.paint.list_item) = (None, None, None);
+        }
+        if bits & INHERIT_BOX_WIDTH != 0 { (self.width, self.paint.has_width) = (None, None); }
+        if bits & INHERIT_BOX_HEIGHT != 0 { self.height = None; }
+        if bits & INHERIT_BOX_POSITION != 0 { (self.position, self.paint.position_kind) = (None, None); }
+        if bits & INHERIT_BOX_BORDER != 0 {
+            (self.paint.border, self.paint.border_width, self.paint.border_style, self.paint.border_alpha) = (None, None, None, None);
+        }
+        if bits & INHERIT_BOX_BACKGROUND_COLOR != 0 { (self.paint.background, self.paint.bg_alpha) = (None, None); }
+        self.inherit_box |= bits;
+    }
+
+    /// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `merge_specified`'s half for the box bits, after its Somes are
+    /// copied (SR815's `merge_inherit` shape): a value `src` gives clears this style's bit, an explicit inherit it
+    /// gives clears this style's earlier value and sets the bit.
+    pub fn merge_inherit_box(&mut self, src: &Self) {
+        let valued = src.valued_box();
+        self.inherit_box &= !valued;
+        self.set_inherit_box(src.inherit_box & !valued);
+    }
+}
+
+/// AETHERCSSWIDENONINHERITEDINHERIT (SR1007): `inherit` on a property of [`inherit_box_bit`]'s table writes its bit and
+/// ends the declaration (`unset` on these is SR832's initial rewrite, before this gate).
+fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>) -> bool {
+    let bit = inherit_box_bit(prop);
+    if bit == 0 || !value.eq_ignore_ascii_case("inherit") {
+        return false;
+    }
+    style.set_inherit_box(bit);
+    true
 }
