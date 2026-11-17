@@ -579,6 +579,7 @@ fn transport() -> TetraNode {
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
         button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), // STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
+        button("ripple-all", "Ripple All"), // STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (a Shift-drag on a clip edge ripples every track)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }

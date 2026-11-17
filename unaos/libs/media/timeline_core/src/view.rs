@@ -622,7 +622,7 @@ pub struct Drag {
     pub guide: Option<i64>,
     /// STRIARIPPLETRIM (SR850): a trim begun with shift on the primary's handle ripples (`EditorState::ripple_trim`).
     pub ripple: bool,
-    pub roll: bool, // STRIAROLLMORE (SR954): the face's roll tool turned this trim into a roll of its handle's cut (`EditorState::roll_selected`; set by [`Drag::rolled`])
+    pub roll: bool, // STRIAROLLMORE (SR954): the face's roll tool turned this trim into a roll of its handle's cut (`EditorState::roll_selected`; set by [`Drag::rolled`]) pub ripple_all: bool, // STRIARIPPLETHREE (SR9034): a ripple begun with the face's ripple-all tool on runs on every track (`EditorState::ripple_trim_all`, file tail)
 }
 
 impl Drag {
@@ -649,7 +649,7 @@ impl Drag {
             snap: !nosnap,
             additive: shift, toggle: false,
             guide: None,
-            ripple: false, roll: false, // STRIAROLLMORE (SR954)
+            ripple: false, roll: false, // STRIAROLLMORE (SR954) ripple_all: false,
         };
         if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) {
             let y0 = l.row_y(track) as f64;
@@ -726,7 +726,7 @@ impl Drag {
         }
         match self.kind {
             DragKind::TrimOut if self.roll => st.roll_selected(self.delta), // STRIAROLLMORE (SR954): the roll tool's drag is ONE roll of the cut at the clip's out edge
-            DragKind::TrimIn | DragKind::TrimOut if self.ripple => st.ripple_trim(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta),
+            DragKind::TrimIn | DragKind::TrimOut if self.ripple && self.ripple_all => st.ripple_trim_all(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta), DragKind::TrimIn | DragKind::TrimOut if self.ripple => st.ripple_trim(if self.kind == DragKind::TrimIn { Edge::In } else { Edge::Out }, self.delta), // STRIARIPPLETHREE (SR9034): the ripple-all tool's drag is the one all-tracks op (file tail)
             DragKind::TrimIn => st.trim_by_ticks(Edge::In, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::TrimOut => st.trim_by_ticks(Edge::Out, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::Slip => st.slip_selected(self.delta),
@@ -3485,7 +3485,7 @@ impl Drag {
         let riders: Vec<(usize, usize)> =
             tr.clips.iter().enumerate().filter(|&(i, n)| i == self.idx || n.at >= e).map(|(i, _)| (self.track, i)).collect();
         let ex = l.x_of(e) as f64 + s as f64 * (x - self.origin.0);
-        if let Some(t) = snap_to(&l, &snap_targets(st, &riders, true), ex) {
+        if let Some(t) = snap_to(&l, &snap_targets(st, &self.all_riders(st, riders, c), true), ex) { // STRIARIPPLETHREE (SR9034): every track's riders under the ripple-all tool (file tail)
             self.delta = s * (t - e);
             self.guide = Some(t);
         }
@@ -4718,5 +4718,108 @@ mod striakthumbs_tests {
         let l = Layout::of(480, 200, &st);
         assert_eq!(thumb_want(&st.timeline, &l, &|_, _| Some(Some(48))), None);
         assert_eq!(thumb_want(&st.timeline, &l, &|_, _| Some(None)), None);
+    }
+}
+
+// ---- STRIARIPPLETHREE (LEDGER SR9034): the sync lock — a ripple drag across every track (named tail block) ----
+// Every modifier on the selected clip's edge zone is taken (SR850), so the all-tracks ripple drag is a face TOOL (the roll
+// tool's shape, SR954): with the tool on, the face maps the drag a press begins through `Drag::synced`, which marks a
+// RIPPLE trim (Shift on the handle) `ripple_all`; `Drag::finish` commits it as SR953's ONE `EditorState::ripple_trim_all`
+// (one undo step) and `Drag::shown` previews it. Every other drag is unchanged. Under the tool the other tracks' twins and
+// later clips move with the edit too, so `all_riders` leaves them out of the snap targets as SR953 left out the primary
+// track's. The kernel never sets the bool: byte-identical there.
+
+impl Drag {
+    /// STRIARIPPLETHREE: this drag under the face's ripple-all tool `on`: a ripple trim becomes all-tracks; anything else
+    /// (a plain trim, a move, a slip, a slide, a roll) is returned unchanged.
+    pub fn synced(self, on: bool) -> Drag {
+        let trim = matches!(self.kind, DragKind::TrimIn | DragKind::TrimOut);
+        Drag { ripple_all: on && self.ripple && trim, ..self }
+    }
+    /// STRIARIPPLETHREE: `snap_ripple`'s riders, plus, under `ripple_all`, every other track's twin of `c` (its exact span)
+    /// and every clip at or past `c`'s end: all of them move with the edit, so none is a snap target.
+    fn all_riders(&self, st: &EditorState, mut riders: Vec<(usize, usize)>, c: crate::Clip) -> Vec<(usize, usize)> {
+        if !self.ripple_all {
+            return riders;
+        }
+        let e = c.end();
+        for (k, t) in st.timeline.tracks.iter().enumerate().filter(|&(k, _)| k != self.track) {
+            riders.extend(t.clips.iter().enumerate().filter(|&(_, n)| n.at >= e || (n.at == c.at && n.end() == e)).map(|(i, _)| (k, i)));
+        }
+        riders
+    }
+}
+
+#[cfg(test)]
+mod striaripplethree_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// A 40-tick source; V1 0..10 at 0, 10..20 at 10; A1 the same two clips (V1's twins); the view band `Role::Tracks`
+    /// 320x96 (8 px per tick, t0 0, row 0 at y 16, row 1 at y 56); V1's clip 0 selected; the y of row 0's centre.
+    fn fixture() -> (Timeline, EditorState, Layout, f64) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10)];
+        tl.tracks[1].clips = tl.tracks[0].clips.clone();
+        let mut st = EditorState::new(tl.clone());
+        st.select(0, 0).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 96, &st);
+        let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
+        (tl, st, l, y)
+    }
+
+    /// STRIARIPPLETHREE (SR9034) M3: shift on V1 clip 0's out handle (x 78) under the tool, dragged -24 px (-3 ticks): the
+    /// drag is a ripple_all TrimOut, its preview and its release are `ripple_all_out(0, 0, 7)` (A1's twin and both
+    /// tracks' later clips follow), ONE undo step; untouched by the tool the same drag ripples V1 only.
+    #[test]
+    fn striaripplethree_synced_ripple_moves_every_track() {
+        let (tl, mut st, l, y) = fixture();
+        let mut d = Drag::begin_with(&mut st.clone(), l, 78.0, y, true, true, false).unwrap().synced(true);
+        d.update(&st, 54.0, y);
+        assert_eq!((d.kind, d.ripple, d.ripple_all, d.delta), (DragKind::TrimOut, true, true, -3));
+        let want = tl.ripple_all_out(0, 0, 7).unwrap();
+        assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((&st.timeline, st.undo_depth()), (&want, 1));
+        assert_eq!(want.tracks[1].clips, alloc::vec![Clip::new(want.tracks[1].clips[0].src, 0, 7, 0), Clip::new(want.tracks[1].clips[0].src, 10, 20, 7)]);
+        let (tl, mut st, l, y) = fixture();
+        let mut d = Drag::begin_with(&mut st.clone(), l, 78.0, y, true, true, false).unwrap().synced(false);
+        d.update(&st, 54.0, y);
+        assert!(!d.ripple_all);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, tl.ripple_trim_out(0, 0, 7).unwrap());
+    }
+
+    /// STRIARIPPLETHREE (SR9034) M3: the tool leaves every non-ripple drag alone: a plain trim (no shift) and a body move
+    /// stay as begun (`synced(true)` changes nothing), and the plain trim's release is the plain `trim`.
+    #[test]
+    fn striaripplethree_synced_leaves_other_drags() {
+        let (tl, mut st, l, y) = fixture();
+        let d0 = Drag::begin_with(&mut st.clone(), l, 78.0, y, false, true, false).unwrap();
+        assert_eq!(d0.synced(true), d0);
+        let mut d = d0.synced(true);
+        d.update(&st, 54.0, y);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline.tracks[0].clips[1], tl.tracks[0].clips[1], "a plain trim moves no later clip");
+        assert_eq!(st.timeline.tracks[1], tl.tracks[1]);
+        let (_, mut st, l, y) = fixture();
+        let m = Drag::begin_with(&mut st, l, 40.0, y, false, false, false).unwrap();
+        assert_eq!(m.kind, DragKind::Move);
+        assert_eq!(m.synced(true), m);
+    }
+
+    /// STRIARIPPLETHREE (SR9034) M3: under the tool the other track's riders are no snap targets: A1's twin and its later
+    /// clip are excluded beside V1's own; off the tool A1's clips stay targets (SR953's riders, V1 only).
+    #[test]
+    fn striaripplethree_all_riders_cover_every_track() {
+        let (_, st, l, y) = fixture();
+        let d = Drag::begin_with(&mut st.clone(), l, 78.0, y, true, false, false).unwrap();
+        let c = st.timeline.tracks[0].clips[0];
+        let own = alloc::vec![(0, 0), (0, 1)];
+        assert_eq!(d.all_riders(&st, own.clone(), c), own);
+        assert_eq!(d.synced(true).all_riders(&st, own.clone(), c), alloc::vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
     }
 }
