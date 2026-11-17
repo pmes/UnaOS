@@ -352,7 +352,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail) paint_headers(&mut c, l, st, labels.as_deref_mut()); // STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail)
+    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_xkeys(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail) paint_headers(&mut c, l, st, labels.as_deref_mut()); // STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail) // STRIAXFORMKEYSNAV (SR9069): a keyed clip's point marks (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -6059,5 +6059,25 @@ mod striakstereowave_tests {
         }
         assert_eq!(peaks_bytes(360_000, 2), 3 * peaks_bytes(360_000, 1), "stereo: three tables");
         assert!(peaks_bytes(360_000, 1) < 2 * 360_000 + 20, "a pyramid adds under the table's own size");
+    }
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): a keyed clip's placement points marked on its body (named tail block) ----
+// One 3 px x 7 px [`XKEY`] mark centred on each point a clip shows ([`crate::Clip::point_ticks`]), at the body's vertical
+// middle, painted over the selection and under the transitions and the playhead. An unkeyed clip paints nothing here.
+
+/// A placement point's mark.
+pub const XKEY: [u8; 4] = [0xff, 0xff, 0xff, 255];
+
+/// Every keyed clip's point marks (nothing when no clip has points).
+fn paint_xkeys(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, track) in st.timeline.tracks.iter().enumerate() {
+        let ym = l.row_y(row) + ROW_H as i64 / 2;
+        for clip in track.clips.iter().filter(|cl| !cl.xkeys.is_empty()) {
+            for t in clip.point_ticks() {
+                let x = l.x_of(t);
+                c.rect(x - 1, ym - 3, x + 2, ym + 4, XKEY);
+            }
+        }
     }
 }

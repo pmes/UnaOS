@@ -199,7 +199,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["track-gain", db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {db}") }, // STRIATRACKGAIN (SR864): `track-gain:-6`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
         [w] if w.starts_with("crop-") => SMessage::Input { target: SURFACE.into(), text: w.to_string() }, // STRIACROPFACE (SR900): `crop-l+` ... `crop-b-`, one side of the selection's crop by a step
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey" | "prev" | "next")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIATCSET (SR908): `tc:frames` sets the readout; STRIAUNDOHISTORYDRAG (SR912): `history:<n>`; STRIAGAPSALLTRACKS (SR929): `close-gaps:all`; STRIAUNDOJUMP (SR934): `undo:<n>` / `redo:<n>`
         ["dur", h, m, s, f] => SMessage::Input { target: SURFACE.into(), text: format!("dur {h}:{m}:{s}:{f}") }, // STRIATRANSITIONMORE (SR956): `dur:00:00:00:07`
         ["mark", name] => SMessage::Input { target: SURFACE.into(), text: format!("mark {name}") }, // STRIAMARKERSMORE (SR966): `mark:<name>` names / renames the playhead's marker
         [w @ ("mute" | "solo"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINKEYSNEXT (SR983): `mute:A2` / `solo:V1` toggle the named track
@@ -575,7 +575,7 @@ fn transport() -> TetraNode {
         button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
         button("xfade-curve", "Curve"), button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
-        button("scale-", "Scale -"), button("scale+", "Scale +"), button("pip left", "PiP <"), button("pip right", "PiP >"), button("pip up", "PiP ^"), button("pip down", "PiP v"), // STRIAXFORMTHREE (SR9033): the selected clip's placement nudged a step (SR975's words); STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
+        button("scale-", "Scale -"), button("scale+", "Scale +"), button("pip left", "PiP <"), button("pip right", "PiP >"), button("pip up", "PiP ^"), button("pip down", "PiP v"), button("pip key", "Key"), button("pip unkey", "Unkey"), // STRIAXFORMTHREE (SR9033): the selected clip's placement nudged a step (SR975's words); STRIAXFORMKEYSNAV (SR9069): a placement point at the playhead set / removed; STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
@@ -3402,5 +3402,35 @@ mod striagainenvelope_tests {
         assert_eq!(drive(&mut face, "env:x"), vec![format!("env x: {}", timeline_core::EditError::Gain)]);
         assert_eq!(face.state.undo_depth(), 3);
         println!("striagainenvelope witness: at:12:1,env:-6 -> ({s}, -600); env+ -> -500; env-del -> empty; env:x -> {}", timeline_core::EditError::Gain);
+    }
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the witness's key / unkey buttons and point nav tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformkeysnav_tests {
+    use super::*;
+
+    /// STRIAXFORMKEYSNAV (SR9069): the Key / Unkey buttons stand just before help and fire `pip key` / `pip unkey`;
+    /// `pip:prev` / `pip:next` move the playhead between the selected clip's points with no undo step; no point that
+    /// way is refused by name.
+    #[test]
+    fn striaxformkeysnav_witness_nav_tokens() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let texts: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
+        assert_eq!(&texts[texts.len() - 3..], &["pip key".to_string(), "pip unkey".to_string(), "help".to_string()]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        face.state.playhead = 11;
+        assert!(drive(&mut face, "pip:tl,pip:key").is_empty());
+        face.state.playhead = 18;
+        assert!(drive(&mut face, "pip:br").is_empty());
+        let depth = face.state.undo_depth();
+        assert!(drive(&mut face, "pip:prev").is_empty());
+        assert_eq!((face.state.playhead, face.state.undo_depth()), (11, depth));
+        assert!(drive(&mut face, "pip:next").is_empty());
+        assert_eq!(face.state.playhead, 18);
+        assert_eq!(drive(&mut face, "pip:next"), vec![format!("pip next: {}", timeline_core::EditError::XKey)]);
+        assert_eq!(face.state.playhead, 18);
     }
 }

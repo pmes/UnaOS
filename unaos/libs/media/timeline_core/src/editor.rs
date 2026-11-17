@@ -4559,7 +4559,7 @@ impl EditorState {
     }
     /// The key words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xkey_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if let Some(r) = self.xkey_nav_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMKEYSNAV (SR9069): `pip prev|next` (file tail)
         if !matches!(w.as_slice(), ["pip", "key"] | ["pip", "unkey"] | ["pip", "unkey", "all"]) {
             return None;
         }
@@ -5305,5 +5305,30 @@ mod striakshuttle_tests {
         for r in [-8, -1, 1, 2, 4, 8] {
             assert_eq!(shuttle_rate("stop", true, r, 8), 1);
         }
+    }
+}
+
+// ---- STRIAXFORMKEYSNAV (LEDGER SR9069): the playhead to the selected clip's previous / next placement point (named tail block) ----
+// `pip prev` / `pip next` seek the playhead ([`EditorState::seek`]) to the nearest point the selected clip SHOWS
+// ([`crate::Clip::point_ticks`]) strictly before / after it. View-only: no commit, no undo step, the document unchanged.
+// Refused: no clip selected `EditError::NoClip`; no shown point that way (unkeyed, audio, past the last) `EditError::XKey`.
+impl EditorState {
+    /// The nav words of [`EditorState::verb`]; `None` when `v` is neither.
+    fn xkey_nav_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let next = match v.split_ascii_whitespace().collect::<Vec<&str>>().as_slice() {
+            ["pip", "prev"] => false,
+            ["pip", "next"] => true,
+            _ => return None,
+        };
+        let Some(c) = self.selected() else { return Some(Err(EditError::NoClip)) };
+        let ph = self.playhead;
+        let to = if next { c.point_ticks().filter(|&t| t > ph).min() } else { c.point_ticks().filter(|&t| t < ph).max() };
+        Some(match to {
+            Some(t) => {
+                self.seek(t);
+                Ok(())
+            }
+            None => Err(EditError::XKey),
+        })
     }
 }
