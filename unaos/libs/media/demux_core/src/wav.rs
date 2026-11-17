@@ -8,7 +8,7 @@
 //! need no second road. It is reached ONLY through [`Demuxer::open_wav`]: [`crate::probe`] and [`Demuxer::open`] stay
 //! WAV-blind, because a player plays a bare WAV through audio_core's own reader exactly when the demuxer refuses it.
 //! Accepted: `fmt ` tag 1 (8-bit unsigned, 16 / 24 / 32-bit integer), tag 3 (32 / 64-bit float), and WAVE_FORMAT_EXTENSIBLE
-//! whose SubFormat is one of those with valid bits at or below the container (decoded at the container width), RF64 / BW64 with its `ds64` data size (STRIAWAVVALIDBITS, SR937); 1..=8 channels; a `data` size 0 / 0xFFFFFFFF (streamed) runs to the end of the file (STRIAIMPORTWAVWIDE, SR920). Everything else is refused by name (`wav: ...`).
+//! whose SubFormat is one of those with valid bits at or below the container (decoded at the container width), RF64 / BW64 with its `ds64` data size (STRIAWAVVALIDBITS, SR937) and a non-data chunk's 0xFFFFFFFF size from the ds64 table (STRIAWAVVALIDBITSNEXT, SR982); 1..=8 channels; a `data` size 0 / 0xFFFFFFFF (streamed) runs to the end of the file (STRIAIMPORTWAVWIDE, SR920). Everything else is refused by name (`wav: ...`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -88,7 +88,7 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
             return Err(Error::Invalid(if fmt.is_none() { "wav: no fmt chunk" } else { "wav: no samples" }));
         }
         let id = &data[p..p + 4];
-        let len = le32(data, p + 4) as usize;
+        let len = match le32(data, p + 4) { 0xFFFF_FFFF if id != b"data" && &data[0..4] != b"RIFF" => rf64_table_len(data, id)?, l => l as usize }; // STRIAWAVVALIDBITSNEXT (SR982): an RF64 / BW64 non-data chunk sized 0xFFFFFFFF takes its size from the ds64 table
         let body = p + 8;
         match id {
             b"fmt " => {
@@ -163,4 +163,30 @@ fn rf64_data_len(data: &[u8]) -> Result<usize, Error> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&data[28..36]);
     Ok(usize::try_from(u64::from_le_bytes(b)).unwrap_or(usize::MAX))
+}
+
+// ---- STRIAWAVVALIDBITSNEXT (LEDGER SR982): RF64 / BW64 ds64 table sizes (named tail block) ----
+
+/// STRIAWAVVALIDBITSNEXT (SR982): the 64-bit size of an RF64 / BW64 non-data chunk whose 32-bit size is 0xFFFFFFFF, read
+/// from the `ds64` chunk's table (EBU Tech 3306: tableLength u32 at offset 44, entries of chunkId[4] + chunkSize u64 from
+/// offset 48, inside the ds64 chunk). A size past `usize` is `usize::MAX`, which the walk then stops on.
+fn rf64_table_len(data: &[u8], id: &[u8]) -> Result<usize, Error> {
+    let miss = || Error::Invalid("wav: RF64 chunk size not in the ds64 table");
+    if data.len() < 48 || &data[12..16] != b"ds64" || le32(data, 16) < 28 {
+        return Err(miss());
+    }
+    let end = (20usize.saturating_add(le32(data, 16) as usize)).min(data.len());
+    let n = le32(data, 44) as usize;
+    for i in 0..n {
+        let o = 48 + 12 * i;
+        if o + 12 > end {
+            break;
+        }
+        if &data[o..o + 4] == id {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[o + 4..o + 12]);
+            return Ok(usize::try_from(u64::from_le_bytes(b)).unwrap_or(usize::MAX));
+        }
+    }
+    Err(miss())
 }
