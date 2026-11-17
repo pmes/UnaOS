@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 35] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "marker colour", "marker range", "help"]; // STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail)
+pub const VERBS: [&str; 36] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "mark", "unmark", "title", "marker-", "marker+", "cut-", "cut+", "marker colour", "marker range", "marker marks", "help"]; // STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATITLECLIP (SR828): title (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } // STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.marker_verb(v) { return r; } if let Some(r) = self.jump_verb(v) { return r; } if let Some(r) = self.marker_style_verb(v) { return r; } if let Some(r) = self.marker_marks_verb(v) { return r; } // STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -3182,7 +3182,7 @@ impl Face {
             let tc = self.state.timeline.fps().map_or_else(|| now.to_string(), |f| timeline_core::edl::timecode(now, f));
             self.last_error = Some(match j {
                 timeline_core::editor::Jump::Marker => {
-                    let name = self.state.timeline.marker_at(now).map(|m| m.name.clone()).unwrap_or_default();
+                    let name = self.marker_jump_name(now); // STRIAMARKERRANGES (SR9052): `M1` at a marker, `M1 end` at a range end (file tail)
                     format!("{}: {name} at {tc}", v.trim())
                 }
                 timeline_core::editor::Jump::Cut => format!("{}: {tc}", v.trim()),
@@ -3254,6 +3254,37 @@ impl Face {
                     (r, _) => self.last_error = Some(format!("marker range: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
                 }
             }
+        }
+        Some(true)
+    }
+}
+
+// ---- STRIAMARKERRANGES (LEDGER SR9052): the marker marks word's note and refusals; range-end names (named tail block) ----
+// `marker marks` (the Marker Marks button) is timeline_core's `EditorState::verb` word (SR723's marks commit: one or none);
+// the face words the result: a success is the note `marks <in>..<out> from marker M1`, a refusal is `last_error`
+// (`marker marks: no marker at or before <tc>`, `marker marks: M1 is a point marker (no range)`). A marker jump that lands
+// on a range end names it `M1 end` (a marker standing on that tick is named instead).
+
+impl Face {
+    /// The name a marker jump word gives tick `t`: the marker at `t`, else `<name> end` of a marker whose range ends at `t`.
+    fn marker_jump_name(&self, t: i64) -> String {
+        let tl = &self.state.timeline;
+        tl.marker_at(t).map(|m| m.name.clone()).or_else(|| tl.markers.iter().find(|m| m.len > 0 && m.at + m.len == t).map(|m| format!("{} end", m.name))).unwrap_or_default()
+    }
+    /// The `marker marks` word (`timeline_core::editor::marker_marks_word`) through the one dispatch, with its note or
+    /// refusal; `None` for any other word.
+    fn marker_marks_verb(&mut self, v: &str) -> Option<bool> {
+        if !timeline_core::editor::marker_marks_word(v) {
+            return None;
+        }
+        let ph = self.state.playhead;
+        let before = self.state.timeline.marker_before(ph).map(|m| (m.name.clone(), m.at, m.len));
+        let r = self.state.verb(v).unwrap_or(Err(EditError::Marker));
+        match (r, before) {
+            (Ok(()), Some((name, at, len))) => self.note = Some(format!("marks {}..{} from marker {name}", self.marker_tc(at), self.marker_tc(at + len))),
+            (Err(EditError::Marker), None) => self.last_error = Some(format!("marker marks: no marker at or before {}", self.marker_tc(ph))),
+            (Err(EditError::Marker), Some((name, _, 0))) => self.last_error = Some(format!("marker marks: {name} is a point marker (no range)")),
+            (r, _) => self.last_error = Some(format!("marker marks: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
         }
         Some(true)
     }

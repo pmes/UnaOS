@@ -4004,3 +4004,47 @@ fn striamarkerjumpkeysnext_face_colour_range_note_and_refusals() {
     assert_eq!(f.state.timeline.marker_at(12).map(|m| m.len), Some(8));
     println!("striamarkerjumpkeysnext: M1 red -> blue, range 12..20, cleared, undone; EDL {}", text.lines().filter(|l| l.starts_with("* UNA M")).count());
 }
+
+// ---- STRIAMARKERRANGES (LEDGER SR9052): a range end as a marker jump stop; `marker marks` on the face (named tail block) ----
+
+/// `marker marks` sits before `help`; `'` (marker+) stops at a range end and names it `M1 end`; `marker marks` sets the
+/// export marks to the range of the marker at or before the playhead (ONE undo step, the note, `* UNA MARK` in the EDL);
+/// refusals are `last_error`.
+#[test]
+fn striamarkerranges_face_marks_and_range_end_jump() {
+    let help = VERBS.iter().position(|v| *v == "help").unwrap();
+    let i = VERBS.iter().position(|x| *x == "marker marks").expect("marker marks is a VERBS word");
+    assert!(i < help, "marker marks before help");
+    let mut f = striamarkerjumpkeys_face();
+    assert!(f.verb("marker marks"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker marks: no marker at or before 00:00:00:00"));
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    f.state.seek(20);
+    assert!(f.verb("marker range"));
+    let _ = f.last_error.take();
+    f.state.seek(0);
+    assert!(f.on(&bandy::SMessage::BrowserText("'".into())));
+    assert_eq!((f.state.playhead, f.last_error.take().as_deref()), (12, Some("marker+: M1 at 00:00:00:12")));
+    assert!(f.on(&bandy::SMessage::BrowserText("'".into())));
+    assert_eq!((f.state.playhead, f.last_error.take().as_deref()), (20, Some("marker+: M1 end at 00:00:00:20")));
+    let depth = f.state.undo_depth();
+    assert!(f.verb("marker marks"));
+    assert_eq!((f.last_error.as_deref(), f.note.as_deref()), (None, Some("marks 00:00:00:12..00:00:00:20 from marker M1")));
+    assert_eq!((f.state.timeline.marks, f.state.undo_depth()), ((Some(12), Some(20)), depth + 1));
+    assert!(f.verb("marker marks"));
+    assert_eq!(f.state.undo_depth(), depth + 1, "the same marks commit nothing");
+    assert!(f.dirty());
+    let text = edl::write(&f.state.timeline, "T").unwrap();
+    assert!(text.contains("* UNA MARK "), "{text}");
+    f.state.seek(30);
+    assert!(f.verb("mark"));
+    let _ = f.last_error.take();
+    assert!(f.verb("marker marks"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marker marks: M2 is a point marker (no range)"));
+    assert_eq!(f.state.undo_depth(), depth + 2, "only the mark");
+    assert!(f.verb("undo"));
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline.marks, (None, None));
+    println!("striamarkerranges: ' stops at M1 end 00:00:00:20; marker marks -> 12..20, one step");
+}
