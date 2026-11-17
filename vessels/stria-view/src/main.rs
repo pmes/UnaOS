@@ -187,6 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, // STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -518,6 +519,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("pip", "PiP"), // STRIAPOSITIONSCALE (SR879): the selected clip to the bottom-right quarter (THE `pip` verb)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -924,5 +926,28 @@ mod striacrop_tests {
         assert_eq!(drive(&mut face, "crop:1:2"), vec!["bad token crop:1:2".to_string()]);
         assert_eq!(drive(&mut face, "crop:900:0:200:0"), vec![format!("crop 900 0 200 0: {}", timeline_core::EditError::Crop)]);
         assert_eq!(face.state.undo_depth(), 1);
+    }
+}
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): the witness's pip / scale tokens and button (named tail block) ----
+#[cfg(test)]
+mod striapositionscale_tests {
+    use super::*;
+
+    /// STRIAPOSITIONSCALE (SR879): `pip` (the VERBS word and its button), `pip:X:Y`, `scale:S` and `pip:off` are
+    /// timeline_core's words on the selected clip, one undo step each; a rect off the frame is refused by name on the
+    /// message row; a malformed token is a bad token.
+    #[test]
+    fn striapositionscale_witness_pip_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,pip,scale:100,pip:0:0");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.undo_depth(), 3);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform { x: 0, y: 0, s: 100 }));
+        assert_eq!(drive(&mut face, "pip:1:2:3"), vec!["bad token pip:1:2:3".to_string()]);
+        assert_eq!(drive(&mut face, "pip:950:0"), vec![format!("pip 950 0: {}", timeline_core::EditError::Xform)]);
+        assert!(drive(&mut face, "pip:off").is_empty());
+        assert_eq!((face.state.undo_depth(), face.state.selected().map(|c| c.xform)), (4, Some(timeline_core::Xform::NONE)));
     }
 }

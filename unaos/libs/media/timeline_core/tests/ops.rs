@@ -393,3 +393,153 @@ fn striaopacity_opacity_word_is_one_undo_step() {
     assert_eq!(st.verb("opacity 50"), Some(Err(EditError::Opacity)), "an audio clip");
     assert_eq!(st.timeline, tl);
 }
+
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): the per-clip position / scale: geometry, the placement, the composite, the op, the words and the EDL line (named tail block) ----
+mod striapositionscale {
+    use super::base;
+    use timeline_core::edl::{self, EdlError};
+    use timeline_core::editor::EditorState;
+    use timeline_core::schedule::Frac;
+    use timeline_core::{Clip, Crop, EditError, SizePolicy, TransitionKind, Xform, crop_frame, place_frame, xform_frame};
+
+    const Q: Xform = Xform { x: 500, y: 500, s: 500 };
+
+    #[test]
+    fn striapositionscale_rect_and_validity() {
+        let r = Q.rect(8, 4);
+        assert_eq!((r.x, r.y, r.w, r.h), (4, 2, 4, 2));
+        let r = Xform::NONE.rect(7, 3);
+        assert_eq!((r.x, r.y, r.w, r.h), (0, 0, 7, 3));
+        let r = Xform { x: 999, y: 0, s: 1 }.rect(4, 2);
+        assert_eq!((r.x, r.y, r.w, r.h), (3, 0, 1, 1), "at least one sample, inside the frame");
+        assert!(Xform::PIP.ok() && Xform::NONE.ok() && Q.ok());
+        assert!(!Xform { x: 600, y: 0, s: 500 }.ok());
+        assert!(!Xform { x: 0, y: 501, s: 500 }.ok());
+        assert!(!Xform { x: 0, y: 0, s: 0 }.ok());
+        assert_eq!(Xform::default(), Xform::NONE);
+        assert_eq!(Clip::new(timeline_core::SourceId(0), 0, 1, 0).xform, Xform::NONE);
+    }
+
+    #[test]
+    fn striapositionscale_place_frame_into_a_rect() {
+        let px: Vec<u32> = (0..8).collect(); // 4 x 2: 0 1 2 3 / 4 5 6 7
+        let mut out = vec![99u32; 16]; // 4 x 4
+        place_frame(&px, 4, 2, Crop::NONE, SizePolicy::Stretch, &mut out, 4, Xform { x: 500, y: 500, s: 500 }.rect(4, 4));
+        assert_eq!(out, vec![99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 0, 2, 99, 99, 4, 6], "the frame scaled into the rect, the rest untouched");
+        let mut whole = vec![7u32; 8];
+        place_frame(&px, 4, 2, Crop { l: 500, t: 0, r: 0, b: 0 }, SizePolicy::Letterbox, &mut whole, 4, Xform::NONE.rect(4, 2));
+        assert_eq!(whole, vec![7, 2, 3, 7, 7, 6, 7, 7], "the crop pass's placement: the rest left as it was");
+        assert_eq!(crop_frame(&px, 4, 2, Crop { l: 500, t: 0, r: 0, b: 0 }, SizePolicy::Letterbox, 99), vec![99, 2, 3, 99, 99, 6, 7, 99], "crop_frame unchanged");
+        let mut short = vec![1u32; 4];
+        place_frame(&px, 4, 2, Crop::NONE, SizePolicy::Stretch, &mut short, 4, Xform::NONE.rect(4, 2));
+        assert_eq!(short, vec![1; 4], "a destination past out places nothing");
+    }
+
+    #[test]
+    fn striapositionscale_xform_frame_outside_is_the_lower_frame() {
+        let (w, h) = (8usize, 4usize);
+        let top: Vec<[u8; 4]> = (0..w * h).map(|i| [i as u8, 100, 200, 255]).collect();
+        let under: Vec<[u8; 4]> = (0..w * h).map(|i| [10, i as u8, 20, 255]).collect();
+        let r = Q.rect(w, h);
+        let inside = |i: usize| (r.x..r.x + r.w).contains(&(i % w)) && (r.y..r.y + r.h).contains(&(i / w));
+        let opaque = xform_frame(&top, &under, w, h, Crop::NONE, SizePolicy::Letterbox, Q, Frac { num: 100, den: 100 });
+        let mut want = under.clone();
+        place_frame(&top, w, h, Crop::NONE, SizePolicy::Letterbox, &mut want, w, r);
+        assert_eq!(opaque, want, "opaque: the top placed straight into the rect");
+        assert_eq!(opaque[2 * w + 4], top[0], "the rect's corner is the top's corner");
+        let half = xform_frame(&top, &under, w, h, Crop::NONE, SizePolicy::Letterbox, Q, Frac { num: 50, den: 100 });
+        for i in 0..w * h {
+            if inside(i) {
+                let mut px = under[i];
+                timeline_core::vmix::mix_step(TransitionKind::Dissolve, Frac { num: 50, den: 100 }, &mut px, &opaque[i], 1, 1);
+                assert_eq!(half[i], px, "inside {i}: THE mix over the lower pixel");
+            } else {
+                assert_eq!(half[i], under[i], "outside {i}: the lower frame byte for byte");
+                assert_eq!(opaque[i], under[i]);
+            }
+        }
+        assert_eq!(xform_frame(&top[..3], &under, w, h, Crop::NONE, SizePolicy::Letterbox, Q, Frac { num: 1, den: 1 }), under, "a short frame: the lower");
+    }
+
+    #[test]
+    fn striapositionscale_set_xform_and_refusals() {
+        let (tl, _, _) = base();
+        let t2 = tl.set_xform(0, 1, Q).unwrap();
+        assert_eq!((t2.tracks[0].clips[1].xform, t2.tracks[0].clips[0].xform), (Q, Xform::NONE));
+        assert_eq!(tl.tracks[0].clips[1].xform, Xform::NONE, "pure");
+        assert_eq!(tl.set_xform(0, 1, Xform { x: 600, y: 0, s: 500 }), Err(EditError::Xform));
+        assert_eq!(tl.set_xform(0, 9, Q), Err(EditError::NoClip));
+        assert_eq!(tl.set_xform(9, 0, Q), Err(EditError::NoTrack));
+        assert_eq!(tl.set_xform(1, 0, Q), Err(EditError::Kind));
+        assert_eq!(EditError::Xform.to_string(), "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000");
+        let s = t2.split(0, 15).unwrap();
+        assert_eq!((s.tracks[0].clips[1].xform, s.tracks[0].clips[2].xform), (Q, Q), "both halves keep the placement");
+        assert_eq!((t2.xform_at(0, 12), t2.xform_at(0, 3), t2.xform_at(7, 3)), (Q, Xform::NONE, Xform::NONE));
+    }
+
+    #[test]
+    fn striapositionscale_words_one_undo_step_each() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("pip"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (1, Some(Xform::PIP)));
+        assert_eq!(st.verb("pip"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 1, "the same placement commits nothing");
+        assert_eq!(st.verb("scale 100"), Some(Ok(())));
+        assert_eq!(st.selected().map(|c| c.xform), Some(Xform { x: 725, y: 725, s: 100 }));
+        assert_eq!(st.verb("pip 0 0"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (3, Some(Xform { x: 0, y: 0, s: 100 })));
+        for bad in ["pip 1", "pip 1 2 3", "pip a 0", "pip -1 0", "pip 950 0", "scale", "scale 0", "scale 1001", "scale x", "pip on"] {
+            assert_eq!(st.verb(bad), Some(Err(EditError::Xform)), "{bad}");
+        }
+        assert_eq!(st.undo_depth(), 3);
+        assert_eq!(st.verb("pip off"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.selected().map(|c| c.xform)), (4, Some(Xform::NONE)));
+        for _ in 0..4 {
+            assert!(st.undo());
+        }
+        assert_eq!(st.timeline, tl);
+        st.select(1, 0).ok();
+        assert_eq!(st.verb("pipx"), None, "not a pip word");
+        assert_eq!(st.verb("scales 1"), None);
+    }
+
+    #[test]
+    fn striapositionscale_edl_round_trip() {
+        let (tl, _, _) = base();
+        let plain = edl::write(&tl, "T").unwrap();
+        assert!(!plain.contains("UNA XFORM"));
+        let t2 = tl.set_crop(0, 1, Crop { l: 1, t: 2, r: 3, b: 4 }).unwrap().set_xform(0, 1, Xform { x: 10, y: 20, s: 300 }).unwrap();
+        let text = edl::write(&t2, "T").unwrap();
+        assert!(text.contains("\n* UNA CROP 1 2 3 4\n* UNA XFORM 10 20 300\n"), "{text}");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back.tracks[0].clips[1].xform, Xform { x: 10, y: 20, s: 300 });
+        assert_eq!(edl::write(&back, "T").unwrap(), text);
+        assert_eq!(edl::parse(&plain, 25).unwrap().tracks[0].clips[1].xform, Xform::NONE);
+    }
+
+    #[test]
+    fn striapositionscale_edl_refusals() {
+        const V: &str = "001  A        V     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        const A: &str = "002  A        A     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        const BL: &str = "001  BL       V     C        00:00:00:00 00:00:00:10 00:00:00:00 00:00:00:10\n";
+        let h = "FCM: NON-DROP FRAME\n";
+        let ok = format!("{h}{V}* UNA XFORM 10 20 300\n");
+        assert_eq!(edl::parse(&ok, 25).unwrap().tracks[0].clips[0].xform, Xform { x: 10, y: 20, s: 300 });
+        for (text, line) in [
+            (format!("{h}* UNA XFORM 1 2 3\n{V}"), 2),
+            (format!("{h}{V}{A}* UNA XFORM 1 2 3\n"), 4),
+            (format!("{h}{BL}* UNA XFORM 1 2 3\n"), 3),
+            (format!("{h}{V}* UNA XFORM 1 2\n"), 3),
+            (format!("{h}{V}* UNA XFORM 1 2 x\n"), 3),
+            (format!("{h}{V}* UNA XFORM 600 0 500\n"), 3),
+            (format!("{h}{V}* UNA XFORM 0 0 1000\n"), 3),
+            (format!("{h}{V}* UNA XFORM 1 2 3\n* UNA XFORM 1 2 3\n"), 4),
+        ] {
+            assert_eq!(edl::parse(&text, 25).map(|_| ()), Err(EdlError::Syntax { line }), "{text}");
+        }
+    }
+}

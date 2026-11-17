@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAOPACITY (SR868): `opacity <pct>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -719,5 +719,42 @@ impl EditorState {
             (Some(p), None) => self.set_opacity(p),
             _ => Err(EditError::Opacity),
         })
+    }
+}
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): the selected clip's position / scale through the one commit (named tail block) ----
+// `pip` (the bottom-right quarter, [`crate::Xform::PIP`]), `pip off` (the whole frame), `pip <x> <y>` (the top-left, the
+// scale kept) and `scale <s>` (the scale, the top-left kept), each in 1/1000 of the frame, ride THE verb dispatch
+// ([`EditorState::verb`]), so the host face, `stria-view --do pip:x:y` / `scale:s` and the kernel Player's keys reach
+// them. ONE `commit` of `Timeline::set_xform` (undo-able); the same placement again commits nothing. Refused: no clip
+// selected `EditError::NoClip`; an audio clip `EditError::Kind`; a malformed word or a rect off the frame `EditError::Xform`.
+impl EditorState {
+    /// The selected clip placed by `xf` (one commit; the same placement again commits nothing).
+    pub fn set_xform(&mut self, xf: crate::Xform) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_xform(track, idx, xf)?;
+        if tl == self.timeline {
+            return Ok(());
+        }
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `pip` / `scale` words of [`EditorState::verb`]; `None` when `v` is neither.
+    fn xform_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        let (Some(&word), args) = (w.first(), w.get(1..).unwrap_or(&[])) else { return None };
+        if word != "pip" && word != "scale" {
+            return None;
+        }
+        let Some(cur) = self.selected().map(|c| c.xform) else { return Some(Err(EditError::NoClip)) };
+        let n: Vec<Option<u16>> = args.iter().map(|x| x.parse().ok()).collect();
+        let xf = match (word, args, n.as_slice()) {
+            ("pip", [], _) => crate::Xform::PIP,
+            ("pip", ["off"], _) => crate::Xform::NONE,
+            ("pip", _, [Some(x), Some(y)]) => crate::Xform { x: *x, y: *y, ..cur },
+            ("scale", _, [Some(s)]) => crate::Xform { s: *s, ..cur },
+            _ => return Some(Err(EditError::Xform)),
+        };
+        Some(self.set_xform(xf))
     }
 }

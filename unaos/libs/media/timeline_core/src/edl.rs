@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+            xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
@@ -438,7 +438,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.end(), fps)
         ));
         s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
-        s.push_str(&crop_line(c)); if c.gain_cdb != 0 {
+        s.push_str(&crop_line(c)); s.push_str(&xform_line(c)); if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
         if c.fade_in != 0 || c.fade_out != 0 {
@@ -673,4 +673,34 @@ fn alpha_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), Ed
 /// STRIAOPACITY: the event's `* UNA ALPHA` line (empty for an opaque clip).
 fn alpha_line(c: &Clip) -> String {
     if c.opacity == crate::OPAQUE { String::new() } else { format!("* UNA ALPHA {}\n", c.opacity) }
+}
+
+// ---- STRIAPOSITIONSCALE (LEDGER SR879): the clip's `* UNA XFORM` line (named tail block) ----
+// `* UNA XFORM <x> <y> <s>` belongs to the VIDEO event line just above it (the per-clip comment shape of `* UNA CROP`),
+// three integers in 1/1000 of the frame ([`crate::Xform`]), written right after the clip's CROP line and only when it is
+// placed, so an EDL with no placement writes as before. One with no video event above it (none, a `BL` event, an audio
+// event), not three integers, a rect off the frame, the whole frame, or a second XFORM for one event is a syntax error.
+
+/// STRIAPOSITIONSCALE: apply a `* UNA XFORM` line to the video event above it (`None`: none there); any other line is not this one.
+fn xform_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA XFORM ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let n: Vec<Option<u16>> = r.split_whitespace().map(|x| x.parse().ok()).collect();
+    let xf = match n.as_slice() {
+        [Some(x), Some(y), Some(s)] => crate::Xform { x: *x, y: *y, s: *s },
+        _ => return Err(EdlError::Syntax { line }),
+    };
+    if !xf.ok() || xf == crate::Xform::NONE || c.xform != crate::Xform::NONE {
+        return Err(EdlError::Syntax { line });
+    }
+    c.xform = xf;
+    Ok(())
+}
+
+/// STRIAPOSITIONSCALE: the clip's `* UNA XFORM` line, or nothing when it is not placed.
+fn xform_line(c: &Clip) -> String {
+    if c.xform == crate::Xform::NONE {
+        return String::new();
+    }
+    format!("* UNA XFORM {} {} {}\n", c.xform.x, c.xform.y, c.xform.s)
 }
