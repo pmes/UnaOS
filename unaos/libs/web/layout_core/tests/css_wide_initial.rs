@@ -920,3 +920,62 @@ fn css_wide_revert_noninherited_all() {
     assert_eq!(s.paint.background, None, "all: revert: background colour");
     assert_eq!(s.paint.border, None, "all: revert: border");
 }
+// ---- AETHERCSSALIGNCONTENTSAFE (LEDGER SR1064): safe / unsafe / first|last baseline on the alignment arms (named tail block) ----
+
+use layout_core::css::alignment_words;
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): the modifier grammar (css-align-3 §6): `safe` / `unsafe` strip before a
+/// content-position word, `first` / `last` before `baseline`; one token passes through (bare `safe` is then refused by
+/// the arm as before); malformed orders are None (the arm refuses the whole text).
+#[test]
+fn alignment_words_grammar() {
+    assert_eq!(alignment_words("safe center"), Some(("center", true, 0)), "safe center");
+    assert_eq!(alignment_words("unsafe end"), Some(("end", false, 0)), "unsafe end");
+    assert_eq!(alignment_words("first baseline"), Some(("baseline", false, 1)), "first baseline");
+    assert_eq!(alignment_words("last baseline"), Some(("baseline", false, 2)), "last baseline");
+    assert_eq!(alignment_words("center"), Some(("center", false, 0)), "a plain word passes through");
+    assert_eq!(alignment_words("safe"), Some(("safe", false, 0)), "bare safe passes through to the arm's refusal");
+    for bad in ["safe safe center", "baseline first", "safe baseline", "safe space-between", "safe center end"] {
+        assert_eq!(alignment_words(bad), None, "{bad}: refused");
+    }
+}
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): each of the three alignment arms (justify-content, align-content, align-items;
+/// align-self has no arm: AETHER-CSS-ALIGN-SELF-ARM) takes `safe center` as its plain `center` twin, `unsafe end` as
+/// `end`; align-items takes `first` / `last baseline` as `baseline`; the refused forms leave the field None.
+#[test]
+fn alignment_words_arms() {
+    let one = |p: &str, v: &str| styled(&[(p, v)]);
+    assert!(one("justify-content", "center").justify.is_some(), "armed: justify-content center");
+    assert_eq!(one("justify-content", "safe center").justify, one("justify-content", "center").justify, "justify-content: safe center");
+    assert_eq!(one("justify-content", "unsafe end").justify, one("justify-content", "end").justify, "justify-content: unsafe end");
+    assert!(one("align-content", "center").align_content.is_some(), "armed: align-content center");
+    assert_eq!(one("align-content", "safe center").align_content, one("align-content", "center").align_content, "align-content: safe center");
+    assert_eq!(one("align-content", "unsafe end").align_content, one("align-content", "end").align_content, "align-content: unsafe end");
+    assert!(one("align-items", "center").align_items.is_some(), "armed: align-items center");
+    assert_eq!(one("align-items", "safe center").align_items, one("align-items", "center").align_items, "align-items: safe center");
+    assert_eq!(one("align-items", "unsafe end").align_items, one("align-items", "end").align_items, "align-items: unsafe end");
+    assert_eq!(one("align-items", "first baseline").align_items, one("align-items", "baseline").align_items, "align-items: first baseline");
+    assert_eq!(one("align-items", "last baseline").align_items, one("align-items", "baseline").align_items, "align-items: last baseline");
+    for bad in ["safe", "safe safe center", "baseline first"] {
+        assert_eq!(one("justify-content", bad).justify, None, "justify-content: {bad} refused");
+        assert_eq!(one("align-content", bad).align_content, None, "align-content: {bad} refused");
+        assert_eq!(one("align-items", bad).align_items, None, "align-items: {bad} refused");
+    }
+}
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): a 200px flex row with one 50 x 20 child: `justify-content: safe center` centres
+/// it like the plain `center` twin (x 75); before, the declaration was dropped and the child sat at the start.
+#[test]
+fn alignment_words_safe_center_layout() {
+    let x = |jc: &'static str| {
+        let doc = page(vec![el("div", &[("id", "fc")], vec![el("div", &[("id", "k"), ("style", "width: 50px; height: 20px")], vec![])])]);
+        let fc = doc.by_id("fc");
+        let rule: &[(&str, &str)] = &[("display", "flex"), ("width", "200px"), ("height", "20px"), ("justify-content", jc)];
+        let tree = lay_styled(&doc, &Sheet(vec![(fc.id, std::rc::Rc::new(cascade(&[rule])))]), 400.0, 400.0);
+        box_of(&tree, &doc.by_id("k")).0 - box_of(&tree, &fc).0
+    };
+    let (c, s) = (x("center"), x("safe center"));
+    assert!((c - 75.0).abs() <= 0.5, "armed: center puts the child at 75: {c}");
+    assert!((s - c).abs() <= 0.5, "safe center centres like center: {s} vs {c}");
+}

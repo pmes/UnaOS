@@ -1214,7 +1214,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "inherit" | "initial" | "unset" | "revert" | "match-parent" | "-webkit-match-parent" => {}
             other => H::record_css(&format!("text-align:{}", other)),
         },
-        "justify-content" => match value {
+        "justify-content" => match align_word::<H>(value) {
             "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
             "flex-end" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
             "flex-start" | "start" | "normal" => style.justify = Some(taffy::style::JustifyContent::START),
@@ -1463,7 +1463,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-content" => apply_align_content(value, style), "align-items" => match value {
+        "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -4195,3 +4195,46 @@ pub fn erase_reverted<H: Host>(s: &mut SpecifiedStyle<H>, bits: u32) {
 /// UI font (13.333px, normal weight and style); [`apply_font_wide`] gives them the `initial` road, then the control
 /// family (`Host::control_family`, the UA control font) at [`crate::CONTROL_FONT_PX`] through the `font-size` arm.
 const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
+
+// ---- AETHERCSSALIGNCONTENTSAFE (LEDGER SR1064): safe / unsafe / first|last baseline on the alignment arms (named tail block) ----
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): css-align-3 §4.4 / §6 — `<overflow-position>? <content-position>` and
+/// `[ first | last ]? baseline`. Answers (the bare position word, safe, baseline: 0 none / 1 first / 2 last). One token
+/// passes through unchanged (bare `safe` reaches the arm and is refused as before); `first|last baseline` is
+/// `baseline`; `safe|unsafe` before a content-position word strips to that word; anything else (`safe safe center`,
+/// `baseline first`, `safe baseline`, `safe space-between`, three tokens) is None.
+pub fn alignment_words(value: &str) -> Option<(&str, bool, u8)> {
+    let mut it = value.split_ascii_whitespace();
+    let (a, b) = (it.next()?, it.next());
+    if it.next().is_some() {
+        return None;
+    }
+    let Some(b) = b else { return Some((a, false, 0)) };
+    match (a, b) {
+        ("first", "baseline") => Some(("baseline", false, 1)),
+        ("last", "baseline") => Some(("baseline", false, 2)),
+        ("safe" | "unsafe", "center" | "start" | "end" | "flex-start" | "flex-end" | "self-start" | "self-end" | "left" | "right") => {
+            Some((b, a == "safe", 0))
+        }
+        _ => None,
+    }
+}
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): the word the justify-content / align-content / align-items arms match. `safe`
+/// is recorded (`align-overflow:safe`: taffy has no overflow-position, the start fallback on overflow is owed) and
+/// otherwise ignored; `unsafe` is a no-op; `last baseline` is first-baseline + recorded (`align-baseline:last`). An
+/// invalid form comes back whole, so the arm's own refusal records the full text.
+fn align_word<H: Host>(value: &str) -> &str {
+    match alignment_words(value) {
+        Some((w, safe, base)) => {
+            if safe {
+                H::record_css("align-overflow:safe");
+            }
+            if base == 2 {
+                H::record_css("align-baseline:last");
+            }
+            w
+        }
+        None => value,
+    }
+}
