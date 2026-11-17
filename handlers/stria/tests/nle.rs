@@ -5763,7 +5763,39 @@ fn striapan_face_word_sets_the_pan() {
     assert!(!face.verb("pan 3"), "a malformed pan word is not a verb");
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 0);
-    assert!(!VERBS.contains(&"pan"), "no button: NLE-PAN-FACE");
+    assert!(VERBS.contains(&"pan"), "the button: NLE-PAN-FACE BUILT by SR897");
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the face's pan words and their message-row readout (named tail block) ----
+
+/// `pan+` / `pan-` / `pan` (VERBS, just before `help`) step / centre the selected audio clip through timeline_core's verb and
+/// the message row reads the pan: `pan: R 25`, `pan: L 50`, `pan: centre`; nothing selected reads the refusal by name.
+#[test]
+fn striapanface_face_words_read_the_pan() {
+    assert_eq!(&VERBS[VERBS.len() - 4..], &["pan-", "pan", "pan+", "help"]);
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("pan+"));
+    assert_eq!(face.last_error.take(), Some(format!("pan: {}", EditError::NoClip)));
+    face.state.select(1, 1).unwrap();
+    let d0 = face.state.undo_depth();
+    for _ in 0..2 {
+        assert!(face.verb("pan+"));
+    }
+    assert_eq!(face.last_error.take().as_deref(), Some("pan: R 25"));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.state.undo_depth()), (32, d0 + 2));
+    for _ in 0..6 {
+        assert!(face.verb("pan-"));
+    }
+    assert_eq!(face.last_error.take().as_deref(), Some("pan: L 50"));
+    assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, -64);
+    assert!(face.verb("pan"));
+    assert_eq!(face.last_error.take().as_deref(), Some("pan: centre"));
+    assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 0);
+    assert!(face.verb("pan 0.25"));
+    assert_eq!(face.last_error, None, "`pan <x>` stays silent");
+    assert_eq!((stria::nle_face::pan_line(127), stria::nle_face::pan_line(-128), stria::nle_face::pan_line(1)), ("pan: R 100".to_string(), "pan: L 100".to_string(), "pan: R 1".to_string()));
+    println!("striapanface: pan+ x2 -> R 25, pan- x6 -> L 50, pan -> centre");
 }
 
 // ---- STRIAHELPSEARCH (LEDGER SR874): `help <word>` filters the keys help rows; bare `help` unchanged (named tail block) ----

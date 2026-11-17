@@ -332,7 +332,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity));
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
-            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -2291,4 +2291,18 @@ mod striagradeface_tests {
             }
         }
     }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the pan tick on an audio clip's body (named tail block) ----
+// A 2 px x 4 px mark in [`TICK`] at the body's top edge, at the clip's pan along the body between its trim handles (centre
+// at the body's middle, hard left / right a handle's width inside the ends). Painted only on an audio track and only when
+// `pan_cq8 != 0`, so a centred clip paints exactly as before (every golden unchanged). The kernel Player paints it through
+// this same painter: it shows the document's pan, though the kernel plays pan centred (NLE-PAN-KERNEL).
+fn pan_tick(c: &mut Canvas, kind: Kind, clip: &crate::Clip, x0: i64, x1: i64, y0: i64) {
+    if !matches!(kind, Kind::Audio) || clip.pan_cq8 == 0 {
+        return;
+    }
+    let half = ((x1 - x0) / 2 - HANDLE_W - 1).max(0);
+    let xm = (x0 + x1) / 2 + half * (clip.pan_cq8 as i64).clamp(-127, 127) / 127;
+    c.rect(xm - 1, y0 + 2, xm + 1, y0 + 6, TICK);
 }

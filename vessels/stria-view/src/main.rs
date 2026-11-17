@@ -549,6 +549,7 @@ fn transport() -> TetraNode {
         button("normalize", "Normalize"), // STRIANORMALIZE (SR878): the selected audio clip's gain to its exact peak at -1 dBFS
         button("recover", "Recover"), // STRIAAUTOSAVE (SR883): loads the document's newer autosave (`<stem>.autosave.edl`) as one undo step
         button("history", "History"), button("freeze", "Freeze"), // STRIAFREEZEFRAME (SR880): a 2 s hold of the playhead's frame (THE `freeze` verb)
+        button("pan-", "Pan L"), button("pan", "Pan C"), button("pan+", "Pan R"), // STRIAPANFACE (SR897): step / centre the selected clip's pan
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1784,5 +1785,26 @@ mod striakeyboardmap_tests {
         assert_eq!(face.last_error.as_deref(), Some("keys: line 1: unknown action \"spilt\""));
         assert!(face.keymap().is_empty());
         println!("striakeyboardmap witness: --keys \"p play\" + key:p -> playing");
+    }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the three pan buttons before `?` (named tail block) ----
+#[cfg(test)]
+mod striapanface_tests {
+    use super::*;
+
+    /// The transport row's three buttons just before `?` are `pan-` / `pan` / `pan+`; `--do at:12:1,pan+,pan+` pans the
+    /// selected audio clip two eighths right and each press reads the pan on the message row.
+    #[test]
+    fn striapanface_buttons_pan_the_clip() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<&str> = row[row.len() - 4..].iter().map(|b| match b { TetraNode::Button { id, .. } => id.as_str(), _ => panic!("not a button") }).collect();
+        assert_eq!(ids, ["pan-", "pan", "pan+", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let lines = drive(&mut face, "at:12:1,pan+,pan+");
+        assert_eq!(lines, ["pan: R 13", "pan: R 25"]);
+        assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 32);
+        println!("striapanface witness: pan+ x2 -> {lines:?}");
     }
 }

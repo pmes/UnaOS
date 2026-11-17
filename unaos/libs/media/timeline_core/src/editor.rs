@@ -720,7 +720,7 @@ impl EditorState {
     /// The `gain` / `fade` words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn gain_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let mut w = v.split_ascii_whitespace();
-        let word = w.next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
+        let word = w.next().filteror_else(|| self.pan_step(v)).(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
         let (arg, extra) = (w.next(), w.next());
         Some(self.gain_word(word, arg, extra.is_some()))
     }
@@ -751,7 +751,7 @@ impl EditorState {
                 None => Err(refused),
             },
             _ => Err(refused),
-        }
+        } // STRIAPANFACE (SR897): and the face's `pan` / `pan-` / `pan+` (file tail)
     }
 }
 
@@ -2203,5 +2203,27 @@ impl EditorState {
     /// STRIAFREEZEFRAME: the `freeze` word (`None` for any other word).
     fn freeze_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         (v == "freeze").then(|| self.freeze())
+    }
+}
+
+// ---- STRIAPANFACE (LEDGER SR897): the face's pan words — centre and a step of 1/8 on the eighth grid (named tail block) ----
+// `pan` centres the selected clip; `pan-` / `pan+` step it one eighth of the swing left / right on the grid
+// `round(k * 127 / 8)`, k in -8..=8 (0, 16, 32, 48, 64, 79, 95, 111, 127: the values `pan 0.125` ... `pan 1` give). An
+// off-grid pan steps from its nearest grid point. At a hard end the step repeats the value (Ok, no commit). All ride
+// SR861's `set_selected_pan` and its ONE `commit`; with nothing selected it refuses `EditError::NoClip`.
+impl EditorState {
+    /// The pan the word `v` sets (`pan`, `pan-`, `pan+`); `None` for any other word.
+    fn pan_step(&self, v: &str) -> Option<i8> {
+        let d: i32 = match v {
+            "pan" => return Some(0),
+            "pan-" => -1,
+            "pan+" => 1,
+            _ => return None,
+        };
+        let cur = self.selected().map_or(0, |c| c.pan_cq8) as i32;
+        let m = cur * 8;
+        let k = ((m + m.signum() * 63) / 127 + d).clamp(-8, 8);
+        let n = k * 127;
+        Some(((n + n.signum() * 4) / 8) as i8)
     }
 }
