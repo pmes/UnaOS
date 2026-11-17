@@ -214,19 +214,19 @@ fn parse(text: &str, dirs: &[PathBuf]) -> Option<(Vec<PathBuf>, HashMap<PathBuf,
 }
 
 /// The index's answer for the walked `files` of `config` (see the module comment).
-pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State) {
-    let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off) };
-    let parsed = std::fs::read_to_string(dir.join(index_file(&config.dirs))).ok().and_then(|t| parse(&t, &config.dirs));
-    let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss) };
+pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State, usize) {
+    let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off, 0) };
+    let text = std::fs::read_to_string(dir.join(index_file(&config.dirs))).unwrap_or_default(); let parsed = parse(&text, &config.dirs); // AETHERFONTDBCACHECOMPACT (SR791): the text kept for c_dups
+    let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss, 0) };
     let live: HashSet<&PathBuf> = files.iter().collect();
     for p in &order {
         let e = &map[p];
         if !live.contains(p) || stamp(p) != Some((e.size, e.mtime)) {
-            return (None, Vec::new(), State::Stale);
+            return (None, Vec::new(), State::Stale, 0);
         }
     }
     if files.iter().any(|f| !map.contains_key(f)) {
-        return (None, Vec::new(), State::Miss);
+        return (None, Vec::new(), State::Miss, 0);
     }
     let (mut faces, mut seeds) = (Vec::new(), Vec::new());
     for f in files {
@@ -234,16 +234,16 @@ pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>
         faces.extend(e.0);
         seeds.extend(e.1);
     }
-    (Some(faces), seeds, State::Hit)
+    (Some(faces), seeds, State::Hit, c_dups(&text))
 }
 
 /// Rewrites the index after a miss or a stale answer (a no-op for Off and Hit); a failure leaves no index change.
-pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) -> usize {
-    if !matches!(state, State::Miss | State::Stale) {
+pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State, covs: &[Option<Coverage>]) -> usize {
+    if !matches!(state, State::Miss | State::Stale) && (state != State::Hit || covs.is_empty()) { // AETHERFONTDBCACHECOMPACT (SR791): a Hit stores only when it compacts
         return 0;
     }
     let Some(dir) = config.cache_dir.as_deref() else { return 0 };
-    let Some(text) = render(&config.dirs, files, faces) else { return 0 };
+    let Some(text) = render(&config.dirs, files, faces).and_then(|t| with_c_lines(t, faces, covs)) else { return 0 }; // AETHERFONTDBCACHECOMPACT (SR791): the kept C lines
     write_atomic(dir, &index_file(&config.dirs), &text).map_or(0, |()| sweep(dir, &index_file(&config.dirs))) // AETHERFONTDBCACHESWEEP (SR770): the sweep rides the write
 }
 
@@ -694,7 +694,7 @@ mod tests {
         }
         let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
         let faces = FontDb::discover(t.off()).faces;
-        let swept = store(&t.cfg(), &files, &faces, State::Miss);
+        let swept = store(&t.cfg(), &files, &faces, State::Miss, &[]);
         assert_eq!(swept, 3);
         let mut want = vec![index_file(&t.cfg().dirs), format!("{INDEX_FILE}-fedcba9876543210"), "other.txt".to_string()];
         want.sort();
@@ -715,9 +715,9 @@ mod tests {
         assert_eq!(before.len(), 2);
         let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
         let faces = FontDb::discover(t.off()).faces;
-        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale), 0);
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale, &[]), 0);
         assert_eq!(names(&cache), before);
-        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit), 0, "a hit never writes or sweeps");
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit, &[]), 0, "a hit never writes or sweeps");
         assert_eq!(cache_word(State::Miss, 0), "miss");
         assert_eq!(cache_word(State::Hit, 0), "hit");
     }
@@ -753,6 +753,100 @@ mod tests {
         assert_eq!(sweep(&cache, "fontdb-index.v2-0000000000000001"), 1);
         assert!(append(&cache, &name, "C\tx\n").is_err());
         assert!(!cache.join(&name).exists(), "append never recreates a swept index");
+    }
+
+    /// AETHERFONTDBCACHECOMPACT (SR791): INTER discovered and covered (one C line per face), then `extra` more copies
+    /// of face 0's C line appended, alternating its own stamp and mtime 1; returns the walked files.
+    fn with_dups(t: &Tmp, extra: usize) -> Vec<PathBuf> {
+        t.copy_in(INTER);
+        let a = FontDb::discover(t.cfg());
+        assert_eq!(a.discover_cache(), "miss");
+        for i in 0..a.faces.len() {
+            a.covers(i, 'a');
+        }
+        assert_eq!(c_lines(t), a.faces.len());
+        let mut text = fs::read_to_string(t.index()).unwrap();
+        let head = format!("C\t{}\t{}\t", escape(a.faces[0].path.to_str().unwrap()), a.faces[0].index);
+        let line = text.lines().find(|l| l.starts_with(&head)).unwrap().to_string();
+        let mut f: Vec<String> = line.split('\t').map(String::from).collect();
+        f[4] = "1".into();
+        let stale = f.join("\t");
+        for k in 0..extra {
+            text.push_str(if k % 2 == 0 { &stale } else { &line });
+            text.push('\n');
+        }
+        fs::write(t.index(), text).unwrap();
+        vec![t.0.join("fonts").join("InterVariable.ttf")]
+    }
+
+    /// 70 C lines for one face (two stamps): `load` reports 69 duplicates; the hit compacts to one C line per face,
+    /// every coverage survives (a fresh hit reads no cmap byte), and the word carries ` compacted=69`.
+    #[test]
+    fn fontdb_cache_compact_kat() {
+        let t = Tmp::new("compact");
+        let files = with_dups(&t, 69);
+        let (faces, seeds, st, dups) = load(&t.cfg(), &files);
+        assert_eq!((st, dups), (State::Hit, 69), "70 C lines for one face, two stamps");
+        let faces = faces.unwrap();
+        let mut swept = 0;
+        assert_eq!(compact(&t.cfg(), &files, &faces, st, dups, &seeds, &mut swept), 69);
+        assert_eq!(swept, 0);
+        assert_eq!(c_lines(&t), faces.len(), "one C line per face");
+        assert_eq!(c_dups(&fs::read_to_string(t.index()).unwrap()), 0);
+        let b = FontDb::discover(t.cfg());
+        assert_eq!(b.discover_cache(), "hit");
+        for i in 0..b.faces.len() {
+            assert_eq!(b.covers(i, 'a'), Some(true), "face {i}");
+        }
+        assert_eq!(b.scan_bytes(), 0, "every coverage survives the compaction");
+        assert_eq!(load(&t.cfg(), &files).3, 0);
+        assert_eq!(compact_word(cache_word(State::Hit, swept), 69), "hit compacted=69");
+    }
+
+    /// Below `COMPACT_AT` a hit leaves the index byte for byte and the word as today's.
+    #[test]
+    fn fontdb_cache_compact_below_kat() {
+        assert_eq!(COMPACT_AT, 64);
+        let t = Tmp::new("compactbelow");
+        let files = with_dups(&t, 10);
+        let before = fs::read(t.index()).unwrap();
+        let (faces, seeds, st, dups) = load(&t.cfg(), &files);
+        assert_eq!((st, dups), (State::Hit, 10));
+        let mut swept = 0;
+        assert_eq!(compact(&t.cfg(), &files, &faces.unwrap(), st, dups, &seeds, &mut swept), 0);
+        assert_eq!(fs::read(t.index()).unwrap(), before, "below COMPACT_AT the index is untouched");
+        assert_eq!(compact_word(cache_word(State::Hit, swept), 0), "hit");
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "hit");
+        assert_eq!(fs::read(t.index()).unwrap(), before, "a discovery below the threshold writes nothing");
+    }
+
+    /// The race: two processes load the fresh index before any C line exists and each appends one per face it reads
+    /// (one duplicate per face); a third, seeded by those lines, reads no cmap and appends nothing.
+    #[test]
+    fn fontdb_cache_compact_race_kat() {
+        let t = Tmp::new("compactrace");
+        t.copy_in(INTER);
+        t.copy_in(JB);
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let (p, q) = (FontDb::discover(t.cfg()), FontDb::discover(t.cfg()));
+        assert_eq!((p.discover_cache(), q.discover_cache()), ("hit", "hit"));
+        let n = p.faces.len();
+        for i in 0..n {
+            p.covers(i, 'a');
+        }
+        for i in 0..n {
+            q.covers(i, 'a');
+        }
+        assert!(p.scan_bytes() > 0 && q.scan_bytes() > 0, "both loaded before any C line");
+        assert_eq!(c_lines(&t), 2 * n);
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf"), t.0.join("fonts").join("JetBrainsMono-Variable.ttf")];
+        assert_eq!(load(&t.cfg(), &files).3, n, "one duplicate per face per extra racing process");
+        let r = FontDb::discover(t.cfg());
+        for i in 0..n {
+            r.covers(i, 'a');
+        }
+        assert_eq!(r.scan_bytes(), 0, "a seeded process never reads the cmap");
+        assert_eq!(c_lines(&t), 2 * n, "and never appends");
     }
 }
 
@@ -947,4 +1041,72 @@ fn sweep(dir: &Path, keep: &str) -> usize {
 /// The `cache=` word of the `[fonts] discover` line: the state, and ` swept=<n>` only when a store removed files.
 pub(crate) fn cache_word(state: State, swept: usize) -> String {
     if swept > 0 { format!("{} swept={swept}", state.as_str()) } else { state.as_str().to_string() }
+}
+
+// ---- AETHERFONTDBCACHECOMPACT (LEDGER SR791): duplicate C lines compacted on a hit (named tail block) ----
+// A process whose `load` seeded a face's cell never appends for it again (`get_or_init` never runs the read), so the
+// C lines for one face number the processes whose `load` ran before that face's first C line existed and that later
+// read its cmap (two windows, or Aether and quartzite, started together after a miss or stale rewrite), plus a re-read
+// after a stale-stamp line. A hit never rewrote, so they stayed until the next miss or stale. `load` now counts them
+// (`c_dups`; the last matching-stamp line still seeds the cell) and, at `COMPACT_AT` or more, the hit arm calls
+// `compact`: ONE `store` with the loaded faces and their cells, which `with_c_lines` writes back as one C line per
+// covered face, so no coverage already learned is lost. The rewrite is `store`'s (tmp and rename, the sweep riding
+// it); a line another process appends to the old file meanwhile is lost, the window every rewrite has.
+
+/// The duplicate `C` lines one index may carry before a hit rewrites it (all faces together; a Config knob is owed).
+pub const COMPACT_AT: usize = 64;
+
+/// The `C` lines after an index text's `end` trailer whose (path, face index) an earlier `C` line already named.
+fn c_dups(text: &str) -> usize {
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let (mut ended, mut n) = (false, 0);
+    for line in text.lines() {
+        if !ended {
+            ended = line.starts_with("end\t");
+            continue;
+        }
+        let mut f = line.split('\t');
+        if f.next() == Some("C") && !seen.insert((f.next().unwrap_or(""), f.next().unwrap_or(""))) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `text` (a `render`ed body) with one `C` line per face whose cell `covs` holds (aligned to `faces`), once per
+/// (path, index), stamped now; None when a file cannot be stat'ed or a path is not UTF-8. Empty `covs`: `text` as is.
+fn with_c_lines(mut text: String, faces: &[FaceInfo], covs: &[Option<Coverage>]) -> Option<String> {
+    let mut seen: HashSet<(&Path, u32)> = HashSet::new();
+    for (f, cov) in faces.iter().zip(covs) {
+        let Some(cov) = cov else { continue };
+        if !seen.insert((f.path.as_path(), f.index)) {
+            continue;
+        }
+        let (size, mtime) = stamp(&f.path)?;
+        text.push_str(&c_line(f.path.to_str()?, f.index, size, mtime, cov));
+    }
+    Some(text)
+}
+
+/// On a hit whose index carried `dups >= COMPACT_AT` duplicate C lines, rewrites it once through [`store`] with the
+/// faces and their cells, adding the files that rewrite swept to `swept`; returns `dups` then, else 0 (no I/O).
+pub(crate) fn compact(
+    config: &Config,
+    files: &[PathBuf],
+    faces: &[FaceInfo],
+    state: State,
+    dups: usize,
+    covs: &[Option<Coverage>],
+    swept: &mut usize,
+) -> usize {
+    if state != State::Hit || dups < COMPACT_AT {
+        return 0;
+    }
+    *swept += store(config, files, faces, state, covs);
+    dups
+}
+
+/// `word` (from [`cache_word`]) and ` compacted=<n>` only when a hit compacted.
+pub(crate) fn compact_word(word: String, compacted: usize) -> String {
+    if compacted > 0 { format!("{word} compacted={compacted}") } else { word }
 }
