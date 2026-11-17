@@ -3038,7 +3038,7 @@ fn frame_walk(
                     let right = (box_sx + bw).round() - 1.0;
                     let x0 = right - 13.0;
                     let y0 = (box_sy.round() + ((bh.round() - 1.0) / 2.0).floor()) - 3.0;
-                    let ink = spec.color.unwrap_or((0, 0, 0));
+                    let ink = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0)));
                     for (r, row) in ARROW.iter().enumerate() {
                         for (c, &v) in row.iter().enumerate() {
                             let (x, y) = (x0 + c as f32, y0 + r as f32);
@@ -3058,7 +3058,7 @@ fn frame_walk(
                     let text = crate::forms::control_value(dom_node);
                     let mode = crate::fonts::lines::TextMode { white_space: 3, ..Default::default() };
                     let adv = inherited.advancer();
-                    let color = spec.color.unwrap_or((0, 0, 0));
+                    let color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0)));
                     let focus = focus_of(dom_node);
                     let lh = crate::fonts::face(&adv.sel).map(|f| crate::fonts::line_height(f, adv.size, 0.0)).unwrap_or(adv.size * 1.2);
                     let max_w = content_w.max(1.0);
@@ -3087,7 +3087,7 @@ fn frame_walk(
                     }
                 }
                 // AETHERFILECOLORPAINT (SR456): a file input's Choose-File button and status, a color input's swatch; never its value as text.
-                let file_color = paint_file_color(dom_node, tag, box_sx, box_sy, bw, bh, bord, pad, &inherited, *font, spec.color.unwrap_or((0, 0, 0)), surface, width, height, damage_rects, clip);
+                let file_color = paint_file_color(dom_node, tag, box_sx, box_sy, bw, bh, bord, pad, &inherited, *font, spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0))), surface, width, height, damage_rects, clip);
                 if is_control && tag != "button" && !checkable && tag != "textarea" && !file_color && !(image_input && image_painted) { // AETHERIMAGEINPUTFETCH (SR461): a painted image input shows no text
                     let face = crate::fonts::face(&inherited.sel());
                     if let Some(font) = face.or(*font) {
@@ -3131,7 +3131,7 @@ fn frame_walk(
                         drop(attrs);
                         // Field text is black (FieldText), a placeholder
                         // #757575 (html.css ::placeholder darkGray).
-                        let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or((0, 0, 0)) };
+                        let value_color = if is_placeholder { (117, 117, 117) } else { spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0))) };
                         let fs = inherited.font_size;
                         let is_field = kind == Some(crate::layout::Control::Field);
                         let focus = if is_field { focus_of(dom_node) } else { None };
@@ -3193,7 +3193,7 @@ fn frame_walk(
                                 if let Some(f) = focus.filter(|f| f.caret_visible) {
                                     let caret = if is_placeholder { 0 } else { f.caret };
                                     let cx = x_at(caret).floor().min(content_x + content_w - 1.0).max(content_x);
-                                    let color = spec.color.unwrap_or((0, 0, 0));
+                                    let color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0)));
                                     fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
                                 }
                             } else {
