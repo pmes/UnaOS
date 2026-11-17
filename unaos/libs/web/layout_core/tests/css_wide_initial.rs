@@ -131,7 +131,7 @@ fn css_wide_initial_border_width_medium() {
 #[test]
 fn css_wide_initial_leaves_the_rest() {
     let before = cascade(&[&[("margin", "20px")]]);
-    for kw in ["revert" /* SR1007 */] {
+    for kw in [/* SR1037 fold: revert (SR1037) and inherit (SR1007) both erase margin now; `revert-layer` is the keyword still left as it was */ "revert-layer"] {
         let s = cascade(&[&[("margin", "20px")], &[("margin", kw)]]);
         assert_eq!(s.margin, before.margin, "margin: {kw} is unchanged by this arc");
     }
@@ -754,8 +754,8 @@ fn css_wide_revert_sizes_auto() {
 fn css_wide_revert_noninherited_dropped_owed() {
     let before = cascade(&[&[("margin-left", "20px"), ("display", "block")]]);
     let s = cascade(&[&[("margin-left", "20px"), ("display", "block")], &[("margin-left", "revert"), ("display", "revert")]]);
-    assert_eq!(s.margin[3], before.margin[3], "margin-left: revert keeps 20px (owed)");
-    assert_eq!(s.paint.display_kind, before.paint.display_kind, "display: revert keeps block (owed)");
+    assert!(s.margin[3].is_none() && before.margin[3].is_some(), "margin-left: revert erases the 20px"); /* SR1037 */
+    assert!(s.paint.display_kind.is_none() && before.paint.display_kind.is_some(), "display: revert erases block"); /* SR1037 */
 }
 
 /// AETHERCSSWIDEREVERT (SR1028): `font: revert` reverts the seven font fields (no bits, the mark set).
@@ -779,6 +779,146 @@ fn css_wide_revert_all() {
     assert_eq!(s.paint.rtl, Some(true), "direction survives all: revert");
     let s = cascade(&[armed, &[("all", "revert-layer")]]);
     assert_eq!(s.paint.color, Some(ALL_RED), "all: revert-layer is dropped (owed)");
+}
+
+// ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
+
+use layout_core::css::{parse_declaration_block, REVERT_BORDER, REVERT_DISPLAY, REVERT_MARGIN};
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `margin: revert` after `margin: 0` erases the four sides (None: `ua_margin`
+/// at fold time), `margin-left: revert` the left only.
+#[test]
+fn css_wide_revert_noninherited_margin() {
+    let zero = cascade(&[&[("margin", "0")]]);
+    assert!(zero.margin.iter().all(|m| m.is_some()), "armed: margin 0 on four sides");
+    for kw in ["revert", "REVERT"] {
+        let s = cascade(&[&[("margin", "0")], &[("margin", kw)]]);
+        assert_eq!(s.margin, [None; 4], "margin: {kw} erases the four sides");
+        assert_eq!(s.revert_spec & REVERT_MARGIN, REVERT_MARGIN, "margin: {kw}: the four marks");
+    }
+    let twenty = cascade(&[&[("margin", "20px")]]);
+    let s = cascade(&[&[("margin", "20px")], &[("margin-left", "revert")]]);
+    assert_eq!(s.margin[3], None, "margin-left: revert erases the left");
+    assert_eq!(&s.margin[..3], &twenty.margin[..3], "the other three sides keep 20px");
+    let s = styled(&[("margin", "20px"), ("margin", "revert")]);
+    assert_eq!(s.margin, [None; 4], "one block: the revert erases the block's own earlier value");
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): a reverted `p` margin lays out as the UA 1em (16px) top margin, the armed
+/// `margin: 0` twin at 0 (the p sits in a padded div, so no margin collapses through).
+#[test]
+fn css_wide_revert_noninherited_margin_layout() {
+    let doc = page(vec![el("div", &[("style", "padding: 1px")], vec![el("p", &[("id", "p")], vec![text("A")])])]);
+    let p = doc.by_id("p");
+    let top = |rules: &[&[(&str, &str)]]| {
+        let tree = lay_styled(&doc, &Sheet(vec![(p.id, std::rc::Rc::new(cascade(rules)))]), 400.0, 400.0);
+        box_of(&tree, &p).1
+    };
+    let zero = top(&[&[("margin", "0")]]);
+    let rev = top(&[&[("margin", "0")], &[("margin", "revert")]]);
+    assert!((rev - zero - 16.0).abs() < 0.5, "margin: revert is p's UA 1em: {zero} -> {rev}");
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `display: revert` erases the display arm's five fields, so the tag road
+/// lays the element (a div as a block, a span inline) as with no rule.
+#[test]
+fn css_wide_revert_noninherited_display() {
+    let s = cascade(&[&[("display", "inline")], &[("display", "revert")]]);
+    assert_eq!((s.display, s.flex_container, s.paint.flex_container, s.paint.display_kind, s.paint.list_item), (None, None, None, None, None), "display: revert erases the five fields");
+    assert_eq!(s.revert_spec & REVERT_DISPLAY, REVERT_DISPLAY, "the mark");
+    let s = cascade(&[&[("display", "list-item")], &[("display", "revert")]]);
+    assert_eq!(s.paint.list_item, None, "list-item's marker flag goes too");
+    for (tag, armed) in [("div", "inline"), ("span", "block")] {
+        let doc = page(vec![el(tag, &[("id", "e")], vec![text("Hello")])]);
+        let e = doc.by_id("e");
+        let width = |rules: &[&[(&str, &str)]]| {
+            let tree = lay_styled(&doc, &Sheet(vec![(e.id, std::rc::Rc::new(cascade(rules)))]), 400.0, 400.0);
+            box_of(&tree, &e).2
+        };
+        let plain = width(&[]);
+        let rev = width(&[&[("display", armed)], &[("display", "revert")]]);
+        assert!((rev - plain).abs() < 0.5, "{tag} display {armed} then revert lays as the tag: {plain} vs {rev}");
+    }
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `padding-top: revert` erases the top side only; `padding: revert` all four.
+#[test]
+fn css_wide_revert_noninherited_padding() {
+    let s = cascade(&[&[("padding", "10px")], &[("padding-top", "revert")]]);
+    assert_eq!(s.padding[0], None, "padding-top: revert erases the top");
+    assert!(s.padding[1..].iter().all(|p| p.is_some()), "the other sides keep 10px");
+    let s = cascade(&[&[("padding", "10px")], &[("padding", "revert")]]);
+    assert_eq!(s.padding, [None; 4], "padding: revert erases the four sides");
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `border: revert` / `border-style: revert` erase the whole border (None: a
+/// control's UA frame, nothing elsewhere); `border-left: revert` and `border-left-style: revert` drop the left side.
+#[test]
+fn css_wide_revert_noninherited_border() {
+    for prop in ["border", "border-style"] {
+        let s = cascade(&[&[("border", "2px solid red")], &[(prop, "revert")]]);
+        assert_eq!((s.paint.border, s.paint.border_style, s.paint.border_alpha), (None, None, None), "{prop}: revert erases the border");
+        assert_eq!(s.revert_spec & REVERT_BORDER, REVERT_BORDER, "{prop}: the four marks");
+    }
+    for prop in ["border-left", "border-left-style"] {
+        let s = cascade(&[&[("border", "2px solid red")], &[(prop, "revert")]]);
+        let b = s.paint.border.expect("the other sides stay");
+        assert!(b[3].is_none() && b[..3].iter().all(|x| x.is_some()), "{prop}: revert drops the left only: {b:?}");
+    }
+    let s = cascade(&[&[("border", "2px solid red")], &[("border", "revert"), ("border", "1px solid blue")]]);
+    assert!(s.paint.border.is_some_and(|b| b.iter().all(|x| x.is_some_and(|(w, _)| w == 1.0))), "a later border in the block wins");
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `background: revert` / `background-color: revert` erase the colour, so a
+/// button paints ButtonFace again (armed red); `background-color: revert` keeps an image, `background: revert` drops it.
+#[test]
+fn css_wide_revert_noninherited_background() {
+    for prop in ["background", "background-color"] {
+        let s = cascade(&[&[("background-color", "red")], &[(prop, "revert")]]);
+        assert_eq!((s.paint.background, s.paint.bg_alpha), (None, None), "{prop}: revert erases the colour");
+    }
+    let s = cascade(&[&[("background", "url(a.png) red")], &[("background-color", "revert")]]);
+    assert!(s.paint.bg_image.is_some(), "background-color: revert keeps the image");
+    let s = cascade(&[&[("background", "url(a.png) red")], &[("background", "revert")]]);
+    assert!(s.paint.bg_image.is_none(), "background: revert drops the image (no tag has a UA image)");
+    let s = cascade(&[&[("background", "url(a.png)")], &[("background-image", "revert")]]);
+    assert!(s.paint.bg_image.is_none(), "background-image: revert is none");
+    let doc = page(vec![el("button", &[("id", "b")], vec![text("Go")])]);
+    let b = doc.by_id("b");
+    let bg = |rules: &[&[(&str, &str)]]| {
+        let tree = lay_styled(&doc, &Sheet(vec![(b.id, std::rc::Rc::new(cascade(rules)))]), 400.0, 400.0);
+        tree.paint_map.get(&id_of(&tree, &b)).and_then(|p| p.background)
+    };
+    assert_eq!(bg(&[&[("background-color", "red")]]), Some((255, 0, 0)), "armed: red");
+    assert_eq!(bg(&[&[("background-color", "red")], &[("background", "revert")]]), Some(layout_core::BUTTON_FACE), "background: revert is ButtonFace");
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the later of value / revert wins, in a block and across rules.
+#[test]
+fn css_wide_revert_noninherited_order() {
+    let five = styled(&[("margin", "5px")]).margin;
+    let s = cascade(&[&[("margin", "20px")], &[("margin", "revert"), ("margin", "5px")]]);
+    assert_eq!(s.margin, five, "revert then 5px in a block: 5px");
+    let s = cascade(&[&[("margin", "20px")], &[("margin", "5px"), ("margin", "revert")]]);
+    assert_eq!(s.margin, [None; 4], "5px then revert in a block: erased");
+    let s = cascade(&[&[("margin", "revert")], &[("margin", "20px")]]);
+    assert_eq!(s.margin, styled(&[("margin", "20px")]).margin, "a later rule's margin: 20px wins");
+    let cx = ParseCx::default();
+    for body in ["margin: 20px; margin: revert !important", "margin: revert !important; margin: 20px"] {
+        assert_eq!(parse_declaration_block::<TH>(body, &cx).margin, [None; 4], "{body}: the important revert erases");
+    }
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `all: revert` now reverts margin / padding / display / background / border
+/// too (the longhands' side bits; the four border-*-style sides erase the whole border).
+#[test]
+fn css_wide_revert_noninherited_all() {
+    let armed: &[(&str, &str)] = &[("margin", "20px"), ("padding", "3px"), ("display", "inline"), ("background-color", "red"), ("border", "2px solid red")];
+    let s = cascade(&[armed, &[("all", "revert")]]);
+    assert_eq!((s.margin, s.padding), ([None; 4], [None; 4]), "all: revert: margin and padding");
+    assert_eq!((s.display, s.paint.display_kind), (None, None), "all: revert: display");
+    assert_eq!(s.paint.background, None, "all: revert: background colour");
+    assert_eq!(s.paint.border, None, "all: revert: border");
 }
 
 // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----

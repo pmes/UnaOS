@@ -7698,7 +7698,132 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "xr", "color"), "rgb(0, 0, 255)", "all: revert: the parent's blue");
         assert_eq!(font_shorthand_cs(&mut e, "xr", "fontWeight"), "400", "all: revert: weight 400");
         let (ml, ..) = imgalt_rect(&mut e, "mr");
-        assert!((ml - 20.0).abs() <= 0.5, "margin-left: revert is dropped (owed): {ml}");
+        assert!(ml.abs() <= 0.5, "margin-left: revert is the div's UA 0: {ml}"); /* SR1037 */
+    }
+
+    // ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
+
+    /// AETHERCSSWIDEREVERTNONINHERITED (SR1037): each `.r` twin reverts its armed twin's earlier rule: a `margin: 0` p, an
+    /// inline div, a block span, a red button, and a revert followed by `margin: 20px`. Each sits in a 1px-padded section
+    /// (no margin collapses through), body 16px serif, 400 px wide.
+    fn css_wide_revert_noninherited_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            section { display: block; margin: 0; padding: 1px 0 }
+            p.z { margin: 0 }
+            p.z.r { margin: revert }
+            div.n { display: inline }
+            div.n.r { display: revert }
+            span.b { display: block }
+            span.b.r { display: revert }
+            button.g { background: rgb(255, 0, 0) }
+            button.g.r { background: revert }
+            div.w { margin: revert }
+            div.w.r { margin-left: 20px }
+            </style></head><body style="margin:0;font:16px serif">
+            <section id="sz"><p id="pz" class="z">A</p></section>
+            <section id="szr"><p id="pzr" class="z r">A</p></section>
+            <section><div id="dn" class="n">Hi</div></section>
+            <section><div id="dnr" class="n r">Hi</div></section>
+            <section><span id="sb" class="b">Hi</span></section>
+            <section><span id="sbr" class="b r">Hi</span></section>
+            <section><button id="bg" class="g">Go</button> <button id="bgr" class="g r">Go</button></section>
+            <section><div id="dw" class="w r">Hi</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `p { margin: 0 } p.r { margin: revert }` is the UA 1em top margin (the p
+    /// sits 16px lower in its section than the armed twin).
+    #[test]
+    fn css_wide_revert_noninherited_p_margin() {
+        let mut e = css_wide_revert_noninherited_engine();
+        let off = |e: &mut crate::AetherEngine, p: &str, s: &str| imgalt_rect(e, p).1 - imgalt_rect(e, s).1;
+        let zero = off(&mut e, "pz", "sz");
+        let rev = off(&mut e, "pzr", "szr");
+        assert!((rev - zero - 16.0).abs() <= 1.0, "margin: revert is p's 1em: armed {zero}, reverted {rev}");
+    }
+
+    /// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `display: revert` is the tag road: the div a 400px block, the span as
+    /// narrow as its text; each armed twin differs.
+    #[test]
+    fn css_wide_revert_noninherited_display() {
+        let mut e = css_wide_revert_noninherited_engine();
+        let (_, _, dnr, _) = imgalt_rect(&mut e, "dnr");
+        assert!((dnr - 400.0).abs() <= 0.5, "div display: revert is a block: {dnr}");
+        let (_, _, sbr, _) = imgalt_rect(&mut e, "sbr");
+        let (_, _, sb, _) = imgalt_rect(&mut e, "sb");
+        assert!(sbr < 100.0 && sb > sbr, "span display: revert is inline ({sbr}), the armed block wider ({sb})");
+    }
+
+    /// AETHERCSSWIDEREVERTNONINHERITED (SR1037): `button { background: red } button.r { background: revert }` paints
+    /// ButtonFace (239, 239, 239), no red; the armed twin paints red.
+    #[test]
+    fn css_wide_revert_noninherited_button_face() {
+        let mut e = css_wide_revert_noninherited_engine();
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_red) > 20, "armed: the button paints red");
+        assert_eq!(css_wide_color_ink(&mut e, "bgr", css_wide_red), 0, "background: revert paints no red");
+        assert!(css_wide_color_ink(&mut e, "bgr", css_wide_revert_noninherited_face) > 20, "background: revert paints ButtonFace");
+    }
+
+    fn css_wide_revert_noninherited_face(c: (u8, u8, u8)) -> bool {
+        (c.0 as i32 - 239).abs() <= 2 && (c.1 as i32 - 239).abs() <= 2 && (c.2 as i32 - 239).abs() <= 2
+    }
+
+    /// AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later `margin-left: 20px` beats an earlier rule's `margin: revert`.
+    #[test]
+    fn css_wide_revert_noninherited_later_value_wins() {
+        let mut e = css_wide_revert_noninherited_engine();
+        let (ml, ..) = imgalt_rect(&mut e, "dw");
+        assert!((ml - 20.0).abs() <= 0.5, "the later margin-left: 20px wins: {ml}");
+    }
+
+    // ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): font: caption / icon / menu / message-box / small-caption / status-bar (named tail block) ----
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): under a 30px serif parent: a `font: menu` div with a child span, a
+    /// `font: italic bold 20px serif; font: status-bar` span, a plain button (the control-font reference) and a plain span
+    /// (the armed parent reference).
+    fn system_font_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font:30px serif"><span id="par">Hello</span></div>
+            <div style="font:30px serif"><div id="sys" style="font:menu">Hello <span id="kid">World</span></div></div>
+            <div style="font:30px serif"><span id="sb" style="font:italic bold 20px serif;font:status-bar">Hello</span></div>
+            <div style="font:30px serif"><button id="pbtn">Go</button></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): `font: menu` reads the plain button's used size (CONTROL_FONT_PX, 13.333px)
+    /// and its child span inherits it, not the 30px parent (armed: the parent reference reads 30px).
+    #[test]
+    fn system_font_used_size() {
+        let mut e = system_font_engine();
+        let control = font_shorthand_cs(&mut e, "pbtn", "fontSize");
+        assert!(control.starts_with("13.333"), "the control size: {control}");
+        assert_eq!(font_shorthand_cs(&mut e, "par", "fontSize"), "30px", "armed: the parent is 30px");
+        assert_eq!(font_shorthand_cs(&mut e, "sys", "fontSize"), control, "font: menu is the control size");
+        assert_eq!(font_shorthand_cs(&mut e, "kid", "fontSize"), control, "the child inherits the control size, not 30px");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontSize"), control, "font: status-bar is the same font");
+    }
+
+    /// AETHERFONTSHORTHANDSYSTEM (SR1022): the system font resets weight and style (the initial road) and takes the
+    /// control family: the family word Aether reports for a plain button.
+    #[test]
+    fn system_font_weight_style_family() {
+        let mut e = system_font_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontWeight"), "400", "bold reset");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontStyle"), "normal", "italic reset");
+        let family = font_shorthand_cs(&mut e, "pbtn", "fontFamily");
+        assert_eq!(font_shorthand_cs(&mut e, "sys", "fontFamily"), family, "the control family");
+        assert_eq!(font_shorthand_cs(&mut e, "sb", "fontFamily"), family, "the control family");
+        assert_ne!(font_shorthand_cs(&mut e, "par", "fontFamily"), family, "armed: the parent is serif");
     }
 
     // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----

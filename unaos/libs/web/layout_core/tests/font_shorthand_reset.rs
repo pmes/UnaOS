@@ -68,7 +68,7 @@ fn invalid_font_changes_nothing() {
 #[test]
 fn css_wide_keywords_and_system_fonts_unchanged() {
     // Owed (AETHER-CSS-WIDE-REVERT / AETHER-FONT-SHORTHAND-SYSTEM): pinned as today, dropped; inherit / initial / unset are SR810's.
-    for v in [/* SR1028: revert built */ "menu", "status-bar"] {
+    for v in [/* SR1028: revert built; SR1022: the six system fonts now apply (system_font_* below) */ "bogus-system"] {
         let s = styled(&[("font-style", "italic"), ("font", v)]);
         assert_eq!(s.paint.italic, Some(true), "font: {v}");
         assert_eq!(s.paint.font_size, None, "font: {v}");
@@ -642,4 +642,68 @@ fn text_decoration_color_merge() {
     assert_eq!(dst.paint.decoration_color, Some(None), "a later currentcolor wins");
     merge_paint(&mut dst.paint, &styled(&[("text-decoration", "underline blue")]).paint);
     assert_eq!(dst.paint.decoration_color, Some(Some((0, 0, 255))), "a later shorthand colour wins");
+}
+
+// ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): the six system-font keywords of font (named tail block) ----
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): css-fonts-4 §4.3.1's six system-font keywords.
+const SYSTEM_FONT_WORDS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): `font: menu` after `font: italic bold 20px serif` is the initial road plus the
+/// control family at CONTROL_FONT_PX: upright, 400, stretch 100, caps normal, line-height normal, absolute size.
+#[test]
+fn system_font_sets_the_control_font() {
+    let s = styled(&[("font", "italic bold 20px serif"), ("font", "menu")]);
+    assert_eq!(s.paint.font_size, Some(layout_core::CONTROL_FONT_PX), "the control size");
+    assert_eq!(s.paint.font_size_rel, Some((2, 0.0)), "absolute");
+    assert_eq!(s.paint.weight, Some(FontWeight::Abs(400)));
+    assert_eq!(s.paint.italic, Some(false));
+    assert_eq!(s.paint.stretch, Some(100));
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal));
+    assert_eq!(s.paint.line_height, Some(0.0), "line-height normal (the initial road)");
+    assert_eq!(s.paint.family, Some(<TH as layout_core::Host>::control_family()), "the UA control family");
+    let twin = styled(&[("font", "italic bold 20px serif")]);
+    assert_eq!((twin.paint.font_size, twin.paint.weight, twin.paint.italic), (Some(20.0), Some(FontWeight::Abs(700)), Some(true)), "armed twin");
+    assert_ne!(twin.paint.family, s.paint.family, "armed twin keeps serif");
+}
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): the six keywords are not distinguished (Chromium on Linux).
+#[test]
+fn system_font_six_words_agree() {
+    let menu = font_fields(&font_wide("menu"));
+    for w in SYSTEM_FONT_WORDS {
+        assert_eq!(font_fields(&font_wide(w)), menu, "font: {w}");
+    }
+}
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): a later longhand still wins by declaration order.
+#[test]
+fn system_font_later_longhand_wins() {
+    let s = styled(&[("font", "menu"), ("font-size", "20px")]);
+    assert_eq!(s.paint.font_size, Some(20.0));
+    assert_eq!(s.paint.family, Some(<TH as layout_core::Host>::control_family()));
+}
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): an earlier `2em` size's relative mark does not survive (font_size_rel absolute),
+/// and the font-relative replay keeps line-height normal and the control size.
+#[test]
+fn system_font_replay_keeps_control_size() {
+    let mut s = styled(&[("font-size", "2em"), ("line-height", "3"), ("padding", "1em"), ("font", "status-bar")]);
+    assert_eq!(s.paint.font_size_rel, Some((2, 0.0)), "the 2em mark is gone");
+    let list = s.paint.font_rel.clone().expect("length declarations kept");
+    assert!(list.iter().any(|(p, v)| p == "line-height" && v == "normal"), "the line-height entry was replaced: {list:?}");
+    let cx = ParseCx::default();
+    let spec: SpecifiedStyle<TH> = reapply_declarations(&list, &cx);
+    merge_paint(&mut s.paint, &spec.paint);
+    assert_eq!(s.paint.line_height, Some(0.0), "the replay does not bring line-height 3 back");
+    assert_eq!(s.paint.font_size, Some(layout_core::CONTROL_FONT_PX), "the control size");
+}
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): an unknown word is still an invalid `font` (dropped whole).
+#[test]
+fn system_font_bogus_dropped() {
+    let s = styled(&[("font-style", "italic"), ("font", "bogus-system")]);
+    assert_eq!(s.paint.italic, Some(true));
+    assert_eq!(s.paint.font_size, None);
+    assert_eq!(s.paint.family, None);
 }

@@ -90,7 +90,7 @@ pub struct SpecifiedStyle<H: Host> {
     pub flex_shrink: Option<f32>,
     pub flex_basis: Option<Dimension>,
     /// `aspect-ratio` (css-sizing-4 §5): Some(None) = `auto`, Some(Some(w / h)) = a preferred ratio.
-    pub aspect_ratio: Option<Option<f32>>,
+    pub aspect_ratio: Option<Option<f32>>, pub revert_spec: u32, // AETHERCSSWIDEREVERTNONINHERITED (SR1037): the revert erase marks of display / margin / padding / border / background (REVERT_*)
     pub paint: PaintStyle<H>,
     /// `cursor` (css-ui-4 §5.1, inherited): the keyword the cascade chose, `auto` included; read
     /// back per element by [`cursor_for`] for the hovered element (AETHERHOVER, SR67).
@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } match prop { "all" => apply_css_wide_all(value, style, cx),
+    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } if css_wide_box(prop, value, style) { return; } if apply_revert_spec(prop, value, style, cx) { return; } match prop { "all" => apply_css_wide_all(value, style, cx),
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -2734,7 +2734,7 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    for i in 0..4 {
+    erase_reverted(dst, src.revert_spec); dst.revert_spec |= src.revert_spec; for i in 0..4 { // AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later revert erases the earlier rule's field before the Some-copy
         if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
         if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
     }
@@ -3631,7 +3631,7 @@ fn reset_font_shorthand_rest<H: Host>(size: &str, style: &mut SpecifiedStyle<H>,
 /// line-height back) then None, font-family None; the size takes the parent-relative road `smaller` / `larger` use
 /// (font_size None, font_size_rel (0, 1.0)), because a None size is the tag's code default (13.333 px on a control),
 /// not the parent's. `initial` is SR805's reset ([`reset_font_prefix`], [`reset_font_shorthand_rest`] at `medium`)
-/// plus the standard family. `revert` (SR1028) reverts the seven fields to their tag roads; the system fonts are dropped.
+/// plus the standard family. `revert` (SR1028) reverts the seven fields to their tag roads; the six system fonts are SR1022's.
 /// AETHERCSSWIDELONGHANDS (SR815): inherit / unset write the seven explicit inherit bits (`PaintStyle::set_inherit`).
 fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
     match kw {
@@ -3644,7 +3644,8 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
             reset_font_shorthand_rest("medium", style, cx);
             style.paint.family = Some(crate::STANDARD);
         }
-        "revert" => { apply_declaration("line-height", "revert", style, cx); style.paint.set_revert(crate::paint::INHERIT_FONT); } _ => {} // SR1028: revert -> each font field's tag road; the six system fonts: dropped (AETHER-FONT-SHORTHAND-SYSTEM owed)
+        "revert" => { apply_declaration("line-height", "revert", style, cx); style.paint.set_revert(crate::paint::INHERIT_FONT); } w if SYSTEM_FONTS.contains(&w) => { apply_font_wide("initial", style, cx); apply_declaration("font-size", &format!("{}px", crate::CONTROL_FONT_PX), style, cx); style.paint.family = Some(H::control_family()); } // SR1022
+        _ => {} // SR1028: revert -> each font field's tag road; the six system fonts: dropped (AETHER-FONT-SHORTHAND-SYSTEM owed)
     }
 }
 
@@ -4090,6 +4091,106 @@ fn apply_css_wide_all<H: Host>(value: &str, style: &mut SpecifiedStyle<H>, cx: &
         _ => H::record_css(&format!("all-value:{}", clip(value))),
     }
 }
+
+// ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the `revert_spec` bit of `display` (its five fields: display, flex_container
+/// and paint's flex_container / display_kind / list_item).
+pub const REVERT_DISPLAY: u32 = 1;
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the four margin sides, side i = `2 << i` ([top, right, bottom, left]).
+pub const REVERT_MARGIN: u32 = 0b1111 << 1;
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the four padding sides, side i = `32 << i`.
+pub const REVERT_PADDING: u32 = 0b1111 << 5;
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the four border sides, side i = `512 << i`; all four erase the whole border.
+pub const REVERT_BORDER: u32 = 0b1111 << 9;
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): the background colour (background, bg_alpha, CC_BG).
+pub const REVERT_BACKGROUND: u32 = 1 << 13;
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): css-cascade-4 §7.3.2 `revert` on the five non-inherited families whose UA
+/// value is a per-tag table applied where the field is None at fold time (tree.rs `ua_margin`, the td / ul padding, the
+/// display tag road `is_inline_node`, the hr / control border, `BUTTON_FACE`): the field is erased here (aether folds
+/// every declaration into ONE style) and its bit set in `revert_spec`, which `merge_specified` reads to erase the earlier
+/// rule's value before its Some-copy (SR1028's `set_revert` shape). The four background layer longhands have no per-tag
+/// table, so revert == initial there. Border width / colour revert is dropped (AETHER-CSS-WIDE-REVERT-BORDER-PARTS owed).
+fn apply_revert_spec<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) -> bool {
+    if !value.eq_ignore_ascii_case("revert") {
+        return false;
+    }
+    let side = |group: u32, p: &str| (group & group.wrapping_neg()) << side_index(p);
+    let bits = match prop {
+        "display" => REVERT_DISPLAY,
+        "margin" => REVERT_MARGIN,
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => side(REVERT_MARGIN, prop),
+        "padding" => REVERT_PADDING,
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => side(REVERT_PADDING, prop),
+        "border" | "border-style" => REVERT_BORDER,
+        "border-top" | "border-right" | "border-bottom" | "border-left" => side(REVERT_BORDER, prop),
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => side(REVERT_BORDER, prop.trim_end_matches("-style")),
+        "background-color" => REVERT_BACKGROUND,
+        "background" => {
+            apply_declaration("background", "initial", style, cx);
+            REVERT_BACKGROUND
+        }
+        "background-image" | "background-size" | "background-position" | "background-repeat" => {
+            apply_declaration(prop, "initial", style, cx);
+            return true;
+        }
+        _ => return false,
+    };
+    erase_reverted(style, bits);
+    style.revert_spec |= bits;
+    true
+}
+
+/// AETHERCSSWIDEREVERTNONINHERITED (SR1037): erases the fields of `bits` to None (the tag road). One border side None is
+/// style none (every non-control tag's UA value); all four sides erase the whole border, so a control gets its UA frame.
+pub fn erase_reverted<H: Host>(s: &mut SpecifiedStyle<H>, bits: u32) {
+    if bits == 0 {
+        return;
+    }
+    if bits & REVERT_DISPLAY != 0 {
+        s.display = None;
+        s.flex_container = None;
+        s.paint.flex_container = None;
+        s.paint.display_kind = None;
+        s.paint.list_item = None;
+    }
+    for i in 0..4 {
+        if bits & (2 << i) != 0 {
+            s.margin[i] = None;
+        }
+        if bits & (32 << i) != 0 {
+            s.padding[i] = None;
+        }
+        if bits & (512 << i) != 0 {
+            if let Some(b) = s.paint.border.as_mut() {
+                b[i] = None;
+            }
+            if let Some(w) = s.paint.border_width.as_mut() {
+                w[i] = None;
+            }
+            s.paint.currentcolor &= !(1u8 << i);
+        }
+    }
+    if bits & REVERT_BORDER == REVERT_BORDER {
+        s.paint.border = None;
+        s.paint.border_width = None;
+        s.paint.border_style = None;
+        s.paint.border_alpha = None;
+    }
+    if bits & REVERT_BACKGROUND != 0 {
+        s.paint.background = None;
+        s.paint.bg_alpha = None;
+        s.paint.currentcolor &= !crate::paint::CC_BG;
+    }
+}
+
+// ---- AETHERFONTSHORTHANDSYSTEM (LEDGER SR1022): css-fonts-4 §4.3.1 the six system-font keywords of `font` (named tail block) ----
+
+/// AETHERFONTSHORTHANDSYSTEM (SR1022): the `font` shorthand's system-font keywords. Chromium resolves all six to the same
+/// UI font (13.333px, normal weight and style); [`apply_font_wide`] gives them the `initial` road, then the control
+/// family (`Host::control_family`, the UA control font) at [`crate::CONTROL_FONT_PX`] through the `font-size` arm.
+const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
 
 // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
 
