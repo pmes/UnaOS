@@ -12631,4 +12631,110 @@ b</div>
         let mut big = scroll_into_view_sticky_engine("scroll-padding-top: 400px", "");
         assert_eq!(scroll_into_view_sticky_go(&mut big, "t", "{block: 'center'}"), 700.0, "an oversized padding clamps the view length at 0");
     }
+
+    // ---- AETHERCSSOMSCROLLINTOVIEWNESTED (LEDGER SR1175): scrollIntoView runs inner to outer, each step seeing the previous one's landing (named tail block) ----
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): 400x300, a 1000px spacer, then `inner` (a page fragment holding the panel),
+    /// `#q` 50px and a 2000px spacer. The panel `#p` is 200px tall, `overflow: auto` (+ `panel` declarations), holding 40
+    /// rows `#r0`..`#r39` of 50px; with `snap_every` > 0 every such row carries `scroll-snap-align: start`.
+    fn scroll_into_view_nested_engine(wrap: (&str, &str), panel: &str, snap_every: usize) -> crate::AetherEngine {
+        let rows: String = (0..40)
+            .map(|i| {
+                let snap = if snap_every > 0 && i % snap_every == 0 { ";scroll-snap-align:start" } else { "" };
+                format!(r#"<div id="r{i}" style="height:50px{snap}"></div>"#)
+            })
+            .collect();
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0">
+            <div style="height:1000px"></div>
+            {}<div id="p" style="height:200px;overflow:auto;{panel}">{rows}</div>{}
+            <div id="q" style="height:50px"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#,
+            wrap.0, wrap.1
+        );
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): runs `el.scrollIntoView(arg)` on `#id` and returns the scrollY it wrote; then
+    /// hands that page offset to the engine (a script's page scroll is a JS mirror the next tick overwrites with the
+    /// engine's `scroll_y`: AETHER-WINDOW-SCROLL-APPLY, owed) and ticks once, so the queued panel scrolls land.
+    fn scroll_into_view_nested_go(e: &mut crate::AetherEngine, id: &str, arg: &str) -> f64 {
+        let sy = js_num(e, &format!("document.getElementById('{id}').scrollIntoView({arg}); scrollY"));
+        e.scroll_y = sy;
+        e.tick();
+        sy
+    }
+
+    fn scroll_into_view_nested_top(e: &mut crate::AetherEngine, id: &str) -> f64 {
+        js_num(e, &format!("document.getElementById('{id}').scrollTop"))
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): `#r30` (content y 1500 in `#p` at page y 1000): the panel lands at 1500
+    /// and the page at 1000, `#r30` at the viewport's top (armed: scrollY 2500 before SR1175, the row's place before the
+    /// panel moved).
+    #[test]
+    fn scroll_into_view_nested_block_start() {
+        let mut e = scroll_into_view_nested_engine(("", ""), "", 0);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "r30", ""), 1000.0, "page step after the panel's landing (armed: 2500 before SR1175)");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 1500.0, "the panel at the row's block start");
+        assert_eq!(imgalt_rect(&mut e, "r30").1, 0.0, "#r30 at the viewport's top");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): `{block: 'end'}`: the panel lands at 1550 - 200 = 1350 and the page puts the
+    /// row's bottom (page 1200 after the panel) at the viewport's bottom: 900 (armed: 2250 before SR1175).
+    #[test]
+    fn scroll_into_view_nested_block_end() {
+        let mut e = scroll_into_view_nested_engine(("", ""), "", 0);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "r30", "{block: 'end'}"), 900.0, "block end (armed: 2250 before SR1175)");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 1350.0, "the panel at the row's block end");
+        assert_eq!(imgalt_rect(&mut e, "r30").1, 250.0, "#r30's bottom at the viewport's bottom");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): the last row asks the panel for 1950 but its range ends at 1800: the page
+    /// step takes the CLAMPED delta, 1150 (armed: 2950 before SR1175; 1000 with the unclamped delta).
+    #[test]
+    fn scroll_into_view_nested_last_row_clamped() {
+        let mut e = scroll_into_view_nested_engine(("", ""), "", 0);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "r39", ""), 1150.0, "the clamped panel delta (armed: 2950 before SR1175)");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 1800.0, "the panel at the end of its range");
+        assert_eq!(imgalt_rect(&mut e, "r39").1, 0.0, "#r39 at the viewport's top");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): a `scroll-snap-type: y mandatory` panel with snap areas on every 4th row:
+    /// `#r31` asks for 1550, the panel snaps to 1600 (`scroll_target`, the call `scroll_frame` lands it with) and the page
+    /// step takes the SNAPPED delta: 950 (1000 with the unsnapped delta; armed: 2550 before SR1175).
+    #[test]
+    fn scroll_into_view_nested_snapped_delta() {
+        let mut e = scroll_into_view_nested_engine(("", ""), "scroll-snap-type: y mandatory", 4);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "r31", ""), 950.0, "the snapped panel delta (armed: 2550 before SR1175)");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 1600.0, "the panel on the nearest snap position");
+        assert_eq!(imgalt_rect(&mut e, "r31").1, 0.0, "#r31 at the viewport's top");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): `#p` inside a 300px panel `#o` (1000px above it, 1000px below): inner lands
+    /// 1500, the outer sees the row after that landing and lands 1000 (armed: asked 2500, clamped to 1900), the page 1000
+    /// (armed: 3500 before SR1175); the row at the viewport's top.
+    #[test]
+    fn scroll_into_view_nested_panel_in_panel() {
+        let mut e = scroll_into_view_nested_engine((r#"<div id="o" style="height:300px;overflow:auto"><div style="height:1000px"></div>"#, r#"<div style="height:1000px"></div></div>"#), "", 0);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "r30", ""), 1000.0, "the deltas accumulate outward (armed: 3500 before SR1175)");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 1500.0, "the inner panel");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "o"), 1000.0, "the outer panel after the inner landing (armed: 1900 before SR1175)");
+        assert_eq!(imgalt_rect(&mut e, "r30").1, 0.0, "#r30 at the viewport's top");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): a target inside no panel (`#q`, page y 1200) is unchanged (pin), and leaves
+    /// the panel unscrolled.
+    #[test]
+    fn scroll_into_view_nested_outside_panel_unchanged() {
+        let mut e = scroll_into_view_nested_engine(("", ""), "", 0);
+        assert_eq!(scroll_into_view_nested_go(&mut e, "q", ""), 1200.0, "#q at its place");
+        assert_eq!(scroll_into_view_nested_top(&mut e, "p"), 0.0, "the panel untouched");
+        assert_eq!(imgalt_rect(&mut e, "q").1, 0.0, "#q at the viewport's top");
+    }
 }

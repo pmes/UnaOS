@@ -1696,7 +1696,7 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         _ => crate::layout::ScrollBehavior::Auto,
     };
     // Scroll-container ancestors, innermost first.
-    let mut cur = with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0));
+    let mut cur = with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0)); let (mut dx, mut dy) = (0.0_f64, 0.0_f64); // AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): the running shift every inner scroller WILL apply
     while let Some(c) = cur {
         let is_root = with_doc(|d| d.parent(NodeId(c)).is_some_and(|p| p.0 == dom::main_doc()));
         let is_body = with_doc(|d| dom::is_html_tag(d, c, "body"));
@@ -1711,13 +1711,13 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
                 if let Some((_, _, cw, ch)) = first {
                     let (sx, sy) = crate::layout::element_scroll_offset(NodeId(c));
                     // The element's position in the container's scrolled content.
-                    let ex = x - cx - bl as f64 + sx as f64;
-                    let ey = y - cy - bt as f64 + sy as f64;
+                    let ex = x - dx - cx - bl as f64 + sx as f64; // AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): seen after the inner scrollers' landing
+                    let ey = y - dy - cy - bt as f64 + sy as f64; // AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): seen after the inner scrollers' landing
                     let tx = align_axis(&inline, ex, w, sx as f64 + cp[3], ((cw - 2.0 * bl) as f64 - cp[3] - cp[1]).max(0.0)) - cp[3];
                     let ty = align_axis(&block, ey, h, sy as f64 + cp[0], ((ch - 2.0 * bt) as f64 - cp[0] - cp[2]).max(0.0)) - cp[0];
                     let nx = scrolls(&ox).then_some(tx.max(0.0) as f32);
                     let ny = scrolls(&oy).then_some(ty.max(0.0) as f32);
-                    crate::layout::request_element_scroll(NodeId(c), nx, ny, sb);
+                    crate::layout::request_element_scroll(NodeId(c), nx, ny, sb); let (ddx, ddy) = into_view_shift(c, (sx, sy), (nx, ny)); dx += ddx; dy += ddy; // AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): this panel's clamped, snapped delta, accumulated outward
                 }
             }
         }
@@ -1727,8 +1727,8 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let (sx, sy) = page(|p| p.scroll);
     let (vw, vh) = page(|p| p.viewport);
     let (dw, dh) = document_extent();
-    let vp = with_doc(|d| d.element_children(NodeId(dom::main_doc())).next().map(|r| r.0)).map_or([0.0; 4], |r| into_view_box(r).2); let tx = (align_axis(&inline, x + sx, w, sx + vp[3], (vw as f64 - vp[3] - vp[1]).max(0.0)) - vp[3]).clamp(0.0, (dw - vw as f64).max(0.0)); // AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): the root's scroll-padding is the viewport's
-    let ty = (align_axis(&block, y + sy, h, sy + vp[0], (vh as f64 - vp[0] - vp[2]).max(0.0)) - vp[0]).clamp(0.0, (dh - vh as f64).max(0.0));
+    let vp = with_doc(|d| d.element_children(NodeId(dom::main_doc())).next().map(|r| r.0)).map_or([0.0; 4], |r| into_view_box(r).2); let tx = (align_axis(&inline, x - dx + sx, w, sx + vp[3], (vw as f64 - vp[3] - vp[1]).max(0.0)) - vp[3]).clamp(0.0, (dw - vw as f64).max(0.0)); // AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): the root's scroll-padding is the viewport's
+    let ty = (align_axis(&block, y - dy + sy, h, sy + vp[0], (vh as f64 - vp[0] - vp[2]).max(0.0)) - vp[0]).clamp(0.0, (dh - vh as f64).max(0.0)); // AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): the element where the panels leave it
     page(|p| p.scroll = (tx, ty));
     Ok(Value::Undefined)
 }
@@ -3487,4 +3487,20 @@ fn into_view_box(el: usize) -> ((f64, f64, f64, f64), [f64; 4], [f64; 4]) {
         let px = |a: Option<[f32; 4]>| a.map_or([0.0; 4], |a| a.map(|v| v as f64));
         ((x - hx as f64, y - hy as f64, w, h), px(p.and_then(|p| p.scroll_margin)), px(p.and_then(|p| p.scroll_padding)))
     })
+}
+
+// ---- AETHERCSSOMSCROLLINTOVIEWNESTED (LEDGER SR1175): scrollIntoView runs inner to outer, each step seeing the previous one's landing (named tail block) ----
+
+/// AETHERCSSOMSCROLLINTOVIEWNESTED (SR1175): cssom-view "scroll an element into view" runs inner to outer with each step
+/// seeing the result of the previous: the delta scroll container `c` WILL apply (from `cur`, its offset now) when its
+/// queued request `want` lands in `layout::scroll_frame` — `layout_core::scroll::scroll_target`'s answer on the flushed
+/// tree, the same clamp to the scroll range and snap `scroll_frame` applies — so every outer scroller and the page align
+/// the element where the panel will leave it. (0, 0) for a box the flushed tree lacks or an axis left alone.
+fn into_view_shift(c: usize, cur: (f32, f32), want: (Option<f32>, Option<f32>)) -> (f64, f64) {
+    let to = with_layout(|f| {
+        let tid = f.tree.node_map.iter().find(|(_, n)| n.id() == NodeId(c)).map(|(t, _)| *t)?;
+        Some(layout_core::scroll::scroll_target(&f.tree, tid, want.0.unwrap_or(cur.0), want.1.unwrap_or(cur.1)))
+    });
+    let d = |w: Option<f32>, t: f32, o: f32| if w.is_some() { (t - o) as f64 } else { 0.0 };
+    to.map_or((0.0, 0.0), |(tx, ty)| (d(want.0, tx, cur.0), d(want.1, ty, cur.1)))
 }
