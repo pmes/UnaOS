@@ -1841,7 +1841,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             if matches!(value.trim(), "none" | "hidden") {
                 style.paint.border = Some([None; 4]);
             } else if let Some(r) = parse_sides(value, border_style_code) {
-                style.paint.border_style = Some([r.top, r.right, r.bottom, r.left]);
+                style.paint.border_style = Some([r.top, r.right, r.bottom, r.left]); border_pending_create(&mut style.paint, crate::paint::CC_SIDES);
             }
         }
         "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
@@ -1849,7 +1849,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             if let Some(k) = border_style_code(value) {
                 let mut bs = style.paint.border_style.unwrap_or([0; 4]);
                 bs[side] = k;
-                style.paint.border_style = Some(bs);
+                style.paint.border_style = Some(bs); border_pending_create(&mut style.paint, 1 << side);
             } else if matches!(value, "none" | "hidden") {
                 let mut sides = style.paint.border.unwrap_or_default();
                 sides[side] = None;
@@ -1867,9 +1867,9 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
             if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
                 style.paint.border_alpha = Some(color_alpha::<H>(value));
-                let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
+                let Some(mut sides) = border_color_pend(&mut style.paint, c) else { return };
                 for side in sides.iter_mut() {
-                    let w = side.map(|(w, _)| w).unwrap_or(1.0);
+                    let Some((w, _)) = *side else { continue };
                     *side = Some((w, c));
                 }
                 style.paint.border = Some(sides);
@@ -1877,7 +1877,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "border-width" => {
             if let Some(w) = parse_px(value, cx) { width_cc(&mut style.paint);
-                let mut sides = style.paint.border.unwrap_or([Some((1.0, (128, 128, 128))); 4]);
+                let mut sides = border_create_sides(&mut style.paint, crate::paint::CC_SIDES, true);
                 for side in sides.iter_mut() {
                     let c = side.map(|(_, c)| c).unwrap_or((128, 128, 128));
                     *side = Some((w, c));
@@ -2546,7 +2546,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     macro_rules! clone {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
-    copy!(
+    merge_border_pending(dst, src); copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
@@ -3816,7 +3816,7 @@ fn border_transparent<H: Host>(v: &str) -> bool {
 /// stored: AETHER-CSS-BORDER-COLOR-STORED owed). The colour goes through `border_color_of` unchanged; only this side's
 /// currentcolor bit keeps its answer, the other three are put back. `transparent` drops the side, as `border-color` does.
 fn side_color_of<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
-    let Some(mut sides) = paint.border.filter(|b| b[side].is_some()) else { return };
+    let Some(mut sides) = paint.border.filter(|b| b[side].is_some()) else { return side_color_pend::<H>(side, value, paint) };
     if border_transparent::<H>(value) {
         sides[side] = None;
         paint.border = Some(sides);
@@ -3962,7 +3962,7 @@ impl<H: Host> SpecifiedStyle<H> {
         if bits & INHERIT_BOX_HEIGHT != 0 { self.height = None; }
         if bits & INHERIT_BOX_POSITION != 0 { (self.position, self.paint.position_kind) = (None, None); }
         if bits & INHERIT_BOX_BORDER != 0 {
-            (self.paint.border, self.paint.border_width, self.paint.border_style, self.paint.border_alpha) = (None, None, None, None);
+            (self.paint.border, self.paint.border_width, self.paint.border_style, self.paint.border_alpha) = (None, None, None, None); self.paint.border_pending = None;
         }
         if bits & INHERIT_BOX_BACKGROUND_COLOR != 0 { (self.paint.background, self.paint.bg_alpha) = (None, None); }
         self.inherit_box |= bits;
@@ -4802,4 +4802,119 @@ fn text_align_last_code<H: Host>(value: &str) -> Option<u8> {
             None
         }
     }
+}
+
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the ONE side-creating helper over `PaintStyle::border_pending`. Each side in
+/// `mask` with no entry takes its pending colour (width 1.0, the width the fabricated frame had; `border_width` still
+/// overrides at paint) and the pending entry's currentcolor bit; with `grey`, a side with no pending colour takes the
+/// grey carrier and the bit (the initial currentcolor: `border-width`'s road before SR1058). Sides with an entry stay.
+fn border_create_sides<H: Host>(paint: &mut PaintStyle<H>, mask: u8, grey: bool) -> [Option<(f32, (u8, u8, u8))>; 4] {
+    let mut sides = paint.border.unwrap_or([None; 4]);
+    let pend = paint.border_pending.unwrap_or([None; 4]);
+    for i in 0..4 {
+        let bit = 1u8 << i;
+        if mask & bit == 0 || sides[i].is_some() {
+            continue;
+        }
+        match pend[i] {
+            Some((c, cc)) => {
+                sides[i] = Some((1.0, c));
+                if cc { paint.currentcolor |= bit } else { paint.currentcolor &= !bit }
+            }
+            None if grey => {
+                sides[i] = Some((1.0, (128, 128, 128)));
+                paint.currentcolor |= bit;
+            }
+            None => {}
+        }
+    }
+    sides
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-style` / `border-*-style` with a style: the sides in `mask` that have a
+/// pending colour and no entry are created from it (`border-color: red; border-style: solid` keeps its frame). With no
+/// pending colour in `mask` nothing is written, so a style-only block never writes a `border` that would replace an
+/// earlier rule's sides at the merge (a lone style creating a medium side: AETHER-CSS-BORDER-SIDE-STYLE-WIDTH owed).
+fn border_pending_create<H: Host>(paint: &mut PaintStyle<H>, mask: u8) {
+    let pend = paint.border_pending.unwrap_or([None; 4]);
+    let absent = |i: usize| paint.border.map_or(true, |b| b[i].is_none());
+    if (0..4).any(|i| mask & (1 << i) != 0 && pend[i].is_some() && absent(i)) {
+        paint.border = Some(border_create_sides(paint, mask, false));
+    }
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the `border-color` arm's colour `c` (from `border_color_of`, which set or
+/// cleared all four currentcolor bits) is pended for all four sides; the answer is the sides the arm recolours: this
+/// block's entries, created first for the absent sides when the block declared a style (`border-style: solid;
+/// border-color: red`), else as they are (an absent side stays absent: css-backgrounds-3 §3.2 style none paints
+/// nothing). None (no border in this block, no style) = the arm writes nothing: the colour waits in the store, and
+/// `merge_border_pending` lays it on an earlier rule's sides.
+fn border_color_pend<H: Host>(paint: &mut PaintStyle<H>, c: (u8, u8, u8)) -> Option<[Option<(f32, (u8, u8, u8))>; 4]> {
+    let cc = paint.currentcolor & 1 != 0;
+    paint.border_pending = Some([Some((c, cc)); 4]);
+    if paint.border_style.is_some() {
+        return Some(border_create_sides(paint, crate::paint::CC_SIDES, false));
+    }
+    paint.border
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `side_color_of`'s side with no entry: the colour is pended for that side (its
+/// currentcolor answer in the entry, the four live bits put back as they were), not dropped. `transparent` forgets the
+/// side's pending entry (AETHER-CSS-BORDER-PENDING-TRANSPARENT owed); an invalid value is recorded as before.
+fn side_color_pend<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
+    if border_transparent::<H>(value) {
+        if let Some(p) = paint.border_pending.as_mut() {
+            p[side] = None;
+        }
+        return;
+    }
+    let before = paint.currentcolor;
+    let Some(c) = border_color_of::<H>(paint, value) else {
+        if !is_neutral_keyword(value) {
+            H::record_css(&format!("border-side-color-value:{}", clip(value)));
+        }
+        return;
+    };
+    let cc = paint.currentcolor & (1 << side) != 0;
+    paint.currentcolor = before;
+    paint.border_alpha = Some(color_alpha::<H>(value));
+    let mut p = paint.border_pending.unwrap_or([None; 4]);
+    p[side] = Some((c, cc));
+    paint.border_pending = Some(p);
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `merge_paint`'s token, BEFORE the whole-array `border` copy: a later block's
+/// pending colours recolour `dst`'s earlier sides (width kept, the side's currentcolor bit from the entry), so
+/// `.a { border: 3px solid blue } .a:hover { border-color: red }` paints 3px red and `.a:hover { border-top-color: red }`
+/// reaches the top; when `dst` has no border at all but a declared style, the pending sides are created at 1px (the
+/// in-block `border_color_pend` rule across rules). The entries then carry later-wins per side; a later block's own
+/// `border` replaces whatever was recoloured (the copy that follows), so chained merges agree.
+fn merge_border_pending<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    let Some(p) = src.border_pending else { return };
+    let create = dst.border.is_none() && dst.border_style.is_some() && p.iter().any(|e| e.is_some());
+    if create {
+        dst.border = Some([None; 4]);
+    }
+    if let Some(sides) = dst.border.as_mut() {
+        for i in 0..4 {
+            let Some((c, cc)) = p[i] else { continue };
+            match sides[i] {
+                Some((w, _)) => sides[i] = Some((w, c)),
+                None if create => sides[i] = Some((1.0, c)),
+                None => continue,
+            }
+            let bit = 1u8 << i;
+            if cc { dst.currentcolor |= bit } else { dst.currentcolor &= !bit }
+        }
+    }
+    let mut dp = dst.border_pending.unwrap_or([None; 4]);
+    for i in 0..4 {
+        if p[i].is_some() {
+            dp[i] = p[i];
+        }
+    }
+    dst.border_pending = Some(dp);
 }
