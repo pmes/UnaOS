@@ -113,7 +113,7 @@ impl core::fmt::Display for ScheduleError {
 }
 
 /// The winner at tick `t` for `kind`: (track index, clip index).
-fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
+pub(crate) fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
     tl.tracks.iter().enumerate().rev().filter(|(_, tr)| tr.kind == kind).find_map(|(i, _)| tl.clip_at(i, t).map(|c| (i, c)))
 }
 

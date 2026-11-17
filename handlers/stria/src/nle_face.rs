@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    crop_drag: Option<view::CropDrag>, // STRIACROPMORE (SR960): the live crop drag on the preview picture (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, crop_drag: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -386,6 +387,14 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("Alt+l", "crop-l+"), // STRIACROPMORE (SR960): Alt+side crops a side in, Alt+Shift+SIDE out (SR900's step words; GTK names, no Meta twin)
+    ("Alt+Shift+L", "crop-l-"),
+    ("Alt+t", "crop-t+"),
+    ("Alt+Shift+T", "crop-t-"),
+    ("Alt+r", "crop-r+"),
+    ("Alt+Shift+R", "crop-r-"),
+    ("Alt+b", "crop-b+"),
+    ("Alt+Shift+B", "crop-b-"),
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -495,7 +504,7 @@ impl Face {
         }
         let Some(&(_, act)) = KEYS.iter().find(|(name, _)| *name == k) else { return false };
         if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
-        if VERBS.contains(&act) || slipslide_word(act).is_some() { // NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
+        if VERBS.contains(&act) || slipslide_word(act).is_some() || act.starts_with("crop-") { // STRIACROPMORE (SR960): the crop chords' SR900 step words; NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
         let r = match act {
@@ -1588,7 +1597,7 @@ impl Face {
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
-        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
+        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state)).or_else(|| self.crop_drag.as_ref().and_then(|d| d.shown(&self.state))); // STRIACROPMORE (SR960): a live crop drag shows its clip uncropped (timeline_core view.rs tail)
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
@@ -1600,7 +1609,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(view::paint_crop_drag(paint_in(st, l, self.order, self.labels.as_ref(), still), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -2602,6 +2611,14 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("crop-l+", "crop the left side in"), // STRIACROPMORE (SR960): the crop chords' words
+    ("crop-l-", "uncrop the left side"),
+    ("crop-t+", "crop the top in"),
+    ("crop-t-", "uncrop the top"),
+    ("crop-r+", "crop the right side in"),
+    ("crop-r-", "uncrop the right side"),
+    ("crop-b+", "crop the bottom in"),
+    ("crop-b-", "uncrop the bottom"),
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3095,5 +3112,74 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIACROPMORE (LEDGER SR960): the crop drag on the preview picture and its routing (named tail block) ----
+// NLE-CROP-DRAG on the face: `Face::on`'s first line hands every message here first. A press on the preview picture's edge
+// (the split face's preview Surface, or an unsplit face's preview band through `takes`) begins timeline_core's
+// `view::CropDrag` over the layout the face paints that band with (`layout_for(..).with_message(..)`) and the preview still's
+// size (`self.still`, else ONE `preview` call: THE frame road); while live, that Surface's moves update it, its release
+// commits ONCE (`CropDrag::finish`: `EditorState::crop_set`; a refusal on the message row as `crop-drag: <e>`), Escape drops
+// it; the one-Surface face keeps its `pointer` through them as `press` / `release` do. Anything else (no drag, a press off
+// the edge, the help shown) returns `None`: the old road, unchanged. At the fold this call follows SR962's meter click on
+// the same `Face::on` line (both ahead of `takes` for the preview Surface).
+// NLE-CROP-KEYS: `Alt+l` / `Alt+Shift+L` (t, r, b) are KEYS rows onto SR900's `crop-<side>±` words through `Face::key`'s
+// one `Face::verb` road (GTK names; AppKit forwards no Option chord: NLE-CROP-KEYS-MAC owed).
+
+impl Face {
+    /// STRIACROPMORE (SR960): the live crop drag on the preview picture.
+    pub fn crop_dragging(&self) -> Option<&view::CropDrag> {
+        self.crop_drag.as_ref()
+    }
+    /// The role of the preview picture a message belongs to: split, the preview Surface's `Preview`; unsplit, `Whole` for a
+    /// message this face takes; `None` otherwise.
+    fn crop_drag_surface(&self, msg: &SMessage) -> Option<Role> {
+        match self.split {
+            Some(s) => (msg.surface() == Some(s.preview) && s.preview != s.tracks).then_some(Role::Preview),
+            None => self.takes(msg).then_some(Role::Whole),
+        }
+    }
+    /// The crop drag's messages (`Some(repaint)`); `None` hands the message on to [`Face::on`]'s road.
+    fn crop_drag_on(&mut self, msg: &SMessage) -> Option<bool> {
+        if self.crop_drag.is_some() {
+            return match msg {
+                SMessage::BrowserMouseMove(x, y, _) if self.crop_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let d = self.crop_drag.as_mut()?;
+                    let before = d.crop();
+                    d.update(*x, *y);
+                    Some(d.crop() != before)
+                }
+                SMessage::BrowserButton { down: false, x, y, .. } if self.crop_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let mut d = self.crop_drag.take()?;
+                    d.update(*x, *y);
+                    if let Err(e) = d.finish(&mut self.state) {
+                        self.last_error = Some(format!("crop-drag: {e}"));
+                    }
+                    Some(true)
+                }
+                SMessage::BrowserKey(k) if k == "Escape" => {
+                    self.crop_drag = None;
+                    Some(true)
+                }
+                _ => None,
+            };
+        }
+        let SMessage::BrowserButton { down: true, x, y, .. } = *msg else { return None };
+        if self.help {
+            return None;
+        }
+        let role = self.crop_drag_surface(msg)?;
+        let l = self.layout_for(role).with_message(self.labels.is_some());
+        if self.still.is_none() {
+            self.still = preview(&self.state.timeline, &self.sources, self.state.playhead).ok().flatten();
+        }
+        let (sw, sh) = self.still.as_ref().map(|s| (s.width, s.height))?;
+        self.crop_drag = Some(view::CropDrag::begin(&self.state, l, sw, sh, x, y)?);
+        self.buttons = true;
+        if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
+        Some(true)
     }
 }

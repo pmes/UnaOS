@@ -3730,3 +3730,119 @@ fn striacropface_face_words() {
     assert_eq!(face.state.undo_depth(), 4);
     println!("striacropface: crop-l+ crop-r+ -> {s}/0/{s}/0 badge painted; crop clears; crop-l+ past the frame refused");
 }
+
+// ---- STRIACROPMORE (LEDGER SR960): the crop chords and the crop drag on the preview picture (named tail block) ----
+
+/// The synth fixture's face (320 x 160, labels off: the preview band 0..64), V1's first clip selected at playhead 0, painted
+/// once; the preview picture's rect (the still letterboxed into the band) as `(x, y, w, h)` and its vertical middle.
+fn striacropmore_face() -> (Face, (f64, f64, f64, f64), f64) {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 0).unwrap();
+    let _ = face.paint();
+    let s = face.still().expect("a preview still").clone();
+    let l = face.layout();
+    let q = SizePolicy::Letterbox.place(s.width as usize, s.height as usize, l.w as usize, l.preview_h as usize).dst;
+    let ym = (q.y + q.h / 2) as f64;
+    (face, (q.x as f64, q.y as f64, q.w as f64, q.h as f64), ym)
+}
+
+/// STRIACROPMORE (SR960): a press on the preview picture's left edge begins a crop drag (no timeline drag); a move of a
+/// tenth of the picture is l = 100 while live (nothing committed, the dragged rect painted in CROP_BADGE); the release
+/// commits ONCE and undo clears it.
+#[test]
+fn striacropmore_drag_left_edge_commits_once() {
+    let (mut face, (qx, _, qw, _), ym) = striacropmore_face();
+    let cropless = face.paint();
+    let btn = |down: bool, x: f64, y: f64| bandy::SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 };
+    assert!(face.on(&btn(true, qx, ym)));
+    assert!(face.dragging().is_none());
+    assert_eq!(face.crop_dragging().map(|d| d.sides), Some(1));
+    let dx = qw / 10.0;
+    assert!(face.on(&bandy::SMessage::BrowserMouseMove(qx + dx, ym, 0)));
+    assert_eq!(face.crop_dragging().map(|d| d.crop().l), Some(100));
+    let live = face.paint();
+    assert_ne!(live, cropless);
+    assert!(live.as_chunks::<4>().0.contains(&timeline_core::view::CROP_BADGE), "the dragged rect");
+    assert_eq!(face.state.undo_depth(), 0, "nothing committed while live");
+    assert!(face.on(&btn(false, qx + dx, ym)));
+    face.on(&bandy::SMessage::BrowserClick(qx + dx, ym, 0));
+    assert!(face.crop_dragging().is_none());
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 100, t: 0, r: 0, b: 0 }));
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop::NONE));
+    println!("striacropmore: left edge dragged {dx} px -> l=100, one commit, undo clears");
+}
+
+/// A press in the middle of the picture is no crop drag (the old road: nothing); Escape drops a live crop drag uncommitted.
+#[test]
+fn striacropmore_press_off_the_edge_and_escape() {
+    let (mut face, (qx, _, qw, _), ym) = striacropmore_face();
+    let btn = |down: bool, x: f64, y: f64| bandy::SMessage::BrowserButton { down, x, y, mods: 0, surface: 0 };
+    assert!(!face.on(&btn(true, qx + qw / 2.0, ym)));
+    assert!(face.crop_dragging().is_none());
+    face.on(&btn(false, qx + qw / 2.0, ym));
+    assert!(face.on(&btn(true, qx + qw - 1.0, ym)));
+    assert_eq!(face.crop_dragging().map(|d| d.sides), Some(4));
+    assert!(face.on(&bandy::SMessage::BrowserMouseMove(qx + qw / 2.0, ym, 0)));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())));
+    assert!(face.crop_dragging().is_none());
+    assert_eq!((face.state.selected().map(|c| c.crop), face.state.undo_depth()), (Some(timeline_core::Crop::NONE), 0));
+}
+
+/// The split face: the preview Surface's press / move / release are the crop drag's (its other pointer messages still
+/// refused), committing once.
+#[test]
+fn striacropmore_split_preview_surface_drags() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1);
+    face.state.select(0, 0).unwrap();
+    let _ = face.frames();
+    let s = face.still().expect("a preview still").clone();
+    let l = face.layout_for(stria::nle_face::Role::Preview);
+    let q = SizePolicy::Letterbox.place(s.width as usize, s.height as usize, l.w as usize, l.preview_h as usize).dst;
+    let (qx, ym, dx) = (q.x as f64, (q.y + q.h / 2) as f64, q.w as f64 / 10.0);
+    let btn = |down: bool, x: f64| bandy::SMessage::BrowserButton { down, x, y: ym, mods: 0, surface: 0 };
+    assert!(!face.on(&btn(true, qx + q.w as f64 / 2.0)), "off the edge: the preview Surface's press is refused as before");
+    assert!(face.on(&btn(true, qx)));
+    assert!(face.on(&bandy::SMessage::BrowserMouseMove(qx + dx, ym, 0)));
+    assert!(face.on(&btn(false, qx + dx)));
+    assert_eq!(face.state.selected().map(|c| c.crop.l), Some(100));
+    assert_eq!((face.state.undo_depth(), face.last_error.take()), (1, None));
+}
+
+/// The eight crop chords are KEYS rows onto SR900's step words (no VERBS word): Alt+l crops the left side in by CROP_STEP,
+/// Alt+Shift+L uncrops it (one undo step each); the help names each chord with its phrase; the chord as text is not taken.
+#[test]
+fn striacropmore_keys_step_the_crop() {
+    let chords = [
+        ("Alt+l", "crop-l+"),
+        ("Alt+Shift+L", "crop-l-"),
+        ("Alt+t", "crop-t+"),
+        ("Alt+Shift+T", "crop-t-"),
+        ("Alt+r", "crop-r+"),
+        ("Alt+Shift+R", "crop-r-"),
+        ("Alt+b", "crop-b+"),
+        ("Alt+Shift+B", "crop-b-"),
+    ];
+    let rows = help_rows();
+    for (k, w) in chords {
+        assert!(KEYS.contains(&(k, w)), "{k}");
+        assert!(!VERBS.contains(&w), "{w}: a key's word, no button");
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(row.1 != w, "{w}: a phrase, not the word");
+    }
+    let (mut face, _, _) = striacropmore_face();
+    let s = timeline_core::editor::CROP_STEP;
+    assert!(face.on(&bandy::SMessage::BrowserKey("Alt+l".into())));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Alt+b".into())));
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: s, t: 0, r: 0, b: s }));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Alt+Shift+L".into())));
+    assert_eq!(face.state.selected().map(|c| c.crop), Some(timeline_core::Crop { l: 0, t: 0, r: 0, b: s }));
+    assert_eq!((face.state.undo_depth(), face.last_error.take()), (3, None));
+    assert!(!face.on(&bandy::SMessage::BrowserText("Alt+l".into())));
+    println!("striacropmore: eight chords, Alt+l Alt+b Alt+Shift+L -> 0/0/0/{s}");
+}
