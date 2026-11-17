@@ -9827,6 +9827,104 @@ b</div>
         assert_ne!(imgalt_px(&e, 10, 30), (255, 0, 0), "row 30 is below it");
     }
 
+    // ---- AETHERCSSSTICKYSCROLLDAMAGERECTS (LEDGER SR1139): a blitted scroll damages each fixed / sticky box's old and new place (named tail block) ----
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a 400x300 page of `body` (margin 0) with the paint index armed the way
+    /// the host runs it (`perf::scoped()`, on unless AETHER_NO_SCOPE=1) by one first frame.
+    fn damage_rects_engine(body: &str) -> crate::AetherEngine {
+        let html = format!(r#"<!doctype html><html><body style="margin:0">{body}</body></html>"#);
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    const DAMAGE_RECTS_FIXED: &str = r#"<div style="position:fixed;top:0;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0)"></div>
+        <div style="height:2000px"></div>"#;
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): one unstuck 300x20 sticky box (`top: 30px`, flow y 120): a 50px scroll
+    /// keeps the blit and damages the strip plus ONE hull of its ink (y 118..142, x -2..302) and that ink moved up 50
+    /// (y 68..92), clipped: (0, 68, 302, 74) — not the viewport (armed: SR1135 damaged the viewport).
+    #[test]
+    fn sticky_scroll_damage_rects_one_sticky() {
+        let mut e = damage_rects_engine(
+            r#"<div style="height:120px"></div><div style="position:sticky;top:30px;width:300px;height:20px;background-color:rgb(0, 128, 0)"></div><div style="height:2000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 68, 302, 74)], "the strip and the sticky box's hull (armed)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a fixed 100x20 header at the top: a +50 scroll damages the strip and the
+    /// header's rect (its ghost moved off-screen); at 100 a -50 scroll damages the strip, the header and its ghost 50 rows
+    /// lower (apart: two rects); each total under a quarter of the viewport (armed: SR1135 damaged the viewport).
+    #[test]
+    fn sticky_scroll_damage_rects_fixed_header() {
+        let mut e = damage_rects_engine(DAMAGE_RECTS_FIXED);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 102, 22)], "+50: the strip and the header (armed)");
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 50), (0, 0, 102, 22), (0, 48, 102, 24)], "-50: the strip, the header, its ghost");
+        let area: u32 = e.damage_rects.iter().map(|r| r.2 * r.3).sum();
+        assert!(area * 4 < 400 * 300, "the damage is under a quarter of the viewport ({area})");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): THE correctness pin: a translucent fixed header, a sticky bar and coloured
+    /// rows; +50 (the bar unstuck), +50 (it sticks at 30), -30 (it unsticks): after each blitted frame the whole surface
+    /// equals a control engine scrolled to the same offset and repainted whole, and the damage was not the viewport.
+    #[test]
+    fn sticky_scroll_damage_rects_pixels_match_full_repaint() {
+        let mut body = String::from(
+            r#"<div style="position:fixed;top:0;left:0;width:200px;height:20px;background-color:rgba(0, 0, 255, 0.5)"></div>
+            <div style="height:120px;background-color:rgb(250, 200, 0)"></div>
+            <div style="position:sticky;top:30px;width:300px;height:20px;background-color:rgb(0, 128, 0)"></div>"#,
+        );
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): a fixed box over 80% of the viewport: the holders' damage would pass half
+    /// of it, so the viewport is damaged (SR1135's net).
+    #[test]
+    fn sticky_scroll_damage_rects_big_holder_falls_back() {
+        let mut e = damage_rects_engine(
+            r#"<div style="position:fixed;top:0;left:0;width:400px;height:240px;background-color:rgb(255, 0, 0)"></div><div style="height:2000px"></div>"#,
+        );
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (SR1135's damage)");
+    }
+
+    /// AETHERCSSSTICKYSCROLLDAMAGERECTS (SR1139): the holders are walked once per layout, pinned by the cache field: after
+    /// the first scroll it holds this epoch and the header; with its list emptied (the epoch kept) the second scroll's
+    /// damage is the strip alone, so that event read the cache and walked no paint map.
+    #[test]
+    fn sticky_scroll_damage_rects_cache_walks_once() {
+        let mut e = damage_rects_engine(DAMAGE_RECTS_FIXED);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.holders.0, e.layout_epoch, "the cache holds this layout's epoch");
+        assert_eq!(e.holders.1.len(), 1, "one holder: the header");
+        e.render_frame();
+        e.holders.1.clear();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50)], "the cached (emptied) list: no walk, the strip only");
+    }
+
     // ---- AETHERCSSCOLORALPHAZEROONEROAD (LEDGER SR1126): the text colour's alpha reaches the glyph ink and the cssom (named tail block) ----
 
     /// AETHERCSSCOLORALPHAZEROONEROAD (SR1126): one 20px line per row on white: `#op` opaque black (the control), `#hf`
@@ -10264,6 +10362,71 @@ b</div>
         let (corners, edge) = border_alpha_corner_px(&mut e, "is");
         assert!(border_alpha_half_grey(edge), "the span's top edge is half-alpha grey: {edge:?}");
         assert_eq!(corners[0], edge, "armed: the inline frame's top-left corner composites once");
+    }
+
+    // ---- AETHERFONTUNITSONEFN (LEDGER SR1142): ONE font_units for both re-resolutions (named tail block) ----
+
+    /// AETHERFONTUNITSONEFN (SR1142): a monospace 20px `width: 10ex` / `10ch` box on the font-relative road (#e, #c)
+    /// and the same declarations beside a `height: 1cqw` inside an inline-size container (#ke, #kc), so the
+    /// container-unit road re-applies them too.
+    fn font_units_tree() -> layout::LayoutTree {
+        laid_out(
+            r#"<html><body><div id=e class=m style="width:10ex"></div><div id=c class=m style="width:10ch"></div>
+            <div style="container-type:inline-size;width:400px"><div id=ke class=m style="width:10ex;height:1cqw"></div>
+            <div id=kc class=m style="width:10ch;height:1cqw"></div></div></body></html>"#,
+            "body{margin:0} .m{font-family:monospace;font-size:20px}",
+        )
+    }
+
+    /// The `layout_core::FontSel` of the test's monospace 400 normal 100% run.
+    fn font_units_mono_sel() -> layout_core::FontSel {
+        let family = crate::fonts::intern_family_list(crate::fonts::parse_family_list("monospace").expect("monospace parses"));
+        layout_core::FontSel { family, weight: 400, italic: false, stretch: 100 }
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ex` under a 20px font lays out at 10 x the face's x-height (whole-px rounded), the value
+    /// `font_units` gives (the first inline copy's, unchanged: armed-neutral).
+    #[test]
+    fn font_units_ex_width_face() {
+        let t = font_units_tree();
+        let u = layout_core::font_units(&crate::layout::HostFonts, font_units_mono_sel(), 20.0, 16.0);
+        let w = rect_by_id(&t, "e").unwrap().2;
+        println!("[font_units] face: fs 20 ex {} ch {} -> #e {}", u.2, u.3, w);
+        assert_eq!((u.0, u.1), (20.0, 16.0), "the tuple carries fs and root_fs through");
+        assert_eq!(w, (10.0 * u.2).round(), "#e: 10ex = 10 x {}, at layout's whole-px rounding", u.2);
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): `width: 10ch` under a 20px font lays out at 10 x the advance of "0".
+    #[test]
+    fn font_units_ch_width_face() {
+        let t = font_units_tree();
+        let u = layout_core::font_units(&crate::layout::HostFonts, font_units_mono_sel(), 20.0, 16.0);
+        let w = rect_by_id(&t, "c").unwrap().2;
+        assert_eq!(w, (10.0 * u.3).round(), "#c: 10ch = 10 x {}, at layout's whole-px rounding", u.3);
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): the same declarations re-resolved by the container-unit road (a `1cqw` sibling
+    /// declaration on the box) give the SAME px as the font-relative road. Armed-neutral: the two inline copies were
+    /// measured behaviourally identical at the cut, so the before value is the same.
+    #[test]
+    fn font_units_container_road_same_px() {
+        let t = font_units_tree();
+        let (e, c) = (rect_by_id(&t, "e").unwrap().2, rect_by_id(&t, "c").unwrap().2);
+        assert_eq!(rect_by_id(&t, "ke").unwrap().2, e, "#ke (container road) = #e (font-relative road)");
+        assert_eq!(rect_by_id(&t, "kc").unwrap().2, c, "#kc (container road) = #c (font-relative road)");
+    }
+
+    /// AETHERFONTUNITSONEFN (SR1142): with no face (the Mac's empty database) ex and ch are both fs / 2 on both roads:
+    /// 10ex = 10ch = 100 at 20px. Armed against losing the has_face guard: `measure("0")` is 0 there.
+    #[test]
+    fn font_units_no_face_half_fs() {
+        let sel = layout_core::FontSel { family: 0, weight: 400, italic: false, stretch: 100 };
+        assert_eq!(layout_core::font_units(&HeaderBandNoFaces, sel, 20.0, 16.0), (20.0, 16.0, 10.0, 10.0));
+        let mut t = font_units_tree();
+        layout_core::remeasure(&mut t, &HeaderBandNoFaces);
+        for id in ["e", "c", "ke", "kc"] {
+            assert_eq!(rect_by_id(&t, id).unwrap().2, 100.0, "#{id}: 10 x 20 / 2 with no face");
+        }
     }
 
     // ---- AETHERCSSINLINEBORDERALPHABYCOLOUR (LEDGER SR1146): the inline road's fills carry their alpha, not a colour comparison (named tail block) ----
