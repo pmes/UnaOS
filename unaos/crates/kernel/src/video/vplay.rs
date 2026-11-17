@@ -2246,7 +2246,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide",
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Source => "source", // STRIASOURCEDRAG (SR9081): never begun here (the Player loads no source); named for the exhaustive match
     }
 }
 

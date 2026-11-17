@@ -594,7 +594,7 @@ pub enum DragKind {
     /// NLE3ESLIPDRAG (SR760): the slip modifier on a clip body (`EditorState::slip_selected`: the source window moves).
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
-    Slide,
+    Slide, Source, // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview dropped on a track (`Drag::begin_source`, file tail)
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -684,7 +684,7 @@ impl Drag {
     pub fn update(&mut self, st: &EditorState, x: f64, y: f64) {
         self.at = (x, y);
         self.delta = self.layout.tick_at(x) - self.origin_tick;
-        self.guide = None;
+        self.guide = None; if self.kind == DragKind::Source { return self.update_source(st, x, y); } // STRIASOURCEDRAG (SR9081): the drop tick and row (file tail)
         if self.snap {
             self.snap_delta(st, x);
         }
@@ -715,7 +715,7 @@ impl Drag {
                 st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
                 return Ok(());
             }
-            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st),
+            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st), DragKind::Source => return self.finish_source(st), // STRIASOURCEDRAG (SR9081): the drop is one place (file tail)
             _ => {}
         }
         if st.selection != Some((self.track, self.idx)) {
@@ -742,7 +742,7 @@ impl Drag {
         s.selection = st.selection;
         s.set = st.set.clone();
         s.playhead = st.playhead;
-        s.zoom = st.zoom;
+        s.zoom = st.zoom; if self.kind == DragKind::Source { s.source = st.source.clone(); } // STRIASOURCEDRAG (SR9081): the drop's preview needs the loaded source (file tail)
         self.finish(&mut s).ok()?;
         Some(s)
     }
@@ -796,7 +796,7 @@ impl Drag {
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
             DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x),
-            DragKind::Scrub => {
+            DragKind::Scrub | DragKind::Source => { // STRIASOURCEDRAG (SR9081): the drop tick snaps as the scrub's pointer does
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
                     self.guide = Some(t);
@@ -1584,5 +1584,135 @@ mod striabinmore_tests {
                 assert_eq!(px(&got, w, w as i64 - BIN_THUMB_W - 1, y), px(&base, w, w as i64 - BIN_THUMB_W - 1, y), "left of the thumb unchanged");
             }
         }
+    }
+}
+
+// ---- STRIASOURCEDRAG (LEDGER SR9081): a press on the loaded source's preview dropped on a track (named tail block) ----
+// SR9045 owed NLE-SOURCE-DRAG. The gesture is THE drag model's: `Drag::begin_source` (a face calls it for a press on the
+// preview while `EditorState::source` is loaded) begins `DragKind::Source` with no row; `update` reads the drop tick under
+// the pointer (snapped to clip edges, as a scrub is) and the row under it when that track's kind is one the source lays on;
+// `finish` is ONE `EditorState::drop_source` (SR976's placing road at the drop tick, one commit, one undo). Plain is
+// Overwrite, Shift at the press (`additive`) is Insert. Released off the tracks, nothing is laid.
+
+/// A Source drag's row while the pointer is over no track the source can be laid on.
+pub const NO_ROW: usize = usize::MAX;
+
+impl Drag {
+    /// A press at `(x, y)` on the loaded source's preview: the source drag (`insert`: Shift, `nosnap`: Alt). `None` when no
+    /// source is loaded.
+    pub fn begin_source(st: &EditorState, l: Layout, x: f64, y: f64, insert: bool, nosnap: bool) -> Option<Drag> {
+        st.source.as_ref()?;
+        Some(Drag {
+            kind: DragKind::Source,
+            track: NO_ROW,
+            idx: 0,
+            origin_tick: l.tick_at(x),
+            layout: l,
+            delta: 0,
+            to_track: NO_ROW,
+            origin: (x, y),
+            at: (x, y),
+            snap: !nosnap,
+            additive: insert,
+            guide: None,
+        })
+    }
+    /// The rest of [`Drag::update`] for a source drag: the drop tick snapped, the row under the pointer when its kind is
+    /// one of the loaded source's kinds, else [`NO_ROW`].
+    fn update_source(&mut self, st: &EditorState, x: f64, y: f64) {
+        if self.snap {
+            self.snap_delta(st, x);
+        }
+        let ok = |r: usize| st.source.as_ref().is_some_and(|m| st.timeline.tracks.get(r).is_some_and(|t| m.kinds.contains(&t.kind)));
+        self.to_track = match self.layout.hit(&st.timeline, x, y) {
+            Hit::Clip(r, ..) | Hit::Track(r, _) if ok(r) => r,
+            _ => NO_ROW,
+        };
+    }
+    /// The drop: [`NO_ROW`] lays nothing; else the loaded source's marked range at the drop tick on that row
+    /// (`EditorState::drop_source`, ONE commit), Overwrite, or Insert when begun with Shift.
+    fn finish_source(&self, st: &mut EditorState) -> Result<(), EditError> {
+        if self.to_track == NO_ROW {
+            return Ok(());
+        }
+        let mode = if self.additive { crate::Mode::Insert } else { crate::Mode::Overwrite };
+        st.drop_source(self.to_track, self.origin_tick + self.delta, mode)
+    }
+}
+
+#[cfg(test)]
+mod striasourcedrag_tests {
+    use super::*;
+    use crate::{Clip, Mode, SourceId, Timeline};
+
+    /// A 0..20 at 0 on V1 and A1; B (50 ticks) on no track, loaded for video and audio, marked 1..3.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 40);
+        tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.load_source(SourceId(1), &[Kind::Video, Kind::Audio]).unwrap();
+        st.source.as_mut().unwrap().marks = (Some(1), Some(3));
+        st
+    }
+
+    /// A press in the preview band dragged onto V1 at tick 15 overwrites B 1..3 there on V1 and A1 in one undo step; the
+    /// drag's preview state shows the same timeline before the release.
+    #[test]
+    fn striasourcedrag_drop_lays_the_marked_range_at_the_drop_tick() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let mut d = Drag::begin_source(&st, l, 10.0, 5.0, false, true).unwrap();
+        assert_eq!((d.kind, d.track, d.to_track), (DragKind::Source, NO_ROW, NO_ROW));
+        let (x, y) = l.point(0, 15);
+        d.update(&st, x, y);
+        assert_eq!((d.to_track, d.origin_tick + d.delta), (0, 15));
+        assert!(d.moved());
+        let c = Clip::new(SourceId(1), 1, 3, 15);
+        let want = tl0.place(0, c, Mode::Overwrite).unwrap().place(1, c, Mode::Overwrite).unwrap();
+        assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the live preview");
+        assert_eq!(st.timeline, tl0, "nothing committed while dragging");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want);
+        assert_eq!((st.undo_depth(), st.playhead), (1, 17));
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// Shift is Insert; a release off the tracks lays nothing; nothing loaded begins no source drag.
+    #[test]
+    fn striasourcedrag_insert_off_tracks_and_unloaded() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let mut d = Drag::begin_source(&st, l, 10.0, 5.0, true, true).unwrap();
+        d.update(&st, l.x_of(30) as f64 + 1.0, 5.0);
+        assert_eq!(d.to_track, NO_ROW, "over the preview band");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
+        let (x, y) = l.point(1, 5);
+        d.update(&st, x, y);
+        assert_eq!(d.to_track, 1);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        let c = Clip::new(SourceId(1), 1, 3, 5);
+        assert_eq!(st.timeline, tl0.place(1, c, Mode::Insert).unwrap().place(0, c, Mode::Insert).unwrap());
+        st.source = None;
+        assert!(Drag::begin_source(&st, l, 10.0, 5.0, false, false).is_none());
+    }
+
+    /// With snap on, the drop tick snaps to A's out edge (20) from two pixels short of it.
+    #[test]
+    fn striasourcedrag_drop_snaps_to_a_clip_edge() {
+        let st = state();
+        let l = Layout::of_role(Role::Whole, 400, 200, &st);
+        let mut d = Drag::begin_source(&st, l, 10.0, 5.0, false, false).unwrap();
+        let y = l.point(0, 0).1;
+        d.update(&st, l.x_of(20) as f64 - 2.0, y);
+        assert_eq!((d.origin_tick + d.delta, d.guide, d.to_track), (20, Some(20), 0));
     }
 }
