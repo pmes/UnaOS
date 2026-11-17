@@ -4585,3 +4585,138 @@ impl Drag {
         }
     }
 }
+
+// ---- STRIAKTHUMBS (LEDGER SR9019): the thumbnail want rule (named tail block) ----
+// WHICH still a face decodes next for the stills [`paint_strip`] paints: lifted from Stria's `Thumbs::fill` / `fill_strip`
+// so the host face and the kernel Player (vplay.rs `thumbs_wait`) read ONE rule. Pass 1, the HEADS: video rows on the
+// canvas, a clip whose body left `x_of(at) + 1` lies in `0..w` and whose body is at least [`THUMB_MIN_W`] px wide, its
+// `(src, src_in)` not asked yet. Pass 2, once every such head is asked, the STRIP: a body whose visible part is at least
+// [`THUMB_MIN_W`] px; a body starting left of the canvas asks its head first (the head still's width sets the tiles); a
+// head asked with no picture asks nothing more; then the [`head_tiles`] after the head whose left column is on the canvas,
+// not asked yet. The face owns the cache, the decode and the budget; this fn only names the next key.
+
+/// A clip body narrower than this (px) asks for no head (Stria's `nle_face::THUMB_MIN_W` is this).
+pub const THUMB_MIN_W: i64 = 8;
+
+/// THE want rule (the block's head): the next `(src, src_tick)` to decode for layout `l` of `tl`, or `None` when every
+/// wanted still is asked. `have(src, tick)`: `None` not asked yet, `Some(None)` asked with no picture, `Some(Some(w))` a
+/// still `w` px wide.
+pub fn thumb_want(tl: &Timeline, l: &Layout, have: &dyn Fn(crate::SourceId, i64) -> Option<Option<i64>>) -> Option<(crate::SourceId, i64)> {
+    let w = l.w as i64;
+    let rows = move || {
+        tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video).filter(move |(row, _)| {
+            let y = l.row_y(*row);
+            y < l.h as i64 && y + ROW_H as i64 > 0
+        })
+    };
+    for (_, tr) in rows() {
+        for c in &tr.clips {
+            let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+            if x0 < 0 || x0 >= w || x1 - x0 < THUMB_MIN_W || have(c.src, c.src_in).is_some() {
+                continue;
+            }
+            return Some((c.src, c.src_in));
+        }
+    }
+    for (_, tr) in rows() {
+        for c in &tr.clips {
+            let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+            if x1 <= 0 || x0 >= w || x1.min(w) - x0.max(0) < THUMB_MIN_W {
+                continue;
+            }
+            let sw = match have(c.src, c.src_in) {
+                None if x0 >= 0 => continue, // the head pass left it: no strip either
+                None => return Some((c.src, c.src_in)),
+                Some(None) => continue,
+                Some(Some(sw)) => sw,
+            };
+            for (x, _, tick) in head_tiles(x0, x1, sw, l.zoom, c).into_iter().skip(1) {
+                if x < 0 || x >= w || have(c.src, tick).is_some() {
+                    continue;
+                }
+                return Some((c.src, tick));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod striakthumbs_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+    use alloc::collections::BTreeMap;
+    use core::cell::RefCell;
+
+    /// Two sources 60 ticks long; track 0 audio, track 1 video holding `clips`.
+    fn state(clips: Vec<Clip>) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 60);
+        tl.add_source("B", 60);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(SourceId(0), 0, 50, 0)];
+        tl.tracks[1].clips = clips;
+        EditorState::new(tl)
+    }
+
+    /// Every key `thumb_want` names, in order, each answered by a `sw`-wide still (or no picture when `sw` is 0).
+    fn drain(tl: &Timeline, l: &Layout, sw: i64) -> Vec<(SourceId, i64)> {
+        let held: RefCell<BTreeMap<(SourceId, i64), Option<i64>>> = RefCell::new(BTreeMap::new());
+        let mut order = Vec::new();
+        while let Some(k) = { let h = held.borrow(); thumb_want(tl, l, &|s, t| h.get(&(s, t)).copied()) } {
+            assert!(order.len() < 200, "the want rule must run dry");
+            order.push(k);
+            held.borrow_mut().insert(k, if sw > 0 { Some(sw) } else { None });
+        }
+        order
+    }
+
+    #[test]
+    fn striakthumbs_want_heads_before_tiles() {
+        // at zoom 8 on 480 px: A 0..50 at tick 0 (body 1..399), B 5..25 at tick 52 (body 417..575, its head on the canvas)
+        let st = state(alloc::vec![Clip::new(SourceId(0), 0, 50, 0), Clip::new(SourceId(1), 5, 25, 52)]);
+        let l = Layout::of(480, 200, &st);
+        let order = drain(&st.timeline, &l, 48);
+        assert_eq!(order[0], (SourceId(0), 0), "A's head first");
+        assert_eq!(order[1], (SourceId(1), 5), "then B's head, before any tile");
+        let (x0, x1) = (l.x_of(0) + 1, l.x_of(50) - 1);
+        let tiles: Vec<(SourceId, i64)> = head_tiles(x0, x1, 48, l.zoom, &st.timeline.tracks[1].clips[0]).into_iter().skip(1).map(|t| (SourceId(0), t.2)).collect();
+        assert_eq!(&order[2..2 + tiles.len()], &tiles[..], "then A's tiles in the tile rule's order");
+        assert!(drain(&state(Vec::new()).timeline, &l, 48).is_empty(), "an audio row's clip asks nothing");
+        std::println!("striakthumbs: {} keys, heads first", order.len());
+    }
+
+    #[test]
+    fn striakthumbs_want_offcanvas_head_then_tiles() {
+        let st = state(alloc::vec![Clip::new(SourceId(0), 0, 50, 0)]);
+        let l = Layout { t0: 10, ..Layout::of(480, 200, &st) };
+        let order = drain(&st.timeline, &l, 48);
+        assert_eq!(order[0], (SourceId(0), 0), "a body starting left of the canvas asks its head first");
+        let (x0, x1) = (l.x_of(0) + 1, l.x_of(50) - 1);
+        assert!(x0 < 0);
+        let want: Vec<(SourceId, i64)> = head_tiles(x0, x1, 48, l.zoom, &st.timeline.tracks[1].clips[0]).into_iter().skip(1).filter(|t| t.0 >= 0 && t.0 < l.w as i64).map(|t| (SourceId(0), t.2)).collect();
+        assert_eq!(&order[1..], &want[..], "then only its on-canvas tiles");
+    }
+
+    #[test]
+    fn striakthumbs_want_skips_narrow_and_nopicture() {
+        // a 0-tick-wide body would be refused by Clip; a 1-tick clip at zoom 1 is a body under THUMB_MIN_W
+        let mut st = state(alloc::vec![Clip::new(SourceId(0), 0, 1, 0)]);
+        st.zoom = 1;
+        let l = Layout::of(480, 200, &st);
+        assert_eq!(thumb_want(&st.timeline, &l, &|_, _| None), None, "a narrow body asks nothing");
+        let st = state(alloc::vec![Clip::new(SourceId(0), 0, 50, 0)]);
+        let l = Layout::of(480, 200, &st);
+        assert_eq!(drain(&st.timeline, &l, 0), alloc::vec![(SourceId(0), 0)], "a head with no picture: no tiles");
+    }
+
+    #[test]
+    fn striakthumbs_want_none_when_all_held() {
+        let st = state(alloc::vec![Clip::new(SourceId(0), 0, 50, 0), Clip::new(SourceId(1), 0, 10, 50)]);
+        let l = Layout::of(480, 200, &st);
+        assert_eq!(thumb_want(&st.timeline, &l, &|_, _| Some(Some(48))), None);
+        assert_eq!(thumb_want(&st.timeline, &l, &|_, _| Some(None)), None);
+    }
+}

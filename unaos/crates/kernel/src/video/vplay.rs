@@ -1104,7 +1104,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame, s.src.and_then(|id| tl.source(id)).map_or(timeline_core::SizePolicy::Letterbox, |r| r.size_policy)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame, s.src.and_then(|id| tl.source(id)).map_or(timeline_core::SizePolicy::Letterbox, |r| r.size_policy)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); thumbs_wait(jid, path, &reels, tl, fw, fh); room(jid).map_err(|why| (why, None))?; // STRIAKTHUMBS (LEDGER SR9019): a full queue's idle time decodes the band's wanted stills (file tail). NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -2016,7 +2016,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); HIST_ARMED.store(false, Ordering::Release); ROLL_TOOL.store(false, Ordering::Release); thumbs_close(); // STRIAKROLL (LEDGER SR9003): the tool goes with the face. STRIAKTHUMBS (LEDGER SR9019): the stills go too. NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -2043,7 +2043,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let px = pack(&view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, None), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref())); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail)
+    let th = thumbs_band(&live, l); let px = pack(&view::paint_drag(band_tc(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None, th.as_deref().and_then(|t| t.as_ref()).map(|t| t as &dyn view::PeakSource)), l, st, &mut lab), l, view::Order::Rgba, drag.as_ref())); // STRIAKTC (SR9018): the playhead timecode at the ruler's right end, under the drag guide (file tail) drop(th); // STRIAKTHUMBS (LEDGER SR9019): the Player's stills through the painter's thumb hook, the layout recorded for the job's want (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -3196,4 +3196,160 @@ fn edl_rated(
         x.last = if slow { Some((w, h, px.rgb().to_vec(), ord)) } else { None };
     }
     Ok((w, h, px, ord))
+}
+
+// ---- STRIAKTHUMBS (LEDGER SR9019): the view band's head stills (named tail block) ----
+// The Player's track view shows the host face's heads, filmstrip and tail: [`view_band`] hands the band's `paint_in` the
+// Player's still cache ([`KThumbs`], timeline_core's `PeakSource` hook: `thumb` only, no peaks) and records the layout it
+// paints, so timeline_core's `paint_strip` / `paint_head` (the host's painter) blit whatever the cache holds. WHICH still is
+// decoded next is timeline_core's ONE want rule (`view::thumb_want`, Stria's `Thumbs::fill` loops over it too). The decode
+// runs on the EDL job ([`thumbs_wait`], just before `room`): only while the presenter holds a full queue (QUEUE_LIVE
+// frames), ONE head at a time, the want re-read between decodes, so the paint decodes nothing and playback keeps its
+// frames; a paused Player fills every wanted still. One head = a fresh decoder slot (`slot_room` asked first) opened at the
+// keyframe by `edl_frame` (a run-up of up to one GOP, a scratch report so the job's counters stay the job's), the picture
+// placed into `view::head_size(fw, fh)` by the reel's size policy (`blit_place`; the host's preview at the canvas size then
+// head_still's Fill is the same geometry; Adopt places as Letterbox, `SizePolicy::place`'s rule). A reel with no video
+// caches `None`; a refusal caches `None` and counts. At KTHUMB_CAP entries the oldest goes. The cache survives the job's
+// restarts on the same EDL (a seek, an edit) and goes with the Player ([`edit_close`]). Each decode marks [`BAND_DIRTY`].
+// Wire: `[nle] thumbs edl=<path> decodes=<n> held=<n> refused=<n> ms_max=<n>` each time the want runs dry after a decode.
+// Owed: NLE-THUMBNAILS-KERNEL-WITNESS, NLE-THUMBNAILS-KERNEL-DRAG (the job's timeline is the opened one: a drag's shown
+// heads fill after the release's restart), NLE-WAVEFORM-KERNEL (the hook answers no peaks).
+
+/// STRIAKTHUMBS (SR9019): the most stills the Player keeps (a head is at most 128 x 36 x 4 bytes).
+const KTHUMB_CAP: usize = 64;
+
+/// STRIAKTHUMBS (SR9019): the Player's stills by `(source, source tick)` (`None`: asked, no picture), each with its insertion
+/// seq; the layout the band last painted; the decode counters for the wire.
+struct KThumbs {
+    path: String,
+    map: alloc::collections::BTreeMap<(timeline_core::SourceId, i64), (u64, Option<timeline_core::view::Still>)>,
+    seq: u64,
+    l: Option<timeline_core::view::Layout>,
+    decodes: u64,
+    refused: u64,
+    ms_max: u64,
+    said: bool,
+}
+
+static THUMBS: crate::sync::Mutex<Option<KThumbs>> = crate::sync::Mutex::new(None);
+
+impl KThumbs {
+    fn new(path: &str) -> KThumbs {
+        KThumbs { path: String::from(path), map: alloc::collections::BTreeMap::new(), seq: 0, l: None, decodes: 0, refused: 0, ms_max: 0, said: false }
+    }
+    /// Key `k` takes `v`, the oldest entry dropped first at KTHUMB_CAP.
+    fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<timeline_core::view::Still>) {
+        if !self.map.contains_key(&k) && self.map.len() >= KTHUMB_CAP {
+            if let Some(old) = self.map.iter().min_by_key(|e| (e.1).0).map(|e| *e.0) {
+                self.map.remove(&old);
+            }
+        }
+        self.seq += 1;
+        self.map.insert(k, (self.seq, v));
+        self.said = false;
+    }
+}
+
+impl timeline_core::view::PeakSource for KThumbs {
+    fn peaks(&self, _src: timeline_core::SourceId) -> Option<&timeline_core::view::Peaks> {
+        None
+    }
+    fn gain_q16(&self, _cdb: i32) -> i64 {
+        65536
+    }
+    fn thumb(&self, src: timeline_core::SourceId, src_tick: i64) -> Option<&timeline_core::view::Still> {
+        self.map.get(&(src, src_tick)).and_then(|e| e.1.as_ref())
+    }
+}
+
+/// STRIAKTHUMBS (SR9019): the band's hook for the live EDL at `live` painted at `l`: the cache (a fresh one for another
+/// EDL) with `l` recorded for the job's want. Busy: `None` (this paint shows the bars).
+fn thumbs_band(live: &str, l: timeline_core::view::Layout) -> Option<crate::sync::MutexGuard<'static, Option<KThumbs>>> {
+    let mut g = THUMBS.try_lock()?;
+    if g.as_ref().is_none_or(|t| t.path != live) {
+        *g = Some(KThumbs::new(live));
+    }
+    if let Some(t) = g.as_mut() {
+        t.l = Some(l);
+    }
+    Some(g)
+}
+
+/// STRIAKTHUMBS (SR9019): the EDL job's still fill (the block's rules): while the job's queue is full, the next wanted still
+/// decoded and cached, else room's wait (`snd::tick`, 2 ms). Returns on room's exits (a newer job, room in the queue, the
+/// consumer gone); `room` then runs as before.
+fn thumbs_wait(jid: u32, path: &str, reels: &Reels, tl: &timeline_core::Timeline, fw: u32, fh: u32) {
+    loop {
+        if GEN.load(Ordering::Acquire) != jid {
+            return;
+        }
+        let q = JOB.lock().as_ref().map(|j| j.queue.len()).unwrap_or(0);
+        if q < QUEUE_LIVE.load(Ordering::Acquire) as usize {
+            return;
+        }
+        if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
+            return;
+        }
+        let want = {
+            let mut g = THUMBS.lock();
+            match g.as_mut().filter(|t| t.path == path) {
+                Some(t) => match t.l {
+                    Some(l) => {
+                        let w = timeline_core::view::thumb_want(tl, &l, &|s, k| t.map.get(&(s, k)).map(|e| e.1.as_ref().map(|st| st.width as i64)));
+                        if w.is_none() && !t.said {
+                            t.said = true;
+                            let held = t.map.values().filter(|e| e.1.is_some()).count();
+                            serial_println!("[nle] thumbs edl={} decodes={} held={} refused={} ms_max={}", path, t.decodes, held, t.refused, t.ms_max);
+                        }
+                        w
+                    }
+                    None => None,
+                },
+                None => None,
+            }
+        };
+        let Some((src, tick)) = want else {
+            snd::tick(jid);
+            crate::arch::sched::sleep_ms(2);
+            continue;
+        };
+        let t0 = now();
+        let still = thumb_decode(reels, tl, src, tick, fw, fh);
+        let ms = now().saturating_sub(t0);
+        let mut g = THUMBS.lock();
+        let Some(t) = g.as_mut().filter(|t| t.path == path) else { continue };
+        match &still {
+            Ok(Some(_)) => t.decodes += 1,
+            Ok(None) => {}
+            Err(()) => t.refused += 1,
+        }
+        t.ms_max = t.ms_max.max(ms);
+        t.insert((src, tick), still.ok().flatten());
+        BAND_DIRTY.store(true, Ordering::Release);
+    }
+}
+
+/// STRIAKTHUMBS (SR9019): ONE still of `src` at source tick `tick`, sized `view::head_size(fw, fh)` (the block's rules).
+/// `Ok(None)`: the reel has no video (no picture, no decode); `Err(())`: the heap, the decoder or the placement refused.
+fn thumb_decode(reels: &Reels, tl: &timeline_core::Timeline, src: timeline_core::SourceId, tick: i64, fw: u32, fh: u32) -> Result<Option<timeline_core::view::Still>, ()> {
+    let Some((_, vt, _)) = reels.get(src).and_then(|r| r.v.as_ref()) else { return Ok(None) };
+    let Some((tw, th)) = timeline_core::view::head_size(fw, fh) else { return Ok(None) };
+    slot_room(vt.width as usize, vt.height as usize).map_err(|_| ())?;
+    let mut slot: Option<EdlRun> = None;
+    let mut scratch = EdlReport::default();
+    let (w, h, px, _) = edl_frame(reels, tl.tb, &mut slot, src, tick, true, &mut scratch, false).map_err(|_| ())?;
+    let f = Frame { pts_ms: 0, w, h, px, ord: None };
+    let fit = tl.source(src).map_or(timeline_core::SizePolicy::Letterbox, |s| s.size_policy);
+    let (tw, th) = (tw as usize, th as usize);
+    let mut buf = alloc::vec![0u32; tw * th];
+    if blit_place(&mut buf, tw, 0, 0, tw, th, &f, Some(0), fit).0 == 0 {
+        return Err(());
+    }
+    let rgba = buf.iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]).collect();
+    Ok(Some(timeline_core::view::Still { width: tw as u32, height: th as u32, rgba }))
+}
+
+/// STRIAKTHUMBS (SR9019): the Player closed: its stills go.
+fn thumbs_close() {
+    *THUMBS.lock() = None;
 }
