@@ -12553,4 +12553,66 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
+
+    // ---- AETHERDIRPSEUDOAUTO (LEDGER SR1176): `:dir()` matches dir=auto by its first strong character (named tail block) ----
+
+    /// AETHERDIRPSEUDOAUTO (SR1176): `.t:dir(rtl)` reads red, `.l:dir(ltr)` blue; dir=auto paragraphs with Hebrew-first,
+    /// Latin-first and neutral text, a child of the auto-rtl paragraph, bdi content, explicit dir pins.
+    fn dir_pseudo_auto_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .t:dir(rtl) { color: red }
+            .l:dir(ltr) { color: blue }
+        </style></head><body>
+            <p id="he" dir="auto" class="t">שלום <span id="kid" class="t">abc</span></p>
+            <p id="la" dir="auto" class="t l">abc ש</p>
+            <div dir="rtl"><p id="nr" dir="auto" class="t">123 !</p></div>
+            <p id="nl" dir="auto" class="t l">456</p>
+            <p id="bdi" dir="auto" class="t l"><bdi>שלום</bdi> abc</p>
+            <p id="xr" dir="rtl" class="t">abc</p>
+            <p id="xl" dir="ltr" class="t l">ש</p>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERDIRPSEUDOAUTO (SR1176): Hebrew-first dir=auto matches `:dir(rtl)` and its child with no dir inherits it;
+    /// Latin-first matches `:dir(ltr)` (before SR1176 `#he` and `#kid` read black: dir=auto took the root's ltr).
+    #[test]
+    fn dir_pseudo_auto_first_strong() {
+        let mut e = dir_pseudo_auto_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "he", "color"), "rgb(255, 0, 0)", "hebrew-first dir=auto is rtl");
+        assert_eq!(font_shorthand_cs(&mut e, "kid", "color"), "rgb(255, 0, 0)", "a child of the auto-rtl p inherits rtl");
+        assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 255)", "latin-first dir=auto is ltr");
+    }
+
+    /// AETHERDIRPSEUDOAUTO (SR1176): neutral-only text takes the parent's direction; bdi content is skipped.
+    #[test]
+    fn dir_pseudo_auto_neutral_and_bdi() {
+        let mut e = dir_pseudo_auto_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nr", "color"), "rgb(255, 0, 0)", "neutrals under dir=rtl: rtl");
+        assert_eq!(font_shorthand_cs(&mut e, "nl", "color"), "rgb(0, 0, 255)", "neutrals under the root: ltr");
+        assert_eq!(font_shorthand_cs(&mut e, "bdi", "color"), "rgb(0, 0, 255)", "bdi content skipped: the latin after it decides");
+    }
+
+    /// AETHERDIRPSEUDOAUTO (SR1176): explicit dir=rtl / ltr decide whatever the text (pin).
+    #[test]
+    fn dir_pseudo_auto_explicit_pin() {
+        let mut e = dir_pseudo_auto_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "xr", "color"), "rgb(255, 0, 0)");
+        assert_eq!(font_shorthand_cs(&mut e, "xl", "color"), "rgb(0, 0, 255)");
+    }
+
+    /// AETHERDIRPSEUDOAUTO (SR1176): a text change re-matches on the next frame (`:dir()` makes the invalidation set
+    /// whole: the restyle re-cascades the document).
+    #[test]
+    fn dir_pseudo_auto_text_change_rematches() {
+        let mut e = dir_pseudo_auto_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "he", "color"), "rgb(255, 0, 0)");
+        font_synth_eval(&mut e, "document.getElementById('he').textContent = 'abc'; ''");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "he", "color"), "rgb(0, 0, 0)", "latin text: ltr, the rtl rule no longer matches");
+    }
 }

@@ -196,6 +196,28 @@ impl Element for El<'_> {
         }
         self.doc.parent(self.id).is_some_and(|p| matches!(self.doc.data(p), NodeData::Document))
     }
+    /// AETHERDIRPSEUDOAUTO (SR1176): `dir=auto` resolves by css_core's one first-strong walk over html_core's child
+    /// nodes, font_core's Bidi_Class deciding (L ltr, R / AL rtl).
+    fn dir_auto_rtl(&self) -> Option<bool> {
+        if self.featureless() {
+            return None;
+        }
+        css_core::matching::dir_auto_first_strong(
+            self,
+            &|e, f| {
+                e.doc.children(e.id).any(|c| match e.doc.data(c) {
+                    NodeData::Text(t) => f(Some(t.as_str()), None),
+                    NodeData::Element(_) => f(None, e.hop(Some(c)).as_ref()),
+                    _ => false,
+                })
+            },
+            |c| match font_core::bidi::bidi_class(c) {
+                font_core::bidi::BidiClass::L => Some(false),
+                font_core::bidi::BidiClass::R | font_core::bidi::BidiClass::AL => Some(true),
+                _ => None,
+            },
+        )
+    }
     // The hot simple selectors read the attribute list directly.
     fn attr(&self, name: &str) -> Option<String> {
         if name == HOST_MARK {

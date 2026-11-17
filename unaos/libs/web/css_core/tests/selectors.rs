@@ -240,3 +240,194 @@ fn m2_specificity_and_child_indexed() {
     let hit: Vec<usize> = kids.iter().copied().filter(|&k| matches_list(&l, &El { dom: &d, i: k }, &cx)).collect();
     assert_eq!(hit, vec![kids[3], kids[7]]);
 }
+
+// ---- AETHERDIRPSEUDOAUTO (LEDGER SR1176): `:dir()` on dir=auto through dir_auto_first_strong (named tail block) ----
+
+/// A child of a [`DirDom`] node: a text node or an element (by index).
+enum DirKid {
+    Text(String),
+    El(usize),
+}
+
+/// A text-carrying test DOM (tests/common's Dom has no text nodes): name, `(name, value)` attributes, parent, children.
+#[derive(Default)]
+struct DirDom {
+    nodes: Vec<(String, Vec<(String, String)>, Option<usize>, Vec<DirKid>)>,
+}
+
+impl DirDom {
+    fn el(&mut self, parent: Option<usize>, name: &str, attrs: &[(&str, &str)]) -> usize {
+        let i = self.nodes.len();
+        let attrs = attrs.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        self.nodes.push((name.to_string(), attrs, parent, Vec::new()));
+        if let Some(p) = parent {
+            self.nodes[p].3.push(DirKid::El(i));
+        }
+        i
+    }
+    fn text(&mut self, parent: usize, t: &str) {
+        self.nodes[parent].3.push(DirKid::Text(t.to_string()));
+    }
+    fn at(&self, i: usize) -> DirEl<'_> {
+        DirEl { dom: self, i }
+    }
+    /// The element children of `i`'s parent, and `i`'s position among them.
+    fn siblings(&self, i: usize) -> Option<(Vec<usize>, usize)> {
+        let p = self.nodes[i].2?;
+        let els: Vec<usize> = self.nodes[p].3.iter().filter_map(|k| match k { DirKid::El(e) => Some(*e), _ => None }).collect();
+        let at = els.iter().position(|&e| e == i)?;
+        Some((els, at))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirEl<'a> {
+    dom: &'a DirDom,
+    i: usize,
+}
+
+impl PartialEq for DirEl<'_> {
+    fn eq(&self, o: &Self) -> bool {
+        std::ptr::eq(self.dom, o.dom) && self.i == o.i
+    }
+}
+
+/// The test's strong class: the Hebrew block rtl, ASCII letters ltr, everything else neutral (a stand-in for
+/// font_core's Bidi_Class, which css_core never links).
+fn dir_test_strong(c: char) -> Option<bool> {
+    if ('\u{0590}'..='\u{05FF}').contains(&c) {
+        Some(true)
+    } else if c.is_ascii_alphabetic() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+impl css_core::matching::Element for DirEl<'_> {
+    fn local_name(&self) -> &str {
+        &self.dom.nodes[self.i].0
+    }
+    fn namespace_url(&self) -> &str {
+        HTML_NS
+    }
+    fn each_attr(&self, f: &mut dyn FnMut(&str, &str, &str) -> bool) -> bool {
+        self.dom.nodes[self.i].1.iter().any(|(n, v)| f("", n, v))
+    }
+    fn parent_element(&self) -> Option<Self> {
+        self.dom.nodes[self.i].2.map(|p| self.dom.at(p))
+    }
+    fn prev_sibling_element(&self) -> Option<Self> {
+        let (els, at) = self.dom.siblings(self.i)?;
+        at.checked_sub(1).map(|j| self.dom.at(els[j]))
+    }
+    fn next_sibling_element(&self) -> Option<Self> {
+        let (els, at) = self.dom.siblings(self.i)?;
+        els.get(at + 1).map(|&e| self.dom.at(e))
+    }
+    fn first_child_element(&self) -> Option<Self> {
+        self.dom.nodes[self.i].3.iter().find_map(|k| match k { DirKid::El(e) => Some(self.dom.at(*e)), _ => None })
+    }
+    fn is_empty(&self) -> bool {
+        self.dom.nodes[self.i].3.iter().all(|k| matches!(k, DirKid::Text(t) if t.is_empty()))
+    }
+    fn dir_auto_rtl(&self) -> Option<bool> {
+        css_core::matching::dir_auto_first_strong(
+            self,
+            &|e, f| {
+                e.dom.nodes[e.i].3.iter().any(|k| match k {
+                    DirKid::Text(t) => f(Some(t.as_str()), None),
+                    DirKid::El(c) => f(None, Some(&e.dom.at(*c))),
+                })
+            },
+            dir_test_strong,
+        )
+    }
+}
+
+/// `:dir(rtl)` / `:dir(ltr)` on element `i` of `d`.
+fn dir_of(d: &DirDom, i: usize) -> (bool, bool) {
+    let ns = Namespaces::default();
+    let cx = MatchContext::new();
+    let rtl = matches_list(&parse_selector_str(":dir(rtl)", &ns).unwrap(), &d.at(i), &cx);
+    let ltr = matches_list(&parse_selector_str(":dir(ltr)", &ns).unwrap(), &d.at(i), &cx);
+    (rtl, ltr)
+}
+
+/// AETHERDIRPSEUDOAUTO (SR1176): dir=auto decides by the first strong character (before SR1176 every dir=auto element
+/// took its parent's direction, so a Hebrew dir=auto paragraph under an ltr root matched `:dir(ltr)`).
+#[test]
+fn dir_auto_first_strong_decides() {
+    let mut d = DirDom::default();
+    let root = d.el(None, "html", &[]);
+    let he = d.el(Some(root), "p", &[("dir", "auto")]);
+    d.text(he, "\u{05E9}\u{05DC}\u{05D5}\u{05DD} abc");
+    let la = d.el(Some(root), "p", &[("dir", "AUTO")]);
+    d.text(la, "12 abc \u{05E9}");
+    assert_eq!(dir_of(&d, he), (true, false), "hebrew first: rtl");
+    assert_eq!(dir_of(&d, la), (false, true), "latin first: ltr (the value is ASCII case-insensitive)");
+}
+
+/// AETHERDIRPSEUDOAUTO (SR1176): no strong character: the parent's directionality (root: ltr); a child with no dir of
+/// an auto-rtl paragraph inherits rtl.
+#[test]
+fn dir_auto_neutral_and_inherit() {
+    let mut d = DirDom::default();
+    let root = d.el(None, "html", &[]);
+    let rtl_div = d.el(Some(root), "div", &[("dir", "rtl")]);
+    let n1 = d.el(Some(rtl_div), "p", &[("dir", "auto")]);
+    d.text(n1, "123 !?");
+    let n2 = d.el(Some(root), "p", &[("dir", "auto")]);
+    d.text(n2, "456");
+    let he = d.el(Some(root), "p", &[("dir", "auto")]);
+    d.text(he, "\u{05E9} ");
+    let kid = d.el(Some(he), "span", &[]);
+    d.text(kid, "abc");
+    assert_eq!(dir_of(&d, n1), (true, false), "neutrals under dir=rtl: the parent's rtl");
+    assert_eq!(dir_of(&d, n2), (false, true), "neutrals under the root: ltr");
+    assert_eq!(dir_of(&d, kid), (true, false), "a child of an auto-rtl p inherits rtl (its own latin text is not read)");
+}
+
+/// AETHERDIRPSEUDOAUTO (SR1176): bdi / script / style / textarea content and descendants with a defined dir are skipped;
+/// a descendant whose dir value is invalid is searched.
+#[test]
+fn dir_auto_skips() {
+    let mut d = DirDom::default();
+    let root = d.el(None, "html", &[]);
+    let mut skipped = Vec::new();
+    for (tag, attrs) in [("bdi", &[][..]), ("script", &[][..]), ("style", &[][..]), ("textarea", &[][..]), ("span", &[("dir", "ltr")][..]), ("span", &[("dir", "auto")][..])] {
+        let p = d.el(Some(root), "p", &[("dir", "auto")]);
+        let inner = d.el(Some(p), tag, attrs);
+        d.text(inner, "\u{05E9}\u{05DC}\u{05D5}\u{05DD}");
+        d.text(p, " abc");
+        skipped.push((tag, p));
+    }
+    let inv = d.el(Some(root), "p", &[("dir", "auto")]);
+    let inner = d.el(Some(inv), "span", &[("dir", "sideways")]);
+    d.text(inner, "\u{05E9}");
+    d.text(inv, " abc");
+    for (tag, p) in skipped {
+        assert_eq!(dir_of(&d, p), (false, true), "<{tag}> content skipped: the latin after it decides");
+    }
+    assert_eq!(dir_of(&d, inv), (true, false), "an invalid dir value is not a defined state: searched");
+}
+
+/// AETHERDIRPSEUDOAUTO (SR1176): explicit dir=rtl / ltr decide whatever the content (pin), and an Element impl without
+/// `dir_auto_rtl` (tests/common's Dom: the default None) keeps dir=auto inheriting, as before SR1176.
+#[test]
+fn dir_auto_explicit_and_default_impl() {
+    let mut d = DirDom::default();
+    let root = d.el(None, "html", &[]);
+    let r = d.el(Some(root), "p", &[("dir", "rtl")]);
+    d.text(r, "abc");
+    let l = d.el(Some(root), "p", &[("dir", "ltr")]);
+    d.text(l, "\u{05E9}");
+    assert_eq!(dir_of(&d, r), (true, false), "dir=rtl with latin text");
+    assert_eq!(dir_of(&d, l), (false, true), "dir=ltr with hebrew text");
+    let mut c = Dom { in_document: true, ..Default::default() };
+    let html = c.push(None, "html", HTML_NS, vec![(String::new(), "dir".into(), "rtl".into())]);
+    let p = c.push(Some(html), "p", HTML_NS, vec![(String::new(), "dir".into(), "auto".into())]);
+    let ns = Namespaces::default();
+    let cx = MatchContext::new();
+    assert!(matches_list(&parse_selector_str(":dir(rtl)", &ns).unwrap(), &El { dom: &c, i: p }, &cx), "default impl: dir=auto inherits");
+}

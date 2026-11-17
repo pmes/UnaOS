@@ -84,6 +84,12 @@ pub trait Element: Clone + PartialEq {
         }
         None
     }
+    /// AETHERDIRPSEUDOAUTO (SR1176): `dir=auto`'s direction from the element's own content (HTML §3.2.6.4 "auto
+    /// directionality"): Some(true) rtl, Some(false) ltr, None when no strong character decides (then `:dir()` takes
+    /// the parent's). Default: None (no text access, dir=auto inherits); an impl answers through [`dir_auto_first_strong`].
+    fn dir_auto_rtl(&self) -> Option<bool> {
+        None
+    }
 }
 
 fn is_html_ws(c: char) -> bool {
@@ -435,6 +441,7 @@ fn match_pseudo<E: Element>(p: &PseudoClass, el: &E, cx: &MatchContext<E>) -> bo
                     if d.eq_ignore_ascii_case("ltr") {
                         return !*rtl;
                     }
+                    if d.eq_ignore_ascii_case("auto") && let Some(r) = e.dir_auto_rtl() { return r == *rtl; } // AETHERDIRPSEUDOAUTO (SR1176): None -> the parent's
                 }
                 cur = e.parent_element();
             }
@@ -510,4 +517,33 @@ pub fn lang_matches(range: &str, tag: &str) -> bool {
         j += 1;
     }
     true
+}
+
+// ---- AETHERDIRPSEUDOAUTO (LEDGER SR1176): dir=auto's first strong character for :dir() (named tail block) ----
+
+/// HTML §3.2.6.4 "auto directionality" over `el`'s content: child nodes in tree order; a text node decides with its
+/// first character `strong` classifies (Some(true) R / AL, Some(false) L); an element child is searched in turn unless it
+/// is an HTML `bdi` / `script` / `style` / `textarea` or carries a `dir` attribute in a defined state (ltr / rtl / auto).
+/// `children` visits a node's children (a text node as `(Some(text), None)`, an element as `(None, Some(el))`) and stops
+/// when the visitor returns true. css_core holds no Bidi_Class table: the caller passes its own (aether: font_core's).
+/// This is the ONE first-strong walk over a tree (layout_core joins it: owed AETHER-DIR-AUTO-ONE-WALK).
+pub fn dir_auto_first_strong<E: Element>(
+    el: &E,
+    children: &dyn Fn(&E, &mut dyn FnMut(Option<&str>, Option<&E>) -> bool) -> bool,
+    strong: fn(char) -> Option<bool>,
+) -> Option<bool> {
+    let mut found = None;
+    children(el, &mut |text, child| {
+        if let Some(t) = text {
+            found = t.chars().find_map(strong);
+        } else if let Some(c) = child {
+            let skipped = (c.is_html_element_in_html_document() && matches!(c.local_name(), "bdi" | "script" | "style" | "textarea"))
+                || c.attr("dir").is_some_and(|d| ["ltr", "rtl", "auto"].iter().any(|k| d.eq_ignore_ascii_case(k)));
+            if !skipped {
+                found = dir_auto_first_strong(c, children, strong);
+            }
+        }
+        found.is_some()
+    });
+    found
 }
