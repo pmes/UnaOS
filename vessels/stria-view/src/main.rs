@@ -252,7 +252,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face); // NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face); // NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -924,9 +924,9 @@ mod striasnaptoggle_tests {
         let (tl, src) = nle_face::synth_fixture();
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert!(f.snap_on());
-        assert_eq!(drive(&mut f, text), vec!["snap: off".to_string()]);
+        assert_eq!((drive(&mut f, text), f.note.as_deref()), (Vec::<String>::new(), Some("snap: off"))); // STRIASNAPNEXT (SR990): the snap line is a note, not an error
         assert!(!f.snap_on());
-        assert_eq!(drive(&mut f, text), vec!["snap: on".to_string()]);
+        assert_eq!((drive(&mut f, text), f.note.as_deref()), (Vec::<String>::new(), Some("snap: on"))); // STRIASNAPNEXT (SR990): the snap line is a note, not an error
         assert!(f.snap_on());
         println!("striasnaptoggle witness: button {id} {label:?} -> snap: off, again -> snap: on");
     }
@@ -949,10 +949,38 @@ mod striasnapmore_tests {
         let (tl, src) = nle_face::synth_fixture();
         let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(snap_json(&f), "");
-        assert_eq!(drive(&mut f, "key:n"), vec!["snap: off".to_string()]);
+        assert_eq!((drive(&mut f, "key:n"), f.note.as_deref()), (Vec::<String>::new(), Some("snap: off"))); // STRIASNAPNEXT (SR990): the snap line is a note, not an error
         assert_eq!(snap_json(&f), ",\"snap\":false");
-        assert_eq!(drive(&mut f, "snap"), vec!["snap: on".to_string()]);
+        assert_eq!((drive(&mut f, "snap"), f.note.as_deref()), (Vec::<String>::new(), Some("snap: on"))); // STRIASNAPNEXT (SR990): the snap line is a note, not an error
         assert_eq!(snap_json(&f), "");
         println!("striasnapmore witness: key:n -> \"snap\":false, snap -> absent");
+    }
+}
+
+// ---- STRIASNAPNEXT (LEDGER SR990): the witness's face note reading (named tail block) ----
+/// The witness's `"note"` field, only while a face note stands (`Face.note`, read by `message_text` after
+/// `last_error`); `"` becomes `'` as in `errors`. The default line is unchanged.
+fn note_json(face: &Face) -> String {
+    face.note.as_ref().map_or_else(String::new, |n| format!(",\"note\":\"{}\"", n.replace('"', "'")))
+}
+
+#[cfg(test)]
+mod striasnapnext_tests {
+    use super::*;
+
+    /// STRIASNAPNEXT M3: no note, no field; the `snap` word leaves no error and the line carries `"note":"snap: off"`;
+    /// `key:n` replaces it with `snap: on`; a taken `zoom+` word clears it and the field is gone.
+    #[test]
+    fn striasnapnext_note_field_only_while_a_note_stands() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(note_json(&f), "");
+        assert_eq!(drive(&mut f, "snap"), Vec::<String>::new());
+        assert_eq!(note_json(&f), ",\"note\":\"snap: off\"");
+        assert_eq!(drive(&mut f, "key:n"), Vec::<String>::new());
+        assert_eq!(note_json(&f), ",\"note\":\"snap: on\"");
+        assert_eq!(drive(&mut f, "zoom+"), Vec::<String>::new());
+        assert_eq!(note_json(&f), "");
+        println!("striasnapnext witness: snap -> \"note\":\"snap: off\", key:n -> snap: on, zoom+ -> absent");
     }
 }

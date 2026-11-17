@@ -3703,13 +3703,13 @@ fn striasnaptoggle_word_is_view_only_and_names_itself() {
     let mut face = nlefaceexport_face(tl.clone(), src);
     assert!(face.snap_on());
     assert!(face.verb("snap"));
-    assert_eq!(face.last_error.take().as_deref(), Some("snap: off"));
+    assert_eq!(face.note.take().as_deref(), Some("snap: off"));
     assert!(!face.snap_on());
     assert_eq!(face.state.undo_depth(), 0, "no undo step");
     assert!(!face.dirty(), "not dirty");
     assert_eq!(face.state.timeline, tl);
     assert!(face.verb("snap"));
-    assert_eq!(face.last_error.take().as_deref(), Some("snap: on"));
+    assert_eq!(face.note.take().as_deref(), Some("snap: on"));
     assert!(face.snap_on());
     assert_eq!(face.state.undo_depth(), 0);
     println!("striasnaptoggle: snap -> off, snap -> on; undo depth 0, clean");
@@ -3731,7 +3731,7 @@ fn striasnaptoggle_off_drags_raw_and_alt_snaps() {
     let y = l.point(0, 28).1;
     let (x, to) = (l.x_of(28) as f64 + 7.0, l.x_of(28) as f64 - 14.0);
     assert!(face.verb("snap"));
-    assert_eq!(face.last_error.take().as_deref(), Some("snap: off"));
+    assert_eq!(face.note.take().as_deref(), Some("snap: off"));
     face.on(&nle3eslipdrag_btn(true, x, y, 0));
     face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
     assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.guide)), Some((DragKind::Move, -2, None)), "snap off: raw");
@@ -3746,7 +3746,7 @@ fn striasnaptoggle_off_drags_raw_and_alt_snaps() {
     assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 22).unwrap(), "flush on the mark");
     assert!(face.verb("undo"));
     assert!(face.verb("snap"));
-    assert_eq!(face.last_error.take().as_deref(), Some("snap: on"));
+    assert_eq!(face.note.take().as_deref(), Some("snap: on"));
     face.on(&nle3eslipdrag_btn(true, x, y, 0));
     face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
     assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-3, Some(22))), "snap on: SR836's rule");
@@ -3770,12 +3770,12 @@ fn striasnapmore_n_key_flips_the_default_view_only() {
     assert!(f.snap_on());
     assert!(f.on(&bandy::SMessage::BrowserText("n".into())));
     assert!(!f.snap_on());
-    assert_eq!(f.last_error.take().as_deref(), Some("snap: off"));
+    assert_eq!(f.note.take().as_deref(), Some("snap: off"));
     assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
     assert_eq!(f.state.timeline, tl);
     assert!(f.on(&bandy::SMessage::BrowserText("n".into())));
     assert!(f.snap_on());
-    assert_eq!(f.last_error.take().as_deref(), Some("snap: on"));
+    assert_eq!(f.note.take().as_deref(), Some("snap: on"));
     println!("striasnapmore: n -> snap: off, n -> snap: on, undo 0, clean");
 }
 
@@ -3794,4 +3794,31 @@ fn striasnapmore_help_names_the_key_and_n_under_help_only_dismisses() {
     assert!(f.snap_on(), "a key under the help is not applied");
     assert!(f.last_error.is_none(), "{:?}", f.last_error);
     println!("striasnapmore: help row {:?}; n under the help only dismisses", row);
+}
+
+// ---- STRIASNAPNEXT (LEDGER SR990): the snap line is a face note held until the next acting input (named tail block) ----
+
+/// Rule: the `snap` word's line is `Face.note`, not `last_error`: `message_text` names it; a pointer move and a zoom keep
+/// it; an error standing beside it wins the message row; the next acting input (a typed word) clears it.
+#[test]
+fn striasnapnext_snap_line_is_a_note_held_until_the_next_input() {
+    let snap = || bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "snap".into() };
+    let mut f = nle5dkeyshelp_face(640, 480, false);
+    assert_eq!(f.note, None);
+    assert!(f.on(&snap()));
+    assert!(!f.snap_on());
+    assert_eq!((f.note.as_deref(), f.last_error.as_deref()), (Some("snap: off"), None));
+    assert_eq!(f.message_text().as_deref(), Some("snap: off"));
+    f.on(&bandy::SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    f.on(&bandy::SMessage::BrowserZoom(1));
+    assert_eq!(f.note.as_deref(), Some("snap: off"), "a move and a zoom keep the note");
+    f.last_error = Some("drag: clips overlap".into());
+    assert_eq!(f.message_text().as_deref(), Some("drag: clips overlap"), "an error wins the row");
+    f.last_error = None;
+    assert!(f.on(&snap()));
+    assert_eq!(f.note.as_deref(), Some("snap: on"), "the word's own input clears, then names the new state");
+    assert!(f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "zoom+".into() }));
+    assert_eq!(f.note, None, "the next acting input clears it");
+    assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+    println!("striasnapnext: snap -> note snap: off held over a move and a zoom; snap -> snap: on; zoom+ clears");
 }
