@@ -3961,3 +3961,74 @@ impl Timeline {
 fn gap_black(x: &Transition, start: i64, end: i64) -> bool {
     (x.to_black && x.at == start) || (x.from_black && x.at == end)
 }
+
+// ---- STRIAMARKERCHAPTERS (LEDGER SR9046): the markers as an ffmetadata chapters text (named tail block) ----
+// An export's chapters sidecar: every marker with `span.start <= at < span.end`, in tick order, one `[CHAPTER]` in
+// nanoseconds from the range's start through the one tick-to-ns rule (`Timebase::to_ns`). A ranged marker ends at
+// `min(at + len, span.end)`; a point marker at the next in-range marker, else at `span.end`. The title escapes `=` `;`
+// `#` `\` and newline with a backslash (ffmetadata's rule). No marker in the range: the empty string (no file).
+
+impl Timeline {
+    /// The markers inside `span` as an ffmetadata chapters text (`;FFMETADATA1` then one `[CHAPTER]` each); "" when none.
+    pub fn chapters(&self, span: core::ops::Range<i64>) -> String {
+        let inside: Vec<&Marker> = self.markers.iter().filter(|m| m.at >= span.start && m.at < span.end).collect();
+        if inside.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(";FFMETADATA1\n");
+        for (i, m) in inside.iter().enumerate() {
+            let end = if m.len > 0 { m.at.saturating_add(m.len).min(span.end) } else { inside.get(i + 1).map_or(span.end, |n| n.at) };
+            out.push_str(&alloc::format!(
+                "[CHAPTER]\nTIMEBASE=1/1000000000\nSTART={}\nEND={}\ntitle={}\n",
+                self.tb.to_ns(m.at - span.start),
+                self.tb.to_ns(end - span.start),
+                ffmeta_escape(&m.name)
+            ));
+        }
+        out
+    }
+}
+
+/// STRIAMARKERCHAPTERS (SR9046): `s` with ffmetadata's special characters (`=` `;` `#` `\` newline) backslash-escaped.
+fn ffmeta_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if matches!(c, '=' | ';' | '#' | '\\' | '\n') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod striamarkerchapters_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
+        tl.mark(5, "Intro").unwrap().mark(12, "Act=1; #2").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap()
+    }
+
+    /// STRIAMARKERCHAPTERS M3: only in-range markers; a point marker ends at the next one, a ranged one at its end
+    /// clipped to the range; times relative to the range start at 25 fps (40 ms a tick); the title escaped; none: "".
+    #[test]
+    fn striamarkerchapters_ffmetadata() {
+        let t = tl();
+        assert_eq!(
+            t.chapters(10..30),
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=80000000\nEND=400000000\ntitle=Act\\=1\; \\#2\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=400000000\nEND=800000000\ntitle=End\n"
+        );
+        let all = t.chapters(0..t.end());
+        assert_eq!(all.lines().filter(|l| *l == "[CHAPTER]").count(), 3);
+        assert!(all.contains("START=200000000\nEND=480000000\ntitle=Intro\n"), "{all}");
+        assert!(all.contains("START=800000000\nEND=1600000000\ntitle=End\n"), "{all}");
+        assert_eq!(t.chapters(21..30), "");
+        assert_eq!(Timeline::new(25).chapters(0..10), "");
+        assert_eq!(ffmeta_escape("a\\b\nc"), "a\\\\b\\\nc");
+    }
+}
+

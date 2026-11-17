@@ -2162,7 +2162,7 @@ pub struct ExportJob {
     /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
-    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
+    range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, rate_ema: f64, rate_at: (std::time::Instant, u64), chapters: String, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
 }
 
 impl Face {
@@ -2237,7 +2237,7 @@ impl Face {
                 export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
-        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
+        let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, chapters: self.export_chapters(&range), range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
         Ok(())
     }
     /// The deterministic seam: start an export of `fmt` into `dir` that holds after frame `k` until it is cancelled (Esc,
@@ -2297,7 +2297,7 @@ impl Face {
         let Some(mut j) = self.export.take() else { return };
         let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
         let line = match j.handle.take().map(|h| h.join()) {
-            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames, (self.state.timeline.tb.den, self.state.timeline.tb.num)), j.dir.display()),
+            Some(Ok(Ok(r))) => format!("export: {} frames{}, {} bytes, {} -> {}{}", r.frames, ticks_note(&j.range), r.bytes, export_words(&j.video, j.audio, j.started.elapsed(), r.frames, (self.state.timeline.tb.den, self.state.timeline.tb.num)), j.dir.display(), chapters_done(&j.dir, &j.chapters)),
             Some(Ok(Err(ExportError::Io(e)))) if e.kind() == std::io::ErrorKind::Interrupted && j.cancel.load(Relaxed) => {
                 format!("export: cancelled at {d}/{t} frames; partial files left in {}", j.dir.display())
             }
@@ -9829,5 +9829,35 @@ mod striaperfthree_tests {
         let l = view::Layout::of(320, 240, &f.state);
         let px = none.band(l, Order::Rgba, None, false, |s| { assert!(s.is_none()); vec![7; 4] });
         assert_eq!(px, vec![7; 4], "no still: the paint as before");
+    }
+}
+
+// ---- STRIAMARKERCHAPTERS (LEDGER SR9046): the chapters sidecar beside an export (named tail block) ----
+// `start_export` keeps the timeline's markers inside the exported range as an ffmetadata chapters text
+// (`Timeline::chapters`, times from the one `Timebase::to_ns`) in `ExportJob.chapters`, computed on the face's thread from
+// the same timeline the export thread clones; `finish_export` writes it to `<dir>/chapters.txt` ONLY on a finished export
+// with at least one chapter and names it as one clause on the done line. No markers in range, a cancel or a refusal: no file.
+
+/// STRIAMARKERCHAPTERS (SR9046): the sidecar's name in the export directory.
+pub const CHAPTERS_FILE: &str = "chapters.txt";
+
+impl Face {
+    /// The chapters text of the markers inside the range an export takes (`range`: the marked range, `None` the whole
+    /// timeline, `start_export`'s span rule); empty when no marker stands in it.
+    fn export_chapters(&self, range: &Option<std::ops::Range<i64>>) -> String {
+        self.state.timeline.chapters(range.clone().unwrap_or(0..self.state.timeline.end()))
+    }
+}
+
+/// Write `text` to `<dir>/chapters.txt` and word the done line's clause: `, chapters.txt <n> chapter(s)`, or
+/// `, chapters.txt: <io error>` (the movie stands); "" (and no file) when `text` is empty.
+fn chapters_done(dir: &std::path::Path, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let n = text.lines().filter(|l| *l == "[CHAPTER]").count();
+    match std::fs::write(dir.join(CHAPTERS_FILE), text) {
+        Ok(()) => format!(", {CHAPTERS_FILE} {n} chapter{}", if n == 1 { "" } else { "s" }),
+        Err(e) => format!(", {CHAPTERS_FILE}: {e}"),
     }
 }
