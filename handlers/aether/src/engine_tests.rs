@@ -9774,6 +9774,32 @@ b</div>
         assert_eq!(ta, "start", "align=center sets no text-align on the table's cells");
     }
 
+    // ---- AETHERFONTSGENERICRESOLVENAMEDSERIF (LEDGER SR1120): a family NAMED serif falls through to the next family (named tail block) ----
+
+    /// AETHERFONTSGENERICRESOLVENAMEDSERIF (SR1120): `font-family: 'serif', monospace` paints at the monospace advance (no
+    /// installed family is named serif; it painted with fontconfig's serif alias), and getComputedStyle reads the list kept.
+    #[test]
+    fn named_serif_paints_monospace_engine() {
+        if crate::fonts::db::db().faces.is_empty() {
+            return;
+        }
+        let html = r#"<!doctype html><html><body style="margin:0;font-size:20px">
+            <div><span id="n" style="font-family: 'serif', monospace">iiiiiiiiii</span></div>
+            <div><span id="m" style="font-family: monospace">iiiiiiiiii</span></div>
+            <div><span id="s" style="font-family: serif">iiiiiiiiii</span></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 400));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        let (n, m, s) = (imgalt_rect(&mut e, "n").2, imgalt_rect(&mut e, "m").2, imgalt_rect(&mut e, "s").2);
+        assert_eq!(font_shorthand_cs(&mut e, "n", "fontFamily"), r#""serif", monospace"#, "the list reads back kept");
+        if (m - s).abs() <= 0.5 {
+            return; // the host's monospace and serif faces share an advance: nothing to tell apart
+        }
+        assert!((n - m).abs() <= 0.5, "armed: the named serif paints at the monospace advance {m}, not the serif {s}: {n}");
+    }
+
     // ---- AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (LEDGER SR1121): the text-decoration-line column reads the element's own underline / line-through / both (named tail block) ----
 
     /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): `#lt` a strike-through, `#ul` both lines, `#u` an underline, `#n` none,

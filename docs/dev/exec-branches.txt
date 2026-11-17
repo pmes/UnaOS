@@ -1871,3 +1871,7 @@ exec-rmbp-nlefaceexportjsondocos|287c06bf4|cut128h
 exec-rmbp-aethercssoutlinetransparent|125e73994|cut129h
 exec-rmbp-aetherfontsgenericresolvenamedserif|125e73994|cut129h
 exec-rmbp-aethercssomtextdecorationlinecolumnmulti|125e73994|cut129h
+exec-rmbp-aethercsstextdecorationlinereset|27f7dc7c1|cut130h
+exec-rmbp-nlefacewitnessscriptwordsonetable|27f7dc7c1|cut130h
+exec-rmbp-aethercssomoutlinecolumns|27f7dc7c1|cut130h
+exec-rmbp-aethercssomreportshorthandcomputed|27f7dc7c1|cut130h
