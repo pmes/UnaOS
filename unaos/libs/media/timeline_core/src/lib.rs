@@ -84,8 +84,8 @@ pub struct Source {
     pub duration: i64,
     /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
     pub size_policy: SizePolicy,
-    /// STRIATITLECLIP (SR828): a generated title card's one line of text (`None`: a media reel); `edl` keeps it as `* UNA TITLE`.
-    pub title: Option<String>,
+    /// STRIATITLECLIP (SR828): a generated title card's text (`None`: a media reel; an LF is a line break, STRIAFREEZETHREE SR9029); `edl` keeps it as `* UNA TITLE`.
+    pub title: Option<String>, pub title_style: TitleStyle, // STRIAFREEZETHREE (SR9029): the title's size / alignment / ink (DEFAULT: today's look; `* UNA TITLESTYLE`)
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -408,7 +408,7 @@ pub enum EditError {
     Xform,
     NoMarks, // STRIAINSERTMARKS (SR905): `insert-marked` / `overwrite-marked` with an export mark unset
     InsertForm, // STRIAINSERTMARKS (SR905): an `insert` / `overwrite` word in a shape other than bare or `<reel> <in> <out>`
-    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold,
+    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold, /** STRIAFREEZETHREE (SR9029): a `title-style` word naming no title style. */ Style,
 }
 
 impl core::fmt::Display for EditError {
@@ -428,7 +428,7 @@ impl core::fmt::Display for EditError {
             EditError::Gain => "gain out of range",
             EditError::Rate => "rate is not a positive speed (a dwell or reverse)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
-            EditError::Marks => "the in mark is not before the out mark", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916)
+            EditError::Marks => "the in mark is not before the out mark", EditError::Hold => "no exact one-frame hold of that length", EditError::Style => "no such title style (size 1-50, align left / centre / right, ink RRGGBB)", // STRIAFREEZELEN (SR916)
             EditError::Marker => "one marker per tick (one is already there, or none is there to remove)",
             EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
@@ -437,7 +437,7 @@ impl core::fmt::Display for EditError {
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
             EditError::NoMarks => "no in / out marks set", // STRIAINSERTMARKS (SR905)
             EditError::InsertForm => "insert / overwrite take nothing or <reel> <in> <out>", // STRIAINSERTMARKS (SR905)
-            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916)
+            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916), STRIAFREEZETHREE (SR9029)
         })
     }
 }
@@ -464,7 +464,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox, title: None, title_style: TitleStyle::DEFAULT });
         id
     }
     /// Add an empty track (builder); returns its index.
@@ -4137,5 +4137,159 @@ mod striaclipspeedthree_tests {
         let mut none = EditorState::new(tl(50, alloc::vec![a(0, 10, 0)]));
         assert_eq!(none.verb("]"), Some(Err(EditError::NoClip)));
         std::println!("striaclipspeedthree: on a 2x clip }} ends at 6, {{ {{ at 4; 1x and 0.5x keys == trim by one source tick");
+    }
+}
+
+// ---- STRIAFREEZETHREE (LEDGER SR9029): a title's style — size, alignment, ink (named tail block) ----
+// A title source's look is ONE small value on its `Source` beside its text: `size` (the text height in percent of the frame
+// height, 1..=50), `align` (left / centre / right) and `ink` (RGB). `TitleStyle::DEFAULT` (10, centre, white) is the look
+// STRIATITLECLIP drew before, so a default-style title renders the same still and its EDL writes no `* UNA TITLESTYLE` line.
+// The text may carry LF line breaks (the EDL's quoting already keeps them as `\n`); stria's one raster stacks the lines.
+
+/// STRIAFREEZETHREE: where a title's lines sit across the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleAlign {
+    Left,
+    Centre,
+    Right,
+}
+
+impl TitleAlign {
+    /// STRIAFREEZETHREE: the EDL's and the word's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            TitleAlign::Left => "left",
+            TitleAlign::Centre => "centre",
+            TitleAlign::Right => "right",
+        }
+    }
+    /// STRIAFREEZETHREE: the alignment a name says (`center` read as `centre`).
+    pub fn from_name(s: &str) -> Option<TitleAlign> {
+        match s {
+            "left" => Some(TitleAlign::Left),
+            "centre" | "center" => Some(TitleAlign::Centre),
+            "right" => Some(TitleAlign::Right),
+            _ => None,
+        }
+    }
+}
+
+/// STRIAFREEZETHREE: a title source's look (see the block comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TitleStyle {
+    /// The text height, percent of the frame height (1..=50; 10 is a tenth, the look before SR9029).
+    pub size: u8,
+    pub align: TitleAlign,
+    /// Straight RGB ink.
+    pub ink: [u8; 3],
+}
+
+impl Default for TitleStyle {
+    fn default() -> TitleStyle {
+        TitleStyle::DEFAULT
+    }
+}
+
+/// STRIAFREEZETHREE: the largest title size, percent of the frame height.
+pub const TITLE_SIZE_MAX: u8 = 50;
+
+impl TitleStyle {
+    /// STRIAFREEZETHREE: a tenth of the frame height, centred, white.
+    pub const DEFAULT: TitleStyle = TitleStyle { size: 10, align: TitleAlign::Centre, ink: [255, 255, 255] };
+
+    /// STRIAFREEZETHREE: the EDL's three words, `<size> <align> <RRGGBB>` (e.g. `15 left FFCC00`).
+    pub fn words(&self) -> String {
+        alloc::format!("{} {} {:02X}{:02X}{:02X}", self.size, self.align.name(), self.ink[0], self.ink[1], self.ink[2])
+    }
+    /// STRIAFREEZETHREE: the style [`TitleStyle::words`] wrote: exactly three words; `None` for anything else.
+    pub fn from_words(s: &str) -> Option<TitleStyle> {
+        let mut w = s.split_whitespace();
+        let (size, align, ink) = (title_size(w.next()?)?, TitleAlign::from_name(w.next()?)?, title_ink(w.next()?)?);
+        w.next().is_none().then_some(TitleStyle { size, align, ink })
+    }
+    /// STRIAFREEZETHREE: this style with the `title-style` word's `size=N` / `align=A` / `ink=RRGGBB` pairs applied (any subset,
+    /// any order); `None` for an unknown key, a bad value or a word with no `=`.
+    pub fn with_words(self, s: &str) -> Option<TitleStyle> {
+        let mut out = self;
+        for kv in s.split_whitespace() {
+            match kv.split_once('=')? {
+                ("size", v) => out.size = title_size(v)?,
+                ("align", v) => out.align = TitleAlign::from_name(v)?,
+                ("ink", v) => out.ink = title_ink(v)?,
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+}
+
+/// STRIAFREEZETHREE: a title size word, 1..=[`TITLE_SIZE_MAX`] in plain digits.
+fn title_size(s: &str) -> Option<u8> {
+    if s.is_empty() || s.len() > 2 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u8>().ok().filter(|n| (1..=TITLE_SIZE_MAX).contains(n))
+}
+
+/// STRIAFREEZETHREE: an ink word, exactly six hex digits `RRGGBB` (either case).
+fn title_ink(s: &str) -> Option<[u8; 3]> {
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let h = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).ok();
+    Some([h(0)?, h(2)?, h(4)?])
+}
+
+impl Timeline {
+    /// STRIAFREEZETHREE: the timeline with title source `src`'s style set to `style`. Refused by name: no such source, or a
+    /// media reel (`title == None`), `EditError::NoSource`.
+    pub fn set_title_style(&self, src: SourceId, style: TitleStyle) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let s = tl.sources.iter_mut().find(|s| s.id == src).filter(|s| s.title.is_some()).ok_or(EditError::NoSource)?;
+        s.title_style = style;
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striafreezethree_tests {
+    use super::*;
+
+    /// The three EDL words round-trip; the word pairs apply over a style; bad words are `None`.
+    #[test]
+    fn striafreezethree_title_style_words() {
+        assert_eq!(TitleStyle::DEFAULT.words(), "10 centre FFFFFF");
+        assert_eq!(TitleStyle::default(), TitleStyle::DEFAULT);
+        let s = TitleStyle { size: 15, align: TitleAlign::Left, ink: [0xFF, 0xCC, 0x00] };
+        assert_eq!(s.words(), "15 left FFCC00");
+        assert_eq!(TitleStyle::from_words("15 left FFCC00"), Some(s));
+        assert_eq!(TitleStyle::from_words("15 center ffcc00"), Some(TitleStyle { align: TitleAlign::Centre, ..s }));
+        for bad in ["", "15 left", "15 left FFCC00 x", "0 left FFCC00", "51 left FFCC00", "15 up FFCC00", "15 left FFCC0", "+5 left FFCC00", "15 left GGCC00"] {
+            assert_eq!(TitleStyle::from_words(bad), None, "{bad:?}");
+        }
+        assert_eq!(TitleStyle::DEFAULT.with_words("ink=FFCC00 size=15 align=left"), Some(s));
+        assert_eq!(s.with_words("align=right"), Some(TitleStyle { align: TitleAlign::Right, ..s }), "a subset keeps the rest");
+        assert_eq!(s.with_words(""), Some(s));
+        for bad in ["size", "size=0", "size=51", "font=sans", "align=up", "ink=red", "size=15 x"] {
+            assert_eq!(TitleStyle::DEFAULT.with_words(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A titled source's style changes and nothing else; a media reel and a missing source are `NoSource`.
+    #[test]
+    fn striafreezethree_set_title_style_only_titles() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        tl.sources[1].title = Some(String::from("Hello"));
+        assert_eq!(tl.sources[1].title_style, TitleStyle::DEFAULT, "a new source has the default style");
+        let s = TitleStyle { size: 20, ..TitleStyle::DEFAULT };
+        let out = tl.set_title_style(t, s).unwrap();
+        assert_eq!(out.source(t).map(|x| x.title_style), Some(s));
+        let mut back = out.clone();
+        back.sources[1].title_style = TitleStyle::DEFAULT;
+        assert_eq!(back, tl, "only the style moved");
+        assert_eq!(tl.set_title_style(a, s), Err(EditError::NoSource), "a media reel");
+        assert_eq!(tl.set_title_style(SourceId(99), s), Err(EditError::NoSource), "no such source");
     }
 }

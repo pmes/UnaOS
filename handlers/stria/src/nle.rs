@@ -1032,7 +1032,7 @@ const TITLE_CACHE_MAX: usize = 8;
 const TITLE_INK: [u8; 4] = [255, 255, 255, 255];
 
 /// STRIATITLECLIP: the still cache, `(text, w, h, still)`; locked for one find or one push, never across a raster.
-type TitleCache = std::sync::Mutex<Vec<(String, u32, u32, Arc<timeline_core::view::Still>)>>;
+type TitleCache = std::sync::Mutex<Vec<(String, u32, u32, Arc<timeline_core::view::Still>, timeline_core::TitleStyle)>>; // STRIAFREEZETHREE (SR9029): keyed by the style too
 
 /// STRIATITLECLIP: source `src` of `tl` is a title.
 fn titled(tl: &Timeline, src: SourceId) -> bool {
@@ -1058,43 +1058,20 @@ fn title_size(tl: &Timeline, sources: &Sources, steps: &[timeline_core::schedule
 fn title_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: SourceId, src_t: i64, r: &RenderReport) -> Option<Frame> {
     let text = tl.source(src)?.title.as_deref()?;
     *run = None;
-    let still = sources.title_still_cached(text, r.width, r.height);
+    let still = sources.title_card_cached(text, &tl.source(src)?.title_style, r.width, r.height); // STRIAFREEZETHREE (SR9029): the source's style
     Some(Frame { width: still.width, height: still.height, pts_ns: tl.tb.to_ns(src_t), pixels: gneiss_pal::dsp::video::Pixels::Rgba(still.rgba.clone()) })
 }
 
 /// STRIATITLECLIP: `text` as a `w` x `h` RGBA still: opaque black, white ink, one line through text_host at `h / 10` px (8 at
-/// least), shrunk once to 90% of the width when wider, centred on its line box.
+/// least), shrunk once to 90% of the width when wider, centred on its line box (STRIAFREEZETHREE SR9029: [`title_card`] at the default style).
 pub fn title_still(text: &str, w: u32, h: u32) -> timeline_core::view::Still {
-    use text_host::line::{PixelOrder, TextStyle};
-    let mut rgba = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
-    let mut style = TextStyle::new(&["sans"], (h as f32 / 10.0).max(8.0));
-    let mut line = style.shape(text);
-    let room = w as f32 * 0.9;
-    if line.width > room {
-        style.size = (style.size * room / line.width).max(1.0);
-        line = style.shape(text);
-    }
-    let x = ((w as f32 - line.width) / 2.0).round();
-    let baseline = ((h as f32 + line.ascent - line.descent) / 2.0).round();
-    line.paint(&mut rgba, w, h, w as usize * 4, PixelOrder::Rgba, x, baseline, TITLE_INK, (0, w as i32));
-    timeline_core::view::Still { width: w, height: h, rgba }
+    title_card(text, &timeline_core::TitleStyle::DEFAULT, w, h) // STRIAFREEZETHREE (SR9029): the one raster at the default style
 }
 
 impl Sources {
     /// STRIATITLECLIP: [`title_still`] once per `(text, w, h)`; a second ask returns the same `Arc`.
     pub fn title_still_cached(&self, text: &str, w: u32, h: u32) -> Arc<timeline_core::view::Still> {
-        let hit = self.titles.lock().ok().and_then(|c| c.iter().find(|e| e.0 == text && e.1 == w && e.2 == h).map(|e| e.3.clone()));
-        if let Some(s) = hit {
-            return s;
-        }
-        let s = Arc::new(title_still(text, w, h));
-        if let Ok(mut c) = self.titles.lock() {
-            if c.len() >= TITLE_CACHE_MAX {
-                c.remove(0);
-            }
-            c.push((String::from(text), w, h, s.clone()));
-        }
-        s
+        self.title_card_cached(text, &timeline_core::TitleStyle::DEFAULT, w, h) // STRIAFREEZETHREE (SR9029): the one cache at the default style
     }
 }
 
@@ -1849,5 +1826,66 @@ mod striaseqthree_kept {
         assert!(k.get(5, None).is_none(), "a removed file (no stamp) is not served");
         k.put(6, 2, 2, Arc::new(vec![7; 16]), None);
         assert!(k.get(6, None).is_none(), "a frame kept without a stamp is never served");
+    }
+}
+
+// ---- STRIAFREEZETHREE (LEDGER SR9029): the one title raster — lines and a style (named tail block) ----
+// THE title raster (`title_still` and `title_still_cached` are its default-style calls). The text's LF-separated lines (a
+// trailing CR dropped) are shaped at `h / 10 * (size / 10)` px (8 at least; the default size 10 is a factor of exactly 1.0,
+// so the float is STRIATITLECLIP's), shrunk once so the widest line fits 90% of the width (STRIATITLECLIP's expression)
+// and again so the block fits 90% of the height, stacked one line box apart around the frame's middle (one line: the
+// baseline STRIATITLECLIP drew, by the same expression), each placed left (5% in), centred, or right (5% in), in the
+// style's ink. So a one-line title at `TitleStyle::DEFAULT` is byte-identical to the still SR828 drew.
+
+/// STRIAFREEZETHREE: `text` as a `w` x `h` RGBA still in `style` (see the block comment).
+pub fn title_card(text: &str, style: &timeline_core::TitleStyle, w: u32, h: u32) -> timeline_core::view::Still {
+    use text_host::line::{PixelOrder, TextStyle};
+    let mut rgba = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
+    let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut ts = TextStyle::new(&["sans"], (h as f32 / 10.0 * (style.size as f32 / 10.0)).max(8.0));
+    let mut shaped: Vec<text_host::line::Line> = lines.iter().map(|l| ts.shape(l)).collect();
+    let widest = |v: &[text_host::line::Line]| v.iter().map(|l| l.width).fold(0.0f32, f32::max);
+    let room = w as f32 * 0.9;
+    let wide = widest(&shaped);
+    if wide > room {
+        ts.size = (ts.size * room / wide).max(1.0);
+        shaped = lines.iter().map(|l| ts.shape(l)).collect();
+    }
+    let block = |v: &[text_host::line::Line]| v.first().map_or(0.0, |l| l.height()) * v.len() as f32;
+    let tall = block(&shaped);
+    if tall > h as f32 * 0.9 {
+        ts.size = (ts.size * h as f32 * 0.9 / tall).max(1.0);
+        shaped = lines.iter().map(|l| ts.shape(l)).collect();
+    }
+    let Some(first) = shaped.first() else { return timeline_core::view::Still { width: w, height: h, rgba } };
+    let (mid, step, n) = ((h as f32 + first.ascent - first.descent) / 2.0, first.height(), shaped.len());
+    let ink = [style.ink[0], style.ink[1], style.ink[2], TITLE_INK[3]];
+    for (i, line) in shaped.iter().enumerate() {
+        let x = match style.align {
+            timeline_core::TitleAlign::Left => (w as f32 * 0.05).round(),
+            timeline_core::TitleAlign::Centre => ((w as f32 - line.width) / 2.0).round(),
+            timeline_core::TitleAlign::Right => (w as f32 * 0.95 - line.width).round(),
+        };
+        let baseline = (mid - (n - 1) as f32 * step / 2.0 + i as f32 * step).round();
+        line.paint(&mut rgba, w, h, w as usize * 4, PixelOrder::Rgba, x, baseline, ink, (0, w as i32));
+    }
+    timeline_core::view::Still { width: w, height: h, rgba }
+}
+
+impl Sources {
+    /// STRIAFREEZETHREE: [`title_card`] once per `(text, w, h, style)`; a second ask returns the same `Arc`.
+    pub fn title_card_cached(&self, text: &str, style: &timeline_core::TitleStyle, w: u32, h: u32) -> Arc<timeline_core::view::Still> {
+        let hit = self.titles.lock().ok().and_then(|c| c.iter().find(|e| e.0 == text && e.1 == w && e.2 == h && e.4 == *style).map(|e| e.3.clone()));
+        if let Some(s) = hit {
+            return s;
+        }
+        let s = Arc::new(title_card(text, style, w, h));
+        if let Ok(mut c) = self.titles.lock() {
+            if c.len() >= TITLE_CACHE_MAX {
+                c.remove(0);
+            }
+            c.push((String::from(text), w, h, s.clone(), *style));
+        }
+        s
     }
 }

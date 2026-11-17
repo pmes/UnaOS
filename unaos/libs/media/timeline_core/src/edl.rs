@@ -204,7 +204,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
-            title_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+            title_comment(l, line, &mut tl)?; titlestyle_comment(l, line, &mut tl)?; mark_comment(l, line, &mut tl)?; if let Some(r) = l.strip_prefix("* UNA SIZE ") {
                 sizes.push(size_comment(r, line)?);
             }
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
@@ -395,7 +395,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         if src.size_policy != SizePolicy::Letterbox {
             s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
         }
-        s.push_str(&title_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail)
+        s.push_str(&title_line(src)); s.push_str(&titlestyle_line(src)); // STRIATITLECLIP (SR828): a title source's `* UNA TITLE` line, right after its SOURCE (file tail); STRIAFREEZETHREE (SR9029): its `* UNA TITLESTYLE` line after it (file tail)
     }
     s.push_str(&mark_line(tl)); s.push_str(&marker_lines(tl, fps)); s.push_str(&marker_style_lines(tl, fps)); s.push('\n'); s.insert_str(s.len() - 1, &tracks_line(tl)); // NLE5DRANGESAVE (SR723): the document's `* UNA MARK` line, last in the header (file tail)
     s.insert_str(s.len() - 1, &flag_lines(tl, "MUTE", |t| t.muted)); // STRIATRACKMUTESOLO (SR837): the muted tracks' `* UNA MUTE` lines, before the header's blank line (file tail)
@@ -1571,4 +1571,90 @@ pub fn timecode_in(out: &mut String, t: i64, fps: u32) -> &str {
     out.clear();
     let _ = write!(out, "{:02}:{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60, ff);
     out.as_str()
+}
+
+// ---- STRIAFREEZETHREE (LEDGER SR9029): the `* UNA TITLESTYLE` line (named tail block) ----
+// `* UNA TITLESTYLE <reel> <size> <align> <RRGGBB>` is a title source's non-default style ([`crate::TitleStyle::words`]),
+// written right after its `* UNA TITLE` line and only when the style is not [`crate::TitleStyle::DEFAULT`], so every EDL
+// written before SR9029 writes the same. A TITLESTYLE line naming a reel no TITLE line above it titled, a second
+// TITLESTYLE for one reel, or words `TitleStyle::from_words` cannot read is a syntax error. (`* UNA TITLE ` with its space
+// never matches this word.)
+
+/// STRIAFREEZETHREE: a `* UNA TITLESTYLE` line applied to its (already titled) source; any other line is left alone.
+fn titlestyle_comment(l: &str, line: usize, tl: &mut Timeline) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA TITLESTYLE ") else { return Ok(()) };
+    let (reel, words) = r.split_once(' ').ok_or(EdlError::Syntax { line })?;
+    let style = crate::TitleStyle::from_words(words).ok_or(EdlError::Syntax { line })?;
+    let src = tl
+        .sources
+        .iter_mut()
+        .find(|s| s.reel == reel)
+        .filter(|s| s.title.is_some() && s.title_style == crate::TitleStyle::DEFAULT)
+        .ok_or(EdlError::Syntax { line })?;
+    src.title_style = style;
+    Ok(())
+}
+
+/// STRIAFREEZETHREE: a title source's `* UNA TITLESTYLE` line (empty for a media reel or the default style).
+fn titlestyle_line(src: &crate::Source) -> String {
+    if src.title.is_none() || src.title_style == crate::TitleStyle::DEFAULT {
+        return String::new();
+    }
+    format!("* UNA TITLESTYLE {} {}\n", src.reel, src.title_style.words())
+}
+
+#[cfg(test)]
+mod striafreezethree_tests {
+    use super::*;
+    use crate::{Clip, Kind, TitleAlign, TitleStyle, Timeline};
+
+    fn titled(text: &str, style: TitleStyle) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        tl.sources[1].title = Some(String::from(text));
+        tl.sources[1].title_style = style;
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(t, 0, 20, 10)];
+        tl
+    }
+
+    /// A two-line title with a style round-trips byte-identical; the line sits right after its TITLE line.
+    #[test]
+    fn striafreezethree_titlestyle_round_trips() {
+        let style = TitleStyle { size: 15, align: TitleAlign::Left, ink: [0xFF, 0xCC, 0x00] };
+        let tl = titled("Top\nBottom", style);
+        let s = write(&tl, "TITLES").unwrap();
+        assert!(s.contains("* UNA TITLE T1 \"Top\\nBottom\"\n* UNA TITLESTYLE T1 15 left FFCC00\n"), "{s}");
+        let back = parse(&s, 25).unwrap();
+        assert_eq!(back.sources[1].title.as_deref(), Some("Top\nBottom"));
+        assert_eq!(back.sources[1].title_style, style);
+        assert_eq!(write(&back, "TITLES").unwrap(), s, "write(parse(write)) byte-identical");
+    }
+
+    /// The default style writes no line (every pinned EDL unchanged) and reads back as the default.
+    #[test]
+    fn striafreezethree_default_style_writes_no_line() {
+        let s = write(&titled("Hello", TitleStyle::DEFAULT), "T").unwrap();
+        assert!(!s.contains("TITLESTYLE"), "{s}");
+        assert_eq!(parse(&s, 25).unwrap().sources[1].title_style, TitleStyle::DEFAULT);
+    }
+
+    /// An unknown reel, an untitled reel, a second line, or unreadable words are syntax errors.
+    #[test]
+    fn striafreezethree_bad_titlestyle_lines_are_syntax() {
+        let good = write(&titled("Hello", TitleStyle { size: 20, ..TitleStyle::DEFAULT }), "T").unwrap();
+        let line = "* UNA TITLESTYLE T1 20 centre FFFFFF\n";
+        assert!(good.contains(line), "{good}");
+        for (bad, why) in [
+            (good.replace(line, "* UNA TITLESTYLE T9 20 centre FFFFFF\n"), "unknown reel"),
+            (good.replace(line, "* UNA TITLESTYLE A 20 centre FFFFFF\n"), "a media reel"),
+            (good.replace(line, &alloc::format!("{line}* UNA TITLESTYLE T1 30 left 000000\n")), "second line"),
+            (good.replace(line, "* UNA TITLESTYLE T1 99 centre FFFFFF\n"), "size past 50"),
+            (good.replace(line, "* UNA TITLESTYLE T1 20 middle FFFFFF\n"), "unknown align"),
+            (good.replace(line, "* UNA TITLESTYLE T1 20 centre\n"), "two words"),
+        ] {
+            assert!(matches!(parse(&bad, 25), Err(EdlError::Syntax { .. })), "{why}");
+        }
+    }
 }
