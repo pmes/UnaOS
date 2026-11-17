@@ -1037,7 +1037,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if tag == "a" || tag == "u" {
         inherited.underline = true;
     }
-    deco_ink(inherited, tag, spec); if let Some(u) = spec.underline {
+    if let Some(u) = spec.underline {
         inherited.underline = u;
     }
     if let Some(nw) = spec.nowrap {
@@ -1069,7 +1069,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
         (0, 0, 238) // UA default link blue
     } else if control_tag(tag) { layout_core::ua_colours(inherited.scheme).ink } else if tag == "html" { layout_core::ua_colours(inherited.scheme).canvastext } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
         inherited.color
-    }));
+    })); deco_ink(inherited, tag, spec); // AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): after the colour write, so currentcolor is this element's ink
 }
 
 /// Draws one line's worth of text with its baseline at `baseline_y` — an
@@ -4646,13 +4646,17 @@ pub(crate) fn control_tag(tag: &str) -> bool {
 /// own currentcolor, so the inherited colour resets to None (the run's text ink); then its `text-decoration-color` writes
 /// (`Some(None)` = currentcolor = None). A descendant that sets neither keeps its ancestor's colour, so the ancestor's
 /// decoration paints through the descendant's text in the ancestor's `text-decoration-color`.
+/// AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): css-text-decor-3 §2.1 / §2.3: currentcolor resolves HERE, at the
+/// decorating box, to its own `color` (inherit_element calls this after its colour write), so a descendant's text keeps
+/// the decorating box's ink; None now means only "no decorating ancestor" (draw_decorations' run-ink fallback).
 fn deco_ink(inherited: &mut Inherited, tag: &str, spec: &crate::layout::PaintStyle) {
-    if tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some() {
+    let own = tag == "a" || tag == "u" || spec.underline.is_some() || spec.line_through.is_some(); if own {
         inherited.deco_color = None; inherited.deco_style = 0; inherited.deco_thick = None; inherited.ul_offset = None;
     }
     if let Some(s) = spec.decoration_style { inherited.deco_style = s; } if let Some(t) = spec.decoration_thickness { inherited.deco_thick = t; } if let Some(o) = spec.underline_offset { inherited.ul_offset = o; } if let Some(p) = spec.underline_position { inherited.ul_pos = p; } if let Some(c) = spec.decoration_color {
         inherited.deco_color = c;
     }
+    if own && inherited.deco_color.is_none() { inherited.deco_color = Some(inherited.color); }
 }
 
 // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): the unicode-bidi tag road and the paint-time override (named tail block) ----
