@@ -319,3 +319,124 @@ fn font_inherit_leaves_color() {
     assert!(!dst.paint.inherits(INHERIT_COLOR), "font: inherit does not set the colour bit");
     assert_eq!(dst.paint.inherit, INHERIT_FONT);
 }
+
+// ---- AETHERCSSCOLORCURRENTCOLOR (LEDGER SR841): color: currentcolor writes the colour inherit bit (named tail block) ----
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): css-color-4 §6.2: `currentcolor` on `color` itself is `inherit`: in any case it
+/// clears an earlier colour in the block and sets the colour bit (the `is_neutral_keyword` drop kept the earlier colour);
+/// a later value in the block beats it.
+#[test]
+fn currentcolor_on_color_sets_inherit_bit() {
+    for kw in ["currentcolor", "currentColor", "CURRENTCOLOR"] {
+        let s = styled(&[("color", "blue"), ("color", kw)]);
+        assert_eq!(s.paint.inherit, INHERIT_COLOR, "color: {kw} sets the colour bit");
+        assert_eq!(s.paint.color, None, "color: {kw} clears the earlier colour");
+    }
+    let s = styled(&[("color", "currentcolor"), ("color", "green")]);
+    assert!(!s.paint.inherits(INHERIT_COLOR), "a later value beats the bit");
+    assert!(s.paint.color.is_some(), "the later colour stands");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): `.a { color: blue } .a.b { color: currentcolor }`: the later rule clears the
+/// earlier rule's colour and sets the bit through merge_paint's `merge_inherit`.
+#[test]
+fn merge_paint_currentcolor_beats_earlier_rule() {
+    let mut dst = styled(&[("color", "blue")]);
+    assert!(dst.paint.color.is_some(), "the earlier rule's colour (armed)");
+    merge_paint(&mut dst.paint, &styled(&[("color", "currentcolor")]).paint);
+    assert_eq!(dst.paint.color, None, "the later currentcolor cleared the earlier colour");
+    assert!(dst.paint.inherits(INHERIT_COLOR), "the later currentcolor set the bit");
+}
+
+/// AETHERCSSCOLORCURRENTCOLOR (SR841): the OTHER colour properties are pinned as measured, none of them touching the
+/// inherit bits: outline-color's `Some(None)` is THE currentColor marker (render's focusring `current_color` reads it);
+/// border has no marker and paints the arm's grey (128, 128, 128); background-color drops it, an earlier background
+/// stands (AETHER-CSS-CURRENTCOLOR-REST owed); a font longhand's `currentcolor` sets no bit.
+#[test]
+fn currentcolor_other_properties_pinned() {
+    let s = styled(&[("color", "red"), ("outline-color", "currentcolor")]);
+    assert_eq!(s.paint.outline_color, Some(None), "outline-color: currentcolor is the marker");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("border", "1px solid currentcolor")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, (128, 128, 128))); 4]), "border: currentcolor paints grey today (owed)");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("color", "red"), ("background-color", "blue"), ("background-color", "currentcolor")]);
+    assert!(s.paint.currentcolor & layout_core::paint::CC_BG != 0, "the later currentcolor writes the CC_BG marker"); /* SR849 */
+    assert!(s.paint.background.is_some(), "armed: blue parsed");
+    assert_eq!(s.paint.inherit, 0);
+    let s = styled(&[("font-style", "italic"), ("font-style", "currentcolor")]);
+    assert_eq!(s.paint.inherit, 0, "font-style: currentcolor sets no bit");
+}
+
+// ---- AETHERCSSCURRENTCOLORREST (LEDGER SR849): border / background currentColor marker (named tail block) ----
+
+/// AETHERCSSCURRENTCOLORREST (SR849): the border arms write the side bits of `PaintStyle::currentcolor`: an explicit
+/// `currentcolor` and an omitted colour (css-backgrounds-3 §3.1: border-color's initial value is currentcolor) set
+/// them, a concrete colour clears them; the side shorthand touches its own bit only; `border-color: currentcolor` and
+/// `border-width` alone build 1px / grey-carrier sides with the bits set.
+#[test]
+fn currentcolorrest_border_marker() {
+    use layout_core::paint::CC_SIDES;
+    fn cc(d: &[(&str, &str)]) -> u8 {
+        styled(d).paint.currentcolor
+    }
+    assert_eq!(cc(&[("border", "2px solid currentcolor")]), CC_SIDES, "explicit currentcolor");
+    assert_eq!(cc(&[("border", "2px solid currentColor")]), CC_SIDES, "case-insensitive");
+    assert_eq!(cc(&[("border", "2px solid red")]), 0, "a concrete colour (armed)");
+    assert_eq!(cc(&[("border", "2px solid")]), CC_SIDES, "an omitted colour is the initial currentcolor");
+    assert_eq!(cc(&[("border", "2px solid currentcolor"), ("border-color", "blue")]), 0, "a later border-color clears");
+    assert_eq!(cc(&[("border", "2px solid blue"), ("border-left", "2px solid currentcolor")]), 8, "the left bit only");
+    assert_eq!(cc(&[("border", "2px solid currentcolor"), ("border-top", "2px solid blue")]), CC_SIDES & !1, "the top bit cleared");
+    let s = styled(&[("border-color", "currentcolor")]);
+    assert_eq!(s.paint.currentcolor, CC_SIDES, "border-color: currentcolor");
+    assert_eq!(s.paint.border, Some([Some((1.0, (128, 128, 128))); 4]), "the sides built at 1px with the grey carrier");
+    assert_eq!(cc(&[("border-width", "3px")]), CC_SIDES, "border-width alone: the created sides take currentcolor");
+    assert_eq!(cc(&[("border", "2px solid red"), ("border-width", "3px")]), 0, "border-width keeps the red sides");
+}
+
+/// AETHERCSSCURRENTCOLORREST (SR849): `background-color: currentcolor` writes the carrier, an opaque alpha and CC_BG;
+/// a later concrete colour (the longhand or the shorthand) clears it; `transparent` leaves it (alpha 0 paints nothing).
+#[test]
+fn currentcolorrest_background_marker() {
+    use layout_core::paint::CC_BG;
+    let s = styled(&[("background-color", "rgba(0, 0, 255, 0.5)"), ("background-color", "currentcolor")]);
+    assert_eq!(s.paint.currentcolor, CC_BG);
+    assert!(s.paint.background.is_some(), "the carrier makes the background paint");
+    assert_eq!(s.paint.bg_alpha, Some(1.0), "currentcolor is opaque here");
+    let s = styled(&[("background-color", "currentcolor"), ("background-color", "blue")]);
+    assert_eq!(s.paint.currentcolor, 0, "a later colour clears");
+    assert_eq!(s.paint.background, styled(&[("background-color", "blue")]).paint.background);
+    let s = styled(&[("background-color", "currentcolor"), ("background", "red")]);
+    assert_eq!(s.paint.currentcolor, 0, "a later shorthand colour clears");
+    assert_eq!(styled(&[("background", "currentcolor")]).paint.currentcolor, CC_BG, "the shorthand's currentcolor");
+    assert_eq!(styled(&[("background-color", "red")]).paint.currentcolor, 0, "armed: a colour sets nothing");
+}
+
+/// AETHERCSSCURRENTCOLORREST (SR849): merge_paint's carry: the side bits follow a later rule's `border`, CC_BG its
+/// `background`; a later rule with neither keeps the earlier bits.
+#[test]
+fn currentcolorrest_merge_carries() {
+    use layout_core::paint::{CC_BG, CC_SIDES};
+    let mut dst = styled(&[("border", "2px solid red"), ("background-color", "currentcolor")]);
+    assert_eq!(dst.paint.currentcolor, CC_BG);
+    merge_paint(&mut dst.paint, &styled(&[("border", "2px solid currentcolor")]).paint);
+    assert_eq!(dst.paint.currentcolor, CC_SIDES | CC_BG, "the later border's bits, the background bit kept");
+    merge_paint(&mut dst.paint, &styled(&[("color", "blue")]).paint);
+    assert_eq!(dst.paint.currentcolor, CC_SIDES | CC_BG, "a rule with neither keeps both");
+    merge_paint(&mut dst.paint, &styled(&[("border", "2px solid blue"), ("background-color", "green")]).paint);
+    assert_eq!(dst.paint.currentcolor, 0, "later concrete colours clear both");
+}
+
+/// AETHERCSSCURRENTCOLORREST (SR849): the paint-time resolution: a set bit takes the ink, a clear one keeps its colour.
+#[test]
+fn currentcolorrest_ink_kat() {
+    use layout_core::paint::{bg_ink, border_ink, CC_BG};
+    let g = (128, 128, 128);
+    let b = (0, 0, 255);
+    let sides = [Some((2.0, g)), Some((2.0, b)), None, Some((1.0, g))];
+    let red = (255, 0, 0);
+    assert_eq!(border_ink(sides, 1 | 4 | 8, red), [Some((2.0, red)), Some((2.0, b)), None, Some((1.0, red))]);
+    assert_eq!(border_ink(sides, 0, red), sides);
+    assert_eq!(bg_ink((0, 0, 0), CC_BG, red), red);
+    assert_eq!(bg_ink(b, 15, red), b, "side bits do not touch the background");
+}
