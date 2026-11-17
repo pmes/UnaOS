@@ -6445,3 +6445,67 @@ fn striapasteinsert_face_refusals_name_the_error() {
     assert_eq!(face.last_error.take(), Some(format!("paste-over: {}", EditError::Kind)));
     assert_eq!(face.state.timeline, tl);
 }
+
+// ---- STRIASNAPTOGGLE (LEDGER SR892): the `snap` word flips the face's drag snap default; Alt inverts it (named tail block) ----
+
+/// Rule: `snap` is a VERBS word just before `help`; it is a view word: it flips the default (`Face::snap_on`), names
+/// the new state on the message line (`snap: off` / `snap: on`), pushes no undo step and leaves the document clean.
+#[test]
+fn striasnaptoggle_word_is_view_only_and_names_itself() {
+    assert_eq!(&VERBS[VERBS.len() - 2..], &["snap", "help"]);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.snap_on());
+    assert!(face.verb("snap"));
+    assert_eq!(face.last_error.take().as_deref(), Some("snap: off"));
+    assert!(!face.snap_on());
+    assert_eq!(face.state.undo_depth(), 0, "no undo step");
+    assert!(!face.dirty(), "not dirty");
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.verb("snap"));
+    assert_eq!(face.last_error.take().as_deref(), Some("snap: on"));
+    assert!(face.snap_on());
+    assert_eq!(face.state.undo_depth(), 0);
+    println!("striasnaptoggle: snap -> off, snap -> on; undo depth 0, clean");
+}
+
+/// Rule: over SR836's gesture (in mark 22, V's A@25 body pressed at `x_of(28) + 7` and moved 21 px left: raw -2 ticks),
+/// with the snap default off a plain drag keeps the raw -2 and no guide and commits at 23; undone, the same drag with
+/// Alt snaps to the mark (delta -3, the guide at 22) and commits flush at 22; with the default back on a plain drag
+/// snaps again.
+#[test]
+fn striasnaptoggle_off_drags_raw_and_alt_snaps() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(22);
+    assert!(face.verb("in"));
+    face.state.seek(0);
+    let tl0 = face.state.timeline.clone();
+    let l = face.layout();
+    let y = l.point(0, 28).1;
+    let (x, to) = (l.x_of(28) as f64 + 7.0, l.x_of(28) as f64 - 14.0);
+    assert!(face.verb("snap"));
+    assert_eq!(face.last_error.take().as_deref(), Some("snap: off"));
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.guide)), Some((DragKind::Move, -2, None)), "snap off: raw");
+    face.on(&nle3eslipdrag_btn(false, to, y, 0));
+    assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 23).unwrap());
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-3, Some(22))), "snap off + Alt: snaps");
+    face.on(&nle3eslipdrag_btn(false, to, y, 0));
+    assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 22).unwrap(), "flush on the mark");
+    assert!(face.verb("undo"));
+    assert!(face.verb("snap"));
+    assert_eq!(face.last_error.take().as_deref(), Some("snap: on"));
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-3, Some(22))), "snap on: SR836's rule");
+    face.on(&nle3eslipdrag_btn(false, to, y, 0));
+    assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 22).unwrap());
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striasnaptoggle: off -> lands at 23; off + Alt -> snaps to 22; on -> snaps to 22");
+}

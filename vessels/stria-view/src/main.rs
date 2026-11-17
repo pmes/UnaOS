@@ -541,6 +541,7 @@ fn transport() -> TetraNode {
         button("track-up", "Track Up"), button("track-down", "Track Down"), // STRIATRACKREORDER (SR877): the selected clip's track swaps with its same-kind neighbour
         button("meters-reset", "Reset Meters"), button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
         button("paste-insert", "Paste Insert"), button("paste-over", "Paste Over"), // STRIAPASTEINSERT (SR896): the clipboard laid at the playhead rippling the track / carving what is there
+        button("snap", "Snap"), // STRIASNAPTOGGLE (SR892): the drag snap default on / off (THE `snap` word)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1615,5 +1616,31 @@ mod striapasteinsert_tests {
         let words: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
         assert_eq!(words[words.len() - 3..], ["paste-insert", "paste-over", "help"]);
         println!("striapasteinsert witness: V1 {v1:?}");
+    }
+}
+
+// ---- STRIASNAPTOGGLE (LEDGER SR892): the `snap` transport button — the drag snap default on / off (named tail block) ----
+#[cfg(test)]
+mod striasnaptoggle_tests {
+    use super::*;
+
+    /// STRIASNAPTOGGLE M3: the transport row's second-to-last button is `snap` (before `help`), firing the face's `snap`
+    /// word; driving it (the `--do` road the click takes) turns the snap default off and names it on the message line
+    /// (the witness's errors list), a second press turns it back on.
+    #[test]
+    fn striasnaptoggle_button_before_help_drives_the_word() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let TetraNode::Button { id, label, action } = &row[row.len() - 2] else { panic!("not a button") };
+        assert_eq!((id.as_str(), label.as_str()), ("snap", "Snap"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "snap"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(f.snap_on());
+        assert_eq!(drive(&mut f, text), vec!["snap: off".to_string()]);
+        assert!(!f.snap_on());
+        assert_eq!(drive(&mut f, text), vec!["snap: on".to_string()]);
+        assert!(f.snap_on());
+        println!("striasnaptoggle witness: button {id} {label:?} -> snap: off, again -> snap: on");
     }
 }
