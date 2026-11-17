@@ -11153,3 +11153,91 @@ fn strialinkmore_face_alone_word() {
     assert_eq!((&face.state.timeline, face.state.undo_depth()), (&linked, 1), "link only: alone is no edit");
     println!("strialinkmore: VERBS[{}] alone; set {:?}", VERBS.len() - 2, face.state.set);
 }
+
+// ---- STRIAUNDOMORE (LEDGER SR973): pick an undo step on the history line (named tail block) ----
+
+/// SR934's three named commits (split, delete, slip+) on the synth face, labels on or off: (the face, the post-split
+/// timeline). The history line then reads `history: 3 slip+ | 2 delete | 1 split`.
+fn striaundomore_face(labels: bool) -> (stria::nle_face::Face, Timeline) {
+    use stria::nle_face::{EditorState, Face, PixelOrder};
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 144), PixelOrder::Rgba, labels);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    let split = face.state.timeline.clone();
+    assert!(face.verb("delete"));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("slip+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), 3);
+    (face, split)
+}
+
+/// The `history` word through `Face::on`, its `last_error` taken as `serve` takes it: the line it showed.
+fn striaundomore_history(face: &mut stria::nle_face::Face) -> String {
+    assert!(face.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "history".into() }));
+    let line = face.last_error.take().expect("the history line");
+    assert_eq!(line, "history: 3 slip+ | 2 delete | 1 split");
+    line
+}
+
+/// The point on the message row 2 px into byte `i` of `line` (painted at x 4 with the face's own labels style).
+fn striaundomore_at(face: &stria::nle_face::Face, line: &str, i: usize) -> (f64, f64) {
+    let l = face.layout().with_message(true);
+    assert_eq!(l.message_h, stria::nle_face::MESSAGE_H, "the 320x144 face has a message row");
+    let style = text_host::line::TextStyle::new(&["sans"], 11.0);
+    let x = 4.0 + style.shape(line).caret_x(line, i) as f64 + 2.0;
+    (x, (l.message_y + l.message_h / 2) as f64)
+}
+
+fn striaundomore_press(face: &mut stria::nle_face::Face, x: f64, y: f64) -> bool {
+    face.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 })
+}
+
+/// Rule: the history line stays on the message row after `last_error` is taken (the note); a move keeps it; a press on
+/// the entry `2 delete` runs SR934's `undo 2`, back to before "delete", named on the message line, and the note is gone.
+#[test]
+fn striaundomore_pick_lands_before_the_entry() {
+    let (mut face, split) = striaundomore_face(true);
+    let line = striaundomore_history(&mut face);
+    assert_eq!(face.message_text().as_deref(), Some(line.as_str()), "the note keeps the line on the row");
+    let (x, y) = striaundomore_at(&face, &line, line.find("2 delete").unwrap());
+    face.on(&bandy::SMessage::BrowserMouseMove(x, y, 0));
+    assert_eq!(face.message_text().as_deref(), Some(line.as_str()), "a move keeps the note");
+    assert!(striaundomore_press(&mut face, x, y));
+    let landed = face.last_error.take();
+    assert_eq!(landed.as_deref(), Some("undo 2: back to before \"delete\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (1, 2));
+    assert_eq!(face.state.timeline, split);
+    assert!(face.message_text().is_none_or(|m| !m.starts_with("history:")), "the pick clears the note");
+    println!("striaundomore: pick at x {x:.1} -> {landed:?}");
+}
+
+/// Rule: a press on the row off any entry (the `history: ` prefix) is taken and moves nothing; an error wins over the note;
+/// an Input word clears it; labels off there is no row, and a press clears the note and runs as before.
+#[test]
+fn striaundomore_pick_misses_and_clears() {
+    let (mut face, _split) = striaundomore_face(true);
+    let line = striaundomore_history(&mut face);
+    let top = face.state.timeline.clone();
+    let (x, y) = striaundomore_at(&face, &line, 2);
+    assert!(!striaundomore_press(&mut face, x, y), "on the prefix: taken, nothing to repaint");
+    assert_eq!((face.state.undo_depth(), face.state.timeline == top), (3, true));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.message_text().as_deref(), Some(line.as_str()), "the note stands");
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over the note");
+    face.last_error = None;
+    assert!(face.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "zoom+".into() }));
+    face.last_error = None;
+    assert!(face.message_text().is_none_or(|m| !m.starts_with("history:")), "an input clears the note");
+
+    let (mut off, _split) = striaundomore_face(false);
+    assert!(off.verb("history"));
+    off.last_error = None;
+    striaundomore_press(&mut off, 40.0, 60.0);
+    off.last_error = None;
+    assert_eq!(off.state.undo_depth(), 3, "no row: nothing is picked");
+    assert!(off.message_text().is_none_or(|m| !m.starts_with("history:")), "the press clears the note");
+}

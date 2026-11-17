@@ -200,7 +200,7 @@ pub struct Face {
     help: bool,
     help_query: Option<String>, // STRIAHELPSEARCH (SR874): `help <word>`'s query, the rows the help shows are THE help_rows filtered by it (file tail)
     proxy: Option<ProxyJob>, reel_paths: Vec<(String, std::path::PathBuf)>, proxy_queue: Vec<(timeline_core::SourceId, String)>, proxy_hold: Option<u64>, // STRIAPROXYOFF (SR915): the `proxy all` queue and the job's hold seam (file tail); STRIAPROXYMEDIA (SR882): the running proxy job and each reel's source file (file tail)
-    hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    hover_ticks: Option<((usize, usize), u16)>, loudness: Option<LoudnessJob>, note: Option<String>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     frame_saved: Option<std::path::PathBuf>, // STRIAEXPORTFRAME (SR830): the file the last `frame` wrote (file tail)
     peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
     tc: Option<TcUnit>, // STRIATIMECODEDISPLAY (SR872): the playhead readout's unit on the message row's left half (`None`: off, the default) (file tail)
@@ -219,14 +219,14 @@ pub struct Face {
     export_preset: Option<&'static crate::nle_export::ExportPreset>, preset_note: Option<String>, // STRIAEXPORTPRESETSMORE (SR948): the picked entry of THE preset table a bare `export` takes, and the `preset` word's success note (cleared by the next taken input) (file tail)
     roll_tool: bool, // STRIAROLLMORE (SR954): a trim-handle drag rolls its cut (file tail)
     slip_hold: Option<SlipHold>, // STRIASLIPVIEWMORE (SR946): a word slip / slide's pair held until the next action (file tail)
-    crop_drag: Option<view::CropDrag>, // STRIACROPMORE (SR960): the live crop drag on the preview picture (file tail)
+    crop_drag: Option<view::CropDrag>, // STRIACROPMORE (SR960): the live crop drag on the preview picture (file tail); STRIAUNDOMORE (SR973): the message row's note, read after last_error (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -234,7 +234,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2419,7 +2419,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
+        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -5323,7 +5323,7 @@ impl Face {
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
         if let Some(r) = self.undo_jump_verb(v) { return r; } if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
-            self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N));
+            self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N)); self.note = self.last_error.clone();
             return true;
         }
         let armed = self.state.arm_word(v);
@@ -6189,7 +6189,7 @@ impl Face {
         let arg = v.strip_prefix("history ")?.trim();
         let max = timeline_core::editor::UNDO_MAX;
         self.last_error = Some(match arg.parse::<usize>() {
-            Ok(n) if (1..=max).contains(&n) => self.state.history_line(n),
+            Ok(n) if (1..=max).contains(&n) => { let s = self.state.history_line(n); self.note = Some(s.clone()); s }
             _ => format!("history: {arg:?} is not a count 1..={max}"),
         });
         Some(true)
@@ -8034,4 +8034,74 @@ impl Face {
         if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
         Some(true)
     }
+}
+
+// ---- STRIAUNDOMORE (LEDGER SR973): pick an undo step on the history line (named tail block) ----
+// The history words (SR876 `history`, SR912 `history <n>`) also hold their line in `Face.note`, which `message_text` reads
+// after `last_error`, so the line stays on the message row after `serve` takes `last_error`. While the row shows that line
+// (labels on, the whole layout), a press (a click on a click-only surface) on an entry `<p> <word>` runs SR934's one jump
+// road, `undo <depth + 1 - p>`: back to before that entry, named on the message line. A press on the row off any entry is
+// taken and changes nothing. The next key / text / Input / select-all, or a press or click elsewhere, clears the note and
+// runs as before; moves, releases, scroll, zoom, resize and every other message keep it. Owed: NLE-UNDO-PICK-SPLIT (split
+// mode: the row is on the preview Surface the face does not take), NLE-UNDO-PICK-REDO (the line lists undo entries only).
+impl Face {
+    /// STRIAUNDOMORE (SR973): a pick on the noted history line (`Some(true)`), a press on the row off any entry
+    /// (`Some(false)`), an input that clears the note (then [`Face::on`] as before, `Some(true)`); `None`: no note, or a
+    /// message that keeps it.
+    fn history_pick(&mut self, msg: &SMessage) -> Option<bool> {
+        self.note.as_ref()?;
+        let at = match msg {
+            SMessage::BrowserButton { down: true, x, y, .. } => Some((*x, *y)),
+            SMessage::BrowserClick(x, y, _) if !self.buttons => Some((*x, *y)),
+            SMessage::Input { target, .. } if target == SURFACE => None,
+            SMessage::BrowserKey(_) | SMessage::BrowserText(_) | SMessage::BrowserSelectAll => None,
+            _ => return None,
+        };
+        if matches!(msg, SMessage::BrowserButton { .. }) {
+            self.buttons = true;
+        }
+        if let Some(r) = at.and_then(|(x, y)| self.history_pick_at(x, y)) {
+            return Some(r);
+        }
+        self.note = None;
+        self.on(msg);
+        Some(true)
+    }
+    /// STRIAUNDOMORE (SR973): the point (buffer pixels) on the message row while it shows the noted history line: the
+    /// entry under it undone to (`Some(true)`), or `Some(false)` off any entry; `None` off the row or no such line shown.
+    fn history_pick_at(&mut self, x: f64, y: f64) -> Option<bool> {
+        let style = self.labels.as_ref()?;
+        if self.split.is_some() {
+            return None;
+        }
+        let l = self.layout().with_message(true);
+        if l.message_h < MESSAGE_H || y < l.message_y as f64 || y >= (l.message_y + l.message_h) as f64 {
+            return None;
+        }
+        let text = self.note.clone()?;
+        if self.message_text().as_deref() != Some(text.as_str()) {
+            return None;
+        }
+        let b = style.shape(&text).hit(&text, (x - 4.0) as f32);
+        let depth = self.state.undo_depth();
+        let Some(p) = history_entry_at(&text, b).filter(|p| (1..=depth).contains(p)) else { return Some(false) };
+        self.note = None;
+        self.verb(&format!("undo {}", depth + 1 - p));
+        Some(true)
+    }
+}
+
+/// STRIAUNDOMORE (SR973): the stack position of the history line's entry whose bytes (its end included) hold byte `b` of
+/// `line` (`history: 3 split | 2 (unnamed) | 1 mark in`); `None` on the prefix, a separator, or a line with no entries.
+fn history_entry_at(line: &str, b: usize) -> Option<usize> {
+    let body = line.strip_prefix("history: ")?;
+    let mut start = line.len() - body.len();
+    for item in body.split(" | ") {
+        let end = start + item.len();
+        if (start..=end).contains(&b) {
+            return item.split(' ').next()?.parse().ok();
+        }
+        start = end + 3;
+    }
+    None
 }
