@@ -31,7 +31,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 
 ## B. Audio (nle.rs mix + nle_face.rs meters)
 13. STRIAAUDIOCROSSFADE — an audio transition (equal-power crossfade) at an audio cut: `Transition` on audio tracks (today video only per the `Track.transitions` doc); `mix_run` applies the curve; EDL `* UNA XFADE` EXISTS (edl.rs :219: measure what it carries today).
-14. STRIAPAN — per-clip pan (`pan_cq8: i8`, -128..=127) applied in `mix_into` (constant power); verb `pan <-1..1>`; EDL `* UNA PAN`.
+14. [SR861 started] STRIAPAN — per-clip pan (`pan_cq8: i8`, -128..=127) applied in `mix_into` (constant power); verb `pan <-1..1>`; EDL `* UNA PAN`.
 15. STRIATRACKGAIN — per-track gain (`Track.gain_cdb`) multiplied into every clip's gain in `mix_run`; verb `track-gain`; EDL `* UNA TGAIN`.
 16. STRIAMETERSCLIPHOLD — the meters hold the peak for 2 s and show a red clip indicator that stays until clicked (`paint_meters` :1350; `MeterLevel`).
 17. STRIAAUDIOSCRUB — scrubbing the ruler plays the audio under the playhead (a one-frame PCM burst per scrub step through the existing play road: measure the Player / audio sink).
