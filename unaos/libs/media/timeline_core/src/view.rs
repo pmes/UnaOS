@@ -2843,7 +2843,7 @@ impl Drag {
     /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing),
     /// its undo entry named by the drag's kind ([`DragKind::word`]).
     pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
-        let armed = self.kind.word().map_or(false, |w| st.arm_word(w));
+        let armed = self.word().map_or(false, |w| st.arm_word(w)); // STRIAHISTORYRIPPLE (SR9072): the one word fn of a drag (file tail)
         let r = self.finish_unnamed(st);
         st.disarm_word(armed);
         r
@@ -6154,5 +6154,18 @@ mod striakwaveform_tests {
             }
             assert_eq!(fed, peaks_of(rate, ch, &pcm, PEAKS_PER_SEC).buckets, "rate {rate}");
         }
+    }
+}
+
+// ---- STRIAHISTORYRIPPLE (LEDGER SR9072): the drag's one word fn (named tail block) ----
+// [`Drag::finish`] arms the word [`Drag::word`] gives: today the kind's word ([`DragKind::word`]). This is the one place a
+// drag's state beyond its kind names the entry: when SR850's `ripple` field folds, its arm is
+// `DragKind::TrimIn | DragKind::TrimOut if self.ripple => Some(if self.kind == DragKind::TrimIn { "drag ripple in" } else { "drag ripple out" })`
+// (owed NLE-UNDO-HISTORY-RIPPLE-DRAG). A set's clip count is added by `EditorState::arm_word` (`counted_word`).
+
+impl Drag {
+    /// The word this drag names its undo entry with; `None` for the kinds that commit nothing (marquee, scrub).
+    pub fn word(&self) -> Option<&'static str> {
+        self.kind.word()
     }
 }

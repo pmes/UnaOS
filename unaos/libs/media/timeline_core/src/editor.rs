@@ -2206,7 +2206,7 @@ impl EditorState {
         if self.hist.word.is_some() {
             return false;
         }
-        self.hist.word = Some(clip_word(v));
+        self.hist.word = Some(clip_word(&self.counted_word(v))); // STRIAHISTORYRIPPLE (SR9072): a set edit's word carries its clip count (file tail)
         true
     }
     /// Drop the armed word when this caller armed it ([`EditorState::arm_word`]'s result).
@@ -5330,5 +5330,27 @@ impl EditorState {
             }
             None => Err(EditError::XKey),
         })
+    }
+}
+
+// ---- STRIAHISTORYRIPPLE (LEDGER SR9072): a set edit's undo entry names its clip count (named tail block) ----
+// The words in [`SET_WORDS`] run their op over the whole selected set (`ripple_delete_many`, `lift_many`, `move_many` /
+// `move_pair`, a set body drag's `move_set`); every other word acts on the primary only. SR876's ONE name store
+// ([`EditorState::arm_word`]) arms such a word as `delete (3 clips)` when the set holds more than one clip, so the history
+// line reads what was done; a set of one keeps the bare word. Read at arm time: the set the op is about to run over.
+
+/// The words whose op runs over the whole selected set.
+pub const SET_WORDS: [&str; 5] = ["delete", "lift", "nudge-", "nudge+", "drag move"];
+
+impl EditorState {
+    /// `v` as an undo entry's word: `"<v> (<n> clips)"` when `v` is one of [`SET_WORDS`] and the set holds `n > 1`
+    /// clips, else `v` unchanged.
+    pub fn counted_word(&self, v: &str) -> alloc::string::String {
+        let n = self.set.len();
+        if n > 1 && SET_WORDS.contains(&v) {
+            alloc::format!("{v} ({n} clips)")
+        } else {
+            alloc::string::String::from(v)
+        }
     }
 }

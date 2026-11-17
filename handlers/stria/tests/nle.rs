@@ -13991,3 +13991,31 @@ fn striakwaveform_wave_fill_scans_through_peaks_want() {
     assert_eq!(face.wave_scans() as usize, want.len(), "a second paint scans nothing");
     println!("striakwaveform: face scans={} by peaks_want {want:?}", face.wave_scans());
 }
+
+// ---- STRIAHISTORYRIPPLE (LEDGER SR9072): a set edit's undo entry names its clip count (named tail block) ----
+
+/// A body drag of a two-clip set is `drag move (2 clips)` (`Drag::finish` arms `Drag::word` through `arm_word`, which
+/// counts the set); the face's `delete` over that set is `delete (2 clips)`; SR934's `undo 1` names the counted entry.
+#[test]
+fn striahistoryripple_face_set_drag_and_delete() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    face.state.select_add(0, 2).unwrap();
+    assert_eq!(face.state.set.len(), 2);
+    let l = face.layout();
+    let (x, y) = l.point(0, 15);
+    nle3eslipdrag_drag(&mut face, x, y, 40.0, 0);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 drag move (2 clips)"));
+    assert_eq!(face.state.set.len(), 2, "the set follows its clips");
+    assert!(face.verb("delete"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("history"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("history: 2 delete (2 clips) | 1 drag move (2 clips)"));
+    assert!(face.verb("undo 1"));
+    assert_eq!(face.last_error.take().as_deref(), Some("undo 1: back to before \"delete (2 clips)\""));
+    assert_eq!(face.state.undo_depth(), 1);
+    println!("striahistoryripple: {line:?}");
+}
