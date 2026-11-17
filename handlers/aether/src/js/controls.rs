@@ -648,13 +648,14 @@ fn input_type_set(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 }
 
 /// The `type` attribute's change steps (§4.10.5): value-mode transitions, re-sanitization, and the
-/// selection reset when the selection APIs start to apply. Called by `dom::attribute_changed`.
-pub fn attribute_changed(el: usize, local_name: &str, old: &Option<String>, new: &Option<String>) {
+/// selection reset when the selection APIs start to apply, and the file selection dropped when the File Upload state is left (AETHERFILETYPECHANGE SR783). Called by `dom::attribute_changed`.
+pub fn attribute_changed(vm: &mut Vm, el: usize, local_name: &str, old: &Option<String>, new: &Option<String>) {
     if local_name == "type" && local(el) == "input" {
         let (from, to) = (type_from(old.as_deref()), type_from(new.as_deref()));
         if from == to {
             return;
         }
+        if from == "file" { set_files(vm, el, Vec::new()); } // AETHERFILETYPECHANGE (SR783): leaving the File Upload state drops the selection (Chromium destroys FileInputType and its FileList); SR715's one writer, no event
         let was_selectable = matches!(from, "text" | "search" | "url" | "tel" | "password");
         let (fm, tm) = (mode(from), mode(to));
         if fm == Mode::Value && matches!(tm, Mode::Default | Mode::DefaultOn) {

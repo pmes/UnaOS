@@ -1381,7 +1381,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or(if tag == "a" { (0, 0, 238) } else { parent.color });
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else { c }));
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1410,13 +1410,13 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             };
             let side = |i: usize| paint.border.and_then(|b| b[i]);
             let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
-            let lh = if me.line_height <= 0.0 { "normal".to_string() } else { px(me.line_height * me.font_size) };
+            let lh = line_height_used(&paint, me.line_height, me.font_size, layout_core::FontSel { family: me.family, weight: me.weight, italic: me.italic, ..Default::default() }).map(px).unwrap_or_else(|| "normal".to_string());
             let values = [
                 display.to_string(),
                 position.to_string(),
                 rgb(me.color),
                 paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
-                px(me.font_size),
+                px(font_size_used(&paint, me.font_size)),
                 me.weight.to_string(),
                 if me.italic { "italic" } else { "normal" }.to_string(),
                 crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
@@ -1717,4 +1717,29 @@ mod tests {
     }
 
 
+}
+
+// ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+/// AETHERCSSOMFONTSIZEREL (SR819): the computed `font-size` is the size the element is laid out and painted at:
+/// `PaintStyle::used_font_size`, which layout_core's prepass writes per element from `computed_font_size` (em, %,
+/// smaller / larger, rem and `font: inherit`'s parent-relative road against the parent's used size) and the painter
+/// reads. `computed_report` passes the node's paint record from the same flushed tree, so nothing is recomputed; an
+/// element without a laid-out record (no box) keeps the report's specified / tag-default chain.
+fn font_size_used(paint: &crate::layout::PaintStyle, specified: f32) -> f32 {
+    paint.used_font_size.unwrap_or(specified)
+}
+
+// ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+/// AETHERCSSOMLINEHEIGHTUSED (SR824): the resolved `line-height` (CSSOM: `normal` if the computed value is `normal`,
+/// else the used value). `mult` is the inherited `PaintStyle::line_height` in layout_core's sign encoding (css.rs
+/// `line-height` arm: > 0 a <number>, < 0 -(px) for a length / %, 0 `normal`); em and % were already replayed against
+/// the element's own used font by `reresolve_font_relative`. `None` is the keyword `normal`; otherwise the px the line
+/// box takes: the layout's own resolver `Fonts::line_height` over SR819's used font size.
+fn line_height_used(paint: &crate::layout::PaintStyle, mult: f32, specified: f32, sel: layout_core::FontSel) -> Option<f32> {
+    if mult == 0.0 {
+        return None;
+    }
+    Some(layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult))
 }
