@@ -2277,7 +2277,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL)
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, crate::video::keymap::shift_held(), false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL) // STRIAKMULTISEL (LEDGER SR9020): Shift adds to the set (file tail)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
@@ -2320,7 +2320,7 @@ pub fn edit_drag_end(path: &str) -> Option<u64> {
             }
             _ => {}
         }
-        if !d.moved() {
+        if !d.moved() { if still_toggle(&d, st) { return None; } // STRIAKMULTISEL (LEDGER SR9020): a shift still-press on a member takes it out (file tail)
             serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
             return None;
         }
@@ -3053,4 +3053,23 @@ fn edit_audio_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64)
     let Some(c) = st.timeline.tracks.get(ti).and_then(|t| t.clips.get(ci)) else { return };
     let tg = st.timeline.tracks[ti].gain_cdb;
     serial_println!("[nle] edit audio {} track={} clip={} gain={} track_gain={} heard={} at={}", verb, ti, ci, c.gain_cdb, tg, st.timeline.heard_cdb(ti, c.gain_cdb), at);
+}
+
+// ---- STRIAKMULTISEL (LEDGER SR9020): the Player's shift-press and still-release toggle (named tail block) ----
+// handlers.md §5 NLE5b's NLE-MULTISELECT-KERNEL. [`edit_press`] hands the kernel's ONE modifier state
+// (`keymap::shift_held`, the latest HID report's Shift, read at the press as Quarry's drag and the window resize read it)
+// to `view::Drag::begin_with`, so a shift-press adds the clip to the set (or arms the toggle on a member) and a shift
+// marquee adds, the host face's rules. A release where the press went down runs [`still_toggle`]: timeline_core's
+// `Drag::release_still` (SR950) takes a toggled member out of the set: view-only, no commit, no save, no seek (the band
+// repaints through `BAND_DIRTY`, stored at the top of [`edit_drag_end`]). Wire: `[nle] drag toggle track=<n> clip=<n>
+// selected=<n>`. Player side unexercised (NLE-MULTISELECT-KERNEL-WITNESS owed).
+
+/// A still release of a shift-press on a set member: the member leaves the set (`Drag::release_still`); `true` when the
+/// set changed (the caller returns: nothing to commit or save).
+fn still_toggle(d: &timeline_core::view::Drag, st: &mut timeline_core::editor::EditorState) -> bool {
+    if !d.release_still(st) {
+        return false;
+    }
+    serial_println!("[nle] drag toggle track={} clip={} selected={}", d.track, d.idx, st.set.len());
+    true
 }
