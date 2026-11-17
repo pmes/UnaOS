@@ -3103,7 +3103,7 @@ impl Face {
 /// STRIALOUDNESSREADOUT (SR866): a running measure, the export door's shape: a thread over clones of the timeline and
 /// the shared sources (no lock), joined on the face clock ([`Face::loudness_tick`]).
 struct LoudnessJob {
-    handle: Option<std::thread::JoinHandle<Result<Option<f64>, RenderError>>>,
+    handle: Option<std::thread::JoinHandle<Result<Option<crate::nle::LoudnessReading>, RenderError>>>, // STRIALOUDNESSNEXT (SR995): all three readings (file tail)
     /// The marked range measured (`None`: the whole timeline), named in the line.
     range: Option<std::ops::Range<i64>>, watch: crate::nle::LoudnessWatch, total: u64, shown: String, // STRIALOUDNESSCANCEL (SR903): the stop flag and ticks done, the range's ticks, the progress line last put up (file tail)
 }
@@ -3127,7 +3127,7 @@ impl Face {
         }
         let span = range.clone().unwrap_or(0..self.state.timeline.end());
         let (tl, sources) = (self.state.timeline.clone(), Arc::clone(&self.sources)); let (watch, total) = (crate::nle::LoudnessWatch::new(&span), (span.end - span.start).max(0) as u64); let w = watch.clone(); // STRIALOUDNESSCANCEL (SR903)
-        match std::thread::Builder::new().name("nle-loudness".into()).spawn(move || crate::nle::loudness_watched(&tl, span, &sources, Some(w))) {
+        match std::thread::Builder::new().name("nle-loudness".into()).spawn(move || crate::nle::loudness_reading(&tl, span, &sources, Some(w))) { // STRIALOUDNESSNEXT (SR995): the measure with its range and true peak (file tail)
             Ok(h) => self.loudness = Some(LoudnessJob { handle: Some(h), range, watch, total, shown: String::new() }),
             Err(e) => self.last_error = Some(format!("loudness: {e}")),
         }
@@ -3156,7 +3156,7 @@ impl Face {
     fn finish_loudness(&mut self) {
         let Some(mut j) = self.loudness.take() else { return };
         self.last_error = Some(match j.handle.take().map(|h| h.join()) {
-            Some(Ok(_)) if j.watch.cancel.load(Relaxed) => "loudness: cancelled".to_string(), Some(Ok(r)) => loudness_line(&r, &j.range), // STRIALOUDNESSCANCEL (SR903): the job's own flag names the cancel, as the export's
+            Some(Ok(_)) if j.watch.cancel.load(Relaxed) => "loudness: cancelled".to_string(), Some(Ok(r)) => loudness_reading_line(&r, &j.range), // STRIALOUDNESSNEXT (SR995): the range and true peak after the LUFS (file tail); STRIALOUDNESSCANCEL (SR903): the job's own flag names the cancel, as the export's
             _ => "loudness: the measure thread panicked".to_string(),
         });
     }
@@ -3214,5 +3214,18 @@ impl Face {
         let j = self.loudness.as_ref()?;
         let done = j.watch.done.load(Relaxed);
         Some(if j.total == 0 { 0.0 } else { (done.min(j.total) as f64 / j.total as f64).min(1.0) })
+    }
+}
+
+// ---- STRIALOUDNESSNEXT (LEDGER SR995): the loudness range and true peak on the loudness line (named tail block) ----
+
+/// STRIALOUDNESSNEXT (SR995): the finished measure's line: [`loudness_line`] of its LUFS with `, LRA <x.x> LU, true peak
+/// <y.y> dBTP` right after `LUFS integrated` (before the ticks note and the floor's gate phrase); no audio and a
+/// refusal read exactly as [`loudness_line`].
+pub fn loudness_reading_line(r: &Result<Option<crate::nle::LoudnessReading>, RenderError>, range: &Option<std::ops::Range<i64>>) -> String {
+    match r {
+        Ok(Some(x)) => loudness_line(&Ok(Some(x.lufs)), range).replacen("LUFS integrated", &format!("LUFS integrated, LRA {:.1} LU, true peak {:.1} dBTP", x.range_lu, x.true_peak_db), 1),
+        Ok(None) => loudness_line(&Ok(None), range),
+        Err(e) => loudness_line(&Err(e.clone()), range),
     }
 }

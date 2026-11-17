@@ -70,7 +70,7 @@ pub trait RenderSink {
     fn stop(&self) -> bool {
         false
     }
-    /// STRIALOUDNESSMORE (SR961): false when the sink does not want the video frame at output tick `out_t`: [`render`] asks it once per video step, after [`RenderSink::stop`], and then skips that step's decode (no `frame` call, nothing added to [`RenderReport::frames`]).
+    /// STRIALOUDNESSMORE (SR961): false when the sink does not want the video frame at output tick `out_t`: [`render`] asks it once per video step, after [`RenderSink::stop`], and then skips that step's decode (no `frame` call, nothing added to [`RenderReport::frames`]). STRIALOUDNESSNEXT (SR995): [`render`] also asks it for the FIRST video step when no reel sizes the frame, and refuses [`RenderError::NoSize`] only on a true (a sink declining every frame renders its audio under an empty video track).
     fn frame_wanted(&mut self, _out_t: i64) -> bool { true }
     /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
     fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
@@ -508,7 +508,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             _ => {}
         }
     }
-    if r.width == 0 && steps.iter().any(|s| s.kind == Kind::Video) {
+    if r.width == 0 && steps.iter().find(|s| s.kind == Kind::Video).is_some_and(|s| sink.frame_wanted(s.out_t)) { // STRIALOUDNESSNEXT (SR995): only a sink that wants the first video frame is refused (file tail)
         return Err(RenderError::NoSize);
     }
     if sources.audio_rate > 0 {
@@ -526,7 +526,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
     let mut run_of = runs.iter(); let mut stand_in_audio: Vec<SourceId> = Vec::new(); // NLESTANDINAUDIOEDITOR (SR713): the reels whose audio drew the silent stand-in
     for s in &steps {
-        if sink.stop() { r.stopped = Some(s.out_t); break; } if s.kind == Kind::Video && !sink.frame_wanted(s.out_t) { continue; } // STRIALOUDNESSMORE (SR961): a sink that declines the frame costs no decode; NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
+        if sink.stop() { r.stopped = Some(s.out_t); break; } if s.kind == Kind::Video && !sink.frame_wanted(s.out_t) { continue; } if s.kind == Kind::Video && w == 0 { return Err(RenderError::NoSize); } // STRIALOUDNESSNEXT (SR995): a wanted frame with nothing sized is refused at its step; STRIALOUDNESSMORE (SR961): a sink that declines the frame costs no decode; NLE5DEXPORTSTOP (SR705): the sink said stop: no decode past this step
         match (s.kind, s.src) {
             (Kind::Video, None) => {
                 vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
@@ -1048,9 +1048,7 @@ impl LoudnessSink {
 /// STRIALOUDNESSCANCEL (SR903): [`loudness`] with an optional watch: progress through `done`, a stop at the next step
 /// once `cancel` is set (the partial range's measure is returned; the face names it cancelled by its own flag).
 pub fn loudness_watched(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, watch: Option<LoudnessWatch>) -> Result<Option<f64>, RenderError> {
-    let mut sink = LoudnessSink { l: None, watch };
-    render(tl, range, sources, &mut sink)?;
-    Ok(sink.l.map(|l| l.integrated()))
+    Ok(loudness_reading(tl, range, sources, watch)?.map(|r| r.lufs)) // STRIALOUDNESSNEXT (SR995): the one measure body (file tail)
 }
 
 // ---- STRIALOUDNESSMORE (LEDGER SR961): the measure decodes no video (named tail block) ----
@@ -1059,3 +1057,30 @@ pub fn loudness_watched(tl: &Timeline, range: std::ops::Range<i64>, sources: &So
 // audio path (`mix_run` over its own `auds` slots) never reads the video state, so the PCM, and the LUFS, are unchanged.
 // Every other sink keeps the default `true`. Owed: NLE-LOUDNESS-AUDIOONLY-NOSIZE (render's `NoSize` check, before the step
 // loop, still refuses a measure whose video steps have no sized reel).
+
+// ---- STRIALOUDNESSNEXT (LEDGER SR995): an audio-only measure under an empty video track; loudness range and true peak (named tail block) ----
+// STRIALOUDNESSNEXT (SR995): `render`'s `NoSize` refusal (before the step loop) now asks the sink's `frame_wanted` for
+// the first video step, so a sink that declines it (the loudness sink declines every frame, SR961) renders its audio
+// under a video track holding only gaps; a sink that declined the first and wants a later frame with nothing sized is
+// refused at that step (never a 0x0 frame). Every frame-taking sink (export, preview, the meters) is refused as before.
+// The measure reads, off the one `Loudness` the sink fed, the integrated loudness, the EBU 3342 loudness range and the
+// BS.1770 true peak (audio_core meter.rs); `loudness` / `loudness_watched` keep their LUFS-only answer.
+
+/// STRIALOUDNESSNEXT (SR995): one measure's three readings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoudnessReading {
+    /// BS.1770 integrated loudness, LUFS.
+    pub lufs: f64,
+    /// EBU Tech 3342 loudness range, LU.
+    pub range_lu: f64,
+    /// BS.1770 true peak, dBTP.
+    pub true_peak_db: f64,
+}
+
+/// STRIALOUDNESSNEXT (SR995): THE measure body: [`loudness_watched`]'s render through the PCM-only sink, read as all
+/// three values; `None` when the range sent no PCM.
+pub fn loudness_reading(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, watch: Option<LoudnessWatch>) -> Result<Option<LoudnessReading>, RenderError> {
+    let mut sink = LoudnessSink { l: None, watch };
+    render(tl, range, sources, &mut sink)?;
+    Ok(sink.l.map(|l| LoudnessReading { lufs: l.integrated(), range_lu: l.range_lu(), true_peak_db: l.true_peak_db() }))
+}

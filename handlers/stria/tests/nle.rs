@@ -3684,7 +3684,7 @@ fn strialoudnessreadout_face_line_is_the_render_measure() {
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     assert!(face.loudness_pending());
     assert!(face.wait_loudness());
-    let line = stria::nle_face::loudness_line(&Ok(Some(want)), &None);
+    let line = stria::nle_face::loudness_reading_line(&stria::nle::loudness_reading(&tl, 0..tl.end(), &synth_fixture().1, None), &None); // STRIALOUDNESSNEXT (SR995): the line carries the range and true peak
     assert_eq!(face.last_error.take(), Some(line.clone()));
     assert!(!face.loudness_pending());
     assert_eq!((face.state.undo_depth(), face.dirty(), &face.state.timeline), (undo, false, &tl));
@@ -3699,11 +3699,11 @@ fn strialoudnessreadout_marked_range_and_refusals() {
     let (tl2, src2) = synth_fixture();
     let mut face = nlefaceexport_face(tl, src);
     face.state.set_marks((Some(5), Some(30))).unwrap();
-    let want = stria::nle::loudness(&tl2, 5..30, &src2);
+    let want = stria::nle::loudness_reading(&tl2, 5..30, &src2, None); // STRIALOUDNESSNEXT (SR995): all three readings
     assert!(face.verb("loudness"));
     assert!(face.wait_loudness());
     let line = face.last_error.take().expect("the line");
-    assert_eq!(line, stria::nle_face::loudness_line(&want, &Some(5..30)));
+    assert_eq!(line, stria::nle_face::loudness_reading_line(&want, &Some(5..30))); // STRIALOUDNESSNEXT (SR995)
     assert!(line.ends_with(" ticks 5..30"), "{line}");
     let end = face.state.timeline.end();
     face.state.set_marks((Some(end + 5), Some(end + 9))).unwrap();
@@ -3791,7 +3791,7 @@ fn strialoudnesscancel_progress_line() {
     let (tl2, src2) = synth_fixture();
     let mut face = nlefaceexport_face(tl, src);
     assert!(face.verb("loudness"));
-    let finished = stria::nle_face::loudness_line(&stria::nle::loudness(&tl2, 0..tl2.end(), &src2), &None);
+    let finished = stria::nle_face::loudness_reading_line(&stria::nle::loudness_reading(&tl2, 0..tl2.end(), &src2, None), &None); // STRIALOUDNESSNEXT (SR995)
     if face.loudness_tick() {
         let line = face.last_error.take().expect("a line");
         assert!(line.starts_with("loudness: measuring ") || line == finished, "{line}");
@@ -3881,3 +3881,98 @@ fn strialoudnessmore_band_follows_the_measure() {
     println!("strialoudnessmore: band fraction {f:.3} while running, none after");
 }
 
+// ---- STRIALOUDNESSNEXT (LEDGER SR995): an audio-only measure under an empty video track; range and true peak on the line (named tail block) ----
+
+/// NLE1's fixture with every video track's clips removed: the video track holds only gaps, the audio track its clips.
+fn strialoudnessnext_gap_video() -> (Timeline, Sources) {
+    let (mut tl, src) = synth_fixture();
+    for t in tl.tracks.iter_mut().filter(|t| t.kind == Kind::Video) {
+        t.clips.clear();
+    }
+    (tl, src)
+}
+
+/// Rule: under a video track of gaps the measure reads its audio: the LUFS of exactly the PCM a render of the audio
+/// tracks alone mixes, the count moving inside the range; a frame-taking sink over the same timeline is still refused
+/// `NoSize`.
+#[test]
+fn strialoudnessnext_empty_video_track_measures_the_audio() {
+    let (tl, src) = strialoudnessnext_gap_video();
+    let range = 0..tl.end();
+    assert!(schedule(&tl, range.clone(), &src).unwrap().iter().any(|s| s.kind == Kind::Video), "the gap track still schedules video steps");
+    let mut audio = tl.clone();
+    audio.tracks.retain(|t| t.kind == Kind::Audio);
+    let mut pcm = StriaLoudnessPcm::default();
+    render(&audio, range.clone(), &src, &mut pcm).unwrap();
+    let (rate, ch) = pcm.fmt.expect("the fixture has audio");
+    let want = gneiss_pal::dsp::audio::meter::integrated_lufs(&pcm.pcm, ch as usize, rate);
+    assert_eq!(stria::nle::loudness(&tl, range.clone(), &src).unwrap(), Some(want));
+    let w = stria::nle::LoudnessWatch::new(&range);
+    let got = stria::nle::loudness_reading(&tl, range.clone(), &src, Some(w.clone())).unwrap().expect("a reading");
+    assert_eq!(got.lufs, want);
+    let done = w.done.load(std::sync::atomic::Ordering::Relaxed);
+    let total = (range.end - range.start) as u64;
+    assert!(done > 0 && done <= total, "done {done} of {total}");
+    let mut taker = StriaLoudnessPcm::default();
+    assert!(matches!(render(&tl, range, &src, &mut taker), Err(stria::nle::RenderError::NoSize)));
+    println!("strialoudnessnext: gap video track -> {want:.2} LUFS, done {done}/{total}");
+}
+
+/// A sink that declines only the first frame it is asked for, then wants every one.
+#[derive(Default)]
+struct StriaLoudnessNextLate {
+    asked: usize,
+    frames: usize,
+}
+
+impl stria::nle::RenderSink for StriaLoudnessNextLate {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {
+        self.frames += 1;
+    }
+    fn pcm(&mut self, _out_t: i64, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
+    fn frame_wanted(&mut self, _out_t: i64) -> bool {
+        self.asked += 1;
+        self.asked > 1
+    }
+}
+
+/// Rule: a sink that declines the first video frame passes the size check, but the first frame it wants with nothing
+/// sized is refused `NoSize` at its step: no 0x0 frame is ever handed out.
+#[test]
+fn strialoudnessnext_late_wanted_frame_still_refused() {
+    let (tl, src) = strialoudnessnext_gap_video();
+    let mut sink = StriaLoudnessNextLate::default();
+    assert!(matches!(render(&tl, 0..tl.end(), &src, &mut sink), Err(stria::nle::RenderError::NoSize)));
+    assert_eq!(sink.frames, 0);
+    assert!(sink.asked >= 2, "asked {}", sink.asked);
+    println!("strialoudnessnext: late wanted frame refused after {} asks", sink.asked);
+}
+
+/// Rule: the face's finished line carries the range and the true peak after the LUFS, the ticks note last; under a gap
+/// video track it reads the audio (not the NoSize words); the readings agree with audio_core's meter over the PCM.
+#[test]
+fn strialoudnessnext_face_line_reads_range_and_peak() {
+    let (tl, src) = strialoudnessnext_gap_video();
+    let (tl2, src2) = strialoudnessnext_gap_video();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("loudness"));
+    assert!(face.wait_loudness());
+    let line = face.last_error.take().expect("the line");
+    let want = stria::nle::loudness_reading(&tl2, 0..tl2.end(), &src2, None);
+    assert_eq!(line, stria::nle_face::loudness_reading_line(&want, &None));
+    let r = want.unwrap().expect("a reading");
+    assert!(line.contains(&format!("LUFS integrated, LRA {:.1} LU, true peak {:.1} dBTP", r.range_lu, r.true_peak_db)), "{line}");
+    assert!(!line.contains("no video source"), "{line}");
+    let mut audio = tl2.clone();
+    audio.tracks.retain(|t| t.kind == Kind::Audio);
+    let mut pcm = StriaLoudnessPcm::default();
+    render(&audio, 0..tl2.end(), &src2, &mut pcm).unwrap();
+    let (rate, ch) = pcm.fmt.expect("audio");
+    let mut m = gneiss_pal::dsp::audio::meter::Loudness::new(rate, ch as usize);
+    m.push(&pcm.pcm);
+    assert_eq!((r.range_lu, r.true_peak_db), (m.range_lu(), m.true_peak_db()));
+    let marked = stria::nle_face::loudness_reading_line(&Ok(Some(r)), &Some(5..30));
+    assert!(marked.ends_with(" ticks 5..30"), "{marked}");
+    assert_eq!(stria::nle_face::loudness_reading_line(&Ok(None), &None), "loudness: no audio in the range");
+    println!("strialoudnessnext: {line}");
+}
