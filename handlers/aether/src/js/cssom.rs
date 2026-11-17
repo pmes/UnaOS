@@ -947,6 +947,10 @@ struct Flushed {
     /// pins to the viewport — its rects do not move with the scroll on those axes (applied at read time,
     /// [`client_rect`]: this cache is keyed by DOM version, not by scroll).
     pinned: HashMap<NodeId, (bool, bool)>,
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): every element in a `position: sticky` box's subtree, with its (outermost) sticky
+    /// root and the root's parent document origin — the root's hold for the current scroll is applied at read time
+    /// ([`client_rect`] through `render::placed_origin`), like `pinned`.
+    held: HashMap<NodeId, (taffy::NodeId, (f32, f32))>,
 }
 
 thread_local! {
@@ -971,8 +975,8 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
             let mut tree = crate::layout::build_tree(&doc, w, h);
             crate::css::apply_stylesheets(&mut tree, &sheets);
             let report = crate::css::computed_report(&tree);
-            let (boxes, pinned) = element_boxes(&tree);
-            Flushed { version, tree, report, boxes, pinned }
+            let (boxes, pinned, held) = element_boxes(&tree);
+            Flushed { version, tree, report, boxes, pinned, held }
         }
     };
     let r = f(&flushed);
@@ -985,10 +989,11 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
 /// fixed box takes its origin from `LayoutTree::fixed_at` (the one viewport-origin map the painter reads) on each
 /// pinned axis, and its subtree inherits the pin.
 #[allow(clippy::type_complexity)]
-fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>) {
+fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>, HashMap<NodeId, (taffy::NodeId, (f32, f32))>) {
     use crate::layout::inline::Frag;
     let mut out: HashMap<NodeId, Vec<(f32, f32, f32, f32)>> = HashMap::new();
     let mut pinned: HashMap<NodeId, (bool, bool)> = HashMap::new();
+    let (mut held, mut hold_of) = (HashMap::new(), HashMap::new()); // AETHERCSSOMBOUNDINGSTICKY (SR1144)
     let mut work: Vec<(taffy::NodeId, f32, f32, (bool, bool))> = vec![(tree.root_node, 0.0, 0.0, (false, false))];
     let elem_of = |t: taffy::NodeId| tree.node_map.get(&t).filter(|n| n.is_element()).map(|n| n.id());
     // The root's own location.
@@ -997,6 +1002,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
     }
     while let Some((t, mut x, mut y, mut pin)) = work.pop() {
         let Ok(l) = tree.taffy.layout(t) else { continue };
+        let hold = sticky_hold(tree, t, x, y, l, pin, tree.fixed_at.contains_key(&t), &mut hold_of); // AETHERCSSOMBOUNDINGSTICKY (SR1144): before the fixed origin replaces (x, y)
         if let Some(&(fx, fy)) = tree.fixed_at.get(&t) {
             if let Some(fx) = fx {
                 x = fx;
@@ -1009,6 +1015,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
         }
         if let Some(id) = elem_of(t) {
             out.entry(id).or_default().push((x, y, l.size.width, l.size.height));
+            if let Some(hd) = hold { held.insert(id, hd); }
             if pin != (false, false) {
                 pinned.insert(id, pin);
             }
@@ -1021,6 +1028,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
                     Frag::Box { node, x: fx, y: fy, w, h, .. } => {
                         if let Some(id) = elem_of(*node) {
                             out.entry(id).or_default().push((cx + fx, cy + fy, *w, *h));
+                            if let Some(hd) = hold { held.insert(id, hd); }
                             if pin != (false, false) {
                                 pinned.insert(id, pin);
                             }
@@ -1046,7 +1054,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
             }
         }
     }
-    (out, pinned)
+    (out, pinned, held)
 }
 
 /// AETHERFIT2 (SR191): a document-space rect of element `id` in viewport coordinates — the scroll is subtracted
@@ -1055,6 +1063,7 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32,
 fn client_rect(f: &Flushed, id: NodeId, r: (f32, f32, f32, f32), scroll: (f64, f64)) -> (f64, f64, f64, f64) {
     let (px, py) = f.pinned.get(&id).copied().unwrap_or((false, false));
     let (x, y, w, h) = r;
+    let (x, y) = sticky_held_at(f, id, x, y, scroll);
     (x as f64 - if px { 0.0 } else { scroll.0 }, y as f64 - if py { 0.0 } else { scroll.1 }, w as f64, h as f64)
 }
 
@@ -2787,4 +2796,47 @@ mod cssom_place_tests {
             assert_eq!(shorthands_of(j), vec![sh]);
         }
     }
+}
+
+// ---- AETHERCSSOMBOUNDINGSTICKY (LEDGER SR1144): a stuck sticky box's CSSOM rects read at its held place (named tail block) ----
+
+/// AETHERCSSOMBOUNDINGSTICKY (SR1144): the sticky root that moves box `t` (border-box origin (`x`, `y`) in document space,
+/// before any fixed origin), and the root's parent document origin (`placed_origin`'s `abs`): a fixed box drops the hold
+/// (the painter places it against the viewport); otherwise the parent's hold is inherited (the painter places
+/// descendants from the parent's placed origin, so the OUTERMOST sticky root owns its subtree: an inner root's own
+/// extra hold is owed AETHER-CSSOM-BOUNDING-STICKY-NESTED); otherwise a sticky box outside any pinned subtree starts one.
+/// Records `t`'s hold in `hold_of` for its children (the walk pops a parent before its children).
+#[allow(clippy::too_many_arguments)]
+fn sticky_hold(
+    tree: &crate::layout::LayoutTree,
+    t: taffy::NodeId,
+    x: f32,
+    y: f32,
+    l: &taffy::Layout,
+    pin: (bool, bool),
+    fixed: bool,
+    hold_of: &mut HashMap<taffy::NodeId, (taffy::NodeId, (f32, f32))>,
+) -> Option<(taffy::NodeId, (f32, f32))> {
+    if fixed {
+        return None;
+    }
+    let inherited = tree.taffy.parent(t).and_then(|p| hold_of.get(&p).copied());
+    let sticky = pin == (false, false) && tree.paint_map.get(&t).and_then(|p| p.position_kind) == Some(4);
+    let hold = inherited.or(if sticky { Some((t, (x - l.location.x, y - l.location.y))) } else { None });
+    if let Some(h) = hold {
+        hold_of.insert(t, h);
+    }
+    hold
+}
+
+/// AETHERCSSOMBOUNDINGSTICKY (SR1144): element `id`'s flow origin (`x`, `y`) shifted by its sticky root's hold for the
+/// current `scroll` — the root's place from the painter's ONE origin fn (`render::placed_origin`, with the painter's
+/// truncated scroll and viewport size, as the shell's `hit_origin` calls it) minus its flow place. Unchanged for an
+/// element outside every sticky subtree.
+fn sticky_held_at(f: &Flushed, id: NodeId, x: f32, y: f32, scroll: (f64, f64)) -> (f32, f32) {
+    let Some(&(root, (ax, ay))) = f.held.get(&id) else { return (x, y) };
+    let Ok(l) = f.tree.taffy.layout(root) else { return (x, y) };
+    let (vw, vh) = page(|p| p.viewport);
+    let (hx, hy) = crate::render::placed_origin(&f.tree, root, ax, ay, l, vw as u32, vh as u32, scroll.0 as i32, scroll.1 as i32);
+    (x + hx - (ax + l.location.x), y + hy - (ay + l.location.y))
 }

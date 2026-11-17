@@ -10428,4 +10428,101 @@ b</div>
             assert_eq!(rect_by_id(&t, id).unwrap().2, 100.0, "#{id}: 10 x 20 / 2 with no face");
         }
     }
+
+    // ---- AETHERCSSOMBOUNDINGSTICKY (LEDGER SR1144): a stuck sticky box's CSSOM rects read at its held place (named tail block) ----
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolls `e` by `dy`, repaints, and syncs the page's scroll into the CSSOM (the
+    /// shell's per-turn `tick` hands it over through `set_viewport`).
+    fn bounding_sticky_scroll(e: &mut crate::AetherEngine, dy: f64) {
+        e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+        e.render_frame();
+        e.tick();
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): the id of `document.elementFromPoint(x, y)` ("" for none or an id-less element).
+    fn bounding_sticky_from_point(e: &mut crate::AetherEngine, x: f64, y: f64) -> String {
+        let src = format!("(function(){{var el = document.elementFromPoint({x}, {y}); return el ? el.id : '';}})()");
+        e.js_engine.as_mut().unwrap().eval_string(&src).unwrap()
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): 400x300: a 100px spacer, `#s` sticky `top: 10px` 40px tall holding a 15px block
+    /// then `#k` 10px tall, then a 2000px spacer.
+    fn bounding_sticky_child_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div style="height:100px"></div>
+            <div id="s" style="position:sticky;top:10px;height:40px"><div style="height:15px"></div><div id="k" style="height:10px"></div></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolled 400px, SR1130's red `#d` is painted stuck at rows 20..39; its
+    /// getBoundingClientRect() and getClientRects() read top 20, and elementFromPoint(10, 25) is `#d`. Before SR1144 the
+    /// rect read its normal-flow place (80 - 400 = -320) and the point hit what flowed beneath.
+    #[test]
+    fn bounding_sticky_stuck_box_reads_painted_place() {
+        let mut e = sticky_em_inset_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d is painted stuck at row 20");
+        assert_eq!(imgalt_rect(&mut e, "d").1, 20.0, "#d's bounding top is its painted top (armed: -320 before SR1144)");
+        assert_eq!(js_num(&mut e, "document.getElementById('d').getClientRects()[0].top"), 20.0, "getClientRects follows the same conversion");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 25.0), "d", "elementFromPoint at #d's painted pixels (armed before SR1144)");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): a child of a stuck box moves with its hold: scrolled 400px `#s` holds at 10
+    /// and `#k` (15px into it) reads 25 (armed: 115 - 400 = -285 before SR1144).
+    #[test]
+    fn bounding_sticky_child_moves_with_hold() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(imgalt_rect(&mut e, "s").1, 10.0, "#s holds at top: 10px");
+        assert_eq!(imgalt_rect(&mut e, "k").1, 25.0, "#k moves with #s's hold (armed: -285 before SR1144)");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): unscrolled the rects are the flow rects (`#s` 100, `#k` 115; SR1130's `#a` 20,
+    /// `#b` 40, `#d` 80), and scrolled 50px `#s` is not yet stuck (flow 100 - 50 = 50 > its 10px inset).
+    #[test]
+    fn bounding_sticky_unstuck_is_flow_place() {
+        let mut e = bounding_sticky_child_engine();
+        assert_eq!(imgalt_rect(&mut e, "s").1, 100.0, "#s at its normal-flow y");
+        assert_eq!(imgalt_rect(&mut e, "k").1, 115.0, "#k at its normal-flow y");
+        bounding_sticky_scroll(&mut e, 50.0);
+        assert_eq!(imgalt_rect(&mut e, "s").1, 50.0, "#s scrolls with the page until it reaches its inset");
+        let mut d = sticky_em_inset_engine();
+        assert_eq!(imgalt_rect(&mut d, "a").1, 20.0, "#a unchanged");
+        assert_eq!(imgalt_rect(&mut d, "b").1, 40.0, "#b unchanged");
+        assert_eq!(imgalt_rect(&mut d, "d").1, 80.0, "#d unchanged");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): scrolled 120px, `#s`'s flow place is viewport y -20..19 but it is held at
+    /// 10..49: elementFromPoint(10, 5) is not `#s` (its flow place, empty now), (10, 45) is `#s` and (10, 30) is `#k`
+    /// (held 25..34). Before SR1144 the point at 5 found `#s` and the one at 45 did not.
+    #[test]
+    fn bounding_sticky_flow_place_misses() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 120.0);
+        assert_eq!(e.scroll_y, 120.0, "the page scrolled 120px");
+        assert_ne!(bounding_sticky_from_point(&mut e, 10.0, 5.0), "s", "#s's flow place is not it (armed: #s before SR1144)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 45.0), "s", "#s at its held place (armed before SR1144)");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 30.0), "k", "#k moves with the hold");
+    }
+
+    /// AETHERCSSOMBOUNDINGSTICKY (SR1144): the claim — scrolled 400px, the shell's hit test (SR1141, through the painter's
+    /// `placed_origin`) and the CSSOM's elementFromPoint (through `client_rect`, the same fn) name the same element at
+    /// three points: `#d`'s painted rows, `#b`'s stuck strip above them, and the spacer below.
+    #[test]
+    fn bounding_sticky_shell_and_cssom_agree() {
+        let mut e = sticky_em_inset_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        for (x, y) in [(10.0, 25.0), (10.0, 17.0), (10.0, 100.0)] {
+            let shell = hit_sticky_origin_id(&e, x, y);
+            assert_eq!(bounding_sticky_from_point(&mut e, x, y), shell, "shell hit test and elementFromPoint agree at ({x}, {y})");
+        }
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "the sample at #d's painted rows is #d");
+    }
 }
