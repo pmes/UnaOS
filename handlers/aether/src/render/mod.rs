@@ -1053,7 +1053,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |c| {
+    inherited.scheme = scheme_of(spec, inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |c| {
         ua_color(tag, c, inherited.scheme)
         // AETHEROUTLINECURRENTCOLORUA (SR1131): the a / control (SR1001 ButtonText) / html UA table is `ua_color` (file tail),
         // read by computed_report too
@@ -4843,4 +4843,14 @@ fn inherited_at(layout: &LayoutTree, id: NodeId) -> Inherited {
         }
     }
     inh
+}
+
+// ---- AETHERUACOLORONETABLESCHEME (LEDGER SR1138): ONE color-scheme inherit rule for the render and computed_report (named tail block) ----
+
+/// AETHERUACOLORONETABLESCHEME (SR1138): an element's resolved `color-scheme` bits: its own `PaintStyle::color_scheme`
+/// (`normal` is Some(0), the light reset), else the parent's (`inherit` clears the field through INHERIT_COLOR_SCHEME,
+/// so it takes this road too); None at the root is light. Lifted from `inherit_element`; computed_report calls it on its
+/// walk before the colour, so the color column reads `ua_color` at the same scheme the render paints with.
+pub(crate) fn scheme_of(spec: &crate::layout::PaintStyle, parent: Option<u8>) -> Option<u8> {
+    spec.color_scheme.or(parent)
 }
