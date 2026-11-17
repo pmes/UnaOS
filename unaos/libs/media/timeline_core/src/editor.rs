@@ -809,3 +809,52 @@ mod striaclipgainface_tests {
         assert_eq!((st.selected().unwrap().fade_in, st.selected().unwrap().fade_out), (4, 8));
     }
 }
+
+// ---- STRIANORMALIZELUFSMORE (LEDGER SR9086): every listed clip's gain in ONE commit (named tail block) ----
+
+impl EditorState {
+    /// STRIANORMALIZELUFSMORE (SR9086): each `((track, clip index), gain_cdb)` set through `Timeline::set_gain`'s
+    /// validate, ONE commit (one undo step) when any gain moved; none moved commits nothing; a refusal commits nothing.
+    pub fn set_gains(&mut self, gains: &[((usize, usize), i32)]) -> Result<(), EditError> {
+        let mut tl = self.timeline.clone();
+        let mut moved = false;
+        for &((t, i), cdb) in gains {
+            let c = tl.tracks.get(t).and_then(|tr| tr.clips.get(i)).ok_or(EditError::NoClip)?;
+            if c.gain_cdb == cdb {
+                continue;
+            }
+            tl = tl.set_gain(t, i, cdb)?;
+            moved = true;
+        }
+        if moved {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod strianormalizelufsmore_tests {
+    use super::*;
+    use crate::Kind;
+
+    #[test]
+    fn strianormalizelufsmore_set_gains_one_commit() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10)];
+        let mut st = EditorState::new(tl);
+        let depth = st.undo_depth();
+        assert_eq!(st.set_gains(&[((0, 0), -300), ((0, 1), 250)]), Ok(()));
+        assert_eq!((st.timeline.tracks[0].clips[0].gain_cdb, st.timeline.tracks[0].clips[1].gain_cdb), (-300, 250));
+        assert_eq!(st.undo_depth(), depth + 1, "one undo step");
+        assert_eq!(st.set_gains(&[((0, 0), -300), ((0, 1), 250)]), Ok(()));
+        assert_eq!(st.undo_depth(), depth + 1, "the same gains commit nothing");
+        let before = st.timeline.clone();
+        assert_eq!(st.set_gains(&[((0, 0), -600), ((0, 9), 0)]), Err(EditError::NoClip));
+        assert_eq!(st.timeline, before, "a refusal commits nothing");
+        assert!(st.undo());
+        assert_eq!((st.timeline.tracks[0].clips[0].gain_cdb, st.timeline.tracks[0].clips[1].gain_cdb), (0, 0));
+    }
+}

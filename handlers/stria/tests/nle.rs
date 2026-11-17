@@ -4553,3 +4553,148 @@ fn strianormalizelufs_gain_rule() {
     assert_eq!(g(&r(-30.004, f64::NEG_INFINITY), -2300), Some((700, false)));
     assert_eq!(g(&r(-12.0, -1.0), -2300), Some((-1100, false)));
 }
+
+// ---- STRIANORMALIZELUFSMORE (LEDGER SR9086): Esc cancels the clip measure, its progress, a muted track measured, normalize over a selection (named tail block) ----
+
+/// STRIANORMALIZELUFSMORE (SR9086): the synth fixture with audio clips (1, 0) and (1, 2) selected (primary (1, 2)).
+fn strianormalizelufsmore_multi_face(thread: bool) -> stria::nle_face::Face {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face.state.select_add(1, 2).unwrap();
+    face.scan.thread = thread;
+    face
+}
+
+/// STRIANORMALIZELUFSMORE (SR9086): the gains of audio clips (1, 0) and (1, 2).
+fn strianormalizelufsmore_gains(face: &stria::nle_face::Face) -> (i32, i32) {
+    (face.state.timeline.tracks[1].clips[0].gain_cdb, face.state.timeline.tracks[1].clips[2].gain_cdb)
+}
+
+/// Rule: Esc reaches a served face's running clip measure; its join names it `cancelled` by the job's own flag, the
+/// timeline and the undo depth unmoved; with nothing running there is nothing to cancel.
+#[test]
+fn strianormalizelufsmore_escape_cancels_the_clip_measure() {
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    let (tl, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    assert!(face.verb("normalize lufs -20"));
+    assert!(face.on(&bandy::SMessage::BrowserKey("Escape".into())), "Esc reaches the clip measure");
+    strianormalizethree_wait(&mut face);
+    assert_eq!(face.last_error.take(), Some("normalize: cancelled".to_string()));
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl, depth), "a cancel sets nothing");
+    assert!(!face.cancel_normalize(), "nothing runs");
+    println!("strianormalizelufsmore: Esc cancelled the clip measure");
+}
+
+/// Rule: the progress line clamps; a running clip measure's count rides the message row (ticks of the 20-tick clip);
+/// SR878's peak scan has no stop hook and no count, and still sets its gain.
+#[test]
+fn strianormalizelufsmore_progress_line_and_the_peak_scan() {
+    assert_eq!(stria::nle_face::normalize_progress_line(5, 20), "normalize: measuring 5/20");
+    assert_eq!(stria::nle_face::normalize_progress_line(25, 20), "normalize: measuring 20/20");
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    assert!(face.verb("normalize lufs -20"));
+    let mut shown = 0;
+    for _ in 0..2000 {
+        if face.normalize_progress() {
+            let l = face.last_error.clone().unwrap();
+            assert!(l.starts_with("normalize: measuring ") && l.ends_with("/20"), "{l}");
+            shown += 1;
+        }
+        if face.normalize_tick() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(face.note.is_some(), "the measure reported: {:?}", face.last_error);
+    let (mut face, _) = strianormalize_face();
+    face.scan.thread = true;
+    assert!(face.verb("normalize"));
+    assert!(!face.cancel_normalize(), "the peak scan has no stop hook");
+    assert!(!face.normalize_progress(), "and no count");
+    strianormalizethree_wait(&mut face);
+    assert!(face.last_error.clone().unwrap().contains("-> gain"), "{:?}", face.last_error);
+    println!("strianormalizelufsmore: {shown} progress lines");
+}
+
+/// Rule: `clip_alone` builds every track as `add_track` does (mute, solo and track gain at their defaults when they
+/// fold), with only the one clip on its own track.
+#[test]
+fn strianormalizelufsmore_clip_alone_tracks_are_fresh() {
+    let (tl, _) = stria::nle_face::synth_fixture();
+    let (alone, range) = stria::nle::clip_alone(&tl, 1, 2).unwrap();
+    assert_eq!(range, 25..35);
+    let mut fresh = Timeline::new(25);
+    for t in &tl.tracks {
+        fresh.add_track(t.kind);
+    }
+    fresh.tracks[1].clips.push(tl.tracks[1].clips[2]);
+    assert_eq!(alone.tracks, fresh.tracks, "every track fresh, the one clip alone");
+}
+
+/// Rule: `normalize lufs <t>` over a selection sets EACH selected audio clip's gain from its own alone reading (the one
+/// rule), a video clip in the set skipped and an unselected clip untouched, in ONE undo step, the line on the note;
+/// the same word again commits nothing; one `undo` restores both. The dBFS `normalize` does the same from each peak.
+#[test]
+fn strianormalizelufsmore_every_selected_clip_one_undo_step() {
+    let mut face = strianormalizelufsmore_multi_face(false);
+    face.state.select_add(0, 1).unwrap();
+    let srcs = stria::nle_face::synth_fixture().1;
+    let read = |i: usize| stria::nle_face::normalize_lufs_gain_cdb(&stria::nle::loudness_clip(&face.state.timeline, 1, i, &srcs, None).unwrap().unwrap(), -2000).unwrap();
+    let (w0, w2) = (read(0), read(2));
+    let depth = face.state.undo_depth();
+    assert!(face.verb("normalize lufs -20"));
+    assert_eq!(face.last_error, None, "a success is not an error");
+    assert_eq!(strianormalizelufsmore_gains(&face), (w0.0, w2.0));
+    assert_eq!(face.state.timeline.tracks[0].clips[1].gain_cdb, 0, "a video clip in the set is skipped");
+    assert_eq!(face.state.timeline.tracks[1].clips[1].gain_cdb, 0, "an unselected clip is untouched");
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    let bound = [w0.1, w2.1].iter().filter(|b| **b).count();
+    let tail = if bound > 0 { format!(" ({bound} true-peak bound)") } else { String::new() };
+    let line = format!("normalize: lufs 2 clips -> gains {}, {}{tail}", stria::nle_face::db_words(w0.0), stria::nle_face::db_words(w2.0));
+    assert_eq!(face.note, Some(line.clone()));
+    assert!(face.verb("normalize lufs -20"));
+    assert_eq!(face.state.undo_depth(), depth + 1, "the same gains commit nothing");
+    assert!(face.verb("undo"));
+    assert_eq!(strianormalizelufsmore_gains(&face), (0, 0));
+    let tb = face.state.timeline.tb;
+    let peak = |i: usize| {
+        let c = face.state.timeline.tracks[1].clips[i];
+        stria::nle_face::normalize_gain_cdb(stria::nle::peak_mix(&srcs, c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out), 1).unwrap().unwrap(), -100).unwrap()
+    };
+    let (p0, p2) = (peak(0), peak(2));
+    let depth = face.state.undo_depth();
+    assert!(face.verb("normalize"));
+    assert_eq!(strianormalizelufsmore_gains(&face), (p0, p2));
+    assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    assert_eq!(face.last_error, Some(format!("normalize: peak 2 clips -> gains {}, {}", stria::nle_face::db_words(p0), stria::nle_face::db_words(p2))));
+    println!("strianormalizelufsmore: \"{line}\"");
+}
+
+/// Rule: a served face measures a selection off its thread (`measuring`) and its tick sets the synchronous gains and
+/// line in one undo step, for both words; a selection that moved during the scan sets nothing.
+#[test]
+fn strianormalizelufsmore_multi_scan_off_thread() {
+    for word in ["normalize lufs -20", "normalize"] {
+        let mut sync = strianormalizelufsmore_multi_face(false);
+        assert!(sync.verb(word));
+        let want = (strianormalizelufsmore_gains(&sync), sync.note.clone(), sync.last_error.clone());
+        let mut face = strianormalizelufsmore_multi_face(true);
+        let depth = face.state.undo_depth();
+        assert!(face.verb(word));
+        assert_eq!(face.last_error.take(), Some(format!("normalize: {}", stria::nle_face::NORMALIZE_SCANNING)), "{word}");
+        assert_eq!(strianormalizelufsmore_gains(&face), (0, 0), "the gains wait for the scan");
+        strianormalizethree_wait(&mut face);
+        assert_eq!((strianormalizelufsmore_gains(&face), face.note.clone(), face.last_error.clone()), want, "{word}");
+        assert_eq!(face.state.undo_depth(), depth + 1, "one undo step");
+    }
+    let mut face = strianormalizelufsmore_multi_face(true);
+    assert!(face.verb("normalize lufs -20"));
+    face.state.set_gains(&[((1, 0), -100)]).unwrap();
+    let tl = face.state.timeline.clone();
+    strianormalizethree_wait(&mut face);
+    assert_eq!(face.last_error.take(), Some("normalize: the selection moved".to_string()));
+    assert_eq!(face.state.timeline, tl, "the timeline unmoved");
+}

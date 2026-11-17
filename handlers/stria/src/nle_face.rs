@@ -325,7 +325,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Closed) => break,
             },
             _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.loudness_pending() || face.normalizing() => { // STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.loudness_tick() | face.normalize_tick() {
+                if face.tick() | face.export_tick() | face.loudness_tick() | face.normalize_tick() | face.normalize_progress() { // STRIANORMALIZELUFSMORE (SR9086): a running clip measure's progress line (file tail)
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -517,7 +517,7 @@ impl Face {
                 Ok(())
             }
             "mark-in" | "mark-out" | "home" | "end" | "nudge-" | "nudge+" | "mark in" | "mark out" | "mark clear" => self.state.verb(act).unwrap_or(Err(EditError::NoClip)), // NLE6KEYS: the ONE dispatch; NLE5DRANGEKEYS (SR735): the export marks
-            "cancel" => return self.drag.take().is_some() || self.cancel_export() || self.cancel_loudness(), // NLEFACEEXPORT (SR694): a live drag first, else the running export
+            "cancel" => return self.drag.take().is_some() || self.cancel_export() || self.cancel_loudness() || self.cancel_normalize(), // STRIANORMALIZELUFSMORE (SR9086): else the running clip measure (file tail); NLEFACEEXPORT (SR694): a live drag first, else the running export
             _ => return false,
         };
         if let Err(e) = r {
@@ -3355,7 +3355,7 @@ impl Face {
         if target > 0 {
             return Err("target above 0 dBFS".to_string());
         }
-        let (track, _) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?;
+        if let Some(r) = self.normalize_peak_many(target, os) { return r; } let (track, _) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?; // STRIANORMALIZELUFSMORE (SR9086): two or more selected audio clips, each clip's own peak (file tail)
         let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
         if self.state.timeline.tracks.get(track).map(|t| t.kind) != Some(Kind::Audio) {
             return Err("not an audio clip".to_string());
@@ -3400,7 +3400,7 @@ struct NormalizeJob {
     index: usize,
     clip: Clip,
     target: i32,
-    os: u32,
+    os: u32, lufs: Option<LufsRun>, // STRIANORMALIZELUFSMORE (SR9086): the clip measure's watches and the selection it measures (file tail)
     handle: std::thread::JoinHandle<Result<Option<NormalizeRead>, String>>, // STRIANORMALIZELUFS (SR9054): a peak or a loudness reading (file tail)
 }
 
@@ -3417,7 +3417,7 @@ impl Face {
         let index = self.state.selection.map_or(0, |(_, i)| i);
         let sources = self.sources.clone();
         let handle = std::thread::spawn(move || crate::nle::peak_mix(&sources, c.src, ns, os).map(|p| p.map(NormalizeRead::Peak)).map_err(|e| e.to_string())); // STRIANORMALIZELUFS (SR9054): the peak as a NormalizeRead (file tail)
-        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, handle });
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, lufs: None, handle }); // STRIANORMALIZELUFSMORE (SR9086): a one-clip peak scan carries no run (file tail)
         Ok(None)
     }
     /// The gain from a measured `peak` set through SR838's one road, and its line (SR878's rule, moved here).
@@ -3441,10 +3441,10 @@ impl Face {
         let got = j.handle.join().unwrap_or_else(|_| Err("scan failed".to_string()));
         let stands = self.state.selection == Some((j.track, j.index)) && self.state.selected() == Some(j.clip);
         let r = match got {
-            Err(e) => Err(e),
+            _ if j.lufs.as_ref().is_some_and(LufsRun::cancelled) => Err("cancelled".to_string()), Err(e) => Err(e), // STRIANORMALIZELUFSMORE (SR9086): the job's own flag names the cancel, the timeline unmoved (file tail)
             Ok(None) => Err("no audio".to_string()),
             Ok(Some(_)) if !stands => Err("the selection moved".to_string()),
-            Ok(Some(NormalizeRead::Peak(peak))) => self.normalize_finish(peak, j.target, j.os), Ok(Some(NormalizeRead::Lufs(l))) => { let r = self.normalize_lufs_finish(l, j.target); return self.normalize_lufs_say(r); } // STRIANORMALIZELUFS (SR9054): a loudness reading sets the gain through its own finish (file tail)
+            Ok(Some(NormalizeRead::Peak(peak))) => self.normalize_finish(peak, j.target, j.os), Ok(Some(NormalizeRead::Lufs(l))) => { let r = self.normalize_lufs_finish(l, j.target); return self.normalize_lufs_say(r); } Ok(Some(NormalizeRead::LufsMany(rs))) => { let r = self.normalize_lufs_many_finish(j.lufs.as_ref(), rs, j.target); return self.normalize_lufs_say(r); } Ok(Some(NormalizeRead::PeakMany(ps))) => self.normalize_peak_many_finish(j.lufs.as_ref(), ps, j.target, j.os), // STRIANORMALIZELUFSMORE (SR9086): a selection's readings set every gain in one commit (file tail); STRIANORMALIZELUFS (SR9054): a loudness reading sets the gain through its own finish (file tail)
         };
         self.last_error = Some(match r {
             Ok(line) | Err(line) => format!("normalize: {line}"),
@@ -3470,10 +3470,10 @@ pub const NORMALIZE_LUFS_TARGET_CDB: i32 = -2300;
 pub const NORMALIZE_TP_CEILING_CDB: i32 = -100;
 
 /// STRIANORMALIZELUFS (SR9054): what one normalize scan read: SR9035's peak, or one clip's loudness reading.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)] // STRIANORMALIZELUFSMORE (SR9086): not Copy (a selection's readings are a Vec)
 pub enum NormalizeRead {
     Peak(f32),
-    Lufs(crate::nle::LoudnessReading),
+    Lufs(crate::nle::LoudnessReading), LufsMany(Vec<Option<crate::nle::LoudnessReading>>), PeakMany(Vec<Option<f32>>), // STRIANORMALIZELUFSMORE (SR9086): a selection's readings, one per clip in the run's order (file tail)
 }
 
 /// STRIANORMALIZELUFS (SR9054): the gain (centi-dB) that brings reading `r` to `target_cdb` LUFS, rounded DOWN, and
@@ -3511,7 +3511,7 @@ impl Face {
         if target > 0 {
             return Err("target above 0 LUFS".to_string());
         }
-        let (track, index) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?;
+        if let Some(r) = self.normalize_lufs_many(target) { return r; } let (track, index) = self.state.selection.ok_or_else(|| EditError::NoClip.to_string())?; // STRIANORMALIZELUFSMORE (SR9086): two or more selected audio clips, each measured alone (file tail)
         let c = self.state.selected().ok_or_else(|| EditError::NoClip.to_string())?;
         if self.state.timeline.tracks.get(track).map(|t| t.kind) != Some(Kind::Audio) {
             return Err("not an audio clip".to_string());
@@ -3523,9 +3523,9 @@ impl Face {
         if self.scan.job.is_some() {
             return Err("busy".to_string());
         }
-        let (tl, sources) = (self.state.timeline.clone(), self.sources.clone());
-        let handle = std::thread::spawn(move || crate::nle::loudness_clip(&tl, track, index, &sources, None).map(|r| r.map(NormalizeRead::Lufs)).map_err(|e| e.to_string()));
-        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os: 0, handle });
+        let (tl, sources) = (self.state.timeline.clone(), self.sources.clone()); let run = LufsRun::new(&[((track, index), c)], true); let w = run.watches[0].clone(); // STRIANORMALIZELUFSMORE (SR9086): the measure's watch, SR903's stop and progress (file tail)
+        let handle = std::thread::spawn(move || crate::nle::loudness_clip(&tl, track, index, &sources, Some(w)).map(|r| r.map(NormalizeRead::Lufs)).map_err(|e| e.to_string())); // STRIANORMALIZELUFSMORE (SR9086): watched
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os: 0, lufs: Some(run), handle }); // STRIANORMALIZELUFSMORE (SR9086): the run rides the job
         Err(NORMALIZE_SCANNING.to_string())
     }
     /// The gain from a loudness reading `r` set through SR838's one road, and its line: `lufs <l> LUFS, true peak <t>
@@ -3565,5 +3565,186 @@ impl Face {
         if acts {
             self.note = None;
         }
+    }
+}
+
+// ---- STRIANORMALIZELUFSMORE (LEDGER SR9086): Esc cancels the clip measure, its progress line, and normalize over a selection in one undo step (named tail block) ----
+// The `normalize lufs` scan now carries SR903's `LoudnessWatch` (one per clip, all sharing ONE cancel flag): Esc's
+// `cancel` sets the flag (`RenderSink::stop` reads it before the next step's decode), the join names it `cancelled` by
+// the job's own flag (the timeline unmoved), and `serve`'s clock puts `normalize: measuring <done>/<total>` on the
+// message row while it runs. Two or more selected AUDIO clips (`EditorState.set`; video clips skipped) are each
+// measured alone (`loudness_clip`, or SR878's exact peak through `peak_mix` for the dBFS word), each gain by THE rule
+// (`normalize_lufs_gain_cdb` / `normalize_gain_cdb`), and all set by timeline_core's `EditorState::set_gains`: one
+// commit, one undo step; a silent clip keeps its gain. The peak scan has no stop hook (`peak_mix`): Esc leaves it.
+
+/// STRIANORMALIZELUFSMORE (SR9086): what a normalize scan measures: every clip of the run (re-checked at the join) and,
+/// for a loudness measure, one SR903 watch per clip sharing ONE cancel flag (a peak scan carries no watch).
+struct LufsRun {
+    cancel: Arc<AtomicBool>,
+    watches: Vec<crate::nle::LoudnessWatch>,
+    clips: Vec<((usize, usize), Clip)>,
+    total: u64,
+    shown: String,
+}
+
+impl LufsRun {
+    /// A run over `clips`; `watched` gives each clip a watch over its own ticks (clip_alone's range).
+    fn new(clips: &[((usize, usize), Clip)], watched: bool) -> LufsRun {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let watches = if watched { clips.iter().map(|(_, c)| crate::nle::LoudnessWatch { start: c.at, done: Arc::new(AtomicU64::new(0)), cancel: Arc::clone(&cancel) }).collect() } else { Vec::new() };
+        let total = clips.iter().map(|(_, c)| (c.end() - c.at).max(0) as u64).sum();
+        LufsRun { cancel, watches, clips: clips.to_vec(), total, shown: String::new() }
+    }
+    /// True once Esc (or `cancel`) asked the run to stop.
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Relaxed)
+    }
+    /// The ticks measured so far over every clip (each clamped to its clip's ticks).
+    fn done(&self) -> u64 {
+        self.watches.iter().zip(&self.clips).map(|(w, (_, c))| w.done.load(Relaxed).min((c.end() - c.at).max(0) as u64)).sum()
+    }
+    /// True when every clip of the run still stands where it was measured.
+    fn stands(&self, tl: &Timeline) -> bool {
+        self.clips.iter().all(|&((t, i), c)| tl.tracks.get(t).and_then(|tr| tr.clips.get(i)) == Some(&c))
+    }
+}
+
+/// STRIANORMALIZELUFSMORE (SR9086): `normalize: measuring <ticks done>/<total>` (done clamped to the total).
+pub fn normalize_progress_line(done: u64, total: u64) -> String {
+    format!("normalize: {NORMALIZE_SCANNING} {}/{total}", done.min(total))
+}
+
+impl Face {
+    /// Esc's arm for a running loudness measure: set its cancel flag; false when none runs (a peak scan has no stop).
+    pub fn cancel_normalize(&mut self) -> bool {
+        let Some(run) = self.scan.job.as_ref().and_then(|j| j.lufs.as_ref()).filter(|r| !r.watches.is_empty()) else { return false };
+        run.cancel.store(true, Relaxed);
+        true
+    }
+    /// The running loudness measure's count on the message row ([`normalize_progress_line`]); true (a repaint) only
+    /// when the line moved since the last one put up. A cancelled run shows nothing more until its join.
+    pub fn normalize_progress(&mut self) -> bool {
+        let Some(run) = self.scan.job.as_mut().and_then(|j| j.lufs.as_mut()).filter(|r| !r.watches.is_empty()) else { return false };
+        if run.cancelled() {
+            return false;
+        }
+        let line = normalize_progress_line(run.done(), run.total);
+        if line == run.shown {
+            return false;
+        }
+        run.shown = line.clone();
+        self.last_error = Some(line);
+        true
+    }
+    /// The selected audio clips (`EditorState.set`, video clips skipped) when there are two or more; else `None`.
+    fn normalize_set(&self) -> Option<Vec<((usize, usize), Clip)>> {
+        let tl = &self.state.timeline;
+        let clips: Vec<((usize, usize), Clip)> = self.state.set.iter().filter(|&&(t, _)| tl.tracks.get(t).map(|tr| tr.kind) == Some(Kind::Audio)).filter_map(|&(t, i)| Some(((t, i), *tl.tracks.get(t)?.clips.get(i)?))).collect();
+        (clips.len() >= 2).then_some(clips)
+    }
+    /// `normalize lufs` over a selection: `None` unless two or more audio clips are selected; else measured here
+    /// (unserved) or on one thread clip by clip (served: `measuring`, `busy` while a scan runs).
+    fn normalize_lufs_many(&mut self, target: i32) -> Option<Result<String, String>> {
+        let clips = self.normalize_set()?;
+        if !self.scan.thread {
+            let mut rs = Vec::with_capacity(clips.len());
+            for &((t, i), _) in &clips {
+                match crate::nle::loudness_clip(&self.state.timeline, t, i, &self.sources, None) {
+                    Ok(r) => rs.push(r),
+                    Err(e) => return Some(Err(e.to_string())),
+                }
+            }
+            let run = LufsRun::new(&clips, false);
+            return Some(self.normalize_lufs_many_finish(Some(&run), rs, target));
+        }
+        if self.scan.job.is_some() {
+            return Some(Err("busy".to_string()));
+        }
+        let (track, index) = self.state.selection?;
+        let c = self.state.selected()?;
+        let run = LufsRun::new(&clips, true);
+        let (tl, sources, ws) = (self.state.timeline.clone(), self.sources.clone(), run.watches.clone());
+        let at: Vec<(usize, usize)> = clips.iter().map(|&(p, _)| p).collect();
+        let handle = std::thread::spawn(move || -> Result<Option<NormalizeRead>, String> {
+            let mut rs = Vec::with_capacity(at.len());
+            for (&(t, i), w) in at.iter().zip(ws) {
+                if w.cancel.load(Relaxed) {
+                    rs.push(None);
+                    continue;
+                }
+                rs.push(crate::nle::loudness_clip(&tl, t, i, &sources, Some(w)).map_err(|e| e.to_string())?);
+            }
+            Ok(Some(NormalizeRead::LufsMany(rs)))
+        });
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os: 0, lufs: Some(run), handle });
+        Some(Err(NORMALIZE_SCANNING.to_string()))
+    }
+    /// The dBFS `normalize` over a selection (NLE-NORMALIZE-PEAK-MULTI): `None` unless two or more audio clips are
+    /// selected; each clip's own exact peak at the mix's rate (SR9035's `peak_mix`, `os` SR963's oversampling).
+    fn normalize_peak_many(&mut self, target: i32, os: u32) -> Option<Result<String, String>> {
+        let clips = self.normalize_set()?;
+        let tb = self.state.timeline.tb;
+        let spans: Vec<(timeline_core::SourceId, std::ops::Range<i64>)> = clips.iter().map(|(_, c)| (c.src, tb.to_ns(c.src_in)..tb.to_ns(c.src_out))).collect();
+        if !self.scan.thread {
+            let mut ps = Vec::with_capacity(spans.len());
+            for (src, ns) in &spans {
+                match crate::nle::peak_mix(&self.sources, *src, ns.clone(), os) {
+                    Ok(p) => ps.push(p),
+                    Err(e) => return Some(Err(e.to_string())),
+                }
+            }
+            let run = LufsRun::new(&clips, false);
+            return Some(self.normalize_peak_many_finish(Some(&run), ps, target, os));
+        }
+        if self.scan.job.is_some() {
+            return Some(Err("busy".to_string()));
+        }
+        let (track, index) = self.state.selection?;
+        let c = self.state.selected()?;
+        let sources = self.sources.clone();
+        let handle = std::thread::spawn(move || -> Result<Option<NormalizeRead>, String> {
+            let mut ps = Vec::with_capacity(spans.len());
+            for (src, ns) in spans {
+                ps.push(crate::nle::peak_mix(&sources, src, ns, os).map_err(|e| e.to_string())?);
+            }
+            Ok(Some(NormalizeRead::PeakMany(ps)))
+        });
+        self.scan.job = Some(NormalizeJob { track, index, clip: c, target, os, lufs: Some(LufsRun::new(&clips, false)), handle });
+        Some(Ok(NORMALIZE_SCANNING.to_string()))
+    }
+    /// A selection's loudness readings (the run's order) to gains by [`normalize_lufs_gain_cdb`], set in one commit.
+    fn normalize_lufs_many_finish(&mut self, run: Option<&LufsRun>, rs: Vec<Option<crate::nle::LoudnessReading>>, target: i32) -> Result<String, String> {
+        let gains = rs.into_iter().map(|r| r.and_then(|r| normalize_lufs_gain_cdb(&r, target))).collect();
+        self.normalize_set_finish(run, gains, "lufs")
+    }
+    /// A selection's peaks (the run's order) to gains by [`normalize_gain_cdb`], set in one commit.
+    fn normalize_peak_many_finish(&mut self, run: Option<&LufsRun>, ps: Vec<Option<f32>>, target: i32, os: u32) -> Result<String, String> {
+        let gains = ps.into_iter().map(|p| p.and_then(|p| normalize_gain_cdb(p, target)).map(|g| (g, false))).collect();
+        self.normalize_set_finish(run, gains, if os > 1 { "true peak" } else { "peak" })
+    }
+    /// Set each measurable clip's gain through `EditorState::set_gains` (ONE commit, one undo step; a silent clip
+    /// keeps its gain) and the line `<what> <n> clips -> gains <g1>, <g2>, ...[ (<k> true-peak bound)][ (<s> silent)]`;
+    /// `the selection moved` when any clip of the run no longer stands, `silent clip` when none is measurable.
+    fn normalize_set_finish(&mut self, run: Option<&LufsRun>, gains: Vec<Option<(i32, bool)>>, what: &str) -> Result<String, String> {
+        let run = run.ok_or_else(|| "scan failed".to_string())?;
+        if !run.stands(&self.state.timeline) {
+            return Err("the selection moved".to_string());
+        }
+        let set: Vec<((usize, usize), i32)> = run.clips.iter().zip(&gains).filter_map(|(&(p, _), g)| (*g).map(|(cdb, _)| (p, cdb))).collect();
+        if set.is_empty() {
+            return Err("silent clip".to_string());
+        }
+        self.state.set_gains(&set).map_err(|e| e.to_string())?;
+        let bound = gains.iter().flatten().filter(|g| g.1).count();
+        let silent = gains.len() - set.len();
+        let words: Vec<String> = set.iter().map(|&(_, g)| db_words(g)).collect();
+        let mut line = format!("{what} {} clips -> gains {}", gains.len(), words.join(", "));
+        if bound > 0 {
+            line.push_str(&format!(" ({bound} true-peak bound)"));
+        }
+        if silent > 0 {
+            line.push_str(&format!(" ({silent} silent)"));
+        }
+        Ok(line)
     }
 }
