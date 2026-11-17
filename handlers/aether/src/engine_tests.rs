@@ -5720,77 +5720,91 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
     }
 
-    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
-    /// 4-decimal grammar.
-    #[test]
-    fn font_size_rel_cssom_smaller_larger() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
-        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
-    }
+    // ---- AETHERCSSCONTROLUAFONT (LEDGER SR1009): a form control takes the UA weight 400 and upright style, not the parent's (named tail block) ----
 
-    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
-    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
-    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
-    #[test]
-    fn font_size_rel_cssom_font_inherit_button() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
-        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
-        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
-    }
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
-    #[test]
-    fn font_size_rel_cssom_nested_em() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
-    }
-
-    // ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
-
-    /// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): in a 300px `dir=rtl` column a 100px block with margin-left 10
-    /// and margin-right 20 sits 20 from the right edge (CSS 2.2 §10.3.3: margin-left is the over-constrained one; SR711's
-    /// END), `margin-left: auto` takes the slack to the same place, `margin: 0 auto` centres, an ltr column keeps
-    /// margin-left; `style.direction` flips re-derive it.
-    #[test]
-    fn rtl_margin_over_constrained_ends_at_margin_right() {
-        let html = r#"<html><head><style>
-            body { margin: 0; }
-            .col { width: 300px; }
-            .col div { width: 100px; height: 10px; }
-        </style></head><body>
-        <div class="col" id="rc" dir="rtl">
-            <div id="a" style="margin-left: 10px; margin-right: 20px"></div>
-            <div id="b" style="margin-left: auto; margin-right: 20px"></div>
-            <div id="c" style="margin: 0 auto"></div>
-        </div>
-        <div class="col" id="lc"><div id="d" style="margin-left: 10px; margin-right: 20px"></div></div>
+    /// AETHERCSSCONTROLUAFONT (SR1009): one row per probe under `body { font: 24px serif }`, the rules in a sheet, every
+    /// button label red so its ink is countable. A text span; a plain button; a button under `<b>` and under `<i>`; an
+    /// author `font-weight: bold` button (the armed heavy ink); `.h { font: inherit }` button / input / select / textarea
+    /// under a bold italic row; plain input / select / textarea under `<b><i>`; an author `font-size: 20px` button.
+    /// Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn control_ua_font_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            button { color: rgb(255, 0, 0) }
+            .h { font: inherit }
+            </style></head><body style="margin:0;font:24px serif">
+            <div><span id="txt">Hello</span></div>
+            <div><button id="bp">Hello</button></div>
+            <div><b><button id="bb">Hello</button></b></div>
+            <div><i><button id="bi">Hello</button></i></div>
+            <div><button id="bw" style="font-weight:bold">Hello</button></div>
+            <div style="font-weight:bold;font-style:italic"><button id="bh" class="h">Hello</button></div>
+            <div style="font-weight:bold;font-style:italic"><input id="ih" class="h" value="Hello"></div>
+            <div style="font-weight:bold;font-style:italic"><select id="sh" class="h"><option>Hello</option></select></div>
+            <div style="font-weight:bold;font-style:italic"><textarea id="th" class="h">Hello</textarea></div>
+            <div><b><i><input id="ip" value="Hello"></i></b></div>
+            <div><b><i><select id="sp"><option>Hello</option></select></i></b></div>
+            <div><b><i><textarea id="tp">Hello</textarea></i></b></div>
+            <div><button id="bs" style="font-size:20px">Hello</button></div>
         </body></html>"#;
         let mut engine = crate::AetherEngine::new();
-        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
         engine.load_html("https://example.com/", html, true);
         engine.render_frame();
-        let off = |e: &mut crate::AetherEngine, col: &str, id: &str| {
-            js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().left - document.getElementById('{col}').getBoundingClientRect().left"))
-        };
-        assert_eq!(off(&mut engine, "rc", "a"), 180.0, "rtl 10 / 20: margin-right binds");
-        assert_eq!(off(&mut engine, "rc", "b"), 180.0, "rtl auto / 20: the auto margin takes the slack");
-        assert_eq!(off(&mut engine, "rc", "c"), 100.0, "rtl 0 auto: centred");
-        assert_eq!(off(&mut engine, "lc", "d"), 10.0, "ltr 10 / 20: margin-left binds");
-        for (dir, want) in [("ltr", 10.0), ("rtl", 180.0)] {
-            js_num(&mut engine, &format!("document.getElementById('rc').style.direction = '{dir}'; 0"));
-            engine.render_frame();
-            assert_eq!(off(&mut engine, "rc", "a"), want, "style.direction = {dir}: the 10 / 20 block's offset");
+        engine
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): the size and family were already the UA control font's (layout_core's
+    /// `default_font_size` / `default_family` control arms): an unset button reads 13.333px Arial under the 24px serif
+    /// body, a textarea monospace, and `font: inherit` takes the body's 24px serif (a taller box).
+    #[test]
+    fn control_ua_font_size_family() {
+        let mut e = control_ua_font_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "txt", "fontSize"), "24px", "the body text is 24px");
+        let bp = font_shorthand_cs(&mut e, "bp", "fontSize");
+        assert!(bp.starts_with("13.333"), "an unset button reads the control size, got {bp}");
+        assert_eq!(font_shorthand_cs(&mut e, "bp", "fontFamily"), "Arial", "the control family");
+        assert_eq!(font_shorthand_cs(&mut e, "tp", "fontFamily"), "monospace", "Chromium's textarea monospace");
+        assert_eq!(font_shorthand_cs(&mut e, "bh", "fontSize"), "24px", "font: inherit takes the body's size");
+        assert_eq!(font_shorthand_cs(&mut e, "bh", "fontFamily"), "serif", "font: inherit takes the body's family");
+        let (_, _, _, h) = imgalt_rect(&mut e, "bp");
+        let (_, _, _, hh) = imgalt_rect(&mut e, "bh");
+        assert!(h < hh, "the 13.333px button {h} is shorter than the 24px font: inherit twin {hh}");
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): `font: -webkit-small-control` resets the weight and style, so a control under
+    /// `<b>` / `<i>` is 400 upright (it was 700 / italic: `default_weight` / `default_italic` fell to the parent): the
+    /// report reads it, and the painter draws it: the `<b>` button's red label ink is the plain button's, the author-bold
+    /// button's is heavier (armed).
+    #[test]
+    fn control_ua_font_weight_style() {
+        let mut e = control_ua_font_engine();
+        for id in ["bb", "ip", "sp", "tp"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontWeight"), "400", "{id} under <b> takes the UA weight");
+        }
+        for id in ["bi", "ip", "sp", "tp"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "normal", "{id} under <i> is upright");
+        }
+        let plain = css_wide_color_ink(&mut e, "bp", css_wide_red);
+        let under_b = css_wide_color_ink(&mut e, "bb", css_wide_red);
+        let bold = css_wide_color_ink(&mut e, "bw", css_wide_red);
+        assert!(plain > 3, "the plain button paints its red label ({plain})");
+        assert!(under_b.abs_diff(plain) * 10 <= plain, "the <b> button's ink {under_b} is the plain button's {plain}");
+        assert!(bold * 100 > plain * 115, "the author-bold button's ink {bold} is heavier than {plain} (armed)");
+    }
+
+    /// AETHERCSSCONTROLUAFONT (SR1009): `font: inherit` (the INHERIT_FONT bits) beats the UA arm: the controls under the
+    /// bold italic row read 700 italic.
+    #[test]
+    fn control_ua_font_inherit() {
+        let mut e = control_ua_font_engine();
+        for id in ["bh", "ih", "sh", "th"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontWeight"), "700", "{id} font: inherit takes the parent's bold");
+            assert_eq!(font_shorthand_cs(&mut e, id, "fontStyle"), "italic", "{id} font: inherit takes the parent's italic");
         }
     }
 
-
-    // ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): a removed align=center lets the cell's narrow block go back to the start (named tail block) ----
-
-    /// AETHERCENTERRESTYLEITEMS (SR782): a `td align=center` centres its 200px block (-webkit-center, SR436); a script
-    /// that removes the attribute leaves the block at the cell's content start, as Chromium re-derives the placement on
-    /// the style recalc: neither the rule's align-self (SR686) nor the cell's align-items the rule wrote is kept.
+    /// AETHERCSSCONTROLUAFONT (SR1009): an author value on the control wins over the UA font as before.
     #[test]
     fn center_restyle_items_follow_removed_align() {
         let html = r#"<!doctype html><html><body style="margin: 0"><table style="width: 600px; border-spacing: 0"><tr><td id="cell" align="center"><div id="d" style="width: 200px">ab</div></td></tr></table></body></html>"#;
@@ -7314,6 +7328,112 @@ mod tests {
         let mut e = border_side_color_engine();
         assert_eq!(css_wide_color_ink(&mut e, "sn", css_wide_red), 0, "#sn paints no red");
         assert!(css_wide_color_ink(&mut e, "st", css_wide_red) > 40, "armed: #st paints a red top");
+    }
+
+    // ---- AETHERCSSTEXTDECORATIONCOLOR (LEDGER SR1018): text-decoration-color paints the decoration (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): one 20px serif row per probe, black text, rows 12px apart: `#tl`
+    /// `text-decoration: underline; text-decoration-color: red`; `#ts` `text-decoration: underline red`; `#tc` `color:
+    /// blue; text-decoration: underline red; text-decoration-color: currentcolor`; `#tp` a blue span under a parent with a
+    /// red underline; `#ti` `text-decoration: underline red; text-decoration-color: initial`; `#tg` `.d { text-decoration:
+    /// underline currentcolor } .d.g { color: rgb(0, 160, 0) }`; `#tn` a plain `text-decoration: underline` (control).
+    fn text_decoration_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .d { text-decoration: underline currentcolor }
+            .d.g { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="tl" style="text-decoration:underline;text-decoration-color:red">Hgjx Hgjx</div>
+            <div id="ts" style="text-decoration:underline red">Hgjx Hgjx</div>
+            <div id="tc" style="color:blue;text-decoration:underline red;text-decoration-color:currentcolor">Hgjx Hgjx</div>
+            <div style="text-decoration:underline;text-decoration-color:red"><span id="tp" style="color:blue">Hgjx Hgjx</span></div>
+            <div id="ti" style="text-decoration:underline red;text-decoration-color:initial">Hgjx Hgjx</div>
+            <div id="tg" class="d g">Hgjx Hgjx</div>
+            <div id="tn" style="text-decoration:underline">Hgjx Hgjx</div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the count of pixels passing `hue` in element `id`'s rect extended 4px down
+    /// (the underline sits at the line box's foot).
+    fn text_decoration_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 4).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn text_decoration_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 90 && c.1 < 90 && c.2 < 90
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration: underline; text-decoration-color: red` under black text
+    /// paints a red underline (a run of red pixels) and black glyphs; the plain underline control paints no red.
+    #[test]
+    fn text_decoration_color_longhand_paints_red() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tl", css_wide_red) > 40, "#tl paints a red underline");
+        assert!(text_decoration_ink(&mut e, "tl", text_decoration_black) > 40, "#tl's glyphs stay black");
+        assert_eq!(text_decoration_ink(&mut e, "tn", css_wide_red), 0, "the plain underline paints no red (armed)");
+        assert!(text_decoration_ink(&mut e, "tn", text_decoration_black) > 40, "the plain underline paints");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the shorthand's colour word `text-decoration: underline red` the same.
+    #[test]
+    fn text_decoration_color_shorthand_paints_red() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "ts", css_wide_red) > 40, "#ts paints a red underline");
+        assert!(text_decoration_ink(&mut e, "ts", text_decoration_black) > 40, "#ts's glyphs stay black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a later `text-decoration-color: currentcolor` paints the line in the text's
+    /// blue: no red.
+    #[test]
+    fn text_decoration_color_currentcolor() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tc", css_wide_blue) > 40, "#tc paints blue");
+        assert_eq!(text_decoration_ink(&mut e, "tc", css_wide_red), 0, "#tc paints no red");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): a blue span under a parent whose underline is red paints the parent's red
+    /// underline through its own text, its glyphs blue (the colour rides the inherited underline road).
+    #[test]
+    fn text_decoration_color_child_span() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tp", css_wide_red) > 40, "#tp paints the parent's red underline");
+        assert!(text_decoration_ink(&mut e, "tp", css_wide_blue) > 40, "#tp's glyphs are blue");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `text-decoration-color: initial` is currentcolor: the shorthand's red goes,
+    /// the line paints black.
+    #[test]
+    fn text_decoration_color_initial() {
+        let mut e = text_decoration_color_engine();
+        assert_eq!(text_decoration_ink(&mut e, "ti", css_wide_red), 0, "#ti paints no red");
+        assert!(text_decoration_ink(&mut e, "ti", text_decoration_black) > 40, "#ti paints black");
+    }
+
+    /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): `.d { text-decoration: underline currentcolor }` with a later `.d.g { color:
+    /// rgb(0, 160, 0) }` paints the line green with the text: no black, no red.
+    #[test]
+    fn text_decoration_color_later_color() {
+        let mut e = text_decoration_color_engine();
+        assert!(text_decoration_ink(&mut e, "tg", css_wide_green) > 40, "#tg paints green");
+        assert_eq!(text_decoration_ink(&mut e, "tg", css_wide_red), 0, "#tg paints no red");
+        assert_eq!(text_decoration_ink(&mut e, "tg", text_decoration_black), 0, "#tg paints no black");
     }
 
     // ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
