@@ -1868,3 +1868,6 @@ exec-rmbp-aethercssombordersidealpharead|287c06bf4|cut128h
 exec-rmbp-aethercssomtextunderlineoffsetinherit|287c06bf4|cut128h
 exec-rmbp-h264encrcdocscenecut|287c06bf4|cut128h
 exec-rmbp-nlefaceexportjsondocos|287c06bf4|cut128h
+exec-rmbp-aethercssoutlinetransparent|125e73994|cut129h
+exec-rmbp-aetherfontsgenericresolvenamedserif|125e73994|cut129h
+exec-rmbp-aethercssomtextdecorationlinecolumnmulti|125e73994|cut129h
