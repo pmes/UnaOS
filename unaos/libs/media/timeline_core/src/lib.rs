@@ -2448,3 +2448,45 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIATRACKREORDER (LEDGER SR877): swap a track with its same-kind neighbour (named tail block) ----
+// `track-up` / `track-down` reorder tracks WITHIN a kind: the track swaps with the NEAREST track of the same kind at a lower
+// (up: toward row 0 on screen, which is DOWN in the video composite, `schedule::top` taking the highest index) or higher
+// index, other-kind tracks skipped. The kind in every index slot stays fixed, so `edl::write`'s per-kind channel numbers
+// and `edl::parse`'s canonical rebuild (all video, then audio) give the same order back. A track carries its clips and its
+// transitions; the one other model field naming a track index, `audio_xfades[].track`, is remapped by `track_swapped` and
+// re-sorted. `validate` stays the one gate. Refused: no such track, or no same-kind track that way (`EditError::NoTrack`).
+
+/// STRIATRACKREORDER: where index `i` lands when tracks `a` and `b` swap.
+pub fn track_swapped(i: usize, a: usize, b: usize) -> usize {
+    if i == a {
+        b
+    } else if i == b {
+        a
+    } else {
+        i
+    }
+}
+
+impl Timeline {
+    /// STRIATRACKREORDER: the nearest track of `track`'s kind at a lower (`up`) or higher index (`EditError::NoTrack`: none,
+    /// or no such track).
+    pub fn track_neighbour(&self, track: usize, up: bool) -> Result<usize, EditError> {
+        let k = self.tracks.get(track).ok_or(EditError::NoTrack)?.kind;
+        let same = |&j: &usize| self.tracks[j].kind == k;
+        let j = if up { (0..track).rev().find(same) } else { (track + 1..self.tracks.len()).find(same) };
+        j.ok_or(EditError::NoTrack)
+    }
+    /// STRIATRACKREORDER: the timeline with `track` swapped with its same-kind neighbour ([`Timeline::track_neighbour`]).
+    pub fn swap_track(&self, track: usize, up: bool) -> Result<Timeline, EditError> {
+        let j = self.track_neighbour(track, up)?;
+        let mut tl = self.clone();
+        tl.tracks.swap(track, j);
+        for x in tl.audio_xfades.iter_mut() {
+            x.track = track_swapped(x.track, track, j);
+        }
+        tl.audio_xfades.sort_by_key(|x| (x.track, x.at));
+        tl.validate()?;
+        Ok(tl)
+    }
+}

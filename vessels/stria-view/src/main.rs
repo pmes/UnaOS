@@ -538,6 +538,7 @@ fn transport() -> TetraNode {
         button("track-gain", "Track 0 dB"), // STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
         button("link", "Link"), button("unlink", "Unlink"), // STRIACLIPLINK (SR863): link / unlink the selected clips' group
         button("info", "Info"), // STRIASOURCEINFO (SR875): the selected clip's reel line, standing five seconds on the message row
+        button("track-up", "Track Up"), button("track-down", "Track Down"), // STRIATRACKREORDER (SR877): the selected clip's track swaps with its same-kind neighbour
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }

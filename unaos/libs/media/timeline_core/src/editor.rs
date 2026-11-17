@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail)
+        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1854,4 +1854,41 @@ fn pan_words(v: &str) -> Option<i8> {
     }
     let x = w.next()?.parse::<f64>().ok().filter(|x| (-1.0..=1.0).contains(x))?;
     w.next().is_none().then_some(libm::round(x * 127.0) as i8)
+}
+
+// ---- STRIATRACKREORDER (LEDGER SR877): track-up / track-down through the one commit (named tail block) ----
+// `track-up` / `track-down` ride THE verb dispatch both faces call: the selected clip's track swaps with its nearest
+// same-kind neighbour (`Timeline::swap_track`; up = toward row 0 on screen = down in the video composite) as ONE `commit`
+// (undo-able, it dirties the document). The selection, the set and the selected transition carry track indices that
+// `settle` only bounds-checks, so `retrack_swap` remaps them BEFORE the commit: the selection follows its clip. FOLD NOTE:
+// SR856's `EditorState::retrack` remaps the same indices; `retrack_swap` and `retrack` MUST become ONE fn at the fold.
+// Refused by name: no clip selected `EditError::NoClip`, no same-kind track that way `EditError::NoTrack`.
+impl EditorState {
+    /// The selected clip's track swapped with its same-kind neighbour above (`up`) or below (one commit).
+    pub fn move_track(&mut self, up: bool) -> Result<(), EditError> {
+        let (track, _) = self.selection.ok_or(EditError::NoClip)?;
+        let j = self.timeline.track_neighbour(track, up)?;
+        let tl = self.timeline.swap_track(track, up)?;
+        self.retrack_swap(track, j);
+        self.commit(tl);
+        Ok(())
+    }
+    /// STRIATRACKREORDER: the selection, the set and the selected transition after tracks `a` and `b` swap.
+    fn retrack_swap(&mut self, a: usize, b: usize) {
+        let m = |t: usize| crate::track_swapped(t, a, b);
+        self.selection = self.selection.map(|(t, i)| (m(t), i));
+        for p in self.set.iter_mut() {
+            p.0 = m(p.0);
+        }
+        self.set.sort_unstable();
+        self.transition = self.transition.map(|(t, i)| (m(t), i));
+    }
+    /// The `track-up` / `track-down` words of [`EditorState::verb`]; `None` for any other word.
+    fn track_order_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        match v {
+            "track-up" => Some(self.move_track(true)),
+            "track-down" => Some(self.move_track(false)),
+            _ => None,
+        }
+    }
 }
