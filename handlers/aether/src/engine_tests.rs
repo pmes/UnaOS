@@ -6624,7 +6624,7 @@ mod tests {
     #[test]
     fn cssom_direction_column_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) is column 21, SR1036 appends white-space-collapse / text-wrap-mode / text-decoration-color as 22-24 (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns appended, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
         assert_eq!((crate::css::REPORT_PROPS[0], crate::css::REPORT_PROPS[12]), ("display", "visibility"));
     }
@@ -7832,7 +7832,7 @@ b</div>
     #[test]
     fn cssom_unicode_bidi_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: three columns after unicode-bidi
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: three columns after unicode-bidi (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[21], "unicode-bidi");
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
     }
@@ -8668,12 +8668,12 @@ b</div>
     #[test]
     fn cssom_columns_rest_report_width() {
         assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
-        assert_eq!(crate::css::REPORT_COLS, 25); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1036 fold: unicode-bidi (SR1008) sits at 21 before the three (SR1096: nine box-side columns appended, 34; SR1103: three border side style columns, 37; SR1104: three border side colour columns, 40); SR1108: five text-decoration / caret columns, 45
         assert_eq!(crate::css::REPORT_PROPS[20], "direction");
-        assert_eq!(&crate::css::REPORT_PROPS[22..], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]);
+        assert_eq!(&crate::css::REPORT_PROPS[22..25], &["white-space-collapse", "text-wrap-mode", "text-decoration-color"]); // SR1096: the nine box-side columns follow at 25..34
         let mut e = cssom_columns_rest_engine();
-        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "25"); // SR1036 fold: 25 columns with unicode-bidi
-        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color");
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('wn')).length)"), "45"); // SR1036 fold: 25 columns with unicode-bidi (SR1096: 34 with the nine box-side columns; SR1103: 37 with the three border side style columns); SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('wn')).item(24)"), "text-decoration-color"); // SR1096: still column 24 (the box-side columns append after it)
     }
 
     // ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
@@ -9134,6 +9134,190 @@ b</div>
         assert!(s[0] < 99.5, "the start twin is ragged: {s:?}");
     }
 
+    // ---- AETHERCSSOMBOXSIDECOLUMNS (LEDGER SR1096): report columns for the right / bottom / left sides of margin, padding and border width (named tail block) ----
+
+    /// AETHERCSSOMBOXSIDECOLUMNS (SR1096): the nine box-side columns append after text-decoration-color (no earlier
+    /// index moves) and the computed declaration enumerates all 34.
+    #[test]
+    fn box_side_columns_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1103: three border side style columns appended after the nine; SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_PROPS[24], "text-decoration-color");
+        assert_eq!(
+            &crate::css::REPORT_PROPS[25..34], // SR1103: the nine stay at 25..34
+            &["margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width"]
+        );
+        let mut e = box_side_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('d')).length)"), "45"); // SR1103; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('d')).item(33)"), "border-left-width");
+    }
+
+    fn box_side_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body id="bd">
+            <div id="d" style="margin: 1px 2px 3px 4px; padding: 5px 6px 7px 8px; border-top-width: 1px; border-right-width: 2px; border-bottom-width: 3px; border-left-width: 4px; border-style: solid">x</div>
+            <p id="p">p</p><h1 id="h">h</h1>
+            <div style="width: 300px"><div id="au" style="width: 100px; margin: 0 auto">a</div></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBOXSIDECOLUMNS (SR1096): every side of margin / padding / border width reads its own px through
+    /// getComputedStyle (before SR1096 only the top side had a report column, so the UA body margin read `8px` on
+    /// top and `0px` on the other three, and SR1092's composed `margin` read `8px 0px 0px`).
+    #[test]
+    fn box_side_columns_reads() {
+        let mut e = box_side_engine();
+        for (prop, want) in [
+            ("margin-top", "1px"),
+            ("margin-right", "2px"),
+            ("margin-bottom", "3px"),
+            ("margin-left", "4px"),
+            ("padding-top", "5px"),
+            ("padding-right", "6px"),
+            ("padding-bottom", "7px"),
+            ("padding-left", "8px"),
+            ("border-top-width", "1px"),
+            ("border-right-width", "2px"),
+            ("border-bottom-width", "3px"),
+            ("border-left-width", "4px"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, "d", &format!("getPropertyValue('{prop}')")), want, "#d: {prop}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "d", "marginRight"), "2px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "paddingLeft"), "8px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "borderBottomWidth"), "3px");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "getPropertyValue('padding')"), "5px 6px 7px 8px");
+        // The four widths are declared as longhands: layout_core's `border-width` arm parses one length only, so the
+        // four-value shorthand drops (owed AETHER-CSS-BORDER-WIDTH-MULTI); the composed read is SR1092's from the columns.
+        assert_eq!(font_shorthand_cs(&mut e, "d", "getPropertyValue('border-width')"), "1px 2px 3px 4px");
+        // The UA margins (html.css): body 8px all round, p 1em 0, h1 0.67em 0 at 32px.
+        assert_eq!(font_shorthand_cs(&mut e, "bd", "marginRight"), "8px", "body: margin-right");
+        assert_eq!(font_shorthand_cs(&mut e, "bd", "getPropertyValue('margin')"), "8px", "body: SR1092's composed margin");
+        assert_eq!(font_shorthand_cs(&mut e, "p", "getPropertyValue('margin')"), "16px 0px", "p: composed margin");
+        assert_eq!(font_shorthand_cs(&mut e, "h", "getPropertyValue('margin')"), "21.44px 0px", "h1: composed margin");
+        // The side columns mirror the top column's source, the specified style: `auto` reads `auto` (Chromium reads the
+        // used 100px; owed AETHER-CSSOM-MARGIN-AUTO-RESOLVED).
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginLeft"), "auto", "margin: 0 auto: margin-left");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginRight"), "auto", "margin: 0 auto: margin-right");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "marginTop"), "0px", "margin: 0 auto: margin-top");
+    }
+
+    // ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): four border-style report columns read through layout_core's border_style_word (named tail block) ----
+
+    fn border_side_style_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div id="dd" style="border: 1px dashed; border-left-style: dotted">a</div>
+            <div id="tn" style="border: 1px solid; border-top-style: none">b</div>
+            <div id="w0" style="border: 2px double; border-bottom-width: 0px">c</div>
+            <div id="pl">d</div>
+            <div id="bt" style="border-top: 1px dashed red">e</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the three side style columns append after SR1096's nine (no earlier
+    /// index moves) and the computed declaration enumerates all 37.
+    #[test]
+    fn border_side_style_columns_report_width() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1104: three border side colour columns, 40; SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_PROPS[15], "border-top-style");
+        assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]); // SR1104: the three colour columns follow at 37..40
+        let mut e = border_side_style_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('dd')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('dd')).item(36)"), "border-left-style");
+    }
+
+    /// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): each side reads its own style word (before SR1103 the top column read
+    /// `solid` for any painted side and the other three had no column, so a dashed card read back `solid`); a side with
+    /// no border or a 0 width reads `none` (the render's paint rule; owed AETHER-CSSOM-BORDER-STYLE-SPECIFIED).
+    #[test]
+    fn border_side_style_columns_words() {
+        let mut e = border_side_style_engine();
+        for (id, prop, want) in [
+            ("dd", "borderTopStyle", "dashed"),
+            ("dd", "borderRightStyle", "dashed"),
+            ("dd", "borderBottomStyle", "dashed"),
+            ("dd", "borderLeftStyle", "dotted"),
+            ("tn", "borderTopStyle", "none"),
+            ("tn", "borderBottomStyle", "solid"),
+            ("w0", "borderTopStyle", "double"),
+            ("w0", "borderBottomStyle", "none"),
+            ("pl", "borderTopStyle", "none"),
+            ("pl", "borderRightStyle", "none"),
+            ("pl", "borderBottomStyle", "none"),
+            ("pl", "borderLeftStyle", "none"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "{id} {prop}");
+        }
+        // A partly declared border-style composes from the four columns (SR1092's fallback): before SR1103 the top
+        // column read `solid`, so this read `solid none none`; four_serialize drops the left side equal to the right.
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "borderStyle"), "dashed none none");
+    }
+
+    // ---- AETHERCSSOMBORDERSIDECOLORCOLUMNS (LEDGER SR1104): report columns for the top / right / bottom border colours (named tail block) ----
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): `#bc` border: 1px solid red with a blue left; `#cc` a colourless top
+    /// border under color: green (currentcolor); `#ac` a half-alpha red top; `#nc` an unstyled div.
+    fn border_side_color_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="bc" style="width:40px;height:20px;border:1px solid red;border-left-color:blue"></div>
+            <div id="cc" style="width:40px;height:20px;color:green;border-top:1px solid"></div>
+            <div id="ac" style="width:40px;height:20px;border-top:1px solid rgba(255, 0, 0, 0.5)"></div>
+            <div id="nc" style="width:40px;height:20px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): the three colour columns append after SR1103's three (no earlier index
+    /// moves; border-left-color stays column 16) and the computed declaration enumerates all 40.
+    #[test]
+    fn border_side_color_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 45); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(crate::css::REPORT_PROPS[16], "border-left-color");
+        assert_eq!(&crate::css::REPORT_PROPS[34..37], &["border-right-style", "border-bottom-style", "border-left-style"]);
+        assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]); // SR1108: five text-decoration / caret columns, 45
+        let mut e = border_side_color_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('nc')).length)"), "45"); // SR1108: five text-decoration / caret columns, 45
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('nc')).item(39)"), "border-bottom-color");
+    }
+
+    /// AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): each side reads its own ink through `border_ink` (before SR1104 the top /
+    /// right / bottom colours had no column and read cssom's road); a colourless side reads currentcolor resolved; the
+    /// report serializes no alpha (one `border_alpha` for four sides: owed AETHER-CSS-BORDER-SIDE-ALPHA), so a half-alpha
+    /// red reads `rgb(255, 0, 0)`; an undeclared side reads the element's color (Chromium's currentcolor).
+    #[test]
+    fn border_side_color_columns_read() {
+        let mut e = border_side_color_columns_engine();
+        for (id, prop, want) in [
+            ("bc", "borderTopColor", "rgb(255, 0, 0)"),
+            ("bc", "borderRightColor", "rgb(255, 0, 0)"),
+            ("bc", "borderBottomColor", "rgb(255, 0, 0)"),
+            ("bc", "borderLeftColor", "rgb(0, 0, 255)"),
+            ("cc", "borderTopColor", "rgb(0, 128, 0)"),
+            ("ac", "borderTopColor", "rgb(255, 0, 0)"),
+            ("nc", "borderTopColor", "rgb(0, 0, 0)"),
+            ("nc", "borderRightColor", "rgb(0, 0, 0)"),
+            ("nc", "borderBottomColor", "rgb(0, 0, 0)"),
+            ("nc", "borderLeftColor", "rgb(0, 0, 0)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, prop), want, "{id} {prop}");
+        }
+    }
+
     // ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last (named tail block) ----
 
     /// AETHERTEXTALIGNLAST (SR1062): getComputedStyle reads text-align-last back: `center` on the element, `center`
@@ -9152,6 +9336,87 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "c", "textAlignLast"), "center", "text-align-last: center reads back");
         assert_eq!(font_shorthand_cs(&mut e, "i", "textAlignLast"), "center", "text-align-last is inherited");
         assert_eq!(font_shorthand_cs(&mut e, "j", "textAlignLast"), "justify", "justify reads back");
+    }
+
+    // ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): report columns for text-decoration-style / -thickness, text-underline-offset / -position and caret-color (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): `#td` a wavy red 3px underline, offset 2px, under; `#uc` a span inside an
+    /// `under` div and `#ui` a span there with `text-underline-position: inherit`; `#ff` a from-font thickness; `#pd` a plain
+    /// div; `#cr` an input with caret-color red, `#ca` an auto-caret input in blue, `#ci` an input inside a green-caret div.
+    fn text_decoration_columns_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="td" style="text-decoration: underline wavy red; text-decoration-thickness: 3px; text-underline-offset: 2px; text-underline-position: under">a</div>
+            <div style="text-underline-position: under"><span id="uc">b</span><span id="ui" style="text-underline-position: inherit">c</span></div>
+            <div id="ff" style="text-decoration: underline; text-decoration-thickness: from-font">d</div>
+            <div id="pd">e</div>
+            <input id="cr" style="caret-color: red">
+            <input id="ca" style="color: blue">
+            <div style="caret-color: rgb(0, 128, 0)"><input id="ci"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): `getPropertyValue` on the computed declaration (text-underline-position has
+    /// no camel accessor: owed AETHER-CSSOM-TEXT-UNDERLINE-POSITION-ACCESSOR).
+    fn text_decoration_pv(e: &mut crate::AetherEngine, id: &str, prop: &str) -> String {
+        font_synth_eval(e, &format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{prop}')"))
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): the five columns append after SR1104's three (no earlier index moves) and
+    /// the computed declaration enumerates all 45.
+    #[test]
+    fn text_decoration_columns_layout() {
+        assert_eq!(crate::css::REPORT_PROPS.len(), crate::css::REPORT_COLS);
+        assert_eq!(crate::css::REPORT_COLS, 45);
+        assert_eq!(&crate::css::REPORT_PROPS[37..40], &["border-top-color", "border-right-color", "border-bottom-color"]);
+        assert_eq!(
+            &crate::css::REPORT_PROPS[40..],
+            &["text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color"]
+        );
+        let mut e = text_decoration_columns_engine();
+        assert_eq!(font_synth_eval(&mut e, "String(getComputedStyle(document.getElementById('pd')).length)"), "45");
+        assert_eq!(font_synth_eval(&mut e, "getComputedStyle(document.getElementById('pd')).item(44)"), "caret-color");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): style / thickness / offset read the element's own paint (before SR1108 they
+    /// had no column, so a wavy underline never read `wavy` from the paint); the position reads the inherited value (a child
+    /// and an explicit `inherit` read the parent's `under`); from-font is stored as auto and reads `auto` (owed
+    /// AETHER-CSS-TEXT-DECORATION-FROM-FONT); a plain div reads the initials.
+    #[test]
+    fn text_decoration_columns_read() {
+        let mut e = text_decoration_columns_engine();
+        for (id, prop, want) in [
+            ("td", "text-decoration-style", "wavy"),
+            ("td", "text-decoration-thickness", "3px"),
+            ("td", "text-underline-offset", "2px"),
+            ("td", "text-underline-position", "under"),
+            ("uc", "text-underline-position", "under"),
+            ("ui", "text-underline-position", "under"),
+            ("ff", "text-decoration-thickness", "auto"),
+            ("pd", "text-decoration-style", "solid"),
+            ("pd", "text-decoration-thickness", "auto"),
+            ("pd", "text-underline-offset", "auto"),
+            ("pd", "text-underline-position", "auto"),
+        ] {
+            assert_eq!(text_decoration_pv(&mut e, id, prop), want, "{id} {prop}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textDecorationStyle"), "wavy", "the camel accessor reads the column");
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textDecorationThickness"), "3px");
+        assert_eq!(font_shorthand_cs(&mut e, "td", "textUnderlineOffset"), "2px");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): caret-color reads what `caret_ink` paints: a declared colour as rgb (no
+    /// alpha: owed AETHER-CSSOM-CARET-COLOR-ALPHA), auto the element's color, and the value inherits (`caret_inherit`).
+    #[test]
+    fn text_decoration_columns_caret() {
+        let mut e = text_decoration_columns_engine();
+        for (id, want) in [("cr", "rgb(255, 0, 0)"), ("ca", "rgb(0, 0, 255)"), ("ci", "rgb(0, 128, 0)"), ("pd", "rgb(0, 0, 0)")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "caretColor"), want, "{id} caretColor");
+        }
     }
 
     // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending border colour paints only where a side exists (named tail block) ----
@@ -9237,6 +9502,119 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "g", "fontFamily"), "serif", "the generic twin");
         assert_eq!(font_shorthand_cs(&mut e, "m", "fontFamily"), r#""serif", serif"#, "the name, then the generic");
         assert_eq!(font_synth_eval(&mut e, "document.getElementById('q').style.fontFamily"), r#""serif""#, "el.style (kept)");
+    }
+
+    // ---- AETHERCSSOMWHITESPACELONGHANDSACCESSOR (LEDGER SR1109): the camelCase accessors for white-space's longhands (named tail block) ----
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): one div per case at 400 px wide.
+    fn cssom_white_space_longhands_accessor_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div id="c">a b</div><div id="m">a b</div><div id="t">a b</div><div id="d">a b</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `whiteSpaceCollapse` writes the declaration (getPropertyValue
+    /// and cssText read it) and getComputedStyle reads `preserve` (without the accessor: '' / '' / `collapse`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_collapse() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('c').style; s.whiteSpaceCollapse = 'preserve'; [s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse'), s.cssText].join('|')");
+        assert_eq!(got, "preserve|preserve|white-space-collapse: preserve;");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "c", "whiteSpaceCollapse"), "preserve", "computed white-space-collapse");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrapMode = 'nowrap'` reaches the declaration and the
+    /// computed column (without the accessor: `wrap`).
+    #[test]
+    fn cssom_white_space_longhands_accessor_wrap_mode() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('m').style; s.textWrapMode = 'nowrap'; [s.textWrapMode, s.getPropertyValue('text-wrap-mode')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "m", "textWrapMode"), "nowrap", "computed text-wrap-mode");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): `textWrap = 'nowrap'` is stored as text-wrap (no SHORTHANDS row:
+    /// owed) and SR1044's layout_core arm makes the computed text-wrap-mode `nowrap`.
+    #[test]
+    fn cssom_white_space_longhands_accessor_text_wrap() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('t').style; s.textWrap = 'nowrap'; [s.textWrap, s.getPropertyValue('text-wrap')].join('|')");
+        assert_eq!(got, "nowrap|nowrap");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "t", "textWrapMode"), "nowrap", "computed text-wrap-mode under text-wrap");
+    }
+
+    /// AETHERCSSOMWHITESPACELONGHANDSACCESSOR (SR1109): the same loop installs the dashed accessor.
+    #[test]
+    fn cssom_white_space_longhands_accessor_dashed() {
+        let mut e = cssom_white_space_longhands_accessor_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('d').style; s['white-space-collapse'] = 'preserve-breaks'; [s['white-space-collapse'], s.whiteSpaceCollapse, s.getPropertyValue('white-space-collapse')].join('|')");
+        assert_eq!(got, "preserve-breaks|preserve-breaks|preserve-breaks");
+    }
+
+    // ---- AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (LEDGER SR1113): getComputedStyle textDecoration from the four report columns, the el.style expand and the textUnderlinePosition accessor (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `#w` a wavy red underline, `#t` the same with a 3px thickness, `#p` a plain
+    /// div, `#b` a plain blue div, `#s` / `#u` plain divs the script writes.
+    fn text_decoration_shorthand_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="w" style="text-decoration: underline wavy red">a</div>
+            <div id="t" style="text-decoration: underline wavy red; text-decoration-thickness: 3px">b</div>
+            <div id="p">c</div>
+            <div id="b" style="color: blue">d</div>
+            <div id="s">e</div>
+            <div id="u">f</div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): textDecoration composes `<line> <style> <color> [<thickness>]` from the
+    /// report columns as Chromium reads it (before SR1113: the cascaded `underline wavy red`, and "" for an undecorated div).
+    #[test]
+    fn text_decoration_shorthand_computed() {
+        let mut e = text_decoration_shorthand_engine();
+        for (id, want) in [
+            ("w", "underline wavy rgb(255, 0, 0)"),
+            ("t", "underline wavy rgb(255, 0, 0) 3px"),
+            ("p", "none solid rgb(0, 0, 0)"),
+            ("b", "none solid rgb(0, 0, 255)"),
+        ] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecoration"), want, "#{id} textDecoration");
+        }
+        assert_eq!(text_decoration_pv(&mut e, "w", "text-decoration"), "underline wavy rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `textDecoration = 'underline red'` expands into the longhands (before
+    /// SR1113 it was stored whole and textDecorationLine read ""), cssText recomposes the shorthand, and the computed road reads it.
+    #[test]
+    fn text_decoration_shorthand_style_expands() {
+        let mut e = text_decoration_shorthand_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('s').style; s.textDecoration = 'underline red'; [s.textDecorationLine, s.textDecorationColor, s.textDecorationStyle, s.textDecoration, s.cssText].join('|')");
+        assert_eq!(got, "underline|red|solid|underline red|text-decoration: underline red;");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "s", "textDecoration"), "underline solid rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): text-underline-position is a PROPERTIES name, so the camel accessor
+    /// writes the declaration and getComputedStyle reads SR1108's column (before SR1113: undefined).
+    #[test]
+    fn text_decoration_shorthand_underline_position_accessor() {
+        let mut e = text_decoration_shorthand_engine();
+        let got = font_synth_eval(&mut e, "var s = document.getElementById('u').style; s.textUnderlinePosition = 'under'; [s.textUnderlinePosition, s.getPropertyValue('text-underline-position')].join('|')");
+        assert_eq!(got, "under|under");
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "u", "textUnderlinePosition"), "under");
     }
 
     // ---- AETHERCSSBORDERSIDESTYLEWIDTH (LEDGER SR1069): a style alone paints a medium frame; a width alone paints nothing (named tail block) ----
@@ -9476,5 +9854,107 @@ b</div>
         assert_ne!(imgalt_px(&e, 220, 50), (255, 0, 0), "gap: 40px: x 220 is gutter");
         assert_ne!(imgalt_px(&e, 220, 90), (255, 0, 0), "grid-gap: 40px: x 220 is gutter");
         assert_ne!(imgalt_px(&e, 220, 130), (255, 0, 0), "gap: 0px 40px: the column token, x 220 is gutter");
+    }
+
+    // ---- AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (LEDGER SR1121): the text-decoration-line column reads the element's own underline / line-through / both (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): `#lt` a strike-through, `#ul` both lines, `#u` an underline, `#n` none,
+    /// `#del` the UA line-through, `#pd` an underlined div holding the undecorated span `#ps`.
+    fn text_decoration_line_column_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="lt" style="text-decoration: line-through">a</div>
+            <div id="ul" style="text-decoration-line: underline line-through">b</div>
+            <div id="u" style="text-decoration-line: underline">c</div>
+            <div id="n" style="text-decoration: none">d</div>
+            <div><del id="del">e</del></div>
+            <div id="pd" style="text-decoration: underline"><span id="ps">f</span></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): textDecorationLine reads the own line set in canonical order (before
+    /// SR1121: `#lt` and `#del` read `none`, `#ul` read `underline`; `#u`, `#n`, `#pd` kept).
+    #[test]
+    fn text_decoration_line_column_words() {
+        let mut e = text_decoration_line_column_engine();
+        for (id, want) in [("lt", "line-through"), ("ul", "underline line-through"), ("u", "underline"), ("n", "none"), ("del", "line-through"), ("pd", "underline")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecorationLine"), want, "#{id} textDecorationLine");
+        }
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): text-decoration-line is not inherited: the undecorated span inside an
+    /// underlined div reads `none` as Chromium does (before SR1121: the inherited flag read `underline`; the paint still propagates).
+    #[test]
+    fn text_decoration_line_column_own_not_inherited() {
+        let mut e = text_decoration_line_column_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ps", "textDecorationLine"), "none");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): SR1113's composer reads the column, so the shorthand carries the real
+    /// line set (before SR1121: `none solid rgb(0, 0, 0)` and `underline solid rgb(0, 0, 0)`).
+    #[test]
+    fn text_decoration_line_column_shorthand() {
+        let mut e = text_decoration_line_column_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "lt", "textDecoration"), "line-through solid rgb(0, 0, 0)");
+        assert_eq!(font_shorthand_cs(&mut e, "ul", "textDecoration"), "underline line-through solid rgb(0, 0, 0)");
+    }
+
+    // ---- AETHERCSSTEXTDECORATIONLINERESET (LEDGER SR1122): a declared text-decoration-line replaces the UA link underline; propagation kept (named tail block) ----
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): 20px serif black rows 20px apart, red decorations: `#xa` a div holding the
+    /// link `#xal` declaring `text-decoration: line-through red`; `#xs` the strike-only div twin; `#xu` a div holding a link
+    /// with only `text-decoration-color: red` (the UA underline); `#tu` the underline-only div twin; `#pp` an underlined div
+    /// holding the span `#ppl` declaring `text-decoration: line-through red`.
+    fn text_decoration_line_reset_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 20px }
+            </style></head><body style="margin:0;font:20px serif;color:black">
+            <div id="xa"><a id="xal" href="#x" style="text-decoration: line-through red">Hgjx Hgjx</a></div>
+            <div id="xs" style="text-decoration: line-through red">Hgjx Hgjx</div>
+            <div id="xu"><a href="#x" style="text-decoration-color: red">Hgjx Hgjx</a></div>
+            <div id="tu" style="text-decoration: underline red">Hgjx Hgjx</div>
+            <div id="pp" style="text-decoration: underline"><span id="ppl" style="text-decoration: line-through red">Hgjx Hgjx</span></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): element `id`'s red rows, each measured from its own box top.
+    fn text_decoration_line_reset_rows(e: &mut crate::AetherEngine, id: &str) -> Vec<i64> {
+        let top = imgalt_rect(e, id).1.floor() as i64;
+        text_decoration_style_red(e, id).0.into_iter().map(|y| y as i64 - top).collect()
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): `<a style="text-decoration: line-through red">` paints the strike band of
+    /// its div twin and no row of the UA underline band, and reads textDecorationLine `line-through` (Chromium: the
+    /// declared set replaces the link's UA underline). Before SR1122 the link painted both bands and read `underline line-through`.
+    #[test]
+    fn text_decoration_line_reset_link_strike_only() {
+        let mut e = text_decoration_line_reset_engine();
+        let (link, strike, under) = (text_decoration_line_reset_rows(&mut e, "xa"), text_decoration_line_reset_rows(&mut e, "xs"), text_decoration_line_reset_rows(&mut e, "xu"));
+        assert!(!strike.is_empty() && !under.is_empty(), "both twins paint red: strike {strike:?} underline {under:?}");
+        assert!(strike.iter().all(|r| !under.contains(r)), "the twins' bands are distinct: {strike:?} vs {under:?}");
+        assert_eq!(link, strike, "the link paints the strike band only (armed: the UA underline band too)");
+        assert_eq!(font_shorthand_cs(&mut e, "xal", "textDecorationLine"), "line-through", "the link's own line set");
+    }
+
+    /// AETHERCSSTEXTDECORATIONLINERESET (SR1122): css-text-decor-3 §2.1: a span declaring `line-through` inside an underlined
+    /// div still paints the div's underline through its text beside its own strike (the reset clears only the element's own
+    /// tag default, never the propagated line), and reads `line-through` (text-decoration-line is not inherited).
+    #[test]
+    fn text_decoration_line_reset_propagation_kept() {
+        let mut e = text_decoration_line_reset_engine();
+        let (both, under, strike) = (text_decoration_line_reset_rows(&mut e, "pp"), text_decoration_line_reset_rows(&mut e, "tu"), text_decoration_line_reset_rows(&mut e, "xs"));
+        assert!(!under.is_empty() && !strike.is_empty(), "the twins paint red: {under:?} {strike:?}");
+        assert!(under.iter().all(|r| both.contains(r)), "the parent's underline paints through the span: {both:?} vs {under:?}");
+        assert!(strike.iter().all(|r| both.contains(r)), "the span's own strike paints: {both:?} vs {strike:?}");
+        assert_eq!(font_shorthand_cs(&mut e, "ppl", "textDecorationLine"), "line-through");
     }
 }

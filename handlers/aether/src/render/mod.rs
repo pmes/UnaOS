@@ -1037,10 +1037,10 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if matches!(tag, "input" | "textarea" | "select" | "button") { // SR1058 fold (trunk red since SR1053): css-text-decor-3 §2.1: an ancestor's decoration is not propagated into an atomic inline (a control); it resets here, and only the control's own rule decorates its text
         inherited.underline = false; inherited.line_through = false; inherited.deco_color = None;
     }
-    if tag == "a" || tag == "u" {
+    if (tag == "a" || tag == "u") && spec.underline != Some(false) {
         inherited.underline = true;
     }
-    if let Some(u) = spec.underline {
+    if let Some(u) = spec.underline.filter(|&u| u) {
         inherited.underline = u;
     }
     if let Some(nw) = spec.nowrap {
@@ -1054,7 +1054,7 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; } caret_inherit(inherited, spec);
     inherited.line_through = spec
         .line_through
-        .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
+        .unwrap_or_else(|| crate::layout::default_line_through(tag, false)) || inherited.line_through;
     // html.css list styles: ul disc (circle one level down,
     // square deeper), ol decimal; inherited into the items.
     inherited.list_style = list_style_of(tag, inherited.list_style, spec, dom_node);

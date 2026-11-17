@@ -1736,6 +1736,22 @@ fn text_align_justify_container_start() {
     assert_eq!(styled(&[("text-align", "start")]).paint.text_align, Some(0), "start stays 0");
 }
 
+// ---- AETHERCSSOMBORDERSIDESTYLECOLUMNS (LEDGER SR1103): border_style_word is the exact inverse of border_style_code (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): every paint code round-trips through its keyword, and the 3D styles
+/// (which paint solid) collapse to code 0 and read back `solid`.
+#[test]
+fn border_style_word_round_trip() {
+    use layout_core::css::{border_style_code, border_style_word};
+    for (w, c) in [("solid", 0u8), ("dashed", 1), ("dotted", 2), ("double", 3)] {
+        assert!(border_style_code(w) == Some(c) && border_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["groove", "ridge", "inset", "outset"] {
+        assert_eq!(border_style_code(w).map(border_style_word), Some("solid"), "{w}");
+    }
+    assert_eq!((border_style_code("none"), border_style_code("hidden")), (None, None), "none / hidden clear the side, no code");
+}
+
 // ---- AETHERTEXTALIGNLAST (LEDGER SR1062): css-text-3 §7.2 text-align-last (named tail block) ----
 
 /// AETHERTEXTALIGNLAST (SR1062): the frag (x0, x1) per line of `#p` inside `outer`-styled div.
@@ -1834,6 +1850,33 @@ fn text_align_last_codes() {
     assert!(ALL_LONGHANDS.contains(&"text-align-last"), "the arm is listed for all:");
 }
 
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): text_decoration_style_word / underline_position_word invert the parsers' codes (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-decoration-style code round-trips through its keyword; the
+/// CSS-wide spellings the parser folds (initial / unset) read `solid`.
+#[test]
+fn text_decoration_style_word_round_trip() {
+    use layout_core::css::{deco_style_code, text_decoration_style_word};
+    for (w, c) in [("solid", 0u8), ("double", 1), ("dotted", 2), ("dashed", 3), ("wavy", 4)] {
+        assert!(deco_style_code(w) == Some(c) && text_decoration_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["initial", "unset"] {
+        assert_eq!(deco_style_code(w).map(text_decoration_style_word), Some("solid"), "{w}");
+    }
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-underline-position code round-trips through its keyword; the
+/// spellings the parser folds (initial, and left / right, which only place the line in vertical writing) read their code's word.
+#[test]
+fn underline_position_word_round_trip() {
+    use layout_core::css::{underline_position_code, underline_position_word};
+    for (w, c) in [("auto", 0u8), ("from-font", 1), ("under", 2)] {
+        assert!(underline_position_code(w) == Some(c) && underline_position_word(c) == w, "{w} <-> {c}");
+    }
+    for (w, want) in [("initial", "auto"), ("left", "auto"), ("under right", "under"), ("from-font left", "from-font")] {
+        assert_eq!(underline_position_code(w).map(underline_position_word), Some(want), "{w}");
+    }
+}
 
 // ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
 
@@ -2251,4 +2294,72 @@ fn gap_shorthand_multicol_used_gap() {
     let base: &[(&str, &str)] = &[("width", "410px"), ("column-count", "2"), ("font-size", "20px")];
     assert_eq!(gap(&[base]), 20.0, "no gap: 1em (armed)");
     assert_eq!(gap(&[base, &[("gap", "30px")]]), 30.0, "gap: 30px is the 30px gutter");
+}
+
+// ---- AETHERCSSTEXTDECORATIONLINERESET (LEDGER SR1122): a declared text-decoration-line set replaces the earlier one (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): the (underline, line_through) pair a cascade of rules leaves.
+fn deco_lines(rules: &[&[(&str, &str)]]) -> (Option<bool>, Option<bool>) {
+    let s = cascade(rules);
+    (s.paint.underline, s.paint.line_through)
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): a later rule's `line-through` replaces an earlier `underline` whole
+/// (css-text-decor-3 §2.1: one value; Chromium paints only the strike). Before SR1122: (Some(true), Some(true)).
+#[test]
+fn text_decoration_line_reset_later_rule_replaces() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        assert_eq!(deco_lines(&[&[(p, "underline")], &[(p, "line-through")]]), (Some(false), Some(true)), "{p}: underline then line-through");
+        assert_eq!(deco_lines(&[&[(p, "line-through")], &[(p, "underline")]]), (Some(true), Some(false)), "{p}: line-through then underline");
+    }
+    assert_eq!(deco_lines(&[&[("text-decoration", "underline")], &[("text-decoration-line", "line-through")]]), (Some(false), Some(true)), "shorthand then longhand");
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): `none` writes both false (kept).
+#[test]
+fn text_decoration_line_reset_none() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        assert_eq!(deco_lines(&[&[(p, "underline line-through")], &[(p, "none")]]), (Some(false), Some(false)), "{p}: none");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): both words write both true, in either order.
+#[test]
+fn text_decoration_line_reset_both() {
+    for v in ["underline line-through", "line-through underline"] {
+        assert_eq!(deco_lines(&[&[("text-decoration-line", v)]]), (Some(true), Some(true)), "longhand {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration", v)]]), (Some(true), Some(true)), "shorthand {v}");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): css-text-decor-3 §2.4: the shorthand's omitted line is `none` (Chromium:
+/// `text-decoration: red` reads textDecorationLine `none`). Before SR1122 the flags were not written: (None, None).
+#[test]
+fn text_decoration_line_reset_shorthand_omitted_line() {
+    for v in ["red", "wavy", "wavy red 2px"] {
+        assert_eq!(deco_lines(&[&[("text-decoration", v)]]), (Some(false), Some(false)), "text-decoration: {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration", "underline")], &[("text-decoration", v)]]), (Some(false), Some(false)), "{v} after underline");
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): the CSS-wide keywords write neither flag (no inherit bit for these two
+/// properties: AETHER-CSS-TEXT-DECORATION-LINE-CSSWIDE owed), so an earlier rule stands as before.
+#[test]
+fn text_decoration_line_reset_css_wide_untouched() {
+    for p in ["text-decoration-line", "text-decoration"] {
+        for kw in ["inherit", "initial", "unset", "revert"] {
+            assert_eq!(deco_lines(&[&[(p, kw)]]), (None, None), "{p}: {kw}");
+            assert_eq!(deco_lines(&[&[(p, "underline")], &[(p, kw)]]), (Some(true), Some(false)), "{p}: {kw} after underline");
+        }
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONLINERESET (SR1122): an invalid longhand (a non-line word, a repeated word, `none` beside a line)
+/// is dropped: no flag written, an earlier rule stands.
+#[test]
+fn text_decoration_line_reset_longhand_invalid_dropped() {
+    for v in ["red", "underline underline", "none underline", "wavy"] {
+        assert_eq!(deco_lines(&[&[("text-decoration-line", v)]]), (None, None), "text-decoration-line: {v}");
+        assert_eq!(deco_lines(&[&[("text-decoration-line", "line-through")], &[("text-decoration-line", v)]]), (Some(false), Some(true)), "{v} after line-through");
+    }
 }
