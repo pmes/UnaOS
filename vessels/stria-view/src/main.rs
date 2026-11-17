@@ -62,7 +62,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--peak-cache]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split] [--mute] [--peak-cache | --no-peak-cache]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -71,7 +71,7 @@ fn die(msg: String) -> ! {
 
 fn cli() -> Cli {
     let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false, mute: false, peak_cache: false };
-    let mut a = std::env::args().skip(1);
+    let mut a = std::env::args().skip(1); let mut peak_off = false; // STRIAWAVECACHEPREF (SR9098): `--no-peak-cache` wins over the preference for one run (file tail)
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--synth" => c.synth = true,
@@ -80,6 +80,7 @@ fn cli() -> Cli {
             "--split" => c.split = true,
             "--mute" => c.mute = true, // NLEPLAYAUDIO (SR676): the window plays no sound
             "--peak-cache" => c.peak_cache = true, // STRIAWAVEMULTI (SR9071): the peak table cached beside each reel's media (opt-in)
+            "--no-peak-cache" => peak_off = true, // STRIAWAVECACHEPREF (SR9098): no peak cache this run, whatever the preference says
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -104,6 +105,7 @@ fn cli() -> Cli {
     if (c.edl.is_none() && !c.synth) || (c.two && c.split) {
         die(USAGE.into());
     }
+    c.peak_cache = !peak_off && (c.peak_cache || peak_cache_pref()); // STRIAWAVECACHEPREF (SR9098): the flag OR the saved preference, unless --no-peak-cache (file tail)
     c
 }
 
@@ -116,7 +118,7 @@ fn load(c: &Cli) -> (Timeline, Sources) {
     for s in &tl.sources {
         let Some((_, p)) = c.srcs.iter().find(|(r, _)| *r == s.reel) else { die(format!("no --src for reel {}", s.reel)) };
         let bytes = std::fs::read(p).unwrap_or_else(|e| die(format!("{p}: {e}")));
-        sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{p}: {e}"))); if c.peak_cache { sources.note_path(s.id, std::path::Path::new(p)); } // STRIAWAVEMULTI (SR9071): opt-in peak cache beside the media (nle.rs file tail)
+        sources.add(s.id, bytes).unwrap_or_else(|e| die(format!("{p}: {e}"))); if c.peak_cache { sources.note_path(s.id, std::path::Path::new(p)); sources.note_peak_dir(stria::nle::peak_user_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))); } // STRIAWAVEMULTI (SR9071): opt-in peak cache beside the media (nle.rs file tail)
     }
     (tl, sources)
 }
@@ -904,5 +906,38 @@ mod exportstall_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageetastallwitness witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAWAVECACHEPREF (LEDGER SR9098): the peak cache as a saved preference (named tail block) ----
+// `stria.waveform.peak_cache` (prefs_core SCHEMA, Bool, default false) is read ONCE at start from Principia's store,
+// read-only (tabula `HighlightPrefs::load`'s shape; Principia stays the writer of record). `--peak-cache` turns the cache
+// on for one run, `--no-peak-cache` off for one run whatever the preference says (`cli`). Owed: NLE-WAVEFORM-CACHE-FACE
+// (no in-app toggle: `pref set stria.waveform.peak_cache true`).
+
+/// STRIAWAVECACHEPREF (SR9098): the saved preference (an unreadable store or an unset key: off).
+fn peak_cache_pref() -> bool {
+    principia::PrefStore::load(principia::default_prefs_path()).is_ok_and(|store| peak_cache_from(store.get("stria", "waveform.peak_cache")))
+}
+
+/// STRIAWAVECACHEPREF (SR9098): the cache is on only for a stored `Bool(true)` (the default lives here, with the
+/// consumer: unset or any other value is off).
+fn peak_cache_from(v: Option<bandy::PrefValue>) -> bool {
+    matches!(v, Some(bandy::PrefValue::Bool(true)))
+}
+
+#[cfg(test)]
+mod striawavecachepref_tests {
+    use super::peak_cache_from;
+    use bandy::PrefValue;
+
+    /// STRIAWAVECACHEPREF (SR9098): only a stored `true` turns the cache on; unset, `false` and a wrong type are off.
+    #[test]
+    fn striawavecachepref_pref_reads_bool() {
+        assert!(peak_cache_from(Some(PrefValue::Bool(true))));
+        assert!(!peak_cache_from(Some(PrefValue::Bool(false))));
+        assert!(!peak_cache_from(None));
+        assert!(!peak_cache_from(Some(PrefValue::Str("true".into()))));
+        println!("striawavecachepref: pref true -> on; false / unset / string -> off");
     }
 }

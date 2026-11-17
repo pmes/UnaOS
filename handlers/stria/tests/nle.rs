@@ -4103,3 +4103,62 @@ fn striawavemulti_scan_reads_the_cache() {
     assert_eq!(three.chans.len(), 2);
     println!("striawavemulti: cache {} buckets={} lanes={}", cache.display(), three.buckets.len(), three.chans.len());
 }
+
+// ---- STRIAWAVECACHEPREF (LEDGER SR9098): the per-user peak cache dir a read-only media dir falls back to (named tail block) ----
+
+/// STRIAWAVECACHEPREF (SR9098): the per-user dir is `$XDG_CACHE_HOME/unaos/stria/peaks`, else `$HOME/.cache/...`; an
+/// empty value is unset; neither: no fallback.
+#[test]
+fn striawavecachepref_user_dir_names() {
+    use std::ffi::OsString;
+    use stria::nle::peak_user_dir;
+    let p = |s: &str| std::path::PathBuf::from(s);
+    assert_eq!(peak_user_dir(Some(OsString::from("/x")), Some(OsString::from("/h"))), Some(p("/x/unaos/stria/peaks")));
+    assert_eq!(peak_user_dir(None, Some(OsString::from("/h"))), Some(p("/h/.cache/unaos/stria/peaks")));
+    assert_eq!(peak_user_dir(Some(OsString::new()), Some(OsString::from("/h"))), Some(p("/h/.cache/unaos/stria/peaks")));
+    assert_eq!(peak_user_dir(None, None), None);
+    println!("striawavecachepref: xdg wins, home fallback, neither -> none");
+}
+
+/// STRIAWAVECACHEPREF (SR9098): media in a read-only dir: the first scan writes no beside file and writes the hashed
+/// file in the noted peak dir; a marker table written there under the media's stamp answers the next scan (no decode).
+/// Run as root (a probe write into the read-only dir succeeds) the read-only legs are skipped.
+#[test]
+fn striawavecachepref_readonly_dir_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    use stria::nle::{peak_file_bytes, peak_path_hash, scan_peaks};
+    use timeline_core::view::{PEAKS_PER_SEC, Peaks};
+    let dir = fresh_dir("striawavecachepref", "ro");
+    let ro = dir.join("media");
+    let peaks = dir.join("peaks");
+    std::fs::create_dir_all(&ro).unwrap();
+    let media = ro.join("st.mp4");
+    let bytes = striawavemulti_stereo(2);
+    std::fs::write(&media, &bytes).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = ro.join("probe");
+    let root = std::fs::write(&probe, b"x").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    let mut tl = Timeline::new(25);
+    let st = tl.add_source("ST", 50);
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(st, 0, 50, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(st, bytes.clone()).unwrap();
+    src.note_path(st, &media);
+    src.note_peak_dir(Some(peaks.clone()));
+    let first = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+    let alt = peaks.join(format!("{:016x}.una-peaks", peak_path_hash(media.as_os_str().as_encoded_bytes())));
+    if !root {
+        assert!(!ro.join("st.mp4.una-peaks").exists(), "the read-only dir gains no file");
+        assert!(alt.exists(), "the table lands in the per-user dir under the media path's hash");
+        let (size, mtime) = striawavemulti_stamp(&media);
+        let marker = Peaks { per_sec: PEAKS_PER_SEC, buckets: vec![42; 7], chans: Vec::new(), lod: Vec::new() };
+        std::fs::write(&alt, peak_file_bytes(&marker, size, mtime)).unwrap();
+        let two = scan_peaks(&src, st, PEAKS_PER_SEC).unwrap().expect("audio");
+        assert_eq!(two.buckets, vec![42; 7], "the per-user file answers");
+    }
+    assert_eq!(first.chans.len(), 2);
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    println!("striawavecachepref: read-only dir root={root} alt={} buckets={}", alt.display(), first.buckets.len());
+}

@@ -196,11 +196,12 @@ pub struct Sources {
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
     stand_in: std::sync::Mutex<Vec<SourceId>>,
     peak_paths: Vec<(SourceId, std::path::PathBuf)>, // STRIAWAVEMULTI (SR9071): the media file of each source opened from a path with the peak cache on (file tail)
+    peak_dir: Option<std::path::PathBuf>, // STRIAWAVECACHEPREF (SR9098): the per-user peak cache dir a read-only media dir falls back to (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), peak_paths: Vec::new() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), peak_paths: Vec::new(), peak_dir: None }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -1053,18 +1054,20 @@ impl Sources {
     /// STRIAWAVEMULTI (SR9071): source `id`'s cached table when the file's stamp and `per_sec` match (its pyramid rebuilt).
     fn peak_file_read(&self, id: SourceId, per_sec: u32) -> Option<timeline_core::view::Peaks> {
         let (file, size, mtime) = self.peak_stamp(id)?;
-        let bytes = std::fs::read(&file).ok()?;
-        let p = peak_file_parse(&bytes, size, mtime, per_sec);
-        if p.is_some() {
-            log::debug!("[nle] peak cache hit {}", file.display());
-        }
-        p
+        let dir_file = self.peak_dir_file(&file); // STRIAWAVECACHEPREF (SR9098): beside the media first, then the per-user dir; the first that PARSES wins
+        let (file, p) = core::iter::once(file).chain(dir_file).find_map(|f| std::fs::read(&f).ok().and_then(|b| peak_file_parse(&b, size, mtime, per_sec)).map(|p| (f, p)))?;
+        log::debug!("[nle] peak cache hit {}", file.display());
+        Some(p)
     }
     /// STRIAWAVEMULTI (SR9071): write source `id`'s table beside its media (no path noted: nothing).
     fn peak_file_write(&self, id: SourceId, p: &timeline_core::view::Peaks) {
         let Some((file, size, mtime)) = self.peak_stamp(id) else { return };
-        if let Err(e) = std::fs::write(&file, peak_file_bytes(p, size, mtime)) {
-            log::debug!("[nle] peak cache {}: {e}", file.display());
+        let bytes = peak_file_bytes(p, size, mtime);
+        let Err(e) = std::fs::write(&file, &bytes) else { return };
+        log::debug!("[nle] peak cache {}: {e}", file.display());
+        let Some(alt) = self.peak_dir_file(&file) else { return }; // STRIAWAVECACHEPREF (SR9098): a read-only media dir falls back to the per-user dir
+        if let Err(e) = alt.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&alt, &bytes)) {
+            log::debug!("[nle] peak cache {}: {e}", alt.display());
         }
     }
 }
@@ -1121,4 +1124,44 @@ fn peak_take<'a>(b: &'a [u8], at: &mut usize, n: usize) -> Option<&'a [u8]> {
     let s = b.get(*at..at.checked_add(n)?)?;
     *at += n;
     Some(s)
+}
+
+// ---- STRIAWAVECACHEPREF (LEDGER SR9098): the per-user peak cache dir a read-only media dir falls back to (named tail block) ----
+// SR9071 wrote `<media>.una-peaks` beside the media and dropped a failed write, so a read-only media dir cached nothing.
+// A face that turns the cache on also names a per-user dir ([`Sources::note_peak_dir`], stria-view passes
+// [`peak_user_dir`]): `peak_file_write` writes there when the beside write fails, and `peak_file_read` tries the beside
+// file then the dir file (the first that parses wins, so a stale beside file does not shadow the dir copy). The dir file
+// is `<dir>/<FNV-1a 64 of the media path bytes, 16 hex>.una-peaks`, stamped like the beside file (media size, mtime).
+// No dir noted: exactly SR9071. The library reads no environment (the caller passes `$XDG_CACHE_HOME` / `$HOME`). No
+// lock: filled before the face's `Arc` wraps `Sources`, read-only after (as `peak_paths`). Owed:
+// NLE-WAVEFORM-CACHE-PRUNE (the dir is never pruned).
+
+impl Sources {
+    /// STRIAWAVECACHEPREF (SR9098): a beside-the-media write that fails falls back to `dir` from now on (`None`: no fallback).
+    pub fn note_peak_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.peak_dir = dir;
+    }
+    /// STRIAWAVECACHEPREF (SR9098): the per-user cache file for the beside file `beside` (`<media>.una-peaks`): keyed by
+    /// the hash of the media path (`beside` less its `.una-peaks` extension). `None`: no dir noted.
+    fn peak_dir_file(&self, beside: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dir = self.peak_dir.as_ref()?;
+        let media = beside.with_extension("");
+        Some(dir.join(format!("{:016x}.una-peaks", peak_path_hash(media.as_os_str().as_encoded_bytes()))))
+    }
+}
+
+/// STRIAWAVECACHEPREF (SR9098): the per-user peak cache dir: `<xdg_cache>/unaos/stria/peaks`, else
+/// `<home>/.cache/unaos/stria/peaks` (aether `media::cache_dir`'s shape); an empty value counts as unset; neither: `None`.
+pub fn peak_user_dir(xdg_cache: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let base = match (xdg_cache.filter(|x| !x.is_empty()), home.filter(|h| !h.is_empty())) {
+        (Some(x), _) => std::path::PathBuf::from(x),
+        (None, Some(h)) => std::path::PathBuf::from(h).join(".cache"),
+        (None, None) => return None,
+    };
+    Some(base.join("unaos").join("stria").join("peaks"))
+}
+
+/// STRIAWAVECACHEPREF (SR9098): FNV-1a 64 over `bytes` (the cache file's name for a media path).
+pub fn peak_path_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3))
 }
