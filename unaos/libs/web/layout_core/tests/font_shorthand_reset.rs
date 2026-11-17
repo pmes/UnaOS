@@ -68,7 +68,7 @@ fn invalid_font_changes_nothing() {
 #[test]
 fn css_wide_keywords_and_system_fonts_unchanged() {
     // Owed (AETHER-CSS-WIDE-REVERT / AETHER-FONT-SHORTHAND-SYSTEM): pinned as today, dropped; inherit / initial / unset are SR810's.
-    for v in ["revert", "menu", "status-bar"] {
+    for v in [/* SR1028: revert built */ "menu", "status-bar"] {
         let s = styled(&[("font-style", "italic"), ("font", v)]);
         assert_eq!(s.paint.italic, Some(true), "font: {v}");
         assert_eq!(s.paint.font_size, None, "font: {v}");

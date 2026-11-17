@@ -155,7 +155,7 @@ pub struct PaintStyle<H: Host> {
     /// font-stretch in percent (css-fonts-4 §2.3).
     pub stretch: Option<u16>,
     /// AETHERFONTSYNTHESISPROPERTY (SR750): css-fonts-4 §6 font-synthesis-weight / -style / -small-caps (SR772), Some(true) = auto.
-    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>, pub inherit: u32, // fold seam SR806/SR815
+    pub synth_weight: Option<bool>, pub synth_style: Option<bool>, pub synth_small_caps: Option<bool>, pub small_caps: Option<Caps>, pub inherit: u32, pub revert: u32, // fold seam SR806/SR815
     /// word-spacing in px (css-text-3 §7.1).
     pub word_spacing: Option<f32>,
     /// direction: rtl (true) / ltr (false) (css-writing-modes-4 §2.1; `dir` maps onto it).
@@ -313,7 +313,7 @@ impl<H: Host> Default for PaintStyle<H> {
             font_size_rel: None,
             used_font_size: None,
             font_rel: None,
-            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None, inherit: 0,
+            stretch: None, synth_weight: None, synth_style: None, synth_small_caps: None, small_caps: None, inherit: 0, revert: 0,
             word_spacing: None,
             rtl: None,
             text_shadows: None,
@@ -951,7 +951,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
         if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; }
-        self.inherit |= bits;
+        self.inherit |= bits; self.revert &= !bits; // SR1028: a later inherit beats an earlier revert
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): `merge_paint`'s half for the bits, after its Somes are copied: `src` is the later
@@ -959,8 +959,8 @@ impl<H: Host> PaintStyle<H> {
     /// earlier value and sets the bit.
     pub fn merge_inherit(&mut self, src: &Self) {
         let valued = src.valued();
-        self.inherit &= !valued;
-        self.set_inherit(src.inherit & !valued);
+        self.inherit &= !valued; self.revert &= !valued; // SR1028: a later value beats an earlier revert
+        self.set_inherit(src.inherit & !valued); self.set_revert(src.revert & !valued); // SR1028: the revert erase on merge
     }
 }
 
@@ -992,4 +992,18 @@ pub fn line_height_length_px(mult: f32) -> f32 {
 /// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (a negative keeps today's clamp to 0.0).
 pub fn line_height_zero_or(raw: f32, encoded: f32) -> f32 {
     if raw == 0.0 { LINE_HEIGHT_ZERO } else { encoded }
+}
+
+// ---- AETHERCSSWIDEREVERT (LEDGER SR1028): css-cascade-4 §7.3.2 revert rolls an inherit-bit field back to the tag road (named tail block) ----
+
+impl<H: Host> PaintStyle<H> {
+    /// AETHERCSSWIDEREVERT (SR1028): writes `revert` on the fields of `bits`: their earlier values go through
+    /// [`PaintStyle::set_inherit`]'s per-bit clear, the inherit bit is dropped (so [`or_tag`] takes the tag road: the
+    /// UA origin Aether keeps per tag; with no tag road the parent's, i.e. unset), and the `revert` mark carries the
+    /// erase through `merge_paint` (`merge_inherit`), which copies only Somes. A later value or inherit clears the mark.
+    pub fn set_revert(&mut self, bits: u32) {
+        self.set_inherit(bits);
+        self.inherit &= !bits;
+        self.revert |= bits;
+    }
 }

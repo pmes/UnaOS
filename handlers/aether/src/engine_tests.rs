@@ -6773,4 +6773,94 @@ mod tests {
         let mut e = css_wide_all_engine();
         assert_eq!(font_shorthand_cs(&mut e, "ag", "color"), "rgb(0, 128, 0)", "the later green wins");
     }
+
+    // ---- AETHERCSSWIDEREVERT (LEDGER SR1028): css-cascade-4 §7.3.2 revert rolls an inherit-bit field back to the tag road (named tail block) ----
+
+    /// AETHERCSSWIDEREVERT (SR1028): each `.r` twin reverts what its armed twin's earlier rule set: a red link, a red div
+    /// under a green parent, a `white-space: normal` pre, a 10px h1, a serif button, an `all: revert` div under a blue
+    /// parent, and a margin-left (owed: stays). Body 16px serif, 400 px wide.
+    fn css_wide_revert_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            section { display: block; margin: 0 0 12px }
+            a.k { color: rgb(255, 0, 0) }
+            a.k.r { color: revert }
+            .c { color: rgb(255, 0, 0) }
+            .c.r { color: revert }
+            pre.n { white-space: normal }
+            pre.n.r { white-space: revert }
+            h1.f { font-size: 10px }
+            h1.f.r { font-size: revert }
+            button.s { font-family: serif }
+            button.s.r { font-family: revert }
+            .x { color: rgb(255, 0, 0); font-weight: bold }
+            .x.r { all: revert }
+            .m { margin-left: 20px }
+            .m.r { margin-left: revert }
+            </style></head><body style="margin:0;font:16px serif">
+            <section><a id="ak" class="k" href="x">Hello</a></section>
+            <section><a id="akr" class="k r" href="x">Hello</a></section>
+            <div style="color:rgb(0, 128, 0)">
+              <section><div id="dc" class="c">Hello</div></section>
+              <section><div id="dcr" class="c r">Hello</div></section>
+            </div>
+            <pre id="pn" class="n">a  b</pre>
+            <pre id="pnr" class="n r">a  b</pre>
+            <h1 id="hf" class="f">H</h1>
+            <h1 id="hfr" class="f r">H</h1>
+            <button id="b0">B</button><button id="bs" class="s">B</button><button id="bsr" class="s r">B</button>
+            <div style="color:rgb(0, 0, 255)"><section><div id="xr" class="x r">Hello</div></section></div>
+            <section><div id="mr" class="m r">Hello</div></section>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEREVERT (SR1028): `a.r { color: revert }` after `a { color: red }` is the UA link blue (cssom and ink);
+    /// the armed twin is red.
+    #[test]
+    fn css_wide_revert_link_blue() {
+        let mut e = css_wide_revert_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ak", "color"), "rgb(255, 0, 0)", "the armed link is red");
+        assert_eq!(font_shorthand_cs(&mut e, "akr", "color"), "rgb(0, 0, 238)", "color: revert is the UA link blue");
+        assert!(css_wide_color_ink(&mut e, "akr", css_wide_blue) > 3, "the reverted link paints blue");
+        assert_eq!(css_wide_color_ink(&mut e, "akr", css_wide_red), 0, "no red");
+    }
+
+    /// AETHERCSSWIDEREVERT (SR1028): a div has no UA colour, so `color: revert` inherits the green parent (armed red).
+    #[test]
+    fn css_wide_revert_div_inherits() {
+        let mut e = css_wide_revert_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "dc", "color"), "rgb(255, 0, 0)", "armed red");
+        assert_eq!(font_shorthand_cs(&mut e, "dcr", "color"), "rgb(0, 128, 0)", "revert: the parent's green");
+        assert!(css_wide_color_ink(&mut e, "dcr", css_wide_green) > 3, "paints green");
+        assert_eq!(css_wide_color_ink(&mut e, "dcr", css_wide_red), 0, "no red");
+    }
+
+    /// AETHERCSSWIDEREVERT (SR1028): white-space / font-size / font-family revert to the tag roads: pre `pre`, h1 2em
+    /// (32px), the button's control family; each armed twin keeps the author value.
+    #[test]
+    fn css_wide_revert_tag_roads() {
+        let mut e = css_wide_revert_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pn", "whiteSpace"), "normal", "armed: the author normal");
+        assert_eq!(font_shorthand_cs(&mut e, "pnr", "whiteSpace"), "pre", "white-space: revert is pre's UA pre");
+        assert_eq!(font_shorthand_cs(&mut e, "hf", "fontSize"), "10px", "armed: 10px");
+        assert_eq!(font_shorthand_cs(&mut e, "hfr", "fontSize"), "32px", "font-size: revert is h1's 2em");
+        let plain = font_shorthand_cs(&mut e, "b0", "fontFamily");
+        assert_ne!(font_shorthand_cs(&mut e, "bs", "fontFamily"), plain, "armed: the serif button differs");
+        assert_eq!(font_shorthand_cs(&mut e, "bsr", "fontFamily"), plain, "font-family: revert is the control family");
+    }
+
+    /// AETHERCSSWIDEREVERT (SR1028): `all: revert` on a div under a blue parent: colour blue (no UA colour), weight 400;
+    /// margin-left: revert stays 20px (AETHER-CSS-WIDE-REVERT-NONINHERITED owed).
+    #[test]
+    fn css_wide_revert_all_and_owed_margin() {
+        let mut e = css_wide_revert_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "xr", "color"), "rgb(0, 0, 255)", "all: revert: the parent's blue");
+        assert_eq!(font_shorthand_cs(&mut e, "xr", "fontWeight"), "400", "all: revert: weight 400");
+        let (ml, ..) = imgalt_rect(&mut e, "mr");
+        assert!((ml - 20.0).abs() <= 0.5, "margin-left: revert is dropped (owed): {ml}");
+    }
 }
