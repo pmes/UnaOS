@@ -103,6 +103,7 @@ pub struct Clip {
     pub fade_out: i64,
     /// STRIACLIPSPEED (SR829): the clip's speed, Q16.16 (`0x1_0000` = 1x, the MP4 `elst` media_rate encoding); [`Clip::len`] / [`Clip::src_at`].
     pub rate_q16: u32,
+    pub crop: Crop, // STRIACROP (SR867): the per-clip crop, 1/1000 of the frame per side (Crop::NONE = none; file tail)
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -111,7 +112,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000 }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -391,6 +392,8 @@ pub enum EditError {
     Marker,
     /// STRIATRACKADDREMOVE (SR856): a tenth track of one kind (CMX channels run V..V9 and A..A9).
     Tracks,
+    /// STRIACROP (SR867): a crop side past the frame, `l + r` or `t + b` not under 1000, or a malformed `crop` word.
+    Crop,
 }
 
 impl core::fmt::Display for EditError {
@@ -413,6 +416,7 @@ impl core::fmt::Display for EditError {
             EditError::Marks => "the in mark is not before the out mark",
             EditError::Marker => "one marker per tick (one is already there, or none is there to remove)",
             EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
+            EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
         })
     }
 }
@@ -2150,5 +2154,91 @@ mod striatrackgain_tests {
         raw.tracks[t].gain_cdb = GAIN_MAX_CDB + 1;
         assert_eq!(raw.validate(), Err(EditError::Gain));
         assert_eq!(tl.heard_cdb(7, -300), -300, "no such track: the clip's own");
+    }
+}
+
+// ---- STRIACROP (LEDGER SR867): the per-clip crop, its geometry and THE crop pass (named tail block) ----
+// A video clip's crop keeps a rect of the frame its render step holds (each side in 1/1000 of the frame) and places that
+// rect back into the frame by the clip reel's size policy (`SizePolicy::place`, THE geometry), sampled by yuv_core::scale's
+// ONE `nearest_rows` (generic over the sample: RGBA quads on the host, packed pixels elsewhere): the crop comes BEFORE the
+// size policy. `Crop::NONE` is no crop (the render skips the pass: byte-identical frames). Stored in the EDL as
+// `* UNA CROP <l> <t> <r> <b>` under its event (edl.rs). The kernel Player refuses a cropped timeline by name
+// (`crop-unsupported`, NLE-CROP-KERNEL owed).
+
+/// A clip's crop: the left / top / right / bottom bands cut away, each in 1/1000 of the frame's width or height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Crop {
+    pub l: u16,
+    pub t: u16,
+    pub r: u16,
+    pub b: u16,
+}
+
+impl Crop {
+    /// No crop.
+    pub const NONE: Crop = Crop { l: 0, t: 0, r: 0, b: 0 };
+    /// Some picture is kept: `l + r < 1000` and `t + b < 1000`.
+    pub fn ok(self) -> bool {
+        (self.l as u32 + self.r as u32) < 1000 && (self.t as u32 + self.b as u32) < 1000
+    }
+    /// The rect a `w x h` frame keeps (at least 1 x 1, inside the frame; `w`, `h` > 0).
+    pub fn rect(self, w: usize, h: usize) -> yuv_core::scale::Rect {
+        let side = |n: usize, a: u16, b: u16| {
+            let x = (n * a as usize / 1000).min(n - 1);
+            let k = n.saturating_sub(x + n * b as usize / 1000).max(1).min(n - x);
+            (x, k)
+        };
+        let ((x, w), (y, h)) = (side(w, self.l, self.r), side(h, self.t, self.b));
+        yuv_core::scale::Rect { w, h, x, y }
+    }
+}
+
+/// THE crop pass: the `w x h` frame `px` (row-major samples) with `crop`'s rect placed back into `w x h` by `fit`
+/// ([`SizePolicy::place`]; Adopt places as Letterbox), the rest `bar`. A frame shorter than `w * h`, or an empty one, comes
+/// back as it was.
+pub fn crop_frame<T: Copy>(px: &[T], w: usize, h: usize, crop: Crop, fit: SizePolicy, bar: T) -> Vec<T> {
+    if w == 0 || h == 0 || px.len() < w * h {
+        return px.to_vec();
+    }
+    let k = crop.rect(w, h);
+    let p = fit.place(k.w, k.h, w, h);
+    let mut out = alloc::vec![bar; w * h];
+    let (sx, sy) = (k.x + p.src.x, k.y + p.src.y);
+    let pic = yuv_core::Picture { w: p.src.w, h: p.src.h, y: &px[sy * w + sx..], u: &[], v: &[], y_stride: w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
+    if p.dst.w == 0 || p.dst.h == 0 || !yuv_core::scale::fits(&pic) {
+        return out;
+    }
+    let mut ry = alloc::vec![bar; p.dst.w];
+    yuv_core::scale::nearest_rows(&pic, p.dst.w, p.dst.h, &mut ry, &mut [], &mut [], |r, row| {
+        let o = (p.dst.y + r) * w + p.dst.x;
+        out[o..o + p.dst.w].copy_from_slice(&row.y[..p.dst.w]);
+    });
+    out
+}
+
+impl Timeline {
+    /// The same timeline with clip `idx` of `track` cropped by `crop` ([`Crop::NONE`] clears). Refused: no such track
+    /// (`NoTrack`) or clip (`NoClip`), an audio track (`Kind`), a crop keeping no picture (`Crop`).
+    pub fn set_crop(&self, track: usize, idx: usize, crop: Crop) -> Result<Timeline, EditError> {
+        if self.tracks.get(track).ok_or(EditError::NoTrack)?.kind != Kind::Video {
+            return Err(EditError::Kind);
+        }
+        if !crop.ok() {
+            return Err(EditError::Crop);
+        }
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.crop = crop;
+        Ok(tl)
+    }
+    /// The crop of the frame a video step on `track` at tick `t` holds: the clip covering `t` (`outgoing` false), or, inside
+    /// a transition on that track (`outgoing` true), the clip that ends at the transition's cut. None found: [`Crop::NONE`].
+    pub fn crop_at(&self, track: usize, t: i64, outgoing: bool) -> Crop {
+        let Some(tr) = self.tracks.get(track) else { return Crop::NONE };
+        let c = if outgoing {
+            tr.transitions.iter().find(|x| x.at <= t && t < x.at + x.dur).and_then(|x| tr.clips.iter().find(|c| c.end() == x.at))
+        } else {
+            tr.clips.iter().find(|c| c.covers(t))
+        };
+        c.map_or(Crop::NONE, |c| c.crop)
     }
 }

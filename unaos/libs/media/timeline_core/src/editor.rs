@@ -306,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail)
+        let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1682,5 +1682,36 @@ mod striatrackgain_tests {
         }
         assert_eq!((&st.timeline, st.undo_depth(), &none.timeline), (&tl0, 0, &tl0));
         assert_eq!(st.verb("track-gainx"), None, "not this word");
+    }
+}
+
+// ---- STRIACROP (LEDGER SR867): the selected clip's crop through the one commit (named tail block) ----
+// `crop <l> <t> <r> <b>` (four integers, 1/1000 of the frame per side; `crop 0 0 0 0` clears) rides THE verb dispatch
+// ([`EditorState::verb`]), so the host face, `stria-view --do crop:l:t:r:b` and the kernel Player's keys reach it. ONE
+// `commit` of `Timeline::set_crop` (undo-able); the same crop again commits nothing. Refused: no clip selected
+// `EditError::NoClip`; an audio clip `EditError::Kind`; bare `crop`, a wrong word count, a non-number or a crop keeping no
+// picture `EditError::Crop`.
+impl EditorState {
+    /// The selected clip cropped by `crop` (one commit; the same crop again commits nothing).
+    pub fn set_crop(&mut self, crop: crate::Crop) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let tl = self.timeline.set_crop(track, idx, crop)?;
+        if tl == self.timeline {
+            return Ok(());
+        }
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `crop` words of [`EditorState::verb`]; `None` when `v` is not a `crop` word.
+    fn crop_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("crop") {
+            return None;
+        }
+        let n: Vec<Option<u16>> = w.map(|x| x.parse().ok()).collect();
+        Some(match n.as_slice() {
+            [Some(l), Some(t), Some(r), Some(b)] => self.set_crop(crate::Crop { l: *l, t: *t, r: *r, b: *b }),
+            _ => Err(EditError::Crop),
+        })
     }
 }
