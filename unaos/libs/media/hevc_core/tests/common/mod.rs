@@ -1210,7 +1210,7 @@ pub fn chroma_l1(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
 /// HEVCCONCEALWEIGHTEDCHROMA422 (SR798): 8.5.3.3.3.2 written out for one chroma sample (x, y) of the w x h reference plane
 /// `r` (nearest-edge clamped) at the eighth-sample chroma vector `mv`, 8-bit (shift1 0, shift2 6): the 14-bit intermediate
 /// predSampleLX. ONE oracle for every chroma format (4:2:0 16x16, 4:2:2 16x32, 4:4:4 32x32 at the 32x32 fixtures); tests/rext.rs
-/// `hand_chroma` (SR758) is its twin and retires onto it (HEVC-TESTKIT-PBODY owed).
+/// `hand_chroma` (SR758) and tests/inter.rs's 16x16 `hand_chroma` are one-line wrappers over it (SR807).
 pub fn hand_chroma_wh(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -> i32 {
     let s = |x: i32, y: i32| r[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize] as i32;
     let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
@@ -1223,4 +1223,34 @@ pub fn hand_chroma_wh(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -
     } else {
         (0..4).map(|n| CHROMA_FILTER[yf][n] * hz(yi + n as i32 - 1)).sum::<i32>() >> 6
     }
+}
+
+// ---- HEVCTESTKITPBODY (LEDGER SR807): the IDR head over pcm_cu_fmt at any chroma format (named tail block) ----
+
+/// SR798 (moved to the kit by SR807; tests/inter.rs and tests/rext.rs `conceal_subpel_case` call it): VPS, SPS (32x32,
+/// log2_ctb 4, log2_max_tb 4, pcm (8, 8, 3, 4) at chroma_format_idc `idc`, inter SPS `x`), PPS (`pi`, deblocking off) and
+/// IDR0: four 16x16 pcm CTBs through the kit's `pcm_cu_fmt` over the non-linear pattern (x * 37 + y * 29 + seed) % 256
+/// (seeds 0 / 90 / 170, SR758's: a linear ramp's filtered fractions round alike, so a wrong (SubWidthC, SubHeightC) arm
+/// could hide).
+pub fn head_fmt(idc: u32, x: &InterSps, pi: &PpsInter) -> Vec<u8> {
+    let (sw, sh) = match idc {
+        1 => (2usize, 2usize),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&SpsCfg { width: 32, height: 32, log2_ctb: 4, log2_max_tb: 4, chroma_format_idc: idc, pcm: Some((8, 8, 3, 4, true)), ..Default::default() }, x)));
+    s.extend(nal(34, &pps_rbsp_ext(&PpsCfg { init_qp: 26, deblocking_disabled: true, ..Default::default() }, pi)));
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    for k in 0..4 {
+        let (bx, by) = (k % 2, k / 2);
+        let ctb = |seed: usize, w: usize, h: usize| (0..w * h).map(|i| (((bx * w + i % w) * 37 + (by * h + i / w) * 29 + seed) % 256) as u16).collect::<Vec<u16>>();
+        let (cw, ch) = (16 / sw, 16 / sh);
+        e.pcm_cu_fmt(0, 4, 8, 8, &ctb(0, 16, 16), &ctb(90, cw, ch), &ctb(170, cw, ch), (sw, sh));
+        if k < 3 {
+            e.terminate(0);
+        }
+    }
+    s.extend(nal(19, &e.finish().out));
+    s
 }
