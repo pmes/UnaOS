@@ -145,7 +145,7 @@ fn render(dirs: &[PathBuf], files: &[PathBuf], faces: &[FaceInfo]) -> Option<Str
 
 /// Parses an index written for `dirs`: the files in index order and their entries; None on any mismatch.
 fn parse(text: &str, dirs: &[PathBuf]) -> Option<(Vec<PathBuf>, HashMap<PathBuf, Entry>)> {
-    let mut lines = text.lines();
+    let text = torn_c(text); let mut lines = text.lines(); // AETHERFONTDBCACHELOCK (SR792): a torn trailing C line is skipped
     if !text.ends_with('\n') || lines.next()? != format!("{MAGIC}\t{VERSION}") {
         return None;
     }
@@ -214,19 +214,19 @@ fn parse(text: &str, dirs: &[PathBuf]) -> Option<(Vec<PathBuf>, HashMap<PathBuf,
 }
 
 /// The index's answer for the walked `files` of `config` (see the module comment).
-pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State) {
-    let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off) };
-    let parsed = std::fs::read_to_string(dir.join(index_file(&config.dirs))).ok().and_then(|t| parse(&t, &config.dirs));
-    let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss) };
+pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>, Vec<Option<Coverage>>, State, usize) {
+    let Some(dir) = config.cache_dir.as_deref() else { return (None, Vec::new(), State::Off, 0) };
+    let text = std::fs::read_to_string(dir.join(index_file(&config.dirs))).unwrap_or_default(); let parsed = parse(&text, &config.dirs); // AETHERFONTDBCACHECOMPACT (SR791): the text kept for c_dups
+    let Some((order, mut map)) = parsed else { return (None, Vec::new(), State::Miss, 0) };
     let live: HashSet<&PathBuf> = files.iter().collect();
     for p in &order {
         let e = &map[p];
         if !live.contains(p) || stamp(p) != Some((e.size, e.mtime)) {
-            return (None, Vec::new(), State::Stale);
+            return (None, Vec::new(), State::Stale, 0);
         }
     }
     if files.iter().any(|f| !map.contains_key(f)) {
-        return (None, Vec::new(), State::Miss);
+        return (None, Vec::new(), State::Miss, 0);
     }
     let (mut faces, mut seeds) = (Vec::new(), Vec::new());
     for f in files {
@@ -234,22 +234,22 @@ pub(crate) fn load(config: &Config, files: &[PathBuf]) -> (Option<Vec<FaceInfo>>
         faces.extend(e.0);
         seeds.extend(e.1);
     }
-    (Some(faces), seeds, State::Hit)
+    (Some(faces), seeds, State::Hit, c_dups(&text))
 }
 
 /// Rewrites the index after a miss or a stale answer (a no-op for Off and Hit); a failure leaves no index change.
-pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State) -> usize {
-    if !matches!(state, State::Miss | State::Stale) {
+pub(crate) fn store(config: &Config, files: &[PathBuf], faces: &[FaceInfo], state: State, covs: &[Option<Coverage>]) -> usize {
+    if !matches!(state, State::Miss | State::Stale) && (state != State::Hit || covs.is_empty()) { // AETHERFONTDBCACHECOMPACT (SR791): a Hit stores only when it compacts
         return 0;
     }
     let Some(dir) = config.cache_dir.as_deref() else { return 0 };
-    let Some(text) = render(&config.dirs, files, faces) else { return 0 };
+    let Some(text) = render(&config.dirs, files, faces).and_then(|t| with_c_lines(t, faces, covs)) else { return 0 }; // AETHERFONTDBCACHECOMPACT (SR791): the kept C lines
     write_atomic(dir, &index_file(&config.dirs), &text).map_or(0, |()| sweep(dir, &index_file(&config.dirs))) // AETHERFONTDBCACHESWEEP (SR770): the sweep rides the write
 }
 
 /// Writes the index through a per-process temp file in the same directory and a rename.
 fn write_atomic(dir: &Path, name: &str, text: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir)?; let _lock = lock_file(dir, name); // AETHERFONTDBCACHELOCK (SR792): held across tmp and rename
     let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)?;
     let r = std::fs::rename(&tmp, dir.join(name));
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(b.discover_cache(), "hit");
         assert_eq!(b.discover_bytes(), 0, "a hit reads no font byte");
         assert!(same(&a.faces, &b.faces), "{:?} vs {:?}", a.faces, b.faces);
-        let left: Vec<_> = fs::read_dir(t.0.join("cache")).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        let left: Vec<std::ffi::OsString> = names(&t.0.join("cache")).into_iter().map(Into::into).collect(); // AETHERFONTDBCACHELOCK (SR792): names() leaves the lock file out
         assert_eq!(left, vec![std::ffi::OsString::from(index_file(&t.cfg().dirs))], "only the index remains");
     }
 
@@ -594,7 +594,7 @@ mod tests {
         ] {
             assert!(parse(&(body.clone() + &bad), &dirs).is_none(), "{bad:?}");
         }
-        assert!(parse(&(body.clone() + line.trim_end_matches('\n')), &dirs).is_none(), "no final newline");
+        assert_eq!(parse(&(body.clone() + line.trim_end_matches('\n')), &dirs).expect("a torn trailing C line is skipped").1[&file].covs, vec![None], "no final newline: the C line is skipped"); // AETHERFONTDBCACHELOCK (SR792): skipped, not a miss
         let other = format!("C\t{p}\t0\t{size}\t1\t1\t20\t1\nC\t{p}\t7\t{size}\t{mtime}\t1\t20\t1\n");
         let (_, map) = parse(&(body + &other), &dirs).expect("an unmatched stamp or face is ignored");
         assert_eq!(map[&file].covs, vec![None]);
@@ -646,11 +646,7 @@ mod tests {
         let b = FontDb::discover(root_b());
         assert_eq!(b.discover_cache(), "hit", "root B is not thrashed by A");
         assert!(b.faces.len() > a.faces.len());
-        let mut left: Vec<String> = fs::read_dir(t.0.join("cache"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut left = names(&t.0.join("cache")); // AETHERFONTDBCACHELOCK (SR792): names() leaves the lock file out
         left.sort();
         let mut want = vec![index_file(&t.cfg().dirs), index_file(&root_b().dirs)];
         want.sort();
@@ -667,7 +663,7 @@ mod tests {
     /// The cache dir's file names, sorted.
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> =
-            fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| !n.ends_with(LOCK_SUFFIX)).collect(); // AETHERFONTDBCACHELOCK (SR792): the lock file left out
         v.sort();
         v
     }
@@ -694,7 +690,7 @@ mod tests {
         }
         let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
         let faces = FontDb::discover(t.off()).faces;
-        let swept = store(&t.cfg(), &files, &faces, State::Miss);
+        let swept = store(&t.cfg(), &files, &faces, State::Miss, &[]);
         assert_eq!(swept, 3);
         let mut want = vec![index_file(&t.cfg().dirs), format!("{INDEX_FILE}-fedcba9876543210"), "other.txt".to_string()];
         want.sort();
@@ -715,9 +711,9 @@ mod tests {
         assert_eq!(before.len(), 2);
         let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
         let faces = FontDb::discover(t.off()).faces;
-        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale), 0);
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Stale, &[]), 0);
         assert_eq!(names(&cache), before);
-        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit), 0, "a hit never writes or sweeps");
+        assert_eq!(store(&t.cfg(), &files, &faces, State::Hit, &[]), 0, "a hit never writes or sweeps");
         assert_eq!(cache_word(State::Miss, 0), "miss");
         assert_eq!(cache_word(State::Hit, 0), "hit");
     }
@@ -753,6 +749,235 @@ mod tests {
         assert_eq!(sweep(&cache, "fontdb-index.v2-0000000000000001"), 1);
         assert!(append(&cache, &name, "C\tx\n").is_err());
         assert!(!cache.join(&name).exists(), "append never recreates a swept index");
+    }
+
+    /// AETHERFONTDBCACHECOMPACT (SR791): INTER discovered and covered (one C line per face), then `extra` more copies
+    /// of face 0's C line appended, alternating its own stamp and mtime 1; returns the walked files.
+    fn with_dups(t: &Tmp, extra: usize) -> Vec<PathBuf> {
+        t.copy_in(INTER);
+        let a = FontDb::discover(t.cfg());
+        assert_eq!(a.discover_cache(), "miss");
+        for i in 0..a.faces.len() {
+            a.covers(i, 'a');
+        }
+        assert_eq!(c_lines(t), a.faces.len());
+        let mut text = fs::read_to_string(t.index()).unwrap();
+        let head = format!("C\t{}\t{}\t", escape(a.faces[0].path.to_str().unwrap()), a.faces[0].index);
+        let line = text.lines().find(|l| l.starts_with(&head)).unwrap().to_string();
+        let mut f: Vec<String> = line.split('\t').map(String::from).collect();
+        f[4] = "1".into();
+        let stale = f.join("\t");
+        for k in 0..extra {
+            text.push_str(if k % 2 == 0 { &stale } else { &line });
+            text.push('\n');
+        }
+        fs::write(t.index(), text).unwrap();
+        vec![t.0.join("fonts").join("InterVariable.ttf")]
+    }
+
+    /// 70 C lines for one face (two stamps): `load` reports 69 duplicates; the hit compacts to one C line per face,
+    /// every coverage survives (a fresh hit reads no cmap byte), and the word carries ` compacted=69`.
+    #[test]
+    fn fontdb_cache_compact_kat() {
+        let t = Tmp::new("compact");
+        let files = with_dups(&t, 69);
+        let (faces, seeds, st, dups) = load(&t.cfg(), &files);
+        assert_eq!((st, dups), (State::Hit, 69), "70 C lines for one face, two stamps");
+        let faces = faces.unwrap();
+        let mut swept = 0;
+        assert_eq!(compact(&t.cfg(), &files, &faces, st, dups, &seeds, &mut swept), 69);
+        assert_eq!(swept, 0);
+        assert_eq!(c_lines(&t), faces.len(), "one C line per face");
+        assert_eq!(c_dups(&fs::read_to_string(t.index()).unwrap()), 0);
+        let b = FontDb::discover(t.cfg());
+        assert_eq!(b.discover_cache(), "hit");
+        for i in 0..b.faces.len() {
+            assert_eq!(b.covers(i, 'a'), Some(true), "face {i}");
+        }
+        assert_eq!(b.scan_bytes(), 0, "every coverage survives the compaction");
+        assert_eq!(load(&t.cfg(), &files).3, 0);
+        assert_eq!(compact_word(cache_word(State::Hit, swept), 69), "hit compacted=69");
+    }
+
+    /// Below `COMPACT_AT` a hit leaves the index byte for byte and the word as today's.
+    #[test]
+    fn fontdb_cache_compact_below_kat() {
+        assert_eq!(COMPACT_AT, 64);
+        let t = Tmp::new("compactbelow");
+        let files = with_dups(&t, 10);
+        let before = fs::read(t.index()).unwrap();
+        let (faces, seeds, st, dups) = load(&t.cfg(), &files);
+        assert_eq!((st, dups), (State::Hit, 10));
+        let mut swept = 0;
+        assert_eq!(compact(&t.cfg(), &files, &faces.unwrap(), st, dups, &seeds, &mut swept), 0);
+        assert_eq!(fs::read(t.index()).unwrap(), before, "below COMPACT_AT the index is untouched");
+        assert_eq!(compact_word(cache_word(State::Hit, swept), 0), "hit");
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "hit");
+        assert_eq!(fs::read(t.index()).unwrap(), before, "a discovery below the threshold writes nothing");
+    }
+
+    /// The race: two processes load the fresh index before any C line exists and each appends one per face it reads
+    /// (one duplicate per face); a third, seeded by those lines, reads no cmap and appends nothing.
+    #[test]
+    fn fontdb_cache_compact_race_kat() {
+        let t = Tmp::new("compactrace");
+        t.copy_in(INTER);
+        t.copy_in(JB);
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let (p, q) = (FontDb::discover(t.cfg()), FontDb::discover(t.cfg()));
+        assert_eq!((p.discover_cache(), q.discover_cache()), ("hit", "hit"));
+        let n = p.faces.len();
+        for i in 0..n {
+            p.covers(i, 'a');
+        }
+        for i in 0..n {
+            q.covers(i, 'a');
+        }
+        assert!(p.scan_bytes() > 0 && q.scan_bytes() > 0, "both loaded before any C line");
+        assert_eq!(c_lines(&t), 2 * n);
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf"), t.0.join("fonts").join("JetBrainsMono-Variable.ttf")];
+        assert_eq!(load(&t.cfg(), &files).3, n, "one duplicate per face per extra racing process");
+        let r = FontDb::discover(t.cfg());
+        for i in 0..n {
+            r.covers(i, 'a');
+        }
+        assert_eq!(r.scan_bytes(), 0, "a seeded process never reads the cmap");
+        assert_eq!(c_lines(&t), 2 * n, "and never appends");
+    }
+
+    /// AETHERFONTDBCACHELOCK (SR792): an `append` waits on the lock a rewrite holds and then lands in the REWRITTEN
+    /// file, never the old inode the rename unlinked (the lost-append window SR791 named).
+    #[test]
+    fn fontdb_cache_lock_append_waits_kat() {
+        let t = Tmp::new("lockwait");
+        t.copy_in(INTER);
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let (cache, name) = (t.0.join("cache"), index_file(&t.cfg().dirs));
+        let body = fs::read_to_string(t.index()).unwrap();
+        let marker = c_line("/nonexistent/marker.ttf", 0, 1, 1, &[(0x41, 1)]);
+        let guard = lock_file(&cache, &name).expect("the lock");
+        let (c2, n2, m2) = (cache.clone(), name.clone(), marker.clone());
+        let h = std::thread::spawn(move || append(&c2, &n2, &m2));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!fs::read_to_string(t.index()).unwrap().contains(&marker), "the append waits on the lock");
+        let tmp = cache.join("rewrite.tmp");
+        fs::write(&tmp, &body).unwrap();
+        fs::rename(&tmp, t.index()).unwrap();
+        drop(guard);
+        h.join().unwrap().expect("the append");
+        let text = fs::read_to_string(t.index()).unwrap();
+        assert_eq!(text, format!("{body}{marker}"), "the line lands in the rewritten file");
+        assert!(parse(&text, &t.cfg().dirs).is_some());
+    }
+
+    /// Two rewrites of one index in one process (one pid, one tmp name) 100 times: every rewrite succeeds and the
+    /// file is always one whole body.
+    #[test]
+    fn fontdb_cache_lock_rewrites_kat() {
+        let t = Tmp::new("lockrewrite");
+        let (cache, name) = (t.0.join("cache"), index_file(&t.cfg().dirs));
+        let (a, b) = ("a\n".repeat(20_000), "bb\n".repeat(30_000));
+        for _ in 0..100 {
+            let hs: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|body| {
+                    let (c, n) = (cache.clone(), name.clone());
+                    std::thread::spawn(move || write_atomic(&c, &n, &body))
+                })
+                .collect();
+            for h in hs {
+                h.join().unwrap().expect("every rewrite succeeds");
+            }
+            let got = fs::read_to_string(cache.join(&name)).unwrap();
+            assert!(got == a || got == b, "a whole body, {} bytes", got.len());
+        }
+    }
+
+    /// An `append` of a C line longer than PIPE_BUF racing a rewrite 100 times: the index always parses, its body
+    /// (F, A, end) is intact, and after it comes the whole C line or nothing, never a torn one.
+    #[test]
+    fn fontdb_cache_lock_race_kat() {
+        let t = Tmp::new("lockrace");
+        t.copy_in(INTER);
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        let (cache, name) = (t.0.join("cache"), index_file(&t.cfg().dirs));
+        let body = fs::read_to_string(t.index()).unwrap();
+        let ranges: Vec<(u32, u32)> = (0..4000u32).map(|k| (k * 4, 1)).collect();
+        let marker = c_line("/nonexistent/marker.ttf", 0, 1, 1, &ranges);
+        assert!(marker.len() > 4096);
+        for _ in 0..100 {
+            let (c1, n1, b1) = (cache.clone(), name.clone(), body.clone());
+            let (c2, n2, m2) = (cache.clone(), name.clone(), marker.clone());
+            let w = std::thread::spawn(move || write_atomic(&c1, &n1, &b1));
+            let a = std::thread::spawn(move || append(&c2, &n2, &m2));
+            w.join().unwrap().expect("the rewrite");
+            let _ = a.join().unwrap();
+            let text = fs::read_to_string(t.index()).unwrap();
+            assert!(parse(&text, &t.cfg().dirs).is_some(), "never torn");
+            let tail = text.strip_prefix(body.as_str()).expect("the F / A / end body intact");
+            assert!(tail.is_empty() || tail == marker, "the whole C line or nothing: {} bytes", tail.len());
+        }
+    }
+
+    /// A torn trailing C line (no newline: an append seen mid-write, or a crash mid-append) is skipped: the index is a
+    /// hit and every coverage learned before it seeds; a torn body or trailer stays a miss.
+    #[test]
+    fn fontdb_cache_torn_c_line_kat() {
+        let t = Tmp::new("torn");
+        t.copy_in(INTER);
+        let a = FontDb::discover(t.cfg());
+        assert_eq!(a.discover_cache(), "miss");
+        for i in 0..a.faces.len() {
+            a.covers(i, 'a');
+        }
+        assert_eq!(c_lines(&t), a.faces.len());
+        let mut text = fs::read_to_string(t.index()).unwrap();
+        let line = text.lines().rev().find(|l| l.starts_with("C\t")).unwrap().to_string();
+        text.push_str(&line[..line.len() / 2]);
+        fs::write(t.index(), &text).unwrap();
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        let (faces, seeds, st, _) = load(&t.cfg(), &files);
+        assert_eq!(st, State::Hit, "a torn trailing C line is skipped, not a miss");
+        assert_eq!(faces.unwrap().len(), a.faces.len());
+        assert!(seeds.iter().all(Option::is_some), "every learned coverage survives");
+        let b = FontDb::discover(t.cfg());
+        assert_eq!(b.discover_cache(), "hit");
+        assert_eq!(b.covers(0, 'a'), Some(true));
+        assert_eq!(b.scan_bytes(), 0);
+        let whole = "fontdb-index\t2\ndirs\t/f\nend\t0\t0\n";
+        assert_eq!(torn_c(&format!("{whole}C\t/x\t0")), whole);
+        assert_eq!(torn_c(&format!("{whole}C")), whole);
+        assert_eq!(torn_c(whole), whole);
+        let body = "fontdb-index\t2\ndirs\t/f\nF\t/x";
+        assert_eq!(torn_c(body), body, "a torn body is left (a miss)");
+        let early = "fontdb-index\t2\ndirs\t/f\nC\t/x";
+        assert_eq!(torn_c(early), early, "a C line before the trailer is left (a miss)");
+        let trailer = "fontdb-index\t2\ndirs\t/f\nen";
+        assert_eq!(torn_c(trailer), trailer, "a torn trailer is left (a miss)");
+    }
+
+    /// The lock file: none with cache=off; `<index>.lock` (empty) beside the index after a store; aged 31 days it
+    /// survives the next store's sweep (the sweep grammar never matches it); `names()` leaves it out.
+    #[test]
+    fn fontdb_cache_lock_file_kat() {
+        let t = Tmp::new("lockfile");
+        t.copy_in(INTER);
+        let cache = t.0.join("cache");
+        let keep = index_file(&t.cfg().dirs);
+        let lock = format!("{keep}{LOCK_SUFFIX}");
+        let off = FontDb::discover(t.off());
+        assert_eq!(off.covers(0, 'a'), Some(true));
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 0, "cache=off takes no lock and creates no lock file");
+        assert_eq!(FontDb::discover(t.cfg()).discover_cache(), "miss");
+        assert!(cache.join(&lock).is_file(), "the lock file beside the index");
+        assert_eq!(fs::metadata(cache.join(&lock)).unwrap().len(), 0);
+        age(&cache.join(&lock), 31 * DAY);
+        let files = vec![t.0.join("fonts").join("InterVariable.ttf")];
+        assert_eq!(store(&t.cfg(), &files, &off.faces, State::Stale, &[]), 0, "the aged lock file is not swept");
+        assert!(cache.join(&lock).is_file());
+        assert_eq!(sweep_age(&lock, &keep), None);
+        assert_eq!(sweep_age("fontdb-index.v2.lock", "fontdb-index.v2-0000000000000001"), None);
+        assert_eq!(names(&cache), vec![keep], "names() leaves the lock file out");
     }
 }
 
@@ -858,7 +1083,7 @@ pub(crate) fn read_coverage(config: &Config, state: State, f: &FaceInfo) -> Opti
 /// Appends `line` to an existing index in one write; never creates the file.
 fn append(dir: &Path, name: &str, line: &str) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::OpenOptions::new().append(true).open(dir.join(name))?.write_all(line.as_bytes())
+    let _lock = lock_file(dir, name); std::fs::OpenOptions::new().append(true).open(dir.join(name))?.write_all(line.as_bytes()) // AETHERFONTDBCACHELOCK (SR792): the open and the write under the lock
 }
 
 /// The per-face coverage cells of a discovery: pre-filled from `seeds` (aligned to the faces), else empty.
@@ -947,4 +1172,104 @@ fn sweep(dir: &Path, keep: &str) -> usize {
 /// The `cache=` word of the `[fonts] discover` line: the state, and ` swept=<n>` only when a store removed files.
 pub(crate) fn cache_word(state: State, swept: usize) -> String {
     if swept > 0 { format!("{} swept={swept}", state.as_str()) } else { state.as_str().to_string() }
+}
+
+// ---- AETHERFONTDBCACHECOMPACT (LEDGER SR791): duplicate C lines compacted on a hit (named tail block) ----
+// A process whose `load` seeded a face's cell never appends for it again (`get_or_init` never runs the read), so the
+// C lines for one face number the processes whose `load` ran before that face's first C line existed and that later
+// read its cmap (two windows, or Aether and quartzite, started together after a miss or stale rewrite), plus a re-read
+// after a stale-stamp line. A hit never rewrote, so they stayed until the next miss or stale. `load` now counts them
+// (`c_dups`; the last matching-stamp line still seeds the cell) and, at `COMPACT_AT` or more, the hit arm calls
+// `compact`: ONE `store` with the loaded faces and their cells, which `with_c_lines` writes back as one C line per
+// covered face, so no coverage already learned is lost. The rewrite is `store`'s (tmp and rename, the sweep riding
+// it); a line another process appends to the old file meanwhile is lost, the window every rewrite has.
+
+/// The duplicate `C` lines one index may carry before a hit rewrites it (all faces together; a Config knob is owed).
+pub const COMPACT_AT: usize = 64;
+
+/// The `C` lines after an index text's `end` trailer whose (path, face index) an earlier `C` line already named.
+fn c_dups(text: &str) -> usize {
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let (mut ended, mut n) = (false, 0);
+    for line in text.lines() {
+        if !ended {
+            ended = line.starts_with("end\t");
+            continue;
+        }
+        let mut f = line.split('\t');
+        if f.next() == Some("C") && !seen.insert((f.next().unwrap_or(""), f.next().unwrap_or(""))) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `text` (a `render`ed body) with one `C` line per face whose cell `covs` holds (aligned to `faces`), once per
+/// (path, index), stamped now; None when a file cannot be stat'ed or a path is not UTF-8. Empty `covs`: `text` as is.
+fn with_c_lines(mut text: String, faces: &[FaceInfo], covs: &[Option<Coverage>]) -> Option<String> {
+    let mut seen: HashSet<(&Path, u32)> = HashSet::new();
+    for (f, cov) in faces.iter().zip(covs) {
+        let Some(cov) = cov else { continue };
+        if !seen.insert((f.path.as_path(), f.index)) {
+            continue;
+        }
+        let (size, mtime) = stamp(&f.path)?;
+        text.push_str(&c_line(f.path.to_str()?, f.index, size, mtime, cov));
+    }
+    Some(text)
+}
+
+/// On a hit whose index carried `dups >= COMPACT_AT` duplicate C lines, rewrites it once through [`store`] with the
+/// faces and their cells, adding the files that rewrite swept to `swept`; returns `dups` then, else 0 (no I/O).
+pub(crate) fn compact(
+    config: &Config,
+    files: &[PathBuf],
+    faces: &[FaceInfo],
+    state: State,
+    dups: usize,
+    covs: &[Option<Coverage>],
+    swept: &mut usize,
+) -> usize {
+    if state != State::Hit || dups < COMPACT_AT {
+        return 0;
+    }
+    *swept += store(config, files, faces, state, covs);
+    dups
+}
+
+/// `word` (from [`cache_word`]) and ` compacted=<n>` only when a hit compacted.
+pub(crate) fn compact_word(word: String, compacted: usize) -> String {
+    if compacted > 0 { format!("{word} compacted={compacted}") } else { word }
+}
+
+// ---- AETHERFONTDBCACHELOCK (LEDGER SR792): an advisory lock file beside the index for the two write roads (named tail block) ----
+// SR697 / SR767 / SR770 / SR791 wrote the index with no lock: an `append` could open the old file, a rewrite rename
+// over it, and the line land in the unlinked inode; two rewrites in one process shared one `{name}.{pid}.tmp`. ONE
+// advisory lock, the index name + `LOCK_SUFFIX` in the same directory, is now held EXCLUSIVE (std `File::lock`,
+// flock(2) LOCK_EX on Unix, blocking) by `write_atomic` across its tmp and rename and by `append` across its open and
+// write, so an append that waits on a rewrite lands in the rewritten file. Readers take no lock: a rename is atomic,
+// and a C line can outgrow one indivisible write (37 KB measured for a CJK face), so `parse` skips a torn trailing C
+// line (`torn_c`). A lock error is ignored (the write proceeds unlocked: a lock never fails a write); cache=off reaches
+// neither writer; SR770's sweep grammar never matches the lock file. Not closed: a rewrite renders its body before it
+// locks, so a line appended to the old file before then is still dropped by that rewrite (owed -LOCK-CARRY).
+
+/// The lock file's suffix: index `name`'s lock is `<name>.lock` in the same directory.
+pub const LOCK_SUFFIX: &str = ".lock";
+
+/// Opens (or creates) `dir/<name>.lock` and takes its exclusive lock, blocking; the lock lasts while the returned
+/// file lives. None on any error (the caller proceeds unlocked).
+fn lock_file(dir: &Path, name: &str) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(dir.join(format!("{name}{LOCK_SUFFIX}"))).ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
+/// `text` without a torn trailing `C` line: when it does not end in a newline, its last partial line is (a prefix
+/// of) a `C` line and the `end` trailer precedes it, the text up to that line; else `text` (a torn body or trailer
+/// stays a miss).
+fn torn_c(text: &str) -> &str {
+    let cut = text.rfind('\n').map_or(0, |i| i + 1);
+    let tail = &text[cut..];
+    let c_prefix = tail.starts_with("C\t") || "C\t".starts_with(tail);
+    if !tail.is_empty() && c_prefix && text[..cut].contains("\nend\t") { &text[..cut] } else { text }
 }
