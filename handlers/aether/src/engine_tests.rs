@@ -10269,4 +10269,98 @@ b</div>
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 10.0), "f", "#f stays at the viewport's top-left");
         assert_ne!(hit_sticky_origin_id(&e, 10.0, 50.0), "f", "below #f's 30px");
     }
+
+    // ---- AETHERCSSBORDERALPHACORNEROVERLAP (LEDGER SR1143): each plain border pixel composites once, the corners stay the vertical side's (named tail block) ----
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): 40x20 boxes (48x28 with the frame) on white, rows 12px apart: `#ha` a
+    /// `4px solid rgba(0, 0, 0, 0.5)` frame, `#oc` an opaque frame with red top / bottom and blue left / right, `#cl` a
+    /// `box-sizing: border-box` 6px box under the same half-alpha frame (8x8: the borders floor the box), and a `<p>`
+    /// holding `#is`, an inline span with the half-alpha frame and white text.
+    fn border_alpha_corner_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            body { margin: 0; background: #fff }
+            div { width: 40px; height: 20px; margin: 0 0 12px }
+            p { margin: 0 0 12px; padding: 0 8px; font: 16px sans-serif }
+            </style></head><body>
+            <div id="ha" style="border:4px solid rgba(0, 0, 0, 0.5)"></div>
+            <div id="oc" style="border:4px solid red;border-left-color:blue;border-right-color:blue"></div>
+            <div id="cl" style="box-sizing:border-box;width:6px;height:6px;border:4px solid rgba(0, 0, 0, 0.5)"></div>
+            <p><span id="is" style="border:4px solid rgba(0, 0, 0, 0.5);color:#fff">x</span></p>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// The four corner pixels (one pixel in from each corner of the border box) and the top edge's mid pixel.
+    fn border_alpha_corner_px(e: &mut crate::AetherEngine, id: &str) -> ([(u8, u8, u8); 4], (u8, u8, u8)) {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (l, t, w, h) = (l.round() as usize, t.round() as usize, w.round() as usize, h.round() as usize);
+        let c = [imgalt_px(e, l + 1, t + 1), imgalt_px(e, l + w - 2, t + 1), imgalt_px(e, l + 1, t + h - 2), imgalt_px(e, l + w - 2, t + h - 2)];
+        (c, imgalt_px(e, l + w / 2, t + 1))
+    }
+
+    fn border_alpha_half_grey(c: (u8, u8, u8)) -> bool {
+        [c.0, c.1, c.2].iter().all(|v| (110..=150).contains(v))
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): a half-alpha frame's four corner pixels equal its top edge (~127 grey on
+    /// white). Before SR1143 the top / bottom and left / right rects both covered each corner square: 63 grey (0.75).
+    #[test]
+    fn border_alpha_corner_half() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "ha");
+        assert!(border_alpha_half_grey(edge), "the top edge is half-alpha grey: {edge:?}");
+        for (i, c) in corners.iter().enumerate() {
+            assert_eq!(*c, edge, "armed: corner {i} composites once, like the edge (before: 63 grey)");
+        }
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): an opaque two-colour frame keeps its corner owner: the left / right
+    /// sides paint after the top / bottom (render's order top, bottom, left, right), so all four corners were and stay
+    /// blue; the top edge is red. Pinned: the horizontal rects are the ones inset.
+    #[test]
+    fn border_alpha_corner_opaque_owner() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "oc");
+        assert_eq!(edge, (255, 0, 0), "the top edge is red");
+        assert_eq!(corners, [(0, 0, 255); 4], "every corner stays the vertical side's blue");
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): SR1134's currentcolor frame under half-alpha text (`#hb`): the corner
+    /// equals the top edge (SR1134 sampled mid-x because the corner read 63).
+    #[test]
+    fn border_alpha_corner_currentcolor() {
+        let mut e = currentcolor_alpha_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "hb");
+        assert!(border_alpha_half_grey(edge), "the currentcolor top edge is half-alpha grey: {edge:?}");
+        assert_eq!(corners, [edge; 4], "armed: every corner composites once");
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): a box no wider than its side borders (8x8 under 4px sides): the inset
+    /// top / bottom rects are empty (no underflow, no panic) and the left / right rects tile the box, every pixel once.
+    #[test]
+    fn border_alpha_corner_collapse() {
+        let mut e = border_alpha_corner_engine();
+        let (l, t, w, h) = imgalt_rect(&mut e, "cl");
+        assert_eq!((w, h), (8.0, 8.0), "the 4px sides floor the border-box 6px box at 8x8");
+        for y in t as usize..(t + h) as usize {
+            for x in l as usize..(l + w) as usize {
+                let c = imgalt_px(&e, x, y);
+                assert!(border_alpha_half_grey(c), "({x},{y}) composites once: {c:?}");
+            }
+        }
+    }
+
+    /// AETHERCSSBORDERALPHACORNEROVERLAP (SR1143): the inline road (a square solid span frame) has the same four-rect shape:
+    /// its corner pixel equals its top edge.
+    #[test]
+    fn border_alpha_corner_inline() {
+        let mut e = border_alpha_corner_engine();
+        let (corners, edge) = border_alpha_corner_px(&mut e, "is");
+        assert!(border_alpha_half_grey(edge), "the span's top edge is half-alpha grey: {edge:?}");
+        assert_eq!(corners[0], edge, "armed: the inline frame's top-left corner composites once");
+    }
 }
