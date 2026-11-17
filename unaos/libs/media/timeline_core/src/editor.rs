@@ -697,7 +697,7 @@ pub const GAIN_STEP_CDB: i32 = 100;
 impl EditorState {
     /// The selected clip's gain set to `cdb` centi-dB (`Timeline::set_gain`, ONE commit; the same gain commits nothing).
     pub fn set_selected_gain(&mut self, cdb: i32) -> Result<(), EditError> {
-        if self.set.len() > 1 { return self.crop_set(|_| crop); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIACROPFACE (SR900): a set of more than one clip crops through `crop_set` (file tail)
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.gain_cdb == cdb {
             return Ok(());
@@ -721,7 +721,7 @@ impl EditorState {
     /// The `gain` / `fade` words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn gain_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let mut w = v.split_ascii_whitespace();
-        let word = w.next().filteror_else(|| self.pan_step(v)).(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
+        let word = w.next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
         let (arg, extra) = (w.next(), w.next());
         Some(self.gain_word(word, arg, extra.is_some()))
     }
@@ -1696,7 +1696,7 @@ mod striatrackgain_tests {
 impl EditorState {
     /// The selected clip cropped by `crop` (one commit; the same crop again commits nothing).
     pub fn set_crop(&mut self, crop: crate::Crop) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if self.set.len() > 1 { return self.crop_set(|_| crop); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIACROPFACE (SR900): a set of more than one clip crops through `crop_set` (file tail)
         let tl = self.timeline.set_crop(track, idx, crop)?;
         if tl == self.timeline {
             return Ok(());
@@ -1844,7 +1844,7 @@ impl EditorState {
     }
     /// The `pan <x>` word of [`EditorState::verb`]; `None` when `v` is not that shape.
     fn pan_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        pan_words(v).map(|p| self.set_selected_pan(p))
+        pan_words(v).or_else(|| self.pan_step(v)).map(|p| self.set_selected_pan(p)) // STRIAPANFACE (SR897): and the face's `pan` / `pan-` / `pan+` (file tail)
     }
 }
 

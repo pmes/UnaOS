@@ -393,7 +393,7 @@ pub enum EditError {
     /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
-    Marks,
+    Marks, /** STRIAFREEZELEN (SR916): a `freeze` hold the one-tick hold rate cannot lay at exactly the asked length, or a hold length the `freeze` words cannot read. */ Hold,
     /// STRIAMARKERS (SR835): a marker already at that tick (or none there to remove; or markers out of tick order).
     Marker,
     /// STRIATRACKADDREMOVE (SR856): a tenth track of one kind (CMX channels run V..V9 and A..A9).
@@ -427,7 +427,7 @@ impl core::fmt::Display for EditError {
             EditError::Gain => "gain out of range",
             EditError::Rate => "rate is not a positive speed (a dwell or reverse)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
-            EditError::Marks => "the in mark is not before the out mark",
+            EditError::Marks => "the in mark is not before the out mark", EditError::Hold => "no exact one-frame hold of that length", // STRIAFREEZELEN (SR916)
             EditError::Marker => "one marker per tick (one is already there, or none is there to remove)",
             EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
