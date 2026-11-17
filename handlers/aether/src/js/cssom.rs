@@ -458,6 +458,7 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
         }
         "gap" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("row-gap", c)),
         "overflow" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"))),
+        "place-content" | "place-items" | "place-self" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase())),
         "flex" => {
             let parts = split_values(v);
             let num_of = |c: &CV| match c {
@@ -1922,6 +1923,9 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
             "background-repeat", "background-attachment", "background-origin", "background-clip", "background-color",
         ],
     ),
+    ("place-content", &["align-content", "justify-content"]),
+    ("place-items", &["align-items", "justify-items"]),
+    ("place-self", &["align-self", "justify-self"]),
 ];
 
 #[cfg(test)]
@@ -2050,11 +2054,11 @@ top>inset";
                 old_of.insert(p, shs.split(' ').collect());
             }
         }
-        assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
+        assert_eq!(keys + PLACE_SHORTHANDS.len(), SHORTHANDS.len(), "every old shorthand is a table row, plus SR1087's three place-* rows (19 + 3 = 22)");
         let names = universe();
         assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
         for p in &names {
-            let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
+            let want = if let Some(sh) = PLACE_SHORTHANDS.iter().find(|sh| longhands(sh).unwrap().contains(p)) { vec![*sh] /* SR1087: a place-* longhand maps to its place row */ } else if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
         }
         for p in FIXED {
@@ -2419,6 +2423,9 @@ const PLAIN_N: &[(&str, u8)] = &[
     ("border-radius", 4),
     ("gap", 2),
     ("overflow", 2),
+    ("place-content", 2),
+    ("place-items", 2),
+    ("place-self", 2),
 ];
 
 /// The plain n-value serialization of a [`PLAIN_N`] shorthand's longhand values (in [`SHORTHANDS`] order).
@@ -2541,6 +2548,7 @@ mod shorthand_table_expand_tests {
             "border-color" => ["red", "lime", "blue", "yellow"],
             "gap" => ["5px", "10px", "", ""],
             "overflow" => ["hidden", "auto", "", ""],
+            "place-content" | "place-items" | "place-self" => ["center", "start", "", ""],
             _ => ["1px", "2px", "3px", "4px"],
         }
     }
@@ -2666,5 +2674,117 @@ mod shorthand_table_expand_tests {
         let p = pairs("border-radius", "1px / 2px");
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].0, "border-radius");
+    }
+}
+
+// ---- AETHERCSSOMPLACEEXPAND (LEDGER SR1087): place-* as PLAIN_N n = 2 rows (named tail block) ----
+
+/// AETHERCSSOMPLACEEXPAND (SR1087): css-align-3 §6.4 / §7.4 / §8.3's two-longhand shorthands (align-* then justify-*),
+/// the [`SHORTHANDS`] rows past SR786's capture; each is a [`PLAIN_N`] n = 2 row expanded through [`plain_expand`].
+#[cfg(test)]
+const PLACE_SHORTHANDS: [&str; 3] = ["place-content", "place-items", "place-self"];
+
+#[cfg(test)]
+mod cssom_place_tests {
+    use super::*;
+
+    fn cv(value: &str) -> Vec<CV> {
+        css_core::parser::parse_component_values(value)
+    }
+
+    #[test]
+    fn cssom_place_items_one_value_sets_both() {
+        let b = Block::parse("place-items: center");
+        assert_eq!(b.get("align-items"), "center");
+        assert_eq!(b.get("justify-items"), "center");
+        assert_eq!(b.get("place-items"), "center");
+    }
+
+    #[test]
+    fn cssom_place_content_two_values() {
+        let b = Block::parse("place-content: start end");
+        assert_eq!(b.get("align-content"), "start");
+        assert_eq!(b.get("justify-content"), "end");
+        assert_eq!(b.get("place-content"), "start end");
+    }
+
+    #[test]
+    fn cssom_place_self_two_values() {
+        let b = Block::parse("place-self: center start");
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("center".to_string(), "start".to_string()));
+        assert_eq!(b.get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_camel_case_setter_expands() {
+        assert_eq!(prop_from_attr("placeSelf"), "place-self");
+        assert_eq!(prop_from_attr("placeItems"), "place-items");
+        assert_eq!(prop_from_attr("placeContent"), "place-content");
+        let mut b = Block::default();
+        assert!(b.set(&prop_from_attr("placeSelf"), &cv("auto"), false));
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("auto".to_string(), "auto".to_string()));
+        assert_eq!(b.get("place-self"), "auto");
+    }
+
+    #[test]
+    fn cssom_place_remove_removes_both() {
+        let mut b = Block::parse("place-content: center; color: red");
+        assert!(b.remove("place-content"));
+        assert_eq!(b.get("align-content"), "");
+        assert_eq!(b.get("justify-content"), "");
+        assert_eq!(b.serialize(), "color: red;");
+    }
+
+    #[test]
+    fn cssom_place_three_values_refused() {
+        let mut b = Block::parse("color: red");
+        let before = b.serialize();
+        assert!(!b.set("place-items", &cv("center start end"), false));
+        assert_eq!(b.serialize(), before);
+    }
+
+    /// No alignment keyword list on the align-* longhand road (normalize_value stores any identifier), so an unknown
+    /// identifier is stored to both longhands, as `align-items: bogus` is; a non-identifier token refuses.
+    #[test]
+    fn cssom_place_ident_only_validator() {
+        let b = Block::parse("place-items: bogus");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("bogus".to_string(), "bogus".to_string()));
+        let mut b = Block::default();
+        assert!(!b.set("place-items", &cv("10px"), false));
+        assert!(!b.set("place-self", &cv("center 7"), false));
+        assert_eq!(b.serialize(), "");
+    }
+
+    #[test]
+    fn cssom_place_css_wide_and_case() {
+        let b = Block::parse("place-items: inherit");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("inherit".to_string(), "inherit".to_string()));
+        assert_eq!(b.get("place-items"), "inherit");
+        assert_eq!(Block::parse("place-self: CENTER Start").get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_css_text_round_trip() {
+        assert_eq!(Block::parse("align-items: center; justify-items: center").serialize(), "place-items: center;");
+        assert_eq!(Block::parse("place-self: auto start").serialize(), "place-self: auto start;");
+        assert_eq!(Block::parse("align-items: center").serialize(), "align-items: center;");
+        assert_eq!(Block::parse("place-content: center; justify-content: end").serialize(), "place-content: center end;");
+    }
+
+    #[test]
+    fn cssom_place_table_pins() {
+        assert_eq!(SHORTHANDS.len(), 22);
+        assert_eq!(PLAIN_N.len(), 12);
+        for (sh, a, j) in [
+            ("place-content", "align-content", "justify-content"),
+            ("place-items", "align-items", "justify-items"),
+            ("place-self", "align-self", "justify-self"),
+        ] {
+            assert!(PLACE_SHORTHANDS.contains(&sh));
+            assert_eq!(plain_n(sh), Some(2), "{sh}");
+            assert_eq!(longhands(sh), Some(vec![a.to_string(), j.to_string()]), "{sh}");
+            assert_eq!(shorthands_of(a), vec![sh]);
+            assert_eq!(shorthands_of(j), vec![sh]);
+        }
     }
 }
