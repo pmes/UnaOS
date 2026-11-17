@@ -3796,3 +3796,56 @@ fn face_export_qp_words_constant_quality_export() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("face_export_qp_words: constant-quality export {line}");
 }
+
+// ---- H264ENCTWOPASSFACEPROGRESS (LEDGER SR1093): one progress road over both passes of the face's two-pass export (named tail block) ----
+
+/// The held job's reading `(k, total)`, then Esc: the cancel line and whether a pass-2 video exists.
+fn twopassprogress_hold(dir: &std::path::Path, k: u64, plan: stria::nle_face::ExportPlan, want: (u64, u64)) -> (String, bool) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_plan(dir, "h264", k, plan).unwrap();
+    nlefaceexport_until(&face, want);
+    let video = dir.join("video.mp4").exists();
+    assert!(face.cancel_export() && face.wait_export());
+    let line = face.last_error.take().expect("the cancel line");
+    (line, video)
+}
+
+#[test]
+fn face_export_twopass_progress_one_road_over_both_passes() {
+    use stria::nle_face::export_plan_of;
+    let mut readings = Vec::new();
+    for k in [10u64, 35, 50, 70] {
+        let dir = nlefaceexport_dir(&format!("twopassprogress-{k}"));
+        let (line, video) = twopassprogress_hold(&dir, k, export_plan_of("bitrate 400 two-pass").unwrap(), (k, 70));
+        assert_eq!(line, format!("export: cancelled at {k}/70 frames; partial files left in {}", dir.display()));
+        if k <= 35 {
+            assert!(!video, "reading {k}: pass 1 reads 1..=35 before any pass-2 frame");
+        }
+        readings.push((k, 70u64));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(readings.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 == w[1].1), "monotone over one total: {readings:?}");
+    assert_eq!(readings.last(), Some(&(70, 70)), "the last reading is the total, 2 x 35");
+    println!("face_export_twopass_progress: readings {readings:?} over both passes");
+}
+
+#[test]
+fn face_export_twopass_progress_cancel_in_pass1_writes_no_video() {
+    let dir = nlefaceexport_dir("twopassprogress-cancel");
+    let plan = stria::nle_face::export_plan_of("bitrate 400 two-pass").unwrap();
+    let (line, _) = twopassprogress_hold(&dir, 10, plan, (10, 70));
+    assert_eq!(line, format!("export: cancelled at 10/70 frames; partial files left in {}", dir.display()), "the face's own Interrupted error through pass 1");
+    assert!(!dir.join("video.mp4").exists(), "no planned pass after a first-pass cancel");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass_progress: {line}");
+}
+
+#[test]
+fn face_export_twopass_progress_single_pass_unchanged() {
+    let dir = nlefaceexport_dir("twopassprogress-single");
+    let (line, _) = twopassprogress_hold(&dir, 10, stria::nle_face::ExportPlan::default(), (10, 35));
+    assert_eq!(line, format!("export: cancelled at 10/35 frames; partial files left in {}", dir.display()));
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("face_export_twopass_progress: single pass {line}");
+}
