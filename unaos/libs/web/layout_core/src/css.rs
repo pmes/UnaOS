@@ -1597,7 +1597,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "text-decoration" | "text-decoration-line" => {
-            let v = value.trim(); deco_shorthand_color::<H>(prop, v, &mut style.paint);
+            let v = value.trim(); deco_shorthand_rest::<H>(prop, v, &mut style.paint, cx);
             if v.contains("underline") {
                 style.paint.underline = Some(true);
             } else if v.starts_with("none") {
@@ -1611,6 +1611,16 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "text-decoration-color" => {
             if let Some(c) = deco_color_value::<H>(value) {
                 style.paint.decoration_color = Some(c);
+            }
+        }
+        "text-decoration-style" => {
+            if let Some(k) = deco_style_code(value) {
+                style.paint.decoration_style = Some(k);
+            }
+        }
+        "text-decoration-thickness" => {
+            if let Some(t) = deco_thickness_value(value, cx) {
+                style.paint.decoration_thickness = Some(t);
             }
         }
         "white-space" | "white-space-collapse" => {
@@ -2590,7 +2600,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, object_fit, flex_container, border_style, radius,
-        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color,
+        white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
         stretch, word_spacing, rtl, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
@@ -3694,7 +3704,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
         | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
-        "border-width" => "3px", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", // SR1014 fold: the branch's table row
+        "border-width" => "3px", "text-decoration-style" => "solid", "text-decoration-thickness" => "auto", "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => "currentcolor", // SR1014 fold: the branch's table row
         // AETHERCSSWIDENONINHERITEDREST (SR848): the rest of the non-inherited arms, each its arm's own literal.
         "position" => "static",
         "float" | "clear" => "none",
@@ -3896,12 +3906,34 @@ fn deco_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8)>> {
 /// AETHERCSSTEXTDECORATIONCOLOR (SR1018): the `text-decoration` shorthand (css-text-decor-3 §2.4) sets its colour
 /// longhand: the first top-level token that is a colour (or `currentcolor`), else the initial currentcolor (the reset);
 /// `inherit` / `revert` leave it. `text-decoration-line` never touches it.
-fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>) {
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): the same ONE pass reads the style word ([`deco_style_code`]) and the
+/// thickness (`auto` / `from-font` / a length, [`deco_thickness_value`]) in any order beside the colour; each the value
+/// omits resets to its initial (solid, auto).
+fn deco_shorthand_rest<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>, cx: &ParseCx) {
     if prop != "text-decoration" || v.eq_ignore_ascii_case("inherit") || v.eq_ignore_ascii_case("revert") {
         return;
     }
-    let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
+    let (mut c, mut style, mut thick) = (None, None, None);
+    for p in split_top_level(v) {
+        if style.is_none() && !p.eq_ignore_ascii_case("initial") && !p.eq_ignore_ascii_case("unset") {
+            if let Some(k) = deco_style_code(p) {
+                style = Some(k);
+                continue;
+            }
+        }
+        if thick.is_none() && !p.eq_ignore_ascii_case("initial") && !p.eq_ignore_ascii_case("unset") {
+            if let Some(t) = deco_thickness_value(p, cx) {
+                thick = Some(t);
+                continue;
+            }
+        }
+        if c.is_none() {
+            c = deco_color_value::<H>(p);
+        }
+    }
     paint.decoration_color = Some(c.unwrap_or(None));
+    paint.decoration_style = Some(style.unwrap_or(0));
+    paint.decoration_thickness = Some(thick.unwrap_or(None));
 }
 
 // ---- AETHERCSSWIDENONINHERITEDINHERIT (LEDGER SR1007): inherit on a non-inherited property writes an explicit-inherit bit the layout resolves against the parent (named tail block) ----
@@ -4007,4 +4039,49 @@ fn css_wide_box<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>)
     }
     style.set_inherit_box(bit);
     true
+}
+
+
+// ---- AETHERCSSTEXTDECORATIONSTYLETHICKNESS (LEDGER SR1038): text-decoration-style and -thickness values (named tail block) ----
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a `text-decoration-style` keyword as [`PaintStyle::decoration_style`]'s
+/// code: 0 solid 1 double 2 dotted 3 dashed 4 wavy; `initial` / `unset` (not inherited) are solid; anything else None.
+pub fn deco_style_code(v: &str) -> Option<u8> {
+    let v = v.trim();
+    let is = |k: &str| v.eq_ignore_ascii_case(k);
+    if is("solid") || is("initial") || is("unset") {
+        Some(0)
+    } else if is("double") {
+        Some(1)
+    } else if is("dotted") {
+        Some(2)
+    } else if is("dashed") {
+        Some(3)
+    } else if is("wavy") {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+/// AETHERCSSTEXTDECORATIONSTYLETHICKNESS (SR1038): a `text-decoration-thickness` value in the
+/// [`PaintStyle::decoration_thickness`] marker shape: `auto`, `from-font` (the face's thickness either way:
+/// AETHER-CSS-TEXT-DECORATION-FROM-FONT owed), `initial` and `unset` are `Some(None)`; a non-negative length is
+/// `Some(Some(px))` through [`parse_px`] (em at the parse context's font); a bare non-zero number, a percentage
+/// (AETHER-CSS-TEXT-DECORATION-THICKNESS-PERCENT owed) or anything else None.
+fn deco_thickness_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("from-font") || v.eq_ignore_ascii_case("initial")
+        || v.eq_ignore_ascii_case("unset")
+    {
+        return Some(None);
+    }
+    if v.ends_with('%') || !v.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let bare = v.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if bare && v.parse::<f32>().ok() != Some(0.0) {
+        return None;
+    }
+    parse_px(v, cx).filter(|px| *px >= 0.0).map(Some)
 }
