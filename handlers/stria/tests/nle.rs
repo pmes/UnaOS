@@ -7924,7 +7924,7 @@ fn striazoomfitkeys_resize_refits_only_after_a_fit() {
 fn striatrackgainstep_face_steps_and_line() {
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
-    assert_eq!(&VERBS[VERBS.len() - 3..], &["track-gain-", "track-gain+", "help"]);
+    assert_eq!(&VERBS[VERBS.len() - 7..], &["track-gain-", "track-gain+", "env", "env-", "env+", "env-del", "help"]); // STRIAGAINENVELOPE (SR9047): the env words sit between the track gain words and help
     assert!(face.verb("track-gain-"));
     assert_eq!(face.last_error.take(), Some(format!("track-gain-: {}", EditError::NoTrack)));
     face.state.select(1, 0).unwrap();
@@ -13862,4 +13862,46 @@ fn striaseqrateedl_animated_default_shows_first_frame() {
         assert!(sink.0[t].3 == [255u8, 255, 255, 255].to_vec(), "tick {t}: one tick per file shows its canvas 0");
     }
     println!("striaseqrateedl: no rate -> each tick its file's first canvas");
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): a clip's gain envelope through the render's mix and the face's words (named tail block) ----
+/// M3: a flat -6.02 dB envelope renders sample for sample as the clip gained -602; a ramp from -6 dB (source tick 10) to
+/// 0 dB (tick 14) is the -6 dB render before it and the plain render after it.
+#[test]
+fn striagainenvelope_render() {
+    let c = Clip::new(SourceId(0), 0, 20, 0);
+    let env = |pts: &[(i64, i32)]| pts.iter().fold(timeline_core::GainEnv::EMPTY, |e, &(t, v)| e.with(t, v).unwrap());
+    let (_, flat) = mix(&[0], vec![vec![Clip { gain_env: env(&[(3, -602), (9, -602)]), ..c }]], 20, 0);
+    let (_, gained) = mix(&[0], vec![vec![c.gained(-602)]], 20, 0);
+    assert_eq!(flat.pcm, gained.pcm, "a flat envelope is the flat gain");
+    let (_, ramp) = mix(&[0], vec![vec![Clip { gain_env: env(&[(10, -600), (14, 0)]), ..c }]], 20, 0);
+    let (_, low) = mix(&[0], vec![vec![c.gained(-600)]], 20, 0);
+    let (_, plain) = mix(&[0], vec![vec![c]], 20, 0);
+    assert_eq!(&ramp.pcm[..10 * PER], &low.pcm[..10 * PER], "before the ramp: -6 dB");
+    assert_eq!(&ramp.pcm[14 * PER..], &plain.pcm[14 * PER..], "after it: unity");
+    let mid = 12 * PER + PER / 2;
+    assert!(ramp.pcm[mid].abs() <= plain.pcm[mid].abs() && ramp.pcm[mid].abs() >= low.pcm[mid].abs(), "inside: between");
+    println!("striagainenvelope render: flat -602 == gained -602; ramp -6 -> 0 dB over ticks 10..14");
+}
+
+/// M3: `env -6` on the selected A1 clip at the playhead puts the point on its source tick in one undo step and its line
+/// on the NOTE; a refusal stays on last_error; the EDL carries the GENV line; undo restores.
+#[test]
+fn striagainenvelope_face_words() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("env -6"));
+    assert_eq!((face.last_error.as_deref(), face.note.as_deref()), (None, Some("env: -6.0 dB at 5, 1 points")));
+    assert_eq!(face.state.timeline.tracks[1].clips[0].gain_env.points(), &[(18, -600)], "source tick 13 + 5");
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(edl::write(&face.state.timeline, "T").unwrap().contains("* UNA GENV 00:00:00:18 -600\n"));
+    assert!(face.verb("env+"));
+    assert_eq!(face.note.as_deref(), Some("env: -5.0 dB at 5, 1 points"));
+    assert!(face.verb("env 99"));
+    assert_eq!(face.last_error.take(), Some(format!("env 99: {}", EditError::Gain)));
+    assert!(face.verb("undo") && face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striagainenvelope face: env -6 at 5 -> point (18, -600), note; env 99 -> {}", EditError::Gain);
 }

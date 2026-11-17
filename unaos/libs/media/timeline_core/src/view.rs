@@ -338,7 +338,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             paint_gain_fades(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip); // STRIACLIPGAINFACE (SR838): the gain line and fade ramps over the body (file tail)
         }
     }
-    paint_track_flags(&mut c, l, tl); paint_track_gains(&mut c, l, tl); // STRIATRACKMUTESOLO (SR837): the inactive rows dimmed, the M / S badges (file tail); STRIATRACKGAINSTEP (SR901): the track gain readout badge (file tail)
+    paint_track_flags(&mut c, l, tl); paint_track_gains(&mut c, l, tl); paint_gain_env(&mut c, &l, st); // STRIAGAINENVELOPE (SR9047): the selected audio clip's gain envelope (file tail); STRIATRACKMUTESOLO (SR837): the inactive rows dimmed, the M / S badges (file tail); STRIATRACKGAINSTEP (SR901): the track gain readout badge (file tail)
     // The selection (NLE2c: every clip of the set outlined), and the primary's two trim handles.
     for &(row, i) in &st.set {
         if let Some(clip) = tl.tracks.get(row).and_then(|tr| tr.clips.get(i)) {
@@ -5603,5 +5603,91 @@ mod kscrub_tests {
         let d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
         assert_eq!(d.kind, DragKind::Move);
         assert_eq!(d.scrub_tick(), None);
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the selected audio clip's gain envelope on its body (named tail block) ----
+// The selected AUDIO clip with gain points shows them over its body: a 1-px polyline at [`gain_y`] of the heard clip gain
+// (`gain_cdb + gain_env.at(source tick)`) across the body columns, each column joined to the last by a vertical run, and a
+// 3x3 dot at each point whose source tick lies in `src_in..src_out`. Nothing for no selection, a video clip or an empty
+// envelope, so every golden and the kernel view pin are unchanged.
+
+/// STRIAGAINENVELOPE (SR9047): the envelope's ink.
+pub const ENV_INK: [u8; 4] = [0xff, 0x90, 0x40, 255];
+
+/// THE envelope painter (see the block comment); the body rect is [`paint_in`]'s for that clip.
+pub fn paint_gain_env(c: &mut Canvas, l: &Layout, st: &EditorState) {
+    let Some((row, _)) = st.selection else { return };
+    let Some(clip) = st.selected() else { return };
+    if clip.gain_env.is_empty() || st.timeline.tracks.get(row).is_none_or(|t| t.kind != Kind::Audio) {
+        return;
+    }
+    let y0 = l.row_y(row);
+    let (x0, y1, x1) = (l.x_of(clip.at) + 1, y0 + ROW_H as i64 - 2, l.x_of(clip.end()) - 1);
+    let (top, bottom) = (y0 + 2, y1 - 1);
+    if x1 - x0 < 2 || bottom - top < 2 {
+        return;
+    }
+    let (xa, z) = (l.x_of(clip.at), l.zoom.max(1) as i64);
+    let y_at = |s: i64| gain_y(clip.gain_cdb.saturating_add(clip.gain_env.at(s)), top, bottom);
+    let mut prev: Option<i64> = None;
+    for x in x0.max(0)..x1.min(c.w as i64) {
+        let t = clip.at + (x - xa).max(0) / z;
+        let y = y_at(clip.src_tick(t));
+        let (a, b) = match prev {
+            Some(p) => (p.min(y), p.max(y)),
+            None => (y, y),
+        };
+        c.rect(x, a, x + 1, b + 1, ENV_INK);
+        prev = Some(y);
+    }
+    for &(s, _) in clip.gain_env.points().iter().filter(|p| clip.src_in <= p.0 && p.0 < clip.src_out) {
+        let (x, y) = (l.x_of(clip.at + (s - clip.src_in)), y_at(s));
+        c.rect((x - 1).max(x0), (y - 1).max(top), (x + 2).min(x1), (y + 2).min(bottom + 1), ENV_INK);
+    }
+}
+
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+    use crate::{Clip, GainEnv};
+
+    fn st(clip: Clip, select: bool) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![clip];
+        let mut st = EditorState::new(tl);
+        if select {
+            st.select(0, 0).unwrap();
+        }
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    fn has_ink(px: &[u8]) -> bool {
+        px.chunks(4).any(|p| p == ENV_INK)
+    }
+
+    /// M3: an empty envelope, or an unselected clip, paints byte-identical to the plain clip; the selected clip with a
+    /// ramp shows the ink, higher (smaller row) at the 0 dB end than at the -12 dB end, and a dot at each point.
+    #[test]
+    fn striagainenvelope_band() {
+        let c = Clip::new(crate::SourceId(0), 0, 20, 0);
+        let (s0, l) = st(c, true);
+        let plain = paint_in(&s0, l, Order::Rgba, None, None);
+        assert!(!has_ink(&plain));
+        let e = GainEnv::EMPTY.with(4, -1200).unwrap().with(16, 0).unwrap();
+        let (s1, l1) = st(Clip { gain_env: e, ..c }, false);
+        let (s_plain, _) = st(c, false);
+        assert_eq!(paint_in(&s1, l1, Order::Rgba, None, None), paint_in(&s_plain, l1, Order::Rgba, None, None), "unselected: nothing");
+        let (s2, l2) = st(Clip { gain_env: e, ..c }, true);
+        let px = paint_in(&s2, l2, Order::Rgba, None, None);
+        assert!(has_ink(&px));
+        let rows = |x: i64| (0..56i64).filter(|&y| px[((y * 320 + x) * 4) as usize..((y * 320 + x) * 4 + 4) as usize] == ENV_INK).collect::<Vec<i64>>();
+        let (lo, hi) = (rows(l2.x_of(2)), rows(l2.x_of(18)));
+        assert!(!lo.is_empty() && !hi.is_empty());
+        assert!(hi[0] < lo[0], "0 dB sits higher than -12 dB: {hi:?} {lo:?}");
+        assert!(rows(l2.x_of(4) - 1).len() >= 3, "the dot at source tick 4");
     }
 }

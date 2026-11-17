@@ -206,6 +206,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         ["dur", t @ ..] if (2..=3).contains(&t.len()) => SMessage::Input { target: SURFACE.into(), text: format!("dur {}", t.join(":")) }, // STRIATRANSITIONNEXT (SR991): `dur:00:07`, `dur:00:00:07`
         ["track-gain", ch, db] => SMessage::Input { target: SURFACE.into(), text: format!("track-gain {ch} {db}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain:A2:-6` the named track
         [w @ ("track-gain-" | "track-gain+"), ch] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {ch}") }, // STRIATRACKGAINTHREE (SR9024): `track-gain-:A2` / `track-gain+:V1`
+        ["env", db] => SMessage::Input { target: SURFACE.into(), text: format!("env {db}") }, // STRIAGAINENVELOPE (SR9047): `env:-6` a gain point at the playhead
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, ["find", q] => SMessage::ConsoleInput(q.to_string()), // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button; STRIAHELPMORE (SR977): `find:<q>` the bar field's Enter
         _ => return None,
     };
@@ -583,6 +584,7 @@ fn transport() -> TetraNode {
         button("rspeed", "Ripple Speed"), // STRIACLIPSPEEDTHREE (SR9031): the selected clip 1x -> 2x -> 4x -> 1x with the rest of its track following (THE `rspeed` verb)
         button("headers", "Hdr"), button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
         button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
+        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
@@ -3368,5 +3370,37 @@ mod striapanautomation_tests {
         assert_eq!(face.state.selected().map(|c| c.pan_keys.n), Some(0));
         assert_eq!(face.state.undo_depth(), depth + 1);
         println!("striapanautomation witness: pan-key -0.5 then pan-unkey");
+    }
+}
+
+// ---- STRIAGAINENVELOPE (LEDGER SR9047): the `env:<dB>` token and the Env buttons (named tail block) ----
+#[cfg(test)]
+mod striagainenvelope_tests {
+    use super::*;
+
+    /// M3: the four Env buttons are on the row (help still last); `at:12:1,env:-6` puts a -6 dB point on the selected A1
+    /// clip at the playhead's source tick (one undo step, no error line); `env+` steps it; `env-del` removes it; `env:x` is
+    /// refused by name.
+    #[test]
+    fn striagainenvelope_witness_env() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        for w in ["env", "env-", "env+", "env-del"] {
+            assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == w)), "{w}");
+        }
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:1,env:-6").is_empty());
+        let c = face.state.selected().unwrap();
+        let s = c.src_tick(face.state.playhead);
+        assert_eq!((c.gain_env.points(), face.state.undo_depth()), (&[(s, -600)][..], 1));
+        assert!(face.note.as_deref().is_some_and(|n| n.starts_with("env: -6.0 dB at ")));
+        assert!(drive(&mut face, "env+").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.points(), &[(s, -500)]);
+        assert!(drive(&mut face, "env-del").is_empty());
+        assert!(face.state.selected().unwrap().gain_env.is_empty());
+        assert_eq!(drive(&mut face, "env:x"), vec![format!("env x: {}", timeline_core::EditError::Gain)]);
+        assert_eq!(face.state.undo_depth(), 3);
+        println!("striagainenvelope witness: at:12:1,env:-6 -> ({s}, -600); env+ -> -500; env-del -> empty; env:x -> {}", timeline_core::EditError::Gain);
     }
 }
