@@ -6244,4 +6244,165 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "gi", css_wide_red) > 100, "and paints the parent's red");
         assert_eq!(font_shorthand_cs(&mut e, "gi", "backgroundColor"), "rgb(255, 0, 0)", "getComputedStyle reads red");
     }
+
+    // ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): a removed align=center lets the cell's narrow block go back to the start (named tail block) ----
+
+    /// AETHERCENTERRESTYLEITEMS (SR782): a `td align=center` centres its 200px block (-webkit-center, SR436); a script
+    /// that removes the attribute leaves the block at the cell's content start, as Chromium re-derives the placement on
+    /// the style recalc: neither the rule's align-self (SR686) nor the cell's align-items the rule wrote is kept.
+    #[test]
+    fn center_restyle_items_follow_removed_align() {
+        let html = r#"<!doctype html><html><body style="margin: 0"><table style="width: 600px; border-spacing: 0"><tr><td id="cell" align="center"><div id="d" style="width: 200px">ab</div></td></tr></table></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let r = |e: &mut crate::AetherEngine, id: &str, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (cl, cw, dl, dw) = (r(&mut engine, "cell", "left"), r(&mut engine, "cell", "width"), r(&mut engine, "d", "left"), r(&mut engine, "d", "width"));
+        assert!(dw > 0.0 && (dl + dw / 2.0 - (cl + cw / 2.0)).abs() <= 1.0, "td align=center centres #d (d {dl} + {dw}, cell {cl} + {cw})");
+        engine.js_engine.as_mut().unwrap().execute("document.getElementById('cell').removeAttribute('align');").expect("script must run clean");
+        engine.render_frame();
+        let (cl, dl) = (r(&mut engine, "cell", "left"), r(&mut engine, "d", "left"));
+        assert!((dl - (cl + 1.0)).abs() <= 1.0, "align removed: #d sits at the cell's content start (d {dl}, cell {cl})");
+        let ta = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('cell')).textAlign").unwrap();
+        assert_ne!(ta, "-webkit-center", "align removed: the cell's computed text-align is no longer the align= value");
+    }
+
+    // ---- AETHERFILETYPECHANGE (LEDGER SR783): leaving type=file drops the selection (named tail block) ----
+
+    /// AETHERFILETYPECHANGE (SR783): file input `f` (multiple, two Files through SR706's DataTransfer helper), `fv`
+    /// (value="kept.txt", one File), text input `t` and a fresh multiple file input `fresh`; `input` / `change` on f, fv
+    /// and t count into `window.ev`.
+    fn file_type_change_page() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body>
+            <div><input type="file" id="f" multiple></div>
+            <div><input type="file" id="fv" value="kept.txt"></div>
+            <div><input type="text" id="t"></div>
+            <div><input type="file" id="fresh" multiple></div>
+            <script>
+              function list(names) { var d = new DataTransfer(); names.forEach(function (n) { d.items.add(new File(["x"], n)); }); return d.files; }
+              document.getElementById("f").files = list(["a.txt", "b.txt"]);
+              document.getElementById("fv").files = list(["report.pdf"]);
+              window.ev = 0;
+              ["f", "fv", "t"].forEach(function (id) { ["input", "change"].forEach(function (k) { document.getElementById(id).addEventListener(k, function () { window.ev++; }); }); });
+            </script>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): `type = 'text'` on a file input holding a FileList drops the selection (Chromium
+    /// destroys FileInputType and its FileList): `files` reads null, `value` reads the value content attribute (HTML
+    /// §4.10.5 type change: "" with none, `kept.txt` on fv, never the fakepath), the FileList held before reads length
+    /// 0 with no index, and no `input` / `change` event fires, then or after a tick.
+    #[test]
+    fn file_type_change_leaving_clears() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"), fv = document.getElementById("fv"), k = f.files, n = k.length, fp = fv.value; f.type = "text"; fv.type = "text"; return [n, f.files === null, JSON.stringify(f.value), k.length, k[0] === undefined, fp, fv.value, fv.files === null, window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "2,true,\"\",0,true,C:\\fakepath\\report.pdf,kept.txt,true,0");
+        engine.tick();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        assert_eq!(js.eval_string("String(window.ev)").unwrap(), "0", "no event is queued by the type change");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a file input taken to text and back to file holds an empty FileList, `value` "",
+    /// no event fired, and its painted status is a fresh input's (SR715's probe), where two Files painted `2 files`.
+    #[test]
+    fn file_type_change_return_empty() {
+        let mut engine = file_type_change_page();
+        let before = file_value_clear_extent(&mut engine, "f");
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var f = document.getElementById("f"); f.type = "text"; f.type = "file"; return [f.files.length, JSON.stringify(f.value), window.ev].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "0,\"\",0");
+        engine.tick(); engine.render_frame();
+        let (f, fresh) = (file_value_clear_extent(&mut engine, "f"), file_value_clear_extent(&mut engine, "fresh"));
+        assert_ne!(before, fresh, "two Files painted `2 files` before the type change");
+        assert_eq!(f, fresh, "the returned input paints a fresh input's status");
+    }
+
+    /// AETHERFILETYPECHANGE (SR783): a text input's `files` is null (HTML: null off the File Upload state); taken to
+    /// `file` it holds an empty FileList.
+    #[test]
+    fn file_type_change_text_to_file() {
+        let mut engine = file_type_change_page();
+        let js = engine.js_engine.as_mut().expect("page must have booted");
+        let got = js
+            .eval_string(r#"(function () { var t = document.getElementById("t"), was = t.files === null; t.type = "file"; return [was, t.files !== null, t.files.length].join(","); })()"#)
+            .unwrap();
+        assert_eq!(got, "true,true,0");
+    }
+
+    // ---- AETHERCSSOMLINEHEIGHTUSED (LEDGER SR824): getComputedStyle's lineHeight is the used px (named tail block) ----
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): one probe per line-height road: a number (under a px and an em font size), a
+    /// length, `normal`, a % and em (at 16px and 20px, the latter through `reresolve_font_relative`), and inheritance
+    /// (a number re-multiplies, a length is kept).
+    fn line_height_used_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:20px"><span id="num" style="line-height:1.5">Hello</span></div>
+            <div style="font-size:10px"><span id="numem" style="font-size:2em;line-height:1.5">Hello</span></div>
+            <div><span id="len" style="line-height:24px">Hello</span></div>
+            <div><span id="nrm" style="line-height:normal">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="line-height:150%">Hello</span></div>
+            <div style="font-size:16px"><span id="em16" style="line-height:1.5em">Hello</span></div>
+            <div><span id="em20" style="font-size:20px;line-height:1.5em">Hello</span></div>
+            <div style="font-size:10px;line-height:2"><span id="inum" style="font-size:20px">Hello</span></div>
+            <div style="font-size:10px;line-height:20px"><span id="ilen" style="font-size:30px">Hello</span></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a number reads number x the USED font size: `1.5` under 20px reads 30px
+    /// (Chromium), and `font-size: 2em; line-height: 1.5` under 10px reads 30px (1.5 x the used 20px).
+    #[test]
+    fn line_height_used_cssom_number() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "num", "lineHeight"), "30px", "1.5 x 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "numem", "lineHeight"), "30px", "1.5 x the used 2em of 10px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a px line-height reads its px (it read `normal`: the stored length is negative).
+    #[test]
+    fn line_height_used_cssom_length() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "len", "lineHeight"), "24px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): `normal` stays the keyword (Chromium).
+    #[test]
+    fn line_height_used_cssom_normal() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): a % and an em resolve against the element's own used font size: `150%` and
+    /// `1.5em` at 16px read 24px, `1.5em` with `font-size: 20px` reads 30px.
+    #[test]
+    fn line_height_used_cssom_percent_em() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "lineHeight"), "24px", "150% of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em16", "lineHeight"), "24px", "1.5em of 16px");
+        assert_eq!(font_shorthand_cs(&mut e, "em20", "lineHeight"), "30px", "1.5em of the element's own 20px");
+    }
+
+    /// AETHERCSSOMLINEHEIGHTUSED (SR824): CSS 2.2 §10.8.1 inheritance: a number inherits as the number (a 20px child of
+    /// `line-height: 2` reads 40px), a length as the length (a 30px child of `line-height: 20px` reads 20px).
+    #[test]
+    fn line_height_used_cssom_inherit() {
+        let mut e = line_height_used_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "inum", "lineHeight"), "40px", "2 x the child's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ilen", "lineHeight"), "20px", "the parent's 20px kept");
+    }
 }
