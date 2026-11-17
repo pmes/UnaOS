@@ -3748,12 +3748,12 @@ fn striaimportwav_refusals_by_name() {
         src.add(SourceId(0), bytes).expect_err("refused").to_string()
     };
     let good = striaimportwav_pcm16(48_000, 1, 4800);
-    // 8-bit: bits 8, block align 1.
+    // 12-bit: bits 12.
     let mut eight = good.clone();
     eight[32..34].copy_from_slice(&1u16.to_le_bytes());
-    eight[34..36].copy_from_slice(&8u16.to_le_bytes());
+    eight[34..36].copy_from_slice(&12u16.to_le_bytes());
     let e = refusal(eight);
-    assert!(e.contains("wav: sample layout (16-bit integer or 32-bit float)"), "{e}");
+    assert!(e.contains("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"), "{e}");
     // A compressed tag (2 = MS ADPCM).
     let mut adpcm = good.clone();
     adpcm[20..22].copy_from_slice(&2u16.to_le_bytes());
@@ -3808,4 +3808,100 @@ fn striaimportwav_a_wav_is_its_own_timeline() {
     render(&tl, 0..50, &src, &mut sink).unwrap();
     assert_eq!(sink.pcm.len(), 96_000 * 2);
     assert!(sink.pcm.iter().enumerate().all(|(j, g)| *g == q(striaimportwav_sample(j) as i32)));
+}
+
+// ---- STRIAIMPORTWAVWIDE (LEDGER SR920): wide and streamed WAV reels (named tail block) ----
+
+/// STRIAIMPORTWAVWIDE (SR920): a RIFF/WAVE file with a 16-byte `fmt ` of `tag` at `bits`; the `data` size field is
+/// `size` when given (0 / 0xFFFFFFFF = streamed), else the payload's length.
+fn striaimportwavwide_wav(tag: u16, bits: u16, ch: u16, rate: u32, size: Option<u32>, payload: &[u8]) -> Vec<u8> {
+    let align = ch * (bits / 8);
+    let mut w = Vec::new();
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + payload.len() as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&tag.to_le_bytes());
+    w.extend_from_slice(&ch.to_le_bytes());
+    w.extend_from_slice(&rate.to_le_bytes());
+    w.extend_from_slice(&(rate * align as u32).to_le_bytes());
+    w.extend_from_slice(&align.to_le_bytes());
+    w.extend_from_slice(&bits.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&size.unwrap_or(payload.len() as u32).to_le_bytes());
+    w.extend_from_slice(payload);
+    w
+}
+
+/// STRIAIMPORTWAVWIDE (SR920): `n` mono samples `striaimportwav_sample(i)` = v laid out at `bits` (`float`): 8-bit
+/// unsigned (v>>8)+128, 16-bit v, 24-bit v<<8, 32-bit integer v<<16, float 64 v/32768.
+fn striaimportwavwide_payload(bits: u16, float: bool, n: usize) -> Vec<u8> {
+    let mut p = Vec::new();
+    for i in 0..n {
+        let v = striaimportwav_sample(i) as i32;
+        match (float, bits) {
+            (true, _) => p.extend_from_slice(&(v as f64 / 32768.0).to_le_bytes()),
+            (false, 8) => p.push(((v >> 8) + 128) as u8),
+            (false, 16) => p.extend_from_slice(&(v as i16).to_le_bytes()),
+            (false, 24) => p.extend_from_slice(&(v << 8).to_le_bytes()[..3]),
+            (false, _) => p.extend_from_slice(&(v << 16).to_le_bytes()),
+        }
+    }
+    p
+}
+
+#[test]
+fn striaimportwavwide_widths_render_exact() {
+    // Mono 48 kHz, 2 s = 50 ticks at 25 fps; the clip starts 10 ticks in (a seek mid-file).
+    for (tag, bits, float) in [(1u16, 8u16, false), (1, 24, false), (1, 32, false), (3, 64, true)] {
+        let wav = striaimportwavwide_wav(tag, bits, 1, 48_000, None, &striaimportwavwide_payload(bits, float, 96_000));
+        let d = gneiss_pal::dsp::demux::Demuxer::open_wav(wav.clone()).expect("open_wav");
+        assert_eq!(d.tracks()[0].codec, gneiss_pal::dsp::demux::Codec::Pcm { bits, float, big_endian: false });
+        let (src, s) = striaimportwav_render(wav, (10, 30), 20);
+        assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50));
+        assert_eq!((s.rate, s.ch), (48_000, 1));
+        assert_eq!(s.pcm.len(), 20 * 1920);
+        let skip = 10 * 1920;
+        for (j, got) in s.pcm.iter().enumerate() {
+            let v = striaimportwav_sample(skip + j) as i32;
+            let want = if bits == 8 { q((v >> 8) << 8) } else { q(v) };
+            assert_eq!(*got, want, "{bits}-bit float={float} sample {j}");
+        }
+    }
+}
+
+#[test]
+fn striaimportwavwide_streamed_data_runs_to_eof() {
+    for size in [0u32, 0xFFFF_FFFF] {
+        let mut payload = striaimportwavwide_payload(16, false, 96_000);
+        payload.push(0x5A); // a stray byte: a partial frame, dropped
+        let wav = striaimportwavwide_wav(1, 16, 1, 48_000, Some(size), &payload);
+        let (src, s) = striaimportwav_render(wav, (0, 50), 50);
+        assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50), "size field {size:#x}");
+        assert_eq!(s.pcm.len(), 96_000);
+        for (j, got) in s.pcm.iter().enumerate() {
+            assert_eq!(*got, q(striaimportwav_sample(j) as i32), "size field {size:#x} sample {j}");
+        }
+    }
+}
+
+#[test]
+fn striaimportwavwide_refusals_by_name() {
+    let refusal = |bytes: Vec<u8>| {
+        let tl = Timeline::new(25);
+        let mut src = Sources::new(&tl);
+        src.add(SourceId(0), bytes).expect_err("refused").to_string()
+    };
+    let half = striaimportwavwide_payload(16, false, 2400);
+    // A non-streamed size past the end of the file is still refused.
+    let e = refusal(striaimportwavwide_wav(1, 16, 1, 48_000, Some(9600), &half));
+    assert!(e.contains("wav: data chunk runs past the end of the file"), "{e}");
+    // Float at 16 bits and integer at 12 bits are not layouts the PCM decoder reads.
+    let e = refusal(striaimportwavwide_wav(3, 16, 1, 48_000, None, &half));
+    assert!(e.contains("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"), "{e}");
+    let e = refusal(striaimportwavwide_wav(1, 12, 1, 48_000, None, &half));
+    assert!(e.contains("wav: sample layout (8/16/24/32-bit integer or 32/64-bit float)"), "{e}");
+    // A streamed header with no sample after it.
+    let e = refusal(striaimportwavwide_wav(1, 16, 1, 48_000, Some(0), &[]));
+    assert!(e.contains("wav: no samples"), "{e}");
 }
