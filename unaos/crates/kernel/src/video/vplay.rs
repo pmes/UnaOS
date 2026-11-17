@@ -3865,13 +3865,13 @@ fn shuttle_key(path: &str, verb: &str, ms: u64) -> Option<u64> {
     }
     let playing = !PAUSED.load(Ordering::Acquire);
     let rate = SHUTTLE.lock().as_ref().filter(|s| s.0 == path).map_or(1, |s| s.1);
-    let next = timeline_core::editor::shuttle_rate(verb, playing, rate, KSHUTTLE_MAX);
+    let next = timeline_core::editor::shuttle_rate(verb, playing, rate, shuttle_top(verb, rate)); // STRIAKSHUTTLEHOLD (SR9105): the ceiling 4x, 8x while the decode keeps up (file tail)
     let play = verb != "stop";
     if next == rate || (play && !playing) {
         serial_println!("[nle] shuttle {} unchanged rate={}x", verb, rate);
         return None;
     }
-    *SHUTTLE.lock() = Some((String::from(path), next));
+    if shuttle_hold(path, verb, rate, next) { return None; } *SHUTTLE.lock() = Some((String::from(path), next)); // STRIAKSHUTTLEHOLD (SR9105): a live Nx step, or a repeat held while a restart shows no frame (file tail)
     SHUTTLE_PLAY.store(if play { 1 } else { 2 }, Ordering::Release);
     serial_println!("[nle] shuttle {} rate={}x at_ms={} play={}", verb, next, ms, play as u8);
     Some(ms)
@@ -4331,4 +4331,77 @@ fn band_note_paint(px: Vec<u8>, l: timeline_core::view::Layout) -> Vec<u8> {
     c.rect(x.saturating_sub(4) as i64, ry, w as i64, ry + view::RULER_H as i64, view::RULER);
     view::Text::text(&mut ViewLabels(0), &mut c, &line, x as f32, ry as f32 + LABEL_RISE, (x as i32, w as i32));
     c.px
+}
+
+// ---- STRIAKSHUTTLEHOLD (LEDGER SR9105): a held J / K / L at the key repeat rate, and the 8x ceiling (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SHUTTLE-KHOLD and NLE-SHUTTLE-K8X. A held key posts every 40 ms (pal.rs typematic) and each
+// `Some(ms)` from [`shuttle_key`] restarts the job (the seek door). [`shuttle_hold`] bounds that: a step between two rates
+// above 1x is LIVE (the job already runs without sound and only [`present`]'s clock line reads the rate, so
+// `SHUTTLE_RUN` changes in place with no restart), and a repeat that would restart while the last restart has shown no
+// frame (`PLAY.presented == 0`, reset by [`start_at`]) is HELD and stores nothing. [`shuttle_top`] is the ladder's
+// ceiling: [`KSHUTTLE_MAX`] (4x), opened to [`KSHUTTLE_TOP`] (8x) by timeline_core's ONE `editor::shuttle_ceiling` (a lag
+// rule over the frames shown since the rate last changed: `PLAY.sync_sum`, the shown frame's distance behind the clock),
+// and stepped back to 4x when the same rule fails at 8x (evaluated on an `l` key: an unattended step back would need a
+// hook in `present`, owed). Wire: `[nle] shuttle shuttle+ rate=<n>x live (no restart: sound already off)`,
+// `[nle] shuttle <word> held (restart in flight: no frame shown yet)`, `[nle] shuttle ceiling=8x shown=<n> lag_ms=<ms>`,
+// `[nle] shuttle back=4x shown=<n> lag_ms=<ms> (the decode falls behind at 8x)`.
+
+/// The Player's top shuttle rate, reached only while the measured decode keeps up at [`KSHUTTLE_MAX`].
+const KSHUTTLE_TOP: i64 = 8;
+
+/// `(PLAY.presented, PLAY.sync_sum)` when the shuttle rate last changed ((0, 0) on a restart: [`start_at`] zeroes PLAY).
+static SHUTTLE_MARK: crate::sync::Mutex<(u64, u64)> = crate::sync::Mutex::new((0, 0));
+
+/// `(PLAY.presented, PLAY.sync_sum)` now.
+fn shuttle_shown() -> (u64, u64) {
+    let p = PLAY.lock();
+    (p.presented, p.sync_sum)
+}
+
+/// The frames shown and their summed lag (ms) since the rate last changed.
+fn shuttle_since() -> (u64, u64) {
+    let (n, l) = shuttle_shown();
+    let (n0, l0) = *SHUTTLE_MARK.lock();
+    (n.saturating_sub(n0), l.saturating_sub(l0))
+}
+
+/// The ceiling `verb` climbs to from `rate`: below 4x the base; at 4x the base or 8x by the lag rule; at 8x it stays, or
+/// steps back to 4x once as many frames as the rule counts were shown lagging.
+fn shuttle_top(verb: &str, rate: i64) -> i64 {
+    if verb != "shuttle+" || rate < KSHUTTLE_MAX {
+        return KSHUTTLE_MAX;
+    }
+    let (n, l) = shuttle_since();
+    let top = timeline_core::editor::shuttle_ceiling(n, l, KSHUTTLE_MAX, KSHUTTLE_TOP);
+    if rate >= KSHUTTLE_TOP {
+        if n >= timeline_core::editor::SHUTTLE_KEEP_SHOWN && top == KSHUTTLE_MAX {
+            serial_println!("[nle] shuttle back={}x shown={} lag_ms={} (the decode falls behind at {}x)", KSHUTTLE_MAX, n, l / n.max(1), rate);
+            return KSHUTTLE_MAX;
+        }
+        return rate;
+    }
+    if top > rate {
+        serial_println!("[nle] shuttle ceiling={}x shown={} lag_ms={}", top, n, l / n.max(1));
+    }
+    top.max(rate)
+}
+
+/// Before a shuttle key stores `next` (from `rate`) for `path`: `true` when it was handled here (a live step between two
+/// rates above 1x, or held while the last restart has shown no frame); `false`: the restart goes ahead.
+fn shuttle_hold(path: &str, verb: &str, rate: i64, next: i64) -> bool {
+    if verb == "shuttle+" && rate > 1 && next > 1 && SHUTTLE_RUN.load(Ordering::Acquire) > 1 {
+        *SHUTTLE.lock() = Some((String::from(path), next));
+        SHUTTLE_RUN.store(next, Ordering::Release);
+        let now_shown = shuttle_shown();
+        *SHUTTLE_MARK.lock() = now_shown;
+        serial_println!("[nle] shuttle {} rate={}x live (no restart: sound already off)", verb, next);
+        return true;
+    }
+    let shown = PLAY.lock().presented;
+    if shown == 0 && !finished() {
+        serial_println!("[nle] shuttle {} held (restart in flight: no frame shown yet)", verb);
+        return true;
+    }
+    *SHUTTLE_MARK.lock() = (0, 0);
+    false
 }
