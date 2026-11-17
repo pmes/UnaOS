@@ -3973,3 +3973,71 @@ mod striaxformkeysease {
     }
 }
 
+
+// ---- STRIAKXFORMKEYS (LEDGER SR9073): the Player's placement follows the keys (named tail block) ----
+mod striakxformkeys {
+    use timeline_core::schedule::{Frac, Step, VideoMix};
+    use timeline_core::{Clip, Crop, Kind, SizePolicy, SourceId, Timeline, TransitionKind, XKeys, Xform, xform_frame};
+
+    const W: usize = 16;
+    const H: usize = 8;
+    const ONE: Frac = Frac { num: 1, den: 1 };
+
+    /// V1 holds source A, V2 holds source B unplaced (static `Xform::NONE`) carrying the points `keys`.
+    fn keyed(keys: XKeys) -> (Timeline, SourceId, SourceId) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        let b = tl.add_source("B", 100);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = vec![Clip::new(b, 0, 20, 0)];
+        let tl = tl.set_xkeys(1, 0, keys).unwrap();
+        tl.validate().unwrap();
+        (tl, a, b)
+    }
+
+    /// The schedule's step for V2 at output tick `t` over V1 (STRIAOPACITY's Dissolve of the track below).
+    fn step(a: SourceId, b: SourceId, t: i64) -> Step {
+        Step { kind: Kind::Video, track: Some(1), src: Some(b), src_t: t, out_t: t, len: 1, seek: None, vmix: Some(VideoMix { kind: TransitionKind::Dissolve, src: Some(a), src_t: t, seek: None, t: ONE }) }
+    }
+
+    fn frames() -> (Vec<[u8; 4]>, Vec<[u8; 4]>) {
+        let under: Vec<[u8; 4]> = (0..W * H).map(|i| [i as u8, 10, 20, 255]).collect();
+        let top: Vec<[u8; 4]> = (0..W * H).map(|i| [200, i as u8, 100, 255]).collect();
+        (under, top)
+    }
+
+    /// The one rule both faces call (`place_step`, the kernel Player's `edl_mix` included) shows the keyed placement at
+    /// each step's own tick: the points held before / after, linear between, and two points' frames differ.
+    #[test]
+    fn striakxformkeys_place_step_follows_keys() {
+        let half = Xform { x: 0, y: 0, s: 500 };
+        let keys = XKeys::NONE.with(0, Xform::PIP).unwrap().with(10, half).unwrap();
+        let (tl, a, b) = keyed(keys);
+        assert!(tl.tracks[1].clips[0].placed(), "a keyed clip with no static placement is placed");
+        let (under, top) = frames();
+        let mut shown = Vec::new();
+        for t in [0, 5, 10, 15] {
+            let xf = tl.xform_at(1, t);
+            assert_eq!(xf, keys.at(t).unwrap(), "tick {t}: the points' placement");
+            let want = xform_frame(&top, &under, W, H, Crop::NONE, SizePolicy::Letterbox, xf, ONE);
+            let got = tl.place_step(&step(a, b, t), &under, &top, W, H);
+            assert_eq!(got, Some(want), "tick {t}: the step's frame is the one composite at the keyed placement");
+            shown.push(got.unwrap());
+        }
+        assert_eq!(tl.xform_at(1, 15), half, "after the last point: held");
+        assert_ne!(shown[0], shown[2], "the two points show two rects");
+        assert_eq!(shown[2], shown[3], "held after the last point");
+        println!("striakxformkeys: place_step at ticks 0 5 10 15 follows {} points", keys.len());
+    }
+
+    /// A clip keyed to the whole frame is not placed at that tick: `place_step` is `None` and both faces mix as before.
+    #[test]
+    fn striakxformkeys_place_step_keyed_full_frame_is_none() {
+        let (tl, a, b) = keyed(XKeys::NONE.with(0, Xform::NONE).unwrap());
+        assert!(tl.tracks[1].clips[0].placed(), "the clip carries a point");
+        let (under, top) = frames();
+        assert_eq!(tl.place_step(&step(a, b, 5), &under, &top, W, H), None, "the whole frame: no placement");
+    }
+}

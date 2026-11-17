@@ -470,6 +470,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Alt+Shift+B", "crop-b-"),
     ("y", "link-av"), ("Y", "unlink"), ("Ctrl+l", "link"), ("Meta+l", "link"), ("Ctrl+Shift+L", "unlink-all"), ("Shift+Meta+L", "unlink-all"), // STRIALINKAUTOTHREE (SR9039): the four link words' keys (text y / Y, the Player's letters; GTK orders a chord Ctrl, Alt, Shift, Meta)
     ("A", "ripple-all"), // STRIARIPPLETHREE (SR9034): A (Shift+a, text) turns the ripple-all tool on / off (file tail)
+    ("p", "pip key"), ("P", "pip unkey"), // STRIAKXFORMKEYS (LEDGER SR9073): p / P (text) set / remove the placement point at the playhead, the kernel Player's EDIT_KEYS p / P too
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
     ("E", "export-skip"), // STRIAEXPORTQUEUELIST (SR932): Shift+e (text, both faces) skips the running export through the `export-skip` word; STRIAUNDOJUMP (SR934): `h` lists the undo history
     ("Shift+Escape", "export-skip"), // STRIAEXPORTQUEUETHREE (SR9042): GTK's Shift+Esc skips the running export (AppKit drops Escape; `E` is its key)
@@ -572,7 +573,7 @@ impl Face {
         }
         let Some(act) = self.bound(k) else { return false }; // STRIAKEYBOARDMAP (SR886): the face's key overlay first, then KEYS (file tail)
         if self.help { self.help = false; return true; } if act == "help" { return self.verb(act); } // NLE5DKEYSHELP (SR744): a taken key while the help shows only dismisses it (not applied); `?` shows it through the one verb
-        if VERBS.contains(&act) || slipslide_word(act).is_some() || act.starts_with("crop-") { // STRIACROPMORE (SR960): the crop chords' SR900 step words; NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
+        if VERBS.contains(&act) || slipslide_word(act).is_some() || act.starts_with("crop-") || matches!(act, "pip key" | "pip unkey") { // STRIACROPMORE (SR960): the crop chords' SR900 step words; STRIAKXFORMKEYS (LEDGER SR9073): the key words through the face's one verb road; NLE3ESLIPSTEP (SR752): the 10-frame words are keys, not VERBS: the same road
             return self.verb(act);
         }
         let r = match act {
@@ -2670,6 +2671,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("crop-b-", "uncrop the bottom"),
     ("link-av", "link each picture to its sound"), ("unlink", "unlink the selected clips"), ("link", "link the selected clips"), ("unlink-all", "unlink every clip"), // STRIALINKAUTOTHREE (SR9039): the link keys' phrases
     ("ripple-all", "ripple all tracks on / off: shift-drag a clip edge to ripple every track"), // STRIARIPPLETHREE (SR9034)
+    ("pip key", "set the placement point at the playhead"), ("pip unkey", "remove the placement point at the playhead"), // STRIAKXFORMKEYS (LEDGER SR9073)
     ("help", "show / hide this help"),
     ("export-skip", "skip the running export (the next waiting one starts)"), // STRIAEXPORTQUEUELIST (SR932): the `E` row // STRIAUNDOJUMP (SR934)
 ];

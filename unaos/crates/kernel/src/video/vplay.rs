@@ -1910,7 +1910,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 202120192020192022202219202120] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys) // STRIAKSHUTTLE (SR9061): + j / k / l, the host KEYS words
+const EDIT_KEYS: [(u8, &str); 20212019202019202220221920212020] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys) // STRIAKSHUTTLE (SR9061): + j / k / l, the host KEYS words // STRIAKXFORMKEYS (LEDGER SR9073): 18 -> 20, `p` / `P`
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1950,6 +1950,7 @@ const EDIT_KEYS: [(u8, &str); 202120192020192022202219202120] = [ // STRIAXFADET
     (b'k', "stop"),
     (b'l', "shuttle+"),
     (b'8', "opacity-"), (b'9', "opacity+"), // STRIAKOPACITY (SR9013): the host's KEYS 8 / 9, the shown clip's opacity 10 % down / up (file tail)
+    (b'p', "pip key"), (b'P', "pip unkey"), // STRIAKXFORMKEYS (LEDGER SR9073): the placement point at the playhead set / removed on the shown clip (the host KEYS p / P)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
