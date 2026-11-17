@@ -1373,7 +1373,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(a) = paint.text_align {
                 me.text_align = a;
             }
-            if tag == "a" || tag == "u" {
+            me.underline = false; if tag == "a" || tag == "u" { // SR1121: text-decoration-line is not inherited: the column reads the element's own line (the paint propagation is render's)
                 me.underline = true;
             }
             if let Some(u) = paint.underline {
@@ -1435,7 +1435,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
                 lh,
                 match me.text_align { 1 => "center", 2 => "right", 3 => "end", 4 => "left", 5 => "-webkit-center", 6 => "-webkit-right", 7 => "-webkit-left", 8 => "justify", _ => "start" }.to_string(),
-                if me.underline { "underline" } else { "none" }.to_string(),
+                decoration_line_words(me.underline, paint.line_through.unwrap_or_else(|| crate::layout::default_line_through(tag, false))), // SR1121
                 white_space_word(me.white_space).to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),
                 list_style_word(me.list_style).to_string(),
@@ -1979,4 +1979,13 @@ fn rect_side<T: Copy>(r: &taffy::geometry::Rect<T>, i: usize) -> T {
 /// `normal`), so the report keeps calling `line_height_used`; this fn is for a reader that needs the number.
 pub(crate) fn line_height_used_px(paint: &crate::layout::PaintStyle, mult: f32, specified: f32, sel: layout_core::FontSel) -> f32 {
     layout_core::Fonts::line_height(&crate::layout::HostFonts, sel, font_size_used(paint, specified), mult)
+}
+
+// ---- AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (LEDGER SR1121): the text-decoration-line column's words from the element's own line bools (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): the computed text-decoration-line in css-text-decor-3 §2.1 canonical
+/// order (`underline` then `line-through`, `none` when neither), from the element's OWN lines (not the propagated paint).
+fn decoration_line_words(underline: bool, line_through: bool) -> String {
+    let w: Vec<&str> = [(underline, "underline"), (line_through, "line-through")].into_iter().filter(|p| p.0).map(|p| p.1).collect();
+    if w.is_empty() { "none".to_string() } else { w.join(" ") }
 }
