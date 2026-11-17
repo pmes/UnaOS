@@ -10629,6 +10629,78 @@ b</div>
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 25.0), "d", "the sample at #d's painted rows is #d");
     }
 
+    // ---- AETHERCSSOMOFFSETTOPSTICKY (LEDGER SR1149): offsetTop / offsetLeft read a stuck sticky box at its held place (named tail block) ----
+
+    /// AETHERCSSOMOFFSETTOPSTICKY (SR1149): scrolled 400px `#s` (sticky `top: 10px`, flow y 100, body its offsetParent) is
+    /// held at document y 410, and its offsetTop reads 410 (armed: 100, the flow place, before SR1149); the claim — the
+    /// two roads agree: getBoundingClientRect().top + scrollY == offsetTop.
+    #[test]
+    fn offset_top_sticky_stuck_reads_held_place() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(js_num(&mut e, "document.getElementById('s').offsetTop"), 410.0, "#s's offsetTop is its held document y (armed: 100 before SR1149)");
+        let both = js_num(&mut e, "document.getElementById('s').getBoundingClientRect().top + window.scrollY");
+        assert_eq!(both, js_num(&mut e, "document.getElementById('s').offsetTop"), "getBoundingClientRect().top + scrollY == offsetTop");
+    }
+
+    /// AETHERCSSOMOFFSETTOPSTICKY (SR1149): unscrolled and scrolled 50px (flow 100 - 50 = 50 > its 10px inset: not stuck)
+    /// `#s`'s offsetTop is its normal-flow y, 100.
+    #[test]
+    fn offset_top_sticky_unstuck_is_flow_place() {
+        let mut e = bounding_sticky_child_engine();
+        assert_eq!(js_num(&mut e, "document.getElementById('s').offsetTop"), 100.0, "unscrolled: the flow place");
+        bounding_sticky_scroll(&mut e, 50.0);
+        assert_eq!(js_num(&mut e, "document.getElementById('s').offsetTop"), 100.0, "scrolled 50px, not yet stuck: the flow place");
+    }
+
+    /// AETHERCSSOMOFFSETTOPSTICKY (SR1149): `offset_parent` treats sticky as positioned, so `#k`'s offsetParent is `#s`;
+    /// both read through the same hold, so `#k`.offsetTop is 15 (its place inside `#s`) unscrolled and stuck alike — a
+    /// shift of `#k` alone would read 325.
+    #[test]
+    fn offset_top_sticky_child_offset_parent() {
+        let mut e = bounding_sticky_child_engine();
+        let parent = e.js_engine.as_mut().unwrap().eval_string("String(document.getElementById('k').offsetParent.id)").unwrap();
+        assert_eq!(parent, "s", "#k's offsetParent is the sticky #s");
+        assert_eq!(js_num(&mut e, "document.getElementById('k').offsetTop"), 15.0, "#k 15px into #s, unscrolled");
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(js_num(&mut e, "document.getElementById('k').offsetTop"), 15.0, "#k 15px into #s while #s is stuck");
+    }
+
+    /// AETHERCSSOMOFFSETTOPSTICKY (SR1149): a hold moves, it does not resize: `#s`'s offsetWidth 400, offsetHeight 40 and
+    /// offsetLeft 0 at scroll 0, 50 and 400.
+    #[test]
+    fn offset_top_sticky_sizes_unchanged() {
+        let mut e = bounding_sticky_child_engine();
+        for dy in [0.0, 50.0, 350.0] {
+            if dy > 0.0 {
+                bounding_sticky_scroll(&mut e, dy);
+            }
+            assert_eq!(js_num(&mut e, "document.getElementById('s').offsetWidth"), 400.0, "offsetWidth after +{dy}");
+            assert_eq!(js_num(&mut e, "document.getElementById('s').offsetHeight"), 40.0, "offsetHeight after +{dy}");
+            assert_eq!(js_num(&mut e, "document.getElementById('s').offsetLeft"), 0.0, "offsetLeft after +{dy}");
+        }
+        assert_eq!(e.scroll_y, 400.0, "the last state is scrolled 400px");
+    }
+
+    /// AETHERCSSOMOFFSETTOPSTICKY (SR1149): pin of the unchanged fixed road — `#f` (`position: fixed; top: 30px`) reads
+    /// its viewport origin as offsetTop, 30, unscrolled and scrolled 400px (no sticky hold applies to a fixed box).
+    #[test]
+    fn offset_top_sticky_fixed_unchanged() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="f" style="position:fixed;top:30px;height:20px;width:50px"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(js_num(&mut e, "document.getElementById('f').offsetTop"), 30.0, "fixed #f unscrolled");
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(js_num(&mut e, "document.getElementById('f').offsetTop"), 30.0, "fixed #f scrolled 400px: unchanged");
+    }
+
     // ---- AETHERCSSINLINEBORDERALPHABYCOLOUR (LEDGER SR1146): the inline road's fills carry their alpha, not a colour comparison (named tail block) ----
 
     /// AETHERCSSINLINEBORDERALPHABYCOLOUR (SR1146): on white, three inline spans (`padding: 0 12px`, white text) and
