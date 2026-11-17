@@ -187,8 +187,8 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease" | "dur" | "gap"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
-        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`
+        [w @ ("kind" | "ease" | "dur" | "gap" | "track+" | "track-"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator); STRIAGAPCLOSE (SR857): `gap:5`; STRIATRACKADDREMOVE (SR856): `track+:audio`, `track-:V2`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -532,6 +532,7 @@ fn transport() -> TetraNode {
         button("xfade", "Xfade"), button("tc", "TC"), // STRIATIMECODEDISPLAY (SR872): the playhead readout off / timecode / frames / seconds
         button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
+        button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1169,5 +1170,31 @@ mod striaexportpresets_tests {
         assert_eq!(t, "web: h264 + aac crf=23 aq=10 scenecut=40\narchive: png + wav\nproxy: h264 + aac:64 crf=32\n");
         assert_eq!(t.lines().count(), stria::nle_export::PRESETS.len());
         assert!(USAGE.contains("[--presets]"), "{USAGE}");
+    }
+}
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): the V+ / A+ / Track - buttons and the `track+:` / `track-:` tokens (named tail block) ----
+
+#[cfg(test)]
+mod striatrackaddremove_tests {
+    use super::*;
+
+    /// M3: `track+:audio` adds A2 (the JSON `"tracks"` reads 3), `track-:A2` removes it (2) and names it on the message
+    /// line (the witness's `errors`), two undo steps; the three buttons' words are VERBS words and sit before `help`, still the last button.
+    #[test]
+    fn striatrackaddremove_witness_tokens_and_buttons() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "track+:audio").is_empty());
+        assert_eq!(face.state.timeline.tracks.len(), 3);
+        assert!(face.dirty());
+        assert_eq!(drive(&mut face, "track-:A2"), vec!["track-: removed A2 (0 clips)".to_string()], "the message road");
+        assert_eq!((face.state.timeline.tracks.len(), face.state.undo_depth()), (2, 2));
+        assert_eq!(face.state.timeline, tl);
+        assert_eq!(drive(&mut face, "track-:V9"), vec![format!("track- V9: {}", timeline_core::EditError::NoTrack)]);
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<&str> = row.iter().map(|b| if let TetraNode::Button { id, .. } = b { id.as_str() } else { "" }).collect();
+        assert_eq!(ids[ids.len() - 4..], ["track+ video", "track+ audio", "track-", "help"]);
+        assert!(["track+ video", "track+ audio", "track-"].iter().all(|w| nle_face::VERBS.contains(w)));
     }
 }

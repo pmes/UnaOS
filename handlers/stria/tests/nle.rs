@@ -5338,3 +5338,40 @@ fn striaslipview_split_kats() {
     assert_eq!((&r[0..4], &r[4..12], &r[12..16]), (&field[..], &[5u8; 8][..], &field[..]), "letterboxed: a 2x2 in a 4x2 cell");
     println!("striaslipview: slip_split KATs");
 }
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): the V+ / A+ / Track - words on the face, the message line, the save (named tail block) ----
+
+/// The face's words are timeline_core's: `track+ audio` adds an empty A2 (one undo step, dirty), `save` writes
+/// `* UNA TRACKS 1 2` and the reopened document holds the empty track; bare `track-` removes the selected clip's track
+/// WITH its clips and the message line names it (`track-: removed V (3 clips)`); one undo brings all of it back; with
+/// nothing selected the word is refused by name.
+#[test]
+fn striatrackaddremove_face_buttons_add_and_remove() {
+    let (tl0, src) = synth_fixture();
+    let path = common::fresh_dir("striatrackaddremove", "face").join("cut.edl");
+    std::fs::write(&path, edl::write(&tl0, "cut").unwrap()).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false).with_doc(Some(path.as_path()));
+    for w in ["track+ video", "track+ audio", "track-"] {
+        assert!(VERBS.contains(&w), "{w}");
+    }
+    assert!(face.verb("track+ audio"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!((face.state.timeline.tracks.len(), face.state.undo_depth(), face.dirty()), (3, 1, true));
+    assert!(face.verb("save"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("* UNA TRACKS 1 2\n"), "{text}");
+    assert_eq!(edl::parse(&text, 25).unwrap(), face.state.timeline, "the empty A2 survives the save");
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("track-"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-: removed V (3 clips)"));
+    assert_eq!((face.state.timeline.tracks.len(), face.state.selection), (2, None));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0.insert_track(Kind::Audio).unwrap(), "one undo restores the track and its clips");
+    face.state.deselect();
+    assert!(face.verb("track-"));
+    assert_eq!(face.last_error.take(), Some(format!("track-: {}", EditError::NoTrack)));
+    assert!(face.verb("track- A2"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-: removed A2 (0 clips)"));
+    assert_eq!(face.state.timeline, tl0);
+    println!("striatrackaddremove: A+ -> 3 tracks, saved with * UNA TRACKS 1 2; track- -> removed V (3 clips); undo; A2 removed");
+}

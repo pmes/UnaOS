@@ -711,3 +711,128 @@ fn strianudge_verb_moves_the_set_by_a_count() {
     assert_eq!(st.verb("nudge 1"), Some(Err(EditError::NoClip)));
     println!("strianudge: nudge 10 / nudge 5 over a set of two, one commit each; -50 Negative, +3 Overlap, deselected NoClip");
 }
+
+// ---- STRIATRACKADDREMOVE (LEDGER SR856): add / remove a track, the canonical slot, the carried indices, the EDL (named tail block) ----
+
+mod striatrackaddremove {
+    use timeline_core::editor::EditorState;
+    use timeline_core::{Clip, Curve, EditError, Kind, Timeline, edl};
+
+    /// V1 A[0,20)@0 B[0,20)@20; A1 the same with an equal-power crossfade on its cut; A2 A[0,10)@0.
+    fn three() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 100), tl.add_source("B", 100));
+        let (v1, a1, a2) = (tl.add_track(Kind::Video), tl.add_track(Kind::Audio), tl.add_track(Kind::Audio));
+        tl.tracks[v1].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+        tl.tracks[a1].clips = tl.tracks[v1].clips.clone();
+        tl.tracks[a2].clips = vec![Clip::new(a, 0, 10, 0)];
+        tl.add_audio_xfade(a1, 20, 4, Curve::EqualPower).unwrap()
+    }
+
+    /// A video track goes after the last video track (before the audio), an audio one after the last audio; the xfade's
+    /// track index follows its track; a tenth of a kind is `Tracks`; with no track of a kind, video first, audio last.
+    #[test]
+    fn striatrackaddremove_insert_slots_and_cap() {
+        let tl = three();
+        let v = tl.insert_track(Kind::Video).unwrap();
+        assert_eq!(v.tracks.iter().map(|t| t.kind).collect::<Vec<_>>(), vec![Kind::Video, Kind::Video, Kind::Audio, Kind::Audio]);
+        assert!(v.tracks[1].clips.is_empty());
+        assert_eq!((v.audio_xfades[0].track, v.tracks[2].clips.clone()), (2, tl.tracks[1].clips.clone()));
+        let a = tl.insert_track(Kind::Audio).unwrap();
+        assert_eq!((a.tracks.len(), a.tracks[3].kind, a.audio_xfades[0].track), (4, Kind::Audio, 1));
+        assert_eq!((a.track_of(Kind::Audio, 3), a.track_word(3).as_deref(), a.track_word(0).as_deref()), (Some(3), Some("A3"), Some("V")));
+        let mut full = tl.clone();
+        for _ in 0..8 {
+            full = full.insert_track(Kind::Video).unwrap();
+        }
+        assert_eq!(full.insert_track(Kind::Video), Err(EditError::Tracks));
+        assert_eq!(full.insert_track(Kind::Audio).map(|t| t.tracks.len()), Ok(12));
+        let empty = Timeline::new(25);
+        assert_eq!((empty.track_slot(Kind::Video), empty.track_slot(Kind::Audio)), (0, 0));
+        let only_a = empty.insert_track(Kind::Audio).unwrap();
+        assert_eq!((only_a.track_slot(Kind::Video), only_a.track_slot(Kind::Audio)), (0, 1));
+    }
+
+    /// Removing a track takes its clips, transitions and explicit crossfades; a later crossfade moves down one track;
+    /// no such track is `NoTrack`; the source timeline is untouched.
+    #[test]
+    fn striatrackaddremove_remove_shifts_xfades_and_drops_its_own() {
+        let tl = three();
+        let before = tl.clone();
+        let r = tl.remove_track(0).unwrap();
+        assert_eq!((r.tracks.len(), r.audio_xfades[0].track), (2, 0));
+        assert_eq!(r.tracks[0], tl.tracks[1]);
+        let own = tl.remove_track(1).unwrap();
+        assert!(own.audio_xfades.is_empty());
+        assert_eq!(own.tracks[1], tl.tracks[2]);
+        let last = tl.remove_track(2).unwrap();
+        assert_eq!(last.audio_xfades, tl.audio_xfades);
+        assert_eq!(tl.remove_track(3), Err(EditError::NoTrack));
+        assert_eq!(tl, before);
+    }
+
+    /// The words through THE dispatch: one undo step each; the selection and set follow their clips; a removed track's
+    /// selection goes; each refusal by name; other `track+` shapes are not editor verbs.
+    #[test]
+    fn striatrackaddremove_verb_one_undo_step_and_selection_follows() {
+        let tl = three();
+        let mut st = EditorState::new(tl.clone());
+        st.select(1, 1).unwrap();
+        st.select_add(2, 0).unwrap();
+        let sel = st.selected();
+        assert_eq!(st.verb("track+ video"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), st.timeline.tracks.len()), (1, 4));
+        assert_eq!((st.selected(), st.set.clone()), (sel, vec![(2, 1), (3, 0)]));
+        assert_eq!(st.verb("track- V2"), Some(Ok(())));
+        assert_eq!((st.timeline.clone(), st.selected(), st.undo_depth()), (tl.clone(), sel, 2));
+        assert_eq!(st.verb("track-"), Some(Ok(())), "bare: the primary's track (A2) with its clip");
+        assert_eq!((st.timeline.tracks.len(), st.selection, st.set.clone()), (2, Some((1, 1)), vec![(1, 1)]), "A2's entry dropped");
+        assert_eq!(st.timeline, tl.remove_track(2).unwrap());
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl);
+        st.deselect();
+        assert_eq!(st.verb("track-"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.verb("track- A3"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.verb("track- X"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.verb("track- V V"), Some(Err(EditError::NoTrack)));
+        assert_eq!(st.track_minus_target("track- A1"), Some(Ok(1)));
+        assert_eq!(st.verb("track+"), None);
+        assert_eq!(st.verb("track+ title"), None);
+        for _ in 0..7 {
+            assert_eq!(st.verb("track+ audio"), Some(Ok(())));
+        }
+        let depth = st.undo_depth();
+        assert_eq!(st.verb("track+ audio"), Some(Err(EditError::Tracks)));
+        assert_eq!(st.undo_depth(), depth, "a refusal commits nothing");
+    }
+
+    /// An empty trailing track survives a save: `* UNA TRACKS` is written last in the header only then, parse restores
+    /// the track, write(parse(write)) is byte-identical; a timeline without one writes exactly as before; refusals.
+    #[test]
+    fn striatrackaddremove_edl_empty_trailing_track_round_trips() {
+        let tl = three();
+        let plain = edl::write(&tl, "T").unwrap();
+        assert!(!plain.contains("* UNA TRACKS"));
+        let mid = tl.insert_track(Kind::Video).unwrap().remove_track(0).unwrap().insert_track(Kind::Video).unwrap();
+        let both = tl.insert_track(Kind::Video).unwrap().insert_track(Kind::Audio).unwrap();
+        let text = edl::write(&both, "T").unwrap();
+        assert!(text.contains("* UNA TRACKS 2 3\n\n001"), "{text}");
+        assert_eq!(text.replace("* UNA TRACKS 2 3\n", ""), plain, "only the one line differs");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back, both);
+        assert_eq!(edl::write(&back, "T").unwrap(), text);
+        assert_eq!(edl::parse(&edl::write(&mid, "T").unwrap(), 25).unwrap(), mid);
+        let mut empty = Timeline::new(25);
+        empty = empty.insert_track(Kind::Video).unwrap();
+        let e = edl::write(&empty, "E").unwrap();
+        assert!(e.contains("* UNA TRACKS 1 0\n"), "{e}");
+        assert_eq!(edl::parse(&e, 25).unwrap(), empty);
+        let at = text.lines().position(|l| l.starts_with("* UNA TRACKS")).unwrap() + 1;
+        for bad in ["* UNA TRACKS 2", "* UNA TRACKS 2 3 4", "* UNA TRACKS x 3", "* UNA TRACKS 10 3", "* UNA TRACKS 2 3\n* UNA TRACKS 2 3"] {
+            let t = text.replace("* UNA TRACKS 2 3", bad);
+            let line = if bad.contains('\n') { at + 1 } else { at };
+            assert_eq!(edl::parse(&t, 25), Err(edl::EdlError::Syntax { line }), "{bad}");
+        }
+        assert_eq!(edl::parse(&text.replace("* UNA TRACKS 2 3", "* UNA TRACKS 0 0"), 25).unwrap(), tl, "a floor below the events: theirs");
+    }
+}
