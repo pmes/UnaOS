@@ -2773,3 +2773,111 @@ fn text_decoration_color_alpha_cascade() {
     let r = cascade(&[half, &[("text-decoration", "underline")]]);
     assert_eq!((r.paint.decoration_color, r.paint.deco_alpha), (Some(None), None), "the shorthand's reset clears both");
 }
+
+// ---- AETHERTEXTJUSTIFY (LEDGER SR1156): css-text-3 §7.4 text-justify (named tail block) ----
+
+/// AETHERTEXTJUSTIFY (SR1156): `text-justify: none` leaves every justified line at its natural width (170, one frag per
+/// chunk, at the start); armed: the plain justify twin ends flush at 200.
+#[test]
+fn text_justify_none() {
+    let n = justify_lines("text-align: justify; text-justify: none", fifteen());
+    assert_eq!(n.len(), 3, "three lines: {n:?}");
+    for l in &n {
+        assert!((right_edge(l) - 170.0).abs() <= 0.5 && left_edge(l) == 0.0, "none: natural width at the start: {l:?}");
+        assert_eq!(l.len(), 1, "none: no word pieces: {l:?}");
+    }
+    let j = justify_lines("text-align: justify", fifteen());
+    assert!((right_edge(&j[0]) - 200.0).abs() <= 0.5, "armed: plain justify stretches: {:?}", j[0]);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): under `auto` and `inter-word` the frag list (count and every x / right edge) is the cut's
+/// (SR1057's road, no text-justify declared), on the plain paragraph, the <br> paragraph and rtl.
+#[test]
+fn text_justify_inter_word_pin() {
+    let br = || vec![text("abcdef abcdef"), el("br", &[], vec![]), text(&["abcdef"; 10].join(" "))];
+    let cases: [(&str, &dyn Fn() -> Vec<Spec>); 3] = [("text-align: justify", &fifteen), ("text-align: justify", &br), ("direction: rtl; text-align: justify", &fifteen)];
+    for (base, kids) in cases {
+        let cut = justify_lines(base, kids());
+        for v in ["auto", "inter-word"] {
+            let got = justify_lines(&format!("{base}; text-justify: {v}"), kids());
+            assert_eq!(got, cut, "{v} under {base:?} is the cut's frag list");
+        }
+    }
+    let cut = justify_lines("text-align: justify", fifteen());
+    assert_eq!(cut[0].len(), 5, "the cut: one frag per word: {:?}", cut[0]);
+    assert_eq!(cut[0][0].0, 0.0);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): `inter-character` on a line of three words spreads the free space over every cluster
+/// gap: 35 clusters (the two spaces included), natural 175, free 25, so the first two letters sit 5 + 25/34 apart (frag
+/// x on whole pixels: within 0.5) and the line ends flush; armed: inter-word keeps one frag per word.
+#[test]
+fn text_justify_inter_character() {
+    let kids = || vec![text("abcdefghijk abcdefghijk abcdefghijk abcdef")];
+    let c = justify_lines("text-align: justify; text-justify: inter-character", kids());
+    assert_eq!(c.len(), 2, "two lines: {c:?}");
+    assert_eq!(c[0].len(), 35, "one frag per cluster: {:?}", c[0]);
+    let per = 25.0 / 34.0;
+    assert!((c[0][1].0 - c[0][0].0 - 5.0 - per).abs() <= 0.5, "the first gap grew by free / (clusters - 1): {:?}", &c[0][..2]);
+    assert!((right_edge(&c[0]) - 200.0).abs() <= 0.5 && c[0][0].0 == 0.0, "flush both sides: {:?}", c[0]);
+    let w = justify_lines("text-align: justify; text-justify: inter-word", kids());
+    assert_eq!(w[0].len(), 3, "armed: inter-word keeps one frag per word: {:?}", w[0]);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): the paragraph's last line stays unjustified (170 at the start) under none, inter-word and
+/// inter-character.
+#[test]
+fn text_justify_last_line() {
+    for v in ["none", "inter-word", "inter-character"] {
+        let l = justify_lines(&format!("text-align: justify; text-justify: {v}"), fifteen());
+        assert!((right_edge(&l[2]) - 170.0).abs() <= 0.5 && left_edge(&l[2]) == 0.0, "{v}: the last line is start: {:?}", l[2]);
+    }
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): the legacy `distribute` lays out as `inter-character`.
+#[test]
+fn text_justify_distribute() {
+    let d = justify_lines("text-align: justify; text-justify: distribute", fifteen());
+    assert_eq!(d, justify_lines("text-align: justify; text-justify: inter-character", fifteen()));
+    assert_eq!(d[0].len(), 34, "per-cluster frags: {:?}", d[0]);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): a word holding a cursive-joining character (Arabic) stays one unit under inter-character
+/// (css-text-3 §7.4): one frag per word, the free space over the word gaps, flush; armed: the Latin twin splits.
+#[test]
+fn text_justify_cursive_unit() {
+    let c = justify_lines("text-align: justify; text-justify: inter-character", vec![text(&["\u{0627}\u{0628}\u{062A}\u{062B}\u{062C}\u{062D}"; 15].join(" "))]);
+    assert_eq!(c[0].len(), 5, "one frag per cursive word: {:?}", c[0]);
+    assert!((right_edge(&c[0]) - 200.0).abs() <= 0.5, "still flush: {:?}", c[0]);
+    let l = justify_lines("text-align: justify; text-justify: inter-character", fifteen());
+    assert_eq!(l[0].len(), 34, "armed: the Latin twin splits per cluster: {:?}", l[0]);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): text-justify inherits from the parent div; an invalid child value keeps the parent's; an
+/// explicit child `auto` overrides it.
+#[test]
+fn text_justify_inherits() {
+    let n = align_last_lines("text-justify: none", "text-align: justify", fifteen());
+    assert!((right_edge(&n[0]) - 170.0).abs() <= 0.5, "the inherited none: {:?}", n[0]);
+    let b = align_last_lines("text-justify: none", "text-align: justify; text-justify: bogus", fifteen());
+    assert!((right_edge(&b[0]) - 170.0).abs() <= 0.5, "an invalid value keeps the parent's: {:?}", b[0]);
+    let a = align_last_lines("text-justify: none", "text-align: justify; text-justify: auto", fifteen());
+    assert!((right_edge(&a[0]) - 200.0).abs() <= 0.5, "an own auto wins: {:?}", a[0]);
+}
+
+/// AETHERTEXTJUSTIFY (SR1156): the parse codes, the wide keywords dropped, merge_paint carries the field, and the arm's
+/// name is in ALL_LONGHANDS.
+#[test]
+fn text_justify_codes() {
+    let code = |v: &str| styled(&[("text-justify", v)]).paint.text_justify;
+    assert_eq!(code("auto"), Some(0));
+    assert_eq!(code("initial"), Some(0));
+    assert_eq!(code("none"), Some(1));
+    assert_eq!(code("inter-word"), Some(2));
+    assert_eq!(code("inter-character"), Some(3));
+    assert_eq!(code("Distribute"), Some(3));
+    assert_eq!(code("inherit"), None);
+    assert_eq!(code("bogus"), None);
+    assert_eq!(cascade(&[&[("text-justify", "none")], &[("color", "red")]]).paint.text_justify, Some(1), "merge_paint keeps it");
+    assert!(ALL_LONGHANDS.contains(&"text-justify"), "the arm is listed for all:");
+}

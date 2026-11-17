@@ -1158,7 +1158,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         // descendant block, not just this box's own flex children. The
         // paint field carries it down (see layout::remeasure); the justify
         // here is the immediate effect on this box's own row.
-        "text-align-last" => { if let Some(c) = text_align_last_code::<H>(value) { style.paint.text_align_last = Some(c); } } "text-align" => match value { // AETHERTEXTALIGNLAST (SR1062): text-align-last parses through text_align_last_code
+        "text-justify" => { if let Some(c) = text_justify_code::<H>(value) { style.paint.text_justify = Some(c); } } "text-align-last" => { if let Some(c) = text_align_last_code::<H>(value) { style.paint.text_align_last = Some(c); } } "text-align" => match value { // AETHERTEXTALIGNLAST (SR1062): text-align-last parses through text_align_last_code
             "center" => {
                 style.justify = Some(taffy::style::JustifyContent::CENTER);
                 style.paint.text_align = Some(1);
@@ -2502,7 +2502,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     merge_border_pending(dst, src); merge_border_alpha(dst, src); if src.color.is_some() { dst.color_alpha = src.color_alpha; } if src.decoration_color.is_some() { dst.deco_alpha = src.deco_alpha; } copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
-        mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
+        mask_repeat, text_align, text_align_last, text_justify, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
         list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha,
@@ -4040,7 +4040,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "writing-mode", "text-combine-upright", "text-orientation",
     "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
     "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
-    "vertical-align", "clear", "float", "text-indent", "text-align", "text-align-last", "justify-content", "align-items", "align-content", "align-self", "justify-items", "justify-self", // SR1068 SR1088
+    "vertical-align", "clear", "float", "text-indent", "text-align", "text-align-last", "text-justify", "justify-content", "align-items", "align-content", "align-self", "justify-items", "justify-self", // SR1068 SR1088
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
@@ -5183,4 +5183,24 @@ pub fn alignment_valid(prop: &str, value: &str) -> bool {
 /// a declared colour's alpha through [`color_alpha`] (`transparent` 0), None when opaque or currentcolor (SR1126's shape).
 fn deco_alpha_of<H: Host>(c: Option<Option<(u8, u8, u8)>>, v: &str) -> Option<f32> {
     c.flatten().and(Some(color_alpha::<H>(v)).filter(|a| *a < 1.0))
+}
+
+// ---- AETHERTEXTJUSTIFY (LEDGER SR1156): css-text-3 §7.4 text-justify parses to one inherited code (named tail block) ----
+
+/// AETHERTEXTJUSTIFY (SR1156): css-text-3 §7.4 `text-justify` to its code: 0 `auto` (which `initial` also writes, so an
+/// explicit auto overrides an inherited value), 1 `none`, 2 `inter-word`, 3 `inter-character` (the legacy `distribute`
+/// too). `inherit` / `unset` / `revert` / `revert-layer` are dropped as [`text_align_last_code`] drops them (the field
+/// stays unspecified and inherits); anything else is recorded and dropped.
+fn text_justify_code<H: Host>(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "initial" => Some(0),
+        "none" => Some(1),
+        "inter-word" => Some(2),
+        "inter-character" | "distribute" => Some(3),
+        "inherit" | "unset" | "revert" | "revert-layer" => None,
+        other => {
+            H::record_css(&format!("text-justify:{}", clip(other)));
+            None
+        }
+    }
 }
