@@ -111,7 +111,7 @@ impl EditorState {
             Edge::In => self.timeline.trim_in(track, idx, c.src_in + delta)?,
             Edge::Out => self.timeline.trim_out(track, idx, c.src_out + delta)?,
         };
-        self.commit(tl);
+        let tl = tl.linked(track, idx, |t, k, i, m| match edge { Edge::In => t.trim_in(k, i, m.src_in + delta), Edge::Out => t.trim_out(k, i, m.src_out + delta) })?; self.commit(tl); // STRIALINKTRIM (SR910): every link mate trims by the same source delta, all-or-nothing (lib.rs tail)
         Ok(())
     }
     /// Move the selected clip to `to_at` on `to_track` (`Timeline::move_clip`); the selection follows the clip.
@@ -468,7 +468,7 @@ impl EditorState {
             Edge::In => self.timeline.ripple_trim_in(track, idx, c.src_in + delta)?,
             Edge::Out => self.timeline.ripple_trim_out(track, idx, c.src_out + delta)?,
         };
-        self.commit(tl);
+        let tl = tl.linked(track, idx, |t, k, i, m| match edge { Edge::In => t.ripple_trim_in(k, i, m.src_in + delta), Edge::Out => t.ripple_trim_out(k, i, m.src_out + delta) })?; self.commit(tl); // STRIALINKTRIM (SR910): every link mate ripple-trims by the same source delta, all-or-nothing (lib.rs tail)
         Ok(())
     }
     /// The set as a transitioned pair: `(track, outgoing index)` when it is exactly clips `i` and `i + 1` of one track,
@@ -514,7 +514,7 @@ impl EditorState {
     pub fn slip_selected(&mut self, delta: i64) -> Result<(), EditError> {
         let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let tl = self.timeline.slip(track, idx, delta)?;
-        self.commit(tl);
+        let tl = tl.linked(track, idx, |t, k, i, _| t.slip(k, i, delta))?; self.commit(tl); // STRIALINKTRIM (SR910): every link mate slips by the same source delta, all-or-nothing (lib.rs tail)
         Ok(())
     }
     /// Slide the selected clip by `delta` timeline ticks (`Timeline::slide`); the selection stays on it.
@@ -664,7 +664,7 @@ impl EditorState {
 // ---- STRIACLIPLINK (LEDGER SR863): link selection and the `link` / `unlink` words (named tail block) ----
 // Selecting a clip selects its whole link group (`Timeline::mates`), so the set ops already carry it: a move is ONE
 // `move_many`, `delete` / `lift` take every member, `split` cuts them all (`Timeline::split_linked`); trims, slip and
-// slide stay the primary clip's. `link` gives the set (two or more clips) ONE fresh group, `unlink` gives it 0; ONE commit
+// slide: trims and slip carry every mate by the same source delta (STRIALINKTRIM SR910), slide stays the primary clip's. `link` gives the set (two or more clips) ONE fresh group, `unlink` gives it 0; ONE commit
 // each through THE verb dispatch both faces call. Refused `EditError::NoClip`: nothing selected, `link` of one clip.
 impl EditorState {
     /// The set grown by every pick's link mates (sorted, deduped).

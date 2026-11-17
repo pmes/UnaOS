@@ -1591,3 +1591,24 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIALINKTRIM (LEDGER SR910): a trim, ripple trim or slip carried to every link mate (named tail block) ----
+// The editor's trim doors (`EditorState::trim`, `ripple_trim`, `slip_selected`) run their op on the primary clip, then
+// `linked` runs the same op, by the same source delta, on every other member of its group (`Timeline::mates`), chained
+// on the edited timeline: one refusal refuses the whole edit, success is ONE commit. Group 0 is the primary alone, so
+// `linked` returns the timeline unchanged. None of these ops reorders a track or touches a group, so the picks hold.
+impl Timeline {
+    /// STRIALINKTRIM: `self` (the timeline after the primary clip `idx` of `track` was edited) with `op(tl, track, idx,
+    /// clip)` applied to each of that clip's link mates in turn; the first refusal is the result.
+    pub fn linked(self, track: usize, idx: usize, op: impl Fn(&Timeline, usize, usize, Clip) -> Result<Timeline, EditError>) -> Result<Timeline, EditError> {
+        let mut tl = self;
+        for (k, i) in tl.mates(track, idx) {
+            if (k, i) == (track, idx) {
+                continue;
+            }
+            let m = *tl.tracks.get(k).and_then(|t| t.clips.get(i)).ok_or(EditError::NoClip)?;
+            tl = op(&tl, k, i, m)?;
+        }
+        Ok(tl)
+    }
+}
