@@ -1280,10 +1280,14 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 25; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 45; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
     "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
+    "margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width", // SR1096
+    "border-right-style", "border-bottom-style", "border-left-style", // SR1103
+    "border-top-color", "border-right-color", "border-bottom-color", // SR1104
+    "text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color", // SR1108
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1306,7 +1310,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         text_align: u8,
         underline: bool,
         nowrap: bool, white_space: u8, list_style: u8, rtl: bool,
-        hidden: bool,
+        hidden: bool, ul_pos: u8, caret: Option<(u8, u8, u8, u8)>,
     }
     fn num(v: f32) -> String {
         let a = (v as f64).abs(); let d = if a > 0.0 && a.is_finite() { (5 - a.log10().floor() as i32).clamp(0, 15) } else { 0 }; let k = 10f64.powi(d); let r = (v as f64 * k).round() / k; // SR1023: 6 significant digits (Blink's CSS number serialization)
@@ -1345,7 +1349,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false, ul_pos: 0, caret: None,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1382,7 +1386,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c }));
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); if let Some(p) = paint.underline_position { me.ul_pos = p; } if let Some(c) = paint.caret_color { me.caret = c; } // SR1108: deco_ink's ul_pos and caret_inherit, verbatim
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1410,7 +1414,15 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 _ => "row",
             };
             let side = |i: usize| paint.border.map(|b| layout_core::paint::border_ink(b, paint.currentcolor, me.color)).and_then(|b| b[i]);
-            let bw_top = paint.border_width.and_then(|w| w[0]).or(side(0).map(|s| s.0)).unwrap_or(0.0);
+            let sstyle = |i: usize| { let w = paint.border_width.and_then(|w| w[i]).or(side(i).map(|s| s.0)).unwrap_or(0.0); (if side(i).is_some() && w > 0.0 { layout_core::css::border_style_word(paint.border_style.map_or(0, |s| s[i])) } else { "none" }).to_string() }; // AETHERCSSOMBORDERSIDESTYLECOLUMNS (SR1103): the four border-style columns, the render's paint rule
+            let scolor = |i: usize| rgb(side(i).map(|s| s.1).unwrap_or(me.color)); // AETHERCSSOMBORDERSIDECOLORCOLUMNS (SR1104): the four border-color columns, one rule (an unpainted side reads the element's color)
+            // AETHERCSSOMBOXSIDECOLUMNS (SR1096): the box-side columns, one expression per property for all four sides (i: top, right, bottom, left).
+            let mside = |i: usize| st.as_ref().map(|s| lpa_s(rect_side(&s.margin, i))).unwrap_or_else(|| px(0.0));
+            let pside = |i: usize| st.as_ref().map(|s| lp(rect_side(&s.padding, i))).unwrap_or_else(|| px(0.0));
+            let bside = |i: usize| {
+                let w = paint.border_width.and_then(|w| w[i]).or(side(i).map(|s| s.0)).unwrap_or(0.0);
+                px(if side(i).is_some() || w > 0.0 { w } else { 0.0 })
+            };
             let lh = line_height_used(&paint, me.line_height, me.font_size, layout_core::FontSel { family: me.family, weight: me.weight, italic: me.italic, ..Default::default() }).map(px).unwrap_or_else(|| "normal".to_string());
             let values = [
                 display.to_string(),
@@ -1427,15 +1439,20 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 white_space_word(me.white_space).to_string(),
                 if me.hidden { "hidden" } else { "visible" }.to_string(),
                 list_style_word(me.list_style).to_string(),
-                px(if side(0).is_some() || bw_top > 0.0 { bw_top } else { 0.0 }),
-                if side(0).is_some() && bw_top > 0.0 { "solid" } else { "none" }.to_string(),
-                rgb(side(3).map(|s| s.1).unwrap_or(me.color)),
-                st.as_ref().map(|s| lp(s.padding.top)).unwrap_or_else(|| px(0.0)),
-                st.as_ref().map(|s| lpa_s(s.margin.top)).unwrap_or_else(|| px(0.0)),
+                bside(0),
+                sstyle(0),
+                scolor(3),
+                pside(0),
+                mside(0),
                 flex_direction.to_string(), if me.rtl { "rtl" } else { "ltr" }.to_string(), unicode_bidi_word(crate::render::unicode_bidi_of(tag, &paint, &any.node_at(id))).to_string(),
                 white_space_longhands(me.white_space).0.to_string(),
                 white_space_longhands(me.white_space).1.to_string(),
                 rgb(paint.decoration_color.flatten().unwrap_or(me.color)),
+                mside(1), mside(2), mside(3), pside(1), pside(2), pside(3), bside(1), bside(2), bside(3),
+                sstyle(1), sstyle(2), sstyle(3), // SR1103
+                scolor(0), scolor(1), scolor(2), // SR1104
+                layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
+                paint.underline_offset.flatten().map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), rgb(me.caret.map_or(me.color, |c| (c.0, c.1, c.2))), // SR1108
             ];
             out.insert(id, values);
             inh.insert(id, me);
@@ -1942,6 +1959,14 @@ mod supports_value_tests {
         assert!(crate::ledger::snapshot().contains(crate::ledger::ApiCategory::Css, "display:grid"), "armed: the engine records it");
         crate::ledger::reset();
     }
+}
+
+// ---- AETHERCSSOMBOXSIDECOLUMNS (LEDGER SR1096): one side of a taffy Rect by index, for computed_report's box-side columns (named tail block) ----
+
+/// AETHERCSSOMBOXSIDECOLUMNS (SR1096): side `i` of `r` in CSS order (0 top, 1 right, 2 bottom, 3 left), so
+/// [`computed_report`] reads margin / padding for every side through one expression.
+fn rect_side<T: Copy>(r: &taffy::geometry::Rect<T>, i: usize) -> T {
+    [r.top, r.right, r.bottom, r.left][i]
 }
 
 // ---- AETHERCSSOMLINEHEIGHTNORMALPX (LEDGER SR1063): the used line-height px, `normal` included (named tail block) ----
