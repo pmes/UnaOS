@@ -256,3 +256,90 @@ fn css_wide_rest_background_layers() {
     let s = cascade(&[&[("background-size", "cover")], &[("background-size", "initial")]]);
     assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "background-size: initial is auto");
 }
+
+// ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content its own field; column-gap an explicit normal (named tail block) ----
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): a flex container (the rules cascaded into ONE sheet entry) over the given
+/// children (`style=""`), laid out at 400 x 400; returns each child's (y, height) relative to the container.
+fn align_content_lay(rules: &[&[(&str, &str)]], kids: &[(&'static str, &'static str)]) -> Vec<(f32, f32)> {
+    let doc = page(vec![el("div", &[("id", "fc")], kids.iter().map(|(id, st)| el("div", &[("id", id), ("style", st)], vec![])).collect())]);
+    let fc = doc.by_id("fc");
+    let tree = lay_styled(&doc, &Sheet(vec![(fc.id, std::rc::Rc::new(cascade(rules)))]), 400.0, 400.0);
+    let (_, cy, ..) = box_of(&tree, &fc);
+    kids.iter().map(|(id, _)| { let (_, y, _, h) = box_of(&tree, &doc.by_id(id)); (y - cy, h) }).collect()
+}
+
+const AC_FLEX: &[(&str, &str)] = &[("display", "flex"), ("flex-wrap", "wrap"), ("width", "100px"), ("height", "200px")];
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): `align-content` writes its own field and leaves `align_items` alone (the shared
+/// arm wrote align_items: center centred the items, space-between was refused); initial / unset reset it to normal.
+#[test]
+fn align_content_own_field() {
+    use layout_core::taffy::style::AlignContent;
+    let s = styled(&[("align-content", "space-between")]);
+    assert_eq!(s.align_content, Some(AlignContent::SPACE_BETWEEN), "space-between reaches align_content");
+    assert_eq!(s.align_items, None, "align-items untouched");
+    let s = styled(&[("align-content", "center")]);
+    assert_eq!((s.align_content, s.align_items), (Some(AlignContent::CENTER), None), "center: align-content only");
+    let s = styled(&[("align-items", "center"), ("align-content", "flex-end")]);
+    assert_eq!(s.align_items, styled(&[("align-items", "center")]).align_items, "align-items keeps center");
+    assert_eq!(s.align_content, Some(AlignContent::FLEX_END), "align-content flex-end beside it");
+    for kw in ["initial", "unset"] {
+        let s = cascade(&[&[("align-content", "center")], &[("align-content", kw)]]);
+        assert_eq!(s.align_content, Some(AlignContent::NORMAL), "align-content: {kw} is normal");
+    }
+    assert_eq!(styled(&[("align-content", "bogus")]).align_content, None, "an unknown value is dropped");
+}
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): a wrapping 100 x 200 flex container with two 100 x 20 items (two lines):
+/// space-between puts the second line at the bottom (180), normal (= stretch for flex; initial) splits the height into
+/// two 100px lines, flex-start packs them (20); a nowrap container has one line and the property shows nothing.
+#[test]
+fn align_content_space_between_lines() {
+    let kids: &[(&'static str, &'static str)] = &[("a", "width: 100px; height: 20px"), ("b", "width: 100px; height: 20px")];
+    let sb = align_content_lay(&[AC_FLEX, &[("align-content", "space-between")]], kids);
+    assert_eq!((sb[0].0, sb[1].0), (0.0, 180.0), "space-between: lines at the top and bottom");
+    let ini = align_content_lay(&[AC_FLEX, &[("align-content", "space-between")], &[("align-content", "initial")]], kids);
+    assert_eq!((ini[0].0, ini[1].0), (0.0, 100.0), "initial = normal = stretch: two 100px lines");
+    let fs = align_content_lay(&[AC_FLEX, &[("align-content", "flex-start")]], kids);
+    assert_eq!((fs[0].0, fs[1].0), (0.0, 20.0), "flex-start packs the lines");
+    let nw = align_content_lay(&[AC_FLEX, &[("flex-wrap", "nowrap"), ("align-content", "flex-end")]], &[("a", "width: 50px; height: 20px"), ("b", "width: 50px; height: 20px")]);
+    assert_eq!((nw[0].0, nw[1].0), (0.0, 0.0), "a single-line container ignores align-content");
+}
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): align-items center and align-content flex-end on one container both apply, in
+/// either order: line 1 [a 50x20, b 50x10] and line 2 [c 100x20] pack at the bottom (160, 180), b centred in its line.
+#[test]
+fn align_content_and_items_independent() {
+    let kids: &[(&'static str, &'static str)] =
+        &[("a", "width: 50px; height: 20px"), ("b", "width: 50px; height: 10px"), ("c", "width: 100px; height: 20px")];
+    for decls in [
+        [("align-items", "center"), ("align-content", "flex-end")],
+        [("align-content", "flex-end"), ("align-items", "center")],
+    ] {
+        let r = align_content_lay(&[AC_FLEX, &decls], kids);
+        assert_eq!((r[0].0, r[1].0, r[2].0), (160.0, 165.0, 180.0), "{decls:?}: both properties apply");
+    }
+}
+
+/// AETHERCSSALIGNCONTENTFIELD (SR1016): `column-gap: normal` / initial / unset after 40px is an explicit normal
+/// (Some(None)), so the multicol gutter is 1em again (20px at 20px), where it kept 40px before.
+#[test]
+fn column_gap_explicit_normal() {
+    let s = cascade(&[&[("column-gap", "40px")]]);
+    assert_eq!(s.paint.col_gap, Some(Some(40.0)), "40px (armed)");
+    for kw in ["normal", "initial", "unset"] {
+        let s = cascade(&[&[("column-gap", "40px")], &[("column-gap", kw)]]);
+        assert_eq!(s.paint.col_gap, Some(None), "column-gap: {kw} after 40px is an explicit normal");
+    }
+    let gap = |rules: &[&[(&str, &str)]]| {
+        let doc = page(vec![el("div", &[("id", "mc")], (0..4).map(|_| el("div", &[("style", "height: 20px")], vec![])).collect())]);
+        let mc = doc.by_id("mc");
+        let tree = lay_styled(&doc, &Sheet(vec![(mc.id, std::rc::Rc::new(cascade(rules)))]), 800.0, 600.0);
+        tree.multicol[&id_of(&tree, &mc)].gap
+    };
+    let base: &[(&str, &str)] = &[("width", "410px"), ("column-count", "2"), ("font-size", "20px"), ("column-gap", "40px")];
+    assert_eq!(gap(&[base]), 40.0, "the 40px gutter (armed)");
+    assert_eq!(gap(&[base, &[("column-gap", "normal")]]), 20.0, "a later normal: 1em");
+    assert_eq!(gap(&[base, &[("column-gap", "initial")]]), 20.0, "a later initial: 1em");
+}
