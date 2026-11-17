@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    if css_wide(prop, value, &mut style.paint) { return; } match prop {
+    let value = noninherited_initial(prop, value); if css_wide(prop, value, &mut style.paint) { return; } match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -3657,4 +3657,36 @@ fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool
     }
     paint.set_inherit(bit);
     true
+}
+
+// ---- AETHERCSSWIDENONINHERITEDINITIAL (LEDGER SR832): initial / unset on a non-inherited property writes its initial value (named tail block) ----
+
+/// AETHERCSSWIDENONINHERITEDINITIAL (SR832): css-cascade-4 §7.3.1 / §7.3.3: `initial`, and `unset` on a NON-inherited
+/// property, mean the property's initial value. Each rule parses into its own SpecifiedStyle and `merge_specified` /
+/// `merge_paint` copy only Somes, so an arm that dropped the keyword let an earlier rule's value stand
+/// (`.x { margin: 20px } .x.r { margin: initial }` kept 20px; `display: initial` fell to the tag road: block on a div).
+/// The keyword is rewritten ONCE, before the dispatch, to the initial literal each arm already parses into its own
+/// Some: margin / padding / background-color from `anim::initial_value` (its table not widened); `display` inline;
+/// the sizes `auto` (max-width / max-height too: taffy's auto max is no maximum, `parse_dimension_str` has no `none`);
+/// the border family and border styles `none`; `border-width` 3px (medium); `background` transparent (its image,
+/// repeat, position and size layers stay as they were: AETHER-CSS-WIDE-NONINHERITED-REST owed). `revert` is not
+/// rewritten (author-origin revert rolls back to the UA origin, which Aether keeps on the tag road:
+/// AETHER-CSS-WIDE-REVERT-UA owed), nor `inherit` (AETHER-CSS-WIDE-NONINHERITED-INHERIT owed), nor any other property.
+fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
+    if !(value.eq_ignore_ascii_case("initial") || value.eq_ignore_ascii_case("unset")) {
+        return value;
+    }
+    match prop {
+        "margin" | "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding" | "padding-top"
+        | "padding-right" | "padding-bottom" | "padding-left" | "background-color" => {
+            crate::anim::initial_value(prop).unwrap_or(value)
+        }
+        "background" => "transparent",
+        "display" => "inline",
+        "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => "auto",
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" | "border-style"
+        | "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
+        "border-width" => "3px",
+        _ => value,
+    }
 }
