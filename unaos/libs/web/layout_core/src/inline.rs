@@ -1020,3 +1020,66 @@ fn img_alt_metrics<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx: &Ctx<F
     let m = metrics(ctx.fonts, run_of(ctx, id, fallback));
     Some((m.lh, m.off))
 }
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): the case segments a small-caps run is shaped in (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the size a synthesized small capital is shaped at, as a fraction of the run's font
+/// size (Chromium's `kSmallCapsFontSizeMultiplier = 0.7f`, recalled).
+pub const SMALL_CAPS_SCALE: f32 = 0.7;
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): `text` split as Chromium's SmallCapsIterator splits it (recalled: on
+/// `UCHAR_CHANGES_WHEN_UPPERCASED`): maximal byte ranges of characters whose uppercase mapping differs from the
+/// character (`true`: shaped uppercased at [`SMALL_CAPS_SCALE`]) and of the rest (`false`: shaped as is, full size).
+/// The uppercased text of a small segment can be longer (`ß` is `SS`).
+pub fn small_caps_segments(text: &str) -> Vec<(core::ops::Range<usize>, bool)> {
+    let mut out: Vec<(core::ops::Range<usize>, bool)> = Vec::new();
+    for (i, c) in text.char_indices() {
+        let mut up = c.to_uppercase();
+        let small = !(up.next() == Some(c) && up.next().is_none());
+        let end = i + c.len_utf8();
+        match out.last_mut() {
+            Some((r, s)) if *s == small => r.end = end,
+            _ => out.push((i..end, small)),
+        }
+    }
+    out
+}
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the computed `font-variant-caps` of box `id` (true = small-caps): the nearest
+/// specified `PaintStyle::small_caps` up the box tree, else normal. Aether's CSSOM reads it (the `font` shorthand's
+/// prefix sets it and is not expanded there).
+pub fn small_caps_used<H: Host>(tree: &LayoutTree<H>, id: NodeId) -> bool {
+    inherited(tree, id, |p| p.small_caps).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod small_caps_tests {
+    use super::*;
+
+    #[test]
+    fn small_caps_segments_kat() {
+        assert_eq!(small_caps_segments("Hello World"), vec![(0..1, false), (1..5, true), (5..7, false), (7..11, true)]);
+        assert_eq!(small_caps_segments("ABC 123"), vec![(0..7, false)]);
+        assert_eq!(small_caps_segments(""), vec![]);
+        let s = "\u{df}";
+        assert_eq!(small_caps_segments(s), vec![(0..2, true)]);
+        assert_eq!(s.to_uppercase(), "SS", "the small segment grows when uppercased");
+    }
+
+    #[test]
+    fn font_variant_caps_parse_kat() {
+        use crate::css::parse_font_variant_caps as p;
+        assert_eq!(p("font-variant-caps", "small-caps"), Some(true));
+        assert_eq!(p("font-variant-caps", "normal"), Some(false));
+        assert_eq!(p("font-variant-caps", "initial"), Some(false));
+        assert_eq!(p("font-variant-caps", "all-small-caps"), None);
+        assert_eq!(p("font-variant-caps", "inherit"), None);
+        assert_eq!(p("font-variant-caps", "bogus"), None);
+        assert_eq!(p("font-variant", "small-caps"), Some(true));
+        assert_eq!(p("font-variant", "common-ligatures small-caps"), Some(true));
+        assert_eq!(p("font-variant", "normal"), Some(false));
+        assert_eq!(p("font-variant", "none"), Some(false));
+        assert_eq!(p("font-variant", "oldstyle-nums"), Some(false), "the shorthand resets its caps longhand");
+        assert_eq!(p("font-variant", "petite-caps"), None);
+    }
+}

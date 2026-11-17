@@ -45,7 +45,7 @@ pub const PROPERTIES: &[&str] = &[
     "content", "counter-increment", "counter-reset", "cursor", "direction", "display", "empty-cells", "fill",
     "filter", "flex", "flex-basis", "flex-direction", "flex-flow", "flex-grow", "flex-shrink", "flex-wrap",
     "float", "font", "font-family", "font-feature-settings", "font-kerning", "font-size", "font-stretch",
-    "font-style", "font-synthesis", "font-synthesis-small-caps", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
+    "font-style", "font-synthesis", "font-synthesis-small-caps", "font-synthesis-style", "font-synthesis-weight", "font-variant", "font-variant-caps", "font-weight", "gap", "grid", "grid-area", "grid-auto-columns",
     "grid-auto-flow", "grid-auto-rows", "grid-column", "grid-column-end", "grid-column-start", "grid-row",
     "grid-row-end", "grid-row-start", "grid-template", "grid-template-areas", "grid-template-columns",
     "grid-template-rows", "height", "hyphens", "image-rendering", "inline-size", "inset", "isolation",
@@ -1150,7 +1150,7 @@ fn initial_value(p: &str) -> &'static str {
         "direction" => "ltr",
         "pointer-events" => "auto",
         "letter-spacing" | "word-spacing" => "normal",
-        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto",
+        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
         "min-width" | "min-height" => "0px",
         "margin-right" | "margin-bottom" | "margin-left" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
         "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
@@ -1178,7 +1178,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
             return "none".into();
         }
     }
-    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); }
+    if prop == "caption-side" { return caption_side_computed(el); } if prop == "font-synthesis" { return font_synthesis_computed(el); } if prop == "font-variant-caps" { return font_variant_caps_computed(el); }
     if matches!(prop, "width" | "height") {
         if let Some(r) = with_layout(|f| f.boxes.get(&NodeId(el)).and_then(|v| v.first().copied())) {
             crate::ledger::record_css("getComputedStyle-size-is-border-box");
@@ -2102,7 +2102,7 @@ top>inset";
         }
         assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
         let names = universe();
-        assert_eq!(names.len(), 242);
+        assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
         for p in &names {
             let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
@@ -2180,5 +2180,23 @@ top>inset";
             "background: red; background-position: 10px;"
         );
         assert_eq!(Block::parse("margin: 1px; margin-block: 2px").serialize(), "margin: 1px; margin-block: 2px;");
+    }
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): getComputedStyle's font-variant-caps from the flushed layout (named tail block) ----
+
+/// AETHERFONTVARIANTSMALLCAPS (SR800): the computed `font-variant-caps`, read as SR686 reads caption-side: the used value
+/// layout_core folded into `PaintStyle::small_caps` (the longhand, `font-variant`'s caps half or the `font` shorthand's
+/// `small-caps` prefix, which this CSSOM does not expand), inherited through its ONE walk (`layout_core::inline::
+/// small_caps_used`) on the flushed tree. An element without a box reads the cascaded value, else `normal`.
+fn font_variant_caps_computed(el: usize) -> String {
+    let used = with_layout(|f| {
+        let (tid, _) = f.tree.node_map.iter().find(|(_, n)| n.is_element() && n.id() == NodeId(el))?;
+        Some(layout_core::inline::small_caps_used(&f.tree, *tid))
+    });
+    match used {
+        Some(true) => "small-caps".to_string(),
+        Some(false) => "normal".to_string(),
+        None => cascaded_value(el, "font-variant-caps").unwrap_or_else(|| "normal".to_string()),
     }
 }

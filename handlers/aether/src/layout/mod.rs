@@ -490,7 +490,7 @@ fn sel_of(s: FontSel) -> crate::fonts::FontSel {
 fn advancer_of(a: &Adv) -> crate::fonts::lines::Advancer {
     crate::fonts::lines::Advancer::new(sel_of(a.sel), a.size, a.letter_spacing)
         .with_word_spacing(a.word_spacing)
-        .with_dir(a.rtl)
+        .with_dir(a.rtl).with_small_caps(a.small_caps)
 }
 
 fn mode_of(m: &TextMode) -> crate::fonts::lines::TextMode {
