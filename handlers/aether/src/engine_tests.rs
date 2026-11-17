@@ -12293,4 +12293,92 @@ b</div>
         assert_eq!(css_wide_color_ink(&mut e, "bt", css_wide_blue), 0, "#bt: no blue");
         assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(0, 0, 0)", "#bt: the color column through the one table");
     }
+
+    // ---- AETHERUACOLORONETABLESCHEME (LEDGER SR1138): getComputedStyle reads the UA colour row of the element's color-scheme (named tail block) ----
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): `head` (raw, e.g. a meta) and `root` (a `:root` rule body) on a page with an
+    /// id'd html (#hr), a text div (#d), an unstyled button (#bt), a link (#la), and a `color-scheme: light` subtree
+    /// holding a text div (#lt) and a button (#lb), on a 400x600 viewport.
+    fn ua_color_scheme_engine(head: &str, root: &str) -> crate::AetherEngine {
+        let html = format!(r##"<!doctype html><html id="hr"><head>{head}<style>
+            :root {{ {root} }}
+            div {{ margin: 0 0 12px }}
+            </style></head><body style="margin:0;font:20px serif">
+            <div id="d">Text</div>
+            <div><button id="bt">Hello</button></div>
+            <div><a id="la" href="#x">Link</a></div>
+            <div style="color-scheme:light"><div id="lt">Text</div><div><button id="lb">Hello</button></div></div>
+        </body></html>"##);
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): under `:root { color-scheme: dark }` the html color column reads the dark
+    /// CanvasText (UA_DARK.canvastext, Chromium `rgb(255, 255, 255)`) and a div inherits it; before SR1138 computed_report
+    /// called `ua_color` at scheme None and read the light `rgb(0, 0, 0)`.
+    #[test]
+    fn ua_color_scheme_dark_root_column() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "hr", "color"), "rgb(255, 255, 255)", "armed: html reads the dark CanvasText (rgb(0, 0, 0) before)");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "armed: a div inherits the white");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): a dark-scheme button's color column is the dark ButtonText (UA_DARK.ink).
+    #[test]
+    fn ua_color_scheme_dark_button_column() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(255, 255, 255)", "armed: the dark ButtonText (rgb(0, 0, 0) before)");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the ONE table's link arm is (0, 0, 238) under dark too, and the render paints
+    /// the same blue (AETHER-UA-LINK-DARK owed: Chromium's dark link differs): column and paint agree.
+    #[test]
+    fn ua_color_scheme_dark_link_one_table() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 238)", "#la: the one table's link blue");
+        assert!(css_wide_color_ink(&mut e, "la", css_wide_blue) > 3, "#la paints the same blue");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the column and the painted ink agree: the dark div's glyphs paint white and
+    /// its color column reads white.
+    #[test]
+    fn ua_color_scheme_column_agrees_with_paint() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert!(css_wide_color_ink(&mut e, "d", color_scheme_white_ink) > 3, "#d paints white CanvasText");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "#d: the column is the painted white");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): `<meta name="color-scheme" content="dark">` (SR1047's UA-origin root rule)
+    /// reads as the `:root` rule does: no special seed, the scheme arrives through the cascade.
+    #[test]
+    fn ua_color_scheme_meta_dark() {
+        let mut e = ua_color_scheme_engine(r#"<meta name="color-scheme" content="dark">"#, "");
+        assert_eq!(font_shorthand_cs(&mut e, "hr", "color"), "rgb(255, 255, 255)", "armed: html under the meta");
+        assert_eq!(font_shorthand_cs(&mut e, "d", "color"), "rgb(255, 255, 255)", "armed: the div under the meta");
+        assert_eq!(font_shorthand_cs(&mut e, "bt", "color"), "rgb(255, 255, 255)", "armed: the button under the meta");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): a `color-scheme: light` subtree inside the dark root reads the light row (the
+    /// render's inherit rule, `scheme_of`): its button is ButtonText black; its div inherits the root's resolved white
+    /// (color inherits as a value, not re-resolved per scheme: AETHER-UA-CANVASTEXT-INHERIT-KEYWORD owed).
+    #[test]
+    fn ua_color_scheme_light_subtree() {
+        let mut e = ua_color_scheme_engine("", "color-scheme: dark");
+        assert_eq!(font_shorthand_cs(&mut e, "lb", "color"), "rgb(0, 0, 0)", "#lb: the light ButtonText");
+        assert_eq!(font_shorthand_cs(&mut e, "lt", "color"), "rgb(255, 255, 255)", "#lt: the inherited white");
+        assert!(css_wide_color_ink(&mut e, "lt", color_scheme_white_ink) > 3, "#lt paints the inherited white (column and paint agree)");
+    }
+
+    /// AETHERUACOLORONETABLESCHEME (SR1138): the light page, unchanged: html / div / button black, the link blue.
+    #[test]
+    fn ua_color_scheme_light_page_unchanged() {
+        let mut e = ua_color_scheme_engine("", "");
+        for id in ["hr", "d", "bt", "lt", "lb"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 0, 0)", "#{id}: light");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 238)", "#la: light");
+    }
 }
