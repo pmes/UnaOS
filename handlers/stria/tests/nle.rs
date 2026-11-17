@@ -3353,3 +3353,46 @@ fn nle5dexportmessageetasmooth_scripted_slow_start() {
     assert_eq!(eta_words(10, 35, Duration::from_secs(2)).as_deref(), Some(eta_words_of(Duration::from_secs(5)).as_str()), "one grammar");
     println!("nle5dexportmessageetasmooth: 302 / 1000 after a 2 s warm-up: EMA {:.2} fps eta {smooth:?} vs mean eta {mean:?}", st.0);
 }
+
+// ---- STRIASNAPDRAG (LEDGER SR836): tick 0 and the in / out marks are snap targets on the face's drag (named tail block) ----
+
+/// Rule: over NLE1's fixture with the in mark at 22 (the `in` verb), a press on V's A@25 body at `x_of(28) + 7` moved
+/// 21 px left puts A's in edge 3 px right of the mark (raw -2 ticks): it snaps (delta -3, the guide at 22, painted as a
+/// GUIDE column through the row), and the release commits A flush on the mark with the guide gone; undone, the same drag
+/// pressed with Alt keeps the raw -2 and no guide.
+#[test]
+fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.seek(22);
+    assert!(face.verb("in"));
+    face.state.seek(0);
+    assert_eq!(face.marks(), (Some(22), None));
+    let tl0 = face.state.timeline.clone();
+    let l = face.layout();
+    let y = l.point(0, 28).1;
+    let (x, to) = (l.x_of(28) as f64 + 7.0, l.x_of(28) as f64 - 14.0);
+    let at = |px: &[u8], x: i64| {
+        let i = (y as usize * l.w as usize + x as usize) * 4;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    };
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    assert_eq!(l.tick_at(to) - l.tick_at(x), -2, "the raw delta");
+    assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.guide)), Some((DragKind::Move, -3, Some(22))));
+    let px = face.paint();
+    assert_eq!(at(&px, l.x_of(22)), timeline_core::view::GUIDE, "the guide through the row");
+    face.on(&nle3eslipdrag_btn(false, to, y, 0));
+    assert!(face.dragging().is_none());
+    assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 22).unwrap(), "flush on the mark");
+    assert_ne!(at(&face.paint(), l.x_of(22)), timeline_core::view::GUIDE, "the guide is gone after the release");
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0);
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-2, None)), "Alt: no snap");
+    face.on(&nle3eslipdrag_btn(false, to, y, 0));
+    assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 23).unwrap());
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    println!("striasnapdrag: A@25 dragged 21 px left snaps to the in mark 22; Alt lands at 23");
+}
