@@ -780,7 +780,6 @@ fn css_wide_revert_all() {
     let s = cascade(&[armed, &[("all", "revert-layer")]]);
     assert_eq!(s.paint.color, Some(ALL_RED), "all: revert-layer is dropped (owed)");
 }
-
 // ---- AETHERCSSWIDEREVERTNONINHERITED (LEDGER SR1037): revert on display / margin / padding / border / background erases to the tag road (named tail block) ----
 
 use layout_core::css::{parse_declaration_block, REVERT_BORDER, REVERT_DISPLAY, REVERT_MARGIN};
@@ -919,6 +918,216 @@ fn css_wide_revert_noninherited_all() {
     assert_eq!((s.display, s.paint.display_kind), (None, None), "all: revert: display");
     assert_eq!(s.paint.background, None, "all: revert: background colour");
     assert_eq!(s.paint.border, None, "all: revert: border");
+}
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a pending per-side border colour; border-color alone builds no frame (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the RGB a `border: 1px solid <c>` side parses to (the arm's own colour road).
+fn stored_rgb(c: &str) -> (u8, u8, u8) {
+    styled(&[("border", format!("1px solid {c}").as_str())]).paint.border.expect("border")[0].expect("side").1
+}
+
+const STORED_GREY: (u8, u8, u8) = (128, 128, 128);
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-color: red` alone builds no frame (style none: Chromium paints nothing);
+/// before SR1058 it built `Some([Some((1.0, red)); 4])`. The colour pends for the four sides; `currentcolor` pends the
+/// grey carrier with its currentcolor answer.
+#[test]
+fn border_color_stored_alone_no_frame() {
+    let red = stored_rgb("red");
+    let s = styled(&[("border-color", "red")]);
+    assert_eq!(s.paint.border, None, "no frame");
+    assert_eq!(s.paint.border_pending, Some([Some((red, false)); 4]), "red pends on four sides");
+    let s = styled(&[("border-color", "currentcolor")]);
+    assert_eq!((s.paint.border, s.paint.border_pending), (None, Some([Some((STORED_GREY, true)); 4])));
+    let s = styled(&[("border-top-color", "red")]);
+    assert_eq!((s.paint.border, s.paint.currentcolor), (None, 0), "a lone longhand: no side, no bit");
+    assert_eq!(s.paint.border_pending, Some([Some((red, false)), None, None, None]), "the top pends");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `border-width` creates the absent sides from the pending colour (the bit from the
+/// entry), the rest at the grey carrier with the currentcolor bit, as before. SR1069 (flipped in place): `border-width`
+/// creates NO side (style none paints nothing; before SR1069 the 2px frames below); the width is stored, and a style
+/// then creates the sides at it from the pending colour, the rest at the grey carrier with the bit.
+#[test]
+fn border_color_stored_width_creates() {
+    let red = stored_rgb("red");
+    let s = styled(&[("border-color", "red"), ("border-width", "2px")]);
+    assert_eq!((s.paint.border, s.paint.border_width), (None, Some([Some(2.0); 4])), "SR1069: no frame, the width stored");
+    let s = styled(&[("border-color", "red"), ("border-width", "2px"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)); 4]));
+    assert_eq!(s.paint.currentcolor, 0);
+    let s = styled(&[("border-top-color", "red"), ("border-width", "2px"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((2.0, STORED_GREY)), Some((2.0, STORED_GREY)), Some((2.0, STORED_GREY))]));
+    assert_eq!(s.paint.currentcolor, 0b1110, "the top is red, the others the initial currentcolor");
+    let s = styled(&[("border-top-color", "currentcolor"), ("border-width", "2px"), ("border-style", "solid")]);
+    assert_eq!(s.paint.currentcolor & 1, 1, "a pending currentcolor carries the SR849 bit");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): a style declaration creates the sides that have a pending colour (either order in
+/// the block keeps the 1px frame the fabricated road drew); a style alone still creates none (owed: SIDE-STYLE-WIDTH).
+/// SR1069 (flipped in place): the created sides are medium 3px (before: 1px), and a style alone creates them too.
+#[test]
+fn border_color_stored_style_creates() {
+    let red = stored_rgb("red");
+    for d in [[("border-color", "red"), ("border-style", "solid")], [("border-style", "solid"), ("border-color", "red")]] {
+        assert_eq!(styled(&d).paint.border, Some([Some((3.0, red)); 4]), "{d:?} (SR1069: 3px, was 1px)");
+    }
+    let s = styled(&[("border-top-color", "red"), ("border-top-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((3.0, red)), None, None, None]), "the top only (SR1069: 3px)");
+    assert_eq!(styled(&[("border-style", "solid")]).paint.border, Some([Some((3.0, STORED_GREY)); 4]), "SR1069: a style alone, medium currentcolor (was None)");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): an absent entry of an existing border is no longer fabricated when the block
+/// declared no style (before: three 1px red sides); with a style word in the block the absent sides are created at 1px
+/// (the in-block style rule: `border_style` is one array for the block, so which side declared it is not known:
+/// AETHER-CSS-BORDER-STYLE-PER-SIDE owed); an existing side is recoloured as before. SR1069: created at medium 3px.
+#[test]
+fn border_color_stored_absent_entry_and_existing() {
+    let (red, blue) = (stored_rgb("red"), stored_rgb("blue"));
+    assert_ne!(red, blue, "armed: two colours");
+    let s = styled(&[("border-top", "2px blue"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), None, None, None]), "no style in the block: the top only");
+    let s = styled(&[("border-top", "2px solid"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((3.0, red)), Some((3.0, red)), Some((3.0, red))]), "a style word: created at medium 3px (SR1069; was 1px)");
+    let s = styled(&[("border", "1px solid blue"), ("border-color", "red")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, red)); 4]), "the existing road");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): css-backgrounds-3 §3.4 / §3.5: the `border` and `border-<side>` shorthands set
+/// the colour longhand (omitted = the initial currentcolor), so a pending colour before them does not reach their
+/// sides (Chromium paints currentcolor).
+#[test]
+fn border_color_stored_shorthand_resets() {
+    use layout_core::paint::CC_SIDES;
+    let s = styled(&[("border-top-color", "red"), ("border-top", "1px solid")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((1.0, STORED_GREY)));
+    assert_eq!(s.paint.currentcolor & 1, 1, "the top is currentcolor");
+    let s = styled(&[("border-color", "red"), ("border", "1px solid")]);
+    assert_eq!(s.paint.border, Some([Some((1.0, STORED_GREY)); 4]));
+    assert_eq!(s.paint.currentcolor, CC_SIDES);
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the merge road: a later rule's pending colour recolours the earlier rule's sides,
+/// width kept (before: the later block's fabricated 1px frame replaced the 3px border; a lone side longhand dropped);
+/// a later shorthand resets to currentcolor; a later currentcolor sets the side bit; an earlier style-only rule takes a
+/// later colour as a 1px frame (the in-block rule across rules; Chromium's medium 3px owed). SR1069: 3px.
+#[test]
+fn border_color_stored_merge() {
+    let (red, blue) = (stored_rgb("red"), stored_rgb("blue"));
+    let s = cascade(&[&[("border", "3px solid blue")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((3.0, red)); 4]), "3px kept, red");
+    let s = cascade(&[&[("border", "2px solid blue")], &[("border-top-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((2.0, red)), Some((2.0, blue)), Some((2.0, blue)), Some((2.0, blue))]));
+    let s = cascade(&[&[("border-left-color", "red")], &[("border-left", "1px solid")]]);
+    assert_eq!(s.paint.border.expect("border")[3], Some((1.0, STORED_GREY)), "the later shorthand resets");
+    assert_eq!(s.paint.currentcolor & 8, 8);
+    let s = cascade(&[&[("border", "2px solid red")], &[("border-top-color", "currentcolor")]]);
+    assert_eq!(s.paint.currentcolor, 1, "the top bit from the pending entry");
+    let s = cascade(&[&[("border-style", "solid")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([Some((3.0, red)); 4]), "style then colour across rules: the medium 3px frame (SR1069; was 1px)");
+    let s = cascade(&[&[("border-color", "red")]]);
+    assert_eq!(s.paint.border, None, "a colour alone across the merge: no frame");
+    let s = cascade(&[&[("border-style", "none")], &[("border-color", "red")]]);
+    assert_eq!(s.paint.border, Some([None; 4]), "an explicit none is not revived");
+}
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): `transparent` forgets a pending entry; `border: inherit` forgets the block's.
+/// SR1069 (flipped in place): a style creates the side (`border-width` alone no longer does).
+#[test]
+fn border_color_stored_transparent_and_inherit() {
+    let s = styled(&[("border-top-color", "red"), ("border-top-color", "transparent"), ("border-width", "2px"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border.expect("border")[0], Some((2.0, STORED_GREY)));
+    assert_eq!(s.paint.currentcolor & 1, 1);
+    assert_eq!(styled(&[("border-color", "red"), ("border", "inherit")]).paint.border_pending, None);
+}
+
+// ---- AETHERCSSBORDERSIDESTYLEWIDTH (LEDGER SR1069): a style alone creates medium sides; border-width stores, never fabricates (named tail block) ----
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): css-backgrounds-3 §4.2-4.3: `border-style: solid` alone creates four medium
+/// (3px) currentcolor sides (before SR1069: None, nothing painted); `border-top-style: dashed` alone the top only.
+#[test]
+fn border_side_style_width_style_alone() {
+    use layout_core::paint::CC_SIDES;
+    let s = styled(&[("border-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((3.0, STORED_GREY)); 4]), "medium currentcolor sides");
+    assert_eq!(s.paint.currentcolor, CC_SIDES, "the four currentcolor bits");
+    let s = styled(&[("border-top-style", "dashed")]);
+    assert_eq!(s.paint.border, Some([Some((3.0, STORED_GREY)), None, None, None]), "the top only");
+    assert_eq!(s.paint.border_style, Some([1, 0, 0, 0]), "dashed stored on the top");
+    let s = cascade(&[&[("border-style", "solid")]]);
+    assert_eq!(s.paint.border, Some([Some((3.0, STORED_GREY)); 4]), "through the merge");
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): a width alone (style none) creates no side — the width is stored in the ONE
+/// store `border_width` (before SR1069 `border-width: 2px` fabricated a 2px frame; AETHER-CSS-BORDER-WIDTH-STORED closed).
+#[test]
+fn border_side_style_width_width_alone() {
+    let s = styled(&[("border-width", "2px")]);
+    assert_eq!((s.paint.border, s.paint.border_width), (None, Some([Some(2.0); 4])));
+    assert_eq!(s.paint.currentcolor, 0, "no side, no bit");
+    let s = styled(&[("border-top-width", "2px")]);
+    assert_eq!((s.paint.border, s.paint.border_width), (None, Some([Some(2.0), None, None, None])));
+    assert_eq!(cascade(&[&[("border-width", "2px")]]).paint.border, None, "nothing through the merge");
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): width and style in either order, in one block or across rules, give 2px sides;
+/// a style with a colour gives 3px in the colour.
+#[test]
+fn border_side_style_width_width_and_style() {
+    let two = Some([Some((2.0, STORED_GREY)); 4]);
+    for d in [[("border-width", "2px"), ("border-style", "solid")], [("border-style", "solid"), ("border-width", "2px")]] {
+        assert_eq!(styled(&d).paint.border, two, "{d:?}");
+    }
+    assert_eq!(cascade(&[&[("border-width", "2px")], &[("border-style", "solid")]]).paint.border, two, "width then style across rules");
+    assert_eq!(cascade(&[&[("border-style", "solid")], &[("border-width", "2px")]]).paint.border, two, "style then width across rules");
+    let s = styled(&[("border-top-width", "5px"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border.expect("sides")[0], Some((5.0, STORED_GREY)), "a side longhand's stored width");
+    assert_eq!(s.paint.border.expect("sides")[1], Some((3.0, STORED_GREY)), "the others medium");
+    let red = stored_rgb("red");
+    assert_eq!(styled(&[("border-style", "solid"), ("border-color", "red")]).paint.border, Some([Some((3.0, red)); 4]));
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the `border` / `border-<side>` shorthands without a width part are medium 3px
+/// through the same literal (AETHER-CSS-BORDER-SHORTHAND-MEDIUM closed; the UA `[popover] { border: solid }` is Chromium's
+/// 3px); an explicit width stays; `border-style: none` after a border removes the sides; a later side width moves an
+/// existing side (the layout box reads `border`).
+#[test]
+fn border_side_style_width_shorthands_and_none() {
+    assert_eq!(styled(&[("border", "solid")]).paint.border, Some([Some((3.0, STORED_GREY)); 4]), "border: solid is medium");
+    assert_eq!(styled(&[("border-top", "dashed")]).paint.border.expect("sides")[0], Some((3.0, STORED_GREY)));
+    assert_eq!(styled(&[("border", "1px solid")]).paint.border, Some([Some((1.0, STORED_GREY)); 4]), "armed: an explicit width");
+    assert_eq!(styled(&[("border", "1px solid"), ("border-style", "none")]).paint.border, Some([None; 4]), "none removes");
+    let s = styled(&[("border", "1px solid"), ("border-top-style", "none")]);
+    assert_eq!(s.paint.border.expect("sides").map(|x| x.is_some()), [false, true, true, true], "the top removed");
+    let s = styled(&[("border", "1px solid"), ("border-top-width", "5px")]);
+    assert_eq!(s.paint.border.expect("sides")[0], Some((5.0, STORED_GREY)), "the side synced");
+    let s = styled(&[("border-width", "5px"), ("border", "1px solid")]);
+    assert_eq!((s.paint.border.expect("sides")[0], s.paint.border_width), (Some((1.0, STORED_GREY)), Some([Some(1.0); 4])), "the shorthand resets the store");
+    let s = styled(&[("border", "2px solid"), ("border", "none"), ("border-style", "solid")]);
+    assert_eq!(s.paint.border, Some([Some((3.0, STORED_GREY)); 4]), "border: none resets the width to medium");
+}
+
+/// AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): `fold_into` with no side: a stored width reaches only a non-zero (UA control)
+/// edge, so `border-width: 0` drops a field's 2px UA edge and a div's 0 edge stays 0 (style none).
+#[test]
+fn border_side_style_width_fold_control_edge() {
+    use taffy::style::{LengthPercentage, Style};
+    let lp = LengthPercentage::length;
+    let mut div = Style::default();
+    styled(&[("border-width", "2px")]).fold_into(&mut div);
+    assert_eq!(div.border.top, lp(0.0), "a div: no border box");
+    let ua = |w: f32| {
+        let mut st = Style::default();
+        st.border = taffy::geometry::Rect { top: lp(2.0), right: lp(2.0), bottom: lp(2.0), left: lp(2.0) };
+        styled(&[("border-width", &*format!("{w}px"))]).fold_into(&mut st);
+        st.border
+    };
+    assert_eq!(ua(0.0).top, lp(0.0), "border-width: 0 drops the UA edge");
+    assert_eq!(ua(1.0).left, lp(1.0), "border-width: 1px on the UA edge");
+    let mut st = Style::default();
+    styled(&[("border-style", "solid")]).fold_into(&mut st);
+    assert_eq!(st.border.top, lp(3.0), "a style alone: the 3px side sizes the box");
 }
 
 // ---- AETHERCSSWIDECOLORCONTROLSDARK (LEDGER SR1031): `color-scheme` parsed into PaintStyle::color_scheme; the ONE UA colour table (named tail block) ----

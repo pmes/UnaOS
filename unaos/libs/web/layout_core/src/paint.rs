@@ -41,7 +41,7 @@ pub struct PaintStyle<H: Host> {
     /// Text transform: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
     pub text_transform: Option<u8>,
     /// border-top-width, border-right-width, border-bottom-width, border-left-width.
-    /// Overrides border[side].0 if set.
+    /// Overrides border[side].0 if set. AETHERCSSBORDERSIDESTYLEWIDTH (SR1069): the ONE per-side width store (`border-width`, the longhands and the shorthands' width write it; a style-created side takes it, else medium).
     pub border_width: Option<[Option<f32>; 4]>,
     /// background-size: (width, height) in pixels or as fractional shorthand values.
     /// Empty string means default (cover), other values stored as-is for rendering.
@@ -254,6 +254,8 @@ pub struct PaintStyle<H: Host> {
     pub outline_offset: Option<f32>,
     /// AETHERCSSCURRENTCOLORREST (SR849): bits 0-3 = border side [top, right, bottom, left] colour is `currentColor`, [`CC_BG`] = background-color is; the RGB in `border` / `background` is then a carrier the paint reads replace.
     pub currentcolor: u8,
+    /// AETHERCSSBORDERCOLORSTORED (SR1058): a border colour declared on a side with no entry (style none here), kept per side [top, right, bottom, left] as (colour or the grey carrier, currentcolor) for the road that creates the side later (`border-width`, a style longhand, the merge onto an earlier rule's sides).
+    pub border_pending: Option<[Option<((u8, u8, u8), bool)>; 4]>,
     /// AETHERCSSWIDECOLORCONTROLSDARK (SR1031): css-color-adjust-1 §2.1 `color-scheme` (inherited): None unspecified (the parent's), Some(bits) bit 0 light, bit 1 dark, Some(0) `normal`; read through `tree::ua_colours`.
     pub color_scheme: Option<u8>, pub sys_color: Option<u8>, pub sys_background: Option<u8>, pub sys_border: Option<(u8, u8)>, // SR1046: system colour keyword slots (index into SYSTEM_COLORS; border = (index, side mask)), resolved by tree::system_color_pass
 }
@@ -367,7 +369,7 @@ impl<H: Host> Default for PaintStyle<H> {
             outline_width: None,
             outline_color: None,
             outline_offset: None,
-            currentcolor: 0,
+            currentcolor: 0, border_pending: None,
             color_scheme: None, sys_color: None, sys_background: None, sys_border: None,
         }
     }
@@ -1077,4 +1079,22 @@ impl<H: Host> PaintStyle<H> {
             self.sys_border = src.sys_border;
         }
     }
+}
+
+// ---- AETHERCSSBORDERCOLORSTORED (LEDGER SR1058): a control's theme frame takes the pending border colour (named tail block) ----
+
+/// AETHERCSSBORDERCOLORSTORED (SR1058): the 1px theme frame a control paints when the author gave it no side: each side
+/// takes its pending colour (`PaintStyle::border_pending`; the element's ink when the entry is currentcolor), else
+/// Chromium's #767676. Before SR1058 a lone `border-color` fabricated the author frame; now the colour waits in the store.
+/// Trunk-merge seam with AETHERCSSWIDECOLORCONTROLSDARK (SR1031): the theme colour is the caller's `frame` (the
+/// scheme's `ua_colours(..).frame`: #767676 light, #858585 dark) instead of a #767676 literal.
+pub fn pending_frame(pending: Option<[Option<((u8, u8, u8), bool)>; 4]>, ink: (u8, u8, u8), frame: (u8, u8, u8)) -> [Option<(f32, (u8, u8, u8))>; 4] {
+    let p = pending.unwrap_or([None; 4]);
+    let mut sides = [Some((1.0, frame)); 4];
+    for (i, side) in sides.iter_mut().enumerate() {
+        if let Some((c, cc)) = p[i] {
+            *side = Some((1.0, if cc { ink } else { c }));
+        }
+    }
+    sides
 }
