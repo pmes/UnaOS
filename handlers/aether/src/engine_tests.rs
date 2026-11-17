@@ -12382,6 +12382,130 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "la", "color"), "rgb(0, 0, 238)", "#la: light");
     }
 
+    // ---- AETHERSTICKYOUTERHOLD (LEDGER SR1167): every reader asks a box inside a stuck sticky box at its painted place (named tail block) ----
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): `#sec` (sticky `top: 0`, 300px, blue) holding a 20px green `<a id="lk">`, an `off`px
+    /// spacer and the red `#sub` (sticky `top: 40px`, 20px): `#sub` sits `20 + off` into `#sec`.
+    fn sticky_outer_hold_inner(off: u32) -> String {
+        format!(
+            r#"<div id="sec" style="position:sticky;top:0;height:300px;background-color:rgb(0, 0, 255)"><a id="lk" href="x" style="display:block;height:20px;background-color:rgb(0, 255, 0)"></a><div style="height:{off}px"></div><div id="sub" style="position:sticky;top:40px;height:20px;background-color:rgb(255, 0, 0)"></div></div>"#
+        )
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): 400x300, body margin 0: a 100px spacer, the section (flow y 100), a 2000px spacer;
+    /// the page scrolled `sc` (CSSOM synced).
+    fn sticky_outer_hold_page(off: u32, sc: f64) -> crate::AetherEngine {
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0"><div style="height:100px"></div>{}<div style="height:2000px"></div></body></html>"#,
+            sticky_outer_hold_inner(off)
+        );
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        if sc > 0.0 {
+            bounding_sticky_scroll(&mut e, sc);
+        }
+        e
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): SR1152's 200px `overflow: auto` panel at y 50 holding a 30px spacer, the section
+    /// (flow y 80) and 1000px; the panel wheeled `dy` (the page stays at 0).
+    fn sticky_outer_hold_panel(off: u32, dy: f64) -> crate::AetherEngine {
+        let inner = format!(r#"<div style="height:30px"></div>{}<div style="height:1000px"></div>"#, sticky_outer_hold_inner(off));
+        let mut e = sticky_nested_scroller_engine(r#"<div style="height:50px"></div>"#, "overflow:auto;height:200px", &inner);
+        if dy > 0.0 {
+            sticky_nested_scroller_wheel(&mut e, dy);
+            e.tick();
+        }
+        e
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): `#sub`'s layout_core reads at the engine's page scroll and viewport: (box_origin y,
+    /// box_origin_held y, sticky_hold y, sticky_stuck bit).
+    fn sticky_outer_hold_probe(e: &crate::AetherEngine) -> (f32, f32, f32, u8) {
+        let t = e.layout_tree.as_ref().expect("laid out");
+        let id = t.node_map.iter().find(|(_, n)| layout_core::DomNode::attr(*n, "id").as_deref() == Some("sub")).map(|(k, _)| *k).expect("#sub has a box");
+        let (vs, vp) = ((e.scroll_x as f32, e.scroll_y as f32), (e.width as f32, e.height as f32));
+        let flow = layout_core::scroll::box_origin(t, id, vs).expect("#sub has an origin").1;
+        let held = layout_core::scroll::box_origin_held(t, id, vs, vp).expect("#sub has a held origin").1;
+        (flow, held, layout_core::scroll::sticky_hold(t, id, vs, vp).1, layout_core::scroll::sticky_stuck(t, id, vs, vp))
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): the first viewport row of colour `c` in column 10.
+    fn sticky_outer_hold_row(e: &crate::AetherEngine, c: (u8, u8, u8)) -> Option<usize> {
+        (0..e.height as usize).find(|&y| imgalt_px(e, 10, y) == c)
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): scrolled 300, the section holds at 0 and `#sub` (20 into it) holds at 40 under it:
+    /// painted row 40, the held origin 320 + its own hold 20 = 340, `stuck: top` (PINNED: the unheld read was TOP too).
+    #[test]
+    fn sticky_outer_hold_both_hold_painted_and_stuck() {
+        let e = sticky_outer_hold_page(0, 300.0);
+        assert_eq!(e.scroll_y, 300.0, "the page scrolled 300px");
+        assert_eq!(sticky_outer_hold_row(&e, (255, 0, 0)), Some(40), "#sub painted at its 40px inset");
+        let (flow, held, hold, stuck) = sticky_outer_hold_probe(&e);
+        assert_eq!((flow, held, hold), (120.0, 320.0, 20.0), "flow 120, under #sec's 200px hold 320, own hold 20");
+        assert_eq!(stuck, css_core::container::TOP, "#sub reads stuck: top");
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): `#sub` 120 into the section: while the section holds, `#sub` rides with it at viewport
+    /// 120, never reaching its 40px inset; at scrolls 150, 300 and 450 the bit is 0 and agrees with the painter (armed at
+    /// 300 and 450: the unheld read said TOP).
+    #[test]
+    fn sticky_outer_hold_only_section_agrees_with_painter() {
+        for sc in [150.0, 300.0, 450.0] {
+            let e = sticky_outer_hold_page(100, sc);
+            let painted = sticky_outer_hold_row(&e, (255, 0, 0)).expect("#sub is painted");
+            let (_, held, hold, stuck) = sticky_outer_hold_probe(&e);
+            assert_eq!(painted, 120, "#sub painted with the section at scroll {sc}");
+            assert_eq!(stuck, 0, "#sub is not stuck at scroll {sc} (armed at 300 / 450)");
+            assert_eq!(hold, 0.0, "no own hold at scroll {sc}");
+            assert_eq!(stuck != 0, (painted as f32 + sc as f32 - held).abs() > 0.5, "the bit and the painter agree at scroll {sc}");
+        }
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): scrolled 300, the link inside the stuck section is painted at row 0, and the shell hit
+    /// test, elementFromPoint and getBoundingClientRect all read it there (PINNED: M1 measured them right before SR1167).
+    #[test]
+    fn sticky_outer_hold_link_reads_painted_place() {
+        let mut e = sticky_outer_hold_page(0, 300.0);
+        assert_eq!(sticky_outer_hold_row(&e, (0, 255, 0)), Some(0), "#lk painted at the section's held top");
+        assert_eq!(hit_sticky_origin_id(&e, 10.0, 5.0), "lk", "shell hit test");
+        assert_eq!(bounding_sticky_from_point(&mut e, 10.0, 5.0), "lk", "elementFromPoint");
+        assert_eq!(imgalt_rect(&mut e, "lk").1, 0.0, "getBoundingClientRect().top");
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): in the panel the section holds at the panel's top (50) and `#sub` (20 into it) holds
+    /// at 50 + 40 = 90 at wheels 100 and 300 (armed: the painter moved the panel's port by the outer hold and drew 160 /
+    /// off the panel); `#sub` 120 into the section rides at 170, not stuck, at wheel 300 (armed: painter off the panel,
+    /// bit TOP).
+    #[test]
+    fn sticky_outer_hold_panel_sub_holds_at_panel_inset() {
+        for dy in [100.0, 300.0] {
+            let e = sticky_outer_hold_panel(0, dy);
+            assert_eq!(sticky_outer_hold_row(&e, (255, 0, 0)), Some(90), "#sub painted at the panel inset at wheel {dy}");
+            assert_eq!(sticky_outer_hold_probe(&e).3, css_core::container::TOP, "#sub stuck at wheel {dy}");
+        }
+        let e = sticky_outer_hold_panel(100, 300.0);
+        assert_eq!(sticky_outer_hold_row(&e, (255, 0, 0)), Some(170), "#sub rides with the held section");
+        assert_eq!(sticky_outer_hold_probe(&e).3, 0, "#sub is not stuck");
+    }
+
+    /// AETHERSTICKYOUTERHOLD (SR1167): the agreement claim (the painter's `placed_origin` sticky arm and layout_core's
+    /// `sticky_hold` are two expressions of one rule, owed AETHER-STICKY-ONE-RULE-PAINTER): at five page scrolls and five
+    /// panel wheels `#sub`'s painted row == box_origin_held + sticky_hold - the page scroll.
+    #[test]
+    fn sticky_outer_hold_painter_agrees_with_layout_core() {
+        let page = [0.0, 50.0, 150.0, 300.0, 450.0].map(|sc| sticky_outer_hold_page(0, sc));
+        let panel = [0.0, 50.0, 100.0, 200.0, 300.0].map(|dy| sticky_outer_hold_panel(0, dy));
+        for e in page.iter().chain(panel.iter()) {
+            let painted = sticky_outer_hold_row(e, (255, 0, 0)).expect("#sub is painted") as f32;
+            let (_, held, hold, _) = sticky_outer_hold_probe(e);
+            assert_eq!(painted, held + hold - e.scroll_y as f32, "painter and layout_core agree (page {}, held {held}, hold {hold})", e.scroll_y);
+        }
+    }
+
     // ---- AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (LEDGER SR1113): getComputedStyle textDecoration from the four report columns, the el.style expand and the textUnderlinePosition accessor (named tail block) ----
 
     /// AETHERCSSOMTEXTDECORATIONSHORTHANDCOMPUTED (SR1113): `#w` a wavy red underline, `#t` the same with a 3px thickness, `#p` a plain

@@ -429,33 +429,10 @@ pub fn sticky_stuck<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), v
         return 0;
     }
     let Some(ins) = p.inset_px else { return 0 };
-    let (Some((nx, ny)), Ok(l)) = (box_origin(tree, id, vs), tree.taffy.layout(id)) else { return 0 };
-    let (w, h) = (l.size.width, l.size.height);
-    let (pl, pt, pr, pb, cb_l, cb_t, cb_r, cb_b) = sticky_scrollport(tree, id, vs, viewport);
-    let mut out = 0u8;
-    if let Some(t) = ins[0] {
-        let target = pt + t;
-        if ny < target && target.min(cb_b - h).max(ny) > ny {
-            out |= TOP;
-        }
-    } else if let Some(b) = ins[2] {
-        let target = pb - b - h;
-        if ny > target && target.max(cb_t).min(ny) < ny {
-            out |= BOTTOM;
-        }
-    }
-    if let Some(lf) = ins[3] {
-        let target = pl + lf;
-        if nx < target && target.min(cb_r - w).max(nx) > nx {
-            out |= LEFT;
-        }
-    } else if let Some(r) = ins[1] {
-        let target = pr - r - w;
-        if nx > target && target.max(cb_l).min(nx) < nx {
-            out |= RIGHT;
-        }
-    }
-    out
+    let (hx, hy) = sticky_hold(tree, id, vs, viewport); // AETHERSTICKYOUTERHOLD (SR1167): the bits read the ONE hold rule at the outer-held place
+    let y = if ins[0].is_some() { if hy > 0.0 { TOP } else { 0 } } else if ins[2].is_some() && hy < 0.0 { BOTTOM } else { 0 };
+    let x = if ins[3].is_some() { if hx > 0.0 { LEFT } else { 0 } } else if ins[1].is_some() && hx < 0.0 { RIGHT } else { 0 };
+    y | x
 }
 
 /// The scroll state a `container-type: scroll-state` box offers its `@container scroll-state()` queries:
@@ -797,4 +774,97 @@ pub fn sticky_scrollport<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f3
         }
     }
     (pl, pt, pl + cw, pt + ch, cb_l, cb_t, cb_r, cb_b)
+}
+
+// ---- AETHERSTICKYOUTERHOLD (LEDGER SR1167): the painted origin of a box under outer sticky holds (named tail block) ----
+
+/// AETHERSTICKYOUTERHOLD (SR1167): the OWN hold of a `position: sticky` box (css-position-3 §3.4): how far the painter
+/// moves it from its place under its ancestors' holds ([`box_origin_held`]); (0, 0) when it is not sticky, has no inset
+/// or sits at that place. The rule is the painter's (`placed_origin`'s sticky arm, owed AETHER-STICKY-ONE-RULE-PAINTER) in
+/// document space: the port and the containing block are [`sticky_scrollport`]'s, the containing block moved by the
+/// outer holds (the parent's painted shift), an inner scroller's port by that scroller's own painted shift
+/// ([`sticky_shift`]), the viewport port absolute. The recursion is bounded by the ancestor depth: every call made here
+/// for `id` ([`box_origin_held`] walks its STRICT ancestors; [`sticky_shift`] is of its scroller, a strict ancestor), so
+/// no chain of calls reaches the same id twice (the cost is exponential only in the count of nested sticky ancestors).
+pub fn sticky_hold<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+    let Some(p) = tree.paint_map.get(&id) else { return (0.0, 0.0) };
+    if p.position_kind != Some(4) {
+        return (0.0, 0.0);
+    }
+    let Some(ins) = p.inset_px else { return (0.0, 0.0) };
+    let (Some((nx, ny)), Some((fx, fy)), Ok(l)) = (box_origin_held(tree, id, vs, viewport), box_origin(tree, id, vs), tree.taffy.layout(id)) else {
+        return (0.0, 0.0);
+    };
+    let (w, h) = (l.size.width, l.size.height);
+    let (ox, oy) = (nx - fx, ny - fy);
+    let (pl, pt, pr, pb, cb_l, cb_t, cb_r, cb_b) = sticky_scrollport(tree, id, vs, viewport);
+    let (qx, qy) = sticky_scroller(tree, id).map_or((0.0, 0.0), |s| sticky_shift(tree, s, vs, viewport));
+    let (pl, pt, pr, pb) = (pl + qx, pt + qy, pr + qx, pb + qy);
+    let (cb_l, cb_t, cb_r, cb_b) = (cb_l + ox, cb_t + oy, cb_r + ox, cb_b + oy);
+    let (mut cx, mut cy) = (nx, ny);
+    if let Some(t) = ins[0] {
+        let target = pt + t;
+        if ny < target {
+            cy = target.min(cb_b - h).max(ny);
+        }
+    } else if let Some(b) = ins[2] {
+        let target = pb - b - h;
+        if ny > target {
+            cy = target.max(cb_t).min(ny);
+        }
+    }
+    if let Some(lf) = ins[3] {
+        let target = pl + lf;
+        if nx < target {
+            cx = target.min(cb_r - w).max(nx);
+        }
+    } else if let Some(r) = ins[1] {
+        let target = pr - r - w;
+        if nx > target {
+            cx = target.max(cb_l).min(nx);
+        }
+    }
+    (cx - nx, cy - ny)
+}
+
+/// AETHERSTICKYOUTERHOLD (SR1167): the document-space border-box origin of `id` as painted UNDER ITS ANCESTORS' sticky
+/// holds: [`box_origin`] plus each strict ancestor's [`sticky_hold`], walking outward; per axis the walk stops past a
+/// `position: fixed` box (`id` or an ancestor) whose `fixed_at` pins that axis (`box_origin` re-bases there). `id`'s own
+/// hold is not included ([`sticky_shift`] adds it). [`box_origin`] stays the unheld flow place for its other readers.
+pub fn box_origin_held<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> Option<(f32, f32)> {
+    let (mut x, mut y) = box_origin(tree, id, vs)?;
+    let pinned = |k: NodeId| -> (bool, bool) {
+        match (tree.paint_map.get(&k).and_then(|q| q.position_kind), tree.fixed_at.get(&k)) {
+            (Some(3), Some(&(fx, fy))) => (fx.is_some(), fy.is_some()),
+            _ => (false, false),
+        }
+    };
+    let (px, py) = pinned(id);
+    let (mut ax, mut ay) = (!px, !py);
+    let mut cur = tree.taffy.parent(id);
+    while let Some(a) = cur {
+        if !ax && !ay {
+            break;
+        }
+        let (hx, hy) = sticky_hold(tree, a, vs, viewport);
+        if ax {
+            x += hx;
+        }
+        if ay {
+            y += hy;
+        }
+        let (px, py) = pinned(a);
+        ax &= !px;
+        ay &= !py;
+        cur = tree.taffy.parent(a);
+    }
+    Some((x, y))
+}
+
+/// AETHERSTICKYOUTERHOLD (SR1167): how far the painter moves `id` from its flow place ([`box_origin`]): its ancestors'
+/// holds and its own, i.e. `box_origin_held + sticky_hold - box_origin`; (0, 0) for a box with no origin.
+pub fn sticky_shift<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+    let (Some((hx, hy)), Some((fx, fy))) = (box_origin_held(tree, id, vs, viewport), box_origin(tree, id, vs)) else { return (0.0, 0.0) };
+    let (ox, oy) = sticky_hold(tree, id, vs, viewport);
+    (hx + ox - fx, hy + oy - fy)
 }
