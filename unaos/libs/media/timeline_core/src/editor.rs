@@ -308,7 +308,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail)
+        if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -3341,4 +3341,76 @@ impl EditorState {
 fn rtrim_all_words(v: &str) -> Option<(Edge, i64)> {
     let rest = v.strip_prefix("rtrim-all")?.strip_prefix(' ')?;
     rtrim_words(&alloc::format!("rtrim {rest}"))
+}
+
+// ---- STRIAFREEZEMORE (LEDGER SR970): the retitle word as ONE commit (named tail block) ----
+impl EditorState {
+    /// STRIAFREEZEMORE: the selected clip's title source retyped to `text` through `Timeline::set_title`: ONE commit, so undo
+    /// restores the old text; every clip of that `T<n>` reel shows the new text. The same text is Ok with no commit (no undo
+    /// step). Refused by name: no selection `NoClip`; the selected clip's source is a media reel `NoSource`.
+    pub fn retitle(&mut self, text: &str) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        if self.timeline.source(c.src).and_then(|s| s.title.as_deref()) == Some(text) {
+            return Ok(());
+        }
+        let tl = self.timeline.set_title(c.src, text)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// STRIAFREEZEMORE: the `retitle [<text...>]` word (`None` for any other word): the words after `retitle`, trimmed; bare
+    /// or empty is "Title" (stria's `title_text` default).
+    fn retitle_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let t = if v == "retitle" { "" } else { v.strip_prefix("retitle ")?.trim() };
+        Some(self.retitle(if t.is_empty() { "Title" } else { t }))
+    }
+}
+
+#[cfg(test)]
+mod striafreezemore_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1 = A[0,10)@0 then a 25-tick title "Hello" laid at 10 (selected).
+    fn titled() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0)];
+        let mut st = EditorState::new(tl);
+        st.seek(10);
+        assert_eq!(st.add_title("Hello", 25), Ok(()));
+        st
+    }
+
+    fn text(st: &EditorState) -> Option<&str> {
+        st.timeline.source_by_reel("T1").and_then(|s| s.title.as_deref())
+    }
+
+    /// `retitle Bye` retypes T1 in one undo step; one undo restores "Hello"; the same text pushes no step; bare is "Title".
+    #[test]
+    fn striafreezemore_retitle_one_undo_step() {
+        let mut st = titled();
+        let d = st.undo_depth();
+        assert_eq!(st.verb("retitle  Bye "), Some(Ok(())));
+        assert_eq!((text(&st), st.undo_depth()), (Some("Bye"), d + 1));
+        assert_eq!(st.verb("retitle Bye"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), d + 1, "the same text pushes no undo step");
+        assert!(st.undo());
+        assert_eq!(text(&st), Some("Hello"), "one undo restores the old text");
+        assert_eq!(st.verb("retitle"), Some(Ok(())));
+        assert_eq!(text(&st), Some("Title"));
+        assert_eq!(st.verb("retitled"), None, "not this word");
+    }
+
+    /// A media clip selected is `NoSource`; nothing selected is `NoClip`; neither pushes an undo step.
+    #[test]
+    fn striafreezemore_retitle_refuses_media_and_no_selection() {
+        let mut st = titled();
+        let d = st.undo_depth();
+        st.select(0, 0).unwrap();
+        assert_eq!(st.verb("retitle X"), Some(Err(EditError::NoSource)));
+        st.deselect();
+        assert_eq!(st.verb("retitle X"), Some(Err(EditError::NoClip)));
+        assert_eq!((text(&st), st.undo_depth()), (Some("Hello"), d));
+    }
 }

@@ -3463,3 +3463,39 @@ impl Timeline {
         Ok(())
     }
 }
+
+// ---- STRIAFREEZEMORE (LEDGER SR970): retype a title source (named tail block) ----
+// A title's text lives on its ONE `Source` (`Source::title`, STRIATITLECLIP SR828); the render keys its still by text, so a
+// new text needs no cache work. `EditorState::retitle` commits this op's value as one undo step.
+impl Timeline {
+    /// STRIAFREEZEMORE: the timeline with title source `src`'s text set to `text`. Refused by name: no such source, or a
+    /// media reel (`title == None`), `EditError::NoSource`.
+    pub fn set_title(&self, src: SourceId, text: &str) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let s = tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?;
+        let t = s.title.as_mut().ok_or(EditError::NoSource)?;
+        *t = String::from(text);
+        Ok(tl)
+    }
+}
+
+#[cfg(test)]
+mod striafreezemore_tests {
+    use super::*;
+
+    /// A titled source retypes and nothing else changes; a media reel and a missing source are `NoSource`.
+    #[test]
+    fn striafreezemore_set_title_retypes_only_a_title() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_source("T1", 125);
+        tl.sources[1].title = Some(String::from("Hello"));
+        let out = tl.set_title(t, "Bye").unwrap();
+        assert_eq!(out.source(t).and_then(|s| s.title.as_deref()), Some("Bye"));
+        let mut back = out.clone();
+        back.sources[1].title = Some(String::from("Hello"));
+        assert_eq!(back, tl, "only the text moved");
+        assert_eq!(tl.set_title(a, "X"), Err(EditError::NoSource), "a media reel");
+        assert_eq!(tl.set_title(SourceId(99), "X"), Err(EditError::NoSource), "no such source");
+    }
+}
