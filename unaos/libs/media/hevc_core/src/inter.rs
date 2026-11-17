@@ -705,5 +705,130 @@ mod hevcconcealweightedbimixed_tests {
             }
         }
     }
+
+    /// HEVCCONCEALWEIGHTEDCHROMA (SR776): the chroma arm of `explicit_weight_of` is 7-56 — ChromaOffset = Clip3(-half,
+    /// half - 1, half + delta_chroma_offset - ((half * ChromaWeight) >> ChromaLog2WeightDenom)), half = 128 (or
+    /// 1 << (BitDepthC - 1) with high_precision), shifted by BitDepthC - 8 (0 with high_precision); log2WD = 7 + shift1.
+    /// Hand-computed: Cb (96, delta -12), Cr (160, delta 2) at ref_idx 0; the clip pair (128, +-300) at ref_idx 1.
+    #[test]
+    fn chroma_offset_rule_7_56() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 7,
+            l0: WeightList { luma: vec![(64, 0), (64, 0)], chroma: vec![[(96, -12), (160, 2)], [(128, 300), (128, -300)]] },
+            l1: WeightList::default(),
+        };
+        // (bd, high, ref_idx, Cb (w, o, log2WD), Cr (w, o, log2WD))
+        let cases = [
+            (8u32, false, 0i8, (96, 20, 13u32), (160, -30, 13u32)),
+            (8, false, 1, (128, 127, 13), (128, -128, 13)),
+            (10, false, 0, (96, 80, 11), (160, -120, 11)),
+            (8, true, 0, (96, 20, 13), (160, -30, 13)),
+            (10, true, 0, (96, 116, 11), (160, -126, 11)),
+        ];
+        for (bd, high, r, cb, cr) in cases {
+            assert_eq!(explicit_weight_of(Some(&pw), 1, 0, r, bd, high), cb, "Cb bd {bd} high {high} ref_idx {r}");
+            assert_eq!(explicit_weight_of(Some(&pw), 2, 0, r, bd, high), cr, "Cr bd {bd} high {high} ref_idx {r}");
+        }
+    }
+
+    /// HEVCCONCEALBIDIRECTFORWARD (SR778): `uni_explicit_inv` undoes 8-252: a sample L weighted by (w, o, log2WD) to q
+    /// (unclipped) comes back within the rounding bound (1 << denom) / (2 |w|) + 1, and identity weights give L exactly.
+    #[test]
+    fn uni_explicit_inv_undoes_uni_explicit() {
+        use super::{uni_explicit, uni_explicit_inv};
+        for bd in [8u32, 10] {
+            let shift1 = (14 - bd as i32).max(2) as u32;
+            let max = (1i32 << bd) - 1;
+            let denom = 6u32;
+            for (w, o) in [(64i32, 0i32), (48, 5), (16, -3), (100, 0), (127, -20), (-32, 127)] {
+                let o = o << (bd - 8);
+                let wt = (w, o, denom + shift1);
+                let bound = (1 << denom) / (2 * w.abs()) + 1;
+                for l in 0..=max {
+                    let q = uni_explicit(l << shift1, wt);
+                    if q < 0 || q > max {
+                        continue;
+                    }
+                    let back = uni_explicit_inv(q << shift1, wt, bd);
+                    if (w, o) == (64, 0) {
+                        assert_eq!(back, l, "bd {bd}: identity weights are the copy");
+                    }
+                    assert!((back - l).abs() <= bound, "bd {bd} (w {w}, o {o}) L {l}: q {q} back {back}, bound {bound}");
+                }
+            }
+        }
+    }
+
+    /// HEVCCONCEALFORWARDBIINVERSE (SR784): `bi_explicit_inv` undoes 8-264 over two equal fetches: a sample L weighted by
+    /// (w0, o0) and (w1, o1) under one log2WD to q (unclipped) comes back within (1 << denom) / abs(w0 + w1) + 1, identity
+    /// weights give L exactly, a negative weight sum inverts, and w0 + w1 == 0 is the copy.
+    #[test]
+    fn bi_explicit_inv_undoes_bi_explicit() {
+        use super::{bi_explicit, bi_explicit_inv};
+        for bd in [8u32, 10] {
+            let shift1 = (14 - bd as i32).max(2) as u32;
+            let max = (1i32 << bd) - 1;
+            let denom = 6u32;
+            let lwd = denom + shift1;
+            for ((w0, o0), (w1, o1)) in [((64i32, 0i32), (64i32, 0i32)), ((48, 5), (16, -3)), ((100, 0), (-20, 7)), ((127, -20), (1, 3)), ((-80, 10), (16, 0))] {
+                let (t0, t1) = ((w0, o0 << (bd - 8), lwd), (w1, o1 << (bd - 8), lwd));
+                let bound = (1 << denom) / (w0 + w1).abs() + 1;
+                for l in 0..=max {
+                    let q = bi_explicit(l << shift1, l << shift1, t0, t1);
+                    if q < 0 || q > max {
+                        continue;
+                    }
+                    let back = bi_explicit_inv(q << shift1, t0, t1, bd);
+                    if (w0, o0, w1, o1) == (64, 0, 64, 0) {
+                        assert_eq!(back, l, "bd {bd}: identity weights are the copy");
+                    }
+                    assert!((back - l).abs() <= bound, "bd {bd} (w0 {w0}, o0 {o0}, w1 {w1}, o1 {o1}) L {l}: q {q} back {back}, bound {bound}");
+                }
+            }
+            for q in 0..=max {
+                assert_eq!(bi_explicit_inv(q << shift1, (32, 0, lwd), (-32, 0, lwd), bd), q, "bd {bd}: w0 + w1 == 0 is the copy");
+            }
+        }
+    }
 }
 
+// ---- HEVCCONCEALBIDIRECTFORWARD (LEDGER SR778): the inverse of 8-252 for the forward refinement (named tail block) ----
+/// HEVCCONCEALBIDIRECTFORWARD (SR778): the inverse of [`uni_explicit`] for dpb.rs's forward refinement (`conceal_fetch`
+/// with `inv`): the referencer C coded pred = w0 * L + o0, so the lost picture is L ~ (C - o0) * 2^denom / w0. On the 14-bit
+/// intermediate `p` of C (shift1 = Max(2, 14 - bitDepth), denom = log2WD - shift1): p' = ((p - (o0 << shift1)) << denom)
+/// / w0 rounded half away from zero, then 8-261's rounding (`uni_default`), clipped to `bd`. Identity weights (1 << denom, 0)
+/// give p' = p (the copy); w0 == 0 (C does not depend on L) is the copy.
+pub(crate) fn uni_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), bd: u32) -> i32 {
+    let max = (1i32 << bd) - 1;
+    if w0 == 0 {
+        return uni_default(p, bd).clamp(0, max);
+    }
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let num = (p as i64 - ((o0 as i64) << shift1)) << lwd.saturating_sub(shift1);
+    let (n, d) = if w0 < 0 { (-num, -(w0 as i64)) } else { (num, w0 as i64) };
+    let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+    uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
+}
+
+// ---- HEVCCONCEALFORWARDBIINVERSE (LEDGER SR784): the equal-vector joint inverse of 8-264 for the forward refinement (named tail block) ----
+/// HEVCCONCEALFORWARDBIINVERSE (SR784): the inverse of [`bi_explicit`] over two equal fetches for dpb.rs's forward refinement
+/// (`conceal_fetch` with `inv`, both of the referencer C's lists on the lost picture L): C coded pred =
+/// floor((t + o0 + o1 + 1) / 2) with t = L * (w0 + w1) / 2^denom, so t lies in [2C - O - 1, 2C - O + 1) (O = o0 + o1) and the
+/// centred estimate is L ~ (2C - O) * 2^denom / (w0 + w1). On the 14-bit intermediate `p` of C (shift1 = Max(2, 14 - bitDepth),
+/// denom = log2WD - shift1): p' = ((p << (denom + 1)) - ((o0 + o1) << log2WD)) / (w0 + w1) rounded half away from zero, then
+/// 8-261's rounding (`uni_default`), clipped to `bd` (the [`uni_explicit_inv`] road). Exact for equal vectors; the caller hands
+/// the averaged fetch when they differ (HEVC-CONCEAL-FORWARD-BI-INVERSE-SPLIT owed). Identity weights give the copy;
+/// w0 + w1 == 0 is the copy.
+pub(crate) fn bi_explicit_inv(p: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32), bd: u32) -> i32 {
+    let max = (1i32 << bd) - 1;
+    let w = w0 as i64 + w1 as i64;
+    if w == 0 {
+        return uni_default(p, bd).clamp(0, max);
+    }
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let num = ((p as i64) << (lwd.saturating_sub(shift1) + 1)) - ((o0 as i64 + o1 as i64) << lwd);
+    let (n, d) = if w < 0 { (-num, -w) } else { (num, w) };
+    let q = if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+    uni_default(q.clamp(-(1 << 24), 1 << 24) as i32, bd).clamp(0, max)
+}
