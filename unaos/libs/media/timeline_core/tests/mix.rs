@@ -858,3 +858,108 @@ fn striapanautowrite_curve_paints_on_the_selected_keyed_clip() {
     assert_eq!((at(xp, yp + 2), at(xp + 2, yp)), (&PAN_INK[..], &PAN_INK[..]), "the plus at the hard-right point");
     assert!(pan_curve_y(&l, 1, -127) < pan_curve_y(&l, 1, 127), "hard left up");
 }
+
+// ---- STRIAPANDRAGPT (LEDGER SR9112): drag a pan point; the set road writes keyed points (named tail block) ----
+
+/// A press on the hard-right point's plus mark of the selected keyed clip begins a `PanPoint` drag; two ticks left and 7 px
+/// up move it to source tick 6 at pan 63 (previewed by `shown`, committed ONCE); the other point is untouched.
+#[test]
+fn striapandragpt_point_drag_moves_tick_and_pan() {
+    use timeline_core::view::{Drag, DragKind, Layout, pan_curve_y};
+    let mut st = EditorState::new(keyed());
+    st.select(1, 0).unwrap();
+    let l = Layout::of(320, 160, &st);
+    let (x, y) = (l.x_of(13) as f64, pan_curve_y(&l, 1, 127) as f64);
+    let d0 = st.undo_depth();
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    assert_eq!((d.kind, d.track, d.idx), (DragKind::PanPoint, 1, 0));
+    d.update(&st, l.x_of(11) as f64, y - 7.0);
+    assert_eq!(d.delta, -2);
+    assert!(d.moved());
+    let shown = d.shown(&st).expect("a preview");
+    assert_eq!(shown.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(0i64, -127i8), (6, 63)]);
+    assert_eq!(st.undo_depth(), d0, "the preview commits nothing");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    let c = st.timeline.tracks[1].clips[0];
+    assert_eq!((c.pan_keys.points().to_vec(), c.pan_cq8, st.undo_depth()), (vec![(0i64, -127i8), (6, 63)], 0, d0 + 1));
+    assert!(st.undo());
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(0i64, -127i8), (8, 127)]);
+    println!("striapandragpt drag: (8, 127) -> (6, 63)");
+}
+
+/// A point drag clamps: it never crosses or lands on its neighbour, stays inside the source window and the pan range; a
+/// y-only move counts as moved; shift / slip at the point do not grab it; an unselected or unkeyed clip has no point grip.
+#[test]
+fn striapandragpt_point_drag_clamps_at_neighbours_and_source() {
+    use timeline_core::view::{Drag, DragKind, Layout, pan_curve_y};
+    let mut st = EditorState::new(keyed());
+    st.select(1, 0).unwrap();
+    let l = Layout::of(320, 160, &st);
+    let (x, y) = (l.x_of(5) as f64, pan_curve_y(&l, 1, -127) as f64);
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    assert_eq!(d.kind, DragKind::PanPoint);
+    d.update(&st, l.x_of(14) as f64, y - 40.0);
+    assert_eq!(d.delta, 7, "stops one tick before the next point");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(7i64, -127i8), (8, 127)]);
+    let (x, y) = (l.x_of(13) as f64, pan_curve_y(&l, 1, 127) as f64);
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    d.update(&st, x + 20.0 * l.zoom as f64, y + 40.0);
+    assert_eq!(d.delta, 1, "stops at the source window's last tick");
+    let mut e = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    e.update(&st, x, y - 2.0);
+    assert!(e.moved() && e.delta == 0, "a y-only move is a move");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!(st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), vec![(7i64, -127i8), (9, 127)]);
+    let (x, y) = (l.x_of(14) as f64, pan_curve_y(&l, 1, 127) as f64);
+    assert_ne!(Drag::begin_with(&mut st, l, x, y, true, false, false).map(|d| d.kind), Some(DragKind::PanPoint));
+    assert_ne!(Drag::begin_with(&mut st, l, x, y, false, false, true).map(|d| d.kind), Some(DragKind::PanPoint));
+    let mut plain = EditorState::new(two_tracks());
+    plain.select(1, 0).unwrap();
+    assert_ne!(Drag::begin_with(&mut plain, l, x, y, false, false, false).map(|d| d.kind), Some(DragKind::PanPoint), "unkeyed");
+}
+
+/// `move_pan_key`: no point at `s0` and a point already at `s1` refuse `PanKey`; outside the source window `OutOfSource`;
+/// the point unchanged commits nothing; nothing selected `NoClip`.
+#[test]
+fn striapandragpt_move_pan_key_refusals_and_no_commit() {
+    let mut st = EditorState::new(keyed());
+    assert_eq!(st.move_pan_key(0, 1, 0), Err(EditError::NoClip));
+    st.select(1, 0).unwrap();
+    let d0 = st.undo_depth();
+    assert_eq!(st.move_pan_key(3, 4, 0), Err(EditError::PanKey));
+    assert_eq!(st.move_pan_key(0, 8, 0), Err(EditError::PanKey));
+    assert_eq!(st.move_pan_key(0, 10, 0), Err(EditError::OutOfSource));
+    assert_eq!(st.move_pan_key(0, -1, 0), Err(EditError::OutOfSource));
+    assert_eq!(st.move_pan_key(8, 8, 127), Ok(()));
+    assert_eq!(st.undo_depth(), d0, "refusals and the unchanged point commit nothing");
+    assert_eq!(st.move_pan_key(8, 8, 100), Ok(()));
+    assert_eq!((st.timeline.tracks[1].clips[0].pan_keys.points().to_vec(), st.undo_depth()), (vec![(0i64, -127i8), (8, 100)], d0 + 1));
+}
+
+/// A set of a keyed and an unkeyed audio clip: `pan <x>` writes the point at the playhead on the keyed one and the static pan
+/// on the other, in ONE undo step; a keyed clip off the playhead is left alone; a set of keyed clips all off the playhead
+/// commits nothing and is Ok.
+#[test]
+fn striapandragpt_set_writes_points_at_the_playhead() {
+    let mut st = EditorState::new(keyed());
+    st.select(0, 0).unwrap();
+    st.select_add(1, 0).unwrap();
+    st.seek(9);
+    let d0 = st.undo_depth();
+    assert_eq!(st.verb("pan 0.5"), Some(Ok(())));
+    let (a, b) = (st.timeline.tracks[0].clips[0], st.timeline.tracks[1].clips[0]);
+    assert_eq!((a.pan_cq8, a.pan_keys.n, b.pan_cq8, b.pan_keys.points().to_vec(), st.undo_depth()), (64, 0, 0, vec![(0i64, -127i8), (4, 64), (8, 127)], d0 + 1));
+    st.seek(2);
+    assert_eq!(st.verb("pan -1"), Some(Ok(())));
+    let (a, b) = (st.timeline.tracks[0].clips[0], st.timeline.tracks[1].clips[0]);
+    assert_eq!((a.pan_cq8, b.pan_keys.n, b.pan_cq8, st.undo_depth()), (-127, 3, 0, d0 + 2), "the keyed clip off the playhead is left alone");
+    let mut both = EditorState::new(keyed().set_pan_key(0, 0, 0, 0).unwrap());
+    both.select(0, 0).unwrap();
+    both.select_add(1, 0).unwrap();
+    both.seek(30);
+    let tl = both.timeline.clone();
+    assert_eq!(both.verb("pan 0.5"), Some(Ok(())));
+    assert_eq!((both.timeline == tl, both.undo_depth()), (true, 0));
+    println!("striapandragpt set: keyed {:?}", st.timeline.tracks[1].clips[0].pan_keys.points());
+}

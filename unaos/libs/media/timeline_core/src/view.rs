@@ -595,7 +595,7 @@ pub enum DragKind {
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
     Slide,
-    Pan, // STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail) XfadeIn, XfadeOut, // STRIAXFADETHREE (SR9023): the explicit audio crossfade bracket's left / right edge (file tail) Source, // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview dropped on a track (`Drag::begin_source`, file tail)
+    Pan, PanPoint, // STRIAPANDRAGPT (SR9112): a pan point of the selected keyed AUDIO clip (`EditorState::move_pan_key`; `delta` is the source-tick change, the pan change is the pointer's y travel) (file tail); STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail) XfadeIn, XfadeOut, // STRIAXFADETHREE (SR9023): the explicit audio crossfade bracket's left / right edge (file tail) Source, // STRIASOURCEDRAG (SR9081): a press on the loaded source's preview dropped on a track (`Drag::begin_source`, file tail)
     GainEnv, // STRIAGAINENVDRAG (SR9082): a point of the selected audio clip's gain envelope (Drag::begin_gain_env, file tail)
 }
 
@@ -654,7 +654,7 @@ impl Drag {
             guide: None,
             ripple: false, roll: false, // STRIAROLLMORE (SR954) ripple_all: false,
         };
-        if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) {
+        if let Some((t, i)) = pan_point_grip(st, &l, x, y, shift, slip) { return Some(mk(DragKind::PanPoint, t, i)); } if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift && slip) { // STRIAPANDRAGPT (SR9112): a press on a pan point drags it, before the trim handles (file tail)
             let y0 = l.row_y(track) as f64;
             if y >= y0 && y < y0 + ROW_H as f64 {
                 let (x0, x1) = (l.x_of(c.at) as f64, l.x_of(c.end()) as f64);
@@ -688,7 +688,7 @@ impl Drag {
     /// The pointer is at `(x, y)`: the tick delta (snapped), and for a move of one clip the row under it when that
     /// track's kind matches.
     pub fn update(&mut self, st: &EditorState, x: f64, y: f64) {
-        if self.kind == DragKind::Pan { return self.pan_update(st, x, y); } self.at = (x, y); // STRIAPANNEXT (SR994): a pan drag reads the pointer as pan (file tail)
+        if self.kind == DragKind::PanPoint { return self.pan_point_update(st, x, y); } if self.kind == DragKind::Pan { return self.pan_update(st, x, y); } self.at = (x, y); // STRIAPANDRAGPT (SR9112): a point drag reads tick and pan (file tail); STRIAPANNEXT (SR994): a pan drag reads the pointer as pan (file tail)
         self.delta = self.layout.tick_at(x) - self.origin_tick;
         self.guide = None; if self.kind == DragKind::Source { return self.update_source(st, x, y); } // STRIASOURCEDRAG (SR9081): the drop tick and row (file tail)
         if self.snap {
@@ -710,7 +710,7 @@ impl Drag {
             DragKind::Marquee => {
                 (self.at.0 - self.origin.0).abs() >= MARQUEE_MIN || (self.at.1 - self.origin.1).abs() >= MARQUEE_MIN
             }
-            DragKind::GainEnv => true, _ => self.delta != 0 || self.to_track != self.track, // STRIAGAINENVDRAG (SR9082): an envelope press always changes or is the same-envelope no-op (file tail)
+            DragKind::GainEnv => true, DragKind::PanPoint => self.delta != 0 || self.at.1 != self.origin.1, _ => self.delta != 0 || self.to_track != self.track, // STRIAGAINENVDRAG (SR9082): an envelope press always changes or is the same-envelope no-op (file tail) // STRIAPANDRAGPT (SR9112): a point drag moved in tick or in pan
         }
     }
     /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing).
@@ -733,7 +733,7 @@ impl Drag {
             DragKind::TrimIn => st.trim_by_ticks(Edge::In, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::TrimOut => st.trim_by_ticks(Edge::Out, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::Slip => st.slip_selected(self.delta),
-            DragKind::Slide => st.slide_selected(self.delta), DragKind::Pan => self.finish_pan(st), // STRIAPANNEXT (SR994): the one pan road (file tail)
+            DragKind::Slide => st.slide_selected(self.delta), DragKind::Pan => self.finish_pan(st), DragKind::PanPoint => self.finish_pan_point(st), // STRIAPANDRAGPT (SR9112): the one point move (file tail); STRIAPANNEXT (SR994): the one pan road (file tail)
             DragKind::Move if st.set.len() > 1 => st.move_set_track(self.to_track as isize - self.track as isize, self.delta), // STRIAMULTISELECTMORE (SR950)
             _ => {
                 let at = st.selected().ok_or(EditError::NoClip)?.at;
@@ -804,7 +804,7 @@ impl Drag {
         let one = [(self.track, self.idx)];
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee | DragKind::Slip => return, DragKind::GainEnv => return self.snap_gain_env(st, x), DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail) DragKind::XfadeIn | DragKind::XfadeOut => return self.snap_xfade(st, x), // STRIAGAINENVDEL (SR9110): an envelope point snaps to the playhead (file tail)
+            DragKind::Marquee | DragKind::Slip | DragKind::Pan | DragKind::PanPoint => return, DragKind::GainEnv => return self.snap_gain_env(st, x), DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail) DragKind::XfadeIn | DragKind::XfadeOut => return self.snap_xfade(st, x), // STRIAGAINENVDEL (SR9110): an envelope point snaps to the playhead (file tail) // STRIAPANDRAGPT (SR9112): pan and pan-point drags never snap (`update` returns before this; the match is exhaustive)
             DragKind::Scrub | DragKind::Source => { // STRIASOURCEDRAG (SR9081): the drop tick snaps as the scrub's pointer does
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -7984,5 +7984,78 @@ mod striagainenvdel_tests {
         let mut d = Drag::begin_with(&mut v, l, x, y, true, false, false).unwrap();
         d.update(&v, x, y);
         assert_eq!(d.gain_env_removal(&v), None, "video");
+    }
+}
+
+// ---- STRIAPANDRAGPT (LEDGER SR9112): drag a pan point on the curve (named tail block) ----
+// A press (no shift, no slip modifier) within [`PAN_PT_HIT`] px of a pan point's plus mark (SR9084's [`pan_curve`]: x at the
+// point's tick, y at [`pan_curve_y`] of its pan) on the selected AUDIO clip that carries pan points begins a
+// [`DragKind::PanPoint`]. The pointer's x travel on the frozen layout moves the point's SOURCE tick (clamped so it never
+// crosses or lands on a neighbouring point and stays inside the clip's source window; no snap), its y travel moves the pan
+// by the inverse of [`pan_curve_y`]'s swing (clamped to -127..=127). The release commits ONCE through
+// `EditorState::move_pan_key` (one undo step). The point is found again from the press pixel on every call (no new
+// [`Drag`] field). The kernel Player refuses the kind in `edit_press` (it plays pan centred: NLE-PAN-AUTO-KERNEL).
+
+/// STRIAPANDRAGPT (SR9112): how near (px, in x and in y) a press must come to a pan point's plus mark to grab it.
+pub const PAN_PT_HIT: i64 = 3;
+
+/// STRIAPANDRAGPT (SR9112): the pan point `(source tick, pan)` of `clip` on track row `row` whose plus mark lies within
+/// [`PAN_PT_HIT`] px of `(x, y)` (the nearest by the larger of the two distances; a tie: the earlier point); only points the
+/// clip covers.
+fn pan_point_near(l: &Layout, row: usize, clip: &crate::Clip, x: f64, y: f64) -> Option<(i64, i8)> {
+    let mut best: Option<(f64, (i64, i8))> = None;
+    for &(s, p) in clip.pan_keys.points() {
+        let t = clip.at + (s - clip.src_in);
+        if !clip.covers(t) {
+            continue;
+        }
+        let d = (l.x_of(t) as f64 - x).abs().max((pan_curve_y(l, row, p) as f64 - y).abs());
+        if d <= PAN_PT_HIT as f64 && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, (s, p)));
+        }
+    }
+    best.map(|(_, q)| q)
+}
+
+/// STRIAPANDRAGPT (SR9112): the selected clip under a press on one of its pan points: no shift, no slip, an AUDIO track, the
+/// clip keyed, a point's mark within [`PAN_PT_HIT`] px; `None` otherwise.
+fn pan_point_grip(st: &EditorState, l: &Layout, x: f64, y: f64, shift: bool, slip: bool) -> Option<(usize, usize)> {
+    if shift || slip {
+        return None;
+    }
+    let (track, idx) = st.selection?;
+    let c = st.selected()?;
+    if c.pan_keys.n == 0 || !matches!(st.timeline.tracks.get(track)?.kind, Kind::Audio) {
+        return None;
+    }
+    pan_point_near(l, track, &c, x, y).map(|_| (track, idx))
+}
+
+impl Drag {
+    /// STRIAPANDRAGPT (SR9112): the grabbed point's source tick `s0`, where the pointer puts it `s1` (clamped between its
+    /// neighbours and inside the source window) and its new pan `p1`; `None` when the clip or the point is gone.
+    fn pan_point_target(&self, st: &EditorState) -> Option<(i64, i64, i8)> {
+        let c = *st.timeline.tracks.get(self.track)?.clips.get(self.idx)?;
+        let (s0, p0) = pan_point_near(&self.layout, self.track, &c, self.origin.0, self.origin.1)?;
+        let pts = c.pan_keys.points();
+        let i = pts.iter().position(|q| q.0 == s0)?;
+        let lo = i.checked_sub(1).map_or(c.src_in, |j| (pts[j].0 + 1).max(c.src_in));
+        let hi = pts.get(i + 1).map_or(c.src_out - 1, |q| (q.0 - 1).min(c.src_out - 1));
+        let s1 = (s0 + (self.layout.tick_at(self.at.0) - self.origin_tick)).clamp(lo, hi.max(lo));
+        let v = (self.at.1 - self.origin.1) * 127.0 / (ROW_H as i64 / 2 - 6) as f64;
+        let steps = if v >= 0.0 { (v + 0.5) as i64 } else { (v - 0.5) as i64 };
+        Some((s0, s1, (p0 as i64 + steps).clamp(-127, 127) as i8))
+    }
+    /// STRIAPANDRAGPT (SR9112): a point drag's pointer: `delta` = the point's source-tick change (clamped); no snap, no guide,
+    /// no track change; the pan is read from `at` at the commit.
+    fn pan_point_update(&mut self, st: &EditorState, x: f64, y: f64) {
+        self.at = (x, y);
+        self.guide = None;
+        self.delta = self.pan_point_target(st).map_or(0, |(s0, s1, _)| s1 - s0);
+    }
+    /// STRIAPANDRAGPT (SR9112): a point drag's ONE commit through `EditorState::move_pan_key`.
+    fn finish_pan_point(&self, st: &mut EditorState) -> Result<(), EditError> {
+        let (s0, s1, p1) = self.pan_point_target(st).ok_or(EditError::PanKey)?;
+        st.move_pan_key(s0, s1, p1)
     }
 }
