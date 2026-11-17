@@ -15159,3 +15159,40 @@ fn striachaptersmkv_export_reimports_markers() {
     assert!(!file.windows(4).any(|w| w == [0x10, 0x43, 0xA7, 0x70]), "no markers, no Chapters");
     assert!(Sources::from_media("RE", &file, 25).unwrap().unwrap().0.markers.is_empty());
 }
+
+// ---- STRIASTACKKERNEL (LEDGER SR9092): a layer that changes slot keeps its run (named tail block) ----
+
+/// SR9066's three-layer scene: the frames are the same model byte for byte, and the render opens three runs (B and A at
+/// tick 0, C at 10): A moves mix -> stack[0] at 10 and back at 20, B live -> mix -> live, each without a reopen
+/// (`vmix::hand_stack`, the schedule's `stack_handoff`). SR9066 alone opened six.
+#[test]
+fn striastackkernel_handoff_renders_with_fewer_seeks() {
+    use timeline_core::TransitionKind::Dissolve;
+    use timeline_core::schedule::Frac;
+    let mut tl = Timeline::new(25);
+    let (a, b, c) = (tl.add_source("A", 50), tl.add_source("B", 50), tl.add_source("C", 50));
+    for _ in 0..3 {
+        tl.add_track(Kind::Video);
+    }
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 30, 0)];
+    tl.tracks[2].clips = vec![Clip::new(c, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    src.add(c, synth_source(2000, 50, 25)).unwrap();
+    let tl = tl.set_opacity(&[(1, 0)], 40).unwrap().set_opacity(&[(2, 0)], 50).unwrap();
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..30, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 30);
+    for t in 0..30usize {
+        let mut model = TestPattern::render(64, 48, t as u32);
+        timeline_core::vmix::mix_step(Dissolve, Frac { num: 40, den: 100 }, &mut model, &TestPattern::render(64, 48, 1000 + t as u32), 64, 48);
+        if (10..20).contains(&t) {
+            timeline_core::vmix::mix_step(Dissolve, Frac { num: 50, den: 100 }, &mut model, &TestPattern::render(64, 48, 2000 + t as u32 - 10), 64, 48);
+        }
+        assert_eq!(sink.frames[t].1, model, "tick {t}");
+    }
+    assert_eq!(r.seeks, 3, "B and A at 0, C at 10; no reopen as the stack forms or shrinks");
+    println!("striastackkernel: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
+}

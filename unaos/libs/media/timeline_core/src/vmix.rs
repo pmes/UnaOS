@@ -294,3 +294,87 @@ pub fn take_stack<R>(s: &Step, runs: &mut [Option<R>]) {
         }
     }
 }
+
+// ---- STRIASTACKKERNEL (LEDGER SR9092): the run handoff and the ONE stack composite, both faces (named tail block) ----
+// NLE-STACK-HANDOFF / NLE-STACK-KERNEL. [`hand_stack`] is the consumer half of `schedule::stack_handoff`: on a step that
+// carries a stack (or follows one) a slot whose layer continues (seek none) but whose run is on another source takes the
+// ONE run that holds its source, by a swap over the step's runs in `schedule::slots` order; then [`take_stack`] drops
+// the runs of unused stack indices. Both faces call it BEFORE [`take_outgoing`]. A mismatch costs one keyframe open,
+// never a wrong picture (a run on another source reopens). [`stack_composite`] is the ONE composite order (lifted from
+// Stria's `stack_rgba`), called by Stria's render and the kernel Player's `edl_stack`.
+
+/// STRIASTACKKERNEL: slot `i` of the runs (0 `live`, 1 `mix`, 2.. `runs`).
+fn slot_run<'a, R>(i: usize, live: &'a mut Option<R>, mix: &'a mut Option<R>, runs: &'a mut [Option<R>; crate::schedule::STACK_UNDER]) -> &'a mut Option<R> {
+    match i {
+        0 => live,
+        1 => mix,
+        k => &mut runs[k - 2],
+    }
+}
+
+/// STRIASTACKKERNEL: a continuing layer's run moved into its slot (see the tail head), then [`take_stack`].
+pub fn hand_stack<R>(
+    s: &Step,
+    live: &mut Option<R>,
+    mix: &mut Option<R>,
+    runs: &mut [Option<R>; crate::schedule::STACK_UNDER],
+    src_of: impl Fn(&R) -> SourceId,
+) {
+    if s.stack == crate::schedule::NO_STACK && runs.iter().all(|r| r.is_none()) {
+        return;
+    }
+    let named = crate::schedule::slots(s);
+    for (i, l) in named.iter().enumerate() {
+        let Some((src, _, None)) = *l else { continue };
+        if named.iter().filter(|n| n.is_some_and(|n| n.0 == src)).count() != 1 {
+            continue;
+        }
+        if slot_run(i, live, mix, runs).as_ref().map(&src_of) == Some(src) {
+            continue;
+        }
+        let held: alloc::vec::Vec<usize> =
+            (0..crate::schedule::SLOTS).filter(|&j| slot_run(j, live, mix, runs).as_ref().map(&src_of) == Some(src)).collect();
+        if let &[j] = held.as_slice() {
+            let a = slot_run(i, live, mix, runs).take();
+            let b = slot_run(j, live, mix, runs).take();
+            *slot_run(i, live, mix, runs) = b;
+            *slot_run(j, live, mix, runs) = a;
+        }
+    }
+    take_stack(s, runs);
+}
+
+/// STRIASTACKKERNEL: `top` (the frame of `s.vmix`'s source, straight RGBA `w x h`) composited in place over `s.stack`:
+/// the bottom layer's frame (`layer(j, m)` for a layer with a source, opaque black else), each next layer put on at the
+/// `t` of the entry below it, then `top` at the top entry's `t`, every mix through [`mix_step`]. [`crate::schedule::NO_STACK`]
+/// or an `Err` from `layer` leaves `top` untouched.
+pub fn stack_composite<E>(
+    s: &Step,
+    top: &mut [u8],
+    w: u32,
+    h: u32,
+    mut layer: impl FnMut(usize, &crate::schedule::VideoMix) -> Result<alloc::vec::Vec<u8>, E>,
+) -> Result<(), E> {
+    let mut out: Option<alloc::vec::Vec<u8>> = None;
+    let mut under_t = None;
+    for (j, m) in s.stack.iter().enumerate() {
+        let Some(m) = m else { break };
+        let f = match m.src {
+            Some(_) => layer(j, m)?,
+            None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
+        };
+        out = Some(match (out, under_t) {
+            (Some(mut o), Some(t)) => {
+                mix_step(TransitionKind::Dissolve, t, &mut o, &f, w, h);
+                o
+            }
+            _ => f,
+        });
+        under_t = Some(m.t);
+    }
+    if let (Some(mut o), Some(t)) = (out, under_t) {
+        mix_step(TransitionKind::Dissolve, t, &mut o, top, w, h);
+        top.copy_from_slice(&o);
+    }
+    Ok(())
+}
