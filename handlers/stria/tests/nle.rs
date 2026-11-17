@@ -3971,7 +3971,7 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
     face.state.seek(22);
     assert!(face.verb("in"));
     face.state.seek(0);
-    assert_eq!(face.marks(), (Some(22), None));
+    assert_eq!((face.marks.take(), face.note()), (None, (Some(22), None));
     let tl0 = face.state.timeline.clone();
     let l = face.layout();
     let y = l.point(0, 28).1;
@@ -3981,7 +3981,7 @@ fn striasnapdrag_face_drag_snaps_to_the_in_mark_and_alt_does_not() {
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
     };
     face.on(&nle3eslipdrag_btn(true, x, y, 0));
-    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0));
+    face.on(&bandy::SMessage::BrowserMouseMove(to, y, 0)));
     assert_eq!(l.tick_at(to) - l.tick_at(x), -2, "the raw delta");
     assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.guide)), Some((DragKind::Move, -3, Some(22))));
     let px = face.paint();
@@ -5403,7 +5403,7 @@ fn striatrackaddremove_face_buttons_add_and_remove() {
     assert!(face.verb("track-"));
     assert_eq!(face.last_error.take(), Some(format!("track-: {}", EditError::NoTrack)));
     assert!(face.verb("track- A2"));
-    assert_eq!(face.last_error.take().as_deref(), Some("track-: removed A2 (0 clips)"));
+    assert_eq!((face.last_error.take(), face.note.take().as_deref()), (None, Some("track-: removed A2 (0 clips)")));
     assert_eq!(face.state.timeline, tl0);
     println!("striatrackaddremove: A+ -> 3 tracks, saved with * UNA TRACKS 1 2; track- -> removed V (3 clips); undo; A2 removed");
 }
@@ -10417,4 +10417,33 @@ fn striamultiselectmore_set_drag_down_to_another_video_track_one_undo() {
     assert_eq!(face.state.set, vec![(2, 0), (2, 1)]);
     assert!(face.verb("undo"));
     assert_eq!(face.state.timeline, tl0);
+}
+
+// ---- STRIATRACKSMORE (LEDGER SR955): the `track-` success line is the face's note, not an error (named tail block) ----
+
+/// `track- A2` through `Face::on` names the removal in `note` (no `last_error`: the witness counts that as an error);
+/// `message_text` reads it, an error still wins over it, and the next taken input clears it. Undo then puts the A2
+/// selection back on its own track (SR955's track map).
+#[test]
+fn striatracksmore_track_remove_note_cleared_by_next_input() {
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |w: &str| bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: w.into() };
+    assert!(face.on(&input("track+ audio")));
+    assert!(face.on(&input("track- A2")));
+    let line = "track-: removed A2 (0 clips)";
+    assert_eq!((face.last_error.clone(), face.note.as_deref(), face.message_text().as_deref()), (None, Some(line), Some(line)));
+    face.last_error = Some("x: y".into());
+    assert_eq!(face.message_text().as_deref(), Some("x: y"), "an error wins over the note");
+    face.last_error = None;
+    assert!(face.on(&input("zoom+")));
+    assert_eq!(face.note, None, "the next taken input clears it");
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select(1, 0).unwrap();
+    let a = face.state.selected();
+    assert!(face.on(&input("track- V")));
+    assert_eq!((face.state.selection, face.note.as_deref()), (Some((0, 0)), Some("track-: removed V (3 clips)")));
+    assert!(face.on(&input("undo")));
+    assert_eq!((face.state.timeline.clone(), face.state.selection, face.state.selected(), face.note.clone()), (tl0.clone(), Some((1, 0)), a, None));
+    println!("striatracksmore: track- A2 -> note {line:?}, cleared by zoom+; track- V then undo -> the A1 selection back on track 1");
 }

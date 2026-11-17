@@ -2579,3 +2579,88 @@ fn striaopacitymore_label_names_the_percent() {
     assert_eq!(opacity_label(String::from("A"), timeline_core::OPAQUE), "A");
     println!("striaopacitymore: labels {got:?}");
 }
+
+// ---- STRIATRACKSMORE (LEDGER SR955): undo / redo of a track add or remove remap the selection (named tail block) ----
+mod striatracksmore {
+    use timeline_core::editor::{EditorState, TrackMap, UNDO_MAX};
+    use timeline_core::{Clip, Kind, Timeline};
+
+    /// V1 A[0,20)@0 B[0,20)@20; A1 the same; A2 A[0,10)@0 (A2's clip differs from A1's first).
+    fn three() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let (a, b) = (tl.add_source("A", 100), tl.add_source("B", 100));
+        let (v1, a1, a2) = (tl.add_track(Kind::Video), tl.add_track(Kind::Audio), tl.add_track(Kind::Audio));
+        tl.tracks[v1].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+        tl.tracks[a1].clips = tl.tracks[v1].clips.clone();
+        tl.tracks[a2].clips = vec![Clip::new(a, 0, 10, 0)];
+        tl
+    }
+
+    /// The map's forward and inverse take each other back; a removed track has no forward, an inserted one no inverse.
+    #[test]
+    fn striatracksmore_track_map_fwd_inv() {
+        for m in [TrackMap::Insert(1), TrackMap::Remove(1), TrackMap::Swap(0, 2)] {
+            for t in 0..4 {
+                if let Some(f) = m.fwd(t) {
+                    assert_eq!(m.inv(f), Some(t), "{m:?} {t}");
+                }
+            }
+        }
+        assert_eq!((TrackMap::Remove(1).fwd(1), TrackMap::Insert(1).inv(1)), (None, None));
+        assert_eq!((TrackMap::Insert(1).fwd(0), TrackMap::Insert(1).fwd(1), TrackMap::Remove(1).inv(1)), (Some(0), Some(2), Some(2)));
+        assert_eq!((TrackMap::Swap(0, 2).fwd(0), TrackMap::Swap(0, 2).inv(1)), (Some(2), Some(1)));
+    }
+
+    /// `track- V` then undo: the A2 selection is back on A2's own clip (it read A1's before: `settle` only bounds-checks);
+    /// redo moves it down again; `track+ video` then undo / redo the same; a plain edit after an undo clears the redo side.
+    #[test]
+    fn striatracksmore_undo_redo_remap_selection() {
+        let tl = three();
+        let a2 = tl.tracks[2].clips[0];
+        let mut st = EditorState::new(tl.clone());
+        st.select(2, 0).unwrap();
+        assert_eq!(st.verb("track- V"), Some(Ok(())));
+        assert_eq!((st.selection, st.selected()), (Some((1, 0)), Some(a2)));
+        assert!(st.undo());
+        assert_eq!((st.timeline.clone(), st.selection, st.set.clone(), st.selected()), (tl.clone(), Some((2, 0)), vec![(2, 0)], Some(a2)));
+        assert!(st.redo());
+        assert_eq!((st.timeline.clone(), st.selection, st.selected()), (tl.remove_track(0).unwrap(), Some((1, 0)), Some(a2)));
+        assert!(st.undo());
+        assert_eq!(st.verb("track+ video"), Some(Ok(())));
+        assert_eq!((st.selection, st.selected()), (Some((3, 0)), Some(a2)));
+        assert!(st.undo());
+        assert_eq!((st.timeline.clone(), st.selection, st.selected()), (tl.clone(), Some((2, 0)), Some(a2)));
+        assert!(st.redo());
+        assert_eq!((st.selection, st.selected()), (Some((3, 0)), Some(a2)));
+        assert!(st.undo());
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("delete"), Some(Ok(())));
+        assert!(!st.redo(), "a commit clears the redo side");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl);
+    }
+
+    /// Past UNDO_MAX the maps trim with the timelines: 300 alternating `track+ video` / `track- V2`, then every kept undo
+    /// leaves the selection on A2's clip (a map off by one entry would land it elsewhere).
+    #[test]
+    fn striatracksmore_maps_stay_in_lock_step_past_undo_max() {
+        let tl = three();
+        let a2 = tl.tracks[2].clips[0];
+        let mut st = EditorState::new(tl.clone());
+        for i in 0..300 {
+            assert_eq!(st.verb(if i % 2 == 0 { "track+ video" } else { "track- V2" }), Some(Ok(())), "{i}");
+        }
+        assert_eq!((st.undo_depth(), st.timeline.clone()), (UNDO_MAX, tl.clone()));
+        st.select(2, 0).unwrap();
+        let mut n = 0;
+        while st.undo() {
+            n += 1;
+            assert_eq!(st.selected(), Some(a2), "undo {n}");
+        }
+        assert_eq!((n, st.selection), (UNDO_MAX, Some((2, 0))));
+        while st.redo() {
+            assert_eq!(st.selected(), Some(a2));
+        }
+        assert_eq!(st.timeline, tl);
+    }
+}

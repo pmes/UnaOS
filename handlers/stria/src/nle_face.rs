@@ -169,6 +169,7 @@ pub struct Face {
     labels: Option<TextStyle>,
     still: Option<Still>,
     pub last_error: Option<String>,
+    pub note: Option<String>, // STRIATRACKSMORE (SR955): a success line, read by `message_text` after `last_error`, cleared by the next taken input (`Face::on`)
     /// The shuttle rate in frames per clock tick (J/K/L; 1 for play).
     pub rate: i64,
     drag: Option<Drag>,
@@ -222,7 +223,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -230,7 +231,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2413,7 +2414,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail)
+        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -4023,7 +4024,7 @@ mod striaslipview_tests {
 
 // ---- STRIATRACKADDREMOVE (LEDGER SR856): `track-` names on the message line what it removed (named tail block) ----
 // The `track+` / `track-` words are timeline_core's (`EditorState::verb`). A removal takes the track's clips with it, so a
-// wrong press must be visible: after a `track-` the message road (`last_error`, read by `message_text`) says
+// wrong press must be visible: after a `track-` the face's `note` (read by `message_text` after `last_error`) says
 // `track-: removed <ch> (<n> clips)`, the channel word and clip count read before the one commit; a refusal reads
 // `<word>: <EditError>` as every verb's does.
 impl Face {
@@ -4033,7 +4034,7 @@ impl Face {
         let tl = &self.state.timeline;
         let named = target.ok().and_then(|t| Some((tl.track_word(t)?, tl.tracks.get(t)?.clips.len())));
         match (self.state.verb(v)?, named) {
-            (Ok(()), Some((word, n))) => self.last_error = Some(format!("track-: removed {word} ({n} clip{})", if n == 1 { "" } else { "s" })),
+            (Ok(()), Some((word, n))) => self.note = Some(format!("track-: removed {word} ({n} clip{})", if n == 1 { "" } else { "s" })),
             (Ok(()), None) => {}
             (Err(e), _) => self.last_error = Some(format!("{v}: {e}")),
         }

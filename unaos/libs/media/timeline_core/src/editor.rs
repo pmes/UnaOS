@@ -47,11 +47,12 @@ pub struct EditorState {
     pub transition: Option<(usize, usize)>,
     pub clipboard: Vec<(usize, crate::Kind, Clip)>, // STRIACOPYPASTE (SR854): the copied clips as (track, its kind, clip), replaced whole by `copy` / `cut` (file tail)
     commits: usize, // STRIAAUTOSAVECAP (SR913): every timeline change (commit, undo, redo), monotonic past UNDO_MAX; read by `commits()` (file tail)
+    track_maps: (Vec<Option<TrackMap>>, Vec<Option<TrackMap>>), // STRIATRACKSMORE (SR955): the undo / redo entries' track maps, in lock-step with `undo` / `redo` (file tail)
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0 }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0, track_maps: (Vec::new(), Vec::new()) }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -138,7 +139,7 @@ impl EditorState {
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.undo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, prev);
-        self.redo.push(cur); self.hist.undone(); self.commits = self.commits.wrapping_add(1);
+        self.redo.push(cur); self.hist.undone(); self.commits = self.commits.wrapping_add(1); self.map_step(true); // STRIATRACKSMORE (SR955): the entry's track map, inverted, before settle (file tail)
         self.settle();
         true
     }
@@ -146,7 +147,7 @@ impl EditorState {
     pub fn redo(&mut self) -> bool {
         let Some(next) = self.redo.pop() else { return false };
         let cur = core::mem::replace(&mut self.timeline, next);
-        self.undo.push(cur); self.hist.redone(); self.commits = self.commits.wrapping_add(1);
+        self.undo.push(cur); self.hist.redone(); self.commits = self.commits.wrapping_add(1); self.map_step(false); // STRIATRACKSMORE (SR955): the entry's track map, forward, before settle (file tail)
         self.settle();
         true
     }
@@ -165,7 +166,7 @@ impl EditorState {
         if self.undo.len() > UNDO_MAX {
             self.undo.remove(0);
         }
-        self.redo.clear(); self.commits = self.commits.wrapping_add(1);
+        self.redo.clear(); self.commits = self.commits.wrapping_add(1); self.map_commit(); // STRIATRACKSMORE (SR955): a `None` track map for the new entry (file tail)
         self.settle();
     }
     /// Keep the selection and the playhead valid for the current timeline.
@@ -1545,7 +1546,7 @@ impl EditorState {
         let slot = self.timeline.track_slot(kind);
         let tl = self.timeline.insert_track(kind)?;
         self.retrack(|t| Some(if t >= slot { t + 1 } else { t }));
-        self.commit(tl);
+        self.commit(tl); self.tag_map(TrackMap::Insert(slot)); // STRIATRACKSMORE (SR955): undo / redo remap the selection (file tail)
         Ok(())
     }
     /// Remove track `track` with its clips (one commit); its selected entries go, later ones move down one track.
@@ -1556,7 +1557,7 @@ impl EditorState {
             t if t > track => Some(t - 1),
             t => Some(t),
         });
-        self.commit(tl);
+        self.commit(tl); self.tag_map(TrackMap::Remove(track)); // STRIATRACKSMORE (SR955): undo / redo remap the selection (file tail)
         Ok(())
     }
     /// The track `track-` words name: `Some(Ok(index))`, `Some(Err(NoTrack))` for none, `None` when `v` is no `track-` word.
@@ -3208,5 +3209,71 @@ mod striamultiselectmore_tests {
         let mut plain = state();
         assert_eq!(same.move_set_track(0, 5), plain.move_set(5));
         assert_eq!(same, plain, "dtrack 0 is move_set");
+    }
+}
+
+// ---- STRIATRACKSMORE (LEDGER SR955): the track map an undo entry carries, so undo / redo remap the selection (named tail block) ----
+// A track op (`add_track`, `remove_track`; SR877's `move_track` tags `Swap` at the fold) moves track indices, and the
+// selection, the set and the selected transition hold them. The op remaps them before its commit; its undo / redo used to
+// restore only the timeline, and `settle` only bounds-checks, so a held `(track, clip)` then named ANOTHER track's clip.
+// Each undo entry now carries an `Option<TrackMap>` in `track_maps` (`.0` beside `undo`, `.1` beside `redo`), kept in
+// lock-step: `commit` pushes `None` (trimmed with UNDO_MAX, the redo side cleared), the op tags its own entry, undo applies
+// the map's INVERSE through `retrack`, redo the map FORWARD, both before `settle`. A selection on a removed track was dropped
+// at the removal and stays gone after its undo. Every other op's entry is `None`: undo behaves as before.
+
+/// STRIATRACKSMORE: how one edit moved the track indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackMap {
+    /// A track inserted at this index (later ones moved up one).
+    Insert(usize),
+    /// This track removed (later ones moved down one).
+    Remove(usize),
+    /// Two tracks swapped (SR877's `move_track`, tagged at the fold).
+    Swap(usize, usize),
+}
+
+impl TrackMap {
+    /// Where the edit took track `t` (`None`: it went).
+    pub fn fwd(self, t: usize) -> Option<usize> {
+        match self {
+            TrackMap::Insert(s) => Some(if t >= s { t + 1 } else { t }),
+            TrackMap::Remove(r) if t == r => None,
+            TrackMap::Remove(r) => Some(if t > r { t - 1 } else { t }),
+            TrackMap::Swap(a, b) => Some(if t == a { b } else if t == b { a } else { t }),
+        }
+    }
+    /// Where undoing the edit takes track `t` (`None`: the inserted track goes).
+    pub fn inv(self, t: usize) -> Option<usize> {
+        match self {
+            TrackMap::Insert(s) if t == s => None,
+            TrackMap::Insert(s) => Some(if t > s { t - 1 } else { t }),
+            TrackMap::Remove(r) => Some(if t >= r { t + 1 } else { t }),
+            TrackMap::Swap(..) => self.fwd(t),
+        }
+    }
+}
+
+impl EditorState {
+    /// Tag the entry the last `commit` pushed with the track map of its edit.
+    fn tag_map(&mut self, m: TrackMap) {
+        if let Some(last) = self.track_maps.0.last_mut() {
+            *last = Some(m);
+        }
+    }
+    /// `commit`'s side: a `None` map beside the new undo entry, trimmed with it; the redo side cleared with `redo`.
+    fn map_commit(&mut self) {
+        self.track_maps.0.push(None);
+        if self.track_maps.0.len() > UNDO_MAX {
+            self.track_maps.0.remove(0);
+        }
+        self.track_maps.1.clear();
+    }
+    /// `undo`'s side (`undo`: true) or `redo`'s: the entry's map moves to the other stack and remaps the held indices.
+    fn map_step(&mut self, undo: bool) {
+        let m = (if undo { self.track_maps.0.pop() } else { self.track_maps.1.pop() }).flatten();
+        if let Some(m) = m {
+            if undo { self.retrack(|t| m.inv(t)) } else { self.retrack(|t| m.fwd(t)) }
+        }
+        if undo { self.track_maps.1.push(m) } else { self.track_maps.0.push(m) }
     }
 }
