@@ -3891,3 +3891,111 @@ fn paint_xfade_name(c: &mut Canvas, labels: &mut Option<&mut dyn Text>, curve: c
         text.text(c, curve.word(), x0 as f32 + 2.0, y0 as f32 - 1.0, (x0 as i32, x1 as i32));
     }
 }
+
+// ---- STRIAROLLNEXT (LEDGER SR999): the roll tool's cue on the cuts a press would roll (named tail block) ----
+// SR954's roll tool had no cue on the band (NLE-ROLL-TOOL-PAINT). The cue asks the press road itself: for the primary's
+// drawn in and out handles it runs `Drag::begin_with` (THE press classification) on a probe state holding the same
+// Timeline and selection, then SR954's `Drag::rolled` (THE roll predicate), and keeps the cut of every drag that rolls.
+// So the cue marks exactly the cuts a press would roll: no second hit test, no second butted-neighbour rule, no Drag
+// literal. The host face paints it only while its tool is on and no drag is live; off, the canvas is returned untouched,
+// so every golden is byte-identical. The kernel band has no tool and never calls it.
+
+/// STRIAROLLNEXT (SR999): the roll tool's cue over a cut a press would roll.
+pub const ROLL_CUE: [u8; 4] = [0x40, 0xff, 0x90, 255];
+
+/// STRIAROLLNEXT (SR999): the cuts `(track, tick)` a press on the primary's in / out handle would roll with the roll tool
+/// on (none without a selection or a butted neighbour).
+pub fn roll_cuts(st: &EditorState, l: Layout) -> Vec<(usize, i64)> {
+    let (Some((track, idx)), Some(c)) = (st.selection, st.selected()) else { return Vec::new() };
+    let mut probe = EditorState::new(st.timeline.clone());
+    if probe.select(track, idx).is_err() {
+        return Vec::new();
+    }
+    let y = (l.row_y(track) + ROW_H as i64 / 2) as f64;
+    let mut v: Vec<(usize, i64)> = Vec::new();
+    for x in [l.x_of(c.at) as f64, (l.x_of(c.end()) - 1) as f64] {
+        let d = Drag::begin_with(&mut probe, l, x, y, false, true, false).map(|d| d.rolled(&probe, true));
+        if let Some(d) = d.filter(|d| d.roll) {
+            if let Some(a) = probe.timeline.tracks.get(d.track).and_then(|tr| tr.clips.get(d.idx)) {
+                if !v.contains(&(d.track, a.end())) {
+                    v.push((d.track, a.end()));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// STRIAROLLNEXT (SR999): the roll cue over a painted canvas: with `on`, a 4 px [`ROLL_CUE`] column straddling each of
+/// [`roll_cuts`]' cuts over its row (the two clip edges that move together); off, `px` untouched.
+pub fn paint_roll_cue(px: Vec<u8>, l: Layout, order: Order, st: &EditorState, on: bool) -> Vec<u8> {
+    if !on {
+        return px;
+    }
+    let cuts = roll_cuts(st, l);
+    if cuts.is_empty() {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    for (track, t) in cuts {
+        let (x, y0) = (l.x_of(t), l.row_y(track));
+        c.rect(x - 2, y0 + 2, x + 2, y0 + ROW_H as i64 - 2, ROLL_CUE);
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod striarollnext_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLEFXA 0..10 at 0, 10..20 at 10, 20..30 at 20 (three butted clips) and 32..36 at 32 (a gap before it), the view
+    /// band `Role::Tracks` 320x56; clip `sel` selected.
+    fn cue_fixture(sel: usize) -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10), Clip::new(a, 20, 30, 20), Clip::new(a, 32, 36, 32)];
+        let mut st = EditorState::new(tl);
+        st.select(0, sel).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        (st, l)
+    }
+
+    /// STRIAROLLNEXT (SR999) M3: the first clip rolls only its out cut, the middle clip both cuts, the gapped last clip
+    /// none; no selection, none.
+    #[test]
+    fn roll_cuts_are_the_cuts_a_press_rolls() {
+        let (st, l) = cue_fixture(0);
+        assert_eq!(roll_cuts(&st, l), alloc::vec![(0, 10)]);
+        let (st, l) = cue_fixture(1);
+        assert_eq!(roll_cuts(&st, l), alloc::vec![(0, 10), (0, 20)]);
+        let (st, l) = cue_fixture(3);
+        assert_eq!(roll_cuts(&st, l), Vec::<(usize, i64)>::new());
+        let (mut st, l) = cue_fixture(0);
+        st.selection = None;
+        assert_eq!(roll_cuts(&st, l), Vec::<(usize, i64)>::new());
+    }
+
+    /// STRIAROLLNEXT (SR999) M3: off, the paint is `paint_in`'s byte for byte; on, ROLL_CUE straddles the cut at tick 10.
+    #[test]
+    fn roll_cue_paints_only_when_on() {
+        let (st, l) = cue_fixture(0);
+        let base = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(paint_roll_cue(base.clone(), l, Order::Rgba, &st, false), base);
+        let px = paint_roll_cue(base.clone(), l, Order::Rgba, &st, true);
+        let at = |x: i64, y: i64| px[((y * 320 + x) * 4) as usize..((y * 320 + x) * 4 + 4) as usize].to_vec();
+        let (x, y) = (l.x_of(10), l.row_y(0) + ROW_H as i64 / 2);
+        assert_eq!((at(x - 2, y), at(x + 1, y)), (ROLL_CUE.to_vec(), ROLL_CUE.to_vec()));
+        assert_ne!(px, base);
+    }
+
+    /// STRIAROLLNEXT (SR999) M3: the probe leaves the caller's state alone (selection, set, undo depth).
+    #[test]
+    fn roll_cuts_leave_the_state_alone() {
+        let (st, l) = cue_fixture(1);
+        let before = (st.selection, st.set.clone(), st.undo_depth(), st.timeline.clone());
+        let _ = roll_cuts(&st, l);
+        assert_eq!((st.selection, st.set.clone(), st.undo_depth(), st.timeline.clone()), before);
+    }
+}

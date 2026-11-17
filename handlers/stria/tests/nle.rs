@@ -2411,9 +2411,9 @@ fn nle3eslipstep_ctrl_less_slides_ten_with_neighbours() {
     assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 13, 33, 20)], "both neighbours follow");
     assert!(nle3eslipstep_chord(&mut face, "Ctrl+Shift+greater"));
     assert_eq!(face.state.timeline, tl);
-    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+less"));
+    assert!(nle3eslipstep_chord(&mut face, "Shift+Meta+less"));
     assert_eq!(face.state.timeline, twin.timeline);
-    assert!(nle3eslipstep_chord(&mut face, "Meta+Shift+greater"));
+    assert!(nle3eslipstep_chord(&mut face, "Shift+Meta+greater"));
     assert_eq!(face.state.timeline, tl);
     assert!(face.last_error.is_none(), "{:?}", face.last_error);
     println!("nle3eslipstep: Ctrl+Shift+less = slide -{SLIP_STEP}, the neighbours follow");
@@ -2444,8 +2444,8 @@ fn nle3eslipstep_help_and_the_one_frame_keys() {
     let chords = [
         ("Ctrl+comma", "Meta+comma", "slip-10"),
         ("Ctrl+period", "Meta+period", "slip+10"),
-        ("Ctrl+Shift+less", "Meta+Shift+less", "slide-10"),
-        ("Ctrl+Shift+greater", "Meta+Shift+greater", "slide+10"),
+        ("Ctrl+Shift+less", "Shift+Meta+less", "slide-10"),
+        ("Ctrl+Shift+greater", "Shift+Meta+greater", "slide+10"),
     ];
     let rows = help_rows();
     for (c, m, w) in chords {
@@ -11984,4 +11984,49 @@ fn striaopacitynext_step_note_is_not_an_error() {
     assert_eq!(face.note, None, "a taken input clears it");
     assert_eq!(face.message_text(), face.reel_line());
     println!("striaopacitynext: opacity- -> note opacity: 90 %, cleared by select-all");
+}
+
+// ---- STRIAROLLNEXT (LEDGER SR999): the roll tool's cue on the band, GTK's order for the slide-ten chords (named tail block) ----
+
+/// Rule: the tool on with V1 clip 0 selected (synth_fixture: A [13,23)@0 | B [0,10)@10 butted), the face's paint shows
+/// timeline_core's ROLL_CUE straddling the cut at tick 10 on V1's row; the tool off again, the paint is byte-identical to
+/// the paint before the tool was turned on.
+#[test]
+fn striarollnext_tool_paints_the_cue_on_the_cut() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 0).unwrap();
+    let off = face.paint();
+    assert!(face.verb("roll-tool"));
+    let on = face.paint();
+    let l = face.layout();
+    let (x, y) = (l.x_of(10), l.point(0, 5).1 as i64);
+    let at = |px: &[u8], x: i64, y: i64| px[((y * l.w as i64 + x) * 4) as usize..((y * l.w as i64 + x) * 4 + 4) as usize].to_vec();
+    assert_eq!(at(&on, x - 2, y), timeline_core::view::ROLL_CUE.to_vec());
+    assert_eq!(at(&on, x + 1, y), timeline_core::view::ROLL_CUE.to_vec());
+    assert_ne!(at(&off, x - 2, y), timeline_core::view::ROLL_CUE.to_vec());
+    assert!(face.verb("roll-tool"));
+    assert_eq!(face.paint(), off, "off: byte-identical");
+    println!("striarollnext: the roll tool paints ROLL_CUE over the cut at x {x}");
+}
+
+/// Rule: SR752's Cmd slide-ten rows take GTK's chord order: `Shift+Meta+less` is `slide -10` (a twin editor's), and
+/// `Shift+Meta+greater` takes it back; the `Meta+Shift+` spellings are no KEYS rows.
+#[test]
+fn striarollnext_cmd_slide_chords_take_gtks_order() {
+    let (mut tl, src) = synth_fixture();
+    let (a, b) = (SourceId(0), SourceId(1));
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 20), Clip::new(a, 23, 33, 30)];
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(0, 22).unwrap();
+    let mut twin = EditorState::new(tl.clone());
+    twin.select_at(0, 22).unwrap();
+    assert_eq!(twin.verb("slide -10"), Some(Ok(())));
+    assert!(nle3eslipstep_chord(&mut face, "Shift+Meta+less"));
+    assert_eq!(face.state.timeline, twin.timeline);
+    assert!(nle3eslipstep_chord(&mut face, "Shift+Meta+greater"));
+    assert_eq!(face.state.timeline, tl);
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(!KEYS.iter().any(|k| k.0 == "Meta+Shift+less" || k.0 == "Meta+Shift+greater"));
+    println!("striarollnext: Shift+Meta+less / greater slide ten");
 }

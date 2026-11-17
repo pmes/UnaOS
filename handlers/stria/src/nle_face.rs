@@ -418,10 +418,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+period", "slip+10"),
     ("Meta+period", "slip+10"),
     ("Ctrl+Shift+less", "slide-10"),
-    ("Meta+Shift+less", "slide-10"),
+    ("Shift+Meta+less", "slide-10"), // STRIAROLLNEXT (SR999): GTK names the chord Ctrl+ Alt+ Shift+ Meta+ in that order
     ("Ctrl+Shift+greater", "slide+10"),
-    ("Meta+Shift+greater", "slide+10"),
-    ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name)
+    ("Shift+Meta+greater", "slide+10"),
+    ("m", "mark"), // STRIAMARKERS (SR835): drop a marker at the playhead (text key, the default name) // STRIAROLLNEXT (SR999): GTK's order
     ("(", "roll-"), (")", "roll+"), ("Ctrl+Shift+parenleft", "roll-10"), ("Shift+Meta+parenleft", "roll-10"), ("Ctrl+Shift+parenright", "roll+10"), ("Shift+Meta+parenright", "roll+10"), // STRIAROLLKEYS (SR893): ( / ) roll the cut at the selected clip's out edge one frame; Ctrl / Cmd + Shift + ( / ) SLIP_STEP frames; STRIAROLLMORE (SR954): GTK names the chord Ctrl+ Alt+ Shift+ Meta+ in that order
     ("r", "roll-tool")
     ("t", "tc"), // STRIATCSET (SR908): `t` (text) cycles the playhead readout through the `tc` word (file tail)
@@ -1662,7 +1662,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
-        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
+        { let px = paint_marks(paint_export(paint_meter_clips(paint_meters(view::paint_drag(view::paint_roll_cue(self.paint_transition_still(px, l), l, vo(self.order), &self.state, self.roll_tool && self.drag.is_none()), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped()), l, self.order, self.export_frac()), l, self.order, self.marks()); self.paint_help(px, l) } // NLEFACEEXPORT (SR694): the progress band over the ruler's foot; NLE5DEXPORTRANGE (SR717): the in / out marks over the ruler; NLE5DKEYSHELP (SR744): the keys help over the timeline band, last (file tail)
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
@@ -8777,3 +8777,9 @@ impl Face {
         }
     }
 }
+
+// ---- STRIAROLLNEXT (LEDGER SR999): the roll tool's cue and GTK's order for the slide-ten chords (named tail block) ----
+// While the roll tool is on and no drag is live, `paint_role` paints timeline_core's `view::paint_roll_cue` under the drag
+// overlay: a ROLL_CUE column over each cut a press on the primary's handles would roll (the press road and SR954's
+// `Drag::rolled` asked on a probe state); off, the canvas is untouched. SR752's Cmd slide-ten rows take GTK's chord order
+// (`Shift+Meta+less` / `Shift+Meta+greater`), as SR954 did for the roll rows. Owed: NLE-ROLL-TOOL-CUE-KERNEL.
