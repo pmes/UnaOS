@@ -1416,7 +1416,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 position.to_string(),
                 rgb(me.color),
                 paint.background.map(rgb).unwrap_or_else(|| "rgba(0, 0, 0, 0)".to_string()),
-                px(me.font_size),
+                px(font_size_used(&paint, me.font_size)),
                 me.weight.to_string(),
                 if me.italic { "italic" } else { "normal" }.to_string(),
                 crate::fonts::serialize_family_list(&crate::fonts::family_list(me.family)),
@@ -1717,4 +1717,15 @@ mod tests {
     }
 
 
+}
+
+// ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+/// AETHERCSSOMFONTSIZEREL (SR819): the computed `font-size` is the size the element is laid out and painted at:
+/// `PaintStyle::used_font_size`, which layout_core's prepass writes per element from `computed_font_size` (em, %,
+/// smaller / larger, rem and `font: inherit`'s parent-relative road against the parent's used size) and the painter
+/// reads. `computed_report` passes the node's paint record from the same flushed tree, so nothing is recomputed; an
+/// element without a laid-out record (no box) keeps the report's specified / tag-default chain.
+fn font_size_used(paint: &crate::layout::PaintStyle, specified: f32) -> f32 {
+    paint.used_font_size.unwrap_or(specified)
 }
