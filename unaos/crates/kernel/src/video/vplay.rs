@@ -1898,7 +1898,7 @@ fn tick_of(tb: timeline_core::Timebase, ms: u64) -> i64 {
 /// saved back when the timeline changed. `Some(ms)`: the playhead to restart the job at (the seek door); `None`: refused,
 /// unchanged, or no EDL open at `path`.
 pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
-    let verb = edit_verb(b)?;
+    let verb = edit_verb(b)?; band_note_clear(); // STRIAKINSERTALL (SR9090): any editing key ends the band's note, the host's taken input (file tail)
     let (at, tl, clips, undo, back) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
@@ -1928,7 +1928,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
             }
             None => return None,
         }
-        let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        laid_note(st, verb); let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum(); // STRIAKINSERTALL (SR9090): a laying word's line on the band (file tail)
         (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(if timeline_core::editor::lays(verb) { st.playhead } else { at }).max(0) as u64) / 1_000_000) // STRIAKINSERT (SR9062): a laying word restarts at the laid end, where the host's playhead lands (file tail)
     };
     let saved = edit_save(path, &tl); // NLE6FACEDRAG (rmbp-ledger B975): the ONE save, shared with the drag door (file tail)
@@ -1943,7 +1943,7 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); band_note_clear(); // STRIAKINSERTALL (SR9090): the note goes with the editor state; NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
@@ -1970,7 +1970,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
     let st = shown.as_ref().unwrap_or(&e.st);
-    let px = pack(&view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()));
+    let px = pack(&band_note_paint(view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()), l)); // STRIAKINSERTALL (SR9090): the band's note in the ruler row, nothing without one (file tail)
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -2258,7 +2258,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     if y < y0 || y >= y0 + l.h as usize || x >= l.w as usize {
         return false;
     }
-    let d = {
+    band_note_clear(); let d = { // STRIAKINSERTALL (SR9090): a band press ends the band's note (it marks BAND_DIRTY: the band repaints)
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
         let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
@@ -2678,3 +2678,56 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 // `[nle] edit insert at=<tick> clips=<n> undo=<n> saved=<bytes>`, `[nle] edit overwrite-marked at=<tick> refused (no in /
 // out marks set)`. Host check: timeline_core editor.rs `striakinsert_tests`; the Player side is unexercised (owed
 // NLE-INSERT-KERNEL-WITNESS).
+
+// ---- STRIAKINSERTALL (LEDGER SR9090): the band's note — the laid line on the Player's ruler row (named tail block) ----
+// The Player's band is `Role::Tracks` (no preview band, so no message row). [`BAND_NOTE`] is ONE line of text the band shows
+// right-aligned in its ruler row over a `view::RULER` backing, through the band's label road ([`ViewLabels`], the kernel's
+// ONE text seam); no note paints nothing, so every band pin stays byte-identical. Its first caller is [`laid_note`]: after
+// a laying word (timeline_core `editor::lays`) the line is timeline_core's `EditorState::laid_line`, the host face's
+// message-row text (`<word>: <reel> <length> at <record in>`). Other Player notes (size, opacity, duration, snap, shuttle)
+// route here through [`band_note_set`]. Cleared as the host's line is, by the next taken input: any editing key
+// ([`edit_key`]), a band press ([`edit_press`]), the Player's close ([`edit_close`]). Lock order: `EDIT` then `BAND_NOTE`,
+// never reversed (the paint try-locks). Wire: `[nle] note <line>`. Owed: NLE-INSERT-KERNEL-LAID-WITNESS,
+// NLE-INSERT-KERNEL-LAID-STALE (a refused key clears the note but restarts nothing: the old line stays painted until the
+// next present), NLE-INSERT-KERNEL-ALL (the host binds no key for the all-tracks words).
+
+/// The band's note: one line shown in the ruler row (`None`: no note).
+static BAND_NOTE: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+
+/// Set the band's note (the next present or band repaint shows it).
+fn band_note_set(line: String) {
+    serial_println!("[nle] note {}", line);
+    *BAND_NOTE.lock() = Some(line);
+}
+
+/// Clear the band's note.
+fn band_note_clear() {
+    *BAND_NOTE.lock() = None;
+}
+
+/// After a successful `verb` on the Player's editor state: a laying word's laid line becomes the band's note.
+fn laid_note(st: &timeline_core::editor::EditorState, verb: &str) {
+    if timeline_core::editor::lays(verb) {
+        if let Some(line) = st.laid_line(verb) {
+            band_note_set(line);
+        }
+    }
+}
+
+/// [`view_band`]'s painted band `px` (layout `l`, RGBA) with the band's note right-aligned in its ruler row over a
+/// `view::RULER` backing; unchanged with no note (or the note's lock held this pass).
+fn band_note_paint(px: Vec<u8>, l: timeline_core::view::Layout) -> Vec<u8> {
+    use timeline_core::view;
+    let Some(line) = BAND_NOTE.try_lock().and_then(|g| g.as_ref().cloned()) else { return px };
+    let w = l.w as usize;
+    if w == 0 || line.is_empty() {
+        return px;
+    }
+    let pen = super::text::draw_with(line.as_bytes(), false, super::text::Face::Body, 0, 0, w, 0, &mut |_, _, _| {});
+    let x = w.saturating_sub(pen + 4);
+    let mut c = view::Canvas { w: l.w, h: l.h, order: view::Order::Rgba, px };
+    let ry = l.ruler_y as i64;
+    c.rect(x.saturating_sub(4) as i64, ry, w as i64, ry + view::RULER_H as i64, view::RULER);
+    view::Text::text(&mut ViewLabels(0), &mut c, &line, x as f32, ry as f32 + LABEL_RISE, (x as i32, w as i32));
+    c.px
+}

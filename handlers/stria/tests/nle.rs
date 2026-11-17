@@ -3873,3 +3873,23 @@ fn striakinsert_face_keys_name_the_laying_words() {
     }
     println!("striakinsert: KEYS w d W D -> laying words (the Player's bytes, the same words)");
 }
+
+// ---- STRIAKINSERTALL (LEDGER SR9090): the face's laid line is timeline_core's one line (named tail block) ----
+
+/// After `insert` / `overwrite` the face's message row reads `EditorState::laid_line`, the line the kernel Player paints in
+/// its band's ruler row: the SR924 string, from timeline_core, not a host copy.
+#[test]
+fn striakinsertall_face_laid_line_is_the_editors() {
+    for word in ["insert", "overwrite"] {
+        let (tl, src) = synth_fixture();
+        let mut face = nlefaceexport_face(tl, src);
+        face.state.select(0, 1).unwrap();
+        face.state.seek(15);
+        assert!(face.verb(word), "{word}");
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        let line = face.state.laid_line(word);
+        assert_eq!(line, Some(format!("{word}: B 00:00:00:10 at 00:00:00:15")));
+        assert_eq!(face.message_text(), line, "{word}: the message row is the editor's laid line");
+    }
+    println!("striakinsertall: insert / overwrite -> message row == EditorState::laid_line");
+}
