@@ -10365,3 +10365,56 @@ fn striathumbnailsmore_heads_before_tiles() {
     }
     println!("striathumbnailsmore: heads first, decodes=12 after {paints} paints");
 }
+
+// ---- STRIAMULTISELECTMORE (LEDGER SR950): the set toggle and the set dragged to another track (named tail block) ----
+// A shift-click on a clip already in NLE2c's set takes it out (timeline_core `Drag::release_still` ->
+// `EditorState::select_remove`, no undo step); a set dragged onto another row of its kind lands there as ONE commit
+// (`EditorState::move_set_track` -> `Timeline::move_many_track`).
+
+#[test]
+fn striamultiselectmore_shift_click_member_toggles_it_out() {
+    let (tl, src) = stria::nle_face::synth_fixture();
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 160), stria::nle_face::PixelOrder::Rgba, false);
+    let tl0 = face.state.timeline.clone();
+    let (x, y) = face.layout().point(0, 15); // V1's B[0,10)@10
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x, y, 0));
+    let (xa, ya) = face.layout().point(1, 30); // A1's A[23,33)@25
+    face.on(&nle3eslipdrag_btn(true, xa, ya, bandy::MOD_SHIFT));
+    face.on(&nle3eslipdrag_btn(false, xa, ya, bandy::MOD_SHIFT));
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((1, 2)), vec![(0, 1), (1, 2)]));
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_SHIFT));
+    assert!(face.on(&nle3eslipdrag_btn(false, x, y, bandy::MOD_SHIFT)));
+    assert_eq!((face.state.selection, face.state.set.clone()), (Some((1, 2)), vec![(1, 2)]), "V1's B toggled out");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0), "view-only");
+    face.on(&nle3eslipdrag_btn(true, xa, ya, bandy::MOD_SHIFT));
+    face.on(&nle3eslipdrag_btn(false, xa, ya, bandy::MOD_SHIFT));
+    assert_eq!((face.state.selection, face.state.set.len()), (None, 0), "the last member toggled out");
+}
+
+#[test]
+fn striamultiselectmore_set_drag_down_to_another_video_track_one_undo() {
+    let (mut tl, src) = stria::nle_face::synth_fixture();
+    tl.add_track(Kind::Video);
+    let mut face = stria::nle_face::Face::new(stria::nle_face::EditorState::new(tl), src, (320, 200), stria::nle_face::PixelOrder::Rgba, false);
+    let tl0 = face.state.timeline.clone();
+    let (x, y) = face.layout().point(0, 15); // V1's B[0,10)@10
+    face.on(&nle3eslipdrag_btn(true, x, y, 0));
+    face.on(&nle3eslipdrag_btn(false, x, y, 0));
+    let (xa, ya) = face.layout().point(0, 5); // V1's A[13,23)@0
+    face.on(&nle3eslipdrag_btn(true, xa, ya, bandy::MOD_SHIFT));
+    face.on(&nle3eslipdrag_btn(false, xa, ya, bandy::MOD_SHIFT));
+    assert_eq!(face.state.set, vec![(0, 0), (0, 1)]);
+    let (_, y2) = face.layout().point(2, 15); // V2, empty
+    face.on(&nle3eslipdrag_btn(true, x, y, bandy::MOD_ALT));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + 40.0, y2, 0));
+    assert_eq!(face.dragging().map(|d| (d.delta, d.to_track)), Some((5, 2)));
+    face.on(&nle3eslipdrag_btn(false, x + 40.0, y2, bandy::MOD_ALT));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    let want = tl0.move_many_track(&[(0, 0), (0, 1)], 2, 5).unwrap();
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&want, 1), "ONE commit");
+    assert_eq!(face.state.timeline.tracks[0].clips.len(), 1, "V1 keeps its third clip");
+    assert_eq!(face.state.set, vec![(2, 0), (2, 1)]);
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl0);
+}

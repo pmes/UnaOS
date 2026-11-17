@@ -491,7 +491,7 @@ impl Face {
         let Some(mut d) = self.drag.take() else { return self.click(x, y) };
         d.update(&self.state, x, y);
         if !d.moved() {
-            return if d.additive { true } else { self.click(x, y) };
+            return if d.additive { d.release_still(&mut self.state); true } else { self.click(x, y) }; // STRIAMULTISELECTMORE (SR950): a shift-click on a set member takes it out (timeline_core view.rs `Drag::release_still`)
         }
         if d.kind == DragKind::Scrub {
             self.state.seek(d.origin_tick + d.delta);

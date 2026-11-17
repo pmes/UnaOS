@@ -616,7 +616,7 @@ pub struct Drag {
     /// NLE2c: snap the moving edge to clip edges / the playhead (off under the no-snap modifier).
     pub snap: bool,
     /// NLE2c: begun with shift (adds to the set instead of replacing it).
-    pub additive: bool,
+    pub additive: bool, pub toggle: bool,
     /// NLE2c: the tick the delta snapped to (painted as the guide line).
     pub guide: Option<i64>,
     /// STRIARIPPLETRIM (SR850): a trim begun with shift on the primary's handle ripples (`EditorState::ripple_trim`).
@@ -645,7 +645,7 @@ impl Drag {
             origin: (x, y),
             at: (x, y),
             snap: !nosnap,
-            additive: shift,
+            additive: shift, toggle: false,
             guide: None,
             ripple: false,
         };
@@ -667,13 +667,13 @@ impl Drag {
             }
         }
         match l.hit(&st.timeline, x, y) {
-            Hit::Clip(track, idx, _) => {
+            Hit::Clip(track, idx, _) => { let toggle = shift && st.set.contains(&(track, idx)); // STRIAMULTISELECTMORE (SR950): a shift-press on a member toggles it out if released still (file tail)
                 if shift || st.set.contains(&(track, idx)) {
                     st.select_add(track, idx).ok()?;
                 } else {
                     st.select(track, idx).ok()?;
                 }
-                Some(mk(if slip { DragKind::Slip } else { DragKind::Move }, track, idx))
+                Some(Drag { toggle, ..mk(if slip { DragKind::Slip } else { DragKind::Move }, track, idx) })
             }
             Hit::Track(track, _) => Some(mk(DragKind::Marquee, track, 0)),
             Hit::Ruler(_) => Some(mk(DragKind::Scrub, 0, 0)),
@@ -689,7 +689,7 @@ impl Drag {
         if self.snap {
             self.snap_delta(st, x);
         }
-        if self.kind != DragKind::Move || st.set.len() > 1 {
+        if self.kind != DragKind::Move { // STRIAMULTISELECTMORE (SR950): a set follows the row too (`move_set_track`)
             return;
         }
         if let Hit::Clip(row, ..) | Hit::Track(row, _) = self.layout.hit(&st.timeline, x, y) {
@@ -728,7 +728,7 @@ impl Drag {
             DragKind::TrimOut => st.trim(Edge::Out, self.delta),
             DragKind::Slip => st.slip_selected(self.delta),
             DragKind::Slide => st.slide_selected(self.delta),
-            DragKind::Move if st.set.len() > 1 => st.move_set(self.delta),
+            DragKind::Move if st.set.len() > 1 => st.move_set_track(self.to_track as isize - self.track as isize, self.delta), // STRIAMULTISELECTMORE (SR950)
             _ => {
                 let at = st.selected().ok_or(EditError::NoClip)?.at;
                 st.move_selected(self.to_track, at + self.delta)
@@ -1003,7 +1003,7 @@ impl Drag {
             origin: (x, y),
             at: (x, y),
             snap: !nosnap,
-            additive: false,
+            additive: false, toggle: false,
             guide: None,
             ripple: false,
         })
@@ -3254,5 +3254,87 @@ mod strip_tests {
         assert!(box_is(&buf, l.w, x0, y0, &marked(0)));
         let bar = clip_colour(0, Kind::Video);
         assert!((x0 + 48..x1).all(|x| px(&buf, l.w, x, y0 + 10) == bar), "undecoded middles and tail keep the bar");
+    }
+}
+
+// ---- STRIAMULTISELECTMORE (LEDGER SR950): the set toggle at a still release, the set dragged to another row (named tail block) ----
+// `Drag.toggle` is set by `begin_with` when a shift-press lands on a clip already in the set; the face's still release
+// calls [`Drag::release_still`], which takes that clip out (`EditorState::select_remove`: view-only, no commit). A
+// shift-drag that moves keeps moving the whole set. A set's Move drag follows the row under the pointer (a track of the
+// pressed clip's kind) and commits through `EditorState::move_set_track` (ONE commit, refused whole).
+impl Drag {
+    /// The press came up where it went down: a shift-press on a set member takes it out of the set. `true` when the set
+    /// changed.
+    pub fn release_still(&self, st: &mut EditorState) -> bool {
+        self.toggle && !self.moved() && st.select_remove(self.track, self.idx)
+    }
+}
+
+#[cfg(test)]
+mod striamultiselectmore_tests {
+    use super::*;
+    use crate::Clip;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10; A1: A 0..20 at 0; V2 (row 2) empty; the set both V1 clips, primary V1's B; the
+    /// tracks band of a 320x136 canvas (three rows).
+    fn state() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        let l = Layout::of_role(Role::Tracks, 320, 136, &st);
+        (st, l)
+    }
+
+    #[test]
+    fn striamultiselectmore_drag_set_to_another_row() {
+        let (mut st, l) = state();
+        let tl0 = st.timeline.clone();
+        let (x, y) = l.point(0, 15);
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).unwrap();
+        assert_eq!((d.kind, d.toggle, st.set.len()), (DragKind::Move, false, 2), "a press on a member keeps the set");
+        let (_, y1) = l.point(1, 15);
+        d.update(&st, x + 40.0, y1);
+        assert_eq!((d.delta, d.to_track), (5, 0), "an audio row is not a video set's row");
+        let (_, y2) = l.point(2, 15);
+        d.update(&st, x + 40.0, y2);
+        assert_eq!((d.delta, d.to_track, d.guide), (5, 2, None));
+        let want = tl0.move_many_track(&[(0, 0), (0, 1)], 2, 5).unwrap();
+        assert_eq!(d.shown(&st).map(|s| s.timeline), Some(want.clone()), "the preview");
+        assert_eq!(st.timeline, tl0, "the preview commits nothing");
+        assert!(!d.release_still(&mut st));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!((&st.timeline, st.undo_depth()), (&want, 1));
+        assert_eq!(st.set, alloc::vec![(2, 0), (2, 1)]);
+    }
+
+    #[test]
+    fn striamultiselectmore_shift_still_press_on_member_toggles() {
+        let (mut st, l) = state();
+        let (x, y) = l.point(0, 5);
+        let d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert_eq!((d.kind, d.toggle, d.additive), (DragKind::Move, true, true));
+        assert!(d.release_still(&mut st));
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), alloc::vec![(0, 1)]));
+        assert_eq!(st.undo_depth(), 0);
+        let (mut st, l) = state();
+        let mut d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        d.update(&st, x + 40.0, y);
+        assert!(d.moved());
+        assert!(!d.release_still(&mut st), "a shift-drag from a member moves the set, it does not toggle");
+        assert_eq!(st.set, alloc::vec![(0, 0), (0, 1)]);
+        let (mut st, l) = state();
+        st.select(0, 1).unwrap();
+        let d = Drag::begin_with(&mut st, l, x, y, true, false, false).unwrap();
+        assert!(!d.toggle, "a shift-press on a non-member adds it");
+        assert!(!d.release_still(&mut st));
+        assert_eq!(st.set, alloc::vec![(0, 0), (0, 1)]);
     }
 }

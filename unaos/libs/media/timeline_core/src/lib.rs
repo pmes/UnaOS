@@ -3225,3 +3225,39 @@ impl Xform {
         xf.ok().then_some(xf)
     }
 }
+
+// ---- STRIAMULTISELECTMORE (LEDGER SR950): a set moved to another track (named tail block) ----
+// `move_many`'s all-leave / all-land with every clip landing `dtrack` tracks away: `move_clip`'s rules per clip (a track
+// that does not exist is `NoTrack`, one of the other kind is `Kind`), then `move_clip`'s road (`retarget_transitions`,
+// `validate`): a transitioned cut whose clips leave their track is refused `Transition` by name, never carried.
+
+impl Timeline {
+    /// Move every clip in `picks` by `delta` ticks AND by `dtrack` tracks as ONE transaction (refused whole). `dtrack == 0`
+    /// is [`Timeline::move_many`].
+    pub fn move_many_track(&self, picks: &[(usize, usize)], dtrack: isize, delta: i64) -> Result<Timeline, EditError> {
+        if dtrack == 0 {
+            return self.move_many(picks, delta);
+        }
+        let order = picks_desc(self, picks)?;
+        let mut tl = self.clone();
+        let mut moved: Vec<(usize, Clip)> = Vec::new();
+        for (t, i) in order {
+            let to = t.checked_add_signed(dtrack).filter(|&u| u < tl.tracks.len()).ok_or(EditError::NoTrack)?;
+            if tl.tracks[to].kind != tl.tracks[t].kind {
+                return Err(EditError::Kind);
+            }
+            let mut c = tl.tracks[t].clips.remove(i);
+            c.at = c.at.saturating_add(delta);
+            moved.push((to, c));
+        }
+        for (u, c) in moved {
+            tl.tracks[u].clips.push(c);
+        }
+        for t in &mut tl.tracks {
+            sort(t);
+        }
+        tl.retarget_transitions(self)?;
+        tl.validate()?;
+        Ok(tl)
+    }
+}
