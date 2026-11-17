@@ -988,3 +988,29 @@ impl Sources {
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
     }
 }
+
+// ---- STRIAWAVEFORM (LEDGER SR827): one source's peak table through the audio road (named tail block) ----
+
+/// STRIAWAVEFORM (SR827): source `id`'s peak table at `per_sec` buckets per second (timeline_core's ONE `view::peaks_of`),
+/// its audio pulled through the render's own road: ONE [`Aud`] (`Aud::open` at source time 0, the decoder's own rate, the
+/// channel count `render` reads, `track.channels`), one second at a time (`fill` soft to the stream's end, `drain`: a hole
+/// is silence), so a source is never held whole in memory. `Ok(None)`: the source has no audio stream. The face calls it
+/// once per source (nle_face.rs `Face::wave_fill`), on its own thread (owed NLE-WAVEFORM-SCAN-THREAD).
+pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Option<timeline_core::view::Peaks>, RenderError> {
+    let m = sources.get(id)?;
+    let Some(i) = m.audio else { return Ok(None) };
+    let ch = m.demux.tracks()[i].channels.max(1);
+    let mut a = Aud::open(m, id, 0, ch)?;
+    let rate = a.rate.max(1);
+    let step = rate as i64;
+    let mut p = timeline_core::view::Peaks { per_sec, buckets: Vec::new() };
+    for k in 0i64.. {
+        a.fill((k + 1) * step, true)?;
+        let pcm = a.drain(k * step, step);
+        if pcm.is_empty() {
+            break;
+        }
+        p.buckets.extend(timeline_core::view::peaks_of(rate, ch, &pcm, per_sec).buckets);
+    }
+    Ok(Some(p))
+}

@@ -3753,3 +3753,66 @@ fn striaexportframe_hd_frame_save_time() {
     println!("striaexportframe: 1280x720 save_frame took {:.1} ms ({} bytes)", took.as_secs_f64() * 1000.0, bytes.len());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- STRIAWAVEFORM (LEDGER SR827): the peak scan rides the audio road; the face scans once (named tail block) ----
+
+/// STRIAWAVEFORM (SR827): `scan_peaks` over `synth_source(0, 50, 25)` (2 s of mono PCM16 at 48 kHz) gives 200 buckets at
+/// 100 / s, non-flat, equal (within 1 per bucket) to timeline_core's `peaks_of` over the PCM `render` mixes for one 0 dB
+/// clip covering the whole source (the mix passes one unfaded layer through bit for bit): the same decoder road. An
+/// unknown source is refused. The test line carries the scan's measured time (NLE-WAVEFORM-SCAN-THREAD owed).
+#[test]
+fn striawaveform_scan_peaks_reads_the_audio_road() {
+    use timeline_core::view::{PEAKS_PER_SEC, peaks_of};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(a, 0, 50, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let t0 = std::time::Instant::now();
+    let p = stria::nle::scan_peaks(&src, a, PEAKS_PER_SEC).unwrap().expect("the synth reel has audio");
+    let took = t0.elapsed();
+    assert_eq!((p.per_sec, p.buckets.len()), (100, 200));
+    let max = p.buckets.iter().copied().max().unwrap();
+    assert!(max > 0 && p.buckets.iter().any(|&b| b != max), "a non-flat table: {:?}", &p.buckets[..10]);
+    let mut sink = Collect::default();
+    render(&tl, 0..50, &src, &mut sink).unwrap();
+    assert_eq!(sink.pcm.len(), 2 * SYNTH_RATE as usize);
+    let mixed = peaks_of(SYNTH_RATE, 1, &sink.pcm, PEAKS_PER_SEC);
+    assert_eq!(mixed.buckets.len(), p.buckets.len());
+    assert!(mixed.buckets.iter().zip(&p.buckets).all(|(m, s)| (*m as i32 - *s as i32).abs() <= 1), "the scan and the mix agree");
+    assert!(stria::nle::scan_peaks(&src, SourceId(9), PEAKS_PER_SEC).is_err(), "an unknown source is refused");
+    println!("striawaveform: scan buckets={} per_sec={} max={max} scan_ms={:.3} (2-s synth source, on the calling thread)", p.buckets.len(), p.per_sec, took.as_secs_f64() * 1e3);
+}
+
+/// STRIAWAVEFORM (SR827): the synth fixture's face scans each audio source once (reels A and B, both on A1) across three
+/// paints; reel A's table is 200 buckets; the A1 row's first clip body shows more than one colour (the peaks over the body).
+#[test]
+fn striawaveform_face_scans_once_across_three_paints() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert_eq!(face.wave_scans(), 0, "Face::new scans nothing");
+    let first = face.paint();
+    assert_eq!(face.wave_scans(), 2, "the first paint scans A and B");
+    let _ = face.paint();
+    let third = face.paint();
+    assert_eq!(face.wave_scans(), 2, "three paints, two scans");
+    assert_eq!(first, third, "the tables never change the picture between paints");
+    let a = face.state.timeline.tracks[1].clips[0];
+    assert_eq!(face.wave_peaks(a.src).map(|p| p.buckets.len()), Some(200));
+    let l = face.layout();
+    let (y0, y1) = (l.row_y(1) + 2, l.row_y(1) + stria::nle_face::ROW_H as i64 - 2);
+    let (x0, x1) = (l.x_of(a.at) + 1, l.x_of(a.end()) - 1);
+    let mut seen: Vec<[u8; 4]> = Vec::new();
+    for y in y0..y1 {
+        for x in x0.max(1)..x1.min(l.w as i64) {
+            let i = (y as usize * l.w as usize + x as usize) * 4;
+            let c = [third[i], third[i + 1], third[i + 2], third[i + 3]];
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        }
+    }
+    assert!(seen.len() > 1, "the audio body shows its peaks");
+    println!("striawaveform: face scans={} after 3 paints body_colours={}", face.wave_scans(), seen.len());
+}
