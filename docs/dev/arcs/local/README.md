@@ -1,4 +1,4 @@
-# Local executor packs (pack 1 Aether; pack 2 Stria)
+# Local executor packs (pack 1 Aether; pack 2 Stria; BACKLOG.md: open-ended)
 
 The cloud seat cuts arcs, measures designs (R131), folds branches into `claude/optimistic-ramanujan-r3qyu5`
 and pushes on green. A local session can run executors on the same protocol; the division is BY TRACK so the
@@ -66,3 +66,9 @@ the export-message chain (nle_face.rs `job_line` / `export_eta`, stria-view `exp
 | `striathumbnails` (SR839) | video clip heads show the `src_in` frame, decoded once and cached, filled lazily per paint | EXTENDS SR827's lookup parameter: run after SR827 |
 
 Order: all nine at once. `VERBS` in nle_face.rs is appended by SR830 / SR835 / SR837 / SR838: each adds its words at the END of the one line and bumps the count; the local seat composes the union. The `* UNA <WORD>` EDL lines are one word per arc (TITLE / MARKER / MUTE / SOLO), own write line, own parse arm.
+
+## The backlog (no last arc)
+
+`BACKLOG.md` holds 42 more Stria entries and the rule: take the top unstarted one whenever a slot frees, id from the
+LOCAL BLOCK SR850-SR999, write the arc file from the entry, launch, measure, fold-test, push, mark it there. Run as many
+at once as the machine carries. When fewer than ten unstarted entries remain, append ten more from the owed clauses.

@@ -100,13 +100,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--make-src") {
         let out = args.get(1).unwrap_or_else(|| usage());
-        let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(d);
+        let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| bad("--make-src", s, &what("--make-src")))).unwrap_or(d); // NLECLIREFUSALSREST (SR814): a bad number by name
         let (base, frames, fps) = (num(2, 0), num(3, 50), num(4, 25));
         std::fs::write(out, synth_source(base, frames, fps)).unwrap_or_else(|e| die(format!("{out}: {e}")));
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail)
+    if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -143,7 +143,7 @@ fn main() {
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
                 srcs.push((r.to_string(), p.to_string()));
             }
-            _ => die(format!("{a}: unknown flag (nle export --help lists them)")),
+            _ => die(unknown_flag(a)), // NLECLIDIDYOUMEAN (SR816): the nearest arm within 2 by name, else SR801's text (file tail)
         }
     }
     let (tl, sources) = load(edl_path, fps, &srcs);
@@ -165,7 +165,7 @@ fn main() {
             }
         }
         "render" => {
-            let stem = out.unwrap_or_else(|| usage());
+            let stem = out.unwrap_or_else(|| die(format!("render: {}", what("render --out")))); // NLECLIREFUSALSREST (SR814): the missing --out by name
             let open = |ext: &str| {
                 let p = format!("{stem}.{ext}");
                 std::io::BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(format!("{p}: {e}"))))
@@ -187,7 +187,7 @@ fn main() {
             }
             let two_pass = two_pass_of(two_pass, pass, stats, bitrate.is_some(), &video); // H264ENCTWOPASS (SR698) / H264ENCTWOPASSFILE (SR719): the mode and its refusals (file tail)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, p2, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| die(format!("export: {}", what("export --out")))), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, p2, container)
         }
         _ => usage(),
     }
@@ -215,7 +215,7 @@ fn size_verb(args: &[String]) {
     let (Some(path), Some(reel), Some(word)) = (args.first(), args.get(1), args.get(2)) else { usage() };
     let fps = match &args[3..] {
         [] => 25,
-        [f, n] if f == "--fps" => n.parse().unwrap_or_else(|_| usage()),
+        [f, n] if f == "--fps" => n.parse().unwrap_or_else(|_| bad("--fps", n, &what("--fps"))), // NLECLIREFUSALSREST (SR814): a bad number by name
         _ => usage(),
     };
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
@@ -361,11 +361,14 @@ fn value(it: &mut std::slice::Iter<'_, String>, flag: &str) -> String {
 }
 
 /// NLECLIREFUSALSBYNAME (SR801): THE table of what a numeric arm takes — the range its PARSE takes (the encoder stays the
-/// authority on a narrower bound: h264enc_core's QP 16..=40, CRF <= 51), `--pass` two_pass_of's own 1 or 2.
+/// authority on a narrower bound: h264enc_core's QP 16..=40, CRF <= 51), `--pass` two_pass_of's own 1 or 2; `<verb> --out` the
+/// missing `--out` of render / export (NLECLIREFUSALSREST SR814: `nle: <verb>: --out <stem|dir> is required`).
 fn what(flag: &str) -> String {
     match flag {
         "--qp" | "--crf" => format!("not a whole number within 0..={}", u8::MAX),
         "--pass" => "not 1 or 2".to_string(),
+        "render --out" => "--out <stem> is required".to_string(), // NLECLIREFUSALSREST (SR814): the missing flag, by verb
+        "export --out" => "--out <dir> is required".to_string(),
         _ => format!("not a whole number within 0..={}", u32::MAX),
     }
 }
@@ -393,4 +396,79 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     let _ = w.flush();
     std::process::exit(code)
+}
+
+// ---- NLECLIDIDYOUMEAN (LEDGER SR816): the nearest arm / verb of an unknown word (named tail block) ----
+/// NLECLIDIDYOUMEAN (SR816): THE list of the option loop's arm words, in arm order (a tie names the first). SR799's
+/// `cli_usage_lists_every_flag` pins it equal to the arms its source scan finds, so a new arm without its word here reds.
+const FLAGS: [&str; 24] = [
+    "--fps", "--out", "--video", "--audio", "--aac", "--png", "--qp", "--gop", "--bitrate", "--mkv", "--crf", "--scenecut",
+    "--min-keyint", "--two-pass", "--pass", "--stats", "--aq", "--hrd", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--pass2", "--src",
+];
+
+/// NLECLIDIDYOUMEAN (SR816): the words `main` reads as its first argument, in the usage's order.
+const VERBS: [&str; 7] = ["schedule", "render", "export", "size", "--make-src", "help", "--help"];
+
+/// NLECLIDIDYOUMEAN (SR816): the farthest a word may be from a candidate and still be named (git's autocorrect suggests
+/// within a bound too; ours is plain distance, ONE candidate).
+const NEAR: usize = 2;
+
+/// NLECLIDIDYOUMEAN (SR816): the optimal-string-alignment Damerau-Levenshtein distance over chars — an insertion, a
+/// deletion, a substitution or a swap of two neighbours each cost 1 (`--qbulr` -> `--qblur` is 1). Three rolling rows:
+/// the swap reads the row two back.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut back: Vec<usize> = vec![0; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = usize::from(a[i - 1] != b[j - 1]);
+            let mut d = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + sub);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d = d.min(back[j - 2] + 1);
+            }
+            cur[j] = d;
+        }
+        std::mem::swap(&mut back, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// NLECLIDIDYOUMEAN (SR816): THE nearest of `words` to `word` — the smallest [`edit_distance`] within [`NEAR`], the first
+/// in `words` on a tie; none within [`NEAR`] is `None`.
+fn nearest(word: &str, words: &[&'static str]) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for &w in words {
+        let d = edit_distance(word, w);
+        if d <= NEAR && best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, w));
+        }
+    }
+    best.map(|(_, w)| w)
+}
+
+/// NLECLIDIDYOUMEAN (SR816): the option loop's unknown-flag refusal — `<a>: unknown flag; did you mean <f>?` when an arm
+/// is within [`NEAR`], else SR801's text byte-identical.
+fn unknown_flag(a: &str) -> String {
+    match nearest(a, &FLAGS) {
+        Some(f) => format!("{a}: unknown flag; did you mean {f}?"),
+        None => format!("{a}: unknown flag (nle export --help lists them)"),
+    }
+}
+
+/// NLECLIDIDYOUMEAN (SR816): a first word that is no verb but is within [`NEAR`] of one — `nle: <w>: unknown verb; did you
+/// mean <v>?` on stderr, then the usage (exit 2), before the option loop and the EDL are read. Otherwise nothing: the
+/// road is today's.
+fn verb_hint(args: &[String]) {
+    let Some(w) = args.first() else { return };
+    if VERBS.contains(&w.as_str()) {
+        return;
+    }
+    if let Some(v) = nearest(w, &VERBS) {
+        eprintln!("nle: {w}: unknown verb; did you mean {v}?");
+        usage()
+    }
 }
