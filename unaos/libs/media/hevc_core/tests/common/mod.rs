@@ -524,6 +524,8 @@ pub struct InterSps {
     pub depth_inter: u32,
     pub amp: bool,
     pub temporal_mvp: bool,
+    /// HEVCCONCEALWEIGHTEDBIDIRECT (SR774): long_term_ref_pics_present_flag (num_long_term_ref_pics_sps 0).
+    pub long_term_refs: bool,
 }
 
 pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
@@ -581,7 +583,7 @@ pub fn sps_rbsp_scc(c: &SpsCfg, x: &InterSps, scc: Option<&SpsScc>) -> Vec<u8> {
         None => b.bit(0),
     }
     b.ue(0); // num_short_term_ref_pic_sets
-    b.bit(0); // long_term_ref_pics_present_flag
+    b.flag(x.long_term_refs); if x.long_term_refs { b.ue(0); } // long_term_ref_pics_present_flag, num_long_term_ref_pics_sps 0
     b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
@@ -837,6 +839,8 @@ pub struct SliceCfg {
     /// The slice's own st_ref_pic_set: (DeltaPocS0, used) nearest first, (DeltaPocS1, used) nearest first.
     pub neg: Vec<(i32, bool)>,
     pub pos: Vec<(i32, bool)>,
+    /// HEVCCONCEALWEIGHTEDBIDIRECT (SR774): the slice's long-term entries (PocLsbLt, used, no msb) when the SPS has long_term_ref_pics_present_flag.
+    pub lt_pocs: Option<Vec<u32>>,
     /// The SPS enables TMVP (slice_temporal_mvp_enabled_flag is coded) / its value.
     pub sps_tmvp: bool,
     pub tmvp: bool,
@@ -856,6 +860,8 @@ pub struct SliceCfg {
     pub weights_l1: Option<Vec<Option<(i32, i32)>>>,
     /// HEVCCONCEALWEIGHTEDCHROMA (SR776): delta_chroma_log2_weight_denom and per l0 entry Some([(delta_chroma_weight, delta_chroma_offset); Cb, Cr]) or None; None: chroma flags 0.
     pub chroma_weights: Option<(i32, Vec<Option<[(i32, i32); 2]>>)>,
+    /// HEVCCONCEALWEIGHTEDCHROMAL1 (SR793): per l1 entry Some([(delta_chroma_weight, delta_chroma_offset); Cb, Cr]) or None; the denom delta is `chroma_weights`' (one per table, 0 when None).
+    pub chroma_weights_l1: Option<Vec<Option<[(i32, i32); 2]>>>,
     pub five_minus_max_num_merge_cand: u32,
     pub deblocking_disabled: bool,
 }
@@ -892,6 +898,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
             b.flag(used);
             prev = d;
         }
+        if let Some(lt) = &c.lt_pocs { b.ue(lt.len() as u32); for &p in lt { b.u(p as u64, 8); b.bit(1); b.bit(0); } } // num_long_term_pics, poc_lsb_lt, used_by_curr_pic_lt_flag 1, no msb (SR774)
         if c.sps_tmvp {
             b.flag(c.tmvp);
         }
@@ -953,7 +960,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
                 if let Some((dw, off)) = w { b.se(*dw); b.se(*off); }
                 for (dw, doff) in chroma_l0(c, i).into_iter().flatten() { b.se(dw); b.se(doff); }
             }
-            if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, w1); } }
+            if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, c, w1); } }
         }
         b.ue(c.five_minus_max_num_merge_cand);
         if let Some(v) = s.use_integer_mv {
@@ -1170,17 +1177,17 @@ impl CabacEnc {
 
 // ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): the L1 pred_weight_table of a B slice (named tail block) ----
 /// HEVCCONCEALWEIGHTEDBIMIXED (SR768): 7.3.6.3's l1 half of pred_weight_table (slice_type B): luma_weight_l1_flag per
-/// entry, chroma_weight_l1_flag 0 per entry, then (delta_luma_weight_l1, luma_offset_l1) of each `Some` entry.
-pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
+/// entry, chroma_weight_l1_flag per entry from `chroma_l1` (SR793), then per entry (delta_luma_weight_l1, luma_offset_l1) of a `Some` entry and its Cb, Cr pairs.
+pub fn pred_weight_l1(b: &mut BitWriter, c: &SliceCfg, ws: &[Option<(i32, i32)>]) {
     for w in ws {
         b.flag(w.is_some());
     }
-    for _ in ws {
-        b.bit(0); // chroma_weight_l1_flag
+    for i in 0..ws.len() {
+        b.flag(chroma_l1(c, i).is_some()); // chroma_weight_l1_flag
     }
-    for (dw, off) in ws.iter().flatten() {
-        b.se(*dw);
-        b.se(*off);
+    for (i, w) in ws.iter().enumerate() {
+        if let Some((dw, off)) = w { b.se(*dw); b.se(*off); }
+        for (dw, doff) in chroma_l1(c, i).into_iter().flatten() { b.se(dw); b.se(doff); }
     }
 }
 
@@ -1189,4 +1196,31 @@ pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
 /// Cr] when that l0 entry carries chroma_weight_l0_flag 1 (7.3.6.3), else None.
 pub fn chroma_l0(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
     c.chroma_weights.as_ref().and_then(|cw| cw.1.get(i).copied().flatten())
+}
+
+// ---- HEVCCONCEALWEIGHTEDCHROMAL1 (LEDGER SR793): an l1 entry's chroma weights (named tail block) ----
+/// HEVCCONCEALWEIGHTEDCHROMAL1 (SR793): entry `i` of `c.chroma_weights_l1` — [(delta_chroma_weight, delta_chroma_offset); Cb,
+/// Cr] when that l1 entry carries chroma_weight_l1_flag 1 (7.3.6.3), else None.
+pub fn chroma_l1(c: &SliceCfg, i: usize) -> Option<[(i32, i32); 2]> {
+    c.chroma_weights_l1.as_ref().and_then(|cw| cw.get(i).copied().flatten())
+}
+
+// ---- HEVCCONCEALWEIGHTEDCHROMA422 (LEDGER SR798): the 8.5.3.3.3.2 chroma oracle at any plane geometry (named tail block) ----
+
+/// HEVCCONCEALWEIGHTEDCHROMA422 (SR798): 8.5.3.3.3.2 written out for one chroma sample (x, y) of the w x h reference plane
+/// `r` (nearest-edge clamped) at the eighth-sample chroma vector `mv`, 8-bit (shift1 0, shift2 6): the 14-bit intermediate
+/// predSampleLX. ONE oracle for every chroma format (4:2:0 16x16, 4:2:2 16x32, 4:4:4 32x32 at the 32x32 fixtures); tests/rext.rs
+/// `hand_chroma` (SR758) is its twin and retires onto it (HEVC-TESTKIT-PBODY owed).
+pub fn hand_chroma_wh(r: &[u16], w: i32, h: i32, x: i32, y: i32, mv: [i32; 2]) -> i32 {
+    let s = |x: i32, y: i32| r[(y.clamp(0, h - 1) * w + x.clamp(0, w - 1)) as usize] as i32;
+    let (xf, yf) = ((mv[0] & 7) as usize, (mv[1] & 7) as usize);
+    let (xi, yi) = (x + (mv[0] >> 3), y + (mv[1] >> 3));
+    let hz = |yy: i32| (0..4).map(|i| CHROMA_FILTER[xf][i] * s(xi + i as i32 - 1, yy)).sum::<i32>();
+    if yf == 0 {
+        if xf == 0 { s(xi, yi) << 6 } else { hz(yi) }
+    } else if xf == 0 {
+        (0..4).map(|i| CHROMA_FILTER[yf][i] * s(xi, yi + i as i32 - 1)).sum()
+    } else {
+        (0..4).map(|n| CHROMA_FILTER[yf][n] * hz(yi + n as i32 - 1)).sum::<i32>() >> 6
+    }
 }
