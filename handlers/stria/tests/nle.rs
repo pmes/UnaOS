@@ -3513,3 +3513,41 @@ fn nle5dexportmessageetastallword_paused_face_names_the_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallword: paused face reads \"{line}\"");
 }
+
+// ---- NLE5DEXPORTMESSAGEETATOTAL (LEDGER SR820): the total seeded before frame 1 (named tail block) ----
+#[test]
+fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
+    use stria::nle_face::export_line;
+    assert_eq!(export_line(0, 35, None), "export: 0 / 35", "a seeded total before frame 1");
+    assert_eq!(export_line(0, 0, None), "export: starting", "the zero-frame grammar kept");
+    let dir = nlefaceexport_dir("etatotal-face");
+    let (tl, src) = synth_fixture();
+    let want = stria::nle_export::export_total(&tl, &(0..tl.end()));
+    assert_eq!(want, 35, "the fixture's whole range");
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    // The seed is stored before `start_export` returns: the total is the rule's whatever `done` the thread has reached.
+    let p0 = face.export_progress().expect("the running job");
+    let line = face.message_text().expect("the running export's line");
+    let eta = face.export_eta();
+    let p1 = face.export_progress().expect("the running job");
+    assert_eq!((p0.1, p1.1), (35, 35), "total seeded at the start");
+    assert!(p0.0 <= p1.0 && p1.0 <= 3, "{p0:?} then {p1:?}");
+    assert_ne!(line, "export: starting", "never the zero-frame word for a 35-frame export");
+    let d: u64 = line.strip_prefix("export: ").and_then(|t| t.split(" / ").next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}: the done count"));
+    assert!(line.starts_with(&format!("export: {d} / 35")) && d <= 3, "{line}");
+    if d == 0 {
+        assert_eq!(line, "export: 0 / 35", "before frame 1: the real count, no eta");
+    }
+    if p1.0 == 0 {
+        assert_eq!(eta, None, "SR796: no eta while done is 0");
+    }
+    nlefaceexport_until(&face, (3, 35));
+    assert_eq!(face.export_progress(), Some((3, 35)), "the thread's readings confirm the seed: total never changed");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
+}
