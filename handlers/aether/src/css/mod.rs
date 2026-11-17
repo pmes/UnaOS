@@ -1280,13 +1280,14 @@ thread_local! {
 }
 
 /// The properties [`computed_report`] serializes, in css_core's oracle order (CSSCORE SR47).
-pub const REPORT_COLS: usize = 40; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
+pub const REPORT_COLS: usize = 45; pub const REPORT_PROPS: [&str; REPORT_COLS] = [
     "display", "position", "color", "background-color", "font-size", "font-weight", "font-style", "font-family", "line-height",
     "text-align", "text-decoration-line", "white-space", "visibility", "list-style-type", "border-top-width", "border-top-style",
     "border-left-color", "padding-top", "margin-top", "flex-direction", "direction", "unicode-bidi", "white-space-collapse", "text-wrap-mode", "text-decoration-color",
     "margin-right", "margin-bottom", "margin-left", "padding-right", "padding-bottom", "padding-left", "border-right-width", "border-bottom-width", "border-left-width", // SR1096
     "border-right-style", "border-bottom-style", "border-left-style", // SR1103
     "border-top-color", "border-right-color", "border-bottom-color", // SR1104
+    "text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position", "caret-color", // SR1108
 ];
 
 /// AETHERSTYLE (SR54) M5: AETHER's computed values — what its layout and paint actually consume after
@@ -1309,7 +1310,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         text_align: u8,
         underline: bool,
         nowrap: bool, white_space: u8, list_style: u8, rtl: bool,
-        hidden: bool,
+        hidden: bool, ul_pos: u8, caret: Option<(u8, u8, u8, u8)>,
     }
     fn num(v: f32) -> String {
         let a = (v as f64).abs(); let d = if a > 0.0 && a.is_finite() { (5 - a.log10().floor() as i32).clamp(0, 15) } else { 0 }; let k = 10f64.powi(d); let r = (v as f64 * k).round() / k; // SR1023: 6 significant digits (Blink's CSS number serialization)
@@ -1348,7 +1349,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
     any.with_doc(|doc, _| {
         let root = Inh {
             color: (0, 0, 0), font_size: 16.0, weight: 400, italic: false, family: crate::fonts::STANDARD, line_height: 0.0,
-            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false,
+            text_align: 0, underline: false, nowrap: false, white_space: 0, list_style: 1, hidden: false, rtl: false, ul_pos: 0, caret: None,
         };
         let mut inh: HashMap<html_core::NodeId, Inh> = HashMap::new();
         for id in doc.descendants(html_core::Document::ROOT) {
@@ -1385,7 +1386,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
-            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c }));
+            me.color = paint.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_COLOR, parent.color, |c| if tag == "a" { (0, 0, 238) } else if crate::render::control_tag(tag) { (0, 0, 0) } else { c })); if let Some(p) = paint.underline_position { me.ul_pos = p; } if let Some(c) = paint.caret_color { me.caret = c; } // SR1108: deco_ink's ul_pos and caret_inherit, verbatim
             let st = tid.and_then(|t| tree.taffy.style(t).ok()).cloned();
             let display = match (&st, &spec) {
                 (None, _) => "none",
@@ -1450,6 +1451,8 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 mside(1), mside(2), mside(3), pside(1), pside(2), pside(3), bside(1), bside(2), bside(3),
                 sstyle(1), sstyle(2), sstyle(3), // SR1103
                 scolor(0), scolor(1), scolor(2), // SR1104
+                layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
+                paint.underline_offset.flatten().map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), rgb(me.caret.map_or(me.color, |c| (c.0, c.1, c.2))), // SR1108
             ];
             out.insert(id, values);
             inh.insert(id, me);

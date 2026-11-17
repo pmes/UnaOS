@@ -1692,3 +1692,31 @@ fn text_align_last_codes() {
     assert_eq!(cascade(&[&[("text-align-last", "right")], &[("color", "red")]]).paint.text_align_last, Some(2), "merge_paint keeps it");
     assert!(ALL_LONGHANDS.contains(&"text-align-last"), "the arm is listed for all:");
 }
+
+// ---- AETHERCSSOMTEXTDECORATIONCOLUMNS (LEDGER SR1108): text_decoration_style_word / underline_position_word invert the parsers' codes (named tail block) ----
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-decoration-style code round-trips through its keyword; the
+/// CSS-wide spellings the parser folds (initial / unset) read `solid`.
+#[test]
+fn text_decoration_style_word_round_trip() {
+    use layout_core::css::{deco_style_code, text_decoration_style_word};
+    for (w, c) in [("solid", 0u8), ("double", 1), ("dotted", 2), ("dashed", 3), ("wavy", 4)] {
+        assert!(deco_style_code(w) == Some(c) && text_decoration_style_word(c) == w, "{w} <-> {c}");
+    }
+    for w in ["initial", "unset"] {
+        assert_eq!(deco_style_code(w).map(text_decoration_style_word), Some("solid"), "{w}");
+    }
+}
+
+/// AETHERCSSOMTEXTDECORATIONCOLUMNS (SR1108): every text-underline-position code round-trips through its keyword; the
+/// spellings the parser folds (initial, and left / right, which only place the line in vertical writing) read their code's word.
+#[test]
+fn underline_position_word_round_trip() {
+    use layout_core::css::{underline_position_code, underline_position_word};
+    for (w, c) in [("auto", 0u8), ("from-font", 1), ("under", 2)] {
+        assert!(underline_position_code(w) == Some(c) && underline_position_word(c) == w, "{w} <-> {c}");
+    }
+    for (w, want) in [("initial", "auto"), ("left", "auto"), ("under right", "under"), ("from-font left", "from-font")] {
+        assert_eq!(underline_position_code(w).map(underline_position_word), Some(want), "{w}");
+    }
+}
