@@ -448,7 +448,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         list.retain(|(p, _)| p != prop);
         list.push((prop.to_string(), value.to_string()));
     }
-    if font_css_wide(prop, value, &mut style.paint) { return; } match prop {
+    if css_wide(prop, value, &mut style.paint) { return; } match prop {
         "display" => {
             // Outer display type (css-display-3 §2.1) for the inline
             // whitespace pass: 0 inline, 1 block-level, 2 inline-level box.
@@ -3648,7 +3648,9 @@ fn apply_font_wide<H: Host>(kw: &str, style: &mut SpecifiedStyle<H>, cx: &ParseC
 /// on one of the seven font longhands writes its explicit inherit bit (`PaintStyle::set_inherit`: the field's earlier
 /// value goes) and ends the declaration: every arm's own inherit road was a no-op (None), which a later rule's Some or
 /// the tag default overrode. Runs after the `font_rel` push, so line-height's replay entry stays `inherit`.
-fn font_css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool {
+/// AETHERCSSWIDECOLOR (SR823): renamed from `font_css_wide`: every property with an inherit bit (`color` too); each is
+/// inherited, so `unset` == `inherit` (css-cascade-4 §7.3.3).
+fn css_wide<H: Host>(prop: &str, value: &str, paint: &mut PaintStyle<H>) -> bool {
     let bit = crate::paint::inherit_bit(prop);
     if bit == 0 || !(value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset")) {
         return false;
