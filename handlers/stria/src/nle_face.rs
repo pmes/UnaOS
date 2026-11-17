@@ -3185,7 +3185,7 @@ pub const THUMBS_PER_PAINT: u32 = 4;
 /// STRIATHUMBNAILS (SR839): a paint's fill stops past this many ms (after its first head).
 pub const THUMB_BUDGET_MS: u64 = 100;
 /// STRIATHUMBNAILS (SR839): a clip body narrower than this (px) asks for no head.
-pub const THUMB_MIN_W: i64 = 8;
+pub const THUMB_MIN_W: i64 = view::THUMB_MIN_W; // STRIAKTHUMBS (SR9019): the want rule's own, lifted to timeline_core view.rs
 
 /// STRIATHUMBNAILS (SR839): the head stills by `(source, src_in)` (`None`: asked, no picture), each with its insertion seq.
 #[derive(Default)]
@@ -3200,29 +3200,23 @@ impl Thumbs {
     fn get(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
         self.map.get(&(src, src_in)).and_then(|e| e.1.as_ref())
     }
-    /// The visible video heads not keyed yet, decoded within this paint's bounds (see the block's RULES).
+    /// The visible video heads not keyed yet, decoded within this paint's bounds (see the block's RULES). STRIAKTHUMBS
+    /// (SR9019): WHICH key is next is timeline_core's `view::thumb_want` (the kernel Player reads it too): heads first, then
+    /// SR949's filmstrip and tail tiles; every decode through `thumb_for`, the same THUMBS_PER_PAINT / THUMB_BUDGET_MS bound.
     fn fill(&mut self, tl: &Timeline, sources: &Sources, l: Layout) {
         let t0 = std::time::Instant::now();
         let mut done = 0u32;
         self.pending = false;
-        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
-            let y = l.row_y(row);
-            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
-                continue;
+        loop {
+            let want = view::thumb_want(tl, &l, &|s, t| self.map.get(&(s, t)).map(|e| e.1.as_ref().map(|st| st.width as i64)));
+            let Some((src, tick)) = want else { break };
+            if done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS)) {
+                self.pending = true;
+                return;
             }
-            for c in &tr.clips {
-                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
-                if x0 < 0 || x0 >= l.w as i64 || x1 - x0 < THUMB_MIN_W || self.map.contains_key(&(c.src, c.src_in)) {
-                    continue;
-                }
-                if done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS)) {
-                    self.pending = true;
-                    return;
-                }
-                let _ = self.thumb_for(tl, sources, c.src, c.src_in);
-                done += 1;
-            }
-        } self.fill_strip(tl, sources, l, t0, done); // STRIATHUMBNAILSMORE (SR949): every head wanted is decoded: the wide bodies' filmstrip and tail on the same budget (file tail)
+            let _ = self.thumb_for(tl, sources, src, tick);
+            done += 1;
+        }
     }
     /// The head of `src` at `src_in`: cached, else decoded once (see the block's RULES).
     fn thumb_for(&mut self, tl: &Timeline, sources: &Sources, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
@@ -3294,53 +3288,6 @@ mod thumb_tests {
 }
 
 // ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail stills (named tail block) ----
-// timeline_core view.rs `head_tiles` is THE tile rule (the painter `paint_strip` reads it too): a body two heads wide shows
-// its head, a filmstrip still every head width and its tail (`src_out - 1`). `Thumbs::fill_strip` decodes those tiles' keys
-// into the SAME map through the SAME `thumb_for` (one `preview`, `head_still`), continuing `fill`'s count and clock, so the
-// THUMBS_PER_PAINT / THUMB_BUDGET_MS rule spans both and `pending` keeps `serve`'s clock filling. ORDER: `fill` calls it only
-// once every visible head is decoded (heads first). A body starting left of the canvas (the head pass skips it) whose visible
-// part is at least THUMB_MIN_W px decodes its head key first, since the head still's width sets the tiles. Tiles left of the
-// canvas or right of it ask nothing (paint_head paints neither). Owed: NLE-THUMBNAILS-STRIP-CACHE (more visible tiles than
-// THUMB_CACHE re-decode every paint), NLE-THUMBNAILS-RATE (STRIACLIPSPEED SR829's `src_at` in `head_tiles`).
-
-impl Thumbs {
-    /// STRIATHUMBNAILSMORE (SR949): the visible tiles beyond each head, decoded within the paint's bounds (the block's rules).
-    fn fill_strip(&mut self, tl: &Timeline, sources: &Sources, l: Layout, t0: std::time::Instant, mut done: u32) {
-        let spent = |done: u32| done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS));
-        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
-            let y = l.row_y(row);
-            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
-                continue;
-            }
-            for c in &tr.clips {
-                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
-                if x1 <= 0 || x0 >= l.w as i64 || x1.min(l.w as i64) - x0.max(0) < THUMB_MIN_W {
-                    continue;
-                }
-                if !self.map.contains_key(&(c.src, c.src_in)) {
-                    if x0 >= 0 {
-                        continue; // the head pass's rule left it (a body under THUMB_MIN_W): no strip either
-                    }
-                    if spent(done) {
-                        self.pending = true;
-                        return;
-                    }
-                    let _ = self.thumb_for(tl, sources, c.src, c.src_in);
-                    done += 1;
-                }
-                let Some(sw) = self.get(c.src, c.src_in).map(|s| s.width as i64) else { continue };
-                for (x, _, tick) in view::head_tiles(x0, x1, sw, l.zoom, c).into_iter().skip(1) {
-                    if x < 0 || x >= l.w as i64 || self.map.contains_key(&(c.src, tick)) {
-                        continue;
-                    }
-                    if spent(done) {
-                        self.pending = true;
-                        return;
-                    }
-                    let _ = self.thumb_for(tl, sources, c.src, tick);
-                    done += 1;
-                }
-            }
-        }
-    }
-}
+// STRIAKTHUMBS (SR9019): SR949's `Thumbs::fill_strip` rule (a wide body's filmstrip and tail tiles after every head, a body
+// starting left of the canvas asking its head first) is timeline_core view.rs `thumb_want`'s second pass; `Thumbs::fill`
+// loops over it. Owed: NLE-THUMBNAILS-STRIP-CACHE, NLE-THUMBNAILS-RATE (STRIACLIPSPEED SR829's `src_at` in `head_tiles`).
