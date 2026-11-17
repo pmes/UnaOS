@@ -714,7 +714,7 @@ impl EditorState {
     pub fn head_transition(&self) -> Option<(usize, usize)> {
         let Some((t, i)) = self.selection else { return self.transition };
         let c = self.timeline.tracks.get(t)?.clips.get(i)?;
-        let x = self.timeline.tracks[t].transitions.iter().position(|x| x.at == c.at && !x.to_black)?;
+        let x = self.timeline.tracks[t].transitions.iter().position(|x| x.at == c.at && !x.to_black).or_else(|| self.black_tail(t, c))?; // STRIAKDUR (SR9089): else the clip's fade to black (file tail)
         Some((t, x))
     }
     /// The `dur-` / `dur+` words of [`EditorState::verb`]; `None` for any other word.
@@ -734,5 +734,29 @@ impl EditorState {
             (self.selection, self.set, self.transition) = keep;
         }
         Some(r)
+    }
+}
+
+// ---- STRIAKDUR (LEDGER SR9089): a selected clip's fade to black is a dur- / dur+ target (named tail block) ----
+// [`EditorState::head_transition`] falls back to the `to_black` transition at the selected clip's END when the clip has
+// no head transition (the head wins). With no clip at the playhead, [`EditorState::gap_select`] (the kernel Player's
+// `edit_key` pick) gives `dur-` / `dur+` the transition to black whose span covers the playhead (schedule.rs's ONE
+// `black_over` rule: the highest video track); every other word deselects as before.
+impl EditorState {
+    /// The index of the `to_black` transition at the end of clip `c` on track `t`.
+    fn black_tail(&self, t: usize, c: &Clip) -> Option<usize> {
+        self.timeline.tracks.get(t)?.transitions.iter().position(|x| x.to_black && x.at == c.end())
+    }
+    /// The transition to black whose span covers tick `at`, `(track, index)` (the schedule's pick).
+    pub fn black_at(&self, at: i64) -> Option<(usize, usize)> {
+        let (t, x) = crate::schedule::black_over(&self.timeline, at, None)?;
+        Some((t, self.timeline.tracks[t].transitions.iter().position(|y| *y == x)?))
+    }
+    /// No clip shown at `at`: deselect; for `dur-` / `dur+` the selected transition becomes [`EditorState::black_at`].
+    pub fn gap_select(&mut self, verb: &str, at: i64) {
+        self.deselect();
+        if verb == "dur-" || verb == "dur+" {
+            self.transition = self.black_at(at);
+        }
     }
 }

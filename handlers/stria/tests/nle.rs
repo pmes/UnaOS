@@ -3761,3 +3761,34 @@ fn striatransitionkernel_edge_drag_note() {
     assert_eq!(face.note, None, "a press and release that did not move sets no note");
     assert_eq!(face.state.undo_depth(), 1);
 }
+
+// ---- STRIAKDUR (LEDGER SR9089): dur- / dur+ on the host: buttons, _ / * and the length note (named tail block) ----
+
+/// The words sit before `help` in VERBS and on `_` / `*` in KEYS; with V1's last clip selected (no head transition) `*`
+/// lengthens its 4-tick fade to black at 35 and the message row names it; `dur-` shortens it with its note; a clip with
+/// no target refuses as `dur+: <e>` with no note and the timeline unchanged.
+#[test]
+fn striakdur_host_words_keys_note() {
+    use bandy::SMessage;
+    let n = VERBS.len();
+    assert_eq!((VERBS[n - 3], VERBS[n - 2], VERBS[n - 1]), ("dur-", "dur+", "help"));
+    assert!(KEYS.contains(&("_", "dur-")) && KEYS.contains(&("*", "dur+")));
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.add_transition_to_black(0, 35, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 2).unwrap();
+    assert!(face.on(&SMessage::BrowserText("*".into())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 5);
+    assert_eq!(face.message_text().as_deref(), Some("transition: 00:00:00:05 (5 ticks)"));
+    assert!(face.verb("dur-"));
+    assert_eq!(face.state.timeline.tracks[0].transitions[0].dur, 4);
+    assert_eq!(face.note.as_deref(), Some("transition: 00:00:00:04 (4 ticks)"));
+    face.state.select(0, 0).unwrap();
+    let before = face.state.timeline.clone();
+    assert!(face.on(&SMessage::Input { target: stria::nle_face::SURFACE.into(), text: "dur+".into() }));
+    assert!(face.last_error.as_deref().is_some_and(|e| e.starts_with("dur+: ")), "{:?}", face.last_error);
+    assert_eq!(face.note, None);
+    assert_eq!(face.state.timeline, before);
+    assert_eq!(face.state.undo_depth(), 2);
+}

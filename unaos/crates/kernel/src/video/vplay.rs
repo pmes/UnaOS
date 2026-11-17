@@ -1913,7 +1913,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
                 Some((t, i)) => {
                     let _ = st.select(t, i);
                 }
-                None => st.deselect(),
+                None => st.gap_select(verb, at), // STRIAKDUR (SR9089): deselect; dur- / dur+ take the fade to black over the playhead
             }
         }
         let before = st.timeline.clone();

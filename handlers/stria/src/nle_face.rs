@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 28] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "dur-", "dur+", "help"]; // STRIAKDUR (SR9089): `dur-` / `dur+` step the clip's transition (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -236,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.transition_step_note(v) { return r; } if let Some(r) = self.transition_len_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -387,6 +387,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("_", "dur-"), ("*", "dur+"), // STRIAKDUR (SR9089): _ / * (text) the kernel Player's bytes for the transition step
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2603,6 +2604,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("dur-", "the clip's transition (its head, else its fade to black) one frame shorter"), ("dur+", "the clip's transition (its head, else its fade to black) one frame longer"), // STRIAKDUR (SR9089)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3168,5 +3170,25 @@ impl Face {
             self.note = self.transition_note();
         }
         Ok(())
+    }
+}
+
+// ---- STRIAKDUR (LEDGER SR9089): dur- / dur+ on the host: buttons, _ / * and the length note (named tail block) ----
+// timeline_core's `dur-` / `dur+` (SR9057's `transition_step_verb`: the selected clip's head transition, else its fade to
+// black, else the selected transition) are VERBS words (stria-view's `Trans -` / `Trans +`) and KEYS `_` / `*` (the bytes
+// the kernel Player binds). A step that commits sets SR991's note from [`Face::transition_note`] (the step selected the
+// transition); a refusal is `last_error` `dur+: <e>` as before.
+
+impl Face {
+    /// `dur-` / `dur+` through THE dispatch, then the note on success; `None` for any other word.
+    fn transition_step_note(&mut self, v: &str) -> Option<bool> {
+        if v != "dur-" && v != "dur+" {
+            return None;
+        }
+        match self.state.verb(v)? {
+            Ok(()) => self.note = self.transition_note(),
+            Err(e) => self.last_error = Some(format!("{v}: {e}")),
+        }
+        Some(true)
     }
 }
