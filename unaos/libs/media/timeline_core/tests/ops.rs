@@ -584,3 +584,40 @@ fn striagapsmore_editor_one_undo_step() {
     assert_eq!(st.timeline, k);
     assert_eq!(st.verb("close-gaps sync x"), None);
 }
+
+// ---- STRIAKGAPS (LEDGER SR9005): the Player's g / G keys over the one verb dispatch (named tail block) ----
+
+/// The kernel Player's key road in host terms (vplay.rs `edit_key`): seek to the playhead, select the top video track's
+/// clip there (`shown_clip`) or deselect, then the key's word. `g` -> `gap` opens one second on the shown clip's track;
+/// `G` -> `close-gaps sync` closes the spans empty on every track; one undo step each; in a gap `gap` is `NoClip` while
+/// `close-gaps sync` needs no selection.
+#[test]
+fn striakgaps_player_keys_route() {
+    use timeline_core::editor::EditorState;
+    fn key(st: &mut EditorState, at: i64, word: &str) -> Option<Result<(), EditError>> {
+        st.seek(at);
+        let ph = st.playhead;
+        match st.timeline.clip_at(0, ph) {
+            Some(i) => st.select(0, i).unwrap(),
+            None => st.deselect(),
+        }
+        st.verb(word)
+    }
+    let (tl, _, _) = striagapclose_base();
+    let mut st = EditorState::new(tl.clone());
+    let sec = tl.tb.from_ns(1_000_000_000).max(1);
+    assert_eq!(key(&mut st, 7, "gap"), Some(Ok(())));
+    let gapped = tl.insert_gap(0, 7, sec).unwrap();
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (gapped.clone(), 1));
+    assert_eq!(key(&mut st, 7, "close-gaps sync"), Some(Ok(())));
+    let synced = gapped.close_gaps_sync().unwrap();
+    assert_ne!(synced, gapped);
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (synced, 2));
+    assert!(st.undo());
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    assert_eq!(key(&mut st, 2, "gap"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.timeline, tl);
+    assert_eq!(key(&mut st, 2, "close-gaps sync"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.close_gaps_sync().unwrap());
+}

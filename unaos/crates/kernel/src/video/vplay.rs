@@ -1842,7 +1842,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 20] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1861,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'g', "gap"), (b'G', "close-gaps sync"), // STRIAKGAPS (LEDGER SR9005): g opens one second of gap at the playhead on the shown clip's track, G closes the spans empty on every track, every track moving alike (timeline_core gap_verb; one undo step each)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
