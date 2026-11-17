@@ -1,0 +1,24 @@
+# STRIAFACEGOLDENS (LEDGER SR891): the face golden table, `name WxH hash` (FNV-1a 64, view::fnv1a).
+# Labels-off RGBA paints through nle_face `paint` / `paint_in` (timeline_core view::paint_in); scenes in nle_face.rs `facegoldens_tests::scene`.
+# Re-pin: UNAOS_REPIN=1 cargo test -p stria --lib striafacegoldens_table   (a hash of `unpinned` prints its value and passes)
+tracks 320x160 99a12b088401a18f
+tracks 1280x720 unpinned
+tracks 1920x1200 unpinned
+set 320x160 b274098fed21524f
+set 1280x720 unpinned
+set 1920x1200 unpinned
+transitions 320x160 9b5278f1281cd494
+transitions 1280x720 unpinned
+transitions 1920x1200 unpinned
+to-black 320x160 7c909fba68bf567e
+to-black 1280x720 unpinned
+to-black 1920x1200 unpinned
+meters 320x160 e813db12ef577e17
+meters 1280x720 unpinned
+meters 1920x1200 unpinned
+preview 320x160 unpinned
+preview 1280x720 unpinned
+preview 1920x1200 unpinned
+keys-tracks 320x160 unpinned
+keys-tracks 1280x720 unpinned
+keys-tracks 1920x1200 unpinned
