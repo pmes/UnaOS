@@ -250,6 +250,9 @@ pub struct PaintStyle<H: Host> {
     /// `outline-color` (§4.4) as RGBA; `Some(None)` = `currentColor` (and `invert`, which a UA without
     /// colour inversion paints as currentColor).
     pub outline_color: Option<Option<(u8, u8, u8, u8)>>,
+    /// AETHERCSSCARETCOLOR (SR1040): `caret-color` (css-ui-4 §4.1, inherited) as RGBA: `Some(Some(c))` a colour (alpha 0 =
+    /// `transparent`: no caret), `Some(None)` `auto` / `currentcolor` (the control's ink), None unspecified (inherit).
+    pub caret_color: Option<Option<(u8, u8, u8, u8)>>,
     /// `outline-offset` in px (§4.5; a negative offset draws the outline inside the border box).
     pub outline_offset: Option<f32>,
     /// AETHERCSSCURRENTCOLORREST (SR849): bits 0-3 = border side [top, right, bottom, left] colour is `currentColor`, [`CC_BG`] = background-color is; the RGB in `border` / `background` is then a carrier the paint reads replace.
@@ -363,7 +366,7 @@ impl<H: Host> Default for PaintStyle<H> {
             container_scroll: None,
             outline_style: None,
             outline_width: None,
-            outline_color: None,
+            outline_color: None, caret_color: None,
             outline_offset: None,
             currentcolor: 0,
         }
@@ -888,6 +891,8 @@ pub const INHERIT_WHITE_SPACE: u32 = 256;
 pub const INHERIT_DIRECTION: u32 = 512;
 /// AETHERCSSWIDEINHERITEDREST (SR831): `list-style-type` (inherited; its tag road is the ul / menu / dir depth and ol match).
 pub const INHERIT_LIST_STYLE: u32 = 1024;
+/// AETHERCSSCARETCOLOR (SR1040): `caret-color` (inherited; no tag road). Not in INHERIT_FONT.
+pub const INHERIT_CARET_COLOR: u32 = 2048;
 /// AETHERCSSWIDELONGHANDS (SR815): every font field `font: inherit` / `font: unset` reaches.
 pub const INHERIT_FONT: u32 = 127;
 
@@ -904,7 +909,7 @@ pub fn inherit_bit(prop: &str) -> u32 {
         "color" => INHERIT_COLOR,
         "white-space" | "white-space-collapse" => INHERIT_WHITE_SPACE,
         "direction" => INHERIT_DIRECTION,
-        "list-style-type" | "list-style" => INHERIT_LIST_STYLE,
+        "list-style-type" | "list-style" => INHERIT_LIST_STYLE, "caret-color" => INHERIT_CARET_COLOR,
         _ => 0,
     }
 }
@@ -924,7 +929,7 @@ impl<H: Host> PaintStyle<H> {
             | on(self.color.is_some(), INHERIT_COLOR)
             | on(self.white_space.is_some(), INHERIT_WHITE_SPACE)
             | on(self.rtl.is_some(), INHERIT_DIRECTION)
-            | on(self.list_style.is_some(), INHERIT_LIST_STYLE)
+            | on(self.list_style.is_some(), INHERIT_LIST_STYLE) | on(self.caret_color.is_some(), INHERIT_CARET_COLOR)
     }
 
     /// AETHERCSSWIDELONGHANDS (SR815): this style explicitly inherits the field of `bit` (the bit is set and no later
@@ -960,7 +965,7 @@ impl<H: Host> PaintStyle<H> {
         if bits & INHERIT_COLOR != 0 { self.color = None; }
         if bits & INHERIT_WHITE_SPACE != 0 { self.white_space = None; self.nowrap = None; } // SR831: the arm's pair
         if bits & INHERIT_DIRECTION != 0 { self.rtl = None; }
-        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; }
+        if bits & INHERIT_LIST_STYLE != 0 { self.list_style = None; } if bits & INHERIT_CARET_COLOR != 0 { self.caret_color = None; }
         self.inherit |= bits;
     }
 

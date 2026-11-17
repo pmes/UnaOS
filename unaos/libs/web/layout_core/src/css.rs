@@ -1813,6 +1813,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.outline_color = Some(c);
             }
         }
+        "caret-color" => {
+            if let Some(c) = caret_color_value::<H>(value) {
+                style.paint.caret_color = Some(c);
+            }
+        }
         "outline-offset" => {
             if let Some(px) = parse_px(value, cx) {
                 style.paint.outline_offset = Some(px);
@@ -2598,7 +2603,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
+        outline_style, outline_width, outline_color, caret_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps,
     );
     clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src);
     if let Some(src_list) = &src.font_rel {
@@ -3902,4 +3907,22 @@ fn deco_shorthand_color<H: Host>(prop: &str, v: &str, paint: &mut PaintStyle<H>)
     }
     let c = split_top_level(v).into_iter().find_map(|p| deco_color_value::<H>(p));
     paint.decoration_color = Some(c.unwrap_or(None));
+}
+
+// ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color in the outline_color RGBA marker shape (named tail block) ----
+
+/// AETHERCSSCARETCOLOR (SR1040): a `caret-color` value (css-ui-4 §4.1: `auto | <color>`) as [`PaintStyle::caret_color`]
+/// holds it: `auto` and `initial` are `Some(None)` (the caret paints the control's currentcolor); `invert` is not a
+/// caret-color value (None); the rest through [`outline_color_value`] (`currentcolor` `Some(None)`, `transparent` alpha
+/// 0, which paints no caret, a colour with its alpha; an invalid value None). `inherit` / `unset` never reach here: the
+/// property is inherited, so [`css_wide`] writes `INHERIT_CARET_COLOR`.
+fn caret_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") {
+        return Some(None);
+    }
+    if v.eq_ignore_ascii_case("invert") {
+        return None;
+    }
+    outline_color_value::<H>(v)
 }
