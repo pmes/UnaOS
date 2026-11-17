@@ -591,3 +591,39 @@ fn strialinkslide_linked_drag_does_not_snap_to_its_mates() {
     let (k, delta, guide, ..) = drag(striacliplink_base(), false, 0, 3.0);
     assert_eq!((k, delta, guide), (DragKind::TrimIn, 0, Some(0)), "unlinked: A1's in edge is a target");
 }
+
+// ---- STRIALINKMORE (LEDGER SR967): `alone` narrows the selection set to the primary, no edit (named tail block) ----
+
+/// V1's and A1's SECOND clips (B[20,30)@10, nothing after them) linked as group 1.
+fn strialinkmore_linked() -> Timeline {
+    striacliplink_base().set_group(&[(0, 1), (1, 1)], 1).unwrap()
+}
+
+#[test]
+fn strialinkmore_alone_narrows_the_set() {
+    let tl = strialinkmore_linked();
+    let mut st = EditorState::new(tl.clone());
+    assert_eq!(st.verb("alone"), Some(Err(EditError::NoClip)), "nothing selected");
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1), (1, 1)]);
+    assert_eq!(st.verb("alone"), Some(Ok(())));
+    assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), vec![(0, 1)]));
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0), "a selection word: no edit, no undo step");
+    assert_eq!(st.verb("nudge+"), Some(Ok(())));
+    assert_eq!(st.timeline, tl.move_many(&[(0, 1)], 1).unwrap(), "the set op moves the primary alone");
+    assert_eq!(st.timeline.tracks[1].clips[1].at, 10, "its mate stays");
+    assert_eq!(st.undo_depth(), 1);
+    st.select(0, 1).unwrap();
+    assert_eq!(st.set, vec![(0, 1), (1, 1)], "a fresh select brings the mate back");
+}
+
+#[test]
+fn strialinkmore_alone_on_an_unlinked_clip_keeps_it() {
+    let tl = striacliplink_base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    st.select_add(1, 1).unwrap();
+    assert_eq!(st.verb("alone"), Some(Ok(())));
+    assert_eq!((st.selection, st.set.clone()), (Some((1, 1)), vec![(1, 1)]), "the primary is the last added");
+    assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+}

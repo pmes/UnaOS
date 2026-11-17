@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIACLIPLINK (SR863): `link` / `unlink` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIALINKMORE (SR967): `alone` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -702,5 +702,25 @@ impl EditorState {
             "unlink" => Some(self.unlink_selected()),
             _ => None,
         }
+    }
+}
+
+// ---- STRIALINKMORE (LEDGER SR967): the `alone` word, one link mate selected without its group (named tail block) ----
+// `select` / `select_add` grow the set by the primary's link mates, and the set ops (`move_set`, `ripple_delete`,
+// `lift_selected`, the body drag) read the set; a press on a clip already in the set adds no mates. So `alone` narrows
+// the set to the primary and those ops then edit that clip by itself; a fresh `select` brings the mates back. A selection
+// word: no commit, no undo step, the document untouched. Trims, slip, slide and split stay group-wide (`Timeline::linked`,
+// `split_linked`; owed NLE-LINK-ALT-TRIM). The Alt-click is owed (NLE-LINK-ALT-GESTURE: every press modifier is spent).
+impl EditorState {
+    /// STRIALINKMORE: the set becomes the primary alone; refused `NoClip` with nothing selected.
+    pub fn select_alone(&mut self) -> Result<(), EditError> {
+        let p = self.selection.ok_or(EditError::NoClip)?;
+        self.set.clear();
+        self.set.push(p);
+        Ok(())
+    }
+    /// The `alone` word of [`EditorState::verb`]; `None` for any other word.
+    fn alone_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        (v == "alone").then(|| self.select_alone())
     }
 }
