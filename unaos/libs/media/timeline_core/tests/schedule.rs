@@ -555,3 +555,25 @@ fn striastack_take_stack_drops_unused() {
     timeline_core::vmix::take_stack(&step, &mut runs);
     assert_eq!(runs, [None, None]);
 }
+
+// ---- STRIASTACKTOOL (LEDGER SR9093): the layer count and the stack text of a step (named tail block) ----
+
+/// On `striastack_three`: tick 10 shows three layers and names A under B at B's 40/100; tick 5 (B 40 % over A) shows two
+/// and has no stack text; with V1 emptied the bottom of the stack at tick 12 is black.
+#[test]
+fn striastacktool_stack_line_names_the_layers() {
+    use timeline_core::schedule::stack_line;
+    let g = Gop { dur: 50 };
+    let tl = striastack_three();
+    let steps = schedule(&tl, 0..30, &g).unwrap();
+    assert_eq!(steps[10].layers(), 3);
+    assert_eq!(stack_line(&tl, &steps[10]).as_deref(), Some("layers=3 stack=A:10@40/100"));
+    assert_eq!(steps[5].layers(), 2);
+    assert_eq!(stack_line(&tl, &steps[5]), None);
+    let mut bl = striastack_three();
+    bl.tracks[0].clips.clear();
+    let steps = schedule(&bl, 0..30, &g).unwrap();
+    assert_eq!(steps[12].layers(), 3);
+    assert_eq!(stack_line(&bl, &steps[12]).as_deref(), Some("layers=3 stack=BL:0@40/100"));
+    println!("striastacktool: {}", stack_line(&bl, &steps[12]).unwrap_or_default());
+}

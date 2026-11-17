@@ -14810,3 +14810,39 @@ fn striaproxywatch_worker_in_flight_never_blocks_a_reload() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("striaproxywatch worker: reload landed with the worker running, stale head and table dropped, re-asked");
 }
+
+// ---- STRIASTACKTOOL (LEDGER SR9093): the message row names the layer count under the playhead (named tail block) ----
+
+/// The STRIASTACK three-layer timeline (V1 A opaque, V2 B 40 %, V3 C[0,10)@10 50 %) on the face: at playhead 12 the
+/// message row reads `stack: 3 layers`, over the selected clip's reel line; at 5 (two layers) the reel line stands; an
+/// error wins over the note; nothing is committed.
+#[test]
+fn striastacktool_message_names_the_layers() {
+    let mut tl = Timeline::new(25);
+    let (a, b, c) = (tl.add_source("A", 50), tl.add_source("B", 50), tl.add_source("C", 50));
+    for _ in 0..3 {
+        tl.add_track(Kind::Video);
+    }
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 30, 0)];
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 30, 0)];
+    tl.tracks[2].clips = vec![Clip::new(c, 0, 10, 10)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(b, synth_source(1000, 50, 25)).unwrap();
+    src.add(c, synth_source(2000, 50, 25)).unwrap();
+    let line = src.summary(a).unwrap();
+    let tl = tl.set_opacity(&[(1, 0)], 40).unwrap().set_opacity(&[(2, 0)], 50).unwrap();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 144), PixelOrder::Rgba, true);
+    face.state.select(0, 0).unwrap();
+    face.state.playhead = 12;
+    assert_eq!(face.stack_note().as_deref(), Some("stack: 3 layers"));
+    assert_eq!(face.message_text().as_deref(), Some("stack: 3 layers"), "the stack note over the reel line");
+    face.state.playhead = 5;
+    assert_eq!(face.stack_note(), None, "two layers say nothing");
+    assert_eq!(face.message_text(), Some(format!("A: {line}")));
+    face.state.playhead = 12;
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over the note");
+    assert_eq!((face.state.undo_depth(), &face.state.timeline), (0, &tl), "view-only");
+    println!("striastacktool: stack: 3 layers at tick 12");
+}
