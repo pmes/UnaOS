@@ -185,7 +185,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "gap"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`; STRIAGAPCLOSE (SR857): `gap:5`
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -856,5 +857,30 @@ mod exporteta_tests {
         assert_eq!(export_json(&face), "");
         println!("nle5dexportmessageeta witness: {j}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): the witness's close-gaps button word and `gap:<n>` token (named tail block) ----
+#[cfg(test)]
+mod striagapclose_tests {
+    use super::*;
+
+    /// `close-gaps` (the Close Gaps button's word) closes V1's 20..25 gap; `gap:5` opens 5 ticks at the playhead (inside B:
+    /// a split), each the timeline_core op by hand; the button is in the transport row before help.
+    #[test]
+    fn striagapclose_witness_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,close-gaps").is_empty());
+        let closed = tl0.close_gaps(0).unwrap();
+        assert_eq!(face.state.timeline, closed);
+        assert_eq!(face.state.timeline.tracks[0].clips[2].at, 20);
+        assert!(drive(&mut face, "gap:5").is_empty());
+        assert_eq!(face.state.timeline, closed.insert_gap(0, 12, 5).unwrap());
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        assert_eq!(&ids[ids.len() - 2..], ["close-gaps".to_string(), "help".to_string()]);
+        println!("striagapclose witness: close-gaps -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }

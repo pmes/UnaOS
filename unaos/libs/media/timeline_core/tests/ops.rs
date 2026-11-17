@@ -237,3 +237,142 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): close every gap of a track, insert a gap at a tick (named tail block) ----
+
+/// A (100 ticks), B (60 ticks). V1: gap 0..5, A[0,10)@5, B[20,30)@15 under a 3-tick dissolve at 15, gap 25..30,
+/// A[40,50)@30. A1: A[0,10)@0, gap 10..20, B[20,30)@20, A[50,60)@30 under a 4-tick explicit audio crossfade at 30.
+fn striagapclose_base() -> (Timeline, SourceId, SourceId) {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 100);
+    let b = tl.add_source("B", 60);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 10, 5), Clip::new(b, 20, 30, 15), Clip::new(a, 40, 50, 30)];
+    tl.tracks[1].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 20), Clip::new(a, 50, 60, 30)];
+    let tl = tl.add_transition(0, 15, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let tl = tl.add_audio_xfade(1, 30, 4, timeline_core::Curve::Linear).unwrap();
+    (tl, a, b)
+}
+
+/// Every gap of the one track closes, the leading one included; the other track never moves; a track with no gap is an
+/// equal value.
+#[test]
+fn striagapclose_close_gaps_closes_every_gap_on_one_track() {
+    let (tl, a, b) = striagapclose_base();
+    let c = tl.close_gaps(0).unwrap();
+    assert_eq!(c.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 10), Clip::new(a, 40, 50, 20)]);
+    assert_eq!(c.tracks[1], tl.tracks[1]);
+    assert_eq!(c.audio_xfades, tl.audio_xfades);
+    assert_eq!(c.close_gaps(0).unwrap(), c);
+    let d = tl.close_gaps(1).unwrap();
+    assert_eq!(d.tracks[1].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 10), Clip::new(a, 50, 60, 20)]);
+    assert_eq!(d.tracks[0], tl.tracks[0]);
+    println!("striagapclose: V1 {:?}", c.tracks[0].clips);
+}
+
+/// A gap inside a clip splits it and pushes the tail and the rest; inside a gap it pushes the next clip; at a clip start
+/// it pushes that clip.
+#[test]
+fn striagapclose_insert_gap_splits_and_pushes() {
+    let (tl, a, b) = striagapclose_base();
+    let g = tl.insert_gap(0, 7, 4).unwrap();
+    assert_eq!(g.tracks[0].clips, vec![Clip::new(a, 0, 2, 5), Clip::new(a, 2, 10, 11), Clip::new(b, 20, 30, 19), Clip::new(a, 40, 50, 34)]);
+    assert_eq!(g.tracks[1], tl.tracks[1]);
+    let g = tl.insert_gap(0, 27, 2).unwrap();
+    assert_eq!(g.tracks[0].clips[2], Clip::new(a, 40, 50, 32));
+    assert_eq!(g.tracks[0].clips[..2], tl.tracks[0].clips[..2]);
+    let g = tl.insert_gap(0, 5, 3).unwrap();
+    assert_eq!(g.tracks[0].clips[0], Clip::new(a, 0, 10, 8));
+}
+
+/// Each refusal by name; the input is untouched.
+#[test]
+fn striagapclose_refusals_by_name() {
+    let (tl, _, _) = striagapclose_base();
+    let before = tl.clone();
+    assert_eq!(tl.close_gaps(9), Err(EditError::NoTrack));
+    assert_eq!(tl.insert_gap(9, 0, 1), Err(EditError::NoTrack));
+    assert_eq!(tl.insert_gap(0, 0, 0), Err(EditError::Empty));
+    assert_eq!(tl.insert_gap(0, 0, -2), Err(EditError::Empty));
+    assert_eq!(tl.insert_gap(0, -1, 1), Err(EditError::Negative));
+    assert_eq!(tl.insert_gap(0, 40, 1), Err(EditError::NoClip));
+    assert_eq!(tl.insert_gap(0, 45, 1), Err(EditError::NoClip));
+    assert_eq!(tl, before);
+}
+
+/// A transition or explicit audio crossfade on a clip that moves goes with it (the shared direct shift); a black
+/// transition that would gain a neighbour, and a gap opened on a transitioned cut, are refused by name (`Transition`).
+#[test]
+fn striagapclose_transitions_and_crossfades_move_with_their_clips() {
+    let (tl, a, b) = striagapclose_base();
+    assert_eq!(tl.close_gaps(0).unwrap().tracks[0].transitions[0].at, 10);
+    assert_eq!(tl.insert_gap(0, 7, 4).unwrap().tracks[0].transitions[0].at, 19);
+    assert_eq!(tl.close_gaps(1).unwrap().audio_xfades[0].at, 20);
+    assert_eq!(tl.insert_gap(1, 25, 3).unwrap().audio_xfades[0].at, 33);
+    assert_eq!(tl.insert_gap(0, 15, 1), Err(EditError::Transition));
+    assert_eq!(tl.insert_gap(1, 30, 1), Err(EditError::Transition));
+    // black: A[0,10)@0, B[0,10)@20 on V1
+    let mut k = Timeline::new(25);
+    let (ka, kb) = (k.add_source("A", 100), k.add_source("B", 60));
+    k.add_track(Kind::Video);
+    k.tracks[0].clips = vec![Clip::new(ka, 0, 10, 0), Clip::new(kb, 0, 10, 20)];
+    let to = k.add_transition_to_black(0, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(to.close_gaps(0), Err(EditError::Transition));
+    let pushed = to.insert_gap(0, 12, 5).unwrap();
+    assert_eq!((pushed.tracks[0].transitions[0].at, pushed.tracks[0].clips[1].at), (10, 25));
+    let from = k.add_transition_from_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(from.close_gaps(0), Err(EditError::Transition));
+    // a from-black on the LEADING gap stays valid when it closes: nothing ends at 0
+    let mut l = Timeline::new(25);
+    let lb = l.add_source("B", 60);
+    l.add_track(Kind::Video);
+    l.tracks[0].clips = vec![Clip::new(lb, 0, 10, 20)];
+    let l = l.add_transition_from_black(0, 20, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    let lc = l.close_gaps(0).unwrap();
+    assert_eq!((lc.tracks[0].clips[0].at, lc.tracks[0].transitions[0].at), (0, 0));
+    let _ = (a, b);
+}
+
+/// The document after each op round-trips through the EDL byte-exact.
+#[test]
+fn striagapclose_edl_round_trip() {
+    let (tl, _, _) = striagapclose_base();
+    for t in [tl.close_gaps(0).unwrap(), tl.close_gaps(1).unwrap(), tl.insert_gap(0, 7, 4).unwrap()] {
+        let text = timeline_core::edl::write(&t, "GAPS").unwrap();
+        let back = timeline_core::edl::parse(&text, 25).unwrap();
+        let video = |t: &Timeline| t.tracks.iter().find(|k| k.kind == Kind::Video).map(|k| (k.clips.clone(), k.transitions.clone()));
+        assert_eq!((video(&back), timeline_core::edl::write(&back, "GAPS").unwrap()), (video(&t), text));
+    }
+}
+
+/// `close-gaps` / `gap <n>` through THE verb dispatch: one commit each, undo restores, an equal value commits nothing,
+/// nothing selected is `NoClip`, the selection follows its clip across a split, malformed words are not this verb.
+#[test]
+fn striagapclose_editor_one_undo_step() {
+    use timeline_core::editor::EditorState;
+    let (tl, _, b) = striagapclose_base();
+    let mut st = EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("close-gaps"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.close_gaps(0).unwrap(), 1));
+    assert_eq!(st.verb("close-gaps"), Some(Ok(())));
+    assert_eq!(st.undo_depth(), 1);
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    st.seek(7);
+    assert_eq!(st.verb("gap 4"), Some(Ok(())));
+    assert_eq!((st.timeline.clone(), st.undo_depth()), (tl.insert_gap(0, 7, 4).unwrap(), 1));
+    assert_eq!(st.selection, Some((0, 2)));
+    assert_eq!(st.selected(), Some(Clip::new(b, 20, 30, 19)));
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+    assert_eq!(st.verb("gap 0"), Some(Err(EditError::Empty)));
+    assert_eq!(st.verb("gap x"), None);
+    assert_eq!(st.verb("gap -1"), None);
+    assert_eq!(st.verb("gap 1 2"), None);
+    st.deselect();
+    assert_eq!(st.verb("close-gaps"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.verb("gap 3"), Some(Err(EditError::NoClip)));
+    assert_eq!(st.timeline, tl);
+}

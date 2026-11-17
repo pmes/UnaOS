@@ -1380,17 +1380,7 @@ impl Timeline {
         let was = tr.clips[idx];
         let (edge, delta) = (was.end(), now.len() - was.len());
         tr.clips[idx] = now;
-        for (i, c) in tr.clips.iter_mut().enumerate() {
-            if i != idx && c.at >= edge {
-                c.at += delta;
-            }
-        }
-        for x in tr.transitions.iter_mut().filter(|x| x.at >= edge) {
-            x.at += delta;
-        }
-        for x in tl.audio_xfades.iter_mut().filter(|x| x.track == track && x.at >= edge) {
-            x.at += delta;
-        }
+        tl.shift_from(track, edge, delta, Some(idx)); // STRIAGAPCLOSE (SR857): the shift body moved to the file tail, shared with the gap ops
         tl.fit_trimmed(track, idx);
         tl.validate()?;
         Ok(tl)
@@ -1525,6 +1515,69 @@ impl Timeline {
         }
         let mut tl = self.clone();
         tl.marks = m;
+        Ok(tl)
+    }
+}
+
+// ---- STRIAGAPCLOSE (LEDGER SR857): close every gap of a track, insert a gap at a tick (named tail block) ----
+// A gap is the space between two clips' `at`s (or before the first clip). `close_gaps` closes every one on ONE track, the
+// leading gap (tick 0 to the first clip) included; `insert_gap` opens `n` ticks at a tick (a clip strictly spanning it splits,
+// `place` Insert's rule) by pushing the next clip start and everything after it. Both move clips through ONE shift body,
+// `shift_from` (`ripple_trim`'s three loops moved here verbatim): every clip, transition and explicit audio crossfade of the
+// track at or past an edge moves by the delta, so a transition or crossfade on a clip that moves goes with it. Other tracks
+// never move. A black transition that would gain a neighbour (a from-black whose gap closes, a to-black whose gap closes) and
+// a gap opened on a transitioned cut are refused by `validate` by name (`Transition`), never dropped.
+impl Timeline {
+    /// The one direct shift (NLE3ETRIMSTRETCH's body): every clip of `track` but `keep` at or past `edge`, the track's
+    /// transitions and its explicit audio crossfades at or past `edge`, move by `delta` ticks. No matcher, no validate.
+    fn shift_from(&mut self, track: usize, edge: i64, delta: i64, keep: Option<usize>) {
+        let tr = &mut self.tracks[track];
+        for (i, c) in tr.clips.iter_mut().enumerate() {
+            if Some(i) != keep && c.at >= edge {
+                c.at += delta;
+            }
+        }
+        for x in tr.transitions.iter_mut().filter(|x| x.at >= edge) {
+            x.at += delta;
+        }
+        for x in self.audio_xfades.iter_mut().filter(|x| x.track == track && x.at >= edge) {
+            x.at += delta;
+        }
+    }
+
+    /// STRIAGAPCLOSE: close every gap on `track` (the leading one included): each clip starting after the previous clip's
+    /// end (0 for the first) moves back to it with everything after it. No gap: an equal value.
+    pub fn close_gaps(&self, track: usize) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let n = tl.tracks.get(track).ok_or(EditError::NoTrack)?.clips.len();
+        let mut end = 0;
+        for i in 0..n {
+            let at = tl.tracks[track].clips[i].at;
+            if at > end {
+                tl.shift_from(track, at, end - at, None);
+            }
+            end = tl.tracks[track].clips[i].end();
+        }
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// STRIAGAPCLOSE: open `n` ticks of gap at tick `at` of `track`: a clip strictly spanning `at` splits there, then the
+    /// first clip starting at or after `at` and everything after it move `n` later. Refused: `n < 1` (`Empty`), `at < 0`
+    /// (`Negative`), no clip at or after `at` (`NoClip`: nothing to push), a bad track (`NoTrack`).
+    pub fn insert_gap(&self, track: usize, at: i64, n: i64) -> Result<Timeline, EditError> {
+        if n < 1 {
+            return Err(EditError::Empty);
+        }
+        if at < 0 {
+            return Err(EditError::Negative);
+        }
+        let mut tl = self.clone();
+        let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        split_at(t, at);
+        let edge = t.clips.iter().map(|c| c.at).find(|&a| a >= at).ok_or(EditError::NoClip)?;
+        tl.shift_from(track, edge, n, None);
+        tl.validate()?;
         Ok(tl)
     }
 }
