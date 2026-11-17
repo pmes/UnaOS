@@ -5135,3 +5135,10 @@ fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
     style.align_self_auto = v.is_none();
 }
 
+// ---- AETHERCSSOMOUTLINECOLUMNS (LEDGER SR1124): the outline-style codes back to their keywords (named tail block) ----
+
+/// AETHERCSSOMOUTLINECOLUMNS (SR1124): the inverse of paint.rs' [`crate::paint::outline_style_code`] (the codes
+/// `OUTLINE_NONE` 0 / `OUTLINE_AUTO` 1 / `OUTLINE_SOLID` 2 / `OUTLINE_DASHED` 3 / `OUTLINE_DOTTED` 4 / `OUTLINE_DOUBLE` 5).
+pub fn outline_style_word(code: u8) -> &'static str {
+    ["none", "auto", "solid", "dashed", "dotted", "double"].get(code as usize).copied().unwrap_or("none")
+}

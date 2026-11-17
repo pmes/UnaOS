@@ -2327,3 +2327,22 @@ fn outline_transparent_border_hsla() {
     assert_eq!(s.paint.border, Some([Some((2.0, (255, 0, 0))); 4]), "armed: four 2px red-RGB sides");
     assert_eq!(s.paint.border_alpha, Some([Some(0.0); 4]), "armed: alpha 0 on every side");
 }
+
+// ---- AETHERCSSOMOUTLINECOLUMNS (LEDGER SR1124): outline_style_word inverts paint.rs' outline_style_code (named tail block) ----
+
+/// AETHERCSSOMOUTLINECOLUMNS (SR1124): every outline-style code round-trips through its word; the lossy parses (groove /
+/// ridge / inset / outset draw solid, `hidden` is none for outlines) read back as their code's word.
+#[test]
+fn outline_style_word_round_trip() {
+    use layout_core::css::outline_style_word;
+    use layout_core::paint::outline_style_code;
+    for code in 0..=5u8 {
+        assert_eq!(outline_style_code(outline_style_word(code)), Some(code), "code {code}");
+    }
+    for w in ["groove", "ridge", "inset", "outset"] {
+        assert_eq!(outline_style_code(w).map(outline_style_word), Some("solid"), "{w}");
+    }
+    assert_eq!(outline_style_code("hidden").map(outline_style_word), Some("none"));
+    assert_eq!(outline_style_word(layout_core::paint::OUTLINE_AUTO), "auto");
+    assert_eq!(outline_style_word(6), "none", "out of range");
+}
