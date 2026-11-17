@@ -27,7 +27,7 @@
 //! the counts, a v1 text and a bad count refuse by name. Test f's tampered line keeps the v2 count token.
 
 use h264_core::Decoder;
-use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_clamp, qpstep_limit, qpstep_seed, IP_QP_OFFSET, read_stats, rescale_stats, step16, write_stats};
+use h264enc_core::rc::{Pass2Opts, PicStat, QP_MAX, QP_MIN, QP_STEP, STATS_VERSION, StatsError, blur_complexity, blur_qscale, qp2qscale_q16, qscale2qp_q16, exp_neg_q16, intra_keep_q16, pass2_qps, qpstep_clamp, qpstep_limit, qpstep_seed, IP_QP_OFFSET, read_stats, rescale_stats, step16, write_stats};
 use h264enc_core::{Access, Config, Encoder, Error, Pic, RateControl, Yuv420};
 
 const W: usize = 128;
@@ -930,3 +930,86 @@ const ZC_SPIKE_PLAN: [[i32; 60]; 2] = [
     [26, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 33, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 30, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 29, 33, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37],
     [20, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 27, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 24, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 27, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31],
 ];
+
+// ---- H264ENCTWOPASSQBLURLINEAR (LEDGER SR1042): qblur over the linear qscale (named tail block) ----
+// (zd) `rc::blur_qscale` against SR736's body copied here as the oracle (the Q16 QP mean): a 30 / 20 / 30 P spike at qblur 0.5
+// plans every entry HIGHER-or-equal (Jensen: a mean of 2^(q / 6) is never below the mean of q), within 1 QP, the spike itself by
+// at least 0.2 QP; a flat window blurs to itself exactly; qblur 0 still plans SR698's K literals (RAW) and SR1026's spiked() pins
+// (sharp). (ze) the conversion pair round-trips every integer QP 0..=51: exact at a multiple of 6, within 16 Q16 ulps elsewhere,
+// the rounded QP exact. Test t's T_DEFAULT_PRE re-measured under the linear blur (annotated there).
+
+/// SR736's `blur_qscale` body, verbatim (the oracle: the floor of the weighted mean of the Q16 QP).
+fn old_blur_qscale(q16: &[i64], kinds: &[Pic], qblur_q8: u32) -> Vec<i64> {
+    let half = ((((qblur_q8 as u64 * 4) >> 8) | 1) / 2) as usize;
+    if half == 0 || q16.is_empty() {
+        return q16.to_vec();
+    }
+    let qq = qblur_q8 as u128 * qblur_q8 as u128;
+    (0..q16.len())
+        .map(|i| {
+            if kinds[i] == Pic::B {
+                return q16[i];
+            }
+            let (mut num, mut den) = (0i128, 0i128);
+            for idx in i.saturating_sub(half)..=(i + half).min(q16.len() - 1) {
+                if kinds[idx] != kinds[i] {
+                    continue;
+                }
+                let d = idx.abs_diff(i) as u128;
+                let c = exp_neg_q16((((d * d) << 32) / qq).min(u64::MAX as u128) as u64) as i128;
+                num += c * q16[idx] as i128;
+                den += c;
+            }
+            num.div_euclid(den.max(1)) as i64
+        })
+        .collect()
+}
+
+#[test]
+fn zd_qblur_linear_biases_toward_the_high_qscale() {
+    let kinds = [Pic::P, Pic::P, Pic::P];
+    let q: Vec<i64> = [30i64, 20, 30].iter().map(|&x| x << 16).collect();
+    let (new, old) = (blur_qscale(&q, &kinds, 128), old_blur_qscale(&q, &kinds, 128));
+    println!("twopassqblurlinear spike 30/20/30 qblur 0.5: log {:?} linear {:?}", old.iter().map(|&x| x as f64 / 65536.0).collect::<Vec<_>>(), new.iter().map(|&x| x as f64 / 65536.0).collect::<Vec<_>>());
+    for i in 0..3 {
+        assert!(new[i] >= old[i] - 16 && new[i] <= old[i] + 65536, "picture {i}: linear {} vs log {} (Jensen: higher-or-equal, within 1 QP)", new[i], old[i]);
+    }
+    assert!(new[1] - old[1] >= 65536 / 5, "the spike pulled up by at least 0.2 QP: {} vs {}", new[1], old[1]);
+    // A flat window, a B untouched, other kinds out of the window, qblur below 0.25 the identity.
+    let flat = [25i64 << 16; 5];
+    assert_eq!(blur_qscale(&flat, &[Pic::P; 5], 128), flat.to_vec());
+    assert_eq!(blur_qscale(&flat, &[Pic::P; 5], 512), flat.to_vec());
+    let mixed = [Pic::Idr, Pic::P, Pic::B, Pic::P];
+    let mq: Vec<i64> = [10i64, 30, 99, 20].iter().map(|&x| x << 16).collect();
+    let mb = blur_qscale(&mq, &mixed, 128);
+    assert_eq!((mb[0], mb[2]), (mq[0], mq[2]), "an I with no I neighbour and a B: unchanged");
+    assert_eq!(blur_qscale(&q, &kinds, 63), q, "qblur < 0.25: the identity");
+    // The qblur 0 roads keep their pins: RAW is SR698's, the sharp default SR1026's spiked() plan.
+    let stats = synthetic();
+    let first: u64 = stats.iter().map(|p| p.bits).sum();
+    assert_eq!(&pass2_qps(&stats, first, QP_MIN, &RAW)[..], &K_SR698[1][..], "RAW: SR698's plan");
+    let spk = spiked();
+    let sfirst: u64 = spk.iter().map(|p| p.bits).sum();
+    let sharp = Pass2Opts { cplxblur: 0, qblur_q8: 0, ..Pass2Opts::default() };
+    assert_eq!(&pass2_qps(&spk, sfirst, QP_MIN, &sharp)[..], &ZC_SPIKE_PLAN[1][..], "sharp (qblur 0): SR1026's pin");
+}
+
+#[test]
+fn ze_qscale_round_trip() {
+    let one = 1u128 << 64;
+    assert_eq!(qp2qscale_q16(0), one);
+    assert_eq!(qp2qscale_q16(-5 << 16), one, "a negative distance is the window's highest");
+    assert_eq!(qp2qscale_q16(48 * 6 << 16), 0, "past 2^-48: no weight");
+    let mut worst = 0i64;
+    for qp in 0..=51i64 {
+        let rt = qscale2qp_q16(qp2qscale_q16(qp << 16), one);
+        let err = rt + (qp << 16);
+        worst = worst.max(err.abs());
+        if qp % 6 == 0 {
+            assert_eq!(err, 0, "qp {qp}: a power-of-two qscale round-trips exactly");
+        }
+        assert!(err.abs() <= 16, "qp {qp}: round trip {rt} vs {}", -(qp << 16));
+        assert_eq!((rt + (1 << 15)) >> 16, -qp, "qp {qp}: the rounded QP exact");
+    }
+    println!("twopassqblurlinear round trip worst {worst} Q16 ulps over 0..=51");
+}

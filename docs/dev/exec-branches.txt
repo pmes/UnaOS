@@ -1831,3 +1831,6 @@ exec-rmbp-aethercssomshorthandtableserialize|f31ee1b02|cut116h
 exec-rmbp-aethercssgapshorthandmulticol|f31ee1b02|cut116h
 exec-rmbp-aetherfontsynthesisposition|f31ee1b02|cut116h
 exec-rmbp-hevcwphalfrangeone|f31ee1b02|cut116h
+exec-rmbp-hevcwptoshibaluma|b336a7e14|cut117h
+exec-rmbp-aethercssomshorthandtableexpand|b336a7e14|cut117h
+exec-rmbp-aethercsslinewidthonetable|b336a7e14|cut117h

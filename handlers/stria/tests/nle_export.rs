@@ -5,6 +5,9 @@
 //! decodes back to the render's frames (counters equal the schedule's), the raw stream is the render's bytes, the WAV
 //! and the PCM16 MP4 carry the render's samples; the WAV header and the f32 -> i16 quantiser are known answers.
 //! NLE5B (SR206): the H.264 export's movie decodes, sample by sample, to the encoder's reconstruction.
+//! NLE-EXPORT-PINS-REPIN (SR1051): the h264 fnv pins below move with h264enc_core's coded bytes (SR844 moved seven unseen). No fold leg runs
+//! `cargo test -p stria --test nle_export` on an h264enc_core fold: foldleg.sh builds the kernel only, ./arroyo check's GATE-HOSTTESTS -p list
+//! omits stria, scripts/tests.registry registers stria::unit RED (alsa-sys). Owed: STRIA-NLE-EXPORT-FOLD-LEG.
 
 use std::path::PathBuf;
 
@@ -734,12 +737,12 @@ fn nle5dclitable_h264_table_is_the_cli_chain() {
 const NLE5DCLITABLE_BEFORE: [u64; 8] = [
     0x3a30_55bf_79db_7d59, // H264ENCPINTRA (SR759): was 0xb3c1_26d2_643f_7976
     0xd4a7_27d4_5b5d_78c5, // H264ENCPINTRA (SR759): was 0xd4a7_27d4_5b5d_78c5
-    0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
-    0x12d0_3f9f_3155_d2fd /* was 0xa8c4_5a90_2fdd_d16e (SR771 fold) */, // H264ENCPINTRA (SR759): was 0x7265_0fd7_6ad4_126c
+    0x1841_a105_b44f_12bc /* SR1051: moved by SR844, was 0x90a9_4459_73cd_a5a0 */, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
+    0x43b6_06e1_4241_9fe5 /* SR1051: moved by SR844, was 0x12d0_3f9f_3155_d2fd */ /* was 0xa8c4_5a90_2fdd_d16e (SR771 fold) */, // H264ENCPINTRA (SR759): was 0x7265_0fd7_6ad4_126c
     0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
     0x711d_bf3f_792b_8b5d, // H264ENCPINTRA (SR759): was 0x3657_59b8_8c60_a4d0
-    0x90a9_4459_73cd_a5a0, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
-    0xd4ff_03e4_a085_e72a, // H264ENCPINTRA (SR759): was 0xaae5_c049_c971_23c3; H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x4f03_dbed_36e4_72d6)
+    0x1841_a105_b44f_12bc /* SR1051: moved by SR844, was 0x90a9_4459_73cd_a5a0 */, // H264ENCPINTRA (SR759): was 0x050f_27c6_7cc3_2beb
+    0xaf8e_fc96_9268_fc56 /* SR1051: moved by SR844, was 0xd4ff_03e4_a085_e72a; RAW now 0x5692_6ebd_0f59_d68f */, // H264ENCPINTRA (SR759): was 0xaae5_c049_c971_23c3; H264ENCTWOPASSBLUR (SR736): the Default Pass2Opts plan (RAW keeps 0x4f03_dbed_36e4_72d6)
 ];
 
 #[test]
@@ -776,7 +779,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
     assert_eq!(ninth, NLE5DCLITABLE_BEFORE[7], "set 9: qcomp 0.6 + cplxblur 20 are x264's defaults, set 8's bytes");
     assert_eq!(ninth, nle5dclitable_fnv(Box::new(chain(Pass2Opts::default())), &refr.frames), "set 9: the knob's chain");
     let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: false, qpstep: 0, ..Pass2Opts::default() }; // H264ENCTWOPASSQPSTEP (SR763): RAW keeps SR698's plan
-    assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x4f03_dbed_36e4_72d6, "RAW plans SR698's QPs: SR718's pin before SR736");
+    assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x5692_6ebd_0f59_d68f /* SR1051: moved by SR844, was 0x4f03_dbed_36e4_72d6 */, "RAW plans SR698's QPs: SR718's pin before SR736");
     let tenth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((1, 1)), None)).unwrap(), &refr.frames);
     let knob = nle5dclitable_fnv(Box::new(chain(Pass2Opts { qcomp: (1, 1), ..Pass2Opts::default() })), &refr.frames);
     assert_eq!(tenth, knob, "set 10: the table is the knob's chain");
@@ -785,7 +788,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
 }
 
 /// The 10th set's fnv, measured on this tree by the arc's EXCEPTION run.
-const H264ENCTWOPASSQCOMPCLI_TENTH: u64 = 0xee63_6af6_08fc_d437;
+const H264ENCTWOPASSQCOMPCLI_TENTH: u64 = 0xe984_9dc2_0dd7_5d3f; // SR1051: moved by SR844, was 0xee63_6af6_08fc_d437
 
 #[test]
 fn h264enctwopassqcompcli_qcomp_of() {
@@ -958,7 +961,7 @@ fn h264enctwopassqblurcli_table_qblur_two_stream() {
 }
 
 /// The qblur-2 stream's fnv, measured on this tree by the arc's EXCEPTION run.
-const H264ENCTWOPASSQBLURCLI_QBLUR2: u64 = 0xe981_d80a_3810_9d2f; // H264ENCPINTRA (SR759): was 0x725b_239b_2b64_f04f (re-measured at the SR790 trunk merge)
+const H264ENCTWOPASSQBLURCLI_QBLUR2: u64 = 0x5686_ea89_b7b0_3ec3 /* SR1051: moved by SR844, was 0xe981_d80a_3810_9d2f */; // H264ENCPINTRA (SR759): was 0x725b_239b_2b64_f04f (re-measured at the SR790 trunk merge)
 
 // ---- H264ENCTWOPASSQPSTEPCLI (LEDGER SR773): `--qpstep N` through the table against SR763's knob (named tail block) ----
 use stria::nle_export::qpstep_of;
