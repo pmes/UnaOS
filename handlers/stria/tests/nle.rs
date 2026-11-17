@@ -3726,3 +3726,28 @@ fn striaopacityface_face_buttons_step_and_name_the_percent() {
     assert_eq!(face.message_text(), face.reel_line(), "the message is taken: the idle line again");
     println!("striaopacityface: opacity- x5 -> 50 %, opacity+ -> 60 %, undo depth {}", face.state.undo_depth());
 }
+
+// ---- STRIAOPACITYMORE (LEDGER SR958): the 8 / 9 keys step the selection's opacity (named tail block) ----
+
+/// `8` (text) on a selected clip reads `opacity: 90 %` as one undo step, `9` reads `opacity: 100 %`; the named key
+/// `BrowserKey("8")` is not taken; the keys help has a `8` row and a `9` row with their phrases.
+#[test]
+fn striaopacitymore_keys_step_the_selection_and_help_names_them() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, help_phrase, help_rows, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(0, 1).unwrap();
+    assert!(face.on(&bandy::SMessage::BrowserText("8".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 90 %"));
+    assert_eq!(face.state.undo_depth(), 1);
+    assert!(face.on(&bandy::SMessage::BrowserText("9".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("opacity: 100 %"));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(!face.on(&bandy::SMessage::BrowserKey("8".into())), "a one-character key is text only");
+    let rows = help_rows();
+    for (k, a) in [("8", "opacity-"), ("9", "opacity+")] {
+        assert!(rows.iter().any(|(keys, p)| *p == help_phrase(a) && keys.split(" / ").any(|x| x == k)), "{k} {a}");
+        assert_ne!(help_phrase(a), a, "{a} has a phrase");
+    }
+    println!("striaopacitymore: key 8 -> opacity: 90 %, key 9 -> opacity: 100 %, help rows 8 / 9");
+}

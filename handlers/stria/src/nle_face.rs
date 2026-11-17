@@ -386,6 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("8", "opacity-"), ("9", "opacity+"), // STRIAOPACITYMORE (SR958): 8 / 9 (text keys) step the selection's opacity through the VERBS words
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2602,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("opacity-", "selection 10 % more transparent"), ("opacity+", "selection 10 % more opaque"), // STRIAOPACITYMORE (SR958)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).

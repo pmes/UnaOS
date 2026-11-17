@@ -333,7 +333,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity)); // STRIAOPACITYFACE (SR898): the body at its opacity (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
-                text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
+                text.text(&mut c, &opacity_label(label, clip.opacity), x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32)); // STRIAOPACITYMORE (SR958): the label names a non-opaque clip's percent (file tail)
             }
         }
     }
@@ -1202,4 +1202,16 @@ pub fn opacity_colour(c: [u8; 4], row: [u8; 4], pct: u8) -> [u8; 4] {
     }
     let mix = |a: u8, b: u8| -> u8 { (b as i32 + ((a as i32 - b as i32) * pct as i32 * 2 + crate::OPAQUE as i32).div_euclid(2 * crate::OPAQUE as i32)) as u8 };
     [mix(c[0], row[0]), mix(c[1], row[1]), mix(c[2], row[2]), 255]
+}
+
+// ---- STRIAOPACITYMORE (LEDGER SR958): the clip label names its opacity (named tail block) ----
+// A clip below [`crate::OPAQUE`] is labelled `<label> <pct>%`; an opaque clip's label is unchanged, so every labelled
+// golden (all opaque) records the same strings. Both faces label through `paint_in`'s `Text` hook.
+
+/// STRIAOPACITYMORE: `label` with ` <pct>%` appended below [`crate::OPAQUE`]; `label` itself at or above it.
+pub fn opacity_label(label: alloc::string::String, pct: u8) -> alloc::string::String {
+    if pct >= crate::OPAQUE {
+        return label;
+    }
+    alloc::format!("{label} {pct}%")
 }
