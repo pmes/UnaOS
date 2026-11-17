@@ -3270,7 +3270,7 @@ impl Timeline {
         for t in &mut tl.tracks {
             sort(t);
         }
-        tl.retarget_transitions(self)?;
+        tl.retarget_transitions(&self.carry_cuts(picks, dtrack))?; // STRIAMULTISELECTNEXT (SR998): a fully picked cut is carried (file tail)
         tl.validate()?;
         Ok(tl)
     }

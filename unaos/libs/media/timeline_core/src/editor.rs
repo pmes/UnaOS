@@ -4556,7 +4556,7 @@ impl EditorState {
     }
     /// The key words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xkey_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.xkey_nav_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMKEYSNAV (SR9069): `pip prev|next` (file tail)
+        if let Some(r) = self.xease_verb(v) { return Some(r); } if let Some(r) = self.xkey_nav_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMKEYSNAV (SR9069): `pip prev|next` (file tail)
         if !matches!(w.as_slice(), ["pip", "key"] | ["pip", "unkey"] | ["pip", "unkey", "all"]) {
             return None;
         }
@@ -5360,7 +5360,7 @@ impl EditorState {
 impl EditorState {
     /// The ease words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xease_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.xease_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMKEYSEASE (SR9070): `pip ease`, `pip ease <name>` (file tail)
+        let w: Vec<&str> = v.split_ascii_whitespace().collect();
         if !matches!(w.as_slice(), ["pip", "ease", ..]) {
             return None;
         }

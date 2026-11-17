@@ -304,7 +304,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     }
     // The ruler: a short mark per tick when they are 4 px apart, a long one per second.
     let fps = tl.fps().or(edl::ntsc_nominal(tl.tb)).unwrap_or(25).max(1) as i64; // STRIATCTHREE (SR9030): an NTSC base rules at its nominal (file tail)
-    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64); let mut tc = alloc::string::String::new(); // STRIAPERFTHREE (SR9037): one ruler timecode buffer (edl.rs tail)
+    let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64); let _tc = alloc::string::String::new(); // STRIAPERFTHREE (SR9037): one ruler timecode buffer (edl.rs tail)
     c.rect(0, ry, w as i64, ty, RULER);
     let t_end = if l.band_on(ry, ty) { l.tick_at(w as f64) + 1 } else { l.t0 - 1 }; // STRIAPERFCANVASFILL (SR919): an off-canvas ruler runs no tick
     for t in l.ruler_ticks(t_end, fps) { // STRIAZOOMFITTHREE (SR9040): every tick, or whole seconds when squeezed (file tail)
@@ -328,7 +328,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             if x1 <= 0 || x0 >= w as i64 {
                 continue;
             }
-            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity_at(st.playhead)));
+            c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity_at(st.playhead))); pan_tick(&mut c, track.kind, clip, x0, x1, y0); paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick; STRIACROPFACE (SR900): a cropped clip's badge (file tails)
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_strip(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left; STRIATHUMBNAILSMORE (SR949): a wide body's filmstrip and tail (file tail) // STRIAOPACITYKEYSFACE (SR9085): a keyed clip's shade is its curve at the playhead; STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail) paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
@@ -352,7 +352,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE); pan_curve(&mut c, &l, st, row, clip); paint_opacity_keys(&mut c, l, &clip, y0, y1); // STRIAPANAUTOWRITE (SR9084): the selected keyed audio clip's pan curve, nothing unkeyed (file tail); STRIAOPACITYKEYSFACE (SR9085): the primary's opacity curve and points (file tail)
     }
-    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_xkeys(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail) // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail) // STRIALINKTRIM (SR910): the chain mark on linked clips (file tail) paint_headers(&mut c, l, st, labels.as_deref_mut()); // STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail) // STRIAXFORMKEYSNAV (SR9069): a keyed clip's point marks (file tail) paint_reverse_badges(&mut c, l, st); // STRIAREVERSEEDIT (SR9094): a reversed body's badge, nothing when none is reversed (file tail)
+    paint_grade_badges(&mut c, l, st); paint_links(&mut c, l, st); paint_xkeys(&mut c, l, st); paint_transitions(&mut c, l, st); paint_audio_xfades(&mut c, l, st, &mut labels); paint_headers(&mut c, l, st, &mut labels); paint_reverse_badges(&mut c, l, st); // STRIAAUDIOCROSSFADE (SR860): the explicit audio crossfades' brackets (file tail); STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail); STRIALINKTRIM (SR910): the chain mark on linked clips (file tail); STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail); STRIAXFORMKEYSNAV (SR9069): a keyed clip's point marks (file tail); STRIAREVERSEEDIT (SR9094): a reversed body's badge, nothing when none is reversed (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -4957,7 +4957,7 @@ impl Layout {
 
 /// STRIATRACKSTHREE (SR9038): the header column over whatever ran left of the page: the ruler's corner, one header per row
 /// with a one-pixel edge, and the row's channel word. Nothing at all while `l.left` is 0.
-fn paint_headers(c: &mut Canvas, l: Layout, st: &EditorState, mut labels: Option<&mut dyn Text>) {
+fn paint_headers(c: &mut Canvas, l: Layout, st: &EditorState, labels: &mut Option<&mut dyn Text>) { // the fold: the painter's labels by reference, as paint_audio_xfades takes them
     if l.left == 0 {
         return;
     }
