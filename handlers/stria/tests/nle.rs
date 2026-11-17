@@ -15636,3 +15636,31 @@ fn striakcutjumpmore_host_keys_match_the_shared_end_jump_keys() {
     assert!(!face.dirty(), "Home / End do not dirty the document");
     println!("striakcutjumpmore: {} shared end jump keys bound alike on both faces", timeline_core::editor::END_JUMP_KEYS.len());
 }
+// ---- STRIAXFORMHOVER (LEDGER SR9107): the hovered placement handle on the face (named tail block) ----
+
+/// A bare move onto a placed, selected clip's top-left handle repaints and the face paints that square in SELECT; a move
+/// onto the rect's body repaints it back to HANDLE; a further body move asks no repaint; nothing is edited.
+#[test]
+fn striaxformhover_face_hover_repaints() {
+    use bandy::SMessage;
+    use stria::nle_face::{EditorState, Face, PixelOrder, Role, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(12);
+    assert!(face.verb("pip"));
+    let _ = face.frame();
+    let l = face.layout_for(Role::Whole).with_message(false);
+    let (sw, sh) = face.still().map(|s| (s.width, s.height)).expect("a preview still");
+    let rest = timeline_core::view::XformDrag::rest(&face.state, l, sw, sh).expect("a placed clip selected at the playhead");
+    let (x0, y0, x1, y1) = rest.rect();
+    let o = (y0 as usize * l.w as usize + x0 as usize) * 4;
+    let (tl, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    assert!(face.on(&SMessage::BrowserMouseMove(x0 as f64, y0 as f64, 0)), "onto the top-left handle: repaint");
+    assert_eq!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::SELECT, "the hovered handle");
+    let (cx, cy) = ((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0);
+    assert!(face.on(&SMessage::BrowserMouseMove(cx, cy, 0)), "off the handle: repaint");
+    assert_eq!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::HANDLE, "back to the plain handle");
+    assert!(!face.on(&SMessage::BrowserMouseMove(cx + 1.0, cy, 0)), "a body move: nothing to repaint");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, depth), "hover edits nothing");
+}

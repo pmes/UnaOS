@@ -544,7 +544,7 @@ impl Face {
     }
     /// The pointer moved: a live drag follows it.
     fn hover(&mut self, x: f64, y: f64) -> bool {
-        if let Some(r) = self.hover_message(x, y) { return r; } // STRIAINFOREELHOVER (SR762): no drag: the pointer moves and the message follows the clip under it (file tail)
+        let hc = self.xform_hover_corner(); if let Some(r) = self.hover_message(x, y) { return r || self.xform_hover_corner() != hc; } // STRIAXFORMHOVER (SR9107): a bare move repaints when the hovered placement handle changed (file tail); STRIAINFOREELHOVER (SR762): no drag: the pointer moves and the message follows the clip under it (file tail)
         let Some(d) = self.drag.as_mut() else { return false };
         let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
@@ -1662,7 +1662,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
-        let px = self.paint_message(paint_source_ruler(view::paint_xform_handles(view::paint_xform_drag(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, self.order, st), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail); STRIASOURCEPLAY (SR9080): the source ruler strip while loaded (file tail)
+        let px = self.paint_message(view::paint_xform_hover(paint_source_ruler(view::paint_xform_handles(view::paint_xform_drag(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, self.order, st), l, vo(self.order), self.xform_hover(st, l, role).as_ref()), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAXFORMHOVER (SR9107): the hovered (or held) handle in SELECT (file tail); STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail); STRIASOURCEPLAY (SR9080): the source ruler strip while loaded (file tail)
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
@@ -11976,5 +11976,37 @@ mod striakmeterreset_tests {
         let rows = help_rows();
         let row = rows.iter().find(|r| r.1 == help_phrase("meters-reset")).expect("a meters-reset help row");
         assert!(row.0.split(" / ").any(|k| k == "!"), "{:?}", row.0);
+    }
+}
+
+// ---- STRIAXFORMHOVER (LEDGER SR9107): the hovered placement handle on the preview picture (named tail block) ----
+// NLE-XFORM-HANDLES-HOVER on the face: `paint_role`'s paint line hands [`Face::xform_hover`] to timeline_core's
+// `view::paint_xform_hover`: on the one-Surface face, the corner a press at THE pointer (`self.pointer`, the pointer the face
+// already keeps) would grab (`view::XformDrag::hover` over the painted state, layout and still); `Face::hover`'s first line
+// compares [`Face::xform_hover_corner`] before and after the move, so a bare move repaints only when that corner changed.
+// NLE-XFORM-HOVER-DRAG: a live corner drag's held corner is the same square (no new state). Nothing on the tracks Surface,
+// under the help, or on the split preview Surface without a drag (its pointer is not the face's: NLE-XFORM-HOVER-SPLIT).
+
+impl Face {
+    /// STRIAXFORMHOVER (SR9107): the drag whose `corner` is highlighted on `role`'s paint of `st` over layout `l`: a live
+    /// corner drag's held corner, else (one Surface) the handle under the pointer; `None` otherwise.
+    fn xform_hover(&self, st: &EditorState, l: Layout, role: Role) -> Option<view::XformDrag> {
+        if role == Role::Tracks || self.help {
+            return None;
+        }
+        if let Some(d) = self.xform_drag {
+            return d.corner.is_some().then_some(d);
+        }
+        if role != Role::Whole {
+            return None;
+        }
+        let (x, y) = self.pointer?;
+        let s = self.still.as_ref()?;
+        view::XformDrag::hover(st, l, s.width, s.height, x, y)
+    }
+    /// STRIAXFORMHOVER (SR9107): the corner [`Face::xform_hover`] highlights on the pointer's Surface now.
+    fn xform_hover_corner(&self) -> Option<u8> {
+        let role = self.pointer_role();
+        self.xform_hover(&self.state, self.layout_for(role).with_message(self.labels.is_some()), role).and_then(|d| d.corner)
     }
 }
