@@ -2142,9 +2142,9 @@ impl Face {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
         self.range_check(&range)?; std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+        let span = range.clone().unwrap_or(0..self.state.timeline.end()); let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(crate::nle_export::export_total(&self.state.timeline, &span))), Arc::new(AtomicBool::new(false))); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the range resolved once, the total seeded before the spawn
         let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
-        let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), range.clone());
+        let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), span);
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
@@ -2162,7 +2162,7 @@ impl Face {
                     }
                     Ok(())
                 };
-                export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
+                export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
@@ -2177,7 +2177,7 @@ impl Face {
     pub fn exporting(&self) -> bool {
         self.export.is_some()
     }
-    /// The running export's reading `(frames done, frames total)` (total 0 until the first frame).
+    /// The running export's reading `(frames done, frames total)` (total seeded at the start from `nle_export::export_total`).
     pub fn export_progress(&self) -> Option<(u64, u64)> {
         self.export.as_ref().map(|j| (j.done.load(Relaxed), j.total.load(Relaxed)))
     }
@@ -2940,7 +2940,7 @@ pub fn eta_words(done: u64, total: u64, elapsed: Duration) -> Option<String> {
 // NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
 
 /// A running export as a person reads it: `export: <done> / <total>`, then ` <eta>` when there is one ([`eta_words`]:
-/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (before the export thread's first reading).
+/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (an export of no frames).
 pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
     if total == 0 {
         return "export: starting".to_string();
