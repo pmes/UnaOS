@@ -1378,7 +1378,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
             if let Some(nw) = paint.nowrap {
                 me.nowrap = nw;
             }
-            me.white_space = paint.white_space.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WHITE_SPACE, parent.white_space, |w| crate::layout::default_white_space(tag, w))); me.list_style = crate::render::list_style_of(tag, parent.list_style, &paint, &any.node_at(id)); me.rtl = paint.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_DIRECTION, parent.rtl, |r| crate::layout::default_rtl(&any.node_at(id), r)));
+            me.white_space = paint.white_space.unwrap_or_else(|| layout_core::css::white_space_halves(Some(&paint), layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_WHITE_SPACE, parent.white_space, |w| crate::layout::default_white_space(tag, w)))); me.list_style = crate::render::list_style_of(tag, parent.list_style, &paint, &any.node_at(id)); me.rtl = paint.rtl.unwrap_or_else(|| layout_core::paint::or_tag(Some(&paint), layout_core::paint::INHERIT_DIRECTION, parent.rtl, |r| crate::layout::default_rtl(&any.node_at(id), r)));
             if let Some(h) = paint.hidden {
                 me.hidden = h;
             }
@@ -1817,6 +1817,10 @@ fn meta_color_scheme(layout_tree: &LayoutTree) -> Option<u8> {
     })
 }
 
+// ---- AETHERCSSOMCOLUMNSREST (LEDGER SR1036): white-space's two css-text-4 longhands from the one code (named tail block) ----
+
+use layout_core::css::white_space_longhands; // SR1036's code -> (white-space-collapse, text-wrap-mode) table, lifted to layout_core by SR1044 (one table for the arms, the resolve and these columns)
+
 // ---- AETHERCSSOMUNICODEBIDI (LEDGER SR1008): the report's unicode-bidi keyword, the 22nd column (named tail block) ----
 
 /// AETHERCSSOMUNICODEBIDI (SR1008): a `PaintStyle::unicode_bidi` code as its keyword (the inverse of layout_core's
@@ -1829,20 +1833,5 @@ fn unicode_bidi_word(c: u8) -> &'static str {
         4 => "isolate-override",
         5 => "plaintext",
         _ => "normal",
-    }
-}
-
-// ---- AETHERCSSOMCOLUMNSREST (LEDGER SR1036): white-space's two css-text-4 longhands from the one code (named tail block) ----
-
-/// AETHERCSSOMCOLUMNSREST (SR1036): a `PaintStyle::white_space` code (the codes [`white_space_word`] reads) as its
-/// css-text-4 §4 longhand pair `(white-space-collapse, text-wrap-mode)`, as Chromium's getComputedStyle reports them.
-fn white_space_longhands(c: u8) -> (&'static str, &'static str) {
-    match c {
-        1 => ("collapse", "nowrap"),
-        2 => ("preserve", "nowrap"),
-        3 => ("preserve", "wrap"),
-        4 => ("preserve-breaks", "wrap"),
-        5 => ("break-spaces", "wrap"),
-        _ => ("collapse", "wrap"),
     }
 }

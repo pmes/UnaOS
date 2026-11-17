@@ -1635,7 +1635,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.underline_position = Some(p);
             }
         }
-        "white-space" | "white-space-collapse" => {
+        "white-space-collapse" | "text-wrap-mode" | "text-wrap" => apply_white_space_longhand::<H>(prop, value, style), "white-space" => {
             let code = match value {
                 "normal" => Some(0),
                 "nowrap" => Some(1),
@@ -1647,7 +1647,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             };
             if let Some(c) = code {
                 style.paint.white_space = Some(c);
-                style.paint.nowrap = Some(matches!(c, 1 | 2));
+                style.paint.nowrap = Some(matches!(c, 1 | 2)); style.paint.ws_collapse = None; style.paint.ws_wrap = None;
             }
         }
         "word-break" => match value {
@@ -1831,6 +1831,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "outline-color" => {
             if let Some(c) = outline_color_value::<H>(value) {
                 style.paint.outline_color = Some(c);
+            }
+        }
+        "caret-color" => {
+            if let Some(c) = caret_color_value::<H>(value) {
+                style.paint.caret_color = Some(c);
             }
         }
         "outline-offset" => {
@@ -2611,9 +2616,9 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         writing_mode, text_orientation, container_type, contain_size,
         scrollbar_gutter, scroll_smooth, snap_type, snap_align, snap_stop, scroll_padding, col_span,
         deco_clone, text_combine, scroll_margin, container_scroll,
-        outline_style, outline_width, outline_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps, color_scheme,
+        outline_style, outline_width, outline_color, caret_color, outline_offset, synth_weight, synth_style, synth_small_caps, small_caps, color_scheme,
     );
-    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src); dst.merge_system_colors(src); border_width_apply(dst);
+    clone!(text_shadows, transform, clip_path, filter, backdrop_filter, container_name); dst.merge_inherit(src); dst.merge_currentcolor(src); dst.merge_system_colors(src); border_width_apply(dst); merge_white_space_halves(dst, src);
     if let Some(src_list) = &src.font_rel {
         let list = dst.font_rel.get_or_insert_with(Vec::new);
         for (p, v) in src_list {
@@ -4121,7 +4126,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
-    "text-decoration-line", "white-space", "white-space-collapse", "word-break", "overflow-wrap", "box-sizing", "text-transform",
+    "text-decoration-line", "white-space", "white-space-collapse", "text-wrap-mode", "word-break", "overflow-wrap", "box-sizing", "text-transform",
     "object-fit", "object-position", "mask-image", "mask-size", "mask-position", "mask-repeat",
     "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
     "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
@@ -4132,6 +4137,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "border-top-color", "border-right-color", "border-bottom-color", "border-left-color", "text-decoration-color",
     // SR1038 / SR1045 folds: text-decoration-style / -thickness, text-underline-offset / -position (the arms landed with their folds).
     "text-decoration-style", "text-decoration-thickness", "text-underline-offset", "text-underline-position",
+    "caret-color", // SR1040 fold
     "color-scheme", // SR1031 fold: the color-scheme arm (inherited; `all` resets it)
 ];
 
@@ -4140,7 +4146,7 @@ pub const ALL_SKIPPED: &[&str] = &[
     // css-cascade-4 §3.1: `all` leaves `direction` and `unicode-bidi` (its arm is SR1008's; the SR1021 fold added the name); `all` is this arm.
     "direction", "unicode-bidi", "all",
     // SHORTHANDS: reset through their longhands, which are listed (the `border-width` shorthand under initial / unset would write 3px into every side of `paint.border` and re-create the sides `border-*-style: none` cleared).
-    "list-style", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
+    "list-style", "text-wrap", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
     // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
     "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
     // ALIAS spellings of a listed name (the same field, the same value grammar).
@@ -4609,4 +4615,139 @@ fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
     if let Some(t) = sides.into_iter().find(|t| !border_transparent::<H>(t)) {
         paint.border_alpha = Some(color_alpha::<H>(t));
     }
+}
+
+// ---- AETHERCSSOMWHITESPACELONGHANDSWRITE (LEDGER SR1044): white-space-collapse / text-wrap-mode / text-wrap write the one white-space code (named tail block) ----
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044; lifted from aether's css/mod.rs, AETHERCSSOMCOLUMNSREST SR1036): a
+/// `PaintStyle::white_space` code as its css-text-4 §4 longhand pair `(white-space-collapse, text-wrap-mode)`, as
+/// Chromium's getComputedStyle reports them. THE one table: the longhand arms, the resolve and the cssom read it.
+pub fn white_space_longhands(c: u8) -> (&'static str, &'static str) {
+    match c {
+        1 => ("collapse", "nowrap"),
+        2 => ("preserve", "nowrap"),
+        3 => ("preserve", "wrap"),
+        4 => ("preserve-breaks", "wrap"),
+        5 => ("break-spaces", "wrap"),
+        _ => ("collapse", "wrap"),
+    }
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): the inverse of [`white_space_longhands`]: the code of a longhand pair,
+/// None for a pair no code holds (preserve-breaks / break-spaces with nowrap: AETHER-CSS-WHITE-SPACE-PAIRS-REST owed).
+pub fn white_space_from_longhands(collapse: &str, wrap: &str) -> Option<u8> {
+    (0..6u8).find(|&c| white_space_longhands(c) == (collapse, wrap))
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): THE resolve every white-space walker calls over its `or_tag` result
+/// `base` (the parent's code through the tag default): a lone longhand half replaces that half of `base`; no half, or a
+/// pair no code holds, is `base`.
+pub fn white_space_halves<H: Host>(paint: Option<&PaintStyle<H>>, base: u8) -> u8 {
+    let Some(p) = paint else { return base };
+    if p.ws_collapse.is_none() && p.ws_wrap.is_none() {
+        return base;
+    }
+    let collapse = white_space_longhands(p.ws_collapse.unwrap_or(base)).0;
+    let wrap = white_space_longhands(p.ws_wrap.unwrap_or(base)).1;
+    white_space_from_longhands(collapse, wrap).unwrap_or(base)
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): THE combine (the arm within a block, `merge_white_space_halves` across
+/// rules): onto a full code the given half makes the new full code (and its nowrap); with no code the half is recorded
+/// for the walkers' resolve, a wrap half writing its nowrap (the run bool only promotes normal to nowrap).
+fn ws_put_halves<H: Host>(p: &mut PaintStyle<H>, collapse: Option<u8>, wrap: Option<u8>) {
+    if collapse.is_none() && wrap.is_none() {
+        return;
+    }
+    match p.white_space {
+        Some(c) => {
+            let pair = (white_space_longhands(collapse.unwrap_or(c)).0, white_space_longhands(wrap.unwrap_or(c)).1);
+            if let Some(n) = white_space_from_longhands(pair.0, pair.1) {
+                p.white_space = Some(n);
+                p.nowrap = Some(matches!(n, 1 | 2));
+            }
+        }
+        None => {
+            if collapse.is_some() {
+                p.ws_collapse = collapse;
+            }
+            if let Some(w) = wrap {
+                p.ws_wrap = Some(w);
+                p.nowrap = Some(matches!(w, 1 | 2));
+            }
+        }
+    }
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): the arms of `white-space-collapse`, `text-wrap-mode` and the
+/// `text-wrap` shorthand (css-text-4 §4 / §5): each value is found THROUGH [`white_space_longhands`] (a half is stored
+/// as a code whose that half is the value). `text-wrap` is `<text-wrap-mode> || <text-wrap-style>`; an omitted mode is
+/// its initial `wrap`; a style other than `auto` is recorded and dropped (AETHER-CSS-TEXT-WRAP-STYLE owed). Any other
+/// value (`white-space-collapse: pre`, `discard`, `preserve-spaces`, a bogus word) is dropped.
+fn apply_white_space_longhand<H: Host>(prop: &str, value: &str, style: &mut SpecifiedStyle<H>) {
+    let v = value.to_ascii_lowercase();
+    let collapse_code = |w: &str| (0..6u8).find(|&c| white_space_longhands(c).0 == w);
+    let wrap_code = |w: &str| (0..6u8).find(|&c| white_space_longhands(c).1 == w);
+    match prop {
+        "white-space-collapse" => {
+            if let Some(c) = collapse_code(&v) {
+                ws_put_halves(&mut style.paint, Some(c), None);
+            }
+        }
+        "text-wrap-mode" => {
+            if let Some(c) = wrap_code(&v) {
+                ws_put_halves(&mut style.paint, None, Some(c));
+            }
+        }
+        _ => {
+            let (mut mode, mut wrap_style, mut n) = (None, None, 0);
+            for tok in v.split_whitespace() {
+                n += 1;
+                match tok {
+                    "wrap" | "nowrap" if mode.is_none() => mode = Some(tok),
+                    "auto" | "balance" | "pretty" | "stable" if wrap_style.is_none() => wrap_style = Some(tok),
+                    _ => return,
+                }
+            }
+            if n == 0 {
+                return;
+            }
+            if let Some(s) = wrap_style.filter(|s| *s != "auto") {
+                H::record_css(&format!("text-wrap-style:{}", s));
+            }
+            if let Some(c) = wrap_code(mode.unwrap_or("wrap")) {
+                ws_put_halves(&mut style.paint, None, Some(c));
+            }
+        }
+    }
+}
+
+/// AETHERCSSOMWHITESPACELONGHANDSWRITE (SR1044): `merge_paint`'s half for the longhands, after `merge_inherit` (a later
+/// rule's `white-space: inherit` has cleared the earlier halves): a later full code (already copied) clears the earlier
+/// halves; later halves combine onto the earlier code, or are recorded over the earlier halves.
+pub fn merge_white_space_halves<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    if src.white_space.is_some() {
+        dst.ws_collapse = None;
+        dst.ws_wrap = None;
+    } else {
+        ws_put_halves(dst, src.ws_collapse, src.ws_wrap);
+    }
+}
+
+// ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color in the outline_color RGBA marker shape (named tail block) ----
+
+/// AETHERCSSCARETCOLOR (SR1040): a `caret-color` value (css-ui-4 §4.1: `auto | <color>`) as [`PaintStyle::caret_color`]
+/// holds it: `auto` and `initial` are `Some(None)` (the caret paints the control's currentcolor); `invert` is not a
+/// caret-color value (None); the rest through [`outline_color_value`] (`currentcolor` `Some(None)`, `transparent` alpha
+/// 0, which paints no caret, a colour with its alpha; an invalid value None). `inherit` / `unset` never reach here: the
+/// property is inherited, so [`css_wide`] writes `INHERIT_CARET_COLOR`.
+fn caret_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") || v.eq_ignore_ascii_case("initial") {
+        return Some(None);
+    }
+    if v.eq_ignore_ascii_case("invert") {
+        return None;
+    }
+    outline_color_value::<H>(v)
 }

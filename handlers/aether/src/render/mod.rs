@@ -26,7 +26,7 @@ struct Inherited {
     white_space: u8,
     word_break: u8,
     overflow_wrap: u8,
-    letter_spacing: f32,
+    letter_spacing: f32, caret_color: Option<(u8, u8, u8, u8)>,
     line_through: bool,
     /// vertical-align super/sub: paint-time baseline shift in px.
     shift_y: f32,
@@ -491,7 +491,7 @@ fn root_inherited() -> Inherited {
         white_space: 0,
         word_break: 0,
         overflow_wrap: 0,
-        letter_spacing: 0.0,
+        letter_spacing: 0.0, caret_color: None,
         line_through: false,
         shift_y: 0.0,
         list_style: 1,
@@ -1045,10 +1045,10 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     }
     inherited.white_space = spec
         .white_space
-        .unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WHITE_SPACE, inherited.white_space, |w| crate::layout::default_white_space(tag, w)));
+        .unwrap_or_else(|| layout_core::css::white_space_halves(Some(spec), layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_WHITE_SPACE, inherited.white_space, |w| crate::layout::default_white_space(tag, w))));
     if let Some(v) = spec.word_break { inherited.word_break = v; }
     if let Some(v) = spec.overflow_wrap { inherited.overflow_wrap = v; }
-    if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; }
+    if let Some(v) = spec.letter_spacing { inherited.letter_spacing = v; } caret_inherit(inherited, spec);
     inherited.line_through = spec
         .line_through
         .unwrap_or_else(|| crate::layout::default_line_through(tag, inherited.line_through));
@@ -3086,7 +3086,7 @@ fn frame_walk(
                         let (l, x) = textarea_caret(&text, f.caret, &adv, max_w, &mode);
                         let cx = (content_x + x).floor().min(content_x + content_w - 1.0);
                         let cy = content_y + l as f32 * lh;
-                        fill_rect(cx, cy, cx + 1.0, cy + lh, color, 255, surface, width, height, damage_rects, clip);
+                        if let Some((c, a)) = caret_ink(&inherited, color) { fill_rect(cx, cy, cx + 1.0, cy + lh, c, a, surface, width, height, damage_rects, clip); }
                     }
                 }
                 // AETHERFILECOLORPAINT (SR456): a file input's Choose-File button and status, a color input's swatch; never its value as text.
@@ -3197,7 +3197,7 @@ fn frame_walk(
                                     let caret = if is_placeholder { 0 } else { f.caret };
                                     let cx = x_at(caret).floor().min(content_x + content_w - 1.0).max(content_x);
                                     let color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(&spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| (0, 0, 0)));
-                                    fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
+                                    if let Some((c, a)) = caret_ink(&inherited, color) { fill_rect(cx, ty, cx + 1.0, ty + lh, c, a, surface, width, height, damage_rects, clip); }
                                 }
                             } else {
                                 // AETHERCAPTIONCORE (SR438): the running clip meets caption_box's padding box.
@@ -4798,4 +4798,25 @@ fn wavy_path(x0: f32, x1: f32, y: f32, t: f32) -> Vec<(f32, f32, f32, f32)> {
 fn underline_top(face: &Font, size: f32, deco: &Deco, baseline: f32, m: &crate::fonts::DecoMetrics, t: f32) -> f32 {
     let base = if deco.ul_pos == 2 { baseline + crate::fonts::line_metrics(face, size).1 + t } else { baseline + m.underline_offset };
     base + deco.ul_offset.unwrap_or(0.0)
+}
+
+// ---- AETHERCSSCARETCOLOR (LEDGER SR1040): caret-color rides the Inherited road to the text control's caret (named tail block) ----
+
+/// AETHERCSSCARETCOLOR (SR1040): `caret-color` is inherited with no tag road: an element's own `caret_color` writes the
+/// inherited one (`Some(None)` = auto = None, the control's ink at paint); unspecified (or `inherit`, whose bit cleared
+/// the field) keeps the parent's.
+fn caret_inherit(inherited: &mut Inherited, spec: &crate::layout::PaintStyle) {
+    if let Some(c) = spec.caret_color {
+        inherited.caret_color = c;
+    }
+}
+
+/// AETHERCSSCARETCOLOR (SR1040): the focused text control's caret colour and alpha: `auto` (None) paints the control's
+/// text ink `ink` opaque; a colour paints with its alpha; `transparent` (alpha 0) paints no caret (None).
+fn caret_ink(inherited: &Inherited, ink: (u8, u8, u8)) -> Option<((u8, u8, u8), u8)> {
+    match inherited.caret_color {
+        None => Some((ink, 255)),
+        Some((_, _, _, 0)) => None,
+        Some((r, g, b, a)) => Some(((r, g, b), a)),
+    }
 }
