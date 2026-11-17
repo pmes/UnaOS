@@ -1688,7 +1688,7 @@ mod nle_fx {
                 let _ = st.select_at(0, 8);
                 st.seek(8);
                 let l = view::Layout::of_role(view::Role::Tracks, 320, 56, &st);
-                view::fnv1a(&view::paint_in(&st, l, view::Order::Rgba, None, None))
+                view::fnv1a(&view::paint_in(&st, l, view::Order::Rgba, None, None, None))
             })
             .unwrap_or(0);
         super::close("fixture");

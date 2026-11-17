@@ -89,14 +89,14 @@ impl view::Text for Labels<'_> {
 /// Paint the editor on a `w` x `h` canvas in `order` (see the module docs). `labels` names the clips (and the
 /// seconds on the ruler) through text_host; `preview` is the frame at the playhead.
 pub fn paint(st: &EditorState, w: u32, h: u32, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
-    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+    paint_in(st, Layout::of(w, h, st), order, labels, preview, None)
 }
 
 /// [`paint`] in a given layout (the face's view, which a wheel zoom anchors at the pointer: [`Face::layout`]): timeline_core's
 /// `view::paint_in`, the labels through [`Labels`].
-pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
+pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
     let mut lab = labels.map(Labels);
-    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview)
+    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview, peaks)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, peaks: WavePeaks::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -1587,7 +1588,7 @@ impl Face {
     /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
-        let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
+        let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
@@ -1600,7 +1601,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3095,5 +3096,63 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAWAVEFORM (LEDGER SR827): the face's peak tables, scanned once per source (named tail block) ----
+// An audio clip's body shows its waveform (timeline_core view.rs `paint_peaks`, through `paint_in`'s `PeakSource` hook). The
+// tables live here, beside `sources`, never in the EDL. LAZY: `paint_role`'s first line calls `wave_fill`, which scans each
+// source on an audio track the first time a paint sees it (`nle::scan_peaks`, the render's own decoder) and never again: the
+// tables are immutable, so no paint invalidates them. The scan runs on the face's thread, so the first paint that shows a long
+// source waits for its whole decode (owed NLE-WAVEFORM-SCAN-THREAD). A source that fails to scan stays flat (logged at debug,
+// never in `last_error`, so no message row changes).
+
+/// STRIAWAVEFORM (SR827): every scanned source's table (`None`: scanned, no audio or refused) and the scans made.
+#[derive(Default)]
+pub struct WavePeaks {
+    map: std::collections::BTreeMap<timeline_core::SourceId, Option<view::Peaks>>,
+    scans: u32,
+}
+
+impl view::PeakSource for WavePeaks {
+    fn peaks(&self, src: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.map.get(&src).and_then(|p| p.as_ref())
+    }
+    /// The mix's ONE gain curve (nle.rs `mix_into`'s).
+    fn gain_q16(&self, cdb: i32) -> i64 {
+        gneiss_pal::dsp::audio::ramp::gain_q16(cdb)
+    }
+}
+
+impl Face {
+    /// STRIAWAVEFORM (SR827): scan every audio-track source not scanned yet (once per source for the face's life).
+    fn wave_fill(&mut self) {
+        let mut want: Vec<timeline_core::SourceId> = Vec::new();
+        for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
+            for c in &tr.clips {
+                if !self.peaks.map.contains_key(&c.src) && !want.contains(&c.src) {
+                    want.push(c.src);
+                }
+            }
+        }
+        for id in want {
+            let p = match crate::nle::scan_peaks(&self.sources, id, view::PEAKS_PER_SEC) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("[nle-face] waveform {id:?}: {e}");
+                    None
+                }
+            };
+            self.peaks.map.insert(id, p);
+            self.peaks.scans += 1;
+        }
+    }
+    /// STRIAWAVEFORM (SR827): the peak scans this face has made.
+    pub fn wave_scans(&self) -> u32 {
+        self.peaks.scans
+    }
+    /// STRIAWAVEFORM (SR827): source `id`'s peak table, once a paint has scanned it.
+    pub fn wave_peaks(&self, id: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.peaks.map.get(&id).and_then(|p| p.as_ref())
     }
 }
