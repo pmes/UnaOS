@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1010,5 +1010,87 @@ mod striatrackgainstep_tests {
         assert_eq!(st.verb("track-gain+"), Some(Err(EditError::Gain)));
         assert_eq!((&st.timeline, st.undo_depth()), (&top, 1));
         assert_eq!(st.verb("track-gain-x"), None, "not this word");
+    }
+}
+
+// ---- STRIATRACKGAINKEYSNEXT (LEDGER SR983): `mute <ch>` / `solo <ch>` on the NAMED track through the one commit (named tail block) ----
+// SR837's words with a channel word (`mute A2`, `solo V1`; [`Timeline::track_named`], uppercase only): they toggle that
+// track's flag with no selection needed (the selection stays), ONE `commit` each through `Timeline::set_track_flags` like
+// SR837's toggles. A word naming no track, or an extra word, is refused `EditError::NoTrack` with the state kept. Bare
+// `mute` / `solo` stay SR837's (`track_verb`, the selected clip's track).
+impl EditorState {
+    /// Toggle track `track`'s solo flag (`solo`) or mute flag (ONE commit; the selection untouched).
+    pub fn toggle_track_flag(&mut self, track: usize, solo: bool) -> Result<(), EditError> {
+        let t = self.timeline.tracks.get(track).ok_or(EditError::NoTrack)?;
+        let (m, s) = if solo { (t.muted, !t.solo) } else { (!t.muted, t.solo) };
+        let tl = self.timeline.set_track_flags(track, m, s)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `mute <ch>` / `solo <ch>` words of [`EditorState::verb`]; `None` for any other word.
+    fn track_ch_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        let solo = match w.next()? {
+            "mute" => false,
+            "solo" => true,
+            _ => return None,
+        };
+        let ch = w.next()?;
+        Some(match (self.timeline.track_named(ch), w.next()) {
+            (Some(t), None) => self.toggle_track_flag(t, solo),
+            _ => Err(EditError::NoTrack),
+        })
+    }
+}
+
+#[cfg(test)]
+mod striatrackgainkeysnext_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1: A 0..20, A1: A 0..20, A2: A 0..20; nothing selected.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        for k in [Kind::Video, Kind::Audio, Kind::Audio] {
+            let t = tl.add_track(k);
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    /// M3: `mute A2` / `solo V1` toggle the named track with no selection, ONE undo step each; the selection stays; undo
+    /// restores; `mute V` names V1.
+    #[test]
+    fn striatrackgainkeysnext_mute_by_channel() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("mute A2"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[2].muted, st.timeline.tracks[1].muted, st.undo_depth()), (true, false, 1));
+        assert_eq!(st.verb("solo V1"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[0].solo, st.timeline.tracks[0].muted, st.undo_depth()), (true, false, 2));
+        assert_eq!(st.selection, None);
+        assert_eq!(st.verb("mute A2"), Some(Ok(())));
+        assert!(!st.timeline.tracks[2].muted, "a toggle");
+        st.undo();
+        st.undo();
+        st.undo();
+        assert_eq!(st.timeline, tl0);
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("mute V"), Some(Ok(())));
+        assert_eq!((st.timeline.tracks[0].muted, st.timeline.tracks[1].muted, st.selection), (true, false, Some((1, 0))));
+    }
+
+    /// M3: each refusal is `NoTrack`, the state and the undo depth untouched; other words are not this one.
+    #[test]
+    fn striatrackgainkeysnext_channel_refusals() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        for bad in ["mute A3", "solo V2", "mute a2", "mute X", "mute A2 A1", "solo V1 x"] {
+            assert_eq!(st.verb(bad), Some(Err(EditError::NoTrack)), "{bad}");
+        }
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0));
+        assert_eq!(st.verb("mute"), Some(Err(EditError::NoTrack)), "bare: SR837's word, nothing selected");
+        assert_eq!(st.verb("muteA2"), None, "not this word");
     }
 }

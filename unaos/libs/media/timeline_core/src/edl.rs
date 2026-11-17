@@ -139,7 +139,7 @@ pub(crate) fn parse_tc(s: &str, fps: u32, line: usize) -> Result<i64, EdlError> 
     Ok(((n[0] * 60 + n[1]) * 60 + n[2]) * fps as i64 + n[3])
 }
 
-fn channel(s: &str) -> Option<(Kind, usize)> {
+pub(crate) fn channel(s: &str) -> Option<(Kind, usize)> { // STRIATRACKGAINKEYSNEXT (SR983): pub(crate), `Timeline::track_named` reads it
     let (k, rest) = match s.as_bytes().first()? {
         b'V' => (Kind::Video, &s[1..]),
         b'A' => (Kind::Audio, &s[1..]),
