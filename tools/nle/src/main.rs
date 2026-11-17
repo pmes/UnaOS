@@ -100,7 +100,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--make-src") {
         let out = args.get(1).unwrap_or_else(|| usage());
-        let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(d);
+        let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| bad("--make-src", s, &what("--make-src")))).unwrap_or(d); // NLECLIREFUSALSREST (SR814): a bad number by name
         let (base, frames, fps) = (num(2, 0), num(3, 50), num(4, 25));
         std::fs::write(out, synth_source(base, frames, fps)).unwrap_or_else(|e| die(format!("{out}: {e}")));
         return;
@@ -136,7 +136,7 @@ fn main() {
             "--qcomp" => qcomp = Some({ let s = value(&mut it, "--qcomp"); qcomp_of(&s).unwrap_or_else(|| bad("--qcomp", &s, "not a fraction within 0..=1")) }), // H264ENCTWOPASSQCOMPCLI (SR753): x264's qcompress of the planned pass
             "--cplxblur" => cplxblur = Some(num(&mut it, "--cplxblur")), // H264ENCTWOPASSQCOMPCLI (SR753): x264's complexity blur of the planned pass
             "--qblur" => qblur_q8 = Some({ let s = value(&mut it, "--qblur"); qblur_of(&s).unwrap_or_else(|| bad("--qblur", &s, "not a number within 0..=16")) }), // H264ENCTWOPASSQBLURCLI (SR766): x264's QP blur of the planned pass (Q8)
-            "--qpstep" => qpstep = Some(it.next().map(|s| qpstep_of(s).unwrap_or_else(|| die(format!("--qpstep {s}: not an integer within 0..=51")))).unwrap_or_else(|| usage())), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
+            "--qpstep" => qpstep = Some({ let s = value(&mut it, "--qpstep"); qpstep_of(&s).unwrap_or_else(|| bad("--qpstep", &s, "not an integer within 0..=51")) }), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
             "--src" => {
                 let v = value(&mut it, "--src");
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };
@@ -164,7 +164,7 @@ fn main() {
             }
         }
         "render" => {
-            let stem = out.unwrap_or_else(|| usage());
+            let stem = out.unwrap_or_else(|| die(format!("render: {}", what("render --out")))); // NLECLIREFUSALSREST (SR814): the missing --out by name
             let open = |ext: &str| {
                 let p = format!("{stem}.{ext}");
                 std::io::BufWriter::new(std::fs::File::create(&p).unwrap_or_else(|e| die(format!("{p}: {e}"))))
@@ -186,7 +186,7 @@ fn main() {
             }
             let two_pass = two_pass_of(two_pass, pass, stats, bitrate.is_some(), &video); // H264ENCTWOPASS (SR698) / H264ENCTWOPASSFILE (SR719): the mode and its refusals (file tail)
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, qcomp, cplxblur, qblur_q8, qpstep, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| die(format!("export: {}", what("export --out")))), &video, &audio, qp, gop, bitrate, crf, scenecut, min_keyint, aq, two_pass, hrd, qcomp, cplxblur, qblur_q8, qpstep, container)
         }
         _ => usage(),
     }
@@ -214,7 +214,7 @@ fn size_verb(args: &[String]) {
     let (Some(path), Some(reel), Some(word)) = (args.first(), args.get(1), args.get(2)) else { usage() };
     let fps = match &args[3..] {
         [] => 25,
-        [f, n] if f == "--fps" => n.parse().unwrap_or_else(|_| usage()),
+        [f, n] if f == "--fps" => n.parse().unwrap_or_else(|_| bad("--fps", n, &what("--fps"))), // NLECLIREFUSALSREST (SR814): a bad number by name
         _ => usage(),
     };
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
@@ -360,11 +360,14 @@ fn value(it: &mut std::slice::Iter<'_, String>, flag: &str) -> String {
 }
 
 /// NLECLIREFUSALSBYNAME (SR801): THE table of what a numeric arm takes — the range its PARSE takes (the encoder stays the
-/// authority on a narrower bound: h264enc_core's QP 16..=40, CRF <= 51), `--pass` two_pass_of's own 1 or 2.
+/// authority on a narrower bound: h264enc_core's QP 16..=40, CRF <= 51), `--pass` two_pass_of's own 1 or 2; `<verb> --out` the
+/// missing `--out` of render / export (NLECLIREFUSALSREST SR814: `nle: <verb>: --out <stem|dir> is required`).
 fn what(flag: &str) -> String {
     match flag {
         "--qp" | "--crf" => format!("not a whole number within 0..={}", u8::MAX),
         "--pass" => "not 1 or 2".to_string(),
+        "render --out" => "--out <stem> is required".to_string(), // NLECLIREFUSALSREST (SR814): the missing flag, by verb
+        "export --out" => "--out <dir> is required".to_string(),
         _ => format!("not a whole number within 0..={}", u32::MAX),
     }
 }
