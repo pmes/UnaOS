@@ -9518,4 +9518,64 @@ b</div>
         let (_, _, w, h) = imgalt_rect(&mut e, "tz");
         assert_eq!((w, h), (40.0, 22.0), "#tz: border-width: 1px 0");
     }
+
+    // ---- AETHERCSSSTICKYEMINSETRELATIVE (LEDGER SR1130): a sticky box's font-relative inset stays the sticky constraint on the re-resolution (named tail block) ----
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): 400x300, 20px-tall boxes in flow from y 0: `#c` a control, `#a` sticky
+    /// `top: 1em`, `#b` sticky `top: 16px`, a 20px-font wrapper holding `#r` relative `top: 1em`, `#d` a red 20px-font
+    /// sticky `top: 1em`, then a 2000px spacer.
+    fn sticky_em_inset_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            .h { height: 20px }
+            </style></head><body style="margin:0">
+            <div id="c" class="h"></div>
+            <div id="a" class="h" style="position:sticky;top:1em"></div>
+            <div id="b" class="h" style="position:sticky;top:16px"></div>
+            <div style="font-size:20px"><div id="r" class="h" style="position:relative;top:1em"></div></div>
+            <div id="d" class="h" style="font-size:20px;position:sticky;top:1em;background-color:rgb(255, 0, 0)"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): unscrolled, each sticky box sits at its normal-flow y (css-position-3
+    /// §3.4): `#a` at 20 like the px-inset `#b` at 40 and the control `#c` at 0; `#d` at 80. Before SR1130 the
+    /// font-relative re-resolution folded `top: 1em` into taffy as a relative offset (`#a` 36, `#d` 100).
+    #[test]
+    fn sticky_em_inset_normal_flow() {
+        let mut e = sticky_em_inset_engine();
+        let top = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).1;
+        assert_eq!(top(&mut e, "c"), 0.0, "#c: the control");
+        assert_eq!(top(&mut e, "a"), 20.0, "#a: sticky top: 1em sits at its normal-flow y (armed: 36 before SR1130)");
+        assert_eq!(top(&mut e, "b"), 40.0, "#b: sticky top: 16px sits at its normal-flow y");
+        assert_eq!(top(&mut e, "d"), 80.0, "#d: sticky top: 1em at 20px sits at its normal-flow y (armed: 100 before SR1130)");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): a relative box's font-relative inset still offsets it, at its own
+    /// font: `#r` normal y 60 + 1em at 20px = 80 (the re-resolution's fold for a kind that is not sticky, unchanged).
+    #[test]
+    fn sticky_em_inset_relative_unchanged() {
+        let mut e = sticky_em_inset_engine();
+        assert_eq!(imgalt_rect(&mut e, "r").1, 80.0, "#r: relative top: 1em at 20px offsets 20");
+    }
+
+    /// AETHERCSSSTICKYEMINSETRELATIVE (SR1130): scrolled 400px, the red `#d` (document y 80) holds at its inset, 1em of
+    /// its own 20px font: rows 20..39 red, rows 19 and 40 not (`inset_px` is re-resolved inside the re-application). The
+    /// scroll is a full viewport or more so the frame repaints whole: a shorter scroll blits the surface and repaints
+    /// only the exposed strip, leaving a stuck box unpainted (owed AETHER-CSS-STICKY-SCROLL-BLIT-DAMAGE).
+    #[test]
+    fn sticky_em_inset_sticks_at_own_font() {
+        let mut e = sticky_em_inset_engine();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 400.0));
+        e.render_frame();
+        assert_eq!(e.scroll_y, 400.0, "the page scrolled 400px");
+        assert_eq!(imgalt_px(&e, 10, 20), (255, 0, 0), "#d: row 20 is its first row (stuck at 1em = 20px)");
+        assert_eq!(imgalt_px(&e, 10, 39), (255, 0, 0), "#d: row 39 is its last row");
+        assert_ne!(imgalt_px(&e, 10, 19), (255, 0, 0), "row 19 is above the stuck box");
+        assert_ne!(imgalt_px(&e, 10, 40), (255, 0, 0), "row 40 is below the stuck box");
+    }
 }
