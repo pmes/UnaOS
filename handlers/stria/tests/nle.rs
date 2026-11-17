@@ -2750,7 +2750,7 @@ fn striainforeelhover_message_names_the_clip_under_the_pointer() {
     assert!(matches!(l.hit(&tl, at(22), row_y), Hit::Track(0, _)));
     assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
     let selected = face.paint();
-    assert!(striainforeelhover_move(&mut face, at(5), row_y), "the hovered clip changed: repaint");
+    assert!(!striainforeelhover_move(&mut face, at(5), row_y), "entering A asks no repaint"); assert!(striainforeelhoverdelay_dwell(&mut face), "the crossing tick repaints"); // STRIAINFOREELHOVERDELAY (SR789): A's line after HOVER_DWELL ticks
     assert_eq!(face.hovered_clip(), Some((0, 0)));
     assert_eq!(face.message_text().as_deref(), Some(a.as_str()));
     assert_eq!(face.reel_line().as_deref(), Some(a.as_str()), "the witness's reel follows the hover");
@@ -2762,10 +2762,10 @@ fn striainforeelhover_message_names_the_clip_under_the_pointer() {
     assert!(striainforeelhover_move(&mut face, at(5), l.ruler_y as f64 + 1.0));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the ruler");
     assert_eq!(face.paint(), selected, "back to the selected clip's paint");
-    striainforeelhover_move(&mut face, at(5), row_y);
+    striainforeelhover_move(&mut face, at(5), row_y); striainforeelhoverdelay_dwell(&mut face); // STRIAINFOREELHOVERDELAY (SR789): dwell on A so leaving it repaints
     assert!(striainforeelhover_move(&mut face, at(15), row_y));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "the selected clip itself");
-    striainforeelhover_move(&mut face, at(5), row_y);
+    striainforeelhover_move(&mut face, at(5), row_y); striainforeelhoverdelay_dwell(&mut face); // STRIAINFOREELHOVERDELAY (SR789): dwell on A so leaving it repaints
     assert!(striainforeelhover_move(&mut face, at(22), row_y));
     assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(b.clone())), "an empty track spot");
     println!("striainforeelhover: hover={a} selected={b}");
@@ -2807,7 +2807,7 @@ fn striainforeelhover_summary(face: &stria::nle_face::Face, i: usize) -> String 
 /// one decimal digit), no leading zeros.
 fn nle5dexportmessagerate_grammar(r: &str) -> bool {
     let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
-    let Some(n) = r.strip_suffix(" fps") else { return false };
+    let Some(n) = nle5dexportmessageraterealtime_unmultiplied(r).strip_suffix(" fps") else { return false }; // NLE5DEXPORTMESSAGERATEREALTIME (SR794): an optional `, <m>x` tail
     match n.split_once('.') {
         Some((a, d)) => num(a) && a.parse::<u32>().is_ok_and(|v| v < 100) && d.len() == 1 && num(d),
         None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 100),
@@ -2839,12 +2839,12 @@ fn nle5dexportmessagerate_rate_words_kat() {
         (1, ms(1), "1000 fps"),
     ];
     for (f, d, want) in rows {
-        assert_eq!(rate_words(f, d).as_deref(), Some(want), "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)).as_deref(), Some(want), "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794): no rate, no multiple
         assert!(nle5dexportmessagerate_grammar(want), "{want}");
     }
     let nones = [(0, ms(800)), (10, ms(0)), (10, us(999))];
     for (f, d) in nones {
-        assert_eq!(rate_words(f, d), None, "{f} frames in {d:?}");
+        assert_eq!(rate_words(f, d, (0, 1)), None, "{f} frames in {d:?}"); // NLE5DEXPORTMESSAGERATEREALTIME (SR794)
     }
     let bad = ["044 fps", "99 fps", "100.0 fps", "3 fps", "3.25 fps", "43.8fps"];
     for b in bad {
@@ -2897,5 +2897,200 @@ fn nle5dexportmessagerate_refusals_carry_no_rate() {
     assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
     assert!(!cancel.contains(" fps)"), "{cancel}");
     println!("nle5dexportmessagerate: usage / unknown format / cancel carry no rate");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- STRIAINFOREELHOVERDELAY (LEDGER SR789): a dwell of HOVER_DWELL face ticks before the hover line replaces the selected one (named tail block) ----
+
+/// `HOVER_DWELL` face ticks; true when every tick but the last asked no repaint and the last (the crossing) did.
+fn striainforeelhoverdelay_dwell(face: &mut stria::nle_face::Face) -> bool {
+    let ticks: Vec<bool> = (0..stria::nle_face::HOVER_DWELL).map(|_| face.tick()).collect();
+    ticks.last() == Some(&true) && ticks[..ticks.len() - 1].iter().all(|t| !t)
+}
+
+/// Rule: the hover line shows only after the pointer has stood `HOVER_DWELL` face ticks on the same clip: until then the
+/// selected clip's line stands and no tick repaints; the crossing tick repaints once; a move off a dwelt clip gives the
+/// selected line back at once and repaints; an error still wins over a dwelt hover.
+#[test]
+fn striainforeelhoverdelay_the_hover_line_waits_for_the_dwell() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(true);
+    let (a, b) = (format!("A: {}", striainforeelhover_summary(&face, 0)), format!("B: {}", striainforeelhover_summary(&face, 1)));
+    let (row_y, at) = (l.tracks_y as f64 + 10.0, |t: i64| l.x_of(t) as f64 + 0.5);
+    assert!(!striainforeelhover_move(&mut face, at(5), row_y), "entering A asks no repaint");
+    assert_eq!(face.hovered_clip(), Some((0, 0)));
+    assert!(face.hover_pending(), "the clock runs while the dwell counts");
+    for n in 1..HOVER_DWELL {
+        assert!(!face.tick(), "tick {n}: no repaint");
+        assert_eq!(face.message_text().as_deref(), Some(b.as_str()), "tick {n}: still the selected line");
+    }
+    assert!(face.tick(), "the crossing tick repaints");
+    assert_eq!((face.hover_dwelt(), face.message_text()), (Some((0, 0)), Some(a.clone())));
+    assert!(!face.hover_pending(), "dwelt: the clock may stop");
+    assert!(!face.tick(), "a further tick asks nothing");
+    assert_eq!(face.reel_line().as_deref(), Some(a.as_str()));
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over a dwelt hover");
+    face.last_error = None;
+    assert!(striainforeelhover_move(&mut face, at(5), l.ruler_y as f64 + 1.0), "a dwelt hover ends: repaint");
+    assert_eq!(face.message_text().as_deref(), Some(b.as_str()), "the ruler: the selected line at once");
+    println!("striainforeelhoverdelay: dwell={HOVER_DWELL} ticks (320 ms at 25 fps) hover={a} selected={b}");
+}
+
+/// Rule: a change of the hovered clip resets the count: A -> B (the selected clip: no hover) -> A within the dwell never
+/// shows A, and the count restarts at the second entry.
+#[test]
+fn striainforeelhoverdelay_a_change_resets_the_count() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(true);
+    let b = format!("B: {}", striainforeelhover_summary(&face, 1));
+    let (row_y, at) = (l.tracks_y as f64 + 10.0, |t: i64| l.x_of(t) as f64 + 0.5);
+    for x in [at(5), at(15), at(5)] {
+        assert!(!striainforeelhover_move(&mut face, x, row_y), "no dwelt hover ends: no repaint");
+        for _ in 1..HOVER_DWELL {
+            assert!(!face.tick());
+            assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
+        }
+    }
+    assert!(face.tick(), "HOVER_DWELL ticks after the second entry");
+    assert_eq!(face.hover_dwelt(), Some((0, 0)));
+}
+
+/// Rule: a labels-off face asks no repaint on any tick and paints byte-identically, while the witness's reel line still
+/// follows the dwell.
+#[test]
+fn striainforeelhoverdelay_labels_off_is_unchanged() {
+    use stria::nle_face::HOVER_DWELL;
+    let (mut face, l) = striainforeelhover_face(false);
+    let before = face.paint();
+    let b = format!("B: {}", striainforeelhover_summary(&face, 1));
+    assert!(!striainforeelhover_move(&mut face, l.x_of(5) as f64 + 0.5, l.tracks_y as f64 + 10.0));
+    assert!(!face.hover_pending(), "labels off: the clock stays off");
+    for _ in 1..HOVER_DWELL {
+        assert!(!face.tick());
+    }
+    assert_eq!(face.reel_line().as_deref(), Some(b.as_str()));
+    assert!(!face.tick(), "labels off: the crossing asks no repaint");
+    assert_eq!(face.hover_dwelt(), Some((0, 0)));
+    assert_eq!(face.reel_line().map(|s| s.starts_with("A: ")), Some(true), "the witness follows the dwell");
+    assert_eq!(face.paint(), before);
+}
+
+/// Rule: a change under a resting pointer with no move is seen at the next tick: selecting the dwelt clip A leaves no
+/// hover (the line is A's as the selection), and selecting B again restarts the count rather than reusing a stale one.
+#[test]
+fn striainforeelhoverdelay_a_select_under_the_pointer_leaves_no_stale_count() {
+    let (mut face, l) = striainforeelhover_face(true);
+    let (a, b) = (format!("A: {}", striainforeelhover_summary(&face, 0)), format!("B: {}", striainforeelhover_summary(&face, 1)));
+    striainforeelhover_move(&mut face, l.x_of(5) as f64 + 0.5, l.tracks_y as f64 + 10.0);
+    assert!(striainforeelhoverdelay_dwell(&mut face));
+    face.state.select(0, 0).unwrap();
+    assert_eq!((face.hovered_clip(), face.message_text()), (None, Some(a)), "A selected: no hover, A's line");
+    face.tick();
+    face.state.select(0, 1).unwrap();
+    assert_eq!(face.hover_dwelt(), None, "the count was cleared at the tick that saw no hover");
+    assert_eq!(face.message_text().as_deref(), Some(b.as_str()));
+    assert!(striainforeelhoverdelay_dwell(&mut face), "the dwell counts again from 1");
+}
+
+// ---- NLE5DEXPORTMESSAGERATEREALTIME (LEDGER SR794): the export's speed as a multiple of real time (named tail block) ----
+
+/// The multiple grammar of `stria::nle_face::realtime_words`: `Nx` (a whole number, 10 or more), `A.Dx` (A 1..9, one
+/// decimal digit) or `0.DDx` (two decimal digits), no leading zeros.
+fn nle5dexportmessageraterealtime_grammar(m: &str) -> bool {
+    let num = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit()) && (x == "0" || !x.starts_with('0'));
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    let Some(n) = m.strip_suffix('x') else { return false };
+    match n.split_once('.') {
+        None => num(n) && n.parse::<u64>().is_ok_and(|v| v >= 10),
+        Some((a, d)) if d.len() == 1 => num(a) && a.parse::<u32>().is_ok_and(|v| (1..10).contains(&v)) && digits(d),
+        Some((a, d)) => a == "0" && d.len() == 2 && digits(d),
+    }
+}
+
+/// A rate with its optional `, <m>x` tail split off when the tail is in the grammar; else the rate as given.
+fn nle5dexportmessageraterealtime_unmultiplied(r: &str) -> &str {
+    match r.split_once(", ") {
+        Some((h, m)) if nle5dexportmessageraterealtime_grammar(m) => h,
+        _ => r,
+    }
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_kat() {
+    use stria::nle_face::{rate_words, realtime_words};
+    use std::time::Duration;
+    let (ms, us) = (Duration::from_millis, Duration::from_micros);
+    let rows = [
+        (35, ms(800), (25, 1), "1.8x"),
+        (1000, ms(2_000), (25, 1), "20x"),
+        (10, ms(1_000), (25, 1), "0.40x"),
+        (30, ms(1_001), (30_000, 1_001), "1.0x"),
+        (19, ms(2_000), (1, 1), "9.5x"),
+        (999, ms(100_000), (1, 1), "10x"),
+    ];
+    for (f, d, fps, want) in rows {
+        assert_eq!(realtime_words(f, d, fps).as_deref(), Some(want), "{f} frames in {d:?} at {fps:?}");
+        assert!(nle5dexportmessageraterealtime_grammar(want), "{want}");
+    }
+    let nones = [(0, ms(800), (25, 1)), (35, ms(800), (25, 0)), (35, ms(800), (0, 1)), (35, us(999), (25, 1))];
+    for (f, d, fps) in nones {
+        assert_eq!(realtime_words(f, d, fps), None, "{f} frames in {d:?} at {fps:?}");
+    }
+    assert_eq!(rate_words(35, ms(800), (25, 1)).as_deref(), Some("43.8 fps, 1.8x"));
+    assert_eq!(rate_words(35, ms(800), (25, 0)).as_deref(), Some("43.8 fps"), "no rate: the fps alone");
+    let bad = ["01.8x", "1.80x", "10.0x", "9x", "0.4x", "1.8 x"];
+    for b in bad {
+        assert!(!nle5dexportmessageraterealtime_grammar(b), "{b}");
+    }
+    assert!(nle5dexportmessagerate_grammar("43.8 fps, 1.8x") && !nle5dexportmessagerate_grammar("43.8 fps, 1.80x"));
+    assert!(nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 1.8x)") && !nle5dexportmessageduration_grammar("0.8 s (43.8 fps, 9x)"));
+    println!("nle5dexportmessageraterealtime: realtime_words {} KAT rows, {} None, {} refused shapes", rows.len(), nones.len(), bad.len());
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_finished_line_names_its_multiple() {
+    let dir = nlefaceexport_dir("realtime-png");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png", dir.display())));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.wait_export());
+    let line = face.last_error.clone().expect("the message line");
+    assert!(line.starts_with("export: 35 frames, ") && line.contains(" bytes, png + wav in "), "{line}");
+    let arrow = line.rfind(" -> ").expect("the dir");
+    let head = &line[..arrow];
+    let t = &head[head.rfind(" in ").expect("the time") + 4..];
+    let (wall, paren) = t.split_once(" (").unwrap_or_else(|| panic!("no ` (<r> fps, <m>x)` in {line}"));
+    let (rate, m) = paren.strip_suffix(')').and_then(|p| p.split_once(", ")).unwrap_or_else(|| panic!("no `, <m>x` in {line}"));
+    assert!(nle5dexportmessagerate_grammar(rate) && rate.ends_with(" fps"), "{rate:?} is not a rate in {line}");
+    assert!(nle5dexportmessageraterealtime_grammar(m), "{m:?} is not a multiple in {line}");
+    assert!(nle5dexportmessageduration_grammar(wall), "{wall:?} in {line}");
+    assert!(nle5dexportmessageduration_unwalled(&line).ends_with(&format!(" bytes, png + wav -> {}", dir.display())), "{line}");
+    let standing = face.paint();
+    face.last_error = None;
+    assert_eq!(face.paint(), standing, "labels off: the message paints nothing");
+    println!("nle5dexportmessageraterealtime: {line}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn nle5dexportmessageraterealtime_refusals_carry_none() {
+    let dir = nlefaceexport_dir("realtime-refused");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(face.verb(&format!("export {} png wav extra", dir.display())));
+    let usage = face.last_error.take().expect("the usage refusal");
+    assert!(usage.starts_with("export: usage: ") && !usage.contains("x)"), "{usage}");
+    assert!(face.verb(&format!("export {} gif", dir.display())));
+    let fmt = face.last_error.take().expect("the format refusal");
+    assert!(fmt.starts_with("export: unknown format gif") && !fmt.contains("x)"), "{fmt}");
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = face.last_error.take().expect("the cancel line");
+    assert_eq!(cancel, format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display()));
+    println!("nle5dexportmessageraterealtime: usage / unknown format / cancel carry no multiple");
     let _ = std::fs::remove_dir_all(&dir);
 }

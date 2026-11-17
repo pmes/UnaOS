@@ -958,7 +958,7 @@ fn h264enctwopassqblurcli_table_qblur_two_stream() {
 }
 
 /// The qblur-2 stream's fnv, measured on this tree by the arc's EXCEPTION run.
-const H264ENCTWOPASSQBLURCLI_QBLUR2: u64 = 0xe981_d80a_3810_9d2f;
+const H264ENCTWOPASSQBLURCLI_QBLUR2: u64 = 0xe981_d80a_3810_9d2f; // H264ENCPINTRA (SR759): was 0x725b_239b_2b64_f04f (re-measured at the SR790 trunk merge)
 
 // ---- H264ENCTWOPASSQPSTEPCLI (LEDGER SR773): `--qpstep N` through the table against SR763's knob (named tail block) ----
 use stria::nle_export::qpstep_of;
@@ -1000,3 +1000,52 @@ fn h264enctwopassqpstepcli_qpstep_zero_is_the_default_on_the_table_set() {
     assert_eq!(table, NLE5DCLITABLE_BEFORE[7], "qpstep 0 == the Default (qpstep 4) on the table set: {table:#018x}");
 }
 
+// ---- H264ENCTWOPASSCLITABLE (LEDGER SR790): `--pass2 k=v,...` and the four knobs as ONE `Pass2Cli` (named tail block) ----
+use stria::nle_export::{Pass2Cli, pass2_cli_of, pass2_words};
+
+#[test]
+fn h264enctwopassclitable_pass2_cli_of_sets_the_four() {
+    let all = pass2_cli_of("qcomp=0.6,cplxblur=20,qblur=0.5,qpstep=4").unwrap();
+    assert_eq!(all, Pass2Cli { qcomp: Some((60, 100)), cplxblur: Some(20), qblur_q8: Some(128), qpstep: Some(4) });
+    assert_eq!(pass2_cli_of("qblur=2").unwrap(), Pass2Cli { qblur_q8: Some(512), ..Pass2Cli::default() });
+    assert_eq!(pass2_cli_of("qcomp=0.6,qcomp=0.7").unwrap().qcomp, Some((70, 100)), "a key written twice: the later wins");
+}
+
+#[test]
+fn h264enctwopassclitable_pass2_cli_of_refusals() {
+    for (word, key) in [("qpstep=52", "qpstep"), ("qcomp=2", "qcomp"), ("cplxblur=x", "cplxblur"), ("qblur=17", "qblur")] {
+        let e = pass2_cli_of(word).unwrap_err();
+        assert!(e.starts_with(key), "{word}: {e}");
+    }
+    assert_eq!(pass2_cli_of("foo=1").unwrap_err(), "unknown pass2 key foo (qcomp|cplxblur|qblur|qpstep)");
+    assert!(pass2_cli_of("qcomp").is_err(), "an item without = is refused");
+}
+
+#[test]
+fn h264enctwopassclitable_over_is_last_wins() {
+    let first = Pass2Cli { qcomp: Some((60, 100)), cplxblur: Some(5), ..Pass2Cli::default() };
+    let later = pass2_cli_of("qcomp=0.7,qpstep=2").unwrap();
+    assert_eq!(later.over(first), Pass2Cli { qcomp: Some((70, 100)), cplxblur: Some(5), qblur_q8: None, qpstep: Some(2) });
+}
+
+#[test]
+fn h264enctwopassclitable_into_opts_sets_the_four_fields() {
+    let all = pass2_cli_of("qcomp=0.6,cplxblur=20,qblur=0.5,qpstep=4").unwrap();
+    let o = all.into_opts(H264Opts::default());
+    assert_eq!((o.qcomp, o.cplxblur, o.qblur_q8, o.qpstep), (Some((60, 100)), Some(20), Some(128), Some(4)));
+    let d = H264Opts::default();
+    assert_eq!((o.qp, o.gop, o.bitrate, o.crf, o.scenecut, o.aq, o.min_keyint, o.hrd), (d.qp, d.gop, d.bitrate, d.crf, d.scenecut, d.aq, d.min_keyint, d.hrd));
+    assert!(o.two_pass_stats.is_none());
+    let n = Pass2Cli::default().into_opts(H264Opts::default());
+    assert_eq!((n.qcomp, n.cplxblur, n.qblur_q8, n.qpstep), (None, None, None, None), "no knob keeps SR736's Default plan");
+    assert_eq!(pass2_of(n.qcomp, n.cplxblur, n.qblur_q8, n.qpstep), Pass2Opts::default());
+}
+
+#[test]
+fn h264enctwopassclitable_pass2_words_reads_the_default_plan() {
+    let d = Pass2Opts::default();
+    let want = format!("qcomp={} cplxblur={} qblur={} qpstep={}", d.qcomp.0 as f64 / d.qcomp.1 as f64, d.cplxblur, f64::from(d.qblur_q8) / 256.0, d.qpstep);
+    assert_eq!(pass2_words(&Pass2Cli::default()), want);
+    assert_eq!(pass2_words(&pass2_cli_of("qcomp=0.6,cplxblur=20,qblur=0.5,qpstep=4").unwrap()), want, "x264's defaults spelled out");
+    println!("h264enctwopassclitable: {want}");
+}
