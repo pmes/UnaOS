@@ -2260,7 +2260,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide",
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it)
     }
 }
 
@@ -2274,7 +2274,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail)
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false).map(|d| d.rolled(&e.st, ROLL_TOOL.load(Ordering::Acquire))).filter(|d| d.kind != timeline_core::view::DragKind::Pan) else { return false }; // STRIAKROLL (LEDGER SR9003): the roll tool turns a trim-handle drag into a roll of its cut (file tail) // STRIAPANNEXT (SR994): no pan drag until the Player's sound road pans (NLE-PAN-DRAG-KERNEL)
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)

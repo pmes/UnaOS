@@ -593,6 +593,7 @@ pub enum DragKind {
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
     Slide,
+    Pan, // STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail)
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -667,7 +668,7 @@ impl Drag {
                 }
             }
         }
-        match l.hit(&st.timeline, x, y) {
+        if let Some((t, i)) = pan_grip(st, &l, x, y, shift, slip) { return Some(mk(DragKind::Pan, t, i)); } match l.hit(&st.timeline, x, y) { // STRIAPANNEXT (SR994): the pan grip over the tick's strip (file tail)
             Hit::Clip(track, idx, _) => { let toggle = shift && st.set.contains(&(track, idx)); // STRIAMULTISELECTMORE (SR950): a shift-press on a member toggles it out if released still (file tail)
                 if toggle {} else if shift || st.set.contains(&(track, idx)) { // STRIAMULTISELECTNEXT (SR998): a member's shift-press keeps the primary until the drag commits (`finish`)
                     st.select_add(track, idx).ok()?;
@@ -684,7 +685,7 @@ impl Drag {
     /// The pointer is at `(x, y)`: the tick delta (snapped), and for a move of one clip the row under it when that
     /// track's kind matches.
     pub fn update(&mut self, st: &EditorState, x: f64, y: f64) {
-        self.at = (x, y);
+        if self.kind == DragKind::Pan { return self.pan_update(st, x, y); } self.at = (x, y); // STRIAPANNEXT (SR994): a pan drag reads the pointer as pan (file tail)
         self.delta = self.layout.tick_at(x) - self.origin_tick;
         self.guide = None;
         if self.snap {
@@ -729,7 +730,7 @@ impl Drag {
             DragKind::TrimIn => st.trim_by_ticks(Edge::In, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::TrimOut => st.trim_by_ticks(Edge::Out, self.delta), // STRIACLIPSPEEDMORE (SR951): the timeline delta through src_at (1x: the same source delta)
             DragKind::Slip => st.slip_selected(self.delta),
-            DragKind::Slide => st.slide_selected(self.delta),
+            DragKind::Slide => st.slide_selected(self.delta), DragKind::Pan => self.finish_pan(st), // STRIAPANNEXT (SR994): the one pan road (file tail)
             DragKind::Move if st.set.len() > 1 => st.move_set_track(self.to_track as isize - self.track as isize, self.delta), // STRIAMULTISELECTMORE (SR950)
             _ => {
                 let at = st.selected().ok_or(EditError::NoClip)?.at;
@@ -2300,7 +2301,7 @@ fn pan_tick(c: &mut Canvas, kind: Kind, clip: &crate::Clip, x0: i64, x1: i64, y0
     if !matches!(kind, Kind::Audio) || clip.pan_cq8 == 0 {
         return;
     }
-    let half = ((x1 - x0) / 2 - HANDLE_W - 1).max(0);
+    let half = pan_half(x0, x1); // STRIAPANNEXT (SR994): the one tick geometry, shared with the pan grip (file tail)
     let xm = (x0 + x1) / 2 + half * (clip.pan_cq8 as i64).clamp(-127, 127) / 127;
     c.rect(xm - 1, y0 + 2, xm + 1, y0 + 6, TICK);
 }
@@ -4044,5 +4045,60 @@ mod striamultiselectnext_tests {
         assert_eq!(d.finish(&mut st), Ok(()));
         assert_eq!(st.timeline, tl0.move_many(&[(0, 0), (0, 1), (0, 2)], 5).unwrap(), "a shift-drag of a member moves the set");
         assert_eq!((st.selection, st.set.len(), st.undo_depth()), (Some((0, 1)), 3, 1), "the pressed clip is primary after");
+    }
+}
+
+// ---- STRIAPANNEXT (LEDGER SR994): the pan drag on the pan tick's strip (named tail block) ----
+// A press (no shift, no slip modifier) on the selected AUDIO clip's top [`PAN_GRIP_H`] px between its trim handles (the strip
+// SR897's [`pan_tick`] paints in) begins a [`DragKind::Pan`]: the pointer's x travel from the press, over [`pan_half`] px per
+// full swing (the tick's own geometry), steps the pan from the clip's pan at the press, clamped to -127..=127; the release
+// commits ONCE through `EditorState::set_selected_pan` (one undo step; a set of more than one pans its audio clips, SR959).
+// The kernel Player does not begin it (its sound road plays pan centred: NLE-PAN-DRAG-KERNEL).
+
+/// STRIAPANNEXT (SR994): the pan grip's height (px) from the clip row's top.
+pub const PAN_GRIP_H: i64 = 6;
+
+/// STRIAPANNEXT (SR994): THE pan geometry: the tick's travel (px) from the body's middle to a hard side on a body `x0..x1`.
+pub fn pan_half(x0: i64, x1: i64) -> i64 {
+    ((x1 - x0) / 2 - HANDLE_W - 1).max(0)
+}
+
+/// STRIAPANNEXT (SR994): the selected clip under a press on its pan grip: no shift, no slip, an AUDIO track, y in the row's top
+/// [`PAN_GRIP_H`] px, x strictly between the trim handles; `None` otherwise.
+fn pan_grip(st: &EditorState, l: &Layout, x: f64, y: f64, shift: bool, slip: bool) -> Option<(usize, usize)> {
+    if shift || slip {
+        return None;
+    }
+    let (track, idx) = st.selection?;
+    let c = st.selected()?;
+    if !matches!(st.timeline.tracks.get(track)?.kind, Kind::Audio) {
+        return None;
+    }
+    let y0 = l.row_y(track) as f64;
+    let (x0, x1) = (l.x_of(c.at), l.x_of(c.end()));
+    let hw = HANDLE_W as f64;
+    (y >= y0 && y < y0 + PAN_GRIP_H as f64 && x >= x0 as f64 + hw && x < x1 as f64 - hw).then_some((track, idx))
+}
+
+impl Drag {
+    /// STRIAPANNEXT (SR994): the grip's clip pan at the press and its swing (px; at least 1); `None` when the clip is gone.
+    fn pan_origin(&self, st: &EditorState) -> Option<(i64, i64)> {
+        let c = st.timeline.tracks.get(self.track)?.clips.get(self.idx)?;
+        Some((c.pan_cq8 as i64, pan_half(self.layout.x_of(c.at), self.layout.x_of(c.end())).max(1)))
+    }
+    /// STRIAPANNEXT (SR994): a pan drag's pointer: `delta` = the pan the x travel reaches (rounded, clamped) - the pan at the
+    /// press; no snap, no guide, no track change.
+    fn pan_update(&mut self, st: &EditorState, x: f64, y: f64) {
+        self.at = (x, y);
+        self.guide = None;
+        let Some((p0, half)) = self.pan_origin(st) else { return };
+        let v = (x - self.origin.0) * 127.0 / half as f64;
+        let steps = if v >= 0.0 { (v + 0.5) as i64 } else { (v - 0.5) as i64 };
+        self.delta = (p0 + steps).clamp(-127, 127) - p0;
+    }
+    /// STRIAPANNEXT (SR994): a pan drag's ONE commit: the pan at the press + `delta` through `EditorState::set_selected_pan`.
+    fn finish_pan(&self, st: &mut EditorState) -> Result<(), EditError> {
+        let (p0, _) = self.pan_origin(st).ok_or(EditError::NoClip)?;
+        st.set_selected_pan((p0 + self.delta).clamp(-127, 127) as i8)
     }
 }

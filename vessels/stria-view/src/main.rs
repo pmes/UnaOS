@@ -270,7 +270,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
-    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
+    let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face) + &note_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); STRIAPANNEXT (SR994): `"note":"<text>"` while a note stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
     let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
@@ -1847,7 +1847,7 @@ mod striapanface_tests {
         let (tl, src) = nle_face::synth_fixture();
         let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         let lines = drive(&mut face, "at:12:1,pan+,pan+");
-        assert_eq!(lines, ["pan: R 13", "pan: R 25"]);
+        assert!(lines.is_empty(), "{lines:?}"); assert_eq!(face.note.as_deref(), Some("pan: R 25")); // STRIAPANNEXT (SR994): the reading is the face note, not an error line
         assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 32);
         println!("striapanface witness: pan+ x2 -> {lines:?}");
     }
@@ -3059,5 +3059,31 @@ mod striaexportpresetsnext_tests {
         assert_eq!(f.message_text().as_deref(), Some("export preset proxy"));
         assert!(presets_text().contains("proxy: h264 + aac:64 crf=32 scale=1/2"));
         println!("striaexportpresetsnext witness: {:?}", f.message_text());
+    }
+}
+
+// ---- STRIAPANNEXT (LEDGER SR994): the witness's face note (named tail block) ----
+/// The witness's `"note"` field, only while a note stands (`Face::note`: SR897's pan reading, a committed pan drag's); the
+/// default line is unchanged.
+fn note_json(face: &Face) -> String {
+    face.note.as_ref().map(|s| format!(",\"note\":\"{}\"", s.replace('"', "'"))).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod striapannext_tests {
+    use super::*;
+
+    /// `at:12:1,pan+` reads the pan as the note (no error line) and the witness's field carries it; a key clears it.
+    #[test]
+    fn striapannext_note_field_while_a_note_stands() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(note_json(&face), "");
+        let lines = drive(&mut face, "at:12:1,pan+");
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(note_json(&face), r#","note":"pan: R 13""#);
+        face.on(&SMessage::BrowserKey("Home".into()));
+        assert_eq!(note_json(&face), "");
+        println!("striapannext witness: pan+ -> note pan: R 13");
     }
 }
