@@ -237,3 +237,74 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIARIPPLEMORE (LEDGER SR953): the ripple across every track (named tail block) ----
+
+/// `base()` with A1 holding V1's twins (A[0,10)@0 B[20,30)@10) and a 4-tick dissolve on V1's cut at 10, so A1's cut at
+/// 10 carries the derived crossfade.
+fn striaripplemore_linked() -> Timeline {
+    let (mut tl, _, _) = base();
+    tl.tracks[1].clips = tl.tracks[0].clips.clone();
+    let tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+    assert!(tl.audio_crossfade(1, 1).is_some_and(|x| x.at == 10));
+    tl
+}
+
+#[test]
+fn striaripplemore_the_twin_follows_and_the_derived_crossfade_stays_paired() {
+    let (_, a, b) = base();
+    let tl = striaripplemore_linked();
+    let r = tl.ripple_all_out(0, 0, 7).unwrap();
+    let want = vec![Clip::new(a, 0, 7, 0), Clip::new(b, 20, 30, 7)];
+    assert_eq!((&r.tracks[0].clips, &r.tracks[1].clips), (&want, &want), "V1 and its A1 twin ripple together");
+    assert_eq!(r.tracks[0].transitions.iter().map(|x| (x.at, x.dur)).collect::<Vec<_>>(), vec![(7, 4)]);
+    assert_eq!(r.audio_crossfade(1, 1).map(|x| x.at), Some(7), "the derived crossfade is still paired");
+    let one = tl.ripple_trim_out(0, 0, 7).unwrap();
+    assert_eq!(one.audio_crossfade(1, 1), None, "the one-track ripple un-pairs it");
+    let back = r.ripple_all_out(0, 0, 10).unwrap();
+    assert_eq!(back, tl, "the ripple back is the original timeline");
+}
+
+#[test]
+fn striaripplemore_a_twin_less_track_shifts_its_later_clips() {
+    let (mut tl, a, b) = base();
+    tl.tracks[1].clips = vec![Clip::new(b, 0, 5, 0), Clip::new(a, 50, 55, 22)];
+    tl.validate().unwrap();
+    let r = tl.ripple_all_out(0, 0, 7).unwrap();
+    assert_eq!(r.tracks[0].clips, vec![Clip::new(a, 0, 7, 0), Clip::new(b, 20, 30, 7)]);
+    assert_eq!(r.tracks[1].clips, vec![Clip::new(b, 0, 5, 0), Clip::new(a, 50, 55, 19)], "the clip before the edge stays");
+    let g = tl.ripple_all_in(0, 1, 18).unwrap();
+    assert_eq!(g.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 18, 30, 10)]);
+    assert_eq!(g.tracks[1].clips, vec![Clip::new(b, 0, 5, 0), Clip::new(a, 50, 55, 24)], "a lengthening ripple pushes later");
+}
+
+#[test]
+fn striaripplemore_a_straddler_is_refused_by_name() {
+    let (mut tl, a, _) = base();
+    tl.tracks[1].clips = vec![Clip::new(a, 50, 60, 5)];
+    tl.validate().unwrap();
+    let before = tl.clone();
+    assert_eq!(tl.ripple_all_out(0, 0, 7), Err(EditError::Overlap));
+    assert_eq!(tl.ripple_all_out(0, 0, 12), Err(EditError::Overlap));
+    assert_eq!(tl.ripple_all_out(0, 2, 7), Err(EditError::NoClip));
+    assert_eq!(tl.ripple_all_out(9, 0, 7), Err(EditError::NoTrack));
+    assert_eq!(tl, before);
+}
+
+#[test]
+fn striaripplemore_the_editor_word_is_one_undo_step() {
+    let (_, a, b) = base();
+    let tl = striaripplemore_linked();
+    let mut st = timeline_core::editor::EditorState::new(tl.clone());
+    st.select(0, 1).unwrap();
+    assert_eq!(st.verb("rtrim-all in 3"), Some(Ok(())));
+    let want = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 23, 30, 10)];
+    assert_eq!((&st.timeline.tracks[0].clips, &st.timeline.tracks[1].clips), (&want, &want));
+    assert_eq!(st.timeline, tl.ripple_all_in(0, 1, 23).unwrap());
+    assert_eq!(st.undo_depth(), 1);
+    for bad in ["rtrim-all up 3", "rtrim-all in", "rtrim-allin 3", "rtrim-all in 3 x"] {
+        assert_eq!(st.verb(bad), None, "{bad}");
+    }
+    assert!(st.undo());
+    assert_eq!(st.timeline, tl);
+}

@@ -1528,3 +1528,78 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIARIPPLEMORE (LEDGER SR953): the ripple across every track (named tail block) ----
+// SR692's `ripple_trim` ripples ONE track, so a derived audio crossfade (the audio cut and the video transition at one
+// tick, `crossfade_of`) un-pairs. The all-tracks ripple runs that one `ripple_trim` on the primary's track and on every
+// other track's TWIN (the clip with the primary's exact span `at..end`: the linked A/V case; no source match, a linked
+// audio clip may carry its own SourceId), which takes the same edge change, and splices each result's track and its
+// explicit audio crossfades into one timeline. A track with no twin shifts every clip, transition and explicit audio
+// crossfade at or past the old end by the length change (`ripple_shift_from`); a clip straddling the old end cannot stay
+// in sync and is refused `Overlap`. ONE final `validate` judges the whole (a non-twin cut at the old end shortened is
+// `Overlap`). `ripple_shift_from` and SR857's `shift_from` become one at the fold.
+impl Timeline {
+    /// STRIARIPPLEMORE: [`Timeline::ripple_trim_in`] across every track: clip `idx`'s in point to source tick `src_in`
+    /// keeping its start; every other track's twin trims the same, every other track's later material follows.
+    pub fn ripple_all_in(&self, track: usize, idx: usize, src_in: i64) -> Result<Timeline, EditError> {
+        let c = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        self.ripple_all(track, idx, Clip { src_in, ..c })
+    }
+
+    /// STRIARIPPLEMORE: [`Timeline::ripple_trim_out`] across every track: clip `idx`'s out point to source tick
+    /// `src_out`; every other track's twin trims the same, every other track's later material follows.
+    pub fn ripple_all_out(&self, track: usize, idx: usize, src_out: i64) -> Result<Timeline, EditError> {
+        let c = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        self.ripple_all(track, idx, Clip { src_out, ..c })
+    }
+
+    /// The one body of the two all-tracks ripples: clip `idx` of `track` becomes `now` (same `at`).
+    fn ripple_all(&self, track: usize, idx: usize, now: Clip) -> Result<Timeline, EditError> {
+        let was = *self.tracks.get(track).ok_or(EditError::NoTrack)?.clips.get(idx).ok_or(EditError::NoClip)?;
+        let (edge, d) = (was.end(), now.len() - was.len());
+        let (din, dout) = (now.src_in - was.src_in, now.src_out - was.src_out);
+        let mut tl = self.clone();
+        for k in 0..self.tracks.len() {
+            let twin = if k == track {
+                Some((idx, now))
+            } else {
+                let clips = &self.tracks[k].clips;
+                clips.iter().position(|c| c.at == was.at && c.end() == edge).map(|i| {
+                    let c = clips[i];
+                    (i, Clip { src_in: c.src_in + din, src_out: c.src_out + dout, ..c })
+                })
+            };
+            match twin {
+                Some((i, c)) => {
+                    let r = self.ripple_trim(k, i, c)?;
+                    tl.tracks[k] = r.tracks[k].clone();
+                    tl.audio_xfades.retain(|x| x.track != k);
+                    tl.audio_xfades.extend(r.audio_xfades.iter().filter(|x| x.track == k).copied());
+                }
+                None => tl.ripple_shift_from(k, edge, d)?,
+            }
+        }
+        tl.audio_xfades.sort_by_key(|x| (x.track, x.at));
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// STRIARIPPLEMORE: every clip, transition and explicit audio crossfade of track `k` at or past tick `edge` moves by
+    /// `d` ticks; a clip straddling `edge` (`at < edge < end`) is refused `Overlap`. No validate (the caller's one gate).
+    fn ripple_shift_from(&mut self, k: usize, edge: i64, d: i64) -> Result<(), EditError> {
+        let tr = self.tracks.get_mut(k).ok_or(EditError::NoTrack)?;
+        if tr.clips.iter().any(|c| c.at < edge && edge < c.end()) {
+            return Err(EditError::Overlap);
+        }
+        for c in tr.clips.iter_mut().filter(|c| c.at >= edge) {
+            c.at += d;
+        }
+        for x in tr.transitions.iter_mut().filter(|x| x.at >= edge) {
+            x.at += d;
+        }
+        for x in self.audio_xfades.iter_mut().filter(|x| x.track == k && x.at >= edge) {
+            x.at += d;
+        }
+        Ok(())
+    }
+}

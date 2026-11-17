@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } // STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -659,4 +659,34 @@ impl EditorState {
             _ => Err(EditError::Transition),
         })
     }
+}
+
+// ---- STRIARIPPLEMORE (LEDGER SR953): the ripple across every track from the editor (named tail block) ----
+// `rtrim-all <in|out> <delta>` rides THE verb dispatch both faces call (the host face's `Face::verb` falls through to it;
+// no VERBS button, no key: the word carries a delta): the selected clip's edge moves by `delta` source ticks through
+// `Timeline::ripple_all_in` / `ripple_all_out` (every track's twin trims the same, every track's later material follows;
+// ONE commit, one undo step). A refusal leaves the state and names its `EditError`.
+impl EditorState {
+    /// The all-tracks twin of [`EditorState::ripple_trim`].
+    pub fn ripple_trim_all(&mut self, edge: Edge, delta: i64) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let tl = match edge {
+            Edge::In => self.timeline.ripple_all_in(track, idx, c.src_in + delta)?,
+            Edge::Out => self.timeline.ripple_all_out(track, idx, c.src_out + delta)?,
+        };
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `rtrim-all` words of [`EditorState::verb`]; `None`: not this verb.
+    fn rtrim_all_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let (edge, delta) = rtrim_all_words(v)?;
+        Some(self.ripple_trim_all(edge, delta))
+    }
+}
+
+/// `rtrim-all in <delta>` / `rtrim-all out <delta>`: the `rtrim` shape ([`rtrim_words`]) under its own first word.
+fn rtrim_all_words(v: &str) -> Option<(Edge, i64)> {
+    let rest = v.strip_prefix("rtrim-all")?.strip_prefix(' ')?;
+    rtrim_words(&alloc::format!("rtrim {rest}"))
 }
