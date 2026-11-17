@@ -527,3 +527,55 @@ fn striapanmore_set_pans_every_clip_in_one_step() {
     assert_eq!(pans(&st), (64, -127), "a set of one: only the selected clip");
     println!("striapanmore: set pan 0.5 -> {:?}", pans(&st));
 }
+
+// ---- STRIAPANNEXT (LEDGER SR994): the pan drag on the pan tick's strip (named tail block) ----
+
+/// A press on the selected audio clip's top `PAN_GRIP_H` px between its handles begins a `Pan` drag; half the swing right reads
+/// 64 (previewed by `shown`, committed ONCE by `finish` through the one pan road); a far drag clamps at -127; the row's middle
+/// still moves, shift / slip at the grip do not pan, and a video clip's top is no grip.
+#[test]
+fn striapannext_pan_drag_on_the_grip() {
+    use timeline_core::view::{Drag, DragKind, Layout, PAN_GRIP_H, pan_half};
+    let (w, h) = (320u32, 160u32);
+    let mut st = EditorState::new(two_tracks());
+    st.select(0, 0).unwrap();
+    let l = Layout::of(w, h, &st);
+    let (x0, x1, y0) = (l.x_of(0), l.x_of(20), l.row_y(0));
+    let half = pan_half(x0, x1).max(1) as f64;
+    let (x, y) = ((x0 + x1) as f64 / 2.0, y0 as f64 + 2.0);
+    assert!(y < (y0 + PAN_GRIP_H) as f64);
+    let d0 = st.undo_depth();
+    let mut d = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    assert_eq!((d.kind, d.track, d.idx), (DragKind::Pan, 0, 0));
+    d.update(&st, x + half / 2.0, y + 9.0);
+    assert_eq!((d.delta, d.guide, d.to_track), (64, None, 0));
+    assert!(d.moved());
+    assert_eq!(d.shown(&st).map(|s| s.timeline.tracks[0].clips[0].pan_cq8), Some(64), "the preview pans");
+    assert_eq!(st.timeline.tracks[0].clips[0].pan_cq8, 0, "the timeline is untouched until the release");
+    assert_eq!(d.finish(&mut st), Ok(()));
+    assert_eq!((st.timeline.tracks[0].clips[0].pan_cq8, st.undo_depth()), (64, d0 + 1));
+
+    let mut far = Drag::begin_with(&mut st, l, x, y, false, false, false).expect("a drag");
+    far.update(&st, x - 4.0 * half, y);
+    assert_eq!(far.delta, -127 - 64, "clamped at hard left");
+    assert_eq!(far.finish(&mut st), Ok(()));
+    assert_eq!((st.timeline.tracks[0].clips[0].pan_cq8, st.undo_depth()), (-127, d0 + 2));
+
+    let mid = y0 as f64 + 20.0;
+    assert_eq!(Drag::begin_with(&mut st, l, x, mid, false, false, false).map(|d| d.kind), Some(DragKind::Move));
+    st.select(0, 0).unwrap();
+    assert_ne!(Drag::begin_with(&mut st, l, x, y, true, false, false).map(|d| d.kind), Some(DragKind::Pan), "shift adds, not pans");
+    st.select(0, 0).unwrap();
+    assert_eq!(Drag::begin_with(&mut st, l, x, y, false, false, true).map(|d| d.kind), Some(DragKind::Slip), "slip at the grip slips");
+
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    let mut vs = EditorState::new(tl);
+    vs.select(0, 0).unwrap();
+    let vl = Layout::of(w, h, &vs);
+    let vy = vl.row_y(0) as f64 + 2.0;
+    assert_eq!(Drag::begin_with(&mut vs, vl, x, vy, false, false, false).map(|d| d.kind), Some(DragKind::Move), "no grip on a video clip");
+    println!("striapannext: grip drag +{} px -> pan 64, far left -> -127", half / 2.0);
+}

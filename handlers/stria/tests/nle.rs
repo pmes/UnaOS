@@ -3698,15 +3698,15 @@ fn striapanface_face_words_read_the_pan() {
     for _ in 0..2 {
         assert!(face.verb("pan+"));
     }
-    assert_eq!(face.last_error.take().as_deref(), Some("pan: R 25"));
+    assert_eq!(face.note.take().as_deref(), Some("pan: R 25")); // STRIAPANNEXT (SR994): the reading is the face note
     assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.state.undo_depth()), (32, d0 + 2));
     for _ in 0..6 {
         assert!(face.verb("pan-"));
     }
-    assert_eq!(face.last_error.take().as_deref(), Some("pan: L 50"));
+    assert_eq!(face.note.take().as_deref(), Some("pan: L 50")); // STRIAPANNEXT (SR994): the reading is the face note
     assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, -64);
     assert!(face.verb("pan"));
-    assert_eq!(face.last_error.take().as_deref(), Some("pan: centre"));
+    assert_eq!(face.note.take().as_deref(), Some("pan: centre")); // STRIAPANNEXT (SR994): the reading is the face note
     assert_eq!(face.state.timeline.tracks[1].clips[1].pan_cq8, 0);
     assert!(face.verb("pan 0.25"));
     assert_eq!(face.last_error, None, "`pan <x>` stays silent");
@@ -3726,11 +3726,11 @@ fn striapanmore_alt_keys_pan_and_read() {
     let key = |f: &mut Face, k: &str| f.on(&bandy::SMessage::BrowserKey(k.into()));
     face.state.select(1, 1).unwrap();
     assert!(key(&mut face, "Alt+Right") && key(&mut face, "Alt+Right"));
-    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (32, Some("pan: R 25")));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.note.take().as_deref()), (32, Some("pan: R 25"))); // STRIAPANNEXT (SR994): the reading is the face note
     assert!(key(&mut face, "Alt+0"));
-    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (0, Some("pan: centre")));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.note.take().as_deref()), (0, Some("pan: centre"))); // STRIAPANNEXT (SR994): the reading is the face note
     assert!(key(&mut face, "Alt+Left"));
-    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.last_error.take().as_deref()), (-16, Some("pan: L 13")));
+    assert_eq!((face.state.timeline.tracks[1].clips[1].pan_cq8, face.note.take().as_deref()), (-16, Some("pan: L 13"))); // STRIAPANNEXT (SR994): the reading is the face note
     assert!(!face.on(&bandy::SMessage::BrowserText("Alt+Left".into())), "a named key is read from BrowserKey only");
     let rows = help_rows();
     for (k, w) in [("Alt+Left", "pan-"), ("Alt+0", "pan"), ("Alt+Right", "pan+")] {
@@ -3746,11 +3746,48 @@ fn striapanmore_alt_keys_pan_and_read() {
     assert!(key(&mut face, "Alt+Right"));
     let p = |f: &Face, t: usize, i: usize| f.state.timeline.tracks[t].clips[i].pan_cq8;
     assert_eq!((p(&face, 1, 0), p(&face, 1, 2), p(&face, 0, 1), face.state.undo_depth()), (16, 16, 0, d0 + 1), "audio clips only, one step");
-    assert_eq!(face.last_error.take().as_deref(), Some("pan: R 13"));
+    assert_eq!(face.note.take().as_deref(), Some("pan: R 13")); // STRIAPANNEXT (SR994): the reading is the face note
     face.state.select(0, 0).unwrap();
     face.state.select_add(0, 1).unwrap();
     assert!(face.verb("pan+"));
     assert_eq!(face.last_error.take(), Some(format!("pan: {}", EditError::NoClip)), "no audio clip in the set");
     assert_eq!(face.state.undo_depth(), d0 + 1);
     println!("striapanmore: Alt keys -> R 25 / centre / L 13; set of two audio + one video -> 16, 16, 0");
+}
+
+// ---- STRIAPANNEXT (LEDGER SR994): the face note and the pan drag's reading (named tail block) ----
+
+/// `pan+` reads its pan on the face note (not `last_error`), and `message_text` shows it; a pointer move keeps it, a named key
+/// clears it; a refusal is `last_error` with no note; a button drag on the selected audio clip's pan grip pans it in one undo
+/// step and its release reads the pan on the note.
+#[test]
+fn striapannext_note_reads_after_last_error() {
+    use timeline_core::view::{PAN_GRIP_H, pan_half};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |f: &mut Face, v: &str| f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: v.into() });
+    assert!(input(&mut face, "pan+"));
+    assert_eq!((face.note.clone(), face.last_error.take()), (None, Some(format!("pan: {}", EditError::NoClip))), "a refusal: no note");
+    face.state.select(1, 1).unwrap();
+    assert!(input(&mut face, "pan+"));
+    assert_eq!((face.note.as_deref(), face.last_error.as_deref()), (Some("pan: R 13"), None));
+    assert_eq!(face.message_text().as_deref(), Some("pan: R 13"));
+    face.on(&bandy::SMessage::BrowserMouseMove(5.0, 5.0, 0));
+    assert_eq!(face.note.as_deref(), Some("pan: R 13"), "a pointer move keeps the note");
+    face.on(&bandy::SMessage::BrowserKey("Home".into()));
+    assert_eq!(face.note, None, "a named key clears it");
+
+    let l = face.layout();
+    let (x0, x1, y0) = (l.x_of(10), l.x_of(20), l.row_y(1));
+    let half = pan_half(x0, x1).max(1) as f64;
+    let (x, y) = ((x0 + x1) as f64 / 2.0, y0 as f64 + 2.0);
+    assert!(y < (y0 + PAN_GRIP_H) as f64);
+    let (p0, d0) = (face.state.timeline.tracks[1].clips[1].pan_cq8, face.state.undo_depth());
+    face.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 });
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Pan));
+    face.on(&bandy::SMessage::BrowserMouseMove(x + half, y, 0));
+    face.on(&bandy::SMessage::BrowserButton { down: false, x: x + half, y, mods: 0, surface: 0 });
+    assert_eq!((p0, face.state.timeline.tracks[1].clips[1].pan_cq8, face.state.undo_depth()), (16, 127, d0 + 1));
+    assert_eq!((face.note.as_deref(), face.last_error.as_deref()), (Some("pan: R 100"), None), "the release reads the pan");
+    println!("striapannext: note pan: R 13 kept by a move, cleared by Home; grip drag -> R 100");
 }

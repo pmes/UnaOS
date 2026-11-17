@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pub note: Option<String>, // STRIAPANNEXT (SR994): a success line, read by message_text after last_error, cleared by the next taken input (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -445,7 +446,7 @@ impl Face {
             self.state.seek(d.origin_tick + d.delta);
             return true;
         }
-        if let Err(e) = d.finish(&mut self.state) {
+        let r = d.finish(&mut self.state); self.pan_drag_note(d.kind, &r); if let Err(e) = r { // STRIAPANNEXT (SR994): a committed pan drag reads its pan on the note (file tail)
             self.last_error = Some(format!("drag: {e}"));
         }
         true
@@ -2361,7 +2362,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3111,7 +3112,7 @@ impl Face {
             return None;
         }
         let Some(r) = self.state.verb(v) else { return Some(false) };
-        self.last_error = Some(match r {
+        if r.is_ok() { self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8))); return Some(true); } self.note = None; self.last_error = Some(match r { // STRIAPANNEXT (SR994): the reading is the note, a refusal last_error (file tail)
             Ok(()) => pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)),
             Err(e) => format!("pan: {e}"),
         });
@@ -3127,5 +3128,31 @@ pub fn pan_line(pan_cq8: i8) -> String {
         0 => "pan: centre".to_string(),
         n if n < 0 => format!("pan: L {}", p.min(100)),
         _ => format!("pan: R {}", p.min(100)),
+    }
+}
+
+// ---- STRIAPANNEXT (LEDGER SR994): the face note — a success line after last_error, and the pan drag's reading (named tail block) ----
+// `Face::note` holds a success line (SR897's pan reading `pan: R 25`, a committed pan drag's): `message_text` reads it after
+// `last_error` and before the export / reel lines; `serve` and the witness do not take it (they take `last_error`), so it stays on
+// the message row until the next taken input clears it: an `Input`, a `BrowserClick`, a button press, `BrowserSelectAll`, a
+// named `BrowserKey` or a one-character `BrowserText` (a pointer move, a button release, a resize keep it).
+impl Face {
+    /// Clear the note on a taken input ([`Face::on`], after the `takes` check).
+    fn clear_note(&mut self, msg: &SMessage) {
+        let input = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserButton { down: true, .. } | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserKey(k) => k.chars().count() > 1,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if input {
+            self.note = None;
+        }
+    }
+    /// A pan drag ([`DragKind::Pan`], timeline_core's grip) that committed: the note reads the primary's pan ([`pan_line`]).
+    fn pan_drag_note(&mut self, kind: DragKind, r: &Result<(), EditError>) {
+        if kind == DragKind::Pan && r.is_ok() {
+            self.note = Some(pan_line(self.state.selected().map_or(0, |c| c.pan_cq8)));
+        }
     }
 }
