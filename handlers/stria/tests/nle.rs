@@ -3868,3 +3868,26 @@ fn striatcmore_readout_off_ntsc_paint_is_unchanged() {
     assert_eq!(face.paint(), off, "off: byte-identical");
     println!("striatcmore: ntsc off fnv {:016x}", stria::nle_face::fnv1a(&off));
 }
+
+// ---- STRIAKTC (LEDGER SR9018): the face's readout is timeline_core's one text (named tail block) ----
+
+/// Each unit's readout is `view::tc_readout` on the face's timeline and playhead (the text the kernel Player's band shows),
+/// on a 1/25 and on a 30000/1001 timeline; off, none.
+#[test]
+fn striaktc_face_readout_is_the_shared_text() {
+    use timeline_core::view::{TcUnit, tc_readout};
+    let mut face = striatimecodedisplay_face(false);
+    face.state.seek(12);
+    assert_eq!(face.tc_readout(), None, "off");
+    for tb in [timeline_core::Timebase { num: 1, den: 25 }, timeline_core::Timebase { num: 1001, den: 30000 }] {
+        face.state.timeline.tb = tb;
+        for (w, u) in [("tc timecode", TcUnit::Timecode), ("tc frames", TcUnit::Frames), ("tc seconds", TcUnit::Seconds)] {
+            assert!(face.verb(w));
+            assert_eq!(face.tc_readout(), Some(tc_readout(&face.state.timeline, face.state.playhead, u)), "{w}");
+        }
+    }
+    assert!(face.verb("tc off"));
+    assert_eq!(face.tc_readout(), None);
+    assert!(face.last_error.is_none());
+    println!("striaktc: face readout == view::tc_readout at {}", face.state.playhead);
+}
