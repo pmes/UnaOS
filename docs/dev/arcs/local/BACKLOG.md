@@ -5,7 +5,7 @@ next id from the LOCAL BLOCK (SR850-SR999 are reserved for local; the cloud seat
 this block), write its arc file from the entry (the pack-2 files are the template: ARC / CHARTER / GOAL / M1 / M2 /
 M3 / OWED / FILES / SEAM / EXCEPTION), launch an Opus executor, measure its design, fold-test, push, tell the cloud
 seat. Mark the entry `[SRnnn started]` / `[SRnnn pushed <sha>]` here and push this file with the branch. Run as many
-at once as the machine carries; the seams named per entry are the only ordering. Every entry is measure-first: the
+at once as the machine carries (ALL ready entries at once, as background agents launched in one message; never one at a time); the seams named per entry are the only ordering. Every entry is measure-first: the
 executor re-measures each anchor and the local seat rules on the design.
 
 Row prefix for every entry: `- NLE5b (SR204 owed)` (handlers.md L104, edited IN PLACE) unless the entry names another.

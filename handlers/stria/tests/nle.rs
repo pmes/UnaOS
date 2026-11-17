@@ -3413,6 +3413,242 @@ fn nle5dexportmessageetastall_scripted_stall() {
     println!("nle5dexportmessageetastall: EMA {:.2} fps: eta {fresh:?} -> {late:?} after a 5 s stall ({} -> {})", st.0, eta_words_of(fresh), eta_words_of(late));
 }
 
+// ---- NLE5DEXPORTMESSAGEETASTALLWORD (LEDGER SR817): a stalled export's line names the stall (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetastallword_stall_words_kat() {
+    use stria::nle_face::{eta_words_of, stall_words, STALL_AFTER};
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(STALL_AFTER, Duration::from_secs(5));
+    let rows: [(Duration, f64, Option<&str>); 10] = [
+        (ms(4000), 10.0, None),
+        (ms(5000), 10.0, None),
+        (ms(5500), 10.0, Some("stalled 6 s")),
+        (ms(5400), 10.0, Some("stalled 5 s")),
+        (ms(7000), 0.0, Some("stalled 7 s")),
+        (ms(4900), 0.0, None),
+        (ms(500), 0.05, None),
+        (ms(100_000), 0.05, None),
+        (ms(250_000), 0.05, Some("stalled 4:10")),
+        (ms(3_725_000), f64::NAN, Some("stalled 1:02:05")),
+    ];
+    for (d, r, want) in rows {
+        let got = stall_words(d, r);
+        assert_eq!(got.as_deref(), want, "stall_words({d:?}, {r})");
+        if let Some(w) = got {
+            assert_eq!(&w["stalled ".len()..], &eta_words_of(d)[1..], "{w}: SR796's one grammar without the tilde");
+        }
+    }
+    println!("nle5dexportmessageetastallword: stall_words {} KAT rows (strict over max(5 s, 10 / rate); flat 5 s without a rate)", rows.len());
+}
+
+#[test]
+fn nle5dexportmessageetastallword_scripted_stall() {
+    use stria::nle_face::{ema_sample, eta_of_rate, eta_words_of, export_line, stall_words};
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    // SR811's script: SR808's 2 s warm-up, the second move seeds 1 fps, then 30 x (100 ms, +10 frames) to 302 / 1000.
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let started = t0 - Duration::from_secs(2);
+    let total = 1000u64;
+    let mut st = (0.0, (started, 0u64));
+    st = ema_sample(st.0, st.1, 1, t0);
+    st = ema_sample(st.0, st.1, 2, t0 + ms(1000));
+    let mut now = t0 + ms(1000);
+    let mut done = 2;
+    for _ in 0..30 {
+        now += ms(100);
+        done += 10;
+        st = ema_sample(st.0, st.1, done, now);
+    }
+    assert_eq!(done, 302);
+    // The line as `job_line` composes it: the stall word wins over the eta word when Some.
+    let line = |done: u64, ema: f64, since: Duration| export_line(done, total, stall_words(since, ema).or_else(|| eta_of_rate(total - done, ema, since).map(eta_words_of)));
+    assert_eq!(line(done, st.0, Duration::from_secs(7)), "export: 302 / 1000 stalled 7 s", "a 7 s stall names itself");
+    let four = line(done, st.0, Duration::from_secs(4));
+    let tail = four.strip_prefix("export: 302 / 1000 ~").unwrap_or_else(|| panic!("{four}: a 4 s stall keeps the eta word"));
+    assert!(nle5dexportmessageetaband_eta_shaped(tail), "{four}: the eta part");
+    // The next move: the last move is now, so the eta word returns.
+    let at = now + ms(7100);
+    let moved = ema_sample(st.0, st.1, done + 10, at);
+    assert_eq!(moved.1, (at, 312), "the move records its instant");
+    assert_eq!(stall_words(at - moved.1.0, moved.0), None, "no time since the move: no stall");
+    let back = line(312, moved.0, at - moved.1.0);
+    assert!(back.strip_prefix("export: 312 / 1000 ~").is_some_and(nle5dexportmessageetaband_eta_shaped), "{back}: the eta word returns");
+    println!("nle5dexportmessageetastallword: EMA {:.2} fps: 7 s -> \"export: 302 / 1000 stalled 7 s\", 4 s -> \"{four}\", next move -> \"{back}\"", st.0);
+}
+
+#[test]
+fn nle5dexportmessageetastallword_paused_face_names_the_stall() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("etastallword-face");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    // One tick records the first move (0 -> 3) as the serve clock would; the EMA still has no rate, so the mean road's flat
+    // 5 s decides, counted from that move (~5 s of wall clock).
+    face.export_tick();
+    let t0 = std::time::Instant::now();
+    let line = loop {
+        let m = face.message_text().expect("the running export's line");
+        if m.starts_with("export: 3 / 35 stalled ") {
+            break m;
+        }
+        assert!(m.starts_with("export: 3 / 35 ~"), "{m}: before the stall the eta word");
+        assert!(t0.elapsed() < Duration::from_secs(20), "the paused job never read stalled: {m}");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let n = line.strip_prefix("export: 3 / 35 stalled ").and_then(|t| t.strip_suffix(" s")).and_then(|n| n.parse::<u64>().ok());
+    assert!(n.is_some_and(|n| n >= 5), "{line}: the stall in whole seconds, 5 or more");
+    assert!(face.export_eta().is_some(), "the witness's eta keeps its number while stalled");
+    face.export_tick();
+    assert_eq!(face.export_progress(), Some((3, 35)), "done never moved");
+    assert!(face.message_text().is_some_and(|m| m.starts_with("export: 3 / 35 stalled ")), "a tick with done fixed keeps the stall word");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetastallword: paused face reads \"{line}\"");
+}
+
+// ---- NLE5DEXPORTMESSAGEETATOTAL (LEDGER SR820): the total seeded before frame 1 (named tail block) ----
+#[test]
+fn nle5dexportmessageetatotal_face_reads_the_total_before_frame_one() {
+    use stria::nle_face::export_line;
+    assert_eq!(export_line(0, 35, None), "export: 0 / 35", "a seeded total before frame 1");
+    assert_eq!(export_line(0, 0, None), "export: starting", "the zero-frame grammar kept");
+    let dir = nlefaceexport_dir("etatotal-face");
+    let (tl, src) = synth_fixture();
+    let want = stria::nle_export::export_total(&tl, &(0..tl.end()));
+    assert_eq!(want, 35, "the fixture's whole range");
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    // The seed is stored before `start_export` returns: the total is the rule's whatever `done` the thread has reached.
+    let p0 = face.export_progress().expect("the running job");
+    let line = face.message_text().expect("the running export's line");
+    let eta = face.export_eta();
+    let p1 = face.export_progress().expect("the running job");
+    assert_eq!((p0.1, p1.1), (35, 35), "total seeded at the start");
+    assert!(p0.0 <= p1.0 && p1.0 <= 3, "{p0:?} then {p1:?}");
+    assert_ne!(line, "export: starting", "never the zero-frame word for a 35-frame export");
+    let d: u64 = line.strip_prefix("export: ").and_then(|t| t.split(" / ").next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}: the done count"));
+    assert!(line.starts_with(&format!("export: {d} / 35")) && d <= 3, "{line}");
+    if d == 0 {
+        assert_eq!(line, "export: 0 / 35", "before frame 1: the real count, no eta");
+    }
+    if p1.0 == 0 {
+        assert_eq!(eta, None, "SR796: no eta while done is 0");
+    }
+    nlefaceexport_until(&face, (3, 35));
+    assert_eq!(face.export_progress(), Some((3, 35)), "the thread's readings confirm the seed: total never changed");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetatotal: right after the call {p0:?} \"{line}\"; at (3, 35) the same total");
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWITNESS (LEDGER SR825): the stall rule's predicate for the witness; the finalise named (named tail block) ----
+#[test]
+fn nle5dexportmessageetastallwitness_stall_since_kat() {
+    use stria::nle_face::{eta_words_of, stall_since, stall_words};
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    // SR817's ten rows, the stalled ones as the time itself.
+    let rows: [(Duration, f64, Option<Duration>); 10] = [
+        (ms(4000), 10.0, None),
+        (ms(5000), 10.0, None),
+        (ms(5500), 10.0, Some(ms(5500))),
+        (ms(5400), 10.0, Some(ms(5400))),
+        (ms(7000), 0.0, Some(ms(7000))),
+        (ms(4900), 0.0, None),
+        (ms(500), 0.05, None),
+        (ms(100_000), 0.05, None),
+        (ms(250_000), 0.05, Some(ms(250_000))),
+        (ms(3_725_000), f64::NAN, Some(ms(3_725_000))),
+    ];
+    for (d, r, want) in rows {
+        assert_eq!(stall_since(d, r), want, "stall_since({d:?}, {r})");
+        let word = stall_since(d, r).map(|s| format!("stalled {}", eta_words_of(s).trim_start_matches('~')));
+        assert_eq!(stall_words(d, r), word, "stall_words({d:?}, {r}) reads stall_since: ONE rule");
+    }
+    println!("nle5dexportmessageetastallwitness: stall_since {} KAT rows, stall_words over it", rows.len());
+}
+
+#[test]
+fn nle5dexportmessageetastallwitness_finishing_words_kat() {
+    use stria::nle_face::{export_line, finishing_words};
+    let rows: [(u64, u64, Option<&str>); 4] = [(35, 35, Some("finishing")), (34, 35, None), (0, 35, None), (0, 0, None)];
+    for (d, t, want) in rows {
+        assert_eq!(finishing_words(d, t).as_deref(), want, "finishing_words({d}, {t})");
+    }
+    assert_eq!(export_line(35, 35, Some("finishing".to_string())), "export: 35 / 35 finishing");
+    assert_eq!(export_line(0, 0, finishing_words(0, 0)), "export: starting", "an export of no frames keeps its word");
+    println!("nle5dexportmessageetastallwitness: finishing_words {} KAT rows", rows.len());
+}
+
+#[test]
+fn nle5dexportmessageetastallwitness_finalise_reads_finishing_never_stalled() {
+    use std::time::{Duration, Instant};
+    let dir = nlefaceexport_dir("etastallwitness-finishing");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    // The hold after the last frame: done == total and the thread not returned, the finalise window (sink.finish runs next).
+    face.export_paused_at(&dir, "png", 35).unwrap();
+    nlefaceexport_until(&face, (35, 35));
+    face.export_tick();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(6000) {
+        assert_eq!(face.message_text().as_deref(), Some("export: 35 / 35 finishing"), "the finalise is named, no eta, no stall");
+        assert_eq!(face.export_stall(), None, "the witness reads no stall while finishing");
+        face.export_tick();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(face.exporting(), "the job held in its finalise window");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 35/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetastallwitness: done == total for 6 s reads \"export: 35 / 35 finishing\"");
+}
+
+#[test]
+fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
+    use std::time::{Duration, Instant};
+    let dir = nlefaceexport_dir("etastallwitness-stall");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    // One tick records the first move (0 -> 3); the EMA has no rate, so the flat 5 s counts from that move (SR817's shape).
+    face.export_tick();
+    assert_eq!(face.export_stall(), None, "fresh: no stall");
+    let t0 = Instant::now();
+    let stall = loop {
+        if let Some(s) = face.export_stall() {
+            break s;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "the paused job never read a stall");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(stall > Duration::from_secs(5), "{stall:?}: strictly over the flat 5 s");
+    let line = face.message_text().expect("the running export's line");
+    assert!(line.starts_with("export: 3 / 35 stalled "), "{line}: the word and the witness read ONE rule");
+    assert!(face.export_stall().is_some_and(|s| s >= stall), "the stall only grows while done is fixed");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.last_error.take(), Some(cancel), "the cancel line unchanged");
+    assert_eq!(face.export_stall(), None, "no job: no stall");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
+}
+
 // ---- STRIASNAPDRAG (LEDGER SR836): tick 0 and the in / out marks are snap targets on the face's drag (named tail block) ----
 
 /// Rule: over NLE1's fixture with the in mark at 22 (the `in` verb), a press on V's A@25 body at `x_of(28) + 7` moved
