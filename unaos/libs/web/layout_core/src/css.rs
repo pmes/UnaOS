@@ -384,7 +384,7 @@ impl<H: Host> SpecifiedStyle<H> {
         // containing block, which already does not depend on its content.
         if (self.paint.container_type == Some(1) || self.paint.contain_size == Some(1)) && self.height.is_none() {
             node_style.size.height = Dimension::length(0.0);
-            node_style.min_size.height = LengthPercentageAuto::auto();
+            if self.min_height.is_none() { node_style.min_size.height = LengthPercentageAuto::auto(); }
         }
         // AETHERSTYLE3 (SR103): a scroll container's automatic minimum size is 0 (css-flexbox-1 §4.5), which
         // taffy reads from its own `overflow`; scrollbars are overlays, so no gutter is reserved.
