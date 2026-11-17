@@ -27,12 +27,12 @@ pub enum PictureHash {
 }
 
 /// The verdict of [`check`] for one picture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HashCheck {
     /// Every component matches.
     Match,
-    /// The first component (cIdx) whose hash differs.
-    Mismatch(usize),
+    /// SR1090: bit c set for each component (cIdx) whose hash differs (0b001 Y, 0b010 Cb, 0b100 Cr).
+    Mismatch(u8),
 }
 
 /// The decoded_picture_hash (payloadType 132) of a SEI RBSP (7.3.2.4 sei_rbsp: sei_message()s until the trailing bits),
@@ -155,7 +155,7 @@ pub fn plane_md5(p: &Plane, bit_depth: u32) -> [u8; 16] {
 /// (SR334): D.3.19's bitDepth is per component — BitDepthY for plane 0, BitDepthC (`bit_depth_c`) for planes 1 and 2.
 /// HEVCSCCTAIL (SR365): a 4:0:0 picture (0x0 chroma planes) is checked over its one component.
 pub fn check(planes: &[Plane; 3], bit_depth: u32, bit_depth_c: u32, h: &PictureHash) -> HashCheck {
-    let comps = if planes[1].data.is_empty() && planes[2].data.is_empty() { 1 } else { 3 };
+    let comps = if planes[1].data.is_empty() && planes[2].data.is_empty() { 1 } else { 3 }; let mut bad = 0u8;
     for c in 0..comps {
         let bd = if c == 0 { bit_depth } else { bit_depth_c };
         let ok = match h {
@@ -164,8 +164,93 @@ pub fn check(planes: &[Plane; 3], bit_depth: u32, bit_depth_c: u32, h: &PictureH
             Checksum(want) => plane_checksum(&planes[c], bd) == want[c],
         };
         if !ok {
-            return HashCheck::Mismatch(c);
+            bad |= 1 << c;
         }
     }
-    HashCheck::Match
+    if bad == 0 { HashCheck::Match } else { HashCheck::Mismatch(bad) }
+}
+
+// ---- HEVCSEIALLCIDX (LEDGER SR1090): the cIdx-mask verdict's helper and print (named tail block) ----
+
+impl HashCheck {
+    /// SR1090: whether component `c` (cIdx 0 Y, 1 Cb, 2 Cr) is among the mismatching ones.
+    pub fn component(&self, c: usize) -> bool {
+        match *self {
+            HashCheck::Match => false,
+            HashCheck::Mismatch(m) => c < 8 && m >> c & 1 == 1,
+        }
+    }
+}
+
+/// SR1090: `Match`, or `Mismatch(` the failing planes joined by `+` `)`, e.g. `Mismatch(Y+Cb)`.
+impl core::fmt::Debug for HashCheck {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let HashCheck::Mismatch(m) = *self else { return f.write_str("Match") };
+        f.write_str("Mismatch(")?;
+        let mut sep = "";
+        for (c, name) in ["Y", "Cb", "Cr"].iter().enumerate() {
+            if m >> c & 1 == 1 {
+                write!(f, "{sep}{name}")?;
+                sep = "+";
+            }
+        }
+        f.write_str(")")
+    }
+}
+
+#[cfg(test)]
+mod hevcseiallcidx_tests {
+    use super::{check, plane_checksum, HashCheck, PictureHash};
+    use crate::picture::Plane;
+    use alloc::{format, vec};
+
+    fn pic() -> [Plane; 3] {
+        [Plane { w: 2, h: 2, data: vec![1, 2, 3, 4] }, Plane { w: 1, h: 1, data: vec![5] }, Plane { w: 1, h: 1, data: vec![6] }]
+    }
+
+    /// The picture's true checksums, with 1 added to the word of every cIdx whose bit is set in `off`.
+    fn sums(p: &[Plane; 3], off: u8) -> PictureHash {
+        PictureHash::Checksum(core::array::from_fn(|c| plane_checksum(&p[c], 8).wrapping_add(u32::from(off >> c & 1))))
+    }
+
+    #[test]
+    fn hash_check_all_cidx_luma_and_cb() {
+        let p = pic();
+        let v = check(&p, 8, 8, &sums(&p, 0b011));
+        assert_eq!(v, HashCheck::Mismatch(0b011));
+        assert_eq!(format!("{v:?}"), "Mismatch(Y+Cb)");
+    }
+
+    #[test]
+    fn hash_check_all_cidx_cr_only_and_all_three() {
+        let p = pic();
+        assert_eq!(check(&p, 8, 8, &sums(&p, 0)), HashCheck::Match);
+        assert_eq!(format!("{:?}", HashCheck::Match), "Match");
+        let cr = check(&p, 8, 8, &sums(&p, 0b100));
+        assert_eq!(cr, HashCheck::Mismatch(0b100));
+        assert_eq!(format!("{cr:?}"), "Mismatch(Cr)");
+        let all = check(&p, 8, 8, &sums(&p, 0b111));
+        assert_eq!(all, HashCheck::Mismatch(0b111));
+        assert_eq!(format!("{all:?}"), "Mismatch(Y+Cb+Cr)");
+    }
+
+    #[test]
+    fn hash_check_all_cidx_monochrome() {
+        let p = pic();
+        let mono = [p[0].clone(), Plane { w: 0, h: 0, data: vec![] }, Plane { w: 0, h: 0, data: vec![] }];
+        let h = PictureHash::Checksum([plane_checksum(&p[0], 8) + 1, 7, 7]);
+        let v = check(&mono, 8, 8, &h);
+        assert_eq!(v, HashCheck::Mismatch(0b001));
+        assert_eq!(format!("{v:?}"), "Mismatch(Y)");
+    }
+
+    #[test]
+    fn hash_check_all_cidx_component_and_print() {
+        assert!(HashCheck::Mismatch(0b010).component(1));
+        assert!(HashCheck::Mismatch(0b011).component(1));
+        assert!(!HashCheck::Mismatch(0b001).component(1));
+        assert!(!HashCheck::Match.component(0));
+        // tests/conformance.rs `check_vector`'s `{bad:?}` print of its (POC, verdict) list.
+        assert_eq!(format!("{:?}", vec![&(2, HashCheck::Mismatch(0b011))]), "[(2, Mismatch(Y+Cb))]");
+    }
 }

@@ -75,7 +75,7 @@ fn run(name: &str) -> Option<String> {
 fn check_vector(name: &str, v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, HashCheck)>) -> Option<String> {
     assert!(!frames.is_empty(), "{name}: no frames decoded");
     let bad: Vec<_> = checks.iter().filter(|(_, c)| matches!(c, HashCheck::Mismatch(_))).collect();
-    assert!(bad.is_empty(), "{name}: decoded picture hash SEI mismatch at (POC, cIdx) {bad:?}");
+    assert!(bad.is_empty(), "{name}: decoded picture hash SEI mismatch at (POC, planes) {bad:?}");
     let ok = checks.iter().filter(|(_, c)| *c == HashCheck::Match).count();
     let md5_unchecked = checks.len() - ok;
     let out: Vec<Vec<u8>> = frames.iter().map(yuv_bytes).collect();
@@ -191,7 +191,7 @@ fn sei_parse_kat() {
     md5.push(0x80);
     let want: [[u8; 16]; 3] = core::array::from_fn(|c| core::array::from_fn(|i| (c * 16 + i) as u8));
     assert_eq!(sei::picture_hash(&md5), Ok(Some(PictureHash::Md5(want))));
-    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0));
+    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0b111)); // SR1090: cIdx mask
     assert_eq!(sei::picture_hash(&[5, 1, 0, 0x80]), Ok(None));
     assert_eq!(sei::picture_hash(&[132, 7, 1, 0x12]), Err(Error::Truncated));
 }
@@ -222,7 +222,7 @@ fn md5_kat() {
 
 /// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 per component through crypto_core, against the hex of an
 /// independent MD5 (Python's hashlib over the same pictureData bytes): a 2x2 / 1x1 / 1x1 picture at 8 bits matches, a
-/// changed Cr is Mismatch(2); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
+/// changed Cr is Mismatch(0b100); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
 #[test]
 fn sei_md5_kat() {
     let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -234,7 +234,7 @@ fn sei_md5_kat() {
     let want = PictureHash::Md5(["08d6c05a21512a79a1dfeb9d2a8f262f", "8bb6c17838643f9691cc6a4de6c51709", "06eca1b437c7904cc3ce6546c8110110"].map(digest));
     assert_eq!(sei::check(&pic, 8, 8, &want), HashCheck::Match);
     let cr_off = [pic[0].clone(), pic[1].clone(), plane(1, 1, &[7])];
-    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(2));
+    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(0b100)); // SR1090: cIdx mask
     assert_eq!(hex(sei::plane_md5(&plane(2, 2, &[0x3FF, 0, 1, 2]), 10)), "c0e517ad64daf3a79e06d779d07d8b26");
     let mono = [pic[0].clone(), plane(0, 0, &[]), plane(0, 0, &[])];
     let one = PictureHash::Md5([digest("08d6c05a21512a79a1dfeb9d2a8f262f"), [0; 16], [0; 16]]);
