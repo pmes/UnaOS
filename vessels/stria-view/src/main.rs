@@ -960,3 +960,22 @@ mod striatrackgainstep_tests {
         println!("striatrackgainstep witness: track-gain- -> A1 -1.0 dB; track-gain+ -> 0.0 dB");
     }
 }
+
+// ---- STRIATRACKGAINKEYS (LEDGER SR926): the witness's key tokens reach the audio words (named tail block) ----
+#[cfg(test)]
+mod striatrackgainkeys_tests {
+    use super::*;
+
+    /// M3: `at:12:1,key:v` steps the clicked A1 clip's gain one step down (the gain line); `key::` steps A1's track one
+    /// dB down (the `key:` prefix is stripped before the `:` split); `key:Q` mutes A1 with no line; three undo steps.
+    #[test]
+    fn striatrackgainkeys_witness_key_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut face, "at:12:1,key:v"), vec!["gain -1.0 dB".to_string()]);
+        assert_eq!(drive(&mut face, "key::"), vec!["track-gain: A1 -1.0 dB".to_string()]);
+        assert!(drive(&mut face, "key:Q").is_empty());
+        assert_eq!((face.state.timeline.tracks[1].muted, face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (true, -100, 3));
+        println!("striatrackgainkeys witness: key:v -> gain -1.0 dB; key:: -> A1 -1.0 dB; key:Q mutes A1");
+    }
+}
