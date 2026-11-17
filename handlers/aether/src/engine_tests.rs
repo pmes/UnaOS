@@ -10055,4 +10055,60 @@ b</div>
         assert_eq!(imgalt_rect(&mut e, "iq").2, 160.0, "#iq: 10em");
         assert_eq!(imgalt_rect(&mut e, "ic").2, 160.0, "#ic: 100cqw of the 160px container");
     }
+
+    // ---- AETHERCSSCONTAINSIZEMINHEIGHT (LEDGER SR1140): size containment keeps a declared min-height (named tail block) ----
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): the height of `#want` in a page with body margin 0 laid out by the cascade.
+    fn contain_size_min_height_of(body: &str) -> f32 {
+        let html = format!(r#"<html><body style="margin:0">{body}</body></html>"#);
+        let t = laid_out(&html, "");
+        rect_by_id(&t, "want").expect("#want is laid out").3
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): css-contain-2 §3.2 lays a size container out as if empty, and an empty box
+    /// still takes its min-height: `container-type: size; min-height: 32px` is 32px tall (before SR1140 the size-containment
+    /// fold reset the declared min-height to auto and the box was 0 tall).
+    #[test]
+    fn contain_size_min_height_px_is_kept() {
+        let h = contain_size_min_height_of(r#"<div id="want" style="container-type: size; min-height: 32px"><div style="height: 100px"></div></div>"#);
+        assert_eq!(h, 32.0, "a size container takes its px min-height (armed: 0 before SR1140)");
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): `min-height: 2em` at the 16px default is 32px; before SR1140 it survived only
+    /// because the font-relative re-application re-folded it after the clear; now the fold keeps it.
+    #[test]
+    fn contain_size_min_height_em_is_kept() {
+        let h = contain_size_min_height_of(r#"<div id="want" style="container-type: size; min-height: 2em"><div style="height: 100px"></div></div>"#);
+        assert_eq!(h, 32.0, "a size container takes its em min-height");
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): with no min-height a size container is the empty box: 0 content plus its
+    /// 10px padding top and bottom, whatever its child's height (unchanged).
+    #[test]
+    fn contain_size_min_height_none_is_empty_box() {
+        let h = contain_size_min_height_of(r#"<div id="want" style="container-type: size; padding: 10px"><div style="height: 100px"></div></div>"#);
+        assert_eq!(h, 20.0, "no min-height: 0 plus the padding");
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): `contain: size` runs through the same fold: `min-height: 40px` makes it 40px.
+    #[test]
+    fn contain_size_min_height_contain_size_is_kept() {
+        let h = contain_size_min_height_of(r#"<div id="want" style="contain: size; min-height: 40px"><div style="height: 100px"></div></div>"#);
+        assert_eq!(h, 40.0, "contain: size takes its min-height (armed: 0 before SR1140)");
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): a size-container flex item with no min-height stays 0 tall: the auto clear
+    /// keeps the automatic minimum from pulling its 100px child back in (the reason the clear stays for the auto case).
+    #[test]
+    fn contain_size_min_height_flex_item_auto_stays_empty() {
+        let h = contain_size_min_height_of(r#"<div style="display: flex; flex-direction: column; height: 300px"><div id="want" style="container-type: size"><div style="height: 100px"></div></div></div>"#);
+        assert_eq!(h, 0.0, "a size-container flex item with an auto min-height is the empty box");
+    }
+
+    /// AETHERCSSCONTAINSIZEMINHEIGHT (SR1140): a declared height skips the size-containment fold: `height: 50px` stays 50.
+    #[test]
+    fn contain_size_min_height_declared_height_wins() {
+        let h = contain_size_min_height_of(r#"<div id="want" style="container-type: size; height: 50px; min-height: 10px"><div style="height: 100px"></div></div>"#);
+        assert_eq!(h, 50.0, "a declared height is the box's height");
+    }
 }
