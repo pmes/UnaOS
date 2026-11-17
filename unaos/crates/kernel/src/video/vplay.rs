@@ -1040,7 +1040,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
-    if let Some(c) = tl.tracks.iter().flat_map(|t| t.clips.iter()).find(|c| c.rate_q16 != 0x1_0000) { return Err(("rate-unsupported", Some(alloc::format!("a clip at rate {:#x} (the Player's EDL mode plays every clip at 1x)", c.rate_q16)))); } let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // NLE-SPEED-KERNEL (SR829): a rated clip is refused by name, never played at 1x
+    if let Some(c) = tl.rated_unheld() { return Err(("rate-unsupported", Some(alloc::format!("a clip at rate {:#x} (the Player's EDL mode plays every clip at 1x but a video hold)", c.rate_q16)))); } let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // NLE-SPEED-KERNEL (SR829): a rated clip is refused by name, never played at 1x; STRIAKFREEZE (SR9008): but a video hold (timeline_core `rated_unheld`)
     for s in &tl.sources {
         let Some(rp) = [".MP4", ".WEBM", ".MKV", ".WAV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
             return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV|.WAV)", s.reel, dir, s.reel))));
@@ -1077,7 +1077,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         None => return Err(("superseded", None)),
     }
     let mut run: Option<EdlRun> = None;
-    let mut mix: Option<EdlRun> = None; let mut seen = timeline_core::Crop::NONE; // STRIAKCROP (SR9010): the crop last named on the wire. NLE6MIX (B899): a transition's outgoing run, the second decoder slot
+    let mut mix: Option<EdlRun> = None; let holds = timeline_core::held_ticks(&steps); let mut held: Option<EdlHeld> = None; let mut seen = timeline_core::Crop::NONE; // STRIAKCROP (SR9010): the crop last named on the wire. NLE6MIX (B899): a transition's outgoing run, the second decoder slot. STRIAKFREEZE (SR9008): the steps whose picture the next repeats (file tail)
     for s in steps.iter().filter(|s| s.kind == Kind::Video) {
         let pts_ms = out_ms(s.out_t);
         if rep.plan.len() < SHOWN_CAP {
@@ -1092,7 +1092,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
             Some(id) => {
-                let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
+                let live = run.as_ref().map(|x| x.src); let (w, h, px, ord) = match edl_held(&held, live, s, id) { Some(f) => f, None => edl_keep(&mut held, &holds, s, id, edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?) }; // STRIAKFREEZE (SR9008): a hold's repeat shows the held picture, no decode (file tail)
                 coded(rep, s.out_t, ord, &px); let px = edl_grade(tl.grade_at(s.track, s.out_t, false), px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) } // STRIAGRADENEXT (SR992): the clip's grade after the coded witness (file tail)
             }
         };
@@ -1847,7 +1847,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 202120192020] = [
+const EDIT_KEYS: [(u8, &str); 20212019202019] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1875,6 +1875,7 @@ const EDIT_KEYS: [(u8, &str); 202120192020] = [
     (b'H', "history"),
     (b'y', "link-av"), (b'Y', "unlink"), // STRIAKLINK (LEDGER SR9006): `y` links every coincident V1 / A1 pair (SR928's `link-av` verb word; None until it folds), `Y` unlinks the shown clip's group
     (b'T', "track+ video"), (b'R', "track-"), // STRIAKTRACKADD (SR9007): `T` adds an empty video track, `R` removes the shown clip's track (timeline_core's words; file tail)
+    (b'e', "freeze"), // STRIAKFREEZE (SR9008): the bare `freeze` word at the playhead (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -2955,4 +2956,42 @@ fn snd_pan(buf: &mut [i32], w: [i64; 2], ch: usize) {
     for (j, v) in buf.iter_mut().enumerate() {
         *v = ((*v as i64 * w[(j % ch).min(1)]) >> 16).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     }
+}
+
+// ---- STRIAKFREEZE (LEDGER SR9008): the Player plays a video hold — the held picture, the `e` key (named tail block) ----
+// SR880's freeze is a rated one-tick clip: its schedule steps repeat ONE source tick with no seek. [`edl_frame`] decodes the
+// next sample on every such step, so a hold would play on at 1x; the job instead keeps the decoded picture of each step
+// timeline_core's `held_ticks` names (the steps whose next step shows the same picture) and shows it again on the repeat
+// ([`edl_held`]), the run's read position untouched, so the next new source tick decodes the very next sample. A 1x EDL names
+// no step: byte-identical. `rated_unheld` narrows SR829's `rate-unsupported` to every rated clip but a video hold. `e` in
+// [`EDIT_KEYS`] names the bare `freeze` word (2 s at the playhead, `EditorState::verb`); [`edit_key`] saves and restarts
+// the job as for any edit. Wire: `[nle] hold src=<id> src_t=<tick> at=<out tick>`, once per hold the job decodes.
+
+/// The picture a hold repeats: the step's source and source tick, its size, its 0RGB and its utp1 ordinal.
+struct EdlHeld {
+    src: timeline_core::SourceId,
+    src_t: i64,
+    w: usize,
+    h: usize,
+    rgb: Vec<u32>,
+    ord: Option<u32>,
+}
+
+/// A hold's repeat: a step with no seek, the live run on `id`, and the held picture's `(src, src_t)` equal to the step's
+/// gives that picture again (no decode). `None`: the step decodes.
+fn edl_held(held: &Option<EdlHeld>, live: Option<timeline_core::SourceId>, s: &timeline_core::schedule::Step, id: timeline_core::SourceId) -> Option<(usize, usize, Px, Option<u32>)> {
+    let h = held.as_ref().filter(|h| s.seek.is_none() && live == Some(id) && h.src == id && h.src_t == s.src_t)?;
+    Some((h.w, h.h, Px::from(h.rgb.clone()), h.ord))
+}
+
+/// After a decode: when `holds` names the step's tick the picture is kept for the repeats (converted once) and the hold is
+/// named on the wire; any other decoded step drops the held picture. The frame comes back unchanged.
+fn edl_keep(held: &mut Option<EdlHeld>, holds: &[i64], s: &timeline_core::schedule::Step, id: timeline_core::SourceId, f: (usize, usize, Px, Option<u32>)) -> (usize, usize, Px, Option<u32>) {
+    if holds.binary_search(&s.out_t).is_err() {
+        *held = None;
+        return f;
+    }
+    serial_println!("[nle] hold src={} src_t={} at={}", id.0, s.src_t, s.out_t);
+    *held = Some(EdlHeld { src: id, src_t: s.src_t, w: f.0, h: f.1, rgb: f.2.rgb().to_vec(), ord: f.3 });
+    f
 }

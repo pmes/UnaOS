@@ -2575,7 +2575,7 @@ impl Timeline {
 // covered tick: the schedule names one source tick, `seek_for` sees the run continue, `Vid::show` holds the decoded frame.
 // The longest hold is 65536 ticks (rate 1). `freeze` lays it by `place` (`Mode::Insert`), which already splits the clip
 // under the playhead (`split_at`, `cut_clean`) and ripples the rest of that track; the EDL keeps it as the hold's `M2` line.
-// The kernel Player refuses a rated clip by name (`rate-unsupported`, SR829), so a frozen EDL is refused there, never shown wrong.
+// The kernel Player plays a video hold (STRIAKFREEZE SR9008: `Timeline::rated_unheld`, `held_ticks`) and refuses every other rated clip by name (`rate-unsupported`, SR829).
 
 /// STRIAFREEZEFRAME: the length of the `freeze` word's hold, seconds.
 pub const FREEZE_SECS: i64 = 2;
@@ -3830,5 +3830,91 @@ impl Timeline {
     pub fn track_removed_note(&self, track: usize) -> Option<String> {
         let (word, n) = (self.track_word(track)?, self.tracks.get(track)?.clips.len());
         Some(alloc::format!("track-: removed {word} ({n} clip{})", if n == 1 { "" } else { "s" }))
+    }
+}
+
+// ---- STRIAKFREEZE (LEDGER SR9008): the Player's hold — Clip::is_hold, Timeline::rated_unheld, held_ticks (named tail block) ----
+// The kernel Player decodes ONE sample per video step (no target pts), so a hold plays only when the steps that repeat a picture
+// are named: `held_ticks` reads them off the schedule's own steps (no seek, the same source, the same source tick; never at 1x).
+// `rated_unheld` is the Player's refusal: every rated clip but a hold (`is_hold`: a one-tick source span, a constant `src_at`
+// at any rate >= 1) on a Video track. The host face holds by pts in `Vid::show` and calls neither.
+impl Clip {
+    /// STRIAKFREEZE: a hold: a one-tick source span, so every covered tick shows the same source tick (`src_at` constant).
+    pub fn is_hold(&self) -> bool {
+        self.src_out - self.src_in == 1
+    }
+}
+
+impl Timeline {
+    /// STRIAKFREEZE: the first clip whose speed is not 1x and that is not a hold on a Video track (the kernel Player's
+    /// `rate-unsupported` refusal); `None`: every clip plays there.
+    pub fn rated_unheld(&self) -> Option<&Clip> {
+        self.tracks.iter().flat_map(|t| t.clips.iter().map(move |c| (t.kind, c))).find(|(k, c)| c.rate_q16 != 0x1_0000 && !(*k == Kind::Video && c.is_hold())).map(|(_, c)| c)
+    }
+}
+
+/// STRIAKFREEZE: the ascending `out_t` of each video step whose NEXT video step shows the same picture (no seek, the same
+/// `Some(src)`, the same `src_t`): the ticks whose decoded picture a one-sample-per-step player keeps for the repeat. Empty
+/// for every 1x timeline (consecutive 1x steps never repeat a source tick).
+pub fn held_ticks(steps: &[schedule::Step]) -> Vec<i64> {
+    let v: Vec<&schedule::Step> = steps.iter().filter(|s| s.kind == Kind::Video).collect();
+    v.windows(2).filter(|w| w[1].seek.is_none() && w[0].src.is_some() && w[1].src == w[0].src && w[1].src_t == w[0].src_t).map(|w| w[0].out_t).collect()
+}
+
+#[cfg(test)]
+mod striakfreeze_tests {
+    extern crate std;
+    use super::*;
+
+    /// Every source 1000 ticks long, a keyframe at 0.
+    struct All;
+    impl SourceIndex for All {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            Some(1000)
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, _: i64) -> Option<i64> {
+            Some(0)
+        }
+    }
+
+    /// V1: A[0,20)@0 and B[0,10)@30; A1: A[0,20)@0.
+    fn fixture() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 10, 30)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    #[test]
+    fn striakfreeze_rated_unheld() {
+        let tl = fixture();
+        assert_eq!(tl.rated_unheld(), None, "a 1x timeline plays");
+        let (fr, _) = tl.freeze(7, 50).unwrap();
+        assert!(fr.tracks[0].clips[1].is_hold());
+        assert_eq!(fr.rated_unheld(), None, "a video hold plays");
+        let mut slow = tl.clone();
+        slow.tracks[0].clips[0] = Clip::new(SourceId(0), 0, 10, 0).at_rate(0x8000);
+        assert_eq!(slow.rated_unheld().map(|c| c.rate_q16), Some(0x8000), "a 0.5x clip is refused");
+        let mut aud = tl.clone();
+        aud.tracks[1].clips = alloc::vec![Clip::new(SourceId(0), 7, 8, 0).at_rate(hold_rate(20))];
+        assert!(aud.tracks[1].clips[0].is_hold());
+        assert!(aud.rated_unheld().is_some(), "a rated audio clip is refused, even a one-tick span");
+    }
+
+    #[test]
+    fn striakfreeze_held_ticks() {
+        let tl = fixture();
+        let plain = crate::schedule::schedule(&tl, 0..tl.end(), &All).unwrap();
+        assert!(held_ticks(&plain).is_empty(), "no 1x step repeats a source tick");
+        let (fr, _) = tl.freeze(7, 50).unwrap();
+        let steps = crate::schedule::schedule(&fr, 0..fr.end(), &All).unwrap();
+        let held = held_ticks(&steps);
+        assert_eq!(held, (7..57).collect::<Vec<i64>>(), "the hold's 50 ticks: each next step (the tail's first included) shows source tick 7");
+        assert!(steps.iter().filter(|s| s.kind == Kind::Video && (7..=57).contains(&s.out_t)).all(|s| s.src_t == 7 && s.seek.is_none()));
+        std::println!("striakfreeze: freeze at 7 for 50 -> held ticks 7..57 ({})", held.len());
     }
 }
