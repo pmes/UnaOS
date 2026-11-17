@@ -73,7 +73,7 @@ fn file_intrinsic_width() {
     // The test font: a character is half the size wide. Chromium's floor, 34 x "0", beats
     // "Choose File" (button edges 16) + 4 + "No file chosen" at the UA size: 226.66 vs 186.66,
     // and the border box is whole pixels (Chromium's ceilf).
-    let floor = 34.0 * 13.333 * 0.5;
+    let floor = 34.0 * layout_core::CONTROL_FONT_PX * 0.5; // SR1023: the const, not a literal
     assert_eq!(b("f").2, f32::ceil(floor), "file border box is 34 digits wide: {}", b("f").2);
     assert_eq!(b("fm").2, b("f").2, "multiple keeps the floor while it dominates");
     assert_eq!(b("f2").2, f32::ceil(34.0 * 26.666 * 0.5), "the floor is in the element's font: {}", b("f2").2);
@@ -142,7 +142,7 @@ fn image_box_has_no_edges() {
     let tree = lay(&doc, 800.0, 600.0);
     let b = |id: &str| box_of(&tree, &doc.by_id(id));
     // The test font: a character is half the size wide, so "Search" is 6 x 13.333 x 0.5 = 40 px of content.
-    assert_eq!(b("ia").2, f32::round(6.0 * 13.333 * 0.5), "the image input is its content, no edges: {}", b("ia").2);
+    assert_eq!(b("ia").2, f32::round(6.0 * layout_core::CONTROL_FONT_PX * 0.5), "the image input is its content, no edges: {}", b("ia").2); // SR1023: the const
     assert_eq!((b("ia").2, b("ia").3), (b("sa").2 - 16.0, b("sa").3 - 6.0), "the submit's 16 x 6 UA edges are gone");
     assert_eq!((b("iu").2, b("iu").3), (b("ia").2, b("ia").3), "the type is trimmed and case-insensitive");
     assert_eq!((b("ix").2, b("ix").3), (b("sa").2, b("sa").3), "author padding and border still apply");

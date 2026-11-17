@@ -677,8 +677,8 @@ fn caption_side_order<H: Host>(tree: &mut LayoutTree<H>) {
     }
 }
 
-/// Chromium's control font: 13.333px (`font: -webkit-small-control`).
-pub const CONTROL_FONT_PX: f32 = 13.333;
+/// Chromium's control font: `font: -webkit-small-control` = 40/3 px (13.333333px; getComputedStyle reads 13.3333px). SR1023.
+pub const CONTROL_FONT_PX: f32 = 40.0 / 3.0;
 
 /// Single-line advance of `text` at `size` in the given family.
 fn text_advance<F: Fonts + ?Sized>(fonts: &F, text: &str, family: u16, size: f32) -> f32 {

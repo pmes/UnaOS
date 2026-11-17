@@ -1309,7 +1309,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         hidden: bool,
     }
     fn num(v: f32) -> String {
-        let r = (v as f64 * 10000.0).round() / 10000.0;
+        let a = (v as f64).abs(); let d = if a > 0.0 && a.is_finite() { (5 - a.log10().floor() as i32).clamp(0, 15) } else { 0 }; let k = 10f64.powi(d); let r = (v as f64 * k).round() / k; // SR1023: 6 significant digits (Blink's CSS number serialization)
         if r == r.trunc() { format!("{}", r as i64) } else { format!("{r}") }
     }
     let px = |v: f32| format!("{}px", num(v));
