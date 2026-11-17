@@ -1689,7 +1689,7 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     if rects.is_empty() {
         return Ok(Value::Undefined);
     }
-    let (x, y, w, h) = bounding(el);
+    let ((x, y, w, h), m, _) = into_view_box(el); let (x, y, w, h) = (x - m[3], y - m[0], w + m[1] + m[3], h + m[0] + m[2]); // AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): the FLOW rect (css-position-3 §3.4) outset by scroll-margin
     let sb = match behavior.as_str() {
         "smooth" => crate::layout::ScrollBehavior::Smooth,
         "instant" => crate::layout::ScrollBehavior::Instant,
@@ -1705,7 +1705,7 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
             let oy = computed_value(c, "overflow-y");
             let scrolls = |v: &str| matches!(v, "auto" | "scroll" | "hidden");
             if scrolls(&ox) || scrolls(&oy) {
-                let (cx, cy, _, _) = bounding(c);
+                let ((cx, cy, _, _), _, cp) = into_view_box(c); // AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): the panel's flow rect and its scroll-padding
                 let (bt, bl) = border_of(c);
                 let first = with_layout(|f| f.boxes.get(&NodeId(c)).and_then(|v| v.first().copied()));
                 if let Some((_, _, cw, ch)) = first {
@@ -1713,8 +1713,8 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
                     // The element's position in the container's scrolled content.
                     let ex = x - cx - bl as f64 + sx as f64;
                     let ey = y - cy - bt as f64 + sy as f64;
-                    let tx = align_axis(&inline, ex, w, sx as f64, (cw - 2.0 * bl) as f64);
-                    let ty = align_axis(&block, ey, h, sy as f64, (ch - 2.0 * bt) as f64);
+                    let tx = align_axis(&inline, ex, w, sx as f64 + cp[3], ((cw - 2.0 * bl) as f64 - cp[3] - cp[1]).max(0.0)) - cp[3];
+                    let ty = align_axis(&block, ey, h, sy as f64 + cp[0], ((ch - 2.0 * bt) as f64 - cp[0] - cp[2]).max(0.0)) - cp[0];
                     let nx = scrolls(&ox).then_some(tx.max(0.0) as f32);
                     let ny = scrolls(&oy).then_some(ty.max(0.0) as f32);
                     crate::layout::request_element_scroll(NodeId(c), nx, ny, sb);
@@ -1727,8 +1727,8 @@ fn scroll_into_view(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let (sx, sy) = page(|p| p.scroll);
     let (vw, vh) = page(|p| p.viewport);
     let (dw, dh) = document_extent();
-    let tx = align_axis(&inline, x + sx, w, sx, vw as f64).clamp(0.0, (dw - vw as f64).max(0.0));
-    let ty = align_axis(&block, y + sy, h, sy, vh as f64).clamp(0.0, (dh - vh as f64).max(0.0));
+    let vp = with_doc(|d| d.element_children(NodeId(dom::main_doc())).next().map(|r| r.0)).map_or([0.0; 4], |r| into_view_box(r).2); let tx = (align_axis(&inline, x + sx, w, sx + vp[3], (vw as f64 - vp[3] - vp[1]).max(0.0)) - vp[3]).clamp(0.0, (dw - vw as f64).max(0.0)); // AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): the root's scroll-padding is the viewport's
+    let ty = (align_axis(&block, y + sy, h, sy + vp[0], (vh as f64 - vp[0] - vp[2]).max(0.0)) - vp[0]).clamp(0.0, (dh - vh as f64).max(0.0));
     page(|p| p.scroll = (tx, ty));
     Ok(Value::Undefined)
 }
@@ -3468,4 +3468,23 @@ mod report_shorthand_computed_tests {
         let v = engine.js_engine.as_mut().unwrap().eval_string("getComputedStyle(document.getElementById('f')).margin").unwrap();
         assert_eq!(v, "16px");
     }
+}
+
+// ---- AETHERCSSOMSCROLLINTOVIEWSTICKY (LEDGER SR1169): scrollIntoView aligns the FLOW rect, with scroll-margin and scroll-padding (named tail block) ----
+
+/// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): element `el`'s bounding rect at its FLOW place (css-position-3 §3.4: an
+/// operation targeting the scroll position of a sticky box, or of one of its descendants, sees the box at its non-offset
+/// position; Blink's `AbsoluteBoundingBoxRectForScrollIntoView` maps with `kIgnoreStickyOffset`) — [`bounding`] minus
+/// SR1144's hold shift ([`sticky_held_at`] of the origin: one sticky root per element, so exact for every fragment; zero
+/// outside every sticky subtree) — and its `scroll-margin` and `scroll-padding` in px [top, right, bottom, left], the
+/// same `PaintStyle` fields `layout_core::scroll::snap_areas` reads (zero when unset). getBoundingClientRect stays held.
+fn into_view_box(el: usize) -> ((f64, f64, f64, f64), [f64; 4], [f64; 4]) {
+    let (x, y, w, h) = bounding(el);
+    let scroll = page(|p| p.scroll);
+    with_layout(|f| {
+        let (hx, hy) = sticky_held_at(f, NodeId(el), 0.0, 0.0, scroll);
+        let p = f.tree.node_map.iter().find(|(_, n)| n.id() == NodeId(el)).and_then(|(t, _)| f.tree.paint_map.get(t));
+        let px = |a: Option<[f32; 4]>| a.map_or([0.0; 4], |a| a.map(|v| v as f64));
+        ((x - hx as f64, y - hy as f64, w, h), px(p.and_then(|p| p.scroll_margin)), px(p.and_then(|p| p.scroll_padding)))
+    })
 }

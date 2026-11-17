@@ -12553,4 +12553,82 @@ b</div>
         assert_eq!(font_shorthand_cs(&mut e, "w", "width"), "200px");
         assert_eq!(font_shorthand_cs(&mut e, "td", "textDecoration"), "underline solid rgb(255, 0, 0)");
     }
+
+    // ---- AETHERCSSOMSCROLLINTOVIEWSTICKY (LEDGER SR1169): scrollIntoView aligns the FLOW rect, with scroll-margin and scroll-padding (named tail block) ----
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): 400x300, `root` the html element's declarations: `#h` sticky `top: 0` 50px
+    /// tall, a 1000px spacer, `#t` 100px tall at flow y 1050 (with `target` declarations), then a 2000px spacer.
+    fn scroll_into_view_sticky_engine(root: &str, target: &str) -> crate::AetherEngine {
+        let html = format!(
+            r#"<!doctype html><html><head><style>html {{ {root} }}</style></head><body style="margin:0">
+            <div id="h" style="position:sticky;top:0;height:50px"></div>
+            <div style="height:1000px"></div>
+            <div id="t" style="height:100px;{target}"></div>
+            <div style="height:2000px"></div>
+        </body></html>"#
+        );
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): runs `el.scrollIntoView(arg)` on `#id` and returns scrollY.
+    fn scroll_into_view_sticky_go(e: &mut crate::AetherEngine, id: &str, arg: &str) -> f64 {
+        js_num(e, &format!("document.getElementById('{id}').scrollIntoView({arg}); scrollY"))
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): css-position-3 §3.4 / Blink's `kIgnoreStickyOffset`: scrolled 400px, SR1144's
+    /// `#s` (flow y 100) is held at 10; `#s.scrollIntoView()` scrolls to its FLOW place 100 (armed: 410, the held place,
+    /// before SR1169); its descendant `#k` (flow 115, "or one of its descendants") scrolls to 115 (armed: 125).
+    #[test]
+    fn scroll_into_view_sticky_stuck_header_flow_place() {
+        let mut e = bounding_sticky_child_engine();
+        bounding_sticky_scroll(&mut e, 400.0);
+        assert_eq!(imgalt_rect(&mut e, "s").1, 10.0, "#s is stuck at top: 10px");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "s", ""), 100.0, "#s: its flow place (armed: 410 before SR1169)");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "k", ""), 115.0, "#k inside the stuck #s: its flow place (armed: 125 before SR1169)");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): unscrolled (not stuck) the flow and held places agree: `#s` scrolls to 100.
+    #[test]
+    fn scroll_into_view_sticky_unstuck_pin() {
+        let mut e = bounding_sticky_child_engine();
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "s", ""), 100.0, "#s unstuck: its flow place");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): `html { scroll-padding-top: 50px }` under a 50px sticky header: `#t` lands
+    /// at y 50, below the header (scrollY 1000; armed: 1050 and top 0 before SR1169); then the stuck header scrolls to its
+    /// flow place 0 less the padding, clamped at 0 (armed: 1000 before SR1169).
+    #[test]
+    fn scroll_into_view_sticky_padding_under_header() {
+        let mut e = scroll_into_view_sticky_engine("scroll-padding-top: 50px", "");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "t", ""), 1000.0, "#t: scrollY 1000 (armed: 1050 before SR1169)");
+        assert_eq!(imgalt_rect(&mut e, "t").1, 50.0, "#t's top sits below the 50px header (armed: 0 before SR1169)");
+        assert_eq!(imgalt_rect(&mut e, "h").1, 0.0, "#h is stuck at the top");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "h", ""), 0.0, "the stuck header: its flow place (armed: 1000 before SR1169)");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): `scroll-margin-top: 20px` on `#t` adds to the root's padding: scrollY 980,
+    /// `#t` top 70 (armed: 1050 / 0 before SR1169).
+    #[test]
+    fn scroll_into_view_sticky_margin_adds() {
+        let mut e = scroll_into_view_sticky_engine("scroll-padding-top: 50px", "scroll-margin-top: 20px");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "t", ""), 980.0, "#t: padding 50 + margin 20 (armed: 1050 before SR1169)");
+        assert_eq!(imgalt_rect(&mut e, "t").1, 70.0, "#t's top at 70");
+    }
+
+    /// AETHERCSSOMSCROLLINTOVIEWSTICKY (SR1169): without scroll-padding `{block: 'end'}` puts `#t`'s bottom (1150) at the
+    /// viewport's bottom (850) and `{block: 'center'}` its middle (1100) at the viewport's (950), unchanged; with a
+    /// scroll-padding-top (400px) larger than the 300px viewport the view length clamps at 0, never negative: center
+    /// lands at 1100 - 400 = 700 (750 with the unclamped -100px length).
+    #[test]
+    fn scroll_into_view_sticky_end_center_pin() {
+        let mut e = scroll_into_view_sticky_engine("", "");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "t", "{block: 'end'}"), 850.0, "block end unchanged");
+        assert_eq!(scroll_into_view_sticky_go(&mut e, "t", "{block: 'center'}"), 950.0, "block center unchanged");
+        let mut big = scroll_into_view_sticky_engine("scroll-padding-top: 400px", "");
+        assert_eq!(scroll_into_view_sticky_go(&mut big, "t", "{block: 'center'}"), 700.0, "an oversized padding clamps the view length at 0");
+    }
 }
