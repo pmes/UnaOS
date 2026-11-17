@@ -5785,4 +5785,282 @@ mod tests {
         }
     }
 
+    // ---- AETHERCSSWIDECOLOR (LEDGER SR823): an explicit color: inherit beats an earlier rule and the a tag's link blue (named tail block) ----
+
+    /// AETHERCSSWIDECOLOR (SR823): one row per probe at 20px serif, the rules in a sheet. Under a red parent: a plain
+    /// link (the UA link blue), `a.c { color: blue }` and its `a.c.x { color: inherit }` twin, `a.u { color: unset }`,
+    /// `a.l { color: inherit } a.l.k { color: rgb(0, 160, 0) }` and a same-block `color: inherit; color: rgb(0, 160, 0)`
+    /// link. Under a black-background yellow-text row (the dark theme): the reset sheet's `a.r { color: inherit }` and a
+    /// plain link. Rows 12px apart, so one probe's rect does not take a neighbour's ink.
+    fn css_wide_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            a.c { color: blue }
+            a.c.x { color: inherit }
+            a.r { color: inherit }
+            a.u { color: unset }
+            a.l { color: inherit }
+            a.l.k { color: rgb(0, 160, 0) }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><a id="aref" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ac" class="c" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ax" class="c x" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="au" class="u" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ak" class="l k" href="#">Hello</a></div>
+            <div style="color:rgb(255, 0, 0)"><a id="ai" href="#" style="color:inherit;color:rgb(0, 160, 0)">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="ar" class="r" href="#">Hello</a></div>
+            <div style="background:#000;color:rgb(255, 255, 0)"><a id="aref2" href="#">Hello</a></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the count of pixels in element `id`'s rect whose (r, g, b) passes `hue`.
+    fn css_wide_color_ink(e: &mut crate::AetherEngine, id: &str, hue: fn((u8, u8, u8)) -> bool) -> usize {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        let (sw, sh) = (e.width as usize, e.height as usize);
+        let (x0, x1) = (l.floor().max(0.0) as usize, ((l + w).ceil() as usize).min(sw));
+        let (y0, y1) = (t.floor().max(0.0) as usize, ((t + h).ceil() as usize + 1).min(sh));
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if hue(imgalt_px(e, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    fn css_wide_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 < 90 && c.2 < 90
+    }
+
+    fn css_wide_blue(c: (u8, u8, u8)) -> bool {
+        c.2 > 150 && c.0 < 90 && c.1 < 90
+    }
+
+    fn css_wide_green(c: (u8, u8, u8)) -> bool {
+        c.1 > 110 && c.0 < 90 && c.2 < 90
+    }
+
+    fn css_wide_yellow(c: (u8, u8, u8)) -> bool {
+        c.0 > 150 && c.1 > 150 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `a.c.x { color: inherit }` after `a.c { color: blue }` under a red parent paints red
+    /// (no blue ink); the `a.c` twin and the plain link paint blue (armed); cssom reads the parent's rgb(255, 0, 0).
+    #[test]
+    fn css_wide_color_cross_rule_red() {
+        let mut e = css_wide_color_engine();
+        for id in ["aref", "ac"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 3, "#{id} paints blue (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red (armed)");
+        }
+        assert!(css_wide_color_ink(&mut e, "ax", css_wide_red) > 3, "a.c.x takes the red parent past the earlier rule");
+        assert_eq!(css_wide_color_ink(&mut e, "ax", css_wide_blue), 0, "a.c.x paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "aref", "color"), "rgb(0, 0, 238)", "the plain link reads the UA link blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ax", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): the reset sheet's `a { color: inherit }` under a dark (black, yellow-text) row paints
+    /// the row's yellow, not the UA link blue; the plain link beside it stays blue (armed).
+    #[test]
+    fn css_wide_color_reset_link_dark() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "aref2", css_wide_blue) > 3, "the plain link on the dark row is blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "ar", css_wide_yellow) > 3, "the reset link paints the row's yellow");
+        assert_eq!(css_wide_color_ink(&mut e, "ar", css_wide_blue), 0, "the reset link paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "ar", "color"), "rgb(255, 255, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): `color: unset` is inherit for an inherited property (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_color_unset_is_inherit() {
+        let mut e = css_wide_color_engine();
+        assert!(css_wide_color_ink(&mut e, "au", css_wide_red) > 3, "a.u takes the red parent");
+        assert_eq!(css_wide_color_ink(&mut e, "au", css_wide_blue), 0, "a.u paints no blue");
+        assert_eq!(font_shorthand_cs(&mut e, "au", "color"), "rgb(255, 0, 0)");
+    }
+
+    /// AETHERCSSWIDECOLOR (SR823): a later `color: rgb(0, 160, 0)` beats an earlier inherit, across rules (`a.l.k`) and
+    /// in one block (the inline style): green, neither red nor blue.
+    #[test]
+    fn css_wide_color_later_value_wins() {
+        let mut e = css_wide_color_engine();
+        for id in ["ak", "ai"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_green) > 3, "#{id} paints the later green");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
+            assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
+    }
+
+    // ---- AETHERCSSWIDECOLORCONTROLS (LEDGER SR840): the form-control ink roads take color: inherit / unset (named tail block) ----
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): one control per row under a red parent: `.i { color: inherit }` on an input
+    /// value, a textarea, a select, a file input, a placeholder-only input and a `<button>`; `.u { color: unset }` on an
+    /// input; and the unstyled input / textarea / select / file twins (the UA black). Rows 12px apart.
+    fn css_wide_controls_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .i { color: inherit }
+            .u { color: unset }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><input id="inp" class="i" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><input id="inpu" class="u" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><textarea id="ta" class="i">Hello</textarea></div>
+            <div style="color:rgb(255, 0, 0)"><select id="sel" class="i"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="fi" class="i" type="file"></div>
+            <div style="color:rgb(255, 0, 0)"><input id="ph" class="i" placeholder="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><button id="btn" class="i">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><input id="inp0" value="Hello"></div>
+            <div style="color:rgb(255, 0, 0)"><textarea id="ta0">Hello</textarea></div>
+            <div style="color:rgb(255, 0, 0)"><select id="sel0"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="fi0" type="file"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 700));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    fn css_wide_controls_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 90 && c.1 < 90 && c.2 < 90
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `color: inherit` on an input value, a textarea, a select (label and arrow) and
+    /// a file input's caption / status paints the red parent; the input's cssom reads rgb(255, 0, 0).
+    #[test]
+    fn css_wide_controls_inherit_red() {
+        let mut e = css_wide_controls_engine();
+        for id in ["inp", "ta", "sel", "fi"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_red) > 3, "#{id} takes the red parent");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "inp", "color"), "rgb(255, 0, 0)", "cssom reads the parent's colour");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `color: unset` on a control is inherit (css-cascade-4 §7.3.3): red.
+    #[test]
+    fn css_wide_controls_unset_red() {
+        let mut e = css_wide_controls_engine();
+        assert!(css_wide_color_ink(&mut e, "inpu", css_wide_red) > 3, "the unset input takes the red parent");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): with no colour rule a control keeps the UA FieldText / ButtonText black under
+    /// the red parent (Chromium's light scheme): black ink, no red.
+    #[test]
+    fn css_wide_controls_unstyled_black() {
+        let mut e = css_wide_controls_engine();
+        for id in ["inp0", "ta0", "sel0", "fi0"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_controls_black) > 3, "#{id} paints black (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+        }
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): a placeholder stays the placeholder's grey under `color: inherit`: no red.
+    #[test]
+    fn css_wide_controls_placeholder_grey() {
+        let mut e = css_wide_controls_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "ph", css_wide_red), 0, "the placeholder paints no red");
+    }
+
+    /// AETHERCSSWIDECOLORCONTROLS (SR840): `<button class=i>`'s label (child text on `inherit_element`'s road) is red.
+    #[test]
+    fn css_wide_controls_button_inherit_red() {
+        let mut e = css_wide_controls_engine();
+        assert!(css_wide_color_ink(&mut e, "btn", css_wide_red) > 3, "the button label takes the red parent");
+    }
+
+    // ---- AETHERCSSCONTROLUACOLOR (LEDGER SR1001): an unset control paints the UA ButtonText / FieldText black, not the parent's colour (named tail block) ----
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): one control per row under a red parent, rows 12px apart: an unstyled `<button>`,
+    /// `button.i { color: inherit }`, `button.u { color: unset }`, an unstyled `<select>` and `<input type=submit>`, a
+    /// `<button>` inside `a.ai { color: inherit }`, and a `<button>` with an author green.
+    fn control_ua_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            button.i { color: inherit }
+            button.u { color: unset }
+            a.ai { color: inherit }
+            </style></head><body style="margin:0;font:20px serif">
+            <div style="color:rgb(255, 0, 0)"><button id="b0">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bi" class="i">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bu" class="u">Hello</button></div>
+            <div style="color:rgb(255, 0, 0)"><select id="s0"><option>Hello</option></select></div>
+            <div style="color:rgb(255, 0, 0)"><input id="sub0" type="submit" value="Go"></div>
+            <div style="color:rgb(255, 0, 0)"><a class="ai" href="#"><button id="ba">Hello</button></a></div>
+            <div style="color:rgb(255, 0, 0)"><button id="bg" style="color:rgb(0, 160, 0)">Hello</button></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<button>` under a red parent paints its label black (Chromium's
+    /// ButtonText), no red.
+    #[test]
+    fn control_ua_color_button_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "b0", css_wide_controls_black) > 3, "the unstyled button paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "b0", css_wide_red), 0, "the unstyled button paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: inherit }` opts back into the parent: red.
+    #[test]
+    fn control_ua_color_button_inherit_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bi", css_wide_red) > 3, "the inherit button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): `button { color: unset }` is inherit for an inherited property: red.
+    #[test]
+    fn control_ua_color_button_unset_red() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bu", css_wide_red) > 3, "the unset button takes the red parent");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an unstyled `<select>`'s label and `<input type=submit>`'s caption (SR840's
+    /// reads) stay black under the red parent: no red.
+    #[test]
+    fn control_ua_color_select_submit_black() {
+        let mut e = control_ua_color_engine();
+        for id in ["s0", "sub0"] {
+            assert!(css_wide_color_ink(&mut e, id, css_wide_controls_black) > 3, "#{id} paints black (armed)");
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id} paints no red");
+        }
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): getComputedStyle reads the UA black on the unstyled button and submit input
+    /// (Chromium: rgb(0, 0, 0)), and the parent's red on the inherit button.
+    #[test]
+    fn control_ua_color_cssom() {
+        let mut e = control_ua_color_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "b0", "color"), "rgb(0, 0, 0)", "the unstyled button reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "sub0", "color"), "rgb(0, 0, 0)", "the unstyled submit input reads black");
+        assert_eq!(font_shorthand_cs(&mut e, "bi", "color"), "rgb(255, 0, 0)", "the inherit button reads the parent's red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): a `<button>` inside `a { color: inherit }` under red: the link takes red, the
+    /// button's own UA default beats it: black, no red.
+    #[test]
+    fn control_ua_color_in_inherit_link_black() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "ba", css_wide_controls_black) > 3, "the button in the link paints black (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "ba", css_wide_red), 0, "the button in the link paints no red");
+    }
+
+    /// AETHERCSSCONTROLUACOLOR (SR1001): an author colour on the control wins as before: green, no red.
+    #[test]
+    fn control_ua_color_author_wins() {
+        let mut e = control_ua_color_engine();
+        assert!(css_wide_color_ink(&mut e, "bg", css_wide_green) > 3, "the author green wins");
+        assert_eq!(css_wide_color_ink(&mut e, "bg", css_wide_red), 0, "the author-green button paints no red");
+    }
 }
