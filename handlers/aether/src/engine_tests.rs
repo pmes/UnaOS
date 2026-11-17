@@ -6570,4 +6570,84 @@ mod tests {
         let (_, rb, ..) = imgalt_rect(&mut e, "tpr");
         assert!(((b - s) - (rb - rs) - 30.0).abs() <= 1.0, "top: initial drops the 30px offset: {} vs {}", b - s, rb - rs);
     }
+
+    // ---- AETHERCSSBORDERSIDECOLOR (LEDGER SR1014): the border-*-color longhands paint one side (named tail block) ----
+
+    /// AETHERCSSBORDERSIDECOLOR (SR1014): one 40x20 box per row, rows 12px apart, under a green parent: `#sl` `border: 2px
+    /// solid blue; border-left-color: red`; `#st` / `#sr` / `#sb` the same with the top / right / bottom longhand; `#sc`
+    /// `border-left-color: currentcolor` on a blue border; `#sn` `border-top-color: red` alone (no border); `#si` the sheet's
+    /// `.i { border: 2px solid blue; border-left-color: red } .i.j { border-left-color: initial }`.
+    fn border_side_color_engine() -> crate::AetherEngine {
+        let html = r##"<!doctype html><html><head><style>
+            div { margin: 0 0 12px }
+            .i { border: 2px solid blue; border-left-color: red }
+            .i.j { border-left-color: initial }
+            </style></head><body style="margin:0;font:20px serif;color:rgb(0, 160, 0)">
+            <div id="sl" style="width:40px;height:20px;border:2px solid blue;border-left-color:red"></div>
+            <div id="st" style="width:40px;height:20px;border:2px solid blue;border-top-color:red"></div>
+            <div id="sr" style="width:40px;height:20px;border:2px solid blue;border-right-color:red"></div>
+            <div id="sb" style="width:40px;height:20px;border:2px solid blue;border-bottom-color:red"></div>
+            <div id="sc" style="width:40px;height:20px;border:2px solid blue;border-left-color:currentcolor"></div>
+            <div id="sn" style="width:40px;height:20px;border-top-color:red"></div>
+            <div id="si" class="i j" style="width:40px;height:20px"></div>
+        </body></html>"##;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBORDERSIDECOLOR (SR1014): the four edge midpoints of `id`'s border box, 1px inside: [top, right, bottom, left].
+    fn border_side_color_edges(e: &mut crate::AetherEngine, id: &str) -> [(u8, u8, u8); 4] {
+        let (l, t, w, h) = imgalt_rect(e, id);
+        [
+            imgalt_px(e, (l + w / 2.0) as usize, (t + 1.0) as usize),
+            imgalt_px(e, (l + w - 1.0) as usize, (t + h / 2.0) as usize),
+            imgalt_px(e, (l + w / 2.0) as usize, (t + h - 1.0) as usize),
+            imgalt_px(e, (l + 1.0) as usize, (t + h / 2.0) as usize),
+        ]
+    }
+
+    /// AETHERCSSBORDERSIDECOLOR (SR1014): each longhand paints its own side red, the other three stay blue; cssom
+    /// borderLeftColor reads rgb(255, 0, 0) for `#sl` and the blue for the others.
+    #[test]
+    fn border_side_color_paints_one_side() {
+        let mut e = border_side_color_engine();
+        for (id, side) in [("st", 0), ("sr", 1), ("sb", 2), ("sl", 3)] {
+            let edges = border_side_color_edges(&mut e, id);
+            for (i, c) in edges.iter().enumerate() {
+                if i == side {
+                    assert!(css_wide_red(*c), "#{id}: side {i} is red: {c:?}");
+                } else {
+                    assert!(css_wide_blue(*c), "#{id}: side {i} stays blue: {c:?}");
+                }
+            }
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "sl", "borderLeftColor"), "rgb(255, 0, 0)", "#sl: cssom");
+        assert_eq!(font_shorthand_cs(&mut e, "st", "borderLeftColor"), "rgb(0, 0, 255)", "#st: the left stays blue");
+    }
+
+    /// AETHERCSSBORDERSIDECOLOR (SR1014): `border-left-color: currentcolor` paints the element's green ink (SR849's bit);
+    /// `initial` after red is the initial currentcolor (SR832's table): green, no red.
+    #[test]
+    fn border_side_color_currentcolor_and_initial() {
+        let mut e = border_side_color_engine();
+        for id in ["sc", "si"] {
+            let edges = border_side_color_edges(&mut e, id);
+            assert!(css_wide_green(edges[3]), "#{id}: the left edge is the green ink: {:?}", edges[3]);
+            assert!(css_wide_blue(edges[0]), "#{id}: the top stays blue: {:?}", edges[0]);
+            assert_eq!(css_wide_color_ink(&mut e, id, css_wide_red), 0, "#{id}: no red");
+            assert_eq!(font_shorthand_cs(&mut e, id, "borderLeftColor"), "rgb(0, 160, 0)", "#{id}: cssom");
+        }
+    }
+
+    /// AETHERCSSBORDERSIDECOLOR (SR1014): `border-top-color: red` on a borderless box paints no ink (its style is none,
+    /// as Chromium); armed: `#st` paints red.
+    #[test]
+    fn border_side_color_alone_paints_nothing() {
+        let mut e = border_side_color_engine();
+        assert_eq!(css_wide_color_ink(&mut e, "sn", css_wide_red), 0, "#sn paints no red");
+        assert!(css_wide_color_ink(&mut e, "st", css_wide_red) > 40, "armed: #st paints a red top");
+    }
 }
