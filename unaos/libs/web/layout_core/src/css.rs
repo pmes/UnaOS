@@ -76,7 +76,7 @@ pub struct SpecifiedStyle<H: Host> {
     pub inset_bottom: Option<LengthPercentageAuto>,
     pub justify: Option<taffy::style::JustifyContent>,
     pub align_items: Option<taffy::style::AlignItems>, pub align_content: Option<taffy::style::AlignContent>, // AETHERCSSALIGNCONTENTFIELD (SR1016): align-content's own field, folded by fold_into on a flex container
-    pub align_self: Option<taffy::style::AlignSelf>,
+    pub align_self: Option<taffy::style::AlignSelf>, pub align_self_auto: bool, pub justify_items: Option<taffy::style::AlignItems>, pub justify_self: Option<taffy::style::AlignSelf>, pub justify_self_auto: bool, // AETHERCSSALIGNSELFARM (SR1068): an explicit align-self auto (taffy None), carried over an earlier rule by merge_specified
     pub box_sizing: Option<taffy::style::BoxSizing>,
     /// `display: flex` (Some(true)) versus any other display (Some(false)).
     /// Aether lays every block out as a column flex box, so a real flex
@@ -371,7 +371,7 @@ impl<H: Host> SpecifiedStyle<H> {
         }
         if let Some(a) = self.align_self {
             node_style.align_self = Some(a);
-        }
+        } if let Some(j) = self.justify_items { node_style.justify_items = j; } if let Some(j) = self.justify_self { node_style.justify_self = Some(j); }
         if let Some(sides) = self.paint.border {
             let w = |i: usize| LengthPercentage::length(sides[i].map(|(w, _)| w).unwrap_or(0.0));
             node_style.border = Rect { top: w(0), right: w(1), bottom: w(2), left: w(3) };
@@ -1215,7 +1215,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             "inherit" | "initial" | "unset" | "revert" | "match-parent" | "-webkit-match-parent" => {}
             other => H::record_css(&format!("text-align:{}", other)),
         },
-        "justify-content" => match value {
+        "justify-content" => match align_word::<H>(value) {
             "center" => style.justify = Some(taffy::style::JustifyContent::CENTER),
             "flex-end" | "end" => style.justify = Some(taffy::style::JustifyContent::END),
             "flex-start" | "start" | "normal" => style.justify = Some(taffy::style::JustifyContent::START),
@@ -1432,15 +1432,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-content" => apply_align_content(value, style), "align-items" => match value {
-            "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
-            "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
-            "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
-            "baseline" => style.align_items = Some(taffy::style::AlignItems::BASELINE),
-            "stretch" | "normal" => style.align_items = Some(taffy::style::AlignItems::STRETCH),
-            "inherit" | "initial" | "unset" => {}
-            other => H::record_css(&format!("align-items-value:{}", other)),
-        },
+        "place-content" => apply_place::<H>("align-content", "justify-content", value, style, cx), "place-items" => apply_place::<H>("align-items", "justify-items", value, style, cx), "place-self" => apply_place::<H>("align-self", "justify-self", value, style, cx), "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => if let Some(Some(a)) = self_alignment::<H>("align-items", align_word::<H>(value), false) { style.align_items = Some(a); }, "justify-items" => if let Some(Some(a)) = self_alignment::<H>("justify-items", align_word::<H>(value), false) { style.justify_items = Some(a); }, "justify-self" => apply_justify_self::<H>(align_word::<H>(value), style),
         "font-size" => match parse_font_size(value, cx) {
             Some(px) => {
                 style.paint.font_size = Some(px);
@@ -2698,12 +2690,12 @@ pub fn merge_specified<H: Host>(dst: &mut SpecifiedStyle<H>, src: &SpecifiedStyl
     macro_rules! take {
         ($($f:ident),*) => { $( if src.$f.is_some() { dst.$f = src.$f; } )* };
     }
-    erase_reverted(dst, src.revert_spec); dst.revert_spec |= src.revert_spec; for i in 0..4 { // AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later revert erases the earlier rule's field before the Some-copy
+    erase_reverted(dst, src.revert_spec); dst.revert_spec |= src.revert_spec; if src.align_self_auto { dst.align_self = None; dst.align_self_auto = true; } if src.justify_self_auto { dst.justify_self = None; dst.justify_self_auto = true; } for i in 0..4 { // AETHERCSSWIDEREVERTNONINHERITED (SR1037): a later revert erases the earlier rule's field before the Some-copy
         if src.padding[i].is_some() { dst.padding[i] = src.padding[i]; }
         if src.margin[i].is_some() { dst.margin[i] = src.margin[i]; }
     }
     take!(display, flex_direction, width, height, position,
-          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_content, align_self,
+          inset_top, inset_left, inset_right, inset_bottom, justify, align_items, align_content, align_self, justify_items, justify_self,
           max_width, max_height, min_width, min_height, box_sizing,
           flex_container, flex_wrap, row_gap, column_gap, flex_grow, flex_shrink, flex_basis, aspect_ratio);
     merge_paint(&mut dst.paint, &src.paint); dst.merge_inherit_box(src);
@@ -3673,7 +3665,7 @@ fn noninherited_initial<'a>(prop: &str, value: &'a str) -> &'a str {
         "flex-flow" => "row nowrap",
         "flex-basis" => "auto",
         "flex" => "0 1 auto",
-        "align-items" | "justify-content" | "align-content" => "normal",
+        "align-items" | "justify-content" | "align-content" | "justify-items" => "normal", "align-self" | "justify-self" => "auto",
         "gap" | "grid-gap" | "row-gap" | "grid-row-gap" => "0px", "column-gap" | "grid-column-gap" => "normal",
         "background-repeat" => "repeat",
         "background-position" => "0% 0%",
@@ -4075,7 +4067,7 @@ pub const ALL_LONGHANDS: &[&str] = &[
     "writing-mode", "text-combine-upright", "text-orientation",
     "column-count", "column-width", "column-fill", "column-rule-width", "column-rule-style", "column-rule-color", "column-span", "box-decoration-break",
     "filter", "backdrop-filter", "break-before", "break-after", "break-inside",
-    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content",
+    "vertical-align", "clear", "float", "text-indent", "text-align", "justify-content", "align-items", "align-content", "align-self", "justify-items", "justify-self",
     "background-color", "background-image", "background-size", "background-position", "background-repeat", "box-shadow",
     "color", "font-family", "font-stretch", "font-synthesis-weight", "font-synthesis-style", "font-synthesis-small-caps", "font-variant-caps", "font-size", "font-weight", "font-style", "line-height",
     "word-spacing", "letter-spacing", "text-shadow", "visibility", "opacity",
@@ -4099,7 +4091,7 @@ pub const ALL_SKIPPED: &[&str] = &[
     // css-cascade-4 §3.1: `all` leaves `direction` and `unicode-bidi` (its arm is SR1008's; the SR1021 fold added the name); `all` is this arm.
     "direction", "unicode-bidi", "all",
     // SHORTHANDS: reset through their longhands, which are listed (the `border-width` shorthand under initial / unset would write 3px into every side of `paint.border` and re-create the sides `border-*-style: none` cleared).
-    "list-style", "text-wrap", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
+    "list-style", "text-wrap", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline", "place-content", "place-items", "place-self",
     // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
     "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
     // ALIAS spellings of a listed name (the same field, the same value grammar).
@@ -4223,6 +4215,66 @@ pub fn erase_reverted<H: Host>(s: &mut SpecifiedStyle<H>, bits: u32) {
 /// UI font (13.333px, normal weight and style); [`apply_font_wide`] gives them the `initial` road, then the control
 /// family (`Host::control_family`, the UA control font) at [`crate::CONTROL_FONT_PX`] through the `font-size` arm.
 const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
+
+// ---- AETHERCSSALIGNCONTENTSAFE (LEDGER SR1064): safe / unsafe / first|last baseline on the alignment arms (named tail block) ----
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): css-align-3 §4.4 / §6 — `<overflow-position>? <content-position>` and
+/// `[ first | last ]? baseline`. Answers (the bare position word, safe, baseline: 0 none / 1 first / 2 last). One token
+/// passes through unchanged (bare `safe` reaches the arm and is refused as before); `first|last baseline` is
+/// `baseline`; `safe|unsafe` before a content-position word strips to that word; anything else (`safe safe center`,
+/// `baseline first`, `safe baseline`, `safe space-between`, three tokens) is None.
+pub fn alignment_words(value: &str) -> Option<(&str, bool, u8)> {
+    let mut it = value.split_ascii_whitespace();
+    let (a, b) = (it.next()?, it.next());
+    if it.next().is_some() {
+        return None;
+    }
+    let Some(b) = b else { return Some((a, false, 0)) };
+    match (a, b) {
+        ("first", "baseline") => Some(("baseline", false, 1)),
+        ("last", "baseline") => Some(("baseline", false, 2)),
+        ("safe" | "unsafe", "center" | "start" | "end" | "flex-start" | "flex-end" | "self-start" | "self-end" | "left" | "right") => {
+            Some((b, a == "safe", 0))
+        }
+        _ => None,
+    }
+}
+
+/// AETHERCSSALIGNCONTENTSAFE (SR1064): the word the justify-content / align-content / align-items arms match. `safe`
+/// is recorded (`align-overflow:safe`: taffy has no overflow-position, the start fallback on overflow is owed) and
+/// otherwise ignored; `unsafe` is a no-op; `last baseline` is first-baseline + recorded (`align-baseline:last`). An
+/// invalid form comes back whole, so the arm's own refusal records the full text.
+fn align_word<H: Host>(value: &str) -> &str {
+    match alignment_words(value) {
+        Some((w, safe, base)) => {
+            if safe {
+                H::record_css("align-overflow:safe");
+            }
+            if base == 2 {
+                H::record_css("align-baseline:last");
+            }
+            w
+        }
+        None => value,
+    }
+}
+
+// ---- AETHERCSSALIGNSELFARM (LEDGER SR1068): css-align-3 §6.2 align-self through align_word (named tail block) ----
+
+/// AETHERCSSALIGNSELFARM (SR1068): css-align-3 §6.2 `align-self: auto | normal | stretch | <baseline-position> |
+/// <overflow-position>? <self-position>` on a flex item, the align-items keyword map over the word [`align_word`] gives
+/// (safe / unsafe / first|last baseline as there). `auto` (and `initial` / `unset` through [`noninherited_initial`]) is
+/// taffy's None, marked `align_self_auto` so [`merge_specified`] carries it over an earlier rule's value; `inherit` is
+/// dropped (as align-items); anything else is refused and recorded (`align-self-value:`). A floated box keeps the
+/// float arm's START / END (Aether's float approximation; Chromium ignores align-self on a float in block flow).
+fn apply_align_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
+    let Some(v) = self_alignment::<H>("align-self", word, true) else { return }; // SR1088: the one keyword map
+    if matches!(style.paint.float, Some(1 | 2)) {
+        return;
+    }
+    style.align_self = v;
+    style.align_self_auto = v.is_none();
+}
 
 // ---- AETHERCOLORSCHEMESYSTEMCOLORS (LEDGER SR1046): the system colour keyword slots written at parse (named tail block) ----
 
@@ -4355,6 +4407,60 @@ fn underline_offset_value(v: &str, cx: &ParseCx) -> Option<Option<f32>> {
         return None;
     }
     parse_px(v, cx).filter(|px| px.is_finite()).map(Some)
+}
+
+// ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-*: <align> <justify>?`, one or two [`alignment_words`] values (a
+/// `safe center` / `first baseline` pair is ONE), the second defaulting to the first, each applied through its
+/// longhand's arm (as `flex-flow` recurses); the justify half through justify-content / justify-items / justify-self
+/// (AETHERCSSJUSTIFYITEMSSELF SR1088: before, the items / self half was recorded `place-justify-dropped:`); a value
+/// with no two valid halves is refused whole (`place-value:`) and nothing is written.
+fn apply_place<H: Host>(align: &str, justify: &str, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    let t: Vec<&str> = value.split_ascii_whitespace().collect();
+    let halves = (0..=2usize).find_map(|k| {
+        let (a, b) = if k == 0 { (t.join(" "), t.join(" ")) } else if k < t.len() { (t[..k].join(" "), t[k..].join(" ")) } else { return None };
+        (alignment_words(&a).is_some() && alignment_words(&b).is_some()).then_some((a, b))
+    });
+    let Some((a, b)) = halves else { return H::record_css(&format!("place-value:{}", clip(value))) };
+    apply_declaration(align, &a, style, cx);
+    apply_declaration(justify, &b, style, cx);
+}
+
+// ---- AETHERCSSJUSTIFYITEMSSELF (LEDGER SR1088): css-align-3 §6.2 / §6.3 justify-items / justify-self and the one self/items keyword map (named tail block) ----
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): THE keyword map of `align-items`, `align-self`, `justify-items` and
+/// `justify-self` over the word [`align_word`] gives (taffy's `AlignSelf` / `JustifyItems` / `JustifySelf` are all
+/// `AlignItems`). `Some(Some(v))` writes v; `auto` (only when `auto`: the *-self twins) is `Some(None)`, taffy's None;
+/// `inherit` (and, for the *-items twins, `initial` / `unset`) is dropped silently; anything else is refused and
+/// recorded `<prop>-value:<word>`. Byte-identical to the align-items arm's inline match and SR1068's map it replaces.
+fn self_alignment<H: Host>(prop: &str, word: &str, auto: bool) -> Option<Option<taffy::style::AlignItems>> {
+    use taffy::style::AlignItems as A;
+    match word {
+        "auto" if auto => Some(None),
+        "center" => Some(Some(A::CENTER)),
+        "flex-end" | "end" => Some(Some(A::END)),
+        "flex-start" | "start" => Some(Some(A::START)),
+        "baseline" => Some(Some(A::BASELINE)),
+        "stretch" | "normal" => Some(Some(A::STRETCH)),
+        "inherit" => None,
+        "initial" | "unset" if !auto => None,
+        other => {
+            H::record_css(&format!("{}-value:{}", prop, other));
+            None
+        }
+    }
+}
+
+/// AETHERCSSJUSTIFYITEMSSELF (SR1088): css-align-3 §6.2 `justify-self` into its own field, SR1068's shape: `auto` (and
+/// `initial` / `unset` through [`noninherited_initial`]) is taffy's None marked `justify_self_auto`, so
+/// [`merge_specified`] carries it over an earlier rule. No float guard (the float approximation writes align-self only).
+/// taffy's flexbox ignores it (correct: css-align-3 §6.1); its out-of-flow pass aligns an abspos box by it.
+fn apply_justify_self<H: Host>(word: &str, style: &mut SpecifiedStyle<H>) {
+    if let Some(v) = self_alignment::<H>("justify-self", word, true) {
+        style.justify_self = v;
+        style.justify_self_auto = v.is_none();
+    }
 }
 
 // ---- AETHERCSSOMWHITESPACELONGHANDSWRITE (LEDGER SR1044): white-space-collapse / text-wrap-mode / text-wrap write the one white-space code (named tail block) ----
