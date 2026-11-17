@@ -50,7 +50,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 28. STRIAPROXYMEDIA — a `proxy` verb renders a quarter-size H.264 of a source once; the face previews from it; export uses the original.
 
 ## D. Document, project, face
-29. STRIAAUTOSAVE — write `<doc>.autosave.edl` every N edits or 60 s off the face's thread; reopen offers it on the message row.
+29. [SR883 started] STRIAAUTOSAVE — write `<doc>.autosave.edl` every N edits or 60 s off the face's thread; reopen offers it on the message row.
 30. STRIARECENTFILES — `~/.config/stria/recent` (5 entries), `open-recent <n>`; stria-view lists them.
 31. STRIAPROJECTBIN — a source bin pane listing the Sources (reel, duration, type) with drag-to-timeline (SR339's split surfaces as the precedent).
 32. STRIAKEYBOARDMAP — `~/.config/stria/keys` remapping the KEYS table (SR744; the owed NLE5D-KEYS-CONFIG in the row: build it).
