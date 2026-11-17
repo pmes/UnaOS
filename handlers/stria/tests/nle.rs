@@ -14135,3 +14135,32 @@ fn striatitlestyleface_verbs_before_help() {
     assert_eq!(&VERBS[n - 5..n - 1], &timeline_core::editor::TITLE_STEP_WORDS[..]);
     println!("striatitlestyleface: VERBS[{}..{}] = {:?}", n - 5, n - 1, &VERBS[n - 5..n - 1]);
 }
+// ---- STRIAXFORMHANDLES (LEDGER SR9068): the placed clip's corner handles on the face (named tail block) ----
+
+/// A placed clip selected at the playhead carries HANDLE squares on its rect's corners in the face's paint; deselected,
+/// or unplaced, the same pixel carries none; painting pushes no undo step and leaves the timeline as it was.
+#[test]
+fn striaxformhandles_face_paints_handles() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, Role, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(12);
+    assert!(face.verb("pip"));
+    let _ = face.frame();
+    let l = face.layout_for(Role::Whole).with_message(false);
+    let (sw, sh) = face.still().map(|s| (s.width, s.height)).expect("a preview still");
+    let rest = timeline_core::view::XformDrag::rest(&face.state, l, sw, sh).expect("a placed clip selected at the playhead");
+    let (x0, y0, _, _) = rest.rect();
+    let o = (y0 as usize * l.w as usize + x0 as usize) * 4;
+    let (tl, depth) = (face.state.timeline.clone(), face.state.undo_depth());
+    let px = face.paint_role(Role::Whole);
+    assert_eq!(&px[o..o + 4], &timeline_core::view::HANDLE, "the top-left handle");
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, depth), "paint edits nothing");
+    let sel = face.state.selection.take();
+    assert!(timeline_core::view::XformDrag::rest(&face.state, l, sw, sh).is_none());
+    assert_ne!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::HANDLE, "nothing selected: no handle");
+    face.state.selection = sel;
+    assert!(face.verb("pip off"));
+    assert_ne!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::HANDLE, "unplaced: no handle");
+}

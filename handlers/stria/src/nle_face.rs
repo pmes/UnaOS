@@ -1647,7 +1647,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
-        let px = self.paint_message(view::paint_xform_drag(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail)
+        let px = self.paint_message(view::paint_xform_handles(view::paint_xform_drag(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, vo(self.order), self.xform_handles(st, l, role).as_ref()), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAXFORMHANDLES (SR9068): the placed clip's corner handles (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail)
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
@@ -3469,7 +3469,7 @@ impl Face {
     pub fn thumb_decodes(&self) -> u32 {
         self.peaks.thumbs.decodes
     }
-    /// STRIATHUMBNAILS (SR839): the head still of `(src, src_in)`, once a paint has decoded it.
+    /// STRIATHUMBNAILS (SR839): the head still of `(src, src_in)`, once a paint has decoded itmods, .
     pub fn thumb(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
         self.peaks.thumbs.get(src, src_in)
     }
@@ -3486,7 +3486,7 @@ mod thumb_tests {
     #[test]
     fn thumb_cache_drops_the_oldest() {
         let mut t = Thumbs::default();
-        let s = Still { width: 1, height: 1, rgba: vec![1, 2, 3, 255] };
+        let s = Still { width: 1, height: 1, rgba: vec![1, 2, 3, 255] }; // STRIAXFORMHANDLES (SR9068): mods carries the no-snap modifier
         for i in 0..=THUMB_CACHE as i64 {
             t.insert((timeline_core::SourceId(0), i), Some(s.clone()));
         }
@@ -9988,7 +9988,7 @@ impl Face {
             self.still = preview(&self.state.timeline, &self.sources, self.state.playhead).ok().flatten();
         }
         let (sw, sh) = self.still.as_ref().map(|s| (s.width, s.height))?;
-        self.xform_drag = Some(view::XformDrag::begin(&self.state, l, sw, sh, x, y)?);
+        self.xform_drag = Some(view::XformDrag::begin_nosnap(&self.state, l, sw, sh, x, y, mods & bandy::MOD_ALT != 0)?); // STRIAXFORMHANDLES (SR9068): Alt at the press snaps nothing, the body press's rule (`press`)
         self.xform_note = None;
         self.buttons = true;
         if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
@@ -10595,5 +10595,26 @@ impl Face {
         if input {
             self.note = None;
         }
+    }
+}
+
+// ---- STRIAXFORMHANDLES (LEDGER SR9068): the placed clip's corner handles on the preview picture (named tail block) ----
+// NLE-XFORM-DRAG-HANDLES on the face: `paint_role`'s paint line hands [`Face::xform_handles`] to timeline_core's
+// `view::paint_xform_handles`: the live placement drag (its dragged rect), else `view::XformDrag::rest` over the painted
+// state, the layout the press reads and the preview still's size; nothing on the tracks Surface or under the help. A
+// rest rect exists only for a placed, selected video clip shown at the playhead, so every other paint is byte-identical.
+// NLE-XFORM-DRAG-SNAP's off switch: `xform_drag_on`'s press reads Alt (`bandy::MOD_ALT`) as the body press does.
+
+impl Face {
+    /// STRIAXFORMHANDLES (SR9068): the rect whose corners carry handles on `role`'s paint of `st` over layout `l`.
+    fn xform_handles(&self, st: &EditorState, l: Layout, role: Role) -> Option<view::XformDrag> {
+        if role == Role::Tracks || self.help {
+            return None;
+        }
+        if let Some(d) = self.xform_drag {
+            return Some(d);
+        }
+        let s = self.still.as_ref()?;
+        view::XformDrag::rest(st, l, s.width, s.height)
     }
 }
