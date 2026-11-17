@@ -506,22 +506,7 @@ fn root_inherited() -> Inherited {
 /// The Advancer a form control's value is painted with: the inherited font state along the box
 /// tree's path from the root to `id` (the engine hit-tests a click into a field's text on it).
 pub fn control_advancer(layout: &LayoutTree, id: NodeId) -> Option<Advancer> {
-    let mut path = vec![id];
-    let mut n = layout.taffy.parent(id);
-    while let Some(p) = n {
-        path.push(p);
-        n = layout.taffy.parent(p);
-    }
-    let mut inh = root_inherited();
-    for p in path.into_iter().rev() {
-        if let Some(dn) = layout.node_map.get(&p) {
-            if let Some(el) = dn.as_element() {
-                let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
-                inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
-            }
-        }
-    }
-    Some(inh.advancer())
+    Some(inherited_at(layout, id).advancer()) // AETHEROUTLINECURRENTCOLORUA (SR1131): the walk is `inherited_at` (file tail)
 }
 
 /// The focused text control's editing state, as the engine hands it to paint (AETHERINPUT, SR68): the
@@ -1068,10 +1053,10 @@ fn inherit_element(inherited: &mut Inherited, tag: &str, spec: &crate::layout::P
     if spec.text_hidden == Some(true) {
         inherited.text_hidden = true;
     }
-    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |_| if tag == "a" {
-        (0, 0, 238) // UA default link blue
-    } else if control_tag(tag) { layout_core::ua_colours(inherited.scheme).ink } else if tag == "html" { layout_core::ua_colours(inherited.scheme).canvastext } else { // AETHERCSSCONTROLUACOLOR (SR1001): the UA ButtonText / FieldText black, not the parent's
-        inherited.color
+    inherited.scheme = spec.color_scheme.or(inherited.scheme); inherited.color = spec.color.unwrap_or_else(|| layout_core::paint::or_tag(Some(spec), layout_core::paint::INHERIT_COLOR, inherited.color, |c| {
+        ua_color(tag, c, inherited.scheme)
+        // AETHEROUTLINECURRENTCOLORUA (SR1131): the a / control (SR1001 ButtonText) / html UA table is `ua_color` (file tail),
+        // read by computed_report too
     })); deco_ink(inherited, tag, spec); // AETHERCSSTEXTDECORATIONPROPAGATEINK (SR1053): after the colour write, so currentcolor is this element's ink
 }
 
@@ -3231,9 +3216,9 @@ fn frame_walk(
 
                 // A focused text field shows Chromium's focus ring (`:focus-visible` always matches a
                 // text field): 2px #101010 over the border box's outer edge.
-                let focused_field = is_control && focus_of(dom_node).is_some();
+                let focused_field = is_control && focus_of(dom_node).is_some(); let mut border_a = border.as_mut().map_or(1.0, |b| layout_core::css::border_visible(&spec, b)); // SR1112: alpha-0 sides dropped, the stroke alpha of the rest
                 if focused_field {
-                    border = Some([Some((2.0, (16, 16, 16))); 4]);
+                    border = Some([Some((2.0, (16, 16, 16))); 4]); border_a = 1.0;
                 }
                 // Chromium's control frame (fields, selects, textareas) is a rounded rect whose four
                 // corner pixels stay unpainted: keep what is under them.
@@ -3260,7 +3245,7 @@ fn frame_walk(
                         for i in 0..4 {
                             bs[i] = sides[i].filter(|(w, _)| *w > 0.0).map(|(w, c)| (w, c, styles[i]));
                         }
-                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let bda = border_a;
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             let a = a * bda;
                             if !in_damage(x, y, damage_rects) || !in_clip(x, y, clip) {
@@ -3289,7 +3274,7 @@ fn frame_walk(
                         // bottom border across the last visible row.
                         let (bx0, by0) = (box_sx, box_sy);
                         let (bx1, by1) = (box_sx + bw, box_sy + bh);
-                        let bda = (spec.border_alpha.unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+                        let bda = (border_a.clamp(0.0, 1.0) * 255.0).round() as u8;
                         let mut stroke = |x0: f32, y0: f32, x1: f32, y1: f32, color: (u8, u8, u8)| {
                             let x0 = x0.max(0.0) as u32;
                             let y0 = y0.max(0.0) as u32;
@@ -3746,7 +3731,7 @@ fn frame_walk(
                         let rounded = radius.iter().any(|&r| r != 0.0)
                             || sides.iter().any(|s| s.is_some_and(|s| s.2 != 0));
                         let bga = spec.bg_alpha.unwrap_or(1.0);
-                        let bda = spec.border_alpha.unwrap_or(1.0);
+                        let bda = layout_core::css::border_visible(spec, &mut sides);
                         let bg_rgb = spec.background.map(|c| layout_core::paint::bg_ink(c, spec.currentcolor, inh.get(node).map_or((0, 0, 0), |i| i.color)));
                         let mut blend_at = |x: u32, y: u32, c: (u8, u8, u8), a: f32| {
                             // Background and border colours composite at their alpha.
@@ -4822,4 +4807,40 @@ fn caret_ink(inherited: &Inherited, ink: (u8, u8, u8)) -> Option<((u8, u8, u8), 
         Some((_, _, _, 0)) => None,
         Some((r, g, b, a)) => Some(((r, g, b), a)),
     }
+}
+
+// ---- AETHEROUTLINECURRENTCOLORUA (LEDGER SR1131): one UA colour table and the render's inherited state at a box (named tail block) ----
+
+/// AETHEROUTLINECURRENTCOLORUA (SR1131): the UA tag colour an element without a declared or inherited `color` takes (html.css):
+/// a link's (0, 0, 238), a control's ButtonText / FieldText (AETHERCSSCONTROLUACOLOR SR1001), html's CanvasText, both from
+/// the resolved scheme's UA row (SR1031); anything else keeps `inherited`. Read by `inherit_element` and computed_report.
+pub(crate) fn ua_color(tag: &str, inherited: (u8, u8, u8), scheme: Option<u8>) -> (u8, u8, u8) {
+    match tag {
+        "a" => (0, 0, 238), // UA default link blue
+        _ if control_tag(tag) => layout_core::ua_colours(scheme).ink,
+        "html" => layout_core::ua_colours(scheme).canvastext,
+        _ => inherited,
+    }
+}
+
+/// AETHEROUTLINECURRENTCOLORUA (SR1131): the inherited state the painter carries at `id`: `root_inherited` and
+/// `inherit_element` along the box tree's path from the root (lifted from `control_advancer`). Its `color` is an outline's
+/// and a canvas background's currentcolor (focusring `current_color`).
+fn inherited_at(layout: &LayoutTree, id: NodeId) -> Inherited {
+    let mut path = vec![id];
+    let mut n = layout.taffy.parent(id);
+    while let Some(p) = n {
+        path.push(p);
+        n = layout.taffy.parent(p);
+    }
+    let mut inh = root_inherited();
+    for p in path.into_iter().rev() {
+        if let Some(dn) = layout.node_map.get(&p) {
+            if let Some(el) = dn.as_element() {
+                let spec = layout.paint_map.get(&p).cloned().unwrap_or_default();
+                inherit_element(&mut inh, el.name.local.as_ref(), &spec, dn, p);
+            }
+        }
+    }
+    inh
 }
