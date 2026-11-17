@@ -1833,6 +1833,7 @@ struct Edit {
     path: String,
     st: timeline_core::editor::EditorState,
     said: bool,
+    snap_off: bool, // STRIAKSNAP (LEDGER SR9063): the Player's drag snap default is off (`n` flips it; Option at the press inverts it) (file tail)
 }
 
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
@@ -1842,7 +1843,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 19] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1861,6 +1862,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'n', "snap"), // STRIAKSNAP (LEDGER SR9063): the host's `n` = `snap`, the Player's snap default flipped (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1874,7 +1876,7 @@ fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> ti
         return timeline_core::editor::EditorState::new(e.st.timeline.clone());
     }
     let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
-    *g = Some(Edit { path: String::from(path), st, said: false });
+    *g = Some(Edit { path: String::from(path), st, said: false, snap_off: false });
     fresh
 }
 
@@ -1905,7 +1907,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if verb == "snap" { return edit_snap(&mut e.snap_off, at); } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
@@ -2260,7 +2262,7 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false, false) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, timeline_core::view::press_nosnap(super::keymap::option_held(), e.snap_off), false) else { return false };
         d
     };
     *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
@@ -2664,4 +2666,21 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKSNAP (LEDGER SR9063): the Player's snap default and the press's Option (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SNAP-TOGGLE-KERNEL / NLE-KERNEL-DRAG-MODS (the Alt half). The host face holds a drag snap default
+// (STRIASNAPTOGGLE SR892, the word `snap` on `n`); the Player now holds its own in its editor state (`Edit::snap_off`,
+// reset by a fresh EDL, kept across the job's restarts), flipped by `n` in [`EDIT_KEYS`] (the host's byte for the same
+// word), intercepted in [`edit_key`] before any verb: view-only, no undo step, no save, no seek. [`edit_press`] passes
+// timeline_core's ONE rule `view::press_nosnap(Option held, snap_off)` (keymap's `option_held`, the Option role), so Option
+// at the press inverts the default as on the host. Control (slip / slide) is owed: keymap.rs has no Control reader
+// (NLE-KERNEL-DRAG-CONTROL). Wire: `[nle] edit snap at=<tick> snap=<on|off>`; a drag pressed with snap off commits
+// `snapped=none`.
+
+/// `n`: flip the Player's snap default (`off`); nothing to save or seek, so `None`.
+fn edit_snap(off: &mut bool, at: i64) -> Option<u64> {
+    *off = !*off;
+    serial_println!("[nle] edit snap at={} snap={}", at, if *off { "off" } else { "on" });
+    None
 }

@@ -428,7 +428,7 @@ impl Face {
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
-        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, (mods & bandy::MOD_ALT != 0) != self.snap_off);
+        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off));
         self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap, mods & (bandy::MOD_CONTROL | bandy::MOD_SUPER) != 0);
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick);
@@ -2389,7 +2389,7 @@ impl Face {
     /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
     fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
         let l = self.layout();
-        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, (mods & bandy::MOD_ALT != 0) != self.snap_off)?;
+        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, view::press_nosnap(mods & bandy::MOD_ALT != 0, self.snap_off))?;
         self.drag = Some(d);
         Some(true)
     }

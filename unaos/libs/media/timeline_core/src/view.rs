@@ -1298,3 +1298,53 @@ mod striasnapdrag_tests {
         assert_eq!((d.origin_tick + d.delta, d.guide), (70, Some(70)));
     }
 }
+
+// ---- STRIAKSNAP (LEDGER SR9063): the press's snap rule, one fn both faces call (named tail block) ----
+// STRIASNAPTOGGLE (SR892) gave the host face a snap default (`snap_off`, the `snap` word, `n`) and Alt / Option at the
+// press inverts it for that drag; the rule was written twice in nle_face.rs and nowhere the kernel Player could reach.
+// [`press_nosnap`] is that rule, once: the host's body press and transition-edge press and the Player's band press
+// (vplay.rs `edit_press`, its own `snap_off` flipped by `n`, Option read from the kernel's modifier state) all call it.
+
+/// The `nosnap` a press hands [`Drag::begin_with`] / [`Drag::begin_transition_edge`]: Alt / Option held inverts the face's
+/// snap default (`snap_off`) for this press only.
+pub fn press_nosnap(alt: bool, snap_off: bool) -> bool {
+    alt != snap_off
+}
+
+#[cfg(test)]
+mod striaksnap_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// M3: snap on by default, Alt turns it off; with the default off, Alt turns it back on.
+    #[test]
+    fn striaksnap_press_nosnap_is_alt_against_the_default() {
+        assert!(!press_nosnap(false, false));
+        assert!(press_nosnap(true, false));
+        assert!(press_nosnap(false, true));
+        assert!(!press_nosnap(true, true));
+    }
+
+    /// M3: V: A 4..14 and A 30..40, the in mark at 50. A body drag of A 30..40 landing 3 px short of the mark snaps
+    /// (guide at 50) when pressed with Alt while the default is off, and moves raw without Alt.
+    #[test]
+    fn striaksnap_alt_with_default_off_snaps() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 4), Clip::new(a, 20, 30, 30)];
+        let st0 = EditorState::new(tl.set_marks((Some(50), None)).unwrap());
+        let l = Layout::of_role(Role::Tracks, 800, 96, &st0);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        let x = l.x_of(35) as f64 + 1.0;
+        let to = x + 20.0 * z - 3.0;
+        let mut st = st0.clone();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, press_nosnap(true, true), false).unwrap();
+        d.update(&st, to, y);
+        assert_eq!((d.delta, d.guide), (20, Some(50)), "Alt with the default off snaps");
+        let mut st = st0.clone();
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, press_nosnap(false, true), false).unwrap();
+        d.update(&st, to, y);
+        assert_eq!((d.delta, d.guide), (19, None), "the default off moves raw");
+    }
+}
