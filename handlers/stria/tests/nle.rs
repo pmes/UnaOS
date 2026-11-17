@@ -3676,7 +3676,7 @@ fn striatrackreorder_track_up_is_one_commit_and_the_selection_follows() {
     let (mut face, tl) = striatrackreorder_face();
     let clip = face.state.selected().unwrap();
     assert!(face.verb("track-up"));
-    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.last_error.take().as_deref(), Some("track-up: V2 above V1")); // STRIATRACKORDERKEYS (SR922): the move is named on the message row
     assert_eq!(face.state.timeline, tl.swap_track(2, true).unwrap());
     assert_eq!(face.state.selection, Some((0, 0)), "the selection moved with the track");
     assert_eq!(face.state.set, vec![(0, 0)]);
@@ -3711,3 +3711,60 @@ fn striatrackreorder_refusals_name_the_reason() {
     assert_eq!(face.state.timeline, tl);
     assert_eq!(face.state.undo_depth(), 0);
 }
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): Alt+Up / Alt+Down, the move named on the message row, the crossfade refusal (named tail block) ----
+
+/// GTK's chord as the window sends it: a named `BrowserKey` (no `BrowserText` while Alt is held).
+fn striatrackorderkeys_key(face: &mut Face, k: &str) -> bool {
+    face.on(&bandy::SMessage::BrowserKey(k.into()))
+}
+
+/// Rule: `Alt+Up` on V2's clip is the `track-up` word (one commit, the selection follows) and the message row names the
+/// move with the names from before it; `Alt+Down` swaps it back and names that move.
+#[test]
+fn striatrackorderkeys_alt_keys_move_and_name_the_move() {
+    let (mut face, tl) = striatrackreorder_face();
+    assert!(KEYS.contains(&("Alt+Up", "track-up")) && KEYS.contains(&("Alt+Down", "track-down")));
+    assert!(striatrackorderkeys_key(&mut face, "Alt+Up"));
+    assert_eq!(face.state.timeline, tl.swap_track(2, true).unwrap());
+    assert_eq!(face.state.selection, Some((0, 0)));
+    assert_eq!(face.state.undo_depth(), 1, "ONE undo step");
+    assert_eq!(face.message_text().as_deref(), Some("track-up: V2 above V1"));
+    assert_eq!(face.last_error.take().as_deref(), Some("track-up: V2 above V1"));
+    assert!(striatrackorderkeys_key(&mut face, "Alt+Down"));
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.last_error.take().as_deref(), Some("track-down: V1 below V2"));
+    assert_eq!(face.state.undo_depth(), 2);
+    println!("striatrackorderkeys: Alt+Up -> \"track-up: V2 above V1\", Alt+Down -> \"track-down: V1 below V2\"");
+}
+
+/// The help shows each chord in its word's row with its phrase (not the bare word).
+#[test]
+fn striatrackorderkeys_help_rows_name_the_chords() {
+    let rows = help_rows();
+    for (k, w) in [("Alt+Up", "track-up"), ("Alt+Down", "track-down")] {
+        let row = rows.iter().find(|r| r.0.split(" / ").any(|x| x == k)).expect("a help row");
+        assert_eq!(row.1, help_phrase(w));
+        assert!(HELP.iter().any(|(a, _)| *a == w) && row.1 != w, "{w}: a phrase");
+    }
+    assert_eq!(rows.last().map(|r| r.1), Some(help_phrase("help")), "help stays the last row");
+}
+
+/// Rule: V1 and V2 both carry a dissolve on the cut at 10 whose clips pair with A1's cut, with different durations; the
+/// audio crossfade takes the first video track's, so swapping them is refused by name on the message row, unchanged.
+#[test]
+fn striatrackorderkeys_reorder_that_retimes_a_crossfade_is_refused() {
+    let (mut tl, src) = synth_fixture();
+    let v2 = tl.add_track(Kind::Video);
+    tl.tracks[v2].clips = tl.tracks[0].clips.clone();
+    tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 2).unwrap();
+    tl = tl.add_transition(v2, 10, timeline_core::TransitionKind::Dissolve, 3).unwrap();
+    assert_eq!(tl.audio_crossfade(1, 1).map(|x| x.dur), Some(2), "the first video track's dissolve");
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select_at(v2, 5).unwrap();
+    assert!(striatrackorderkeys_key(&mut face, "Alt+Up"));
+    assert_eq!(face.last_error.take(), Some(format!("track-up: {}", EditError::Crossfade)));
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.state.undo_depth(), 0);
+}
+

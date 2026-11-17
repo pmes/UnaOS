@@ -235,7 +235,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.track_order_word(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // STRIATRACKORDERKEYS (SR922): the track words name the move (file tail); NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -386,6 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("Alt+Up", "track-up"), ("Alt+Down", "track-down"), // STRIATRACKORDERKEYS (SR922): Alt with Up / Down (GTK's names) move the selected clip's track within its kind
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2602,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("track-up", "move the clip's track up (same kind)"), ("track-down", "move the clip's track down (same kind)"), // STRIATRACKORDERKEYS (SR922)
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
@@ -3095,5 +3097,25 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): track-up / track-down name the move on the message row (named tail block) ----
+// `Alt+Up` / `Alt+Down` (KEYS rows, HELP phrases) and the two transport words reach `Face::verb`, whose first line hands them
+// here: the ONE dispatch (`EditorState::verb` -> `move_track`, one commit) runs, a refusal is `<word>: <why>` as before, and a
+// move is named on the message row from the state after it (`EditorState::track_move_line`: `track-up: V2 above V1`).
+impl Face {
+    /// The `track-up` / `track-down` words; `None` for any other word.
+    fn track_order_word(&mut self, v: &str) -> Option<bool> {
+        let up = match v {
+            "track-up" => true,
+            "track-down" => false,
+            _ => return None,
+        };
+        match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
+            Ok(()) => self.last_error = self.state.track_move_line(up),
+            Err(e) => self.last_error = Some(format!("{v}: {e}")),
+        }
+        Some(true)
     }
 }

@@ -325,3 +325,56 @@ fn striatrackreorder_edl_round_trip_keeps_the_order() {
     assert_eq!(clips(&back, Kind::Video), clips(&mixed, Kind::Video));
     assert_eq!(clips(&back, Kind::Audio), clips(&mixed, Kind::Audio));
 }
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): a reorder never re-times an implied audio fade; the track's name (named tail block) ----
+
+/// V1, V2, A1, each A[0, 10)@0 + B[20, 30)@10 (the audio cut pairs with every video cut); V1's dissolve `d1`, V2's `d2`.
+fn striatrackorderkeys_tl(d1: i64, d2: i64) -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 100);
+    let b = tl.add_source("B", 60);
+    for kind in [Kind::Video, Kind::Video, Kind::Audio] {
+        let t = tl.add_track(kind);
+        tl.tracks[t].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 10)];
+    }
+    tl = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, d1).unwrap();
+    tl = tl.add_transition(1, 10, timeline_core::TransitionKind::Dissolve, d2).unwrap();
+    tl.validate().unwrap();
+    tl
+}
+
+/// Rule: the implied crossfade takes the FIRST video track's transition, so swapping two video tracks whose transitions on
+/// the paired cut differ is refused by name (`EditError::Crossfade`), both ways; equal transitions swap.
+#[test]
+fn striatrackorderkeys_swap_that_retimes_a_crossfade_is_refused() {
+    let tl = striatrackorderkeys_tl(2, 4);
+    assert_eq!(tl.audio_crossfade(2, 1).map(|x| x.dur), Some(2));
+    let before = tl.clone();
+    assert_eq!(tl.swap_track(1, true), Err(EditError::Crossfade));
+    assert_eq!(tl.swap_track(0, false), Err(EditError::Crossfade));
+    assert_eq!(tl, before);
+    let same = striatrackorderkeys_tl(3, 3);
+    let up = same.swap_track(1, true).unwrap();
+    assert_eq!(up.audio_crossfade(2, 1), same.audio_crossfade(2, 1));
+}
+
+/// Rule: an audio swap never trips the guard (the clips and their explicit crossfade travel with the track).
+#[test]
+fn striatrackorderkeys_audio_swap_is_allowed() {
+    let mut tl = striatrackorderkeys_tl(2, 4);
+    let a2 = tl.add_track(Kind::Audio);
+    tl.tracks[a2].clips = tl.tracks[2].clips.clone();
+    tl = tl.add_audio_xfade(a2, 10, 5, timeline_core::Curve::EqualPower).unwrap();
+    let up = tl.swap_track(a2, true).unwrap();
+    assert_eq!(up.crossfade_at(2, 1), tl.crossfade_at(a2, 1));
+    assert_eq!(up.crossfade_at(a2, 1), tl.crossfade_at(2, 1));
+}
+
+/// `track_name`: the kind letter and the number within the kind; `None` past the last track.
+#[test]
+fn striatrackorderkeys_track_name() {
+    let tl = striatrackreorder_tl(&[Kind::Video, Kind::Audio, Kind::Video, Kind::Audio]);
+    let names: Vec<Option<String>> = (0..5).map(|t| tl.track_name(t)).collect();
+    assert_eq!(names, vec![Some("V1".into()), Some("A1".into()), Some("V2".into()), Some("A2".into()), None]);
+}
+

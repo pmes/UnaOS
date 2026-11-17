@@ -376,6 +376,7 @@ pub enum EditError {
     Policy,
     /// NLE5DRANGESAVE (SR723): both export marks set with the in mark not before the out mark.
     Marks,
+    Crossfade, // STRIATRACKORDERKEYS (SR922): a track reorder that would change an audio fade a video transition implies
 }
 
 impl core::fmt::Display for EditError {
@@ -396,6 +397,7 @@ impl core::fmt::Display for EditError {
             EditError::Rate => "edit list rate is not 1 (no speed op)",
             EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
             EditError::Marks => "the in mark is not before the out mark",
+            EditError::Crossfade => "the reorder changes an audio crossfade a video transition implies",
         })
     }
 }
@@ -1566,7 +1568,39 @@ impl Timeline {
             x.track = track_swapped(x.track, track, j);
         }
         tl.audio_xfades.sort_by_key(|x| (x.track, x.at));
-        tl.validate()?;
+        tl.validate()?; self.same_implied_fades(&tl, track, j)?; // STRIATRACKORDERKEYS (SR922): a reorder that re-times an implied audio fade is refused (file tail)
         Ok(tl)
+    }
+}
+
+// ---- STRIATRACKORDERKEYS (LEDGER SR922): the track's name and the implied-fade guard of a reorder (named tail block) ----
+// `crossfade_of` and `black_pair` take the FIRST video track (lowest index) carrying a matching transition, so swapping two
+// video tracks that both carry one at a cut, with different values, would change the audio fade that cut implies (and the
+// schedule both faces call would re-time the sound). `swap_track` refuses that by name (`EditError::Crossfade`): a track
+// ORDER edit never changes what is heard. An audio swap cannot trip it (the clips and their explicit xfade travel with the
+// track). `track_name` is the message row's `V2` / `A1` (kind letter + `track_number`).
+impl Timeline {
+    /// STRIATRACKORDERKEYS: a track's name, its kind letter and its number within the kind (`V2`, `A1`).
+    pub fn track_name(&self, track: usize) -> Option<String> {
+        let k = if self.tracks.get(track)?.kind == Kind::Video { "V" } else { "A" };
+        Some(alloc::format!("{k}{}", self.track_number(track)?))
+    }
+    /// STRIATRACKORDERKEYS: every audio clip's implied fades (`audio_crossfade`, `crossfade_at`, `fade_to_silence`) in
+    /// `self` equal those of the same clip in `after`, where tracks `a` and `b` swapped (`EditError::Crossfade`: one differs).
+    fn same_implied_fades(&self, after: &Timeline, a: usize, b: usize) -> Result<(), EditError> {
+        for (t, tr) in self.tracks.iter().enumerate() {
+            if tr.kind != Kind::Audio {
+                continue;
+            }
+            let u = track_swapped(t, a, b);
+            for ci in 0..tr.clips.len() {
+                let before = (self.audio_crossfade(t, ci), self.crossfade_at(t, ci), self.fade_to_silence(t, ci));
+                let now = (after.audio_crossfade(u, ci), after.crossfade_at(u, ci), after.fade_to_silence(u, ci));
+                if before != now {
+                    return Err(EditError::Crossfade);
+                }
+            }
+        }
+        Ok(())
     }
 }
