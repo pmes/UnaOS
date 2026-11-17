@@ -21,7 +21,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 3. STRIAINSERTOVERWRITE — `insert` / `overwrite` of a source range at the playhead on the selected track (three-point editing: measure whether a source viewer exists; if not, the source range is the clip under the playhead's src range: name the rule).
 4. STRIAMULTISELECT — shift-click adds to the selection, a marquee drag selects clips crossing the rectangle (`Layout::crossing` :110 EXISTS: wire it); every clip op applies to the whole selection (move / delete / gain).
 5. STRIACOPYPASTE — `copy` / `cut` / `paste` of the selection at the playhead (an in-face clipboard `Vec<Clip>`; paste on the selected track; overlaps refused by `validate`).
-6. STRIANUDGE — `,` / `.` move the selection by one frame, shift by ten (through move_clip + undo); the message row reads the new `at`.
+6. [SR855 started] STRIANUDGE — `,` / `.` move the selection by one frame, shift by ten (through move_clip + undo); the message row reads the new `at`.
 7. STRIACLIPLINK — audio and video clips from one source move together: a `group: u32` id on Clip (measure first; EDL `* UNA GROUP`).
 8. STRIATRACKADDREMOVE — `track+ video|audio` / `track-` on the face (Timeline tracks Vec; EDL writes tracks by order already: measure).
 9. STRIATRACKREORDER — drag a track header up / down (needs SR837's badge column or a header column: name).
