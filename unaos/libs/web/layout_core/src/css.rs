@@ -1240,11 +1240,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             }
         }
         "background-image" if value.to_ascii_lowercase().contains("-gradient(") => {
-            style.paint.bg_gradient = H::parse_gradient(value).map(Some);
+            bg_image_layers::<H>(&mut style.paint, value);
         }
-        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
-            style.paint.bg_gradient = H::parse_gradient(value).map(Some);
+            bg_image_layers::<H>(&mut style.paint, value);
             let lower = value.to_ascii_lowercase();
             let start = ["repeating-linear-gradient(", "repeating-radial-gradient(", "linear-gradient(", "radial-gradient("]
                 .iter()
@@ -1278,18 +1278,18 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             style.paint.shadows = Some(H::parse_box_shadow(value));
         }
         "background-image" => match extract_css_url(value) {
-            Some(u) => style.paint.bg_image = Some(u),
+            Some(_) => bg_image_layers::<H>(&mut style.paint, value),
             None => { bg_image_clear::<H>(&mut style.paint, value);
                 if !is_neutral_keyword(value) {
                     H::record_css(&format!("background-image-value:{}", clip(value)));
                 }
             }
         },
-        "background" => { bg_currentcolor::<H>(&mut style.paint, value);
+        "background" => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
-            bg_shorthand_none::<H>(&mut style.paint, value); if let Some(u) = extract_css_url(value) {
-                style.paint.bg_image = Some(u);
+            bg_shorthand_none::<H>(&mut style.paint, value); if extract_css_url(value).is_some() {
+                bg_image_layers::<H>(&mut style.paint, value);
             }
             // Components outside url(...) — the url may itself hold slashes
             // and keywords, so scan only what is left after removing it.
@@ -2609,8 +2609,8 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
             list.push((p.clone(), v.clone()));
         }
     }
-    merge_bg_image_none(dst, src); clone!(pct_math, bg_gradient, shadows);
-    clone!(bg_image, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
+    merge_bg_image_none(dst, src); merge_bg_layers(dst, src); clone!(pct_math, bg_gradient, shadows);
+    clone!(bg_image, bg_more, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
 }
 
 
@@ -3787,7 +3787,7 @@ fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
     if value.trim().eq_ignore_ascii_case("none") {
         paint.bg_image = None;
         paint.bg_gradient = Some(None);
-        paint.bg_image_none = true;
+        paint.bg_image_none = true; paint.bg_more = Some(Vec::new());
     }
 }
 
@@ -3796,17 +3796,13 @@ fn bg_image_clear<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
 /// value, so the image goes (`bg_image_clear`), the colour is transparent, and repeat / position / size take SR848's
 /// initials (repeat / `0% 0%` / auto, stored as their arms store them; not through `apply_declaration`, which would
 /// enter background-color / -position in `animatable`). Any other shorthand keeps its omitted layers
-/// (AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+/// (no longer: SR1061 resets every shorthand through `bg_shorthand_reset` at both arm heads; this guard calls it too).
 fn bg_shorthand_none<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
     let parts = split_top_level(value);
     if parts.is_empty() || !parts.iter().all(|p| p.eq_ignore_ascii_case("none") || p.eq_ignore_ascii_case("transparent")) {
         return;
     }
-    bg_image_clear(paint, "none");
-    paint.bg_alpha = Some(0.0);
-    paint.bg_repeat = parse_repeat("repeat");
-    paint.bg_position = Some("0% 0%".to_string());
-    paint.bg_size = Some("auto".to_string());
+    bg_shorthand_reset(paint, "none");
 }
 
 /// `merge_paint`'s half for the bit, BEFORE the image / gradient clones: a later block that declared none clears the
@@ -4195,3 +4191,66 @@ pub fn erase_reverted<H: Host>(s: &mut SpecifiedStyle<H>, bits: u32) {
 /// UI font (13.333px, normal weight and style); [`apply_font_wide`] gives them the `initial` road, then the control
 /// family (`Host::control_family`, the UA control font) at [`crate::CONTROL_FONT_PX`] through the `font-size` arm.
 const SYSTEM_FONTS: [&str; 6] = ["caption", "icon", "menu", "message-box", "small-caption", "status-bar"];
+
+// ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one comma-separated layer of `background-image` (or of the `background`
+/// shorthand): a `url(...)` written before any `-gradient(` is a url layer, else a gradient the host parses; `none`
+/// and a value neither road reads are no layer.
+fn parse_bg_layer<H: Host>(layer: &str) -> Option<crate::paint::BgLayer<H>> {
+    let lower = layer.to_ascii_lowercase();
+    match (lower.find("url("), lower.find("-gradient(")) {
+        (Some(u), Some(g)) if u < g => extract_css_url(layer).map(crate::paint::BgLayer::Url),
+        (_, Some(_)) => H::parse_gradient(layer).map(crate::paint::BgLayer::Gradient),
+        (Some(_), None) => extract_css_url(layer).map(crate::paint::BgLayer::Url),
+        (None, None) => None,
+    }
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): css-backgrounds-3 §2.2 / §3.3: `background-image` is a layer list, the first
+/// layer topmost. The value splits at depth-0 commas (`anim::split_commas`: `rgb(0, 0, 0)`, `url(a,b)` and data: urls
+/// stay whole); the first layer writes its own field (`bg_image` or `bg_gradient`, the other cleared: one property),
+/// the rest go to `bg_more` (Some even when empty, so `merge_bg_layers` replaces an earlier rule's whole list). A value
+/// with no readable layer changes nothing.
+fn bg_image_layers<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let mut layers = crate::anim::split_commas(value).into_iter().filter_map(parse_bg_layer::<H>);
+    let Some(first) = layers.next() else {
+        return;
+    };
+    paint.bg_image = None;
+    paint.bg_gradient = Some(None);
+    match first {
+        crate::paint::BgLayer::Url(u) => paint.bg_image = Some(u),
+        crate::paint::BgLayer::Gradient(g) => paint.bg_gradient = Some(Some(g)),
+    }
+    paint.bg_more = Some(layers.collect());
+}
+
+/// `merge_paint`'s half for the list, BEFORE the image / gradient / `bg_more` clones: a later block that declared a
+/// layer list clears the accumulated first layer, so its own first layer (copied by the clones) and its `bg_more`
+/// replace the whole earlier list (a url from one rule and a gradient from a later rule no longer both paint).
+fn merge_bg_layers<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    if src.bg_more.is_some() {
+        dst.bg_image = None;
+        dst.bg_gradient = Some(None);
+    }
+}
+
+// ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): css-backgrounds-3 §3.10: both `background` arms call this at their head,
+/// BEFORE `bg_currentcolor` (which re-sets CC_BG and the opaque alpha for a currentcolor token), so every longhand the
+/// value omits takes its initial as an explicit Some that `merge_paint` copies over an earlier rule: no image
+/// (`bg_image_clear`, SR1052's empty `bg_more`), transparent, repeat / `0% 0%` / auto; the arm's scans then write the
+/// parts present. `inherit` / `revert` / `revert-layer` are left as they were (dropped: owed).
+fn bg_shorthand_reset<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "revert" | "revert-layer") {
+        return;
+    }
+    bg_image_clear(paint, "none");
+    paint.bg_alpha = Some(0.0);
+    paint.currentcolor &= !crate::paint::CC_BG;
+    paint.bg_repeat = parse_repeat("repeat");
+    paint.bg_position = Some("0% 0%".to_string());
+    paint.bg_size = Some("auto".to_string());
+}

@@ -22,8 +22,8 @@ fn background_slash_colour() {
     let s = styled(&[("background", "rgb(0 0 0 / 50%)")]);
     assert_eq!(s.paint.background, Some((0, 0, 0)), "the colour function is the layer's colour");
     assert_eq!(s.paint.bg_alpha, Some(0.5), "its alpha after the slash inside the function");
-    assert_eq!(s.paint.bg_position, None, "the slash inside rgb() is not the position / size separator");
-    assert_eq!(s.paint.bg_size, None, "no size from the fragment after the colour's slash");
+    assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "the slash inside rgb() is not the position / size separator (SR1061: the reset's initial)");
+    assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "no size from the fragment after the colour's slash (SR1061: the reset's initial)");
 }
 
 #[test]

@@ -4175,8 +4175,8 @@ mod tests {
                 (el.attributes.borrow().get("id") == Some("h")).then(|| t.paint_map.get(id))?
             })
             .expect("the box has a paint entry");
-        assert_eq!(p.bg_position, None, "no position from the colour's inner slash");
-        assert_eq!(p.bg_size, None, "no size from the colour's inner slash");
+        assert_eq!(p.bg_position.as_deref(), Some("0% 0%"), "no position from the colour's inner slash (SR1061: the reset's initial)");
+        assert_eq!(p.bg_size.as_deref(), Some("auto"), "no size from the colour's inner slash (SR1061: the reset's initial)");
         let (w, h) = (100u32, 100u32);
         let mut surface = vec![0u8; (w * h * 4) as usize];
         crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
@@ -7966,5 +7966,93 @@ mod tests {
         assert_eq!(font_shorthand_cs(&mut e, "ah", "fontSize"), "20px", "an aria-hidden span the same");
         assert_eq!(font_shorthand_cs(&mut e, "hp", "fontSize"), "20px", "a hidden div the same");
         assert_eq!(font_shorthand_cs(&mut e, "hpk", "fontSize"), "20px", "the hidden div's child chains it");
+    }
+
+    // ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): one 20px row per probe at 400 px wide, rows 12px apart. The image is a
+    /// 2x2 checkerboard PNG data: URL (two opaque red pixels, two transparent: tiled, half the box red, the rest a hole),
+    /// the gradient solid blue. `.ug` url over gradient, `.u` / `.g` its one-layer twins, `.gu` gradient over url,
+    /// `.rp.g2` a url rule then a later gradient rule, `.sh` the shorthand's url over gradient.
+    fn background_multi_layer_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .ug { background-image: url(PNG), linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .u { background-image: url(PNG) }
+            .g { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .gu { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)), url(PNG) }
+            .rp { background-image: url(PNG) }
+            .rp.g2 { background-image: linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            .sh { background: url(PNG), linear-gradient(rgb(0, 0, 255), rgb(0, 0, 255)) }
+            </style></head><body style="margin:0">
+            <div id="ug" class="ug"></div>
+            <div id="u" class="u"></div>
+            <div id="g" class="g"></div>
+            <div id="gu" class="gu"></div>
+            <div id="rp" class="rp g2"></div>
+            <div id="sh" class="sh"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8AARFAA4gAAI+4D/QU7+oQAAAAASUVORK5CYII=");
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `url(PNG), linear-gradient(..)` paints the image's opaque pixels on top and
+    /// the gradient through its holes; the url-only twin shows no blue and the gradient-only twin no red (armed).
+    #[test]
+    fn background_multi_layer_url_over_gradient() {
+        let mut e = background_multi_layer_engine();
+        assert!(css_wide_color_ink(&mut e, "u", css_wide_red) > 100, "the url-only twin paints red (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "u", css_wide_blue), 0, "the url-only twin has no blue (armed)");
+        assert!(css_wide_color_ink(&mut e, "g", css_wide_blue) > 100, "the gradient-only twin paints blue (armed)");
+        assert_eq!(css_wide_color_ink(&mut e, "g", css_wide_red), 0, "the gradient-only twin has no red (armed)");
+        assert!(css_wide_color_ink(&mut e, "ug", css_wide_red) > 100, "the top image's opaque pixels");
+        assert!(css_wide_color_ink(&mut e, "ug", css_wide_blue) > 100, "the gradient through the image's holes");
+    }
+
+    /// AETHERCSSBACKGROUNDMULTILAYER (SR1052): the first layer is on top: an opaque gradient listed before the url covers
+    /// it (no red); a later rule's gradient replaces an earlier rule's url (no red); the shorthand's two layers both paint.
+    #[test]
+    fn background_multi_layer_order_replace_shorthand() {
+        let mut e = background_multi_layer_engine();
+        assert!(css_wide_color_ink(&mut e, "gu", css_wide_blue) > 100, "the top gradient paints");
+        assert_eq!(css_wide_color_ink(&mut e, "gu", css_wide_red), 0, "the url under an opaque gradient is covered");
+        assert!(css_wide_color_ink(&mut e, "rp", css_wide_blue) > 100, "the later rule's gradient paints");
+        assert_eq!(css_wide_color_ink(&mut e, "rp", css_wide_red), 0, "the earlier rule's url is replaced");
+        assert!(css_wide_color_ink(&mut e, "sh", css_wide_red) > 100, "shorthand: the url layer");
+        assert!(css_wide_color_ink(&mut e, "sh", css_wide_blue) > 100, "shorthand: the gradient layer");
+    }
+
+    // ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+    /// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): SR1052's 2x2 red checker PNG; `.k` the image alone, `.r` the image then
+    /// `background: rgb(0, 128, 0)` in one block, `.x.y` the image rule then a later shorthand rule. css-backgrounds-3
+    /// §3.10: the shorthand resets the image, so `.r` and `.x.y` paint only green (Chromium: plain green).
+    #[test]
+    fn background_shorthand_reset_paints_colour_only() {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .k { background-image: url(PNG) }
+            .r { background-image: url(PNG); background: rgb(0, 128, 0) }
+            .x { background-image: url(PNG) }
+            .x.y { background: rgb(0, 128, 0) }
+            </style></head><body style="margin:0">
+            <div id="k" class="k"></div>
+            <div id="r" class="r"></div>
+            <div id="xy" class="x y"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8AARFAA4gAAI+4D/QU7+oQAAAAASUVORK5CYII=");
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        assert!(css_wide_color_ink(&mut e, "k", css_wide_red) > 100, "the image alone paints its checker (armed)");
+        assert!(css_wide_color_ink(&mut e, "r", css_wide_green) > 100, "one block: the shorthand's green");
+        assert_eq!(css_wide_color_ink(&mut e, "r", css_wide_red), 0, "one block: no checker pixel");
+        assert!(css_wide_color_ink(&mut e, "xy", css_wide_green) > 100, "a later rule: the shorthand's green");
+        assert_eq!(css_wide_color_ink(&mut e, "xy", css_wide_red), 0, "a later rule: the earlier image is reset");
     }
 }

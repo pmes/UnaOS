@@ -306,8 +306,8 @@ fn css_wide_bgnone_later_url_wins() {
     assert_eq!(again.paint.bg_image, None, "a merged none overlaid again still clears");
 }
 
-/// `background-image: none` clears the image only: the colour stays; `background: red` after an image keeps the image
-/// (pinned: AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+/// `background-image: none` clears the image only: the colour stays; `background: red` after an image drops the image
+/// (SR1061: the shorthand resets the omitted image; the pin flipped).
 #[test]
 fn css_wide_bgnone_image_only_and_pins() {
     let s = cascade(&[&[("background", "red url(a.png)")], &[("background-image", "none")]]);
@@ -315,7 +315,7 @@ fn css_wide_bgnone_image_only_and_pins() {
     assert_eq!(s.paint.background, Some((255, 0, 0)), "the colour stays");
     assert_eq!(s.paint.bg_alpha, Some(1.0), "still opaque");
     let s = cascade(&[&[("background-image", "url(a.png)")], &[("background", "red")]]);
-    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "background: red keeps the image (pinned, owed)");
+    assert_eq!(s.paint.bg_image.as_deref(), None, "background: red resets the image (SR1061, was pinned kept)");
 }
 
 // ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content its own field; column-gap an explicit normal (named tail block) ----
@@ -919,4 +919,116 @@ fn css_wide_revert_noninherited_all() {
     assert_eq!((s.display, s.paint.display_kind), (None, None), "all: revert: display");
     assert_eq!(s.paint.background, None, "all: revert: background colour");
     assert_eq!(s.paint.border, None, "all: revert: border");
+}
+
+// ---- AETHERCSSBACKGROUNDMULTILAYER (LEDGER SR1052): background-image is a comma layer list, painted bottom-up (named tail block) ----
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `bg_more`'s urls in list order (the test host parses no gradient).
+fn bg_more_urls(s: &SpecifiedStyle<TH>) -> Option<Vec<String>> {
+    s.paint.bg_more.as_ref().map(|v| {
+        v.iter()
+            .map(|l| match l {
+                layout_core::paint::BgLayer::Url(u) => u.clone(),
+                layout_core::paint::BgLayer::Gradient(_) => "<gradient>".to_string(),
+            })
+            .collect()
+    })
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): `url(a), url(b)` is two layers, the first in `bg_image` (the one-url value
+/// is one layer: `bg_more` empty, armed); a `,` inside `url()` / a data: url / `rgb()` does not split.
+#[test]
+fn background_multi_layer_two_urls_in_order() {
+    let one = styled(&[("background-image", "url(a.png)")]);
+    assert_eq!((one.paint.bg_image.as_deref(), bg_more_urls(&one)), (Some("a.png"), Some(vec![])), "one layer (armed)");
+    let s = styled(&[("background-image", "url(a.png), url(b.png)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "the first layer is the top one");
+    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "the second layer");
+    let s = styled(&[("background-image", "url(\"a,b.png\"), url(data:image/png;base64,AA,BB)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a,b.png"), "a comma inside url() stays");
+    assert_eq!(bg_more_urls(&s), Some(vec!["data:image/png;base64,AA,BB".to_string()]), "a data: url stays whole");
+    let s = styled(&[("background", "url(a.png), url(b.png) rgb(0, 160, 0)")]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (Some("a.png"), Some(vec!["b.png".to_string()])), "shorthand: two layers");
+    assert_eq!(s.paint.background, Some((0, 160, 0)), "shorthand: the final layer's colour (rgb() not split)");
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): a url written before a gradient is the first layer (the test host reads no
+/// gradient, so the list is the url alone and the gradient field is cleared).
+#[test]
+fn background_multi_layer_url_before_gradient() {
+    let s = styled(&[("background-image", "url(a.png), linear-gradient(red, blue)")]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "the url layer survives the gradient arm");
+    assert!(matches!(s.paint.bg_gradient, Some(None)), "one property: the gradient field is this list's");
+}
+
+/// AETHERCSSBACKGROUNDMULTILAYER (SR1052): a later `background-image: url(c)` replaces the whole earlier list, and
+/// `none` clears it (SR1015's road).
+#[test]
+fn background_multi_layer_later_rule_replaces_list() {
+    let ab: &[(&str, &str)] = &[("background-image", "url(a.png), url(b.png)")];
+    let s = cascade(&[ab]);
+    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "the earlier list (armed)");
+    let s = cascade(&[ab, &[("background-image", "url(c.png)")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (Some("c.png"), Some(vec![])), "url(c) replaces [a, b]");
+    let s = cascade(&[ab, &[("background-image", "none")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "none clears every layer");
+    let s = cascade(&[ab, &[("background", "red")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "background: red resets the list (SR1061, was pinned kept)");
+}
+
+// ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): css-backgrounds-3 §3.10: `background: red` after an image in one block
+/// paints plain red (no image, no list); `background: red` alone is unchanged.
+#[test]
+fn background_shorthand_reset_same_block() {
+    let s = styled(&[("background-image", "url(a.png)"), ("background", "red")]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "the image goes");
+    assert_eq!((s.paint.background, s.paint.bg_alpha), (Some((255, 0, 0)), Some(1.0)), "the colour is red, opaque");
+    let alone = styled(&[("background", "red")]);
+    assert_eq!((alone.paint.background, alone.paint.bg_alpha, alone.paint.bg_image.as_deref()), (Some((255, 0, 0)), Some(1.0), None), "red alone");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): `background: blue` after `url(a) repeat-x 10px 20px / cover` resets the
+/// image, repeat, position and size to their initials (each as its longhand stores it).
+#[test]
+fn background_shorthand_reset_repeat_position_size() {
+    let first: &[(&str, &str)] = &[("background", "url(a.png) repeat-x 10px 20px / cover")];
+    let before = cascade(&[first]);
+    assert_eq!((before.paint.bg_image.as_deref(), before.paint.bg_repeat), (Some("a.png"), Some(2)), "the earlier image and repeat-x (armed)");
+    let s = cascade(&[first, &[("background", "blue")]]);
+    assert_eq!(s.paint.bg_image, None, "no image");
+    assert_eq!(s.paint.bg_repeat, styled(&[("background-repeat", "repeat")]).paint.bg_repeat, "repeat is initial");
+    assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "position is initial");
+    assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "size is initial");
+    assert_eq!(s.paint.background, Some((0, 0, 255)), "the colour is the later blue");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): across rules the merge drops the earlier image (the explicit initial
+/// wins), and `background: url(b)` after `background-color: red` makes the colour transparent.
+#[test]
+fn background_shorthand_reset_across_rules() {
+    let s = cascade(&[&[("background-image", "url(a.png)")], &[("background", "red")]]);
+    assert_eq!(s.paint.bg_image, None, "the earlier rule's image is dropped");
+    assert!(matches!(s.paint.bg_gradient, Some(None)), "the gradient field is cleared too");
+    assert_eq!(cascade(&[&[("background-color", "red")]]).paint.bg_alpha, Some(1.0), "the earlier red is opaque (armed)");
+    let s = cascade(&[&[("background-color", "red")], &[("background", "url(b.png)")]]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("b.png"), "the later image");
+    assert_eq!(s.paint.bg_alpha, Some(0.0), "background-color is reset to transparent");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): `background: inherit` keeps its road (dropped: the earlier rule stands);
+/// `background: currentcolor` after an image keeps the marker opaque and drops the image; the gradient arm resets too.
+#[test]
+fn background_shorthand_reset_keywords_and_gradient_arm() {
+    use layout_core::paint::CC_BG;
+    let first: &[(&str, &str)] = &[("background", "url(a.png) red")];
+    let s = cascade(&[first, &[("background", "inherit")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), s.paint.background, s.paint.bg_alpha), (Some("a.png"), Some((255, 0, 0)), Some(1.0)), "inherit: unchanged road");
+    let s = styled(&[("background-image", "url(a.png)"), ("background", "currentcolor")]);
+    assert_eq!((s.paint.currentcolor & CC_BG, s.paint.bg_alpha, s.paint.bg_image.as_deref()), (CC_BG, Some(1.0), None), "currentcolor after the reset");
+    let s = styled(&[("background-color", "currentcolor"), ("background", "url(a.png)")]);
+    assert_eq!((s.paint.currentcolor & CC_BG, s.paint.bg_alpha), (0, Some(0.0)), "an omitted colour clears the marker");
+    let s = cascade(&[&[("background-repeat", "no-repeat"), ("background-color", "red")], &[("background", "linear-gradient(red, blue)")]]);
+    assert_eq!((s.paint.bg_repeat, s.paint.bg_alpha), (Some(0), Some(0.0)), "the gradient arm resets repeat and colour");
 }
