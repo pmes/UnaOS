@@ -101,6 +101,8 @@ struct Sei {
     pt: Vec<(u32, u32)>,
     /// The VCL HRD's initial_cpb_removal_delay per buffering_period (H264ENCHRDVCL SR1060; empty without `Config::hrd_vcl`).
     vbp: Vec<u32>,
+    /// Per pic_timing carrying them, pic_struct and its clock_timestamp_flags (H264ENCHRDPICSTRUCT SR1066; read from the payload bits).
+    ps: Vec<(u8, Vec<bool>)>,
 }
 
 /// h264_core's decoder fed every access unit's SPS / PPS / SEI NAL units: its HRD notes, per access unit.
@@ -111,7 +113,7 @@ fn seis(aus: &[Access]) -> Vec<Sei> {
             for n in au.nals.iter().filter(|n| matches!(n[0] & 0x1f, NAL_SPS | NAL_PPS | NAL_SEI)) {
                 dec.decode_nal(n).unwrap();
             }
-            let mut s = Sei::default();
+            let mut s = Sei::default(); s.ps = pic_structs(au);
             for note in dec.take_hrd_notes() {
                 match note.kind {
                     HrdKind::BufferingPeriod { sps_id, nal, vcl } => {
@@ -138,8 +140,8 @@ fn bits(au: &Access) -> i128 {
 fn replay(aus: &[Access], sps: &Sps) -> (usize, i128, i128) {
     let (nut, ts, _) = sps.timing_info.expect("timing_info");
     let h = sps.nal_hrd.or(sps.vcl_hrd).expect("nal_hrd_parameters"); // the NAL HRD (Type II, every NAL unit), else the VCL HRD (Type I: VCL + filler, SR1060)
-    let cbr = h.cbr; // H264ENCHRDVBRKAT (SR1034): cbr_flag 0 is the VBR replay (arrival at BitRate, the max, stops while the CPB is full: no overflow under VBR); the CBR arm unchanged
     // cbr_flag 1: continuous arrival from t = 0 at BitRate; cbr_flag 0 (the VCL HRD, SR1060): on demand, `vbr_road` (C.1.2).
+    let cbr = h.cbr || sps.nal_hrd.is_none(); // H264ENCHRDVBRKAT (SR1034): the NAL HRD's cbr_flag 0 is the VBR replay (arrival at BitRate, the max, stops while the CPB is full: no overflow under VBR); the CBR arm unchanged, and the VCL-only replay (SR1060) keeps it before `vbr_road`
     let (nut, ts, br, cpb) = (nut as i128, ts as i128, h.bit_rate as i128, h.cpb_size as i128);
     let notes = seis(aus);
     let unit = 90_000 * ts;
@@ -397,69 +399,6 @@ fn h_vbr_scene_change_stays_in_bucket() {
     assert!(margin >= 0);
 }
 
-// ---- H264ENCHRDVBRUNDERFLOW (LEDGER SR1050): the VBR row-QP room term at the knife edge (named tail block) ----
-// A VBR picture whose bits pass the max bucket's room at its start (bmax - fmax: the CPB `hrd_au` signals is the bucket's mirror)
-// underflows the CPB. The knife edge: the stream's first IDR has no fitted model, so `Rc::picture` codes it at start_qp (cfg.qp 16
-// here) whatever the target, and only `row_qp` can move it. While the target cap is idle its size does not depend on the max, so
-// the run at max 2000 (room x 15/16 far above it: the term cannot fire) IS the old code's IDR at the knife max: the armed contrast
-// is measured at runtime. rc.rs `Rc::room_step` (SR1050) raises the rows' QP until the projected picture fits the room.
-
-/// [`busy`]'s first picture frozen for 6 frames at VBR mean 64 / max `max` kbit/s, gop 12, cfg.qp 16, deblocking on (so
-/// `Encoder::mb_qps` holds the coded QPs): the access units and the IDR's QP per macroblock row (the row's largest).
-fn knife(max: u32) -> (Vec<Access>, Vec<u8>) {
-    let cfg = Config { width: W as u32, height: H as u32, qp: 16, gop: 12, deblock: true, hrd: true, rate: Some(RateControl::vbr(64, max, (FPS, 1))), ..Default::default() };
-    let mut enc = Encoder::new(cfg).unwrap();
-    let p = busy(0);
-    let (mut aus, mut rows) = (Vec::new(), Vec::new());
-    for t in 0..6 {
-        aus.push(enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap());
-        if t == 0 {
-            rows = enc.mb_qps().chunks(W / 16).map(|r| *r.iter().max().unwrap()).collect();
-        }
-    }
-    (aus, rows)
-}
-
-/// The idle run (max 2000) and the knife run (max = 15/16 of the idle IDR's bits): (idle IDR bits, idle rows, knife units, knife rows).
-fn knife_pair() -> (i128, Vec<u8>, Vec<Access>, Vec<u8>) {
-    let (idle, idle_rows) = knife(2000);
-    let x = bits(&idle[0]);
-    let (aus, rows) = knife((x * 15 / 16 / 1000) as u32);
-    (x, idle_rows, aus, rows)
-}
-
-#[test]
-fn i_vbr_knife_edge_does_not_underflow() {
-    let (x, idle_rows, aus, rows) = knife_pair();
-    let v = sps_of(&aus[0].nals[0]);
-    let cpb = v.nal_hrd.expect("nal_hrd_parameters").cpb_size as i128;
-    let y = bits(&aus[0]);
-    println!("hrd vbr knife edge: idle idr {x} bits rows {idle_rows:?}, cpb {cpb} (old margin {}), knife idr {y} bits rows {rows:?}", cpb - x);
-    println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
-    assert!(cpb < x, "the knife CPB ({cpb}) holds the old code's IDR ({x}): not a knife edge");
-    let (fillers, margin, peak) = replay(&aus, &v);
-    println!("  arrival margin min {margin} bits, cpb peak {peak} / {cpb} bits");
-    assert_eq!(fillers, 0, "VBR pads nothing");
-    assert!(margin >= 0);
-    assert!(y <= cpb && y < x, "the knife IDR ({y}) shrank below the CPB ({cpb}) and the old IDR ({x})");
-    // Measured (SR1050 EXCEPTION runs): at the old rc.rs the knife run's IDR was 111928 bits and `replay` panicked (CPB underflow,
-    // old margin 104000 - 111936 = -7936); with the room term the IDR is 93800 bits and the smallest margin 5698.
-    assert_eq!((x, cpb, y, margin), (111_936, 104_000, 93_800, 5_698), "idle IDR, knife CPB, knife IDR, arrival margin");
-}
-
-#[test]
-fn j_vbr_row_qp_steps_are_bounded() {
-    let (_, idle_rows, _, rows) = knife_pair();
-    let term: Vec<i32> = rows.iter().zip(&idle_rows).map(|(&k, &i)| k as i32 - i as i32).collect();
-    println!("hrd vbr knife row term {term:?} (idle rows {idle_rows:?}, knife rows {rows:?})");
-    assert_eq!(term[0], 0, "row 0 never reaches rc_row");
-    assert!(term.iter().all(|d| (0..=6).contains(d)), "the room term is bounded at +6");
-    assert!(term.windows(2).all(|w| w[0] <= w[1]), "the room term never falls within the picture");
-    assert!(term.iter().any(|&d| d > 0), "the room term never fired at the knife edge");
-    // Measured (SR1050): idle rows [16, 19 x 5] (row_qp's +3), knife rows [16, 22, 24, 25, 25, 25]; at the old rc.rs the term was all 0.
-    assert_eq!(term, [0, 3, 5, 6, 6, 6], "the room term per macroblock row");
-}
-
 // ---- H264ENCHRDVCL (LEDGER SR1060): the VCL HRD beside the NAL HRD, replayed as Annex C's Type I point (named tail block) ----
 
 /// The bits of the access unit the Type I CPB receives (C.1): VCL NAL units (nal_unit_type 1..=5) and filler data.
@@ -533,4 +472,161 @@ fn l_vcl_hrd_off_is_byte_identical() {
     assert_eq!(bytes(Config { hrd: false, hrd_vcl: true, ..cbr400(30) }), bytes(Config { hrd: false, ..cbr400(30) }), "hrd_vcl without hrd moved bytes");
     assert_eq!(bytes(Config { hrd_vcl: false, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl false is the default's bytes");
     assert_ne!(bytes(Config { hrd_vcl: true, ..cbr400(6) }), bytes(cbr400(6)), "hrd_vcl wrote nothing");
+}
+
+// ---- H264ENCHRDPICSTRUCT (LEDGER SR1066): pic_struct in the pic_timing SEI (named tail block) ----
+// h264_core reads pic_struct_present_flag and drops it, and its pic_timing note stops after the two delays (the message is
+// skipped by its size): the payload bits are read here (owed H264CORE-PICSTRUCT retires this reader).
+
+use h264enc_core::PicStruct;
+
+/// NumClockTS per pic_struct 0..=8 (D.2.3 Table D-1).
+const NUM_CLOCK_TS: [usize; 9] = [1, 1, 1, 2, 2, 3, 3, 2, 3];
+
+/// The pic_struct fields of every pic_timing message of the access unit's SEI NAL units.
+fn pic_structs(au: &Access) -> Vec<(u8, Vec<bool>)> {
+    au.nals.iter().filter(|n| n[0] & 0x1f == NAL_SEI).filter_map(|n| pic_struct_of(&rbsp(n))).collect()
+}
+
+/// One SEI RBSP's pic_timing (payloadType 1) pic_struct and clock_timestamp_flags, when the payload is longer than the six
+/// bytes of the two 24-bit delays (the SPS's HRD: tests a-c); the payload alignment after them is bit 1 then zeros (D.1.1).
+fn pic_struct_of(r: &[u8]) -> Option<(u8, Vec<bool>)> {
+    let mut i = 0usize;
+    while i + 1 < r.len() {
+        let mut field = || {
+            let mut v = 0usize;
+            while r[i] == 0xFF {
+                v += 255;
+                i += 1;
+            }
+            v += r[i] as usize;
+            i += 1;
+            v
+        };
+        let (ty, size) = (field(), field());
+        let body = &r[i..i + size];
+        i += size;
+        if ty != 1 || size <= 6 {
+            continue;
+        }
+        let bit = |k: usize| body[k / 8] >> (7 - k % 8) & 1 == 1;
+        let ps = (48..52).fold(0u8, |v, k| v << 1 | bit(k) as u8);
+        let n = NUM_CLOCK_TS[ps.min(8) as usize];
+        let flags: Vec<bool> = (52..52 + n).map(bit).collect();
+        assert!(bit(52 + n), "pic_timing: bit_equal_to_one after the pic_struct fields");
+        assert!((53 + n..size * 8).all(|k| !bit(k)), "pic_timing: zero alignment bits");
+        return Some((ps, flags));
+    }
+    None
+}
+
+/// Config::pic_struct under the CBR HRD: the SPS differs from the None twin's in exactly the pic_struct_present_flag (one bit,
+/// h264_core's parse otherwise equal, the bitstream restriction after it included), every pic_timing carries the code and
+/// NumClockTS clock_timestamp_flag 0, the delays are the twin's, the CPB replay holds, and h264_core decodes every picture.
+#[test]
+fn m_pic_struct_frame_doubling_signals() {
+    let twin = run(cbr400(6), N, false);
+    let twin_sps = rbsp(&twin[0].nals[0]);
+    let twin_notes = seis(&twin);
+    assert!(twin_notes.iter().all(|s| s.ps.is_empty()), "None: no pic_struct fields");
+    for (p, code, n) in [(PicStruct::FrameDoubling, 7u8, 2usize), (PicStruct::Frame, 0, 1), (PicStruct::FrameTripling, 8, 3)] {
+        let aus = run(Config { pic_struct: Some(p), ..cbr400(6) }, N, true);
+        assert_eq!(aus.len(), N);
+        let sps = rbsp(&aus[0].nals[0]);
+        assert_eq!(sps.len(), twin_sps.len(), "{p:?}: SPS length");
+        let diff: u32 = sps.iter().zip(&twin_sps).map(|(a, b)| (a ^ b).count_ones()).sum();
+        assert_eq!(diff, 1, "{p:?}: the SPS differs in the pic_struct_present_flag alone");
+        let (v, t) = (sps_of(&aus[0].nals[0]), sps_of(&twin[0].nals[0]));
+        assert_eq!(
+            (v.level_idc, v.timing_info, v.nal_hrd, v.vcl_hrd, v.low_delay_hrd, v.max_num_reorder, v.max_dec_frame_buffering),
+            (t.level_idc, t.timing_info, t.nal_hrd, t.vcl_hrd, t.low_delay_hrd, t.max_num_reorder, t.max_dec_frame_buffering),
+            "{p:?}: h264_core reads the same SPS"
+        );
+        let notes = seis(&aus);
+        for (k, (s, o)) in notes.iter().zip(&twin_notes).enumerate() {
+            assert_eq!(s.ps, vec![(code, vec![false; n])], "access unit {k}: {p:?} pic_struct {code} and {n} clock_timestamp_flag 0");
+            assert_eq!(s.pt, o.pt, "access unit {k}: the delays are the None twin's");
+            assert_eq!(s.bp.len(), o.bp.len(), "access unit {k}: buffering periods where the twin has them");
+        }
+        let (fillers, margin, peak) = replay(&aus, &v);
+        println!("hrd pic_struct {p:?}: code {code}, {n} clock_timestamp_flags, {N} access units, fillers {fillers}, replay margin {margin} peak {peak} / {} bits", v.nal_hrd.unwrap().cpb_size);
+    }
+}
+
+/// pic_struct off, or asked without a pic_timing carrier, moves no byte: d's constant-QP pin, hrd off, CRF; None is the default.
+#[test]
+fn n_pic_struct_off_is_byte_identical() {
+    let some = Some(PicStruct::FrameDoubling);
+    let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop: 30, hrd: true, pic_struct: some, ..Default::default() };
+    let samples: Vec<Vec<u8>> = run(cfg, 60, false).iter().map(Access::avcc_sample).collect();
+    assert_eq!(fnv(&samples), 0xd572_6ae5_9a9b_6d9c, "pic_struct without a bucket moved the constant-QP bytes");
+    let bytes = |cfg: Config| -> Vec<Vec<u8>> { run(cfg, N, false).iter().map(Access::annexb).collect() };
+    assert_eq!(bytes(Config { hrd: false, pic_struct: some, ..cbr400(30) }), bytes(Config { hrd: false, ..cbr400(30) }), "pic_struct without hrd moved bytes");
+    let crf = |pic_struct| Config { rate: Some(RateControl::crf(26, (FPS, 1))), pic_struct, ..cbr400(30) };
+    assert_eq!(bytes(crf(some)), bytes(crf(None)), "pic_struct under CRF moved bytes");
+    assert_eq!(bytes(Config { pic_struct: None, ..cbr400(6) }), bytes(cbr400(6)), "pic_struct None is the default's bytes");
+    assert_ne!(bytes(Config { pic_struct: some, ..cbr400(6) }), bytes(cbr400(6)), "pic_struct wrote nothing");
+}
+
+// ---- H264ENCHRDVBRUNDERFLOW (LEDGER SR1050): the VBR row-QP room term at the knife edge (named tail block) ----
+// A VBR picture whose bits pass the max bucket's room at its start (bmax - fmax: the CPB `hrd_au` signals is the bucket's mirror)
+// underflows the CPB. The knife edge: the stream's first IDR has no fitted model, so `Rc::picture` codes it at start_qp (cfg.qp 16
+// here) whatever the target, and only `row_qp` can move it. While the target cap is idle its size does not depend on the max, so
+// the run at max 2000 (room x 15/16 far above it: the term cannot fire) IS the old code's IDR at the knife max: the armed contrast
+// is measured at runtime. rc.rs `Rc::room_step` (SR1050) raises the rows' QP until the projected picture fits the room.
+
+/// [`busy`]'s first picture frozen for 6 frames at VBR mean 64 / max `max` kbit/s, gop 12, cfg.qp 16, deblocking on (so
+/// `Encoder::mb_qps` holds the coded QPs): the access units and the IDR's QP per macroblock row (the row's largest).
+fn knife(max: u32) -> (Vec<Access>, Vec<u8>) {
+    let cfg = Config { width: W as u32, height: H as u32, qp: 16, gop: 12, deblock: true, hrd: true, rate: Some(RateControl::vbr(64, max, (FPS, 1))), ..Default::default() };
+    let mut enc = Encoder::new(cfg).unwrap();
+    let p = busy(0);
+    let (mut aus, mut rows) = (Vec::new(), Vec::new());
+    for t in 0..6 {
+        aus.push(enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap());
+        if t == 0 {
+            rows = enc.mb_qps().chunks(W / 16).map(|r| *r.iter().max().unwrap()).collect();
+        }
+    }
+    (aus, rows)
+}
+
+/// The idle run (max 2000) and the knife run (max = 15/16 of the idle IDR's bits): (idle IDR bits, idle rows, knife units, knife rows).
+fn knife_pair() -> (i128, Vec<u8>, Vec<Access>, Vec<u8>) {
+    let (idle, idle_rows) = knife(2000);
+    let x = bits(&idle[0]);
+    let (aus, rows) = knife((x * 15 / 16 / 1000) as u32);
+    (x, idle_rows, aus, rows)
+}
+
+#[test]
+fn i_vbr_knife_edge_does_not_underflow() {
+    let (x, idle_rows, aus, rows) = knife_pair();
+    let v = sps_of(&aus[0].nals[0]);
+    let cpb = v.nal_hrd.expect("nal_hrd_parameters").cpb_size as i128;
+    let y = bits(&aus[0]);
+    println!("hrd vbr knife edge: idle idr {x} bits rows {idle_rows:?}, cpb {cpb} (old margin {}), knife idr {y} bits rows {rows:?}", cpb - x);
+    println!("  bytes {:?}", aus.iter().map(|a| bits(a) / 8).collect::<Vec<_>>());
+    assert!(cpb < x, "the knife CPB ({cpb}) holds the old code's IDR ({x}): not a knife edge");
+    let (fillers, margin, peak) = replay(&aus, &v);
+    println!("  arrival margin min {margin} bits, cpb peak {peak} / {cpb} bits");
+    assert_eq!(fillers, 0, "VBR pads nothing");
+    assert!(margin >= 0);
+    assert!(y <= cpb && y < x, "the knife IDR ({y}) shrank below the CPB ({cpb}) and the old IDR ({x})");
+    // Measured (SR1050 EXCEPTION runs): at the old rc.rs the knife run's IDR was 111928 bits and `replay` panicked (CPB underflow,
+    // old margin 104000 - 111936 = -7936); with the room term the IDR is 93800 bits and the smallest margin 5698.
+    assert_eq!((x, cpb, y, margin), (111_936, 104_000, 93_800, 5_698), "idle IDR, knife CPB, knife IDR, arrival margin");
+}
+
+#[test]
+fn j_vbr_row_qp_steps_are_bounded() {
+    let (_, idle_rows, _, rows) = knife_pair();
+    let term: Vec<i32> = rows.iter().zip(&idle_rows).map(|(&k, &i)| k as i32 - i as i32).collect();
+    println!("hrd vbr knife row term {term:?} (idle rows {idle_rows:?}, knife rows {rows:?})");
+    assert_eq!(term[0], 0, "row 0 never reaches rc_row");
+    assert!(term.iter().all(|d| (0..=6).contains(d)), "the room term is bounded at +6");
+    assert!(term.windows(2).all(|w| w[0] <= w[1]), "the room term never falls within the picture");
+    assert!(term.iter().any(|&d| d > 0), "the room term never fired at the knife edge");
+    // Measured (SR1050): idle rows [16, 19 x 5] (row_qp's +3), knife rows [16, 22, 24, 25, 25, 25]; at the old rc.rs the term was all 0.
+    assert_eq!(term, [0, 3, 5, 6, 6, 6], "the room term per macroblock row");
 }
