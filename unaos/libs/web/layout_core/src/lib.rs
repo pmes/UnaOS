@@ -296,12 +296,12 @@ pub struct Adv {
     pub size: f32,
     pub letter_spacing: f32,
     pub word_spacing: f32,
-    pub rtl: bool,
+    pub rtl: bool, pub small_caps: bool,
 }
 
 impl Adv {
     pub fn new(sel: FontSel, size: f32, letter_spacing: f32) -> Self {
-        Adv { sel, size, letter_spacing, word_spacing: 0.0, rtl: false }
+        Adv { sel, size, letter_spacing, word_spacing: 0.0, rtl: false, small_caps: false }
     }
     pub fn with_word_spacing(mut self, ws: f32) -> Self {
         self.word_spacing = ws;
@@ -378,5 +378,16 @@ pub trait Fonts {
     /// (`prior` = some of it is content); the first `first_n` lines (at least one) start at `start_x` (SR779: a float). The default is [`lines::break_lines_from`] over [`Fonts::measure`].
     fn break_lines(&self, text: &str, mode: &TextMode, adv: &Adv, max_w: f32, start_x: f32, first_n: usize, prior: bool) -> Vec<Line> {
         lines::break_lines_from(self, adv, text, mode, max_w, start_x, first_n, prior)
+    }
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): the measurer carries the small-caps synthesis bit (named tail block) ----
+
+impl Adv {
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): synthesize small capitals in this run (`paint::small_caps_synth`); the
+    /// host's measurer splits the run by [`inline::small_caps_segments`].
+    pub fn with_small_caps(mut self, on: bool) -> Self {
+        self.small_caps = on;
+        self
     }
 }
