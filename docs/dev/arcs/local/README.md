@@ -1,5 +1,12 @@
 # Local executor packs (pack 1 Aether; pack 2 Stria; BACKLOG.md: open-ended)
 
+**HOW MANY RUN AT ONCE: ALL OF THEM. NEVER ONE AT A TIME.** The local seat launches EVERY ready arc as a BACKGROUND
+agent (`Agent` tool, `subagent_type: claude`, `model: opus`, `run_in_background: true`) in ONE message, nine launches in
+one response, and only THEN starts reading designs. It never launches one executor and waits for it to finish. Designs
+arrive as messages while the others run; the seat answers each `MEASURE:` as it comes. A slot is free the moment an
+executor hands back; the seat fills it from BACKLOG.md in the same turn. "The order of one local arc" below is the
+LIFECYCLE of a single arc, not a queue: nine arcs are at different steps of it at the same time.
+
 The cloud seat cuts arcs, measures designs (R131), folds branches into `claude/optimistic-ramanujan-r3qyu5`
 and pushes on green. A local session can run executors on the same protocol; the division is BY TRACK so the
 shared-file seams stay inside one machine:
@@ -12,7 +19,7 @@ shared-file seams stay inside one machine:
 
 1. Pull the tip: `git fetch origin claude/optimistic-ramanujan-r3qyu5 && git checkout claude/optimistic-ramanujan-r3qyu5 && git pull --ff-only`.
 2. Worktree + branch from the tip: `git worktree add ../exec/<name> -b exec-rmbp-<name> origin/claude/optimistic-ramanujan-r3qyu5`.
-3. Launch an Opus executor with the launch text below (paste it inline, with `<name>` filled in). It reads
+3. Launch an Opus executor with the launch text below (paste it inline, with `<name>` filled in) as a BACKGROUND agent (`run_in_background: true`), and launch the other ready arcs in the SAME message. Do not wait for one before launching the next. It reads
    `RULES.md` (rules 1-17), its arc file here, `docs/dev/EXECUTOR-BRIEF.md`, `docs/dev/LAWS.md`.
 4. THE FRONT GATE: the executor writes its design and sends it to YOU (the local session is its seat). You answer
    `MEASURE: PASS — <why>` or `MEASURE: FAIL — <why>`; it builds only after PASS, exactly the design.
