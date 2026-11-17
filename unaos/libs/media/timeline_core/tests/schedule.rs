@@ -192,7 +192,7 @@ fn striaopacity_half_top_mixes_the_track_below() {
         assert_eq!(s.seek.is_some(), t == 10, "tick {t}: the top opens once");
     }
     assert!(steps[..10].iter().chain(&steps[20..]).all(|s| s.vmix.is_none()));
-    assert_eq!(steps[20].seek, Some(20 * NS), "V1 reopens after the overlay (NLE-OPACITY-HANDBACK owed)");
+    assert_eq!(steps[20].seek, None, "V1 continues its run after the overlay"); // STRIAOPACITYNEXT (SR993): NLE-OPACITY-HANDBACK built
     assert_eq!(steps[21].seek, None);
 }
 
@@ -245,4 +245,43 @@ fn striaopacity_validate_refuses_by_name() {
     assert_eq!(tl.validate(), Err(EditError::Opacity));
     assert_eq!(tl.set_opacity(&[(a, 0)], 100).map(|t| t.tracks[a].clips[0].opacity), Ok(100));
     assert_eq!(EditError::Opacity.to_string(), "opacity is a percent 0..=100, and video only");
+}
+
+// ---- STRIAOPACITYNEXT (LEDGER SR993): the lower run hands back after an opacity overlay (named tail block) ----
+
+/// 50 % B over A: the first tick after the overlay is A's own step at its own tick with NO seek (the run the overlay
+/// positioned continues), and the tick after it too; the same stack of ONE reel on both tracks still seeks there (the
+/// live run is that reel's too); an opaque stack schedules as before (A reopens at 20).
+#[test]
+fn striaopacitynext_lower_run_hands_back() {
+    let g = Gop { dur: 50 };
+    let steps = schedule(&striaopacity_stack(50), 0..30, &g).unwrap();
+    assert_eq!((steps[20].src, steps[20].src_t, steps[20].track), (Some(SourceId(0)), 20, Some(0)));
+    assert_eq!((steps[20].seek, steps[20].vmix), (None, None));
+    assert_eq!(steps[21].seek, None);
+    let mut one = striaopacity_stack(50);
+    one.tracks[1].clips = vec![Clip::new(SourceId(0), 0, 10, 10).with_opacity(50)];
+    let steps = schedule(&one, 0..30, &g).unwrap();
+    assert_eq!(steps[20].seek, Some(20 * NS), "one reel on both tracks: the live run is not the lower one");
+    let steps = schedule(&striaopacity_stack(timeline_core::OPAQUE), 0..30, &g).unwrap();
+    assert_eq!(steps[20].seek, Some(20 * NS), "opaque: no overlay ran the lower clip");
+}
+
+/// `vmix::take_outgoing` outside a mix: a step with no seek on the mix run's source (the live run another's) takes the
+/// mix run as its live run; with a seek, or the live run already its source's, the mix run is dropped as before.
+#[test]
+fn striaopacitynext_take_outgoing_hands_back() {
+    use timeline_core::vmix::take_outgoing;
+    let (a, b) = (SourceId(0), SourceId(1));
+    let step = |seek: Option<i64>| Step { kind: Kind::Video, track: Some(0), src: Some(a), src_t: 20, out_t: 20, len: 1, seek, vmix: None };
+    let (mut live, mut mix) = (Some(b), Some(a));
+    assert!(!take_outgoing(&step(None), &mut live, &mut mix, |r| *r));
+    assert_eq!((live, mix), (Some(a), None));
+    let (mut live, mut mix) = (Some(b), Some(a));
+    assert!(!take_outgoing(&step(Some(0)), &mut live, &mut mix, |r| *r));
+    assert_eq!((live, mix), (Some(b), None));
+    let (mut live, mut mix) = (Some(a), Some(a));
+    assert!(!take_outgoing(&step(None), &mut live, &mut mix, |r| *r));
+    assert_eq!((live, mix), (Some(a), None));
+    println!("striaopacitynext: the mix run hands back to the live slot");
 }

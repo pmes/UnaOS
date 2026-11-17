@@ -194,13 +194,15 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    /// STRIAOPACITYNEXT (SR993): a success line for the message row ([`Face::message_text`] after `last_error`), cleared by the next taken input ([`Face::clear_note`]).
+    pub note: Option<String>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +210,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -2361,7 +2363,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line()) // STRIAOPACITYNEXT (SR993): a standing note after the error (file tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3113,9 +3115,31 @@ impl Face {
             return None;
         }
         self.last_error = Some(match self.state.verb(v).unwrap_or(Err(EditError::NoClip)) {
-            Ok(()) => format!("opacity: {} %", self.state.selected().map_or(timeline_core::OPAQUE, |c| c.opacity)),
+            Ok(()) => { self.last_error = None; self.note = Some(format!("opacity: {} %", self.state.selected().map_or(timeline_core::OPAQUE, |c| c.opacity))); return Some(true); } // STRIAOPACITYNEXT (SR993): the step's percent is a note, not an error (file tail)
             Err(e) => format!("opacity: {e}"),
         });
         Some(true)
+    }
+}
+
+// ---- STRIAOPACITYNEXT (LEDGER SR993): the face note, a success line that is not an error (named tail block) ----
+// NLE-OPACITY-MORE-NOTE. `Face.note` holds a success line (the opacity step's `opacity: <pct> %`); `message_text` reads it
+// after `last_error`, so the witness and `serve`, which take `last_error`, never report it as an error. The next taken
+// input clears it: a typed word, a click, a press, select-all, a named key, a one-character text; a pointer move, a
+// release, the wheel, a zoom or a resize keeps it.
+
+impl Face {
+    /// STRIAOPACITYNEXT: clear [`Face::note`] when `msg` is a taken input (see the block comment).
+    fn clear_note(&mut self, msg: &SMessage) {
+        let input = match msg {
+            SMessage::Input { .. } | SMessage::BrowserClick(..) | SMessage::BrowserSelectAll => true,
+            SMessage::BrowserButton { down, .. } => *down,
+            SMessage::BrowserKey(_) => true,
+            SMessage::BrowserText(t) => t.chars().count() == 1,
+            _ => false,
+        };
+        if input {
+            self.note = None;
+        }
     }
 }

@@ -925,7 +925,7 @@ mod striaopacityface_tests {
         let n = ids.len();
         assert_eq!(&ids[n - 3..], &["opacity-".to_string(), "opacity+".to_string(), "help".to_string()]);
         let errors = drive(&mut face, "opacity+");
-        assert_eq!(errors, vec!["opacity: 60 %".to_string()]);
+        assert!(errors.is_empty(), "{errors:?}"); assert_eq!(face.message_text().as_deref(), Some("opacity: 60 %")); // STRIAOPACITYNEXT (SR993): the step's percent is a note, not an error
         assert_eq!(face.state.selected().map(|c| c.opacity), Some(60));
         println!("striaopacityface: buttons {:?}; opacity+ -> {errors:?}", &ids[n - 3..]);
     }
