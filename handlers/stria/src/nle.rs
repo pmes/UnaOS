@@ -1025,11 +1025,11 @@ pub fn scan_peaks(sources: &Sources, id: SourceId, per_sec: u32) -> Result<Optio
 /// render's frame size and cached on [`Sources`]. The frame size stays render's rule (the first scheduled media video step's
 /// reel; a titled step sizes nothing); a range whose video steps size nothing but hold a title takes the first untitled
 /// source in `tl.sources` with a video stream, else [`TITLE_SIZE`]. The schedule keys a title itself (every frame is a key).
-pub const TITLE_SIZE: (u32, u32) = (1280, 720);
+pub const TITLE_SIZE: (u32, u32) = timeline_core::view::TITLE_SIZE; // STRIAKTITLE (SR9009): lifted into timeline_core, the kernel Player's too
 /// STRIATITLECLIP: the stills a [`Sources`] keeps, oldest dropped past this many.
 const TITLE_CACHE_MAX: usize = 8;
 /// STRIATITLECLIP: the title ink (straight alpha).
-const TITLE_INK: [u8; 4] = [255, 255, 255, 255];
+const TITLE_INK: [u8; 4] = timeline_core::view::TITLE_INK; // STRIAKTITLE (SR9009): lifted into timeline_core
 
 /// STRIATITLECLIP: the still cache, `(text, w, h, still)`; locked for one find or one push, never across a raster.
 type TitleCache = std::sync::Mutex<Vec<(String, u32, u32, Arc<timeline_core::view::Still>, timeline_core::TitleStyle)>>; // STRIAFREEZETHREE (SR9029): keyed by the style too
@@ -1041,16 +1041,18 @@ fn titled(tl: &Timeline, src: SourceId) -> bool {
 
 /// STRIATITLECLIP: when nothing sized the frame and a video step (or its outgoing) is a title, the size rule above.
 fn title_size(tl: &Timeline, sources: &Sources, steps: &[timeline_core::schedule::Step], r: &mut RenderReport) {
-    let has_title = steps.iter().filter(|s| s.kind == Kind::Video).flat_map(|s| [s.src, s.vmix.and_then(|m| m.src)]).flatten().any(|src| titled(tl, src));
-    if r.width != 0 || !has_title {
+    if r.width != 0 {
         return;
     }
-    let reel = tl.sources.iter().filter(|s| s.title.is_none()).find_map(|s| {
-        if let Some(q) = sources.seq(s.id) { return Some((q.w, q.h)); } let m = sources.get(s.id).ok()?; // STRIASEQMORE (SR978): a sequence reel sizes a title-only range by its first file (file tail)
+    // STRIAKTITLE (SR9009): the rule is timeline_core's `view::title_size` (the kernel Player calls the same fn)
+    let size = timeline_core::view::title_size(tl, steps, |id| {
+        if let Some(q) = sources.seq(s.id) { return Some((q.w, q.h)); } let m = sources.get(id).ok()?; // STRIASEQMORE (SR978): a sequence reel sizes a title-only range by its first file (file tail)
         let t = &m.demux.tracks()[m.video?];
         (t.width > 0 && t.height > 0).then_some((t.width, t.height))
     });
-    (r.width, r.height) = reel.unwrap_or(TITLE_SIZE);
+    if let Some(wh) = size {
+        (r.width, r.height) = wh;
+    }
 }
 
 /// STRIATITLECLIP: the frame of title source `src` at source tick `src_t` (`None`: not a title): the cached still at the
@@ -1843,15 +1845,16 @@ pub fn title_card(text: &str, style: &timeline_core::TitleStyle, w: u32, h: u32)
     let mut rgba = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
     let lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
     let mut ts = TextStyle::new(&["sans"], (h as f32 / 10.0 * (style.size as f32 / 10.0)).max(8.0));
-    let mut shaped: Vec<text_host::line::Line> = lines.iter().map(|l| ts.shape(l)).collect();
-    let widest = |v: &[text_host::line::Line]| v.iter().map(|l| l.width).fold(0.0f32, f32::max);
-    let room = w as f32 * 0.9;
-    let wide = widest(&shaped);
-    if wide > room {
-        ts.size = (ts.size * room / wide).max(1.0);
-        shaped = lines.iter().map(|l| ts.shape(l)).collect();
-    }
-    let block = |v: &[text_host::line::Line]| v.first().map_or(0.0, |l| l.height()) * v.len() as f32;
+    // STRIAKTITLE (SR9009): size, shrink and centring are timeline_core's `view::title_fit` (the kernel Player's too)
+    let (px, x, baseline) = timeline_core::view::title_fit(w, h, &mut |px| {
+        style.size = px;
+        let l = style.shape(text);
+        (l.width, l.ascent, l.descent)
+    });
+    style.size = px;
+    let shaped: Vec<text_host::line::Line> = lines.iter().map(|l| ts.shape(l)).collect();
+    let widest = |v: &[text_host::line::Line]| v.iter().map(|l| l.width).fold(0.0f32, f32::maxlet wide = widest(&shaped);
+    widetstswideshapedlines.iter().map(|l| tsl)).collect(block = |v: &[text_host::line::Line]| v.first().map_or(0.0, |l| l.height()) * v.len() as f32;
     let tall = block(&shaped);
     if tall > h as f32 * 0.9 {
         ts.size = (ts.size * h as f32 * 0.9 / tall).max(1.0);
@@ -1861,12 +1864,12 @@ pub fn title_card(text: &str, style: &timeline_core::TitleStyle, w: u32, h: u32)
     let (mid, step, n) = ((h as f32 + first.ascent - first.descent) / 2.0, first.height(), shaped.len());
     let ink = [style.ink[0], style.ink[1], style.ink[2], TITLE_INK[3]];
     for (i, line) in shaped.iter().enumerate() {
-        let x = match style.align {
+        let  match style.align {
             timeline_core::TitleAlign::Left => (w as f32 * 0.05).round(),
-            timeline_core::TitleAlign::Centre => ((w as f32 - line.width) / 2.0).round(),
+            timeline_core::TitleAlign::Centre =>,
             timeline_core::TitleAlign::Right => (w as f32 * 0.95 - line.width).round(),
-        };
-        let baseline = (mid - (n - 1) as f32 * step / 2.0 + i as f32 * step).round();
+        }
+        mid - n - 1)*step + i as f32 * step);
         line.paint(&mut rgba, w, h, w as usize * 4, PixelOrder::Rgba, x, baseline, ink, (0, w as i32));
     }
     timeline_core::view::Still { width: w, height: h, rgba }
