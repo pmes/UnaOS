@@ -845,7 +845,7 @@ impl EditorState {
     }
     /// The key words of [`EditorState::verb`]; `None` when `v` is none of them.
     fn xkey_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if let Some(r) = self.xease_verb(v) { return Some(r); } let w: Vec<&str> = v.split_ascii_whitespace().collect(); // STRIAXFORMKEYSEASE (SR9070): `pip ease`, `pip ease <name>` (file tail)
         if !matches!(w.as_slice(), ["pip", "key"] | ["pip", "unkey"] | ["pip", "unkey", "all"]) {
             return None;
         }
@@ -862,6 +862,36 @@ impl EditorState {
             _ => c.xkeys.without(c.src_tick(ph)),
         };
         Some(match keys {
+            Some(k) => self.set_xkeys(k),
+            None => Err(EditError::XKey),
+        })
+    }
+}
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the placement points' ease words through the one key commit (named tail block) ----
+// `pip ease` steps the selected keyed clip's curve through [`crate::Ease::ALL`] (InOut wraps to Linear); `pip ease <name>`
+// ([`crate::Ease::from_name`]: linear / in / out / inout) sets it. Each ONE commit of SR9049's [`EditorState::set_xkeys`];
+// the same curve again commits nothing. Refused: no clip selected `EditError::NoClip`; an audio clip `EditError::Kind`;
+// a clip with no points, an unknown name or extra words `EditError::XKey`.
+impl EditorState {
+    /// The ease words of [`EditorState::verb`]; `None` when `v` is none of them.
+    fn xease_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let w: Vec<&str> = v.split_ascii_whitespace().collect();
+        if !matches!(w.as_slice(), ["pip", "ease", ..]) {
+            return None;
+        }
+        let Some(c) = self.selected() else { return Some(Err(EditError::NoClip)) };
+        if self.selection.is_some_and(|(t, _)| self.timeline.tracks.get(t).is_some_and(|tr| tr.kind != crate::Kind::Video)) {
+            return Some(Err(EditError::Kind));
+        }
+        let keys = c.xkeys;
+        let all = crate::Ease::ALL;
+        let e = match w.as_slice() {
+            ["pip", "ease"] => Some(all[(all.iter().position(|&e| e == keys.ease()).unwrap_or(0) + 1) % all.len()]),
+            ["pip", "ease", name] => crate::Ease::from_name(name),
+            _ => None,
+        };
+        Some(match e.and_then(|e| keys.eased(e)) {
             Some(k) => self.set_xkeys(k),
             None => Err(EditError::XKey),
         })

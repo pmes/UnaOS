@@ -187,7 +187,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         ["crop", l, t, r, b] => SMessage::Input { target: SURFACE.into(), text: format!("crop {l} {t} {r} {b}") }, // STRIACROP (SR867): `crop:250:0:250:0`, the selected clip's crop
-        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word)
+        ["pip", x, y] => SMessage::Input { target: SURFACE.into(), text: format!("pip {x} {y}") }, ["pip", "off"] => SMessage::Input { target: SURFACE.into(), text: "pip off".into() }, ["scale", n] => SMessage::Input { target: SURFACE.into(), text: format!("scale {n}") }, ["pip", c @ ("tl" | "tr" | "bl" | "br" | "left" | "right" | "up" | "down" | "key" | "unkey" | "ease")] => SMessage::Input { target: SURFACE.into(), text: format!("pip {c}") }, // STRIAXFORMMORE (SR975): `pip:left` ... the nudge words; STRIAXFORMPRESETS (SR938): `pip:tl` ... the corner presets; STRIAPOSITIONSCALE (SR879): `pip:725:725` / `pip:off` / `scale:250`, the selected clip's placement (bare `pip` is a VERBS word); STRIAXFORMKEYSEASE (SR9070): `pip:ease` cycles, `pip:ease:inout` sets (the x y arm)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
     };
@@ -1019,3 +1019,30 @@ mod striaxformkeys_tests {
         assert_eq!(face.state.undo_depth(), 3);
     }
 }
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the witness's placement ease tokens (named tail block) ----
+#[cfg(test)]
+mod striaxformkeysease_tests {
+    use super::*;
+
+    /// STRIAXFORMKEYSEASE (SR9070): `pip:ease` steps the keyed clip's curve and `pip:ease:inout` sets it, one undo step
+    /// each; with the points gone `pip:ease` is refused by name and commits nothing.
+    #[test]
+    fn striaxformkeysease_witness_ease_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0").is_empty());
+        face.state.playhead = 12;
+        let errors = drive(&mut face, "pip:tl,pip:key,pip:ease");
+        assert!(errors.is_empty(), "{errors:?}");
+        let ease = |face: &Face| face.state.selected().map(|c| c.xkeys.ease());
+        assert_eq!((face.state.undo_depth(), ease(&face)), (3, Some(timeline_core::Ease::In)));
+        assert!(drive(&mut face, "pip:ease:inout").is_empty());
+        assert_eq!((face.state.undo_depth(), ease(&face)), (4, Some(timeline_core::Ease::InOut)));
+        assert!(drive(&mut face, "pip:unkey").is_empty());
+        assert_eq!(ease(&face), Some(timeline_core::Ease::Linear));
+        assert_eq!(drive(&mut face, "pip:ease"), vec![format!("pip ease: {}", timeline_core::EditError::XKey)]);
+        assert_eq!(face.state.undo_depth(), 5);
+    }
+}
+

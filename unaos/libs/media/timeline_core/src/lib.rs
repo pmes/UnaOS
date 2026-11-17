@@ -412,7 +412,7 @@ impl core::fmt::Display for EditError {
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
             EditError::Opacity => "opacity is a percent 0..=100, and video only",
             EditError::Xform => "pip is x y and scale s in 1/1000 with x + s and y + s at most 1000",
-            EditError::XKey => "a placement key needs the playhead on the selected clip, at most 8 points, and a point there to remove",
+            EditError::XKey => "a placement key needs the playhead on the selected clip, at most 8 points, and a point there to remove, and a keyed clip for an ease (linear|in|out|inout)",
         })
     }
 }
@@ -1846,6 +1846,7 @@ impl Xform {
 pub struct XKeys {
     n: u8,
     k: [(i64, Xform); XKEYS_MAX],
+    ease: Ease, // STRIAXFORMKEYSEASE (SR9070): the curve between every two points (Linear: none; read through `ease()`; file tail)
 }
 
 /// The most points one clip carries (the array length; [`XKeys::MAX`]).
@@ -1861,7 +1862,7 @@ impl XKeys {
     /// The most points one clip carries.
     pub const MAX: usize = XKEYS_MAX;
     /// No points (the clip's static `xform` is shown).
-    pub const NONE: XKeys = XKeys { n: 0, k: [(0, Xform::NONE); XKEYS_MAX] };
+    pub const NONE: XKeys = XKeys { n: 0, k: [(0, Xform::NONE); XKEYS_MAX], ease: Ease::Linear };
     pub fn len(&self) -> usize {
         self.n as usize
     }
@@ -1899,11 +1900,12 @@ impl XKeys {
         out.k.copy_within(i + 1..self.len(), i);
         out.n -= 1;
         out.k[out.len()] = (0, Xform::NONE);
+        if out.n == 0 { out.ease = Ease::Linear; } // STRIAXFORMKEYSEASE (SR9070): no points carry no ease
         Some(out)
     }
     /// Sorted, unique ticks, at most [`XKeys::MAX`], every rect inside the frame.
     pub fn ok(&self) -> bool {
-        self.len() <= XKeys::MAX && self.iter().all(|p| p.1.ok()) && self.k[..self.len()].windows(2).all(|w| w[0].0 < w[1].0)
+        self.len() <= XKeys::MAX && self.iter().all(|p| p.1.ok()) && self.k[..self.len()].windows(2).all(|w| w[0].0 < w[1].0) && (self.n > 0 || self.ease == Ease::Linear) // STRIAXFORMKEYSEASE (SR9070): an ease needs points
     }
     /// The placement at source tick `t`: `None` with no points; the first point's before it, the last point's after it,
     /// else x, y and s linear between the two points around `t`, through [`Xform::clamped`].
@@ -1918,7 +1920,7 @@ impl XKeys {
         }
         let i = k.iter().position(|p| p.0 > t)?;
         let ((t0, a), (t1, b)) = (k[i - 1], k[i]);
-        let lerp = |p: u16, q: u16| (p as i64 + (q as i64 - p as i64) * (t - t0) / (t1 - t0)) as i32;
+        let f = self.seg_frac(t - t0, t1 - t0); let lerp = |p: u16, q: u16| (p as i64 + (q as i64 - p as i64) * f.num / f.den) as i32; // STRIAXFORMKEYSEASE (SR9070): the clip's ease on the segment (file tail)
         Some(Xform::clamped(lerp(a.s, b.s), lerp(a.x, b.x), lerp(a.y, b.y)))
     }
 }
@@ -1951,5 +1953,33 @@ impl Timeline {
         let mut tl = self.clone();
         clip_mut(&mut tl, track, idx)?.xkeys = keys;
         Ok(tl)
+    }
+}
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the placement points' per-clip ease (named tail block) ----
+// A keyed clip carries ONE [`Ease`] (SR679's curve, exact integer rationals) applied by [`XKeys::at`] between every two
+// points; Linear (the default, no EDL line) keeps SR9049's exact arithmetic. A non-linear curve reads the segment's
+// position quantized to 1/`XEASE_Q` before [`Ease::apply`], so no i64 overflows however far apart the points are; the
+// result still goes through the one clamp [`Xform::clamped`]. No points carry no ease ([`XKeys::ok`]). The EDL's
+// `* UNA XEASE` line (edl.rs), the editor's `pip ease` words (editor.rs).
+
+/// The steps a non-linear ease reads a segment's position in (den^3 = 2^36 inside `Ease::apply`).
+const XEASE_Q: i64 = 4096;
+
+impl XKeys {
+    /// The curve between the points ([`Ease::Linear`] when none).
+    pub fn ease(&self) -> Ease {
+        self.ease
+    }
+    /// The same points with the curve `e`; `None` when there are no points to ease.
+    pub fn eased(self, e: Ease) -> Option<XKeys> {
+        (self.n > 0).then_some(XKeys { ease: e, ..self })
+    }
+    /// The eased weight of `num / den` along one segment (`0 <= num < den`): exact when Linear.
+    fn seg_frac(&self, num: i64, den: i64) -> schedule::Frac {
+        match self.ease {
+            Ease::Linear => schedule::Frac { num, den },
+            e => e.apply(schedule::Frac { num: num * XEASE_Q / den, den: XEASE_Q }),
+        }
     }
 }

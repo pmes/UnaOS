@@ -755,3 +755,98 @@ mod striaxformkeys {
         assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "a point with no event above");
     }
 }
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the placement points' per-clip ease (named tail block) ----
+mod striaxformkeysease {
+    use super::base;
+    use timeline_core::edl::{self, EdlError};
+    use timeline_core::editor::EditorState;
+    use timeline_core::{Ease, EditError, XKeys, Xform};
+
+    #[test]
+    fn striaxformkeysease_ease_curves_through_at() {
+        let (a, b) = (Xform { x: 0, y: 0, s: 500 }, Xform { x: 500, y: 500, s: 500 });
+        let k = XKeys::NONE.with(0, a).unwrap().with(10, b).unwrap();
+        assert_eq!(k.ease(), Ease::Linear, "points start linear");
+        let x_at = |k: XKeys, t: i64| k.at(t).map(|xf| xf.x);
+        assert_eq!(x_at(k, 5), Some(250));
+        for (e, mid, two) in [(Ease::In, 125, 19), (Ease::Out, 375, 179), (Ease::InOut, 250, 51)] {
+            let ke = k.eased(e).unwrap();
+            assert_eq!((ke.ease(), x_at(ke, 5), x_at(ke, 2)), (e, Some(mid), Some(two)), "{e:?}");
+            assert_eq!((ke.at(-1), ke.at(20)), (Some(a), Some(b)), "held outside the points");
+            assert_eq!(ke.at(5).map(|xf| (xf.y, xf.s)), Some((mid, 500)));
+            assert!(ke.ok());
+        }
+        assert_eq!(XKeys::NONE.eased(Ease::In), None, "no points to ease");
+        let one = XKeys::NONE.with(5, Xform::PIP).unwrap().eased(Ease::Out).unwrap();
+        assert_eq!(one.without(5), Some(XKeys::NONE), "the last point gone takes its ease");
+        assert_eq!(k.eased(Ease::Linear), Some(k));
+        let far = XKeys::NONE.with(0, a).unwrap().with(4_000_000_000, b).unwrap().eased(Ease::InOut).unwrap();
+        assert_eq!(x_at(far, 2_000_000_000), Some(250), "points far apart: no overflow");
+    }
+
+    #[test]
+    fn striaxformkeysease_ease_word_one_undo_step() {
+        let (tl, _, _) = base();
+        let mut st = EditorState::new(tl.clone());
+        assert_eq!(st.verb("pip ease"), Some(Err(EditError::NoClip)));
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("pip ease"), Some(Err(EditError::XKey)), "no points to ease");
+        assert_eq!(st.undo_depth(), 0);
+        st.playhead = 10;
+        assert_eq!(st.verb("pip key"), Some(Ok(())));
+        assert_eq!(st.verb("pip tl"), Some(Ok(())));
+        st.playhead = 19;
+        assert_eq!(st.verb("pip br"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), 3);
+        let ease = |st: &EditorState| st.selected().map(|c| c.xkeys.ease());
+        assert_eq!(st.verb("pip ease"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), ease(&st)), (4, Some(Ease::In)));
+        assert_eq!(st.timeline.xform_at(0, 14), Xform { x: 163, y: 163, s: 250 }, "the one lookup reads the ease");
+        for (d, e) in [(5, Ease::Out), (6, Ease::InOut), (7, Ease::Linear)] {
+            assert_eq!(st.verb("pip ease"), Some(Ok(())));
+            assert_eq!((st.undo_depth(), ease(&st)), (d, Some(e)));
+        }
+        assert_eq!(st.timeline.xform_at(0, 14), Xform { x: 336, y: 336, s: 250 }, "linear again: SR9049's value");
+        assert_eq!(st.verb("pip ease inout"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), ease(&st)), (8, Some(Ease::InOut)));
+        assert_eq!(st.verb("pip ease InOut"), Some(Ok(())), "the same curve again");
+        assert_eq!(st.undo_depth(), 8, "the same curve commits nothing");
+        assert_eq!(st.verb("pip ease sideways"), Some(Err(EditError::XKey)));
+        assert_eq!(st.verb("pip ease in out"), Some(Err(EditError::XKey)));
+        assert_eq!(st.undo_depth(), 8, "a refused word commits nothing");
+        assert_eq!(st.verb("pip unkey all"), Some(Ok(())));
+        assert_eq!((st.undo_depth(), ease(&st)), (9, Some(Ease::Linear)));
+        assert_eq!(st.verb("pip ease"), Some(Err(EditError::XKey)));
+        assert!(st.undo());
+        assert_eq!(ease(&st), Some(Ease::InOut));
+        let mut au = EditorState::new(tl.clone());
+        au.timeline.tracks[1].clips = tl.tracks[0].clips.clone();
+        au.select(1, 0).unwrap();
+        assert_eq!(au.verb("pip ease"), Some(Err(EditError::Kind)));
+    }
+
+    #[test]
+    fn striaxformkeysease_edl_xease_round_trip_and_refusals() {
+        let (tl, _, _) = base();
+        let plain = edl::write(&tl, "T").unwrap();
+        let k = XKeys::NONE.with(20, Xform::PIP).unwrap().with(29, Xform { x: 0, y: 0, s: 500 }).unwrap();
+        let lin = edl::write(&tl.set_xkeys(0, 1, k).unwrap(), "T").unwrap();
+        assert!(!lin.contains("XEASE"), "linear: no line");
+        let ke = k.eased(Ease::Out).unwrap();
+        let text = edl::write(&tl.set_xkeys(0, 1, ke).unwrap(), "T").unwrap();
+        assert!(text.contains("* UNA XKEY 29 0 0 500\n* UNA XEASE out\n"), "{text}");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back.tracks[0].clips[1].xkeys, ke);
+        assert_eq!(edl::write(&back, "T").unwrap(), text);
+        for bad in ["* UNA XEASE linear", "* UNA XEASE sideways", "* UNA XEASE out\n* UNA XEASE in"] {
+            let t = text.replace("* UNA XEASE out", bad);
+            assert!(matches!(edl::parse(&t, 25), Err(EdlError::Syntax { .. })), "{bad}");
+        }
+        let early = text.replace("* UNA XEASE out\n", "").replace("* UNA XKEY 20 ", "* UNA XEASE out\n* UNA XKEY 20 ");
+        assert!(early != text && matches!(edl::parse(&early, 25), Err(EdlError::Syntax { .. })), "an ease before any point");
+        let lead = plain.replacen("\n001 ", "\n* UNA XEASE in\n001 ", 1);
+        assert!(lead != plain && matches!(edl::parse(&lead, 25), Err(EdlError::Syntax { .. })), "an ease with no event above");
+    }
+}
+

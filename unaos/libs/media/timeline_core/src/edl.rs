@@ -213,7 +213,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             want_comment(l, line, last_trans.and_then(|i| trans.get_mut(i)).filter(|x| x.0 == Kind::Video).map(|x| &mut x.2))?; if let Some(r) = l.strip_prefix("* UNA EASE ") {
                 ease_comment(r, line, last_trans.and_then(|i| trans.get_mut(i)).map(|x| &mut x.2))?; // NLEWIPES (SR679)
             }
-            xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+            xease_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xkey_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; xform_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; crop_comment(l, line, cur.and_then(|i| events.get_mut(i)).filter(|e| e.1 == Kind::Video).map(|e| &mut e.3))?; if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
             }
             alpha_comment(l, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?; if l.starts_with("* UNA XFADE") {
@@ -438,7 +438,7 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.end(), fps)
         ));
         s.push_str(&ease_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); s.push_str(&want_line(tl.tracks[*ti].transitions.iter().find(|x| x.at == c.at))); // NLEWIPES (SR679)
-        s.push_str(&crop_line(c)); s.push_str(&xform_line(c)); s.push_str(&xkey_lines(c)); if c.gain_cdb != 0 {
+        s.push_str(&crop_line(c)); s.push_str(&xform_line(c)); s.push_str(&xkey_lines(c)); s.push_str(&xease_line(c)); if c.gain_cdb != 0 {
             s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
         }
         if c.fade_in != 0 || c.fade_out != 0 {
@@ -733,4 +733,30 @@ fn xkey_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), Edl
 /// STRIAXFORMKEYS: the clip's `* UNA XKEY` lines, or nothing when it has no points.
 fn xkey_lines(c: &Clip) -> String {
     c.xkeys.iter().map(|(t, xf)| format!("* UNA XKEY {} {} {} {}\n", t, xf.x, xf.y, xf.s)).collect()
+}
+
+// ---- STRIAXFORMKEYSEASE (LEDGER SR9070): the clip's `* UNA XEASE` line (named tail block) ----
+// `* UNA XEASE <in|out|inout>` is the curve ([`crate::XKeys::ease`]) between the placement points of the VIDEO event line
+// above it, written right after the clip's XKEY lines and only when the clip is keyed and its curve is not linear, so an
+// EDL with no ease writes as before. One with no video event above it, no XKEY point above it on that event, `linear` or
+// an unknown word, or a second XEASE for one clip is a syntax error.
+
+/// STRIAXFORMKEYSEASE: apply a `* UNA XEASE` line to the video event above it (`None`: none there); any other line is not this one.
+fn xease_comment(l: &str, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let Some(r) = l.strip_prefix("* UNA XEASE ") else { return Ok(()) };
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    let e = Ease::from_name(r.trim()).filter(|e| *e != Ease::Linear).ok_or(EdlError::Syntax { line })?;
+    if c.xkeys.ease() != Ease::Linear {
+        return Err(EdlError::Syntax { line });
+    }
+    c.xkeys = c.xkeys.eased(e).ok_or(EdlError::Syntax { line })?;
+    Ok(())
+}
+
+/// STRIAXFORMKEYSEASE: the clip's `* UNA XEASE` line, or nothing when it is unkeyed or linear.
+fn xease_line(c: &Clip) -> String {
+    match c.xkeys.ease() {
+        Ease::Linear => String::new(),
+        e => format!("* UNA XEASE {}\n", e.name()),
+    }
 }

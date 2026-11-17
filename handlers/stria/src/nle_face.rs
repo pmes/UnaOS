@@ -3112,7 +3112,7 @@ impl Face {
         }
         match self.state.verb(v)? {
             Ok(()) => {
-                self.xform_note = self.state.selected().map(|c| (c.xform_at(self.state.playhead), c.xkeys.len())).map(|(xf, n)| format!("pip: x {} y {} scale {}{}", xf.x, xf.y, xf.s, if n > 0 { format!(" keys {n}") } else { String::new() })); // STRIAXFORMKEYS (SR9049): the placement shown at the playhead, its key count when keyed
+                self.xform_note = self.state.selected().map(|c| (c.xform_at(self.state.playhead), c.xkeys.len(), c.xkeys.ease())).map(|(xf, n, e)| format!("pip: x {} y {} scale {}{}{}", xf.x, xf.y, xf.s, if n > 0 { format!(" keys {n}") } else { String::new() }, if e != timeline_core::Ease::Linear { format!(" ease {}", e.name()) } else { String::new() })); // STRIAXFORMKEYS (SR9049): the placement shown at the playhead, its key count when keyed; STRIAXFORMKEYSEASE (SR9070): its ease when not linear
             }
             Err(e) => self.last_error = Some(format!("{v}: {e}")),
         }
