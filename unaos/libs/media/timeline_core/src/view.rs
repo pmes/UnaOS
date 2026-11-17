@@ -5051,3 +5051,209 @@ mod striathumbnailsthree_tests {
         assert!(bars[7] > bars[0], "the bar grows inside one tick: {bars:?}");
     }
 }
+
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the placement drag on the preview (named tail block) ----
+// NLE-XFORM-DRAG: a press in the preview band on the rect of a PLACED primary (`Clip::xform` not [`crate::Xform::NONE`]),
+// the video clip at the playhead the schedule shows (`schedule::top`), begins an [`XformDrag`]: within [`XFORM_GRAB`] px of
+// a corner of the rect it scales the rect with the opposite corner fixed, elsewhere inside it moves the rect. The picture
+// rect `q` is the still letterboxed into the band (`SizePolicy::Letterbox.place`, the geometry SR960's crop drag reads),
+// so a pointer delta maps to 1/1000 of the frame through `q`; every result passes SR975's ONE clamp
+// ([`crate::Xform::clamped`]). While live the face paints [`XformDrag::shown`] (the clip at the dragged placement) and
+// [`paint_xform_drag`] (the dragged rect in [`HANDLE`]); the release commits ONCE through `EditorState::set_xform`. A
+// press on an unplaced clip, or outside the rect, is not this drag's (SR960's crop drag owns the picture's edges of an
+// unplaced clip). The kernel Player never builds one (it refuses a placed timeline).
+
+/// STRIAXFORMTHREE (SR9033): how near (px) a press must come to a corner of the placed rect to scale it.
+pub const XFORM_GRAB: f64 = 6.0;
+
+/// STRIAXFORMTHREE (SR9033): one placement drag on the preview picture (begun by a press, updated by moves, committed ONCE).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XformDrag {
+    pub track: usize,
+    pub idx: usize,
+    /// The picture rect in the preview band at the press (canvas px).
+    pub q: yuv_core::scale::Rect,
+    /// The corner grabbed (bit 1 right, bit 2 bottom: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right); `None` moves.
+    pub corner: Option<u8>,
+    /// The press and the pointer now (canvas px).
+    pub origin: (f64, f64),
+    pub at: (f64, f64),
+    /// The primary's placement at the press.
+    pub xf0: crate::Xform,
+}
+
+impl XformDrag {
+    /// A press at `(x, y)` on layout `l` whose preview still is `sw x sh`: a placement drag when the primary is a placed
+    /// video clip shown at the playhead and the press is on its rect (a corner within [`XFORM_GRAB`]); else `None`.
+    pub fn begin(st: &EditorState, l: Layout, sw: u32, sh: u32, x: f64, y: f64) -> Option<XformDrag> {
+        let (track, idx) = st.selection?;
+        let clip = st.selected()?;
+        if sw == 0 || sh == 0 || l.w == 0 || l.preview_h == 0 || x < 0.0 || y < 0.0 || x >= l.w as f64 || y >= l.preview_h as f64 {
+            return None;
+        }
+        if st.timeline.tracks.get(track)?.kind != Kind::Video || clip.xform == crate::Xform::NONE || !clip.covers(st.playhead) {
+            return None;
+        }
+        if crate::schedule::top(&st.timeline, Kind::Video, st.playhead) != Some((track, idx)) {
+            return None;
+        }
+        let q = crate::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
+        let d = XformDrag { track, idx, q, corner: None, origin: (x, y), at: (x, y), xf0: clip.xform };
+        let (x0, y0, x1, y1) = d.rect();
+        let (x0, y0, x1, y1) = (x0 as f64, y0 as f64, x1 as f64, y1 as f64);
+        let mut corner = None;
+        let mut best = f64::MAX;
+        for (c, cx, cy) in [(0u8, x0, y0), (1, x1, y0), (2, x0, y1), (3, x1, y1)] {
+            let (dx, dy) = ((x - cx).abs(), (y - cy).abs());
+            if dx < XFORM_GRAB && dy < XFORM_GRAB && dx + dy < best {
+                best = dx + dy;
+                corner = Some(c);
+            }
+        }
+        if corner.is_none() && (x < x0 || x >= x1 || y < y0 || y >= y1) {
+            return None;
+        }
+        Some(XformDrag { corner, ..d })
+    }
+    /// The pointer is at `(x, y)`.
+    pub fn update(&mut self, x: f64, y: f64) {
+        self.at = (x, y);
+    }
+    /// The placement as the drag stands: the move, or the corner's scale with the opposite corner fixed, through the ONE
+    /// clamp ([`crate::Xform::clamped`]).
+    pub fn xform(&self) -> crate::Xform {
+        let fx = ((self.at.0 - self.origin.0) * 1000.0 / self.q.w.max(1) as f64) as i32;
+        let fy = ((self.at.1 - self.origin.1) * 1000.0 / self.q.h.max(1) as f64) as i32;
+        let (s, x, y) = (self.xf0.s as i32, self.xf0.x as i32, self.xf0.y as i32);
+        let Some(c) = self.corner else { return crate::Xform::clamped(s, x + fx, y + fy) };
+        let (right, bottom) = (c & 1 != 0, c & 2 != 0);
+        let d = ((if right { fx } else { -fx }) + (if bottom { fy } else { -fy })) / 2;
+        let (ax, ay) = (if right { x } else { x + s }, if bottom { y } else { y + s });
+        let room = (if right { 1000 - ax } else { ax }).min(if bottom { 1000 - ay } else { ay }).max(1);
+        let t = (s + d).clamp(1, room);
+        crate::Xform::clamped(t, if right { ax } else { ax - t }, if bottom { ay } else { ay - t })
+    }
+    /// The drag would change the placement.
+    pub fn moved(&self) -> bool {
+        self.xform() != self.xf0
+    }
+    /// The dragged placement's rect over the picture `q`: `(x0, y0, x1, y1)` canvas px.
+    pub fn rect(&self) -> (i64, i64, i64, i64) {
+        let xf = self.xform();
+        let (qx, qy, qw, qh) = (self.q.x as i64, self.q.y as i64, self.q.w as i64, self.q.h as i64);
+        let (x0, y0) = (qx + qw * xf.x as i64 / 1000, qy + qh * xf.y as i64 / 1000);
+        (x0, y0, x0 + (qw * xf.s as i64 / 1000).max(1), y0 + (qh * xf.s as i64 / 1000).max(1))
+    }
+    /// THE commit of the gesture: ONE `EditorState::set_xform` (nothing when nothing moved); `NoClip` when the primary
+    /// changed.
+    pub fn finish(&self, st: &mut EditorState) -> Result<(), crate::EditError> {
+        if !self.moved() {
+            return Ok(());
+        }
+        if st.selection != Some((self.track, self.idx)) {
+            return Err(crate::EditError::NoClip);
+        }
+        st.set_xform(self.xform())
+    }
+    /// The state the face paints while the drag is live: a scratch state (no undo stacks) with the clip at the dragged
+    /// placement.
+    pub fn shown(&self, st: &EditorState) -> Option<EditorState> {
+        let mut s = EditorState::new(st.timeline.set_xform(self.track, self.idx, self.xform()).ok()?);
+        s.selection = st.selection;
+        s.set = st.set.clone();
+        s.playhead = st.playhead;
+        s.zoom = st.zoom;
+        Some(s)
+    }
+}
+
+/// STRIAXFORMTHREE (SR9033): the live placement drag's rect as a 1 px [`HANDLE`] outline over the painted canvas; `None` (or
+/// a canvas of another size) comes back untouched.
+pub fn paint_xform_drag(px: Vec<u8>, l: Layout, order: Order, drag: Option<&XformDrag>) -> Vec<u8> {
+    let Some(d) = drag else { return px };
+    if px.len() != l.w as usize * l.h as usize * 4 {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x0, y0, x1, y1) = d.rect();
+    c.frame(x0, y0, x1, y1, HANDLE);
+    c.px
+}
+
+#[cfg(test)]
+mod striaxformthree_tests {
+    use super::*;
+    use crate::{Clip, Timeline, Xform};
+
+    /// V1: A 0..20 at 0, placed at [`Xform::PIP`]; A1: A 0..20 at 0; V1's clip selected, playhead 5; the preview band
+    /// 320 x 90 over a 160 x 90 still, so the picture `q` is 160 x 90 at (80, 0) and the PIP rect is (196, 65)..(236, 87).
+    fn fixture() -> (EditorState, Layout) {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let tl = tl.set_xform(0, 0, Xform::PIP).unwrap();
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.playhead = 5;
+        let l = Layout::of_role(Role::Preview, 320, 90, &st);
+        (st, l)
+    }
+
+    /// Inside the rect moves it (16 px of a 160 px picture is 100 / 1000), stopped at the frame's edge; a corner scales it
+    /// with the opposite corner fixed; the release is ONE undo step; an unplaced clip, a press off the rect, a clip not at
+    /// the playhead begin nothing.
+    #[test]
+    fn striaxformthree_drag_moves_and_scales() {
+        let (mut st, l) = fixture();
+        let mut d = XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).expect("inside the rect");
+        assert_eq!(d.corner, None);
+        assert_eq!(d.rect(), (196, 65, 236, 87));
+        d.update(200.0, 76.0);
+        assert_eq!(d.xform(), Xform { x: 625, y: 725, s: 250 });
+        d.update(232.0, 76.0);
+        assert_eq!(d.xform(), Xform { x: 750, y: 725, s: 250 }, "stopped at the right edge");
+        d.update(200.0, 76.0);
+        d.finish(&mut st).unwrap();
+        assert_eq!(st.selected().map(|c| c.xform), Some(Xform { x: 625, y: 725, s: 250 }));
+        assert_eq!(st.undo_depth(), 1);
+
+        let (st, l) = fixture();
+        let mut br = XformDrag::begin(&st, l, 160, 90, 235.0, 86.0).expect("the bottom-right corner");
+        assert_eq!(br.corner, Some(3));
+        br.update(219.0, 77.0);
+        assert_eq!(br.xform(), Xform { x: 725, y: 725, s: 150 }, "the top-left kept");
+        br.update(300.0, 200.0);
+        assert_eq!(br.xform(), Xform { x: 725, y: 725, s: 275 }, "grown to the frame's edge");
+        let mut tl = XformDrag::begin(&st, l, 160, 90, 197.0, 66.0).expect("the top-left corner");
+        assert_eq!(tl.corner, Some(0));
+        tl.update(181.0, 57.0);
+        assert_eq!(tl.xform(), Xform { x: 625, y: 625, s: 350 }, "the bottom-right kept at 975");
+        assert!(!XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).unwrap().moved());
+
+        assert!(XformDrag::begin(&st, l, 160, 90, 120.0, 30.0).is_none(), "off the rect");
+        let mut off = st.clone();
+        off.playhead = 30;
+        assert!(XformDrag::begin(&off, l, 160, 90, 216.0, 76.0).is_none(), "the clip not at the playhead");
+        let mut plain = st.clone();
+        plain.timeline = plain.timeline.set_xform(0, 0, Xform::NONE).unwrap();
+        assert!(XformDrag::begin(&plain, l, 160, 90, 160.0, 45.0).is_none(), "an unplaced clip");
+    }
+
+    /// No drag paints nothing (byte-identical); a live drag outlines the dragged rect in HANDLE and shows the clip there.
+    #[test]
+    fn striaxformthree_paint_none_is_identical() {
+        let (st, l) = fixture();
+        let px = alloc::vec![0u8; l.w as usize * l.h as usize * 4];
+        assert_eq!(paint_xform_drag(px.clone(), l, Order::Rgba, None), px, "no drag: byte-identical");
+        let mut d = XformDrag::begin(&st, l, 160, 90, 216.0, 76.0).unwrap();
+        d.update(200.0, 76.0);
+        let out = paint_xform_drag(px.clone(), l, Order::Rgba, Some(&d));
+        let (x0, y0, _, _) = d.rect();
+        let o = (y0 as usize * l.w as usize + x0 as usize) * 4;
+        assert_eq!(&out[o..o + 4], &HANDLE);
+        assert_eq!(d.shown(&st).and_then(|s| s.selected()).map(|c| c.xform), Some(Xform { x: 625, y: 725, s: 250 }));
+    }
+}

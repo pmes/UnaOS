@@ -574,7 +574,7 @@ fn transport() -> TetraNode {
         button("export-skip", "Skip Export"), button("export-clear", "Clear Queue"), // STRIAEXPORTQUEUESKIP (SR914): cancel the running export (the next queued starts) / drop the waiting requests
         button("xfade-curve", "Curve"), button("proxy-off", "Proxy Off"), button("proxy-all", "Proxy All"), // STRIAPROXYBUTTONS (SR930): detach the selected clip's source's proxy / build or reuse one for every reel with a path
         button("export-list", "Export Queue"), // STRIAEXPORTQUEUELIST (SR932): the waiting export requests on the message row
-        button("scale-", "Scale -"), button("scale+", "Scale +"), // STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
+        button("scale-", "Scale -"), button("scale+", "Scale +"), button("pip left", "PiP <"), button("pip right", "PiP >"), button("pip up", "PiP ^"), button("pip down", "PiP v"), // STRIAXFORMTHREE (SR9033): the selected clip's placement nudged a step (SR975's words); STRIAXFORMPRESETS (SR938): the selected clip's placement scale stepped about its centre
         button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("unmark all", "Unmark All"), // STRIAMARKERSMORE (SR966): THE `unmark all` word
         button("insert-all", "Insert All"), button("insert-marked-all", "Insert Marks All"), button("target", "Target"), // STRIAINSERTMARKSKEYSNEXT (SR985): the inserts that ripple every track; the insert target track cycle
@@ -3227,5 +3227,30 @@ mod striagapsthree_tests {
         assert!(drive(&mut face, "at:12:0,close-gaps:keep").is_empty());
         assert_eq!(face.state.timeline, tl0.close_gaps(0).unwrap());
         println!("striagapsthree witness: close-gaps:keep -> {:?}", face.state.timeline.tracks[0].clips);
+    }
+}
+
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the nudge buttons on the transport row (named tail block) ----
+#[cfg(test)]
+mod striaxformthree_tests {
+    use super::*;
+
+    /// STRIAXFORMTHREE (SR9033): the four nudge buttons stand just before the help button, each firing its VERBS word,
+    /// which moves the selected placed clip one step (one undo step each).
+    #[test]
+    fn striaxformthree_witness_nudge_buttons() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => String::new() }).collect();
+        assert_eq!(&ids[ids.len() - 5..], &["pip left", "pip right", "pip up", "pip down", "help"]);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,pip").is_empty());
+        for b in &row[row.len() - 5..row.len() - 1] {
+            let TetraNode::Button { action, .. } = b else { panic!("not a button") };
+            assert!(face.on(action));
+        }
+        assert_eq!(face.last_error, None);
+        assert_eq!(face.state.undo_depth(), 5);
+        assert_eq!(face.state.selected().map(|c| c.xform), Some(timeline_core::Xform::PIP));
     }
 }

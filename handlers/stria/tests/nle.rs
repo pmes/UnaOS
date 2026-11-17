@@ -9558,7 +9558,7 @@ fn striawavvalidbits_refusals_by_name() {
 #[test]
 fn striaxformpresets_face_presets_and_placement_line() {
     use stria::nle_face::{EditorState, Face, PixelOrder, SURFACE, VERBS, synth_fixture};
-    assert_eq!(&VERBS[VERBS.len() - 3..], &["scale-", "scale+", "help"]);
+    assert_eq!(&VERBS[VERBS.len() - 7..], &["scale-", "scale+", "pip left", "pip right", "pip up", "pip down", "help"]); // STRIAXFORMTHREE (SR9033): the nudge words stand between scale+ and help
     let (tl0, src) = synth_fixture();
     let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
     assert!(face.verb("scale+"));
@@ -13301,4 +13301,64 @@ fn striamarkerranges_face_marks_and_range_end_jump() {
     assert!(f.verb("undo"));
     assert_eq!(f.state.timeline.marks, (None, None));
     println!("striamarkerranges: ' stops at M1 end 00:00:00:20; marker marks -> 12..20, one step");
+}
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the placement drag on the preview and the nudge buttons (named tail block) ----
+
+/// A press inside a placed clip's rect on the preview picture, a move and the release move the rect: ONE undo step, the
+/// placement line on the message row, no error; a drag dropped by Escape commits nothing; a press on an unplaced clip's
+/// picture begins no placement drag.
+#[test]
+fn striaxformthree_face_drag_one_undo() {
+    use bandy::SMessage;
+    use stria::nle_face::{EditorState, Face, PixelOrder, Role, synth_fixture};
+    let (tl0, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(12);
+    let _ = face.frame();
+    let l = face.layout_for(Role::Whole).with_message(false);
+    let (sw, sh) = face.still().map(|s| (s.width, s.height)).expect("a preview still");
+    let q = timeline_core::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
+    let (cx, cy) = (q.x as f64 + q.w as f64 / 2.0, q.y as f64 + q.h as f64 / 2.0);
+    face.on(&SMessage::BrowserButton { down: true, x: cx, y: cy, mods: 0, surface: 0 });
+    assert!(face.xform_dragging().is_none(), "an unplaced clip: no placement drag");
+    face.on(&SMessage::BrowserButton { down: false, x: cx, y: cy, mods: 0, surface: 0 });
+    face.state.select_at(0, 12).unwrap();
+    face.state.seek(12);
+    assert!(face.verb("pip off"));
+    assert!(face.verb("scale 500"));
+    let depth = face.state.undo_depth();
+    let _ = face.frame();
+    let xf = face.state.selected().map(|c| c.xform).unwrap();
+    let (rx, ry) = (q.x as f64 + q.w as f64 * (xf.x as f64 + xf.s as f64 / 2.0) / 1000.0, q.y as f64 + q.h as f64 * (xf.y as f64 + xf.s as f64 / 2.0) / 1000.0);
+    assert!(face.on(&SMessage::BrowserButton { down: true, x: rx, y: ry, mods: 0, surface: 0 }));
+    assert!(face.xform_dragging().is_some(), "a press inside the placed rect");
+    face.on(&SMessage::BrowserMouseMove(rx + q.w as f64 / 10.0, ry, 0));
+    assert!(face.on(&SMessage::BrowserButton { down: false, x: rx + q.w as f64 / 10.0, y: ry, mods: 0, surface: 0 }));
+    assert!(face.xform_dragging().is_none());
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!(face.state.undo_depth(), depth + 1);
+    let moved = face.state.selected().map(|c| c.xform).unwrap();
+    assert!(moved.x > xf.x && moved.y == xf.y && moved.s == xf.s, "{moved:?} from {xf:?}");
+    assert_eq!(face.message_text(), Some(format!("pip: x {} y {} scale {}", moved.x, moved.y, moved.s)));
+    let rx = q.x as f64 + q.w as f64 * (moved.x as f64 + moved.s as f64 / 2.0) / 1000.0;
+    assert!(face.on(&SMessage::BrowserButton { down: true, x: rx, y: ry, mods: 0, surface: 0 }));
+    face.on(&SMessage::BrowserMouseMove(rx - 20.0, ry, 0));
+    assert!(face.on(&SMessage::BrowserKey("Escape".into())));
+    assert!(face.xform_dragging().is_none());
+    assert_eq!(face.state.undo_depth(), depth + 1, "Escape commits nothing");
+}
+
+/// The four nudge words are VERBS words just before `help`, each taken by the face (refused by name with no selection).
+#[test]
+fn striaxformthree_nudge_words_are_buttons() {
+    use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert_eq!(&VERBS[VERBS.len() - 5..], &["pip left", "pip right", "pip up", "pip down", "help"]);
+    for v in ["pip left", "pip right", "pip up", "pip down"] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert_eq!(face.state.timeline, tl);
 }

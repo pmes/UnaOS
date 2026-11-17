@@ -157,7 +157,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 117] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail)
+pub const VERBS: [&str; 121] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "pip left", "pip right", "pip up", "pip down", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -234,13 +234,14 @@ pub struct Face {
     pub note: Option<String>, // STRIAPANNEXT (SR994): a success line, read by message_text after last_error, cleared by the next taken input (file tail)
     watched: Vec<(String, String)>, // STRIAPROXYTHREE (SR9026): each reel's file stamp as last opened (file tail)
     ripple_all: bool, // STRIARIPPLETHREE (SR9034): a ripple drag runs on every track (file tail)
+    xform_drag: Option<view::XformDrag>, // STRIAXFORMTHREE (SR9033): the live placement drag on the preview picture (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, note: None, rate: 1, drag: None, drag_shown: DragShown::default(), pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, frame_saved: None, peaks: WavePeaks::default(), tc: None, slip_view: None, loudness: None, meter_hold: MeterHold::default(), help_query: None, info: None, export_queue: std::collections::VecDeque::new(), snap_off: false, autosave: Autosave::default(), keymap: Keymap::default(), proxy: None, reel_paths: Vec::new(), zoom_fit: None, pcache: PreviewCache::default(), proxy_queue: Vec::new(), proxy_hold: None, laid: None, lcache: LabelCache::default(), xform_note: None, export_preset: None, preset_note: None, roll_tool: false, slip_hold: None, crop_drag: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, note: None, watched: Vec::new(), scan: NormalizeScan::default(), note: None, ripple_all: false, headers: None, xform_drag: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -248,7 +249,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail)
+        if let Some(r) = self.bin_input(msg) { return r; } if let Some(r) = self.preview_meter_input(msg) { return r; } if let Some(r) = self.crop_drag_on(msg) { return r; } if let Some(r) = self.xform_drag_on(msg) { return r; } if !self.takes(msg) { return false; } self.laid_clear(msg); self.xform_note = None; self.preset_note = None; self.note = None; self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.clear_note(msg); self.watch_sources(msg); self.clear_note(msg); if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } if let Some(r) = self.clipboard_key(msg) { return r; } if let Some(r) = self.help_type_input(msg) { return r; } if let Some(r) = self.history_pick(msg) { return r; } // STRIAPASTEKEYS (SR921): BrowserCopy / BrowserPaste reach Face::key as the Ctrl+c / Ctrl+v chords (file tail); NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail); STRIATRACKGAINTHREE (SR9024): an acting input clears the note (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text), SMessage::ConsoleInput(q) => self.help_field(q), // STRIAHELPMORE (SR977): the bar's help query field, its Enter (file tail)
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -1658,7 +1659,7 @@ impl Face {
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
         if role == Role::Bin { return self.paint_bin(); } let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail); STRIAPROJECTBIN (SR885): the bin's own painter (file tail)
-        let shown = self.drag_shown.get(self.drag.as_ref(), &self.state); // STRIAPERFDRAGSHOWN (SR936): the drag preview replayed only when the drag or the state it reads changes (timeline_core view.rs tail) self.slip_refresh(role, shown.as_ref()).or_else(|| self.crop_drag.as_ref().and_then(|d| d.shown(&self.state))); // STRIASLIPVIEW (SR858): a Slip drag's first / last frame pair (file tail) // STRIACROPMORE (SR960): a live crop drag shows its clip uncropped (timeline_core view.rs tail)
+        let shown = self.drag_shown.get(self.drag.as_ref(), &self.state); // STRIAPERFDRAGSHOWN (SR936): the drag preview replayed only when the drag or the state it reads changes (timeline_core view.rs tail) self.slip_refresh(role, shown.as_ref()).or_else(|| self.crop_drag.as_ref().and_then(|d| d.shown(&self.state))).or_else(|| self.xform_drag.as_ref().and_then(|d| d.shown(&self.state))); // STRIASLIPVIEW (SR858): a Slip drag's first / last frame pair (file tail) // STRIACROPMORE (SR960): a live crop drag shows its clip uncropped (timeline_core view.rs tail) // STRIAXFORMTHREE (SR9033): a live placement drag shows its clip at the dragged rect (timeline_core view.rs tail)
         let st = shown.as_deref().unwrap_or(&self.state); self.peaks.thumbs.fill(&st.timeline, &self.sources, l); // STRIATHUMBNAILS (SR839): the visible video heads decoded before the paint, THUMBS_PER_PAINT / THUMB_BUDGET_MS at most (file tail)
         if role != Role::Tracks && !self.pcache.taken(self.play.take_still(&mut self.still, st.playhead, shown.is_none() || scrubbing(&self.drag)) && self.slip_view().is_none()) && !self.pcache.hit(&st.timeline, st.playhead) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIAAUDIOSCRUB (SR865): and a scrub step's, under its live Scrub drag; STRIAPERFPREVIEWCACHE (SR918): an unchanged (timeline, playhead) keeps the still (file tail)
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
@@ -1670,7 +1671,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
-        let px = self.paint_message(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail)
+        let px = self.paint_message(view::paint_xform_drag(self.slipthree_paint_tc(view::paint_crop_drag(self.pcache.band(l, vo(self.order), still, self.playing || self.drag.is_some(), |s| paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), s), Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, vo(self.order), self.xform_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAXFORMTHREE (SR9033): the dragged placement rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail); STRIAPERFTHREE (SR9037): the band's pixels kept by still (file tail)
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
@@ -3383,7 +3384,7 @@ impl Face {
         let word = v.split_ascii_whitespace().next().filter(|w| matches!(*w, "gain-" | "gain+" | "gain" | "fade-in" | "fade-out"))?;
         match self.state.verb(v) {
             Some(Ok(())) => self.last_error = self.state.selected().map(|c| audio_line(word, &c)),
-            Some(Err(e)) => self.last_error = Some(format!("{word}: {e}")),
+            Some(Err(e)) => self.last_error = Some(placement_note(&{word}{e}")),
             None => return None,
         }
         Some(true)
@@ -3397,13 +3398,13 @@ pub fn db_words(cdb: i32) -> String {
 
 /// The message line after a gain / fade word: `gain <db_words>` or `fade-in <n>, fade-out <m>` (ticks).
 fn audio_line(word: &str, c: &Clip) -> String {
-    if word.starts_with("gain") { format!("gain {}", db_words(c.gain_cdb)) } else { format!("fade-in {}, fade-out {}", c.fade_in, c.fade_out) }
+    if word.starts_with("gain") { format!("gain",db_words(c.gain_cdb)) } else { format!("fade-in,fade-outcfade_infade_out) }
 }
 
-// ---- STRIATHUMBNAILS (LEDGER SR839): each video clip head's still, decoded once and cached (named tail block) ----
-// A video clip's body shows its head (timeline_core view.rs `paint_head`, through SR827's `PeakSource` hook, its `thumb`
-// method). The stills live in `Face.peaks` (`WavePeaks.thumbs`), beside the peak tables, never in the EDL. LAZY: `paint_role`
-// calls `Thumbs::fill` once the drag's shown timeline exists (a slip drag's new head fills live) and before `paint_in`. RULES:
+// ---- STRIATHUMBNAILS (LEDGER SR839): each video clip head's stilldecoded once and cached (named tail block) ----
+// A video clip's body shows its head (timeline_core viewrs `paint_head`, through SR827's `PeakSource` hook, its `thumb`
+// method) The stills live in `Face.peaks` (`WavePeaks.thumbs`), beside the peak tables, never in the EDL. LAZY: `paint_role`
+// calls `Thumbs::fill` once the drag' shown timeline exists (a slip drag's new head fills live) and before `paint_in`. RULES:
 // * fill walks VIDEO tracks only, rows on the canvas, clips whose body left `x_of(at) + 1` lies in `0..w` (paint_head's rule)
 //   and whose body is at least THUMB_MIN_W px wide, not yet keyed; it always decodes the first wanted head, then stops once
 //   THUMBS_PER_PAINT heads are decoded or the fill has spent more than THUMB_BUDGET_MS; `pending` says a wanted head was left,
@@ -3486,7 +3487,7 @@ impl Thumbs {
     fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<Still>) {
         if !self.map.contains_key(&k) && self.map.len() >= THUMB_CACHE {
             if let Some(old) = self.map.iter().filter(|e| !self.spared(e.0)).min_by_key(|e| (e.1).0).map(|e| *e.0) { // STRIATHUMBNAILSTHREE (SR9044): a key this or the last paint wanted is never evicted (file tail)
-                self.map.remove(&old);
+                self.map.remove(&old); // STRIAXFORMTHREE (SR9033): the one placement line (file tail)
             }
         }
         self.seq += 1;
@@ -10038,6 +10039,86 @@ impl Face {
             (Err(EditError::Marker), Some((name, _, 0))) => self.last_error = Some(format!("marker marks: {name} is a point marker (no range)")),
             (r, _) => self.last_error = Some(format!("marker marks: {}", r.err().map_or_else(String::new, |e| e.to_string()))),
         }
+        Some(true)
+    }
+}
+
+// ---- STRIAXFORMTHREE (LEDGER SR9033): the placement drag on the preview picture and its routing (named tail block) ----
+// NLE-XFORM-DRAG on the face: `Face::on`'s first line hands every message here first. A press on a PLACED primary's rect in
+// the preview picture (the split face's preview Surface, or an unsplit face's preview band through `takes`) begins
+// timeline_core's `view::XformDrag` over the layout the face paints that band with (`layout_for(..).with_message(..)`)
+// and the preview still's size (`self.still`, else ONE `preview` call: THE frame road); while live, that Surface's moves
+// update it, its release commits ONCE (`XformDrag::finish`: `EditorState::set_xform`; the message row then reads the
+// placement through [`placement_note`], SR938's line; a refusal is `last_error` as `xform-drag: <e>`), Escape drops it;
+// the one-Surface face keeps its `pointer` through them as `press` / `release` do. Anything else (no drag, a press off a
+// placed rect, the help shown) returns `None`: the old road, unchanged. At the fold this call follows SR962's meter click
+// and precedes SR960's `crop_drag_on` on the same line; SR960's `CropDrag::begin` refuses a placed primary (the seat's
+// fold guard), so a placed clip's press is this drag's and an unplaced clip's picture edge is the crop drag's.
+// NLE-XFORM-NUDGE-BUTTON: `pip left` / `pip right` / `pip up` / `pip down` are VERBS words (their buttons in stria-view),
+// SR975's nudge words through the one `Face::verb` road (`xform_note_verb`).
+
+/// STRIAXFORMTHREE (SR9033): THE placement line the message row reads after a placement edit (`pip: x 725 y 725 scale 250`).
+fn placement_note(c: &Clip) -> String {
+    format!("pip: x {} y {} scale {}", c.xform.x, c.xform.y, c.xform.s)
+}
+
+impl Face {
+    /// STRIAXFORMTHREE (SR9033): the live placement drag on the preview picture.
+    pub fn xform_dragging(&self) -> Option<&view::XformDrag> {
+        self.xform_drag.as_ref()
+    }
+    /// The role of the preview picture a message belongs to: split, the preview Surface's `Preview`; unsplit, `Whole` for a
+    /// message this face takes; `None` otherwise.
+    fn xform_drag_surface(&self, msg: &SMessage) -> Option<Role> {
+        match self.split {
+            Some(s) => (msg.surface() == Some(s.preview) && s.preview != s.tracks).then_some(Role::Preview),
+            None => self.takes(msg).then_some(Role::Whole),
+        }
+    }
+    /// The placement drag's messages (`Some(repaint)`); `None` hands the message on to [`Face::on`]'s road.
+    fn xform_drag_on(&mut self, msg: &SMessage) -> Option<bool> {
+        if self.xform_drag.is_some() {
+            return match msg {
+                SMessage::BrowserMouseMove(x, y, _) if self.xform_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let d = self.xform_drag.as_mut()?;
+                    let before = d.xform();
+                    d.update(*x, *y);
+                    Some(d.xform() != before)
+                }
+                SMessage::BrowserButton { down: false, x, y, .. } if self.xform_drag_surface(msg).is_some() => {
+                    if self.split.is_none() { self.pointer = Some((*x, *y)); }
+                    let mut d = self.xform_drag.take()?;
+                    d.update(*x, *y);
+                    let moved = d.moved();
+                    match d.finish(&mut self.state) {
+                        Ok(()) if moved => self.xform_note = self.state.selected().map(|c| placement_note(&c)),
+                        Ok(()) => {}
+                        Err(e) => self.last_error = Some(format!("xform-drag: {e}")),
+                    }
+                    Some(true)
+                }
+                SMessage::BrowserKey(k) if k == "Escape" => {
+                    self.xform_drag = None;
+                    Some(true)
+                }
+                _ => None,
+            };
+        }
+        let SMessage::BrowserButton { down: true, x, y, .. } = *msg else { return None };
+        if self.help {
+            return None;
+        }
+        let role = self.xform_drag_surface(msg)?;
+        let l = self.layout_for(role).with_message(self.labels.is_some());
+        if self.still.is_none() {
+            self.still = preview(&self.state.timeline, &self.sources, self.state.playhead).ok().flatten();
+        }
+        let (sw, sh) = self.still.as_ref().map(|s| (s.width, s.height))?;
+        self.xform_drag = Some(view::XformDrag::begin(&self.state, l, sw, sh, x, y)?);
+        self.xform_note = None;
+        self.buttons = true;
+        if self.split.is_none() { self.pointer = Some((x, y)); } // the one-Surface face's pointer, as `press` keeps it
         Some(true)
     }
 }

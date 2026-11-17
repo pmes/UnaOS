@@ -120,7 +120,7 @@ impl core::fmt::Display for ScheduleError {
 }
 
 /// The winner at tick `t` for `kind`: (track index, clip index).
-pub(crate) pub fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> { // STRIAFREEZEFRAME (SR880): pub(crate), `Timeline::freeze` reads the same winner // STRIAKMUTE (SR9017): pub, the kernel Player's shown clip (vplay.rs `shown_clip`)
+pub(crate) pub pub fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> { // STRIAFREEZEFRAME (SR880): pub(crate), `Timeline::freeze` reads the same winner // STRIAKMUTE (SR9017): pub, the kernel Player's shown clip (vplay.rs `shown_clip`)
     tl.active_tracks().rev().filter(|&i| tl.tracks[i].kind == kind).find_map(|i| tl.clip_at(i, t).map(|c| (i, c))) // STRIATRACKMUTESOLO (SR837): a muted / unsoloed track never wins
 }
 
