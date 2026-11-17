@@ -1108,25 +1108,15 @@ impl Sources {
 // arm: the schedule names `src_at(t)` and `Vid::show` decodes and drops forward (rate > 1) or holds the last frame (rate < 1).
 // A pitch-preserving stretch is owed (NLE-SPEED-PITCH-PRESERVE).
 
-/// STRIACLIPSPEED: the speed layer `li` of `run` plays at: 1x for an under layer or one no clip of its source covers at the
-/// run's first tick (a handle past the clip's end), else that clip's `rate_q16`.
-fn layer_rate(tl: &Timeline, run: &AudioRun, li: usize) -> u32 {
-    let Some(l) = run.layers.get(li) else { return 0x1_0000 };
-    if run.under(li) {
-        return 0x1_0000;
-    }
-    tl.clip_at(l.track, run.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or(0x1_0000, |c| c.rate_q16)
-}
-
 /// STRIACLIPSPEED: layer `li`'s `n` output samples at `rate`: exactly `take_at(start, n, rate)` at 1x, else `take_at` at the
 /// effective rate from the layer's `src_t`.
 #[allow(clippy::too_many_arguments)]
 fn take_rated(tl: &Timeline, run: &AudioRun, li: usize, a: &mut Aud, start: i64, n: i64, rate: u32) -> Result<Vec<f32>, RenderError> {
-    let q = layer_rate(tl, run, li);
+    let q = run.layer_rate(tl, li); // STRIAKSPEED (SR9012): the rule lifted into timeline_core (schedule.rs `AudioRun::layer_rate`), the kernel Player calls it too
     if q == 0x1_0000 || q == 0 {
         return a.take_at(start, n, rate);
     }
-    let eff = ((rate as u64 * 0x1_0000 + q as u64 / 2) / q as u64).clamp(1, u32::MAX as u64) as u32;
+    let eff = timeline_core::schedule::rated_hz(rate, q); // STRIAKSPEED (SR9012): the effective rate lifted into timeline_core (schedule.rs `rated_hz`)
     let l = &run.layers[li];
     a.take_at(samples(tl.tb.to_ns(l.src_t), eff), n, eff)
 }

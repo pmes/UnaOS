@@ -1040,7 +1040,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     let tl = &st.timeline;
     let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
     let mt = crate::shell::vfs_mount_table();
-    if let Some(c) = tl.rated_unheld() { return Err(("rate-unsupported", Some(alloc::format!("a clip at rate {:#x} (the Player's EDL mode plays every clip at 1x but a video hold)", c.rate_q16)))); } let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // NLE-SPEED-KERNEL (SR829): a rated clip is refused by name, never played at 1x; STRIAKFREEZE (SR9008): but a video hold (timeline_core `rated_unheld`)
+    speed_note(tlrated_unheld but a video hold); let mut reels = Reels { tb: tl.tb, reels: Vec::new() }; // STRIAKSPEED (SR9012): a rated clip plays (video through src_at, audio at the effective rate); the SR829 refusal is gone; STRIAKFREEZE (SR9008): but a video hold (timeline_core `rated_unheld`)
     for s in &tl.sources {
         let Some(rp) = [".MP4", ".WEBM", ".MKV", ".WAV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
             return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV|.WAV)", s.reel, dir, s.reel))));
@@ -1092,7 +1092,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
             Some(id) => {
-                let live = run.as_ref().map(|x| x.src); let (w, h, px, ord) = match edl_held(&held, live, s, id) { Some(f) => f, None => edl_keep(&mut held, &holds, s, id, edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?) }; // STRIAKFREEZE (SR9008): a hold's repeat shows the held picture, no decode (file tail)
+                let live = run.as_ref().map(|x| x.src); let (w, h, px, ord) = match edl_held(&held, live, s, id) { Some(f) => f, None => edl_keep(&mut held, &holds, s, id, edl_rated(&reels, tl, &mut run, s, id, rep)?) }; // STRIAKFREEZE (SR9008): a hold's repeat shows the held picture, no decode (file tail) // STRIAKSPEED (SR9012): held or decoded forward to the step's source tick through THE edl_frame (file tail)
                 coded(rep, s.out_t, ord, &px); let px = edl_grade(tl.grade_at(s.track, s.out_t, false), px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) } // STRIAGRADENEXT (SR992): the clip's grade after the coded witness (file tail)
             }
         };
@@ -1125,6 +1125,8 @@ struct EdlRun {
     reads: Vec<demux_core::SampleRead>,
     pos: usize,
     pic: Pic,
+    at: i64, // STRIAKSPEED (SR9012): the source tick of the last picture this run returned (`edl_rated`, file tail)
+    last: Option<(usize, usize, Vec<u32>, Option<u32>)>, // STRIAKSPEED (SR9012): that picture, kept only under a clip slower than 1x (the hold)
 }
 
 /// The ONE open-or-continue fn (Stria's `vid_frame` shape), for a step's own source and a transition's outgoing alike:
@@ -1146,7 +1148,7 @@ fn edl_frame(
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
         let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tb.to_ns(src_t)).collect();
         let pic = Pic::open(vt, tb.to_ns(src_t)); rep.swaps += pic.on_stand_in() as u64; // SWAPBACKVPLAY (rmbp-ledger B956): a fresh decoder per run (the kernel's reseed), else the open-time stand-in
-        *slot = Some(EdlRun { src: id, reads, pos: 0, pic });
+        *slot = Some(EdlRun { src: id, reads, pos: 0, pic, at: src_t - 1, last: None }); // STRIAKSPEED (SR9012): the run's first picture is source tick src_t
         if outgoing {
             rep.mix_seeks += 1;
         } else {
@@ -1169,7 +1171,7 @@ fn edl_frame(
             Ok(Some(_)) if rd.preroll => rep.runup += 1,
             Ok(Some((w, h, px))) => {
                 rep.stand_in_frames += x.pic.on_stand_in() as u64;
-                return Ok((w, h, px, ord));
+                x.at += 1; return Ok((w, h, px, ord)); // STRIAKSPEED (SR9012): one picture = one source tick (`edl_rated`, file tail)
             }
             Ok(None) => {}
             Err(e) => return Err(("decode-refused", Some(e))),
@@ -1370,6 +1372,8 @@ mod snd {
         src: SourceId,
         dec: audio_core::Decoder,
         pos: u64,
+        q: u32, // STRIAKSPEED (SR9012): the speed this stream plays at (Q16.16, `AudioRun::layer_rate`)
+        rs: Option<audio_core::resample::Sinc>, // STRIAKSPEED (SR9012): a rated stream's converter to the effective rate (None at 1x)
     }
 
     /// One mixer source of an audio track: its top layer, or a crossfade's under layer (`under`).
@@ -1402,6 +1406,7 @@ mod snd {
     }
 
     struct Snd {
+        q: Vec<Vec<u32>>, // STRIAKSPEED (SR9012): per run, per layer, the speed it plays at (`rated_q`, the tail of this module)
         runs: Vec<AudioRun>,
         tb: Timebase,
         reels: Vec<ReelSnd>,
@@ -1468,7 +1473,7 @@ mod snd {
             return;
         }
         *SND.lock() = Some(Snd {
-            runs,
+            q: rated_q(&runs, tl), runs, // STRIAKSPEED (SR9012): every layer's speed through timeline_core's `AudioRun::layer_rate`
             tb: tl.tb,
             reels: rs,
             slots,
@@ -1667,7 +1672,7 @@ mod snd {
                 if !mixer::set_gain_ramp(id, from, e1 as u16, n48) {
                     self.refuse("ramp-queue");
                 }
-                play = self.seat(i, l.src, l.src_t, l.seek.is_some(), s0);
+                play = self.seat(i, l.src, l.src_t, l.seek.is_some(), s0, self.q.get(self.slots[i].ri).and_then(|r| r.get(li)).copied().unwrap_or(0x1_0000)); // STRIAKSPEED (SR9012): the layer's speed
             }
             let sl = &mut self.slots[i];
             sl.play = play;
@@ -1715,7 +1720,7 @@ mod snd {
         /// Slot `i`'s decoder at layer source tick `src_t` + `s0` frames: kept when it continues (no `seek`, the same
         /// source, at or before the frame), else reopened through audio_core's door and seeked; then skipped forward to
         /// the frame. False when the reel has no sound this slot can play (the run is silence).
-        fn seat(&mut self, i: usize, src: SourceId, src_t: i64, seek: bool, s0: u64) -> bool {
+        fn seat(&mut self, i: usize, src: SourceId, src_t: i64, seek: bool, s0: u64, q: u32) -> bool { // STRIAKSPEED (SR9012): `q` the layer's speed
             let (rate, ch) = (self.slots[i].rate, self.slots[i].ch);
             let Some(r) = self.reels.iter().find(|r| r.id == src) else { return false };
             let Some(d) = r.d.as_ref().filter(|_| r.rate == rate && r.ch == ch) else {
@@ -1725,8 +1730,8 @@ mod snd {
                 }
                 return false;
             };
-            let want = frames(self.tb, src_t, rate) + s0;
-            let keep = !seek && self.slots[i].aud.as_ref().is_some_and(|a| a.src == src && a.pos <= want);
+            let want = frames(self.tb, src_t, rate) + ((s0 as u128 * q as u128) >> 16) as u64; // STRIAKSPEED (SR9012): `s0` output frames are `s0 * q` source frames (1x: `+ s0`)
+            let keep = !seek && self.slots[i].aud.as_ref().is_some_and(|a| a.src == src && a.q == q && (a.pos <= want || a.rs.is_some())); // STRIAKSPEED (SR9012): a rated stream continues across its own runs (its converter holds the lookahead)
             if !keep {
                 let mut dec = match audio_core::container::open_demuxed(d.share()) {
                     Ok(source) => audio_core::Decoder::from_source(source),
@@ -1743,12 +1748,12 @@ mod snd {
                     Ok(Some(p)) => p.landed,
                     _ => 0, // no table: decoded from the top (a failed seek left the stream at its start)
                 };
-                self.slots[i].aud = Some(Aud { src, dec, pos });
+                self.slots[i].aud = Some(Aud { src, dec, pos, q, rs: rated_rs(rate, q, ch) }); // STRIAKSPEED (SR9012): a fresh converter per opened stream (None at 1x)
             }
             let Some(a) = self.slots[i].aud.as_mut() else { return false };
             let ch = ch.max(1) as usize;
             let mut scratch = alloc::vec![0i32; CHUNK as usize * ch];
-            while a.pos < want {
+            while a.pos < want && !(keep && a.rs.is_some()) { // STRIAKSPEED (SR9012): a kept rated stream is not skipped under its converter
                 let k = ((want - a.pos) as usize).min(CHUNK as usize);
                 let got = a.dec.next_i32(&mut scratch[..k * ch]).unwrap_or(0);
                 if got == 0 {
@@ -1762,7 +1767,7 @@ mod snd {
 
     /// `k` frames of slot `sl` into its pending bytes (PCM16 LE): its decoder's, silence past the reel's end or in a gap.
     fn make(sl: &mut Slot, k: u64) {
-        let ch = sl.ch.max(1) as usize;
+        if make_rated(sl, k) { return; } let ch = sl.ch.max(1) as usize; // STRIAKSPEED (SR9012): a rated layer through its converter (the tail of this module)
         let mut buf = alloc::vec![0i32; k as usize * ch];
         if let (true, Some(a)) = (sl.play, sl.aud.as_mut()) {
             let got = a.dec.next_i32(&mut buf).unwrap_or(0);
@@ -1772,6 +1777,57 @@ mod snd {
         for v in &buf {
             sl.pend.extend_from_slice(&((*v >> 16) as i16).to_le_bytes());
         }
+    }
+
+    // ---- STRIAKSPEED (LEDGER SR9012): a rated layer's sound at the effective rate (named tail block of `mod snd`) ----
+    // timeline_core's rule (schedule.rs `AudioRun::layer_rate` / `rated_hz`, lifted from Stria's render): a layer of a clip at
+    // speed `q` is converted from the reel's rate to `rated_hz(rate, q)` and played at the reel's rate, so its `k` frames cover
+    // `k * q` source frames (pitch follows speed, as the host's). The converter is audio_core's ONE `resample::Sinc`, in the
+    // integer face the mixer's own ingest runs (`process_i16`). Under layers and handles are 1x by the rule.
+
+    /// Per run, per layer: the speed it plays at.
+    fn rated_q(runs: &[AudioRun], tl: &timeline_core::Timeline) -> Vec<Vec<u32>> {
+        runs.iter().map(|r| (0..r.layers.len()).map(|li| r.layer_rate(tl, li)).collect()).collect()
+    }
+
+    /// A stream's converter at speed `q`: None at 1x (the plain 1:1 decode of `make`).
+    fn rated_rs(rate: u32, q: u32, ch: u8) -> Option<audio_core::resample::Sinc> {
+        if q == 0x1_0000 || q == 0 {
+            return None;
+        }
+        Some(audio_core::resample::Sinc::new(rate, timeline_core::schedule::rated_hz(rate, q), ch.max(1) as usize))
+    }
+
+    /// `k` frames of a playing rated slot into its pending bytes (PCM16 LE): the converter's ready frames first, then the
+    /// decoder's frames fed through it until `k` are made; past the reel's end the rest is silence. False: not a rated slot.
+    fn make_rated(sl: &mut Slot, k: u64) -> bool {
+        let ch = sl.ch.max(1) as usize;
+        let Some(a) = sl.aud.as_mut().filter(|a| a.rs.is_some()) else { return false };
+        if !sl.play {
+            return false;
+        }
+        let q = a.q;
+        let Some(rs) = a.rs.as_mut() else { return false };
+        let k = k as usize;
+        let mut out = alloc::vec![0i16; k * ch];
+        let mut made = rs.process_i16(&[], &mut out).1;
+        let mut buf = alloc::vec![0i32; CHUNK as usize * ch];
+        while made < k {
+            let need = ((((k - made) as u64 * q as u64) >> 16) as usize).clamp(1, CHUNK as usize);
+            let got = a.dec.next_i32(&mut buf[..need * ch]).unwrap_or(0);
+            if got == 0 {
+                made += rs.flush_i16(&mut out[made * ch..]); // the reel ends: the converter's tail, then silence
+                break;
+            }
+            a.pos += got as u64;
+            let inp: Vec<i16> = buf[..got * ch].iter().map(|v| (*v >> 16) as i16).collect();
+            made += rs.process_i16(&inp, &mut out[made * ch..]).1;
+        }
+        sl.pend.reserve(out.len() * 2);
+        for v in &out {
+            sl.pend.extend_from_slice(&v.to_le_bytes());
+        }
+        true
     }
 }
 
@@ -3094,4 +3150,49 @@ fn band_tc(px: Vec<u8>, l: timeline_core::view::Layout, st: &timeline_core::edit
     c.rect(x0 as i64, l.ruler_y as i64, l.w as i64, l.tracks_y as i64, view::RULER);
     view::Text::text(lab, &mut c, &s, (x0 + 4) as f32, l.ruler_y as f32 + 9.0, (x0 as i32, l.w as i32));
     c.px
+}
+
+// ---- STRIAKSPEED (LEDGER SR9012): the Player plays a rated clip — the picture at the step's source tick (named tail block) ----
+// handlers.md §5 NLE5b's NLE-SPEED-KERNEL. timeline_core's schedule names a rated clip's source tick per step (`Clip::src_at`)
+// with no seek: 2x steps two source ticks, 0.5x repeats one. [`edl_frame`] returns ONE picture per call and counts it in its
+// run's `at` (one picture = one source tick, the EDL mode's standing rule; NLE-SPEED-KERNEL-FPS owed), so [`edl_rated`] HOLDS
+// the run's last picture when the step repeats its tick (kept only under a clip slower than 1x), decodes forward unseen
+// through THE `edl_frame` when the step is ahead (each in `runup`), then takes ONE picture. At 1x every step is `at + 1`: the
+// one call as before. The sound of a rated layer is `snd`'s tail block. Wire: `[nle] speed rated=<n> (...)` once per open of
+// an EDL with a rated clip (nothing for a 1x EDL).
+
+/// Name a rated EDL once on the wire.
+fn speed_note(tl: &timeline_core::Timeline) {
+    let n = tl.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.rate_q16 != 0x1_0000).count();
+    if n > 0 {
+        serial_println!("[nle] speed rated={} (video through src_at, audio at the effective rate)", n);
+    }
+}
+
+/// The step's own picture at its source tick `s.src_t` (see the section head): held, or decoded forward to, through THE
+/// [`edl_frame`].
+fn edl_rated(
+    reels: &Reels,
+    tl: &timeline_core::Timeline,
+    run: &mut Option<EdlRun>,
+    s: &timeline_core::schedule::Step,
+    id: timeline_core::SourceId,
+    rep: &mut EdlReport,
+) -> Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)> {
+    let seek = s.seek.is_some();
+    if !seek && run.as_ref().is_some_and(|x| x.src == id) {
+        if let Some((w, h, px, ord)) = run.as_ref().filter(|x| x.at == s.src_t).and_then(|x| x.last.clone()) {
+            return Ok((w, h, Px::from(px), ord)); // a slower clip repeats its source tick: the last picture holds
+        }
+        while run.as_ref().is_some_and(|x| x.src == id && x.at + 1 < s.src_t) {
+            edl_frame(reels, tl.tb, run, id, s.src_t, false, rep, false)?; // a faster clip: decoded unseen
+            rep.runup += 1;
+        }
+    }
+    let (w, h, px, ord) = edl_frame(reels, tl.tb, run, id, s.src_t, seek, rep, false)?;
+    let slow = s.track.and_then(|ti| tl.clip_at(ti, s.out_t).map(|ci| tl.tracks[ti].clips[ci].rate_q16 < 0x1_0000)).unwrap_or(false);
+    if let Some(x) = run.as_mut() {
+        x.last = if slow { Some((w, h, px.rgb().to_vec(), ord)) } else { None };
+    }
+    Ok((w, h, px, ord))
 }

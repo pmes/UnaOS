@@ -609,3 +609,29 @@ pub fn pan_mix_q16(pan_cq8: i8, ch: usize) -> [i64; 2] {
     let (w, c) = (pan_q16(pan_cq8), pan_q16(0)[0] as i64);
     [w[0] as i64 * 65536 / c, w[1] as i64 * 65536 / c]
 }
+
+// ---- STRIAKSPEED (LEDGER SR9012): the speed a layer plays at, and its effective rate (named tail block) ----
+// Lifted from Stria's render (nle.rs, STRIACLIPSPEED SR829) so the kernel Player's EDL feed calls the SAME rule: a layer of a
+// clip at `rate_q16` plays at that speed, pitch following it as a tape does (its `n` output samples are asked at the
+// EFFECTIVE rate `round(out_rate * 0x1_0000 / q)`); a crossfade's under layer and a handle past the clip's end play 1x.
+
+impl AudioRun {
+    /// The speed layer `li` plays at (Q16.16): 1x for an under layer or one no clip of its source covers at the run's first
+    /// tick (a handle past the clip's end), else that clip's `rate_q16`.
+    pub fn layer_rate(&self, tl: &Timeline, li: usize) -> u32 {
+        let Some(l) = self.layers.get(li) else { return 0x1_0000 };
+        if self.under(li) {
+            return 0x1_0000;
+        }
+        tl.clip_at(l.track, self.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src).map_or(0x1_0000, |c| c.rate_q16)
+    }
+}
+
+/// The effective sample rate a layer at speed `q` (Q16.16) is asked at so its samples, played at `rate`, cover `q` times the
+/// 1x source span: `round(rate * 0x1_0000 / q)`, at least 1; `q` 0 or 1x is `rate` itself.
+pub fn rated_hz(rate: u32, q: u32) -> u32 {
+    if q == 0x1_0000 || q == 0 {
+        return rate;
+    }
+    ((rate as u64 * 0x1_0000 + q as u64 / 2) / q as u64).clamp(1, u32::MAX as u64) as u32
+}
