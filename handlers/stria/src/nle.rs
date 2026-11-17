@@ -982,7 +982,7 @@ impl Sources {
     /// unknown id or a reel with nothing to say. Reads the open demuxer only (no survey walk, no lock). STRIAINFOREELAUDIO (SR761):
     /// then ` | <audio decoder> <rate>` from the reel's audio Track (`media::track_audio_decoder` / `media::track_audio_bitrate`).
     pub fn summary(&self, id: SourceId) -> Option<String> {
-        let m = self.get(id).ok()?;
+        if let Some(q) = self.seq(id) { return Some(q.summary()); } let m = self.get(id).ok()?; // STRIASEQINFO (SR940): a sequence reel's line (file tail)
         let v = m.video.map(|i| &m.demux.tracks()[i]);
         let (codec, w, h) = v.map_or(("", 0, 0), |t| (t.codec_name.as_str(), t.width, t.height));
         let profile = v.and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default();
@@ -1315,7 +1315,7 @@ struct Seq {
     first: u64,
     last: u64,
     w: u32,
-    h: u32,
+    h: u32, held: SeqHeld, // STRIASEQINFO (SR940): the last decoded frame (file tail)
 }
 
 impl Seq {
@@ -1380,7 +1380,7 @@ impl Sources {
         if first == u64::MAX {
             return Err(refuse(String::from("no file matches")));
         }
-        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0 };
+        let seq = Seq { prefix: String::from(prefix), width, suffix: String::from(suffix), first, last, w: 0, h: 0, held: Default::default() }; // STRIASEQINFO (SR940): nothing kept yet
         let p = seq.path(first);
         let mut head = Vec::new();
         std::fs::File::open(&p).and_then(|f| f.take(4096).read_to_end(&mut head)).map_err(|e| refuse(format!("{p}: {e}")))?;
@@ -1419,13 +1419,39 @@ fn seq_frame(tl: &Timeline, sources: &Sources, run: &mut Option<Vid>, src: Sourc
     let Some(q) = sources.seq(src) else { return Ok(None) };
     *run = None;
     let n = u64::try_from(src_t).ok().and_then(|k| q.first.checked_add(k)).filter(|&n| n <= q.last).ok_or(RenderError::Short(src))?;
-    let path = q.path(n);
+    if let Some(f) = q.held_frame(n, tl.tb.to_ns(src_t)) { return Ok(Some(f)); } let path = q.path(n); // STRIASEQINFO (SR940): a repaint of the kept frame reads no file (file tail)
     let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => RenderError::Demux(format!("image sequence reel={} frame {n} missing ({path})", src.0)),
         _ => RenderError::Demux(format!("image sequence reel={} frame {n} ({path}): {e}", src.0)),
     })?;
     let img = gneiss_pal::dsp::image::decode_png(&bytes).map_err(|e| RenderError::Decode(format!("image sequence reel={} frame {n} ({path}): {e:?}", src.0)))?;
-    Ok(Some(Frame { width: img.width, height: img.height, pts_ns: tl.tb.to_ns(src_t), pixels: gneiss_pal::dsp::video::Pixels::Rgba(img.rgba) }))
+    Ok(Some(q.keep(n, img.width, img.height, img.rgba, tl.tb.to_ns(src_t)))) // STRIASEQINFO (SR940): kept as the reel's one frame (file tail)
+}
+
+// ---- STRIASEQINFO (LEDGER SR940): a sequence reel's line and its kept frame (named tail block) ----
+/// STRIASEQINFO (LEDGER SR940): a sequence reel's ONE kept frame `(file number, w, h, RGBA)`, owned by its [`Seq`] (so keyed by
+/// reel, then by number; a re-add drops it with the `Seq`). Locked for one take or one put, never across a read, a decode or
+/// the RGBA copy.
+type SeqHeld = std::sync::Mutex<Option<(u64, u32, u32, Arc<Vec<u8>>)>>;
+
+impl Seq {
+    /// STRIASEQINFO: the reel's person's line for [`Sources::summary`]: `seq <first>..=<last> <w>x<h>`.
+    fn summary(&self) -> String {
+        format!("seq {}..={} {}x{}", self.first, self.last, self.w, self.h)
+    }
+    /// STRIASEQINFO: the kept frame when it is file number `n` (a repaint of the same tick reads no file).
+    fn held_frame(&self, n: u64, pts_ns: i64) -> Option<Frame> {
+        let (w, h, rgba) = self.held.lock().ok().and_then(|g| g.as_ref().filter(|e| e.0 == n).map(|e| (e.1, e.2, e.3.clone())))?;
+        Some(Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba((*rgba).clone()) })
+    }
+    /// STRIASEQINFO: keep file number `n`'s decoded RGBA as the reel's one frame (the old one dropped) and hand it on as a `Frame`.
+    fn keep(&self, n: u64, w: u32, h: u32, rgba: Vec<u8>, pts_ns: i64) -> Frame {
+        let kept = Arc::new(rgba.clone());
+        if let Ok(mut g) = self.held.lock() {
+            *g = Some((n, w, h, kept));
+        }
+        Frame { width: w, height: h, pts_ns, pixels: gneiss_pal::dsp::video::Pixels::Rgba(rgba) }
+    }
 }
 
 // ---- STRIAPROXYMEDIA (LEDGER SR882): a source's preview proxy (named tail block) ----
