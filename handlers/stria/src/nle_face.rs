@@ -208,7 +208,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if let Some(r) = self.bin_input(msg) { return r; } if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's; STRIAPROJECTBIN (SR885): the bin Surface's pointer first (file tail)
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -1538,6 +1538,7 @@ pub struct Split {
     pub preview: u32,
     pub tracks: u32,
     pub preview_canvas: (u32, u32),
+    pub bin: Option<BinSurface>, // STRIAPROJECTBIN (SR885): the source bin's Surface ([`Face::with_bin`], file tail)
 }
 
 impl Face {
@@ -1547,7 +1548,7 @@ impl Face {
     pub fn on_surfaces(mut self, preview: u32, tracks: u32) -> Face {
         let (w, h) = self.canvas;
         let ph = Layout::of(w, h, &self.state).preview_h;
-        self.split = Some(Split { preview, tracks, preview_canvas: (w, ph.max(1)) });
+        self.split = Some(Split { preview, tracks, preview_canvas: (w, ph.max(1)), bin: None });
         self.canvas = (w, h.saturating_sub(ph).max(1));
         self.surface = Some(tracks);
         self
@@ -1587,7 +1588,7 @@ impl Face {
     /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
-        let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
+        if role == Role::Bin { return self.paint_bin(); } let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail); STRIAPROJECTBIN (SR885): the bin's own painter (file tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
@@ -1613,10 +1614,10 @@ impl Face {
         let tracks = self.paint_role(Role::Tracks);
         let (pw, ph) = s.preview_canvas;
         let (tw, th) = self.canvas;
-        vec![
+        self.bin_blit(vec![ // STRIAPROJECTBIN (SR885): the bin's blit after the tracks' (file tail)
             SMessage::SurfaceBlit { url: PREVIEW_SURFACE.into(), width: pw, height: ph, pixels: preview, damage: None, scroll: None },
             SMessage::SurfaceBlit { url: TRACKS_SURFACE.into(), width: tw, height: th, pixels: tracks, damage: None, scroll: None },
-        ]
+        ])
     }
 }
 
@@ -3095,5 +3096,187 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAPROJECTBIN (LEDGER SR885): the source bin Surface (named tail block) ----
+// The split editor's third Surface, [`BIN_SURFACE`]: timeline_core view's `paint_bin` (one row per source: the reel, its
+// duration as timecode, the kind read from the tracks its clips sit on) and `bin_hit`. A click on a row is SR852's word
+// `insert <reel> 0 <duration>` (`view::bin_word`) through [`Face::verb`]: the reel's whole range at the playhead on the first
+// track holding it, ONE commit and one undo step, a refusal on the message line by name. Drag-to-timeline is owed
+// (NLE-BIN-DRAG): a `Drag` is one Surface's frozen layout and cannot cross onto the tracks Surface.
+
+/// The split editor's bin Surface (the sources list).
+pub const BIN_SURFACE: &str = "stria.nle.bin";
+
+/// The bin's Surface: its number, its canvas and whether it sends `BrowserButton` (its release then stands for the click).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinSurface {
+    pub n: u32,
+    pub canvas: (u32, u32),
+    buttons: bool,
+}
+
+impl Face {
+    /// Put the source bin on Surface `n` of a split face ([`Face::on_surfaces`] first; an unsplit face is returned
+    /// unchanged). Its canvas starts at the tracks' width, one [`view::BIN_ROW_H`] row per source.
+    pub fn with_bin(mut self, n: u32) -> Face {
+        let Some(s) = self.split else { return self };
+        let rows = self.state.timeline.sources.len().max(1) as u32;
+        self.split = Some(Split { bin: Some(BinSurface { n, canvas: (self.canvas.0, view::BIN_ROW_H * rows), buttons: false }), ..s });
+        self
+    }
+    /// The bin's Surface, when the face has one.
+    pub fn bin(&self) -> Option<BinSurface> {
+        self.split.and_then(|s| s.bin)
+    }
+    /// A pointer message from the bin Surface (`Some(repaint)`); `None` for every other message. A resize sizes the bin's
+    /// canvas only; the release (or the click, on a surface that sends no buttons) is [`Face::bin_click`]; a press, move or
+    /// wheel is taken and changes nothing.
+    fn bin_input(&mut self, msg: &SMessage) -> Option<bool> {
+        let s = self.split?;
+        let b = s.bin?;
+        if msg.surface() != Some(b.n) {
+            return None;
+        }
+        let set = |f: &mut Face, b: BinSurface| f.split = Some(Split { bin: Some(b), ..s });
+        Some(match *msg {
+            SMessage::BrowserResize(w, h, _) => {
+                let changed = w > 0 && h > 0 && (w, h) != b.canvas;
+                if changed {
+                    set(self, BinSurface { canvas: (w, h), ..b });
+                }
+                changed
+            }
+            SMessage::BrowserButton { down: true, .. } => {
+                set(self, BinSurface { buttons: true, ..b });
+                false
+            }
+            SMessage::BrowserButton { down: false, x, y, .. } => self.bin_click(x, y),
+            SMessage::BrowserClick(x, y, _) if !b.buttons => self.bin_click(x, y),
+            _ => false,
+        })
+    }
+    /// A click on the bin at `(x, y)`: the row's word (`view::bin_hit` -> `view::bin_word`) through [`Face::verb`];
+    /// false under the last row.
+    fn bin_click(&mut self, x: f64, y: f64) -> bool {
+        let Some(b) = self.bin() else { return false };
+        let tl = &self.state.timeline;
+        let Some(word) = view::bin_hit(tl, b.canvas.0, b.canvas.1, x, y).and_then(|i| view::bin_word(tl, i)) else { return false };
+        self.verb(&word)
+    }
+    /// The bin's pixels (`Role::Bin`): timeline_core view's `paint_bin`, the labels through [`Labels`].
+    fn paint_bin(&self) -> Vec<u8> {
+        let (w, h) = self.bin().map(|b| b.canvas).unwrap_or(self.canvas);
+        let mut lab = self.labels.as_ref().map(Labels);
+        view::paint_bin(&self.state.timeline, w, h, vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text))
+    }
+    /// [`Face::frames`]' blits, with the bin's appended when the face has one.
+    fn bin_blit(&mut self, mut v: Vec<SMessage>) -> Vec<SMessage> {
+        if let Some(b) = self.bin() {
+            let pixels = self.paint_role(Role::Bin);
+            v.push(SMessage::SurfaceBlit { url: BIN_SURFACE.into(), width: b.canvas.0, height: b.canvas.1, pixels, damage: None, scroll: None });
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod striaprojectbin_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId, edl};
+
+    fn plain() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn face() -> Face {
+        plain().on_surfaces(0, 1).with_bin(2)
+    }
+
+    fn click(n: u32, (x, y): (f64, f64)) -> SMessage {
+        SMessage::BrowserClick(x, y, n)
+    }
+
+    fn blit(m: &SMessage) -> (&str, u32, u32, &[u8]) {
+        let SMessage::SurfaceBlit { url, width, height, pixels, .. } = m else { panic!("not a blit: {m:?}") };
+        (url.as_str(), *width, *height, pixels.as_slice())
+    }
+
+    /// The bin is the third blit, painted by timeline_core view's `paint_bin`; a split face without a bin and an unsplit
+    /// face keep their blits.
+    #[test]
+    fn striaprojectbin_frames_carry_the_bin_last() {
+        let mut f = face();
+        assert_eq!(f.bin().map(|b| (b.n, b.canvas)), Some((2, (320, 2 * view::BIN_ROW_H))));
+        let frames = f.frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(blit(&frames[0]).0, PREVIEW_SURFACE);
+        assert_eq!(blit(&frames[1]).0, TRACKS_SURFACE);
+        let want = view::paint_bin(&f.state.timeline, 320, 36, Order::Rgba, None);
+        assert_eq!(blit(&frames[2]), (BIN_SURFACE, 320, 36, want.as_slice()));
+        assert_eq!(f.paint_role(Role::Bin), want);
+        assert_eq!(plain().on_surfaces(0, 1).frames().len(), 2, "no bin: the two split blits");
+        let mut unsplit = plain().with_bin(2);
+        assert!(unsplit.bin().is_none());
+        assert_eq!(unsplit.frames().len(), 1);
+    }
+
+    /// A click on bin row B is SR852's `insert B 0 50`: B's whole range laid at the playhead on V1, one undo step, the EDL
+    /// round trip; the same pixels on the tracks Surface are the clip face's click, not an insert.
+    #[test]
+    fn striaprojectbin_click_inserts_the_reel_at_the_playhead() {
+        let mut f = face();
+        let tl0 = f.state.timeline.clone();
+        f.state.seek(15);
+        assert!(f.on(&click(1, view::bin_point(1))), "the tracks Surface takes its own click");
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0), "no insert from the tracks Surface");
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.on(&click(2, view::bin_point(1))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap());
+        assert_eq!(f.state.timeline.tracks[1], tl0.tracks[1], "only the reel's first track moves");
+        assert_eq!((f.state.selected(), f.state.playhead, f.state.undo_depth()), (Some(Clip::new(SourceId(1), 0, 50, 15)), 65, 1));
+        let text = edl::write(&f.state.timeline, "BIN").unwrap();
+        assert_eq!(edl::parse(&text, 25).unwrap(), f.state.timeline);
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0, "one undo restores");
+        assert!(!f.on(&click(2, (5.0, 40.0))), "under the last row (the canvas is 36 px): nothing");
+        assert_eq!(f.state.timeline, tl0);
+    }
+
+    /// A press / release pair is ONE insert (the trailing click is not a second); a reel on no track is refused by name.
+    #[test]
+    fn striaprojectbin_release_is_the_click_and_refusal_by_name() {
+        let mut f = face();
+        let (x, y) = view::bin_point(0);
+        f.on(&SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 2 });
+        assert_eq!(f.state.undo_depth(), 0, "a press changes nothing");
+        f.on(&SMessage::BrowserButton { down: false, x, y, mods: 0, surface: 2 });
+        f.on(&click(2, (x, y)));
+        assert_eq!(f.state.undo_depth(), 1, "one insert per press / release");
+        let (mut tl, src) = synth_fixture();
+        tl.add_source("C", 25);
+        let mut g = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1).with_bin(2);
+        assert_eq!(g.bin().unwrap().canvas, (320, 3 * view::BIN_ROW_H));
+        assert!(g.on(&click(2, view::bin_point(2))));
+        assert_eq!(g.last_error.take(), Some(format!("insert C 0 25: {}", EditError::NoTrack)));
+        assert_eq!((&g.state.timeline, g.state.undo_depth()), (&tl, 0));
+    }
+
+    /// The bin Surface's resize sizes its canvas only; a move on it is taken and changes nothing.
+    #[test]
+    fn striaprojectbin_resize_and_move_stay_on_the_bin() {
+        let mut f = face();
+        let (canvas, preview) = (f.canvas, f.split().unwrap().preview_canvas);
+        assert!(f.on(&SMessage::BrowserResize(200, 54, 2)));
+        assert!(!f.on(&SMessage::BrowserResize(200, 54, 2)), "the same size: no repaint");
+        assert_eq!(f.bin().unwrap().canvas, (200, 54));
+        assert_eq!((f.canvas, f.split().unwrap().preview_canvas), (canvas, preview));
+        assert!(!f.on(&SMessage::BrowserMouseMove(5.0, 5.0, 2)));
+        assert!(f.pointer().is_none(), "the bin's pointer is not the tracks'");
+        assert_eq!(blit(&f.frames()[2]).1, 200);
     }
 }
