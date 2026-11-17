@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1241,5 +1241,24 @@ mod striamultiselect_tests {
         st.deselect();
         assert_eq!(st.gain_set(|_| 0), Err(EditError::NoClip));
         assert_eq!(st.verb("gain+"), Some(Err(EditError::NoClip)));
+    }
+}
+
+// ---- STRIATRANSITIONLENGTH (LEDGER SR870): the `dur <n>` word (named tail block) ----
+// The edge drag (SR691's `Drag::begin_transition_edge`) and the host face's `[` / `]` change a transition's length by the
+// pointer or by one tick; `dur <n>` gives the selected transition exactly `n` ticks through THE length op
+// `set_transition_dur` (one commit; kind, ease and black kept; the ask fresh). The same length again commits nothing.
+// Refused as `EditError::Transition`: no transition selected, a bare `dur`, a count that is not an integer, extra words;
+// `validate` refuses `n < 1` (`Transition`) and a length past a handle (`Handle`).
+impl EditorState {
+    /// The `dur <n>` word of [`EditorState::verb`]; `None` when the first word is not `dur`.
+    fn transition_dur_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|&w| w == "dur")?;
+        Some(match (self.selected_transition(), w.next().map(str::parse::<i64>), w.next()) {
+            (Some(x), Some(Ok(n)), None) if n == x.dur => Ok(()),
+            (Some(_), Some(Ok(n)), None) => self.set_transition_dur(n),
+            _ => Err(EditError::Transition),
+        })
     }
 }

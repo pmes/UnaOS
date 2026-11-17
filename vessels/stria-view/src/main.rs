@@ -25,6 +25,7 @@
 //! `key:Meta+a` is the `BrowserSelectAll` both faces send for it, and the JSON line ends with the set's size `set`.
 //! NLE3d (SR302): `transition:<track>:<idx>` clicks that transition's widget (selecting it; `delete`, `[` / `]` then edit
 //! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
+//! STRIATRANSITIONLENGTH (SR870): `dur:<n>` gives the selected transition exactly n ticks (timeline_core's `dur <n>` word).
 //! NLE4C (SR301): `meters` feeds the face's meters the tick at the playhead (what one played tick feeds); the JSON line
 //! then ends `"meters":[{"track":<n>,"peak":<dBFS>,"rms":<dBFS>},...,{"track":"master",...}]`.
 //! SURFACEID (SR332): `--two-surfaces` puts a second Surface ([`AUX_SURFACE`]) above the editor's in the tree, so the
@@ -185,7 +186,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
         }
         ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
-        [w @ ("kind" | "ease"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
+        [w @ ("kind" | "ease" | "dur"), arg] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {arg}") }, // STRIATRANSITIONLENGTH (SR870): `dur:7`; NLETRANSITIONFACE (SR691): `kind:W007`, `ease:in`
         [w @ ("insert" | "overwrite"), reel, a, b] => SMessage::Input { target: SURFACE.into(), text: format!("{w} {reel} {a} {b}") }, // STRIAINSERTOVERWRITE (SR852): `insert:A:13:23` (frames: `:` is the token separator)
         ["help"] => SMessage::Input { target: SURFACE.into(), text: "help".into() }, // NLE5DKEYSHELP (SR744) / NLE5DKEYSHELPBUTTON (SR765): the keys help word and button
         _ => return None,
@@ -1034,5 +1035,28 @@ mod striainsertoverwrite_tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(g.state.timeline.tracks[0].clips[1], Clip::new(SourceId(0), 40, 45, 5));
         println!("striainsertoverwrite witness: at:12:0,ruler:15,insert -> clip 15:0:10, V1 end 45; overwrite:A:40:45 at 5");
+    }
+}
+
+// ---- STRIATRANSITIONLENGTH (LEDGER SR870): the `dur:<n>` token (named tail block) ----
+
+#[cfg(test)]
+mod striatransitionlength_tests {
+    use super::*;
+
+    /// M3: `transition:0:0,dur:7` gives the selected dissolve 7 ticks (the JSON `"dur":7`, one undo step); `dur:99` runs
+    /// past the incoming clip's handle and is refused by name, the state left.
+    #[test]
+    fn striatransitionlength_witness_dur_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "transition:0:0,dur:7");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(transition_json(&face).contains(r#""at":10,"dur":7,"#), "{}", transition_json(&face));
+        assert_eq!(face.state.undo_depth(), 1);
+        let before = face.state.clone();
+        assert_eq!(drive(&mut face, "dur:99"), vec![format!("dur 99: {}", timeline_core::EditError::Handle)]);
+        assert_eq!(face.state, before);
     }
 }
