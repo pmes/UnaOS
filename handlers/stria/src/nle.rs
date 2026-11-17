@@ -541,7 +541,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r, proxy)?;
-                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()),; let rgba = cropped(tl, s.track, s.out_t, false, rgba, fw, fh, reel_fit(tl, src, s.vmix.is_none())) tl.grade_at(s.track, s.out_t, false))?; // STRIAGRADEMORE (SR957): the clip's grade inside reel_rgba, on the source frame before the fit, so the bars stay FIELD (file tail); STRIACOLORLIFT (SR869): the clip's grade on the frame it holds; NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()), tl.grade_at(s.track, s.out_t, false))?; let rgba = cropped(tl, s.track, s.out_t, false, rgba, fw, fh, reel_fit(tl, src, s.vmix.is_none())); // STRIAGRADEMORE (SR957): the clip's grade inside reel_rgba, on the source frame before the fit, so the bars stay FIELD (file tail); STRIACOLORLIFT (SR869): the clip's grade on the frame it holds; NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
                 sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r, proxy)?);
                 r.frames += 1;
             }

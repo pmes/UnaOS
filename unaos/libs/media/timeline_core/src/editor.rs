@@ -697,7 +697,7 @@ pub const GAIN_STEP_CDB: i32 = 100;
 impl EditorState {
     /// The selected clip's gain set to `cdb` centi-dB (`Timeline::set_gain`, ONE commit; the same gain commits nothing).
     pub fn set_selected_gain(&mut self, cdb: i32) -> Result<(), EditError> {
-        if self.set.len() > 1 { return self.pan_whole_set(pan_cq8); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAPANMORE (SR959): a set of more than one pans its audio clips (file tail)
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.gain_cdb == cdb {
             return Ok(());
@@ -1833,7 +1833,7 @@ impl EditorState {
 impl EditorState {
     /// The selected clip's pan set to `pan_cq8` (one commit; the same pan again commits nothing).
     pub fn set_selected_pan(&mut self, pan_cq8: i8) -> Result<(), EditError> {
-        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        if self.set.len() > 1 { return self.pan_whole_set(pan_cq8); } let (track, idx) = self.selection.ok_or(EditError::NoClip)?; // STRIAPANMORE (SR959): a set of more than one pans its audio clips (file tail)
         let c = self.selected().ok_or(EditError::NoClip)?;
         if c.pan_cq8 == pan_cq8 {
             return Ok(());

@@ -98,7 +98,7 @@ pub fn paint(st: &EditorState, w: u32, h: u32, order: PixelOrder, labels: Option
 /// `view::paint_in`, the labels through [`Labels`].
 pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
     let lab = labels.map(|s| Labels(s, None)); // STRIAPERFLABELSHAPE (SR935): the free paint shapes uncached (file tail)
-    paint_labelled(st, l, order, lab, preview) // STRIAPERFLABELSHAPE (SR935): the one view::paint_in call (file tail), peaks
+    paint_labelled(st, l, order, lab, preview, peaks) // STRIAPERFLABELSHAPE (SR935): the one view::paint_in call (file tail), peaks
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -3236,7 +3236,7 @@ impl Face {
     /// by name, as `export` refuses. `None` for any other word.
     fn frame_verb(&mut self, v: &str) -> Option<bool> {
         let rest = v.strip_prefix("frame")?;
-        if !(rest.is_empty()let Some(r) = self.gaps_all_note_verbundo_jump_verb(v) { return r; } if let Some(r) = self.(v) { return Some(r); } if  || rest.starts_with(char::is_whitespace)) { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
+        if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
             return None;
         }
         let rest = rest.trim();
@@ -3669,7 +3669,7 @@ impl Face {
     fn paint_tc(&self, px: Vec<u8>, l: Layout) -> Vec<u8> {
         let (Some(style), Some(text)) = (self.labels.as_ref(), self.tc_readout()) else { return px };
         let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
-        view::Text::text(&mut Labels(style), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, (l.w / 2) as i32));
+        view::Text::text(&mut Labels(style, None), &mut c, &text, 4.0, (l.message_y + l.message_h) as f32 - 4.0, (0, (l.w / 2) as i32));
         c.px
     }
 }
@@ -4607,7 +4607,7 @@ impl Face {
     /// STRIAINFOREEL (SR743) / STRIASOURCEINFO (SR875): clip `c`'s reel line, `<reel name>: <summary>` (`nle::Sources::summary`);
     /// `None` for a reel with nothing to say. THE one formatter `reel_line` and `info` read.
     pub fn clip_reel_line(&self, c: Clip) -> Option<String> {
-        let s = self.pcache.summary(&self.sources, c.src)?; // STRIAPERFPREVIEWCACHE (SR918): read once per reel (file tail)
+        let s = self.pcache.summary(&self.sources, c.src); // STRIAPERFPREVIEWCACHE (SR918): read once per reel (file tail)
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         reel_words(name, s, grade_note(c.grade)) // STRIAGRADEMORE (SR957): the summary-less arm (file tail); STRIAGRADEFACE (SR899): the clip's grade while not identity
     }
@@ -5310,7 +5310,7 @@ impl Face {
 impl Face {
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
+        if let Some(r) = self.undo_jump_verb(v) { return r; } if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
             self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N));
             return true;
         }
@@ -5687,7 +5687,7 @@ impl Face {
     /// The bin's pixels (`Role::Bin`): timeline_core view's `paint_bin`, the labels through [`Labels`].
     fn paint_bin(&self) -> Vec<u8> {
         let (w, h) = self.bin().map(|b| b.canvas).unwrap_or(self.canvas);
-        let mut lab = self.labels.as_ref().map(Labels);
+        let mut lab = self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache)));
         view::paint_bin_from(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text)) // STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail)
     }
     /// [`Face::frames`]' blits, with the bin's appended when the face has one.
@@ -5906,7 +5906,7 @@ fn track_word(tl: &Timeline, ti: usize) -> String {
 impl Face {
     /// The `close-gaps` word with its note; `None` for any other word.
     fn gaps_note_verb(&mut self, v: &str) -> Option<bool> {
-        if v != "close-gaps" {
+        if let Some(r) = self.gaps_all_note_verb(v) { return Some(r); } if v != "close-gaps" { // STRIAGAPSALLTRACKS (SR929): `close-gaps all` and its note (file tail)
             return None;
         }
         let track = self.state.selection.map(|(t, _)| t);
@@ -6721,9 +6721,9 @@ fn shaped(style: &TextStyle, cache: Option<&LabelCache>, s: &str) -> std::sync::
 
 /// STRIAPERFLABELSHAPE (SR935): timeline_core's `view::paint_in` with the caller's [`Labels`] (the free [`paint_in`]'s uncached
 /// hook, or the face's cached one).
-fn paint_labelled(st: &EditorState, l: Layout, order: PixelOrder, lab: Option<Labels<'_>>, preview: Option<&Still>) -> Vec<u8> {
+fn paint_labelled(st: &EditorState, l: Layout, order: PixelOrder, lab: Option<Labels<'_>>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
     let mut lab = lab;
-    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview)
+    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview, peaks)
 }
 
 impl Face {
