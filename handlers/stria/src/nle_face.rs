@@ -2085,7 +2085,7 @@ pub struct ExportJob {
     total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<ExportReport, ExportError>>>,
-    /// The `done` the last [`Face::export_tick`] reported (a repaint only when it moved).
+    /// The fnv1a of the export line ([`job_line`]) the last [`Face::export_tick`] saw (a repaint only when it moved: done or the eta word, NLE5DEXPORTMESSAGEETABAND SR803).
     shown: u64,
     /// NLE5DEXPORTRANGE (SR717): the marked range exported (`None`: the whole timeline), named in the result line.
     range: Option<std::ops::Range<i64>>, video: String, audio: AudioOut, started: std::time::Instant, // NLE5DEXPORTMESSAGEAUDIO (SR756): the video word and the audio the result line and the witness name
@@ -2198,7 +2198,7 @@ impl Face {
             self.finish_export();
             return true;
         }
-        let d = j.done.load(Relaxed);
+        let d = fnv1a(job_line(j).as_bytes());
         let moved = d != j.shown;
         j.shown = d;
         moved
@@ -2358,7 +2358,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -2888,4 +2888,32 @@ pub fn eta_words(done: u64, total: u64, elapsed: Duration) -> Option<String> {
     } else {
         format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
     })
+}
+
+// ---- NLE5DEXPORTMESSAGEETABAND (LEDGER SR803): the running export's line on the message line (named tail block) ----
+// While an export runs, `Face::message_text` reads `job_line` after `last_error` and before the hovered / selected reel line,
+// so the one line under the preview says `export: 3 / 35 ~12 s` (labels on only: `paint_message`'s gate, so every labels-off
+// paint is byte-identical); the 2 px band stays the glance. `export_tick` keeps the fnv1a of this line in `ExportJob.shown`, so
+// the face repaints when the eta word moves with done fixed (labels off: frames re-fired ~1/s, pixels unchanged). Owed:
+// NLE5D-EXPORT-MESSAGE-ETA-TOTAL (the real count before frame 1: total is 0 until the export thread's first reading),
+// NLE5D-EXPORT-MESSAGE-ETA-KERNEL (the kernel Player paints the same line), NLE5D-EXPORT-MESSAGE-ETA-SMOOTH (carried),
+// NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// A running export as a person reads it: `export: <done> / <total>`, then ` <eta>` when there is one ([`eta_words`]:
+/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (before the export thread's first reading).
+pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
+    if total == 0 {
+        return "export: starting".to_string();
+    }
+    match eta {
+        Some(e) => format!("export: {done} / {total} {e}"),
+        None => format!("export: {done} / {total}"),
+    }
+}
+
+/// The running job's [`export_line`]: its `done` / `total` reading (as [`Face::export_progress`] reads it) and SR796's
+/// [`eta_words`] over its `started`. A free fn over the job, so [`Face::export_tick`] calls it under its live `&mut` borrow.
+fn job_line(j: &ExportJob) -> String {
+    let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
+    export_line(d, t, eta_words(d, t, j.started.elapsed()))
 }

@@ -3078,3 +3078,114 @@ fn nle5dexportmessageeta_labels_off_paint_is_unmoved() {
     println!("nle5dexportmessageeta: labels-off paint byte-identical across eta {e1:?} -> {e2:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- NLE5DEXPORTMESSAGEETABAND (LEDGER SR803): the running export's line on the message line (named tail block) ----
+
+#[test]
+fn nle5dexportmessageetaband_export_line_kat() {
+    use stria::nle_face::export_line;
+    let rows = [
+        (3, 35, Some("~12 s"), "export: 3 / 35 ~12 s"),
+        (0, 35, None, "export: 0 / 35"),
+        (35, 35, Some("~0 s"), "export: 35 / 35 ~0 s"),
+        (0, 0, None, "export: starting"),
+    ];
+    for (d, t, e, want) in rows {
+        assert_eq!(export_line(d, t, e.map(String::from)), want, "export_line({d}, {t}, {e:?})");
+    }
+    println!("nle5dexportmessageetaband: export_line {} KAT rows", rows.len());
+}
+
+/// The eta part of a running line: `<n> s`, `m:ss` or `h:mm:ss` (SR796's `eta_words` grades without the tilde).
+fn nle5dexportmessageetaband_eta_shaped(tail: &str) -> bool {
+    match tail.strip_suffix(" s") {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => !tail.is_empty() && tail.contains(':') && tail.bytes().all(|b| b.is_ascii_digit() || b == b':'),
+    }
+}
+
+#[test]
+fn nle5dexportmessageetaband_paused_face_reads_the_export_line() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("etaband-line");
+    let (tl, src) = synth_fixture();
+    let reel = format!("A: {}", src.summary(SourceId(0)).unwrap());
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, true);
+    let l = face.layout();
+    assert!(l.message_h > 0, "labels on: the message row exists");
+    let strip = |px: &[u8]| -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in l.message_y..l.message_y + l.message_h {
+            let row = (y * l.w) as usize * 4;
+            out.extend_from_slice(&px[row..row + 64 * 4]);
+        }
+        out
+    };
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.message_text().as_deref(), Some(reel.as_str()));
+    let before = strip(&face.paint());
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    let line = face.message_text().expect("the running export's line");
+    let tail = line.strip_prefix("export: 3 / 35 ~").unwrap_or_else(|| panic!("{line}: the export wins over the selected reel"));
+    assert!(nle5dexportmessageetaband_eta_shaped(tail), "{line}: the eta part");
+    assert_ne!(strip(&face.paint()), before, "the export line inks the message row");
+    face.last_error = Some("split: no such clip".into());
+    assert_eq!(face.message_text().as_deref(), Some("split: no such clip"), "an error wins over the export");
+    assert_eq!(face.last_error.take().as_deref(), Some("split: no such clip"));
+    assert!(face.message_text().is_some_and(|m| m.starts_with("export: 3 / 35 ~")), "the export line again");
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let cancel = format!("export: cancelled at 3/35 frames; partial files left in {}", dir.display());
+    assert_eq!(face.message_text(), Some(cancel.clone()), "the finished line (SR694's cancel) wins after the job");
+    assert_eq!(face.last_error.take(), Some(cancel));
+    assert_eq!(face.message_text().as_deref(), Some(reel.as_str()), "after the cancel line: SR743's reel line");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Labels off: the message row paints nothing, so the paused paint is the idle paint outside the band rows.
+    let odir = nlefaceexport_dir("etaband-off");
+    let (tl, src) = synth_fixture();
+    let mut off = nlefaceexport_face(tl, src);
+    let lo = off.layout();
+    let idle = off.paint();
+    off.export_paused_at(&odir, "png", 3).unwrap();
+    nlefaceexport_until(&off, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(off.message_text().is_some_and(|m| m.starts_with("export: 3 / 35 ~")));
+    let shown = off.paint();
+    let band = (lo.tracks_y - stria::nle_face::EXPORT_BAND_H)..lo.tracks_y;
+    for y in (0..lo.h).filter(|y| !band.contains(y)) {
+        let r = (y * lo.w * 4) as usize..((y + 1) * lo.w * 4) as usize;
+        assert_eq!(&shown[r.clone()], &idle[r], "labels off: row {y} unmoved by the export line");
+    }
+    assert!(off.cancel_export() && off.wait_export());
+    let _ = std::fs::remove_dir_all(&odir);
+    println!("nle5dexportmessageetaband: paused line \"{line}\"; error wins; cancel then the reel line; labels off unmoved");
+}
+
+#[test]
+fn nle5dexportmessageetaband_tick_repaints_when_the_eta_word_moves() {
+    use std::time::Duration;
+    let dir = nlefaceexport_dir("etaband-tick");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.export_paused_at(&dir, "png", 3).unwrap();
+    nlefaceexport_until(&face, (3, 35));
+    std::thread::sleep(Duration::from_millis(2));
+    face.export_tick();
+    let w = face.message_text().expect("the running line");
+    let t0 = std::time::Instant::now();
+    while face.message_text().as_ref() == Some(&w) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the paused eta never moved past {w}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(face.export_progress(), Some((3, 35)), "done never moved");
+    assert!(face.export_tick(), "the eta word moved with done fixed: the tick repaints");
+    let moved = face.message_text();
+    assert!(face.cancel_export());
+    assert!(face.wait_export());
+    let _ = face.last_error.take();
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("nle5dexportmessageetaband: tick repaints {w} -> {moved:?} at 3/35");
+}
