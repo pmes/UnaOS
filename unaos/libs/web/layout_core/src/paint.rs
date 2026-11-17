@@ -164,8 +164,8 @@ pub struct PaintStyle<H: Host> {
     pub table_fixed: Option<bool>,
     /// Alpha of the background colour (css-color-4; absent = opaque).
     pub bg_alpha: Option<f32>,
-    /// Alpha of the border colour(s) (absent = opaque).
-    pub border_alpha: Option<f32>,
+    /// Alpha of each side's border colour, [top, right, bottom, left] (absent / a None side = opaque; SR1112: per side).
+    pub border_alpha: Option<[Option<f32>; 4]>,
     /// How `font_size` was specified: (0, f) = f x the parent's font-size
     /// (em, %, smaller/larger), (1, f) = f x the root's (rem), (2, _) =
     /// absolute (font_size as is).

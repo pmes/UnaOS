@@ -1517,12 +1517,12 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
             };
             let mut sides = style.paint.border.unwrap_or_default();
             if v == "none" || v == "0" {
-                sides[side] = None; border_width_store(&mut style.paint, 1 << side, None);
+                sides[side] = None; border_width_store(&mut style.paint, 1 << side, None); side_alpha_set(&mut style.paint, 1 << side, 1.0);
                 style.paint.border = Some(sides);
                 return;
             }
             let mut width = border_medium();
-            let mut color = (128, 128, 128);
+            let mut color = (128, 128, 128); let mut alpha = 1.0f32;
             let mut got_any = false;
             for part in split_top_level(v) {
                 if let Some(px) = crate::paint::outline_width_keyword(part).or_else(|| parse_px(part, cx).filter(|_| part.ends_with("px") || is_font_relative(part))) {
@@ -1533,14 +1533,14 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                     let mut bs = style.paint.border_style.unwrap_or([0; 4]);
                     bs[side] = k;
                     style.paint.border_style = Some(bs);
-                } else if let Some(c) = parse_color_str::<H>(part) {
+                } else if let Some(c) = border_rgb::<H>(part) {
                     color = c;
                     got_any = true;
-                    style.paint.border_alpha = Some(color_alpha::<H>(part));
+                    alpha = color_alpha::<H>(part);
                 }
             }
             if got_any {
-                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v); border_width_store(&mut style.paint, 1 << side, Some(width));
+                sides[side] = Some((width, color)); border_cc(&mut style.paint, 1 << side, v); border_width_store(&mut style.paint, 1 << side, Some(width)); side_alpha_set(&mut style.paint, 1 << side, alpha);
                 style.paint.border = Some(sides);
             } else { font_rel_undo(&mut style.paint, prop, &fr); }
         }
@@ -1792,11 +1792,11 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "border" => { sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
             let v = value.trim();
             if v == "none" || v == "0" {
-                style.paint.border = Some([None; 4]); border_width_store(&mut style.paint, crate::paint::CC_SIDES, None);
+                style.paint.border = Some([None; 4]); border_width_store(&mut style.paint, crate::paint::CC_SIDES, None); side_alpha_set(&mut style.paint, crate::paint::CC_SIDES, 1.0);
                 return;
             }
             let mut width = border_medium();
-            let mut color = (128, 128, 128);
+            let mut color = (128, 128, 128); let mut alpha = 1.0f32;
             let mut got_any = false;
             for part in split_top_level(v) {
                 if let Some(px) = crate::paint::outline_width_keyword(part).or_else(|| parse_px(part, cx).filter(|_| part.chars().next().map_or(false, |c| c.is_ascii_digit() || c == '.'))) {
@@ -1805,14 +1805,14 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 } else if let Some(k) = border_style_code(part) {
                     got_any = true;
                     style.paint.border_style = Some([k; 4]);
-                } else if let Some(c) = parse_color_str::<H>(part) {
+                } else if let Some(c) = border_rgb::<H>(part) {
                     color = c;
                     got_any = true;
-                    style.paint.border_alpha = Some(color_alpha::<H>(part));
+                    alpha = color_alpha::<H>(part);
                 }
             }
             if got_any {
-                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v); border_width_store(&mut style.paint, crate::paint::CC_SIDES, Some(width));
+                style.paint.border = Some([Some((width, color)); 4]); border_cc(&mut style.paint, crate::paint::CC_SIDES, v); border_width_store(&mut style.paint, crate::paint::CC_SIDES, Some(width)); side_alpha_set(&mut style.paint, crate::paint::CC_SIDES, alpha);
             } else { font_rel_undo(&mut style.paint, prop, &fr);
                 H::record_css(&format!("border-value:{}", clip(value)));
             }
@@ -1837,25 +1837,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { if split_top_level(value).len() > 1 { return border_color_sides::<H>(value, &mut style.paint); } sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
-            // `transparent` (or a fully transparent rgba) is how a page
-            // says "keep the box, drop the stroke" — the UA control border
-            // must go with it, or every quiet button paints an empty frame.
-            let v = value.trim().to_ascii_lowercase();
-            if border_transparent::<H>(&v) {
-                style.paint.border = Some([None; 4]);
-                return;
-            }
-            if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
-                style.paint.border_alpha = Some(color_alpha::<H>(value));
-                let Some(mut sides) = border_color_pend(&mut style.paint, c) else { return };
-                for side in sides.iter_mut() {
-                    let Some((w, _)) = *side else { continue };
-                    *side = Some((w, c));
-                }
-                style.paint.border = Some(sides);
-            }
-        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => border_color_sides::<H>(value, &mut style.paint),
         "border-width" => {
             if let Some(r) = parse_sides(value, |v| line_width(v, cx)) { for (i, w) in [r.top, r.right, r.bottom, r.left].into_iter().enumerate() { border_width_store(&mut style.paint, 1 << i, Some(w)); } } else { font_rel_undo(&mut style.paint, prop, &fr); } // SR1075
         }
@@ -2518,13 +2500,13 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
     macro_rules! clone {
         ($($f:ident),* $(,)?) => { $( if src.$f.is_some() { dst.$f = src.$f.clone(); } )* };
     }
-    merge_border_pending(dst, src); copy!(
+    merge_border_pending(dst, src); merge_border_alpha(dst, src); copy!(
         background, color, font_size, weight, border, line_height, hidden, clip, underline,
         nowrap, family, italic, text_transform, border_width, bg_repeat, text_hidden,
         mask_repeat, text_align, text_align_last, object_fit, flex_container, border_style, radius,
         white_space, word_break, overflow_wrap, letter_spacing, line_through, display_kind, decoration_color, decoration_style, decoration_thickness, underline_offset, underline_position,
         ua_vmargin, border_collapse, caption_side, border_spacing, has_width, position_kind, z_index,
-        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha, border_alpha,
+        list_item, list_style, vertical_align, float, opacity, font_size_rel, table_fixed, bg_alpha,
         stretch, word_spacing, rtl, unicode_bidi, clear, tf_translate, tf_rotate, tf_scale, transform_origin, inset_px,
         overflow, col_count, col_width, col_gap, col_fill, col_rule_width, col_rule_style, col_rule_color,
         writing_mode, text_orientation, container_type, contain_size,
@@ -3190,16 +3172,13 @@ fn outline_width_value(v: &str, cx: &ParseCx) -> Option<f32> {
 }
 
 /// A11YFACE (SR124): an `outline-color` as the RGBA [`PaintStyle::outline_color`] holds: `currentColor` and
-/// `invert` (a UA that cannot invert paints currentColor, css-ui-4 §4.4) are `Some(None)`.
+/// `invert` (a UA that cannot invert paints currentColor, css-ui-4 §4.4) are `Some(None)`; any other colour's RGB through [`border_rgb`] (SR1119: alpha 0 included, `transparent` (0, 0, 0, 0)) and its alpha through [`color_alpha`].
 fn outline_color_value<H: Host>(v: &str) -> Option<Option<(u8, u8, u8, u8)>> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("invert") {
         return Some(None);
     }
-    if v.eq_ignore_ascii_case("transparent") {
-        return Some(Some((0, 0, 0, 0)));
-    }
-    let (r, g, b) = parse_color_str::<H>(v)?;
+    let (r, g, b) = border_rgb::<H>(v)?;
     let a = (color_alpha::<H>(v).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     Some(Some((r, g, b, a)))
 }
@@ -3686,7 +3665,7 @@ fn border_cc<H: Host>(paint: &mut PaintStyle<H>, mask: u8, v: &str) {
 /// `border-color`'s colour: a parsed colour clears the side bits; `currentcolor` sets them and answers the grey
 /// carrier, so the arm builds the sides as it does for a colour; anything else None.
 fn border_color_of<H: Host>(paint: &mut PaintStyle<H>, value: &str) -> Option<(u8, u8, u8)> {
-    if let Some(c) = parse_color_str::<H>(value) {
+    if let Some(c) = border_rgb::<H>(value) {
         paint.currentcolor &= !crate::paint::CC_SIDES;
         Some(c)
     } else if value.trim().eq_ignore_ascii_case("currentcolor") {
@@ -3765,25 +3744,20 @@ fn apply_align_content<H: Host>(value: &str, style: &mut SpecifiedStyle<H>) {
 
 // ---- AETHERCSSBORDERSIDECOLOR (LEDGER SR1014): the border-*-color longhands write one side's colour (named tail block) ----
 
-/// AETHERCSSBORDERSIDECOLOR (SR1014): `transparent`, or a fully transparent rgba (`parse_color_str` answers None), as a
-/// border colour: Aether drops the side (no transparent stroke). Lifted from the `border-color` arm, which calls it too.
+/// AETHERCSSBORDERSIDECOLOR (SR1014): `transparent`, or any colour the host reads at alpha 0 (SR1119; `parse_color_str` refuses those), as a
+/// border colour: a colour at alpha 0 (SR1112: the side is kept, its width sizes the box, `border_rgb` reads its RGB).
 fn border_transparent<H: Host>(v: &str) -> bool {
     let v = v.trim().to_ascii_lowercase();
-    v == "transparent" || (v.starts_with("rgba(") && parse_color_str::<H>(&v).is_none())
+    v == "transparent" || H::parse_color_alpha(&v).is_some_and(|c| c.1 <= 0.0)
 }
 
 /// AETHERCSSBORDERSIDECOLOR (SR1014): `border-top-color` / `-right-` / `-bottom-` / `-left-color` (css-backgrounds-3
 /// §3.1) write ONE side's colour, its width kept. A side with no entry has style none in Aether's model (a side paints
 /// iff its entry is Some), so the longhand creates nothing there and no ink paints, as Chromium (the colour is not
 /// stored: AETHER-CSS-BORDER-COLOR-STORED owed). The colour goes through `border_color_of` unchanged; only this side's
-/// currentcolor bit keeps its answer, the other three are put back. `transparent` drops the side, as `border-color` does.
+/// currentcolor bit keeps its answer, the other three are put back. `transparent` is alpha 0 on that side (SR1112).
 fn side_color_of<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
     let Some(mut sides) = paint.border.filter(|b| b[side].is_some()) else { return side_color_pend::<H>(side, value, paint) };
-    if border_transparent::<H>(value) {
-        sides[side] = None;
-        paint.border = Some(sides);
-        return;
-    }
     let before = paint.currentcolor;
     let Some(c) = border_color_of::<H>(paint, value) else {
         if !is_neutral_keyword(value) {
@@ -3793,7 +3767,7 @@ fn side_color_of<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
     };
     let bit = 1u8 << side;
     paint.currentcolor = (before & !bit) | (paint.currentcolor & bit);
-    paint.border_alpha = Some(color_alpha::<H>(value));
+    side_alpha_set(paint, bit, color_alpha::<H>(value));
     if let Some((w, _)) = sides[side] {
         sides[side] = Some((w, c));
     }
@@ -4884,31 +4858,10 @@ fn border_pending_create<H: Host>(paint: &mut PaintStyle<H>, mask: u8) {
     paint.border = Some(border_create_sides(paint, mask, true));
 }
 
-/// AETHERCSSBORDERCOLORSTORED (SR1058): the `border-color` arm's colour `c` (from `border_color_of`, which set or
-/// cleared all four currentcolor bits) is pended for all four sides; the answer is the sides the arm recolours: this
-/// block's entries, created first for the absent sides when the block declared a style (`border-style: solid;
-/// border-color: red`), else as they are (an absent side stays absent: css-backgrounds-3 §3.2 style none paints
-/// nothing). None (no border in this block, no style) = the arm writes nothing: the colour waits in the store, and
-/// `merge_border_pending` lays it on an earlier rule's sides.
-fn border_color_pend<H: Host>(paint: &mut PaintStyle<H>, c: (u8, u8, u8)) -> Option<[Option<(f32, (u8, u8, u8))>; 4]> {
-    let cc = paint.currentcolor & 1 != 0;
-    paint.border_pending = Some([Some((c, cc)); 4]);
-    if paint.border_style.is_some() {
-        return Some(border_create_sides(paint, crate::paint::CC_SIDES, false));
-    }
-    paint.border
-}
-
 /// AETHERCSSBORDERCOLORSTORED (SR1058): `side_color_of`'s side with no entry: the colour is pended for that side (its
-/// currentcolor answer in the entry, the four live bits put back as they were), not dropped. `transparent` forgets the
-/// side's pending entry (AETHER-CSS-BORDER-PENDING-TRANSPARENT owed); an invalid value is recorded as before.
+/// currentcolor answer in the entry, the four live bits put back as they were), not dropped. `transparent` pends its RGB
+/// with that side's alpha 0 (SR1112: AETHER-CSS-BORDER-PENDING-TRANSPARENT); an invalid value is recorded as before.
 fn side_color_pend<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>) {
-    if border_transparent::<H>(value) {
-        if let Some(p) = paint.border_pending.as_mut() {
-            p[side] = None;
-        }
-        return;
-    }
     let before = paint.currentcolor;
     let Some(c) = border_color_of::<H>(paint, value) else {
         if !is_neutral_keyword(value) {
@@ -4918,7 +4871,7 @@ fn side_color_pend<H: Host>(side: usize, value: &str, paint: &mut PaintStyle<H>)
     };
     let cc = paint.currentcolor & (1 << side) != 0;
     paint.currentcolor = before;
-    paint.border_alpha = Some(color_alpha::<H>(value));
+    side_alpha_set(paint, 1 << side, color_alpha::<H>(value));
     let mut p = paint.border_pending.unwrap_or([None; 4]);
     p[side] = Some((c, cc));
     paint.border_pending = Some(p);
@@ -5106,12 +5059,16 @@ fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
 // ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
 
 /// AETHERCSSBORDERCOLORSIDES (SR1085): css-backgrounds-3 §3.2 `border-color: <color>{1,4}` in the top / right / bottom /
-/// left order. ONE colour keeps the `border-color` arm's own road unchanged; 2-4 colours (before SR1085 dropped whole:
+/// left order. SR1098: THE one road for 1-4 colours (the arm is one call); 2-4 colours (before SR1085 dropped whole:
 /// `parse_color_str` reads no multi-token value) expand through [`parse_sides`] (token indices into `split_top_level`)
 /// and each side goes through the `border-<side>-color` arm's two writers, `sys_border_slot` (cleared first, so an
 /// earlier keyword does not block the join; SR1046's one slot keeps the first keyword) and `side_color_of` (a side with
-/// no entry pends, `transparent` drops or forgets the side). `border_alpha` stays ONE frame value: the first
-/// non-transparent token's (AETHER-CSS-BORDER-ALPHA-PER-SIDE owed). Five values or a bad token drop the declaration.
+/// no entry pends). `border_alpha` is per side since SR1112 (`side_alpha_set`): a transparent token keeps its side at
+/// alpha 0. Five values or a bad token drop the declaration.
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §3.2 sets all four colour longhands, so every side's pending
+/// entry is written (`side_color_pend`, also on a present side: one value and the value four times end with ONE store);
+/// a colour creates no side (§4.3: the old one-value road re-created a side made None while `border_style` was Some);
+/// four transparent tokens drop the frame whole (`Some([None; 4])`, so an earlier rule's or the UA control's frame goes).
 fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
     let (toks, n) = (split_top_level(value), core::cell::Cell::new(0usize));
     let ok = |v: &str| parse_color_str::<H>(v).is_some() || v.eq_ignore_ascii_case("currentcolor") || border_transparent::<H>(v);
@@ -5126,9 +5083,63 @@ fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
     paint.sys_border = None;
     for (i, tok) in sides.into_iter().enumerate() {
         sys_border_slot(paint, 1 << i, tok);
-        side_color_of::<H>(i, tok, paint);
+        side_color_of::<H>(i, tok, paint); side_color_pend::<H>(i, tok, paint);
     }
-    if let Some(t) = sides.into_iter().find(|t| !border_transparent::<H>(t)) {
-        paint.border_alpha = Some(color_alpha::<H>(t));
+    // SR1112 (fold compose): each side's alpha is written by `side_color_of` / `side_color_pend` (`side_alpha_set`); a transparent token keeps its side at alpha 0 (the frame is not dropped: its width sizes the box).
+}
+
+// ---- AETHERCSSBORDERPENDINGTRANSPARENT (LEDGER SR1112): a transparent border colour keeps the side at alpha 0 (named tail block) ----
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): a border colour's RGB: what [`parse_color_str`] reads, else a transparent
+/// colour (`border_transparent`: `transparent`, any zero-alpha colour) as its own RGB (black for the keyword). A transparent
+/// colour is a COLOUR, not an eraser: the side is kept (its width sizes the box) and paints nothing at alpha 0.
+fn border_rgb<H: Host>(v: &str) -> Option<(u8, u8, u8)> {
+    parse_color_str::<H>(v).or_else(|| border_transparent::<H>(v).then(|| H::parse_color_alpha(v).map_or((0, 0, 0), |p| p.0)))
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `PaintStyle::border_alpha` per side: the sides in `mask` take alpha `a`,
+/// the others keep theirs (None = not written here = opaque).
+fn side_alpha_set<H: Host>(paint: &mut PaintStyle<H>, mask: u8, a: f32) {
+    let mut al = paint.border_alpha.unwrap_or([None; 4]);
+    for (i, slot) in al.iter_mut().enumerate() {
+        if mask & (1 << i) != 0 {
+            *slot = Some(a);
+        }
     }
+    paint.border_alpha = Some(al);
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): `merge_paint`'s token in place of the wholesale copy: a later block's side
+/// alphas win per side where it wrote them (as `merge_border_pending`'s entries), so `.a:hover { border-top-color: red }`
+/// over `.a { border: 2px solid transparent }` makes the top opaque and leaves the other three at alpha 0.
+fn merge_border_alpha<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
+    let Some(sa) = src.border_alpha else { return };
+    let mut da = dst.border_alpha.unwrap_or([None; 4]);
+    for i in 0..4 {
+        if sa[i].is_some() {
+            da[i] = sa[i];
+        }
+    }
+    dst.border_alpha = Some(da);
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): side `i`'s border alpha (1 when unwritten).
+pub fn border_side_alpha<H: Host>(paint: &PaintStyle<H>, i: usize) -> f32 {
+    paint.border_alpha.and_then(|a| a[i]).unwrap_or(1.0)
+}
+
+/// AETHERCSSBORDERPENDINGTRANSPARENT (SR1112): the render's ONE per-side alpha read: a side at alpha 0 is dropped from the
+/// paint (its width already sized the box at layout), and the answer is the stroke alpha of the sides left, the largest
+/// of theirs (exact when they agree; two different non-zero side alphas: AETHER-CSS-BORDER-SIDE-ALPHA-MIXED owed).
+pub fn border_visible<H: Host, T>(paint: &PaintStyle<H>, sides: &mut [Option<T>; 4]) -> f32 {
+    let mut a = 0.0f32;
+    for (i, side) in sides.iter_mut().enumerate() {
+        let ai = border_side_alpha(paint, i);
+        if ai <= 0.0 {
+            *side = None;
+        } else if side.is_some() {
+            a = a.max(ai);
+        }
+    }
+    a
 }
