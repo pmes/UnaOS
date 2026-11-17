@@ -1464,7 +1464,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 apply_declaration("font-family", family, style, cx);
             }
         }
-        "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
+        "place-content" => apply_place::<H>("align-content", Some("justify-content"), value, style, cx), "place-items" => apply_place::<H>("align-items", None, value, style, cx), "place-self" => apply_place::<H>("align-self", None, value, style, cx), "align-self" => apply_align_self::<H>(align_word::<H>(value), style), "align-content" => apply_align_content(align_word::<H>(value), style), "align-items" => match align_word::<H>(value) {
             "center" => style.align_items = Some(taffy::style::AlignItems::CENTER),
             "flex-end" | "end" => style.align_items = Some(taffy::style::AlignItems::END),
             "flex-start" | "start" => style.align_items = Some(taffy::style::AlignItems::START),
@@ -4115,7 +4115,7 @@ pub const ALL_SKIPPED: &[&str] = &[
     // css-cascade-4 §3.1: `all` leaves `direction` and `unicode-bidi` (its arm is SR1008's; the SR1021 fold added the name); `all` is this arm.
     "direction", "unicode-bidi", "all",
     // SHORTHANDS: reset through their longhands, which are listed (the `border-width` shorthand under initial / unset would write 3px into every side of `paint.border` and re-create the sides `border-*-style: none` cleared).
-    "list-style", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline",
+    "list-style", "flex-flow", "gap", "flex", "overflow", "scroll-padding", "scroll-margin", "padding", "margin", "inset", "container", "columns", "column-rule", "background", "font-synthesis", "font-variant", "font", "border", "border-top", "border-right", "border-bottom", "border-left", "border-style", "border-color", "border-width", "border-radius", "text-decoration", "mask", "outline", "place-content", "place-items", "place-self",
     // LOGICAL names: `apply_logical` / the scroll-margin arms re-apply them as the physical longhands listed.
     "overflow-inline", "overflow-block", "scroll-margin-block", "scroll-margin-inline", "scroll-margin-block-start", "scroll-margin-block-end", "scroll-margin-inline-start", "scroll-margin-inline-end",
     // ALIAS spellings of a listed name (the same field, the same value grammar).
@@ -4348,4 +4348,26 @@ fn sys_border_slot<H: Host>(paint: &mut PaintStyle<H>, mask: u8, value: &str) {
         _ => (old_k, rest),
     };
     paint.sys_border = (m != 0).then_some((k, m));
+}
+
+// ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-*: <align> <justify>?`, one or two [`alignment_words`] values (a
+/// `safe center` / `first baseline` pair is ONE), the second defaulting to the first, each applied through its
+/// longhand's arm (as `flex-flow` recurses). `justify` None (justify-items / justify-self have no arm: owed
+/// AETHER-CSS-JUSTIFY-SELF) records the dropped half (`place-justify-dropped:`); a value with no two valid halves is
+/// refused whole (`place-value:`) and nothing is written.
+fn apply_place<H: Host>(align: &str, justify: Option<&str>, value: &str, style: &mut SpecifiedStyle<H>, cx: &ParseCx) {
+    let t: Vec<&str> = value.split_ascii_whitespace().collect();
+    let halves = (0..=2usize).find_map(|k| {
+        let (a, b) = if k == 0 { (t.join(" "), t.join(" ")) } else if k < t.len() { (t[..k].join(" "), t[k..].join(" ")) } else { return None };
+        (alignment_words(&a).is_some() && alignment_words(&b).is_some()).then_some((a, b))
+    });
+    let Some((a, b)) = halves else { return H::record_css(&format!("place-value:{}", clip(value))) };
+    apply_declaration(align, &a, style, cx);
+    match justify {
+        Some(j) => apply_declaration(j, &b, style, cx),
+        None if !is_neutral_keyword(&b) => H::record_css(&format!("place-justify-dropped:{}", clip(&b))),
+        None => {}
+    }
 }

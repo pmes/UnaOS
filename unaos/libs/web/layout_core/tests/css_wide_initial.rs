@@ -1241,3 +1241,60 @@ fn system_color_table() {
     assert_eq!(system_color::<TH>(system_color_index("canvas").unwrap(), Some(2)), Some((18, 18, 18)));
     assert_eq!(system_color::<TH>(system_color_index("mark").unwrap(), Some(2)), Some((255, 255, 0)), "a None word keeps light");
 }
+
+// ---- AETHERCSSPLACESHORTHANDS (LEDGER SR1074): css-align-3 §6.4 / §7.4 / §8.3 place-content / place-items / place-self (named tail block) ----
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-content` writes align-content and justify-content through their own arms
+/// (each field equal to its longhand twin), one value or two; a `safe center` pair is ONE value (both halves).
+#[test]
+fn place_shorthands_content() {
+    let one = |p: &str, v: &str| styled(&[(p, v)]);
+    let s = one("place-content", "center");
+    assert!(s.align_content.is_some() && s.justify.is_some(), "armed: place-content: center writes both");
+    assert_eq!(s.align_content, one("align-content", "center").align_content, "center: align half");
+    assert_eq!(s.justify, one("justify-content", "center").justify, "center: justify half");
+    let s = one("place-content", "start end");
+    assert_eq!(s.align_content, one("align-content", "start").align_content, "start end: align start");
+    assert_eq!(s.justify, one("justify-content", "end").justify, "start end: justify end");
+    let s = one("place-content", "safe center");
+    assert_eq!(s.align_content, one("align-content", "center").align_content, "safe center is one value: align");
+    assert_eq!(s.justify, one("justify-content", "center").justify, "safe center is one value: justify");
+    let s = one("place-content", "safe center end");
+    assert_eq!(s.align_content, one("align-content", "center").align_content, "safe center | end: align");
+    assert_eq!(s.justify, one("justify-content", "end").justify, "safe center | end: justify");
+    for bad in ["bogus", "center end start", "safe", ""] {
+        let s = one("place-content", bad);
+        assert_eq!((s.align_content, s.justify), (None, None), "{bad:?}: refused, nothing written");
+    }
+}
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): `place-items` / `place-self` write align-items / align-self (justify-items /
+/// justify-self have no arm: the second half is recorded, nothing else written); `place-self: auto` is SR1068's marker.
+#[test]
+fn place_shorthands_items_self() {
+    let one = |p: &str, v: &str| styled(&[(p, v)]);
+    let s = one("place-items", "center");
+    assert!(s.align_items.is_some(), "armed: place-items: center writes align-items");
+    assert_eq!(s.align_items, one("align-items", "center").align_items, "place-items: center");
+    assert_eq!(s.justify, None, "justify-content untouched");
+    assert_eq!(one("place-items", "first baseline").align_items, one("align-items", "baseline").align_items, "first baseline is one value");
+    assert_eq!(one("place-items", "end start").align_items, one("align-items", "end").align_items, "two values: the first");
+    assert_eq!(one("place-items", "bogus").align_items, None, "bogus refused");
+    assert_eq!(one("place-self", "flex-end").align_self, Some(AlignSelf::END), "place-self: flex-end");
+    assert_eq!(one("place-self", "center start").align_self, Some(AlignSelf::CENTER), "place-self: center start");
+    let s = one("place-self", "auto");
+    assert_eq!(s.align_self, None, "place-self: auto");
+    assert!(s.align_self_auto, "place-self: auto carries the auto marker");
+    let s = one("place-self", "bogus");
+    assert!(s.align_self.is_none() && !s.align_self_auto, "place-self: bogus refused");
+    let c = cascade(&[&[("align-items", "flex-start")], &[("place-items", "center")]]);
+    assert_eq!(c.align_items, one("align-items", "center").align_items, "a later place-items beats an earlier align-items");
+}
+
+/// AETHERCSSPLACESHORTHANDS (SR1074): the three are shorthands: `all` resets their longhands, never them.
+#[test]
+fn place_shorthands_in_skipped() {
+    for n in ["place-content", "place-items", "place-self"] {
+        assert!(ALL_SKIPPED.contains(&n) && !ALL_LONGHANDS.contains(&n), "{n} is a skipped shorthand");
+    }
+}
