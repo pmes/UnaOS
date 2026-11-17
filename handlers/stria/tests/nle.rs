@@ -14164,3 +14164,43 @@ fn striaxformhandles_face_paints_handles() {
     assert!(face.verb("pip off"));
     assert_ne!(&face.paint_role(Role::Whole)[o..o + 4], &timeline_core::view::HANDLE, "unplaced: no handle");
 }
+
+// ---- STRIACHAPTERSMP4 (LEDGER SR9076): an export's MP4 carries the range's markers as a Nero chpl (named tail block) ----
+
+/// The markers inside the exported range land in the MP4 itself (`moov/udta/chpl`: 100 ns starts from the range start,
+/// titles), through `export_as_with`, the door the face and the CLI share; no marker in range: no `udta`.
+#[test]
+fn striachaptersmp4_export_mp4_carries_chpl() {
+    use stria::nle_export::{AudioOut, Container, PngSequence, export_as};
+    let (tl, src) = synth_fixture();
+    let tl = tl.mark(5, "Intro").unwrap().mark(12, "Act 1").unwrap().mark(20, "End").unwrap();
+    let dir = nlefaceexport_dir("striachaptersmp4");
+    std::fs::create_dir_all(&dir).unwrap();
+    export_as(&tl, 10..30, &src, &dir, Box::new(PngSequence), AudioOut::Mp4, Container::Mp4).unwrap();
+    let file = std::fs::read(dir.join("audio.mp4")).unwrap();
+    let mut body = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 2];
+    body.extend_from_slice(&800_000u64.to_be_bytes());
+    body.push(5);
+    body.extend_from_slice(b"Act 1");
+    body.extend_from_slice(&4_000_000u64.to_be_bytes());
+    body.push(3);
+    body.extend_from_slice(b"End");
+    let mut udta = ((body.len() + 16) as u32).to_be_bytes().to_vec();
+    udta.extend_from_slice(b"udta");
+    udta.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+    udta.extend_from_slice(b"chpl");
+    udta.extend_from_slice(&body);
+    let at = file.windows(udta.len()).position(|w| w == udta.as_slice()).expect("moov/udta/chpl with the two in-range chapters");
+    let moov = file.windows(4).position(|w| w == b"moov").unwrap() - 4;
+    let moov_end = moov + u32::from_be_bytes([file[moov], file[moov + 1], file[moov + 2], file[moov + 3]]) as usize;
+    assert!(at > moov && at + udta.len() <= moov_end, "the chpl sits inside the moov");
+    assert!(Sources::from_media("CH", &file, 25).unwrap().is_some(), "the file still opens as media");
+
+    let none = nlefaceexport_dir("striachaptersmp4-none");
+    std::fs::create_dir_all(&none).unwrap();
+    let mut bare = tl.clone();
+    bare.markers.clear();
+    export_as(&bare, 10..30, &src, &none, Box::new(PngSequence), AudioOut::Mp4, Container::Mp4).unwrap();
+    assert!(!std::fs::read(none.join("audio.mp4")).unwrap().windows(4).any(|w| w == b"udta"), "no markers, no udta");
+    println!("striachaptersmp4: audio.mp4 {} bytes carries chpl (2 chapters at 800000 / 4000000 x 100 ns)", file.len());
+}

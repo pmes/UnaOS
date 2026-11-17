@@ -316,7 +316,7 @@ pub struct ExportSink {
     /// EXPORTCOLOURPRIM (B979): the reels' one (primaries, transfer), set by [`export`]; (2, 2) otherwise.
     reels: (u8, u8),
     /// NLE6EXPORTMKV (rmbp-ledger B966): the muxed file's container (its name's extension, `build::Container`).
-    container: build::Container,
+    container: build::Container, chapters: Vec<(i64, String)>, // STRIACHAPTERSMP4 (SR9076): the range's markers as (start ns, title), the MP4's `chpl`
 }
 
 impl ExportSink {
@@ -337,7 +337,7 @@ impl ExportSink {
             err: None,
             colour: None,
             reels: (2, 2),
-            container: build::Container::Mp4,
+            container: build::Container::Mp4, chapters: Vec::new(),
         }
     }
 
@@ -433,7 +433,7 @@ impl ExportSink {
         }
         let movie = self.video.layout() == Layout::Mp4;
         let mut extras = build::Mp4Extras::default();
-        if movie { extras.colour.extend(self.colour.map(|c| (1, c))); extras.btrt.extend(self.btrt(tb)); } // H264ENCCOLOURHOST (SR377): the file colour as the avc1's (track 1) `colr`
+        if movie { extras.colour.extend(self.colour.map(|c| (1, c))); extras.btrt.extend(self.btrt(tb)); } extras.chapters = std::mem::take(&mut self.chapters); // STRIACHAPTERSMP4 (SR9076): every MP4 file carries the chapters; H264ENCCOLOURHOST (SR377): the file colour as the avc1's (track 1) `colr`
         let audio = match (self.audio, self.afmt) {
             (AudioOut::Mp4, Some((rate, ch))) => Some(build::pcm16_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, 1024)),
             (AudioOut::Aac(kbps), Some((rate, ch))) => {
@@ -701,7 +701,7 @@ pub fn export_as_with(
     progress: &mut dyn FnMut(u64, u64) -> Result<(), ExportError>,
 ) -> Result<ExportReport, ExportError> {
     let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
-    sink.container = container;
+    sink.container = container; sink.chapters = tl.chapter_starts(range.clone()); // STRIACHAPTERSMP4 (SR9076): the range's markers, the one in-range rule (timeline_core)
     let total = export_total(tl, &range); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the one frame-count rule, the face's seed too (file tail)
     let rr = render(tl, range, sources, &mut Ticked { sink: &mut sink, progress, total }).map_err(ExportError::Render)?; // NLESTANDINAUDIOEDITOR (SR713): the render report kept for its stand-in count
     sink.finish(tl.tb).map(|e| ExportReport { stand_in_audio: rr.stand_in_audio, ..e }) // NLESTANDINAUDIOEDITOR (SR713)

@@ -3986,7 +3986,7 @@ fn gap_black(x: &Transition, start: i64, end: i64) -> bool {
 impl Timeline {
     /// The markers inside `span` as an ffmetadata chapters text (`;FFMETADATA1` then one `[CHAPTER]` each); "" when none.
     pub fn chapters(&self, span: core::ops::Range<i64>) -> String {
-        let inside: Vec<&Marker> = self.markers.iter().filter(|m| m.at >= span.start && m.at < span.end).collect();
+        let inside: Vec<&Marker> = self.markers_in(&span); // STRIACHAPTERSMP4 (SR9076): the one in-range rule (file tail)
         if inside.is_empty() {
             return String::new();
         }
@@ -4035,7 +4035,7 @@ mod striamarkerchapters_tests {
         let t = tl();
         assert_eq!(
             t.chapters(10..30),
-            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=80000000\nEND=400000000\ntitle=Act\\=1\; \\#2\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=400000000\nEND=800000000\ntitle=End\n"
+            ";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=80000000\nEND=400000000\ntitle=Act\\=1\\; \\#2\n[CHAPTER]\nTIMEBASE=1/1000000000\nSTART=400000000\nEND=800000000\ntitle=End\n"
         );
         let all = t.chapters(0..t.end());
         assert_eq!(all.lines().filter(|l| *l == "[CHAPTER]").count(), 3);
@@ -4972,5 +4972,40 @@ impl XKeys {
             Ease::Linear => schedule::Frac { num, den },
             e => e.apply(schedule::Frac { num: num * XEASE_Q / den, den: XEASE_Q }),
         }
+    }
+}
+
+// ---- STRIACHAPTERSMP4 (LEDGER SR9076): the in-range markers and their chapter starts (named tail block) ----
+// THE in-range rule of an export's chapters (`span.start <= at < span.end`, tick order), read by SR9046's ffmetadata
+// `chapters` and by `chapter_starts`, the (start ns from the range start, title) list the MP4's `chpl` carries.
+
+impl Timeline {
+    /// The markers with `span.start <= at < span.end`, in tick order.
+    pub fn markers_in(&self, span: &core::ops::Range<i64>) -> Vec<&Marker> {
+        self.markers.iter().filter(|m| m.at >= span.start && m.at < span.end).collect()
+    }
+
+    /// The markers inside `span` as (start in ns from `span.start` by `Timebase::to_ns`, name): an export's MP4 chapters.
+    pub fn chapter_starts(&self, span: core::ops::Range<i64>) -> Vec<(i64, String)> {
+        self.markers_in(&span).into_iter().map(|m| (self.tb.to_ns(m.at - span.start), m.name.clone())).collect()
+    }
+}
+
+#[cfg(test)]
+mod striachaptersmp4_tests {
+    use super::*;
+
+    /// STRIACHAPTERSMP4 M3: SR9046's fixture; only in-range markers, ns from the range start at 25 fps; none: empty.
+    #[test]
+    fn striachaptersmp4_chapter_starts() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 40, 0)];
+        let t = tl.mark(5, "Intro").unwrap().mark(12, "Act=1; #2").unwrap().mark(20, "End").unwrap().range_marker(20, 30).unwrap();
+        assert_eq!(t.chapter_starts(10..30), alloc::vec![(80_000_000, String::from("Act=1; #2")), (400_000_000, String::from("End"))]);
+        assert_eq!(t.markers_in(&(0..t.end())).len(), 3);
+        assert!(t.chapter_starts(21..30).is_empty());
+        assert!(Timeline::new(25).chapter_starts(0..10).is_empty());
     }
 }
