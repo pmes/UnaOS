@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -735,5 +735,130 @@ impl EditorState {
             MarkerWord::Mark(name) => self.mark(name),
             MarkerWord::Unmark => self.unmark(),
         })
+    }
+}
+
+// ---- STRIAMARKERJUMP (LEDGER SR894): marker- / marker+ / cut- / cut+ jump the playhead (named tail block) ----
+// View words (no commit: no undo step, the document is not dirtied): `marker-` / `marker+` move the playhead to the
+// previous / next named marker (`Timeline.markers`, already sorted), `cut-` / `cut+` to the previous / next clip edge on any
+// track (`view::snap_targets`, THE clip-edge walk, called unchanged). The move is `seek` (THE clamped playhead road); a
+// target past `timeline.end()` is skipped; with nowhere to go the playhead stays (like `next` at the end).
+
+/// STRIAMARKERJUMP (SR894): what a jump word steps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Jump {
+    /// The named markers.
+    Marker,
+    /// Every clip's `at` and `end` on any track.
+    Cut,
+}
+
+/// STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` (trimmed) as `(what, forward)`; `None` for any other word.
+pub fn jump_word(v: &str) -> Option<(Jump, bool)> {
+    match v.trim() {
+        "marker-" => Some((Jump::Marker, false)),
+        "marker+" => Some((Jump::Marker, true)),
+        "cut-" => Some((Jump::Cut, false)),
+        "cut+" => Some((Jump::Cut, true)),
+        _ => None,
+    }
+}
+
+impl EditorState {
+    /// The ticks a `j` jump may land on, sorted ascending: the markers' ticks, or the clip edges of
+    /// [`crate::view::snap_targets`] (no exclusion, no playhead).
+    pub fn jump_targets(&self, j: Jump) -> Vec<i64> {
+        match j {
+            Jump::Cut => crate::view::snap_targets(self, &[], false),
+            Jump::Marker => self.timeline.markers.iter().map(|m| m.at).collect(),
+        }
+    }
+    /// The playhead to the first target after it (`forward`, at most `timeline.end()`) or the last target before it,
+    /// through `seek`. False when there is none (the playhead stays).
+    pub fn jump(&mut self, j: Jump, forward: bool) -> bool {
+        let (ph, end) = (self.playhead, self.timeline.end().max(0));
+        let t = self.jump_targets(j);
+        let to = if forward { t.iter().copied().find(|&x| x > ph && x <= end) } else { t.iter().rev().copied().find(|&x| x < ph) };
+        match to {
+            Some(x) => {
+                self.seek(x);
+                true
+            }
+            None => false,
+        }
+    }
+    /// The jump words of [`EditorState::verb`] (always `Ok`: a view word); `None` for any other word.
+    fn jump_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let (j, forward) = jump_word(v)?;
+        self.jump(j, forward);
+        Some(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod striamarkerjump_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// stria::nle_face's `synth_fixture` cut list on two tracks: edges 0, 10, 20, 25, 35.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striamarkerjump_cut_steps_every_clip_edge_and_stops_at_the_ends() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.jump_targets(Jump::Cut), alloc::vec![0, 10, 20, 25, 35]);
+        for want in [10, 20, 25, 35, 35] {
+            assert_eq!(st.verb("cut+"), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        for want in [25, 20, 10, 0, 0] {
+            assert_eq!(st.verb("cut-"), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        st.seek(12);
+        assert_eq!(st.verb("cut-"), Some(Ok(())));
+        assert_eq!(st.playhead, 10);
+        assert_eq!(st.timeline, tl0);
+        assert!(!st.undo(), "a jump is not an undo step");
+    }
+
+    #[test]
+    fn striamarkerjump_marker_steps_the_markers_and_skips_past_the_end() {
+        let mut st = state();
+        assert!(!st.jump(Jump::Marker, true), "no markers: nowhere to go");
+        assert_eq!(st.playhead, 0);
+        st.timeline = st.timeline.mark(5, "A").unwrap().mark(30, "B").unwrap().mark(99, "C").unwrap();
+        let tl0 = st.timeline.clone();
+        for want in [5, 30, 30] {
+            assert_eq!(st.verb("marker+"), Some(Ok(())));
+            assert_eq!(st.playhead, want);
+        }
+        assert_eq!(st.verb("marker-"), Some(Ok(())));
+        assert_eq!(st.playhead, 5);
+        assert!(!st.jump(Jump::Marker, false));
+        assert_eq!(st.playhead, 5);
+        assert_eq!(st.timeline, tl0);
+        assert!(!st.undo(), "a jump is not an undo step");
+    }
+
+    #[test]
+    fn striamarkerjump_words() {
+        assert_eq!(jump_word(" cut+ "), Some((Jump::Cut, true)));
+        assert_eq!(jump_word("marker-"), Some((Jump::Marker, false)));
+        for v in ["marker", "cut", "mark -", "markers+", "cut +"] {
+            assert_eq!(jump_word(v), None, "{v}");
+        }
+        assert_eq!(marker_word("marker+"), None, "SR835's mark road never takes a jump word");
     }
 }

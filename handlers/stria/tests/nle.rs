@@ -3612,3 +3612,37 @@ fn striamarkers_m_key_and_help_row() {
     assert!(HELP.iter().any(|(a, _)| *a == "mark"));
     println!("striamarkers: m marks M1; help row m -> {}", help_phrase("mark"));
 }
+
+// ---- STRIAMARKERJUMP (LEDGER SR894): marker- / marker+ / cut- / cut+ from the face — view words, no undo step (named tail block) ----
+
+/// The four jump words are transport words before `help`; through `Face::verb` (which falls through to THE editor
+/// dispatch) `cut+` steps the clip edges and `marker-` returns to a marker, with no message, no undo step and the
+/// document's dirtiness unchanged.
+#[test]
+fn striamarkerjump_face_words_move_only_the_playhead() {
+    let (tl, src) = synth_fixture();
+    let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let help = VERBS.iter().position(|v| *v == "help").unwrap();
+    for v in ["marker-", "marker+", "cut-", "cut+"] {
+        let i = VERBS.iter().position(|x| *x == v).unwrap_or_else(|| panic!("{v} is a VERBS word"));
+        assert!(i < help, "{v} before help");
+    }
+    assert!(f.verb("cut+"));
+    assert_eq!((f.state.playhead, f.state.undo_depth()), (10, 0));
+    assert!(!f.dirty(), "a jump does not dirty the document");
+    assert_eq!(f.last_error.take(), None);
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    let _ = f.last_error.take();
+    let tl0 = f.state.timeline.clone();
+    assert!(f.verb("cut+"));
+    assert_eq!(f.state.playhead, 20);
+    assert!(f.verb("marker-"));
+    assert_eq!(f.state.playhead, 12);
+    assert!(f.verb("marker-"));
+    assert_eq!(f.state.playhead, 12, "no marker before 12: the playhead stays");
+    assert_eq!(f.last_error.take(), None);
+    assert_eq!(f.state.timeline, tl0);
+    assert_eq!(f.state.undo_depth(), 1, "only the mark is an undo step");
+    println!("striamarkerjump: cut+ 0 -> 10, 12 -> 20; marker- 20 -> 12");
+}
