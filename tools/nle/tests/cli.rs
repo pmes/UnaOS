@@ -347,7 +347,7 @@ fn cli_completions_scripts() {
     }
     // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
     let fish = script("fish");
-    assert_eq!(fish.lines().count(), words.len() + 2, "{fish}"); /* SR847 */ /* SR1019 */ // + the size policy line + the --install dir line
+    assert_eq!(fish.lines().count(), words.len() + 3, "{fish}"); /* SR847 */ /* SR1019 */ /* SR1025 */ // + the size policy line + the --install / --uninstall dir lines
     for w in &words {
         let line = match w.strip_prefix("--") {
             Some(l) => format!("complete -c nle -l {l}"),
@@ -371,7 +371,7 @@ fn cli_completions_scripts() {
     assert_eq!(lines.len(), 7, "the hint and six usage lines: {err}");
     assert_eq!(lines[0], "nle: completoins: unknown verb; did you mean completions?");
     assert_eq!(lines[1], USAGE_FIRST);
-    assert_eq!(lines[6], "       nle completions bash|zsh|fish [--install [<dir>]] [--force]"); /* SR1011 */
+    assert_eq!(lines[6], "       nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"); /* SR1011 */ /* SR1025 */
 }
 
 // ---- NLECLICOMPLETIONSVALUES (LEDGER SR847): the words a flag's value takes in every completion script (named tail block) ----
@@ -412,7 +412,7 @@ fn cli_completions_values() {
     assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
     // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
     assert!(bash.contains(&format!("[[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{size}\"\n")), "{bash}");
-    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else if [[ $words[CURRENT-1] == (--install) ]]; then _files -/; else _files; fi; fi}}'")), "{zsh}"); /* SR1019 */
+    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/; else _files; fi; fi}}'")), "{zsh}"); /* SR1019 */ /* SR1025 */
     assert!(fish.contains(&format!("__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{size}\"\n")), "{fish}");
     // Each script parses in its own shell (`-n`: read, not run); zsh / fish skipped by name when the binary is absent.
     let dir = scratch("completions");
@@ -628,7 +628,7 @@ fn cli_completions_install_refusals() {
     let refused: [(&[&str], &str); 4] = [
         (&["completions", "nosuch", "--install"], "nle: completions nosuch: one of bash|zsh|fish\n"),
         (&["completions", "bash", "--instal"], "nle: completions bash --instal: unknown flag; did you mean --install?\n"),
-        (&["completions", "bash", "--bogus"], "nle: completions bash --bogus: unknown flag (--install [<dir>] or --force)\n"),
+        (&["completions", "bash", "--bogus"], "nle: completions bash --bogus: unknown flag (--install [<dir>], --uninstall [<dir>] or --force)\n"), /* SR1025 */
         (&["completions", "bash", "--force"], "nle: completions bash: --force needs --install\n"),
     ];
     for (args, want) in refused {
@@ -646,7 +646,7 @@ fn cli_completions_flags_pin() {
     // SR816's pin subtracts these by name), each a word of the usage's completions line.
     let src = include_str!("../src/main.rs");
     let (own, flags) = (const_words("COMPLETIONS_FLAGS"), const_words("FLAGS"));
-    assert_eq!(own, ["--install", "--force"], "main.rs COMPLETIONS_FLAGS");
+    assert_eq!(own, ["--install", "--force", "--uninstall"], "main.rs COMPLETIONS_FLAGS"); /* SR1025 */
     let usage = usage_text();
     let line = usage.lines().find(|l| l.contains("nle completions ")).expect("the completions usage line");
     for w in &own {
@@ -709,7 +709,7 @@ fn cli_completions_files() {
     assert!(free.contains("--fps|") && !paths.iter().any(|p| free.contains(&format!("{p}|")) || free.contains(&format!("{p})"))), "bash: Free arm {free:?}");
     let path_arm = format!("        {}) w=\"\" ;;\n", paths.join("|"));
     assert!(bash.contains(&path_arm), "bash: {path_arm:?} in {bash}");
-    assert!(bash.contains("        --install) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: the --install arm in {bash}");
+    assert!(bash.contains("        --install|--uninstall) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: the --install arm in {bash}"); /* SR1025 */
     assert!(bash.contains("    [[ $COMP_CWORD == 2 && ${COMP_WORDS[1]} != completions && $cur != -* ]] && w=\"\"\n"), "bash: position 2 in {bash}");
     assert!(bash.contains("    [[ $prev == = || $cur == = ]] && w=\"\"\n"), "bash: after REEL= in {bash}");
     assert!(bash.ends_with("\ncomplete -o default -F _nle nle\n"), "{bash}");
@@ -719,7 +719,7 @@ fn cli_completions_files() {
         let spec = format!(" '*{p}:{l}:{{compset -P \"*=\"; _files}}'");
         assert!(zsh.contains(&spec), "zsh: {spec:?} in {zsh}");
     }
-    let file = "if [[ $words[CURRENT-1] == (--install) ]]; then _files -/; else _files; fi";
+    let file = "if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/; else _files; fi"; /* SR1025 */
     assert!(zsh.contains(&format!(" '*:file:{{{file}}}'\n")), "zsh: the rest spec in {zsh}");
     assert!(zsh.contains(&format!("else {file}; fi}}'")), "zsh: the size spec's else in {zsh}");
     // fish: a Path flag's value is files; --install's directories under the completions verb only.
@@ -735,4 +735,57 @@ fn cli_completions_files() {
     std::fs::write(&p, &bash).unwrap();
     let o = Command::new("bash").arg("-n").arg(&p).output().expect("bash runs");
     assert!(o.status.success(), "bash -n: {}\n{bash}", String::from_utf8_lossy(&o.stderr));
+}
+
+// ---- NLECLICOMPLETIONSUNINSTALL (LEDGER SR1025): `nle completions <shell> --uninstall [<dir>] [--force]` (named tail block) ----
+#[test]
+fn cli_completions_uninstall() {
+    let dir = scratch("uninstall");
+    let home = dir.join("home");
+    let want = [("bash", ".local/share/bash-completion/completions/nle"), ("zsh", ".local/share/zsh/site-functions/_nle"), ("fish", ".config/fish/completions/nle.fish")];
+    for (shell, rel) in want {
+        let path = home.join(rel);
+        let (code, _, err) = nle_env(&["completions", shell, "--install"], Some(&home), &[]);
+        assert_eq!((code, err.as_str()), (0, ""), "{shell} install");
+        assert!(path.exists(), "{shell}: installed at {}", path.display());
+        // The SAME path --install wrote: removed, then absent (idempotent, exit 0 both).
+        let (code, out, err) = nle_env(&["completions", shell, "--uninstall"], Some(&home), &[]);
+        assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", path.display())), "{shell} uninstall");
+        assert!(!path.exists(), "{shell}: the file is gone");
+        let (code, out, err) = nle_env(&["completions", shell, "--uninstall"], Some(&home), &[]);
+        assert_eq!((code, err.as_str(), out), (0, "", format!("removed {} (absent)\n", path.display())), "{shell} again");
+    }
+    // An explicit dir: --uninstall <dir> removes what --install <dir> wrote, HOME not needed.
+    let target = dir.join("a").join("b");
+    let t = s(&target);
+    let (code, _, err) = nle_env(&["completions", "bash", "--install", &t], None, &[]);
+    assert_eq!((code, err.as_str()), (0, ""), "install <dir>");
+    let (code, out, err) = nle_env(&["completions", "bash", "--uninstall", &t], None, &[]);
+    assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", target.join("nle").display())), "uninstall <dir>");
+    assert!(!target.join("nle").exists() && target.exists(), "the file is gone, the dir kept");
+    // A file that is not ours (a hand-written _nle) is refused by name and left intact; --force removes it.
+    let path = home.join(want[1].1);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "#compdef nle\n# mine\n").unwrap();
+    let (code, out, err) = nle_env(&["completions", "zsh", "--uninstall"], Some(&home), &[]);
+    assert_eq!((code, out.as_str(), err), (1, "", format!("nle: {}: not nle's completion script (use --force)\n", path.display())));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "#compdef nle\n# mine\n", "refused: the file is intact");
+    let (code, out, err) = nle_env(&["completions", "zsh", "--uninstall", "--force"], Some(&home), &[]);
+    assert_eq!((code, err.as_str(), out), (0, "", format!("removed {}\n", path.display())), "--force");
+    assert!(!path.exists(), "--force: removed");
+    // --install with --uninstall is refused by name, nothing written.
+    let other = dir.join("other");
+    let (code, out, err) = nle_env(&["completions", "fish", "--install", "--uninstall"], Some(&other), &[]);
+    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "nle: completions fish: --install and --uninstall together (one at a time)\n"));
+    assert!(!other.exists(), "refused: nothing written");
+}
+
+#[test]
+fn cli_completions_uninstall_words() {
+    // --uninstall [<dir>] completes like --install in every shell (COMPLETIONS_ARG's Dir: SR1019's generators, no new road).
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    assert!(bash.contains("        --install|--uninstall) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: {bash}");
+    assert!(zsh.contains("if [[ $words[CURRENT-1] == (--install|--uninstall) ]]; then _files -/;"), "zsh: {zsh}");
+    let line = "complete -c nle -n \"__fish_seen_subcommand_from completions\" -l uninstall -x -a \"(__fish_complete_directories)\"";
+    assert_eq!(fish.lines().filter(|x| *x == line).count(), 1, "fish: {line:?} in {fish}");
 }
