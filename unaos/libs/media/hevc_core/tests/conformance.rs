@@ -89,7 +89,7 @@ fn check_vector(v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, HashCheck)>) -
                 r != Some(f.as_slice())
             })
         });
-        return Verdict::Md5(got, v.md5.clone(), frames.len(), at);
+        return Verdict::Md5(got, v.md5.clone(), frames.len(), at, at.flatten().zip(v.yuv.as_ref()).map(|(i, y)| first_diff(&frames[i], y.get(out[..i].iter().map(Vec::len).sum::<usize>()..).unwrap_or(&[]))));
     }
     Verdict::Ok(format!("{} frames md5 ok, hash SEI: {ok} CRC/checksum ok, {md5_unchecked} MD5 unchecked", frames.len()))
 }
@@ -252,8 +252,8 @@ enum Verdict {
     Ok(String),
     Skip,
     HashMismatch(Vec<(i32, HashCheck)>),
-    /// got, want, frames decoded, the first frame differing from the zip's yuv (None: the zip carries no yuv).
-    Md5(String, String, usize, Option<Option<usize>>),
+    /// got, want, frames decoded, the first frame differing from the zip's yuv (None: the zip carries no yuv), and that frame's first differing sample per plane (SR1101 `first_diff`).
+    Md5(String, String, usize, Option<Option<usize>>, Option<[Option<(usize, usize, u16, u16)>; 3]>),
     Decode(String),
 }
 
@@ -263,8 +263,8 @@ impl std::fmt::Display for Verdict {
             Verdict::Ok(s) | Verdict::Decode(s) => f.write_str(s),
             Verdict::Skip => f.write_str("SKIP"),
             Verdict::HashMismatch(bad) => write!(f, "decoded picture hash SEI mismatch at (POC, planes) {bad:?}"),
-            Verdict::Md5(got, want, n, at) => {
-                write!(f, "decoded YUV md5 {got}, want {want} ({n} frames; first differing frame against the zip's yuv: {at:?})")
+            Verdict::Md5(got, want, n, at, d) => {
+                write!(f, "decoded YUV md5 {got}, want {want} ({n} frames; first differing frame against the zip's yuv: {at:?}){}", diff_text(d))
             }
         }
     }
@@ -319,11 +319,12 @@ fn verdict_md5_names_the_frame_count_and_first_differing_frame() {
     let want = "0".repeat(32);
     let zip_yuv = [yuv_bytes(&frame8([1, 2, 3, 4])), yuv_bytes(&frame8([9, 9, 9, 9]))].concat();
     let red = check_vector(&vector(&want, Some(zip_yuv)), vec![frame8([1, 2, 3, 4]), frame8([1, 2, 3, 4])], vec![]);
-    let Verdict::Md5(got, w, n, at) = &red else { panic!("expected Md5, got {red}") };
+    let Verdict::Md5(got, w, n, at, d) = &red else { panic!("expected Md5, got {red}") };
     assert_eq!((w.as_str(), *n, *at), (want.as_str(), 2, Some(Some(1))));
+    assert_eq!(*d, Some([Some((0, 0, 1, 9)), None, None]));
     let old = format!("decoded YUV md5 {got}, want {} ({} frames; first differing frame against the zip's yuv: {at:?})", want, 2);
-    assert_eq!(red.to_string(), old);
-    assert!(red.to_string().ends_with("(2 frames; first differing frame against the zip's yuv: Some(Some(1)))"));
+    assert_eq!(red.to_string(), old + " first diff Y (0, 0) got 1 want 9");
+    assert!(red.to_string().ends_with("(2 frames; first differing frame against the zip's yuv: Some(Some(1))) first diff Y (0, 0) got 1 want 9"));
 }
 
 #[test]
@@ -407,4 +408,84 @@ fn verdict_catch_panic_red_rows_names_the_panicking_row() {
         ("r3".to_string(), ok()),
     ];
     assert_eq!(red_rows("rext", &rows), Some("1 rext rows red: [r2: panic: hevc/rext/r2.zip: r2.bit is not in the zip]".into()));
+}
+
+// ---- HEVCSEIPERPLANEFIRSTSAMPLE (LEDGER SR1101): the first differing sample per plane of the md5 verdict's first differing frame (named tail block) ----
+
+/// HEVCSEIPERPLANEFIRSTSAMPLE (SR1101): per plane (Y, Cb, Cr), the first sample of `frame` that differs from `yuv` (the
+/// zip's bytes from that frame on, laid out as `yuv_bytes` writes them: two bytes low first when `planes16` is Some,
+/// else one) as (x, y, got, want); None when the plane matches. A sample past the end of a short `yuv` is not compared.
+/// A hash SEI names no sample: this is the md5 verdict's aid, `HashCheck` is unchanged.
+fn first_diff(frame: &Frame, yuv: &[u8]) -> [Option<(usize, usize, u16, u16)>; 3] {
+    let (sw, _) = frame.chroma.sub();
+    let b = if frame.planes16.is_some() { 2 } else { 1 };
+    let mut off = 0;
+    std::array::from_fn(|c| {
+        let got: Vec<u16> = match &frame.planes16 { Some(p) => p[c].clone(), None => frame.planes[c].iter().map(|&v| v as u16).collect() };
+        let w = if c == 0 { frame.width as usize } else { frame.width as usize / sw };
+        let want = |i: usize| yuv.get(off + i * b..off + i * b + b).map(|s| if b == 2 { u16::from_le_bytes([s[0], s[1]]) } else { s[0] as u16 });
+        let hit = got.iter().enumerate().find_map(|(i, &g)| want(i).filter(|&w_| w_ != g).map(|w_| (i % w, i / w, g, w_)));
+        off += got.len() * b;
+        hit
+    })
+}
+
+/// The Md5 Display's tail: ` first diff Y (x, y) got g want w; Cr ...` over the planes that differ; "" when none does.
+fn diff_text(d: &Option<[Option<(usize, usize, u16, u16)>; 3]>) -> String {
+    let parts: Vec<String> = d.iter().flat_map(|d| ["Y", "Cb", "Cr"].into_iter().zip(d)).filter_map(|(p, s)| s.map(|(x, y, g, w)| format!("{p} ({x}, {y}) got {g} want {w}"))).collect();
+    if parts.is_empty() { String::new() } else { format!(" first diff {}", parts.join("; ")) }
+}
+
+/// A 4x4 4:2:0 frame (chroma 2x2); `wide` carries the samples in `planes16` at 10 bits (two bytes in `yuv_bytes`).
+fn frame44(y: Vec<u16>, cb: Vec<u16>, cr: Vec<u16>, wide: bool) -> Frame {
+    let narrow = |p: &Vec<u16>| p.iter().map(|&v| v as u8).collect::<Vec<u8>>();
+    let depth = if wide { 10 } else { 8 };
+    Frame {
+        width: 4,
+        height: 4,
+        planes: [narrow(&y), narrow(&cb), narrow(&cr)],
+        poc: 0,
+        tag: 0,
+        full_range: false,
+        bit_depth: depth,
+        planes16: wide.then(|| [y.clone(), cb.clone(), cr.clone()]),
+        chroma: h264_core::ChromaFormat::Yuv420,
+        bit_depth_c: depth,
+    }
+}
+
+#[test]
+fn verdict_first_diff_8bit_names_y_and_cr() {
+    let (y, cb, cr) = ((0..16).collect::<Vec<u16>>(), vec![5; 4], vec![6, 7, 8, 9]);
+    let want = frame44(y.clone(), cb.clone(), cr.clone(), false);
+    let (mut y2, mut cr2) = (y.clone(), cr.clone());
+    y2[6] = 99; // Y (2, 1)
+    cr2[2] = 3; // Cr (0, 1)
+    let got = frame44(y2, cb, cr2, false);
+    assert_eq!(first_diff(&got, &yuv_bytes(&want)), [Some((2, 1, 99, 6)), None, Some((0, 1, 3, 8))]);
+}
+
+#[test]
+fn verdict_first_diff_10bit_reads_two_byte_samples() {
+    let (y, cr) = (vec![0x200; 16], vec![0x100; 4]);
+    let want = frame44(y.clone(), vec![0x1FF, 0x2FF, 0x1FF, 0x1FF], cr.clone(), true);
+    let got = frame44(y, vec![0x1FF, 0x1FF, 0x1FF, 0x1FF], cr, true);
+    assert_eq!(first_diff(&got, &yuv_bytes(&want)), [None, Some((1, 0, 0x1FF, 0x2FF)), None]);
+}
+
+#[test]
+fn verdict_first_diff_identical_is_none() {
+    let f = frame44((0..16).collect(), vec![1, 2, 3, 4], vec![5, 6, 7, 8], false);
+    assert_eq!(first_diff(&f, &yuv_bytes(&f)), [None; 3]);
+    let f10 = frame44(vec![0x3FF; 16], vec![0x200; 4], vec![1; 4], true);
+    assert_eq!(first_diff(&f10, &yuv_bytes(&f10)), [None; 3]);
+}
+
+#[test]
+fn verdict_first_diff_display_appends_only_with_samples() {
+    let old = "decoded YUV md5 a, want b (2 frames; first differing frame against the zip's yuv: Some(Some(1)))";
+    let md5 = |d| Verdict::Md5("a".into(), "b".into(), 2, Some(Some(1)), d).to_string();
+    assert_eq!(md5(Some([Some((2, 1, 12, 13)), None, Some((0, 1, 7, 9))])), format!("{old} first diff Y (2, 1) got 12 want 13; Cr (0, 1) got 7 want 9"));
+    assert_eq!(md5(None), old);
+    assert_eq!(md5(Some([None; 3])), old);
 }
