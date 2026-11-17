@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } // STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -659,4 +659,33 @@ impl EditorState {
             _ => Err(EditError::Transition),
         })
     }
+}
+
+// ---- STRIAKSLIP (LEDGER SR9002): the face's slip / slide step words in THE dispatch (named tail block) ----
+// Lifted from stria's nle_face.rs (SR737 / SR752): a key or a button carries no number, so `slip-` / `slip+` / `slide-` /
+// `slide+` are SR704's `slip <d>` / `slide <d>` at one frame (the time base is `1/fps`: one frame is one tick), and
+// `slip-10` ... the same at [`SLIP_STEP`]. `EditorState::verb` takes them, so the host face and the kernel Player (its
+// `,` / `.` keys) reach ONE rule through ONE dispatch, one commit each.
+
+/// NLE3ESLIPSTEP (SR752): the coarse slip / slide step (frames = ticks), the Ctrl / Cmd chords' count.
+pub const SLIP_STEP: i64 = 10;
+
+/// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks);
+/// `slip-10` -> `slip -10` ... (the count exactly [`SLIP_STEP`]); None for any other word.
+pub fn slipslide_word(v: &str) -> Option<alloc::string::String> {
+    let (word, rest) = match v.strip_prefix("slip") {
+        Some(r) => ("slip", r),
+        None => ("slide", v.strip_prefix("slide")?),
+    };
+    let (sign, count) = match rest.as_bytes().first().copied()? {
+        b'-' => (-1i64, &rest[1..]),
+        b'+' => (1, &rest[1..]),
+        _ => return None,
+    };
+    let step = match count {
+        "" => 1,
+        c if c.bytes().all(|b| b.is_ascii_digit()) && c.parse::<i64>() == Ok(SLIP_STEP) => SLIP_STEP,
+        _ => return None,
+    };
+    Some(alloc::format!("{word} {}", sign * step))
 }

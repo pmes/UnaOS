@@ -2538,27 +2538,11 @@ mod transitionface_tests {
 // to Ctrl / Cmd chords in KEYS, not VERBS (no button); any other count is not a face word (`slip <d>` takes free counts).
 
 /// NLE3ESLIPSTEP (SR752): the coarse slip / slide step (frames = ticks), the Ctrl / Cmd chords' count.
-pub const SLIP_STEP: i64 = 10;
+pub use timeline_core::editor::SLIP_STEP; // STRIAKSLIP (LEDGER SR9002): lifted into timeline_core with the words
 
 /// `slip-` -> `slip -1`, `slip+` -> `slip 1`, `slide-` -> `slide -1`, `slide+` -> `slide 1` (one frame, in ticks);
 /// `slip-10` -> `slip -10` ... (the count exactly [`SLIP_STEP`]); None for any other word.
-fn slipslide_word(v: &str) -> Option<String> {
-    let (word, rest) = match v.strip_prefix("slip") {
-        Some(r) => ("slip", r),
-        None => ("slide", v.strip_prefix("slide")?),
-    };
-    let (sign, count) = match rest.as_bytes().first().copied()? {
-        b'-' => (-1i64, &rest[1..]),
-        b'+' => (1, &rest[1..]),
-        _ => return None,
-    };
-    let step = match count {
-        "" => 1,
-        c if c.bytes().all(|b| b.is_ascii_digit()) && c.parse::<i64>() == Ok(SLIP_STEP) => SLIP_STEP,
-        _ => return None,
-    };
-    Some(format!("{word} {}", sign * step))
-}
+fn slipslide_word(v: &str) -> Option<String> { timeline_core::editor::slipslide_word(v) } // STRIAKSLIP (LEDGER SR9002): the rule lives in timeline_core, THE dispatch calls it too
 
 // ---- NLE5DKEYSHELP (LEDGER SR744): the keys help overlay over the timeline band (named tail block) ----
 // `?` (a KEYS row) or the word `help` (`Face::verb`) toggles it; while shown the face paints `help_rows()` over the timeline
