@@ -733,7 +733,7 @@ impl EditorState {
                 continue;
             }
             audio = true;
-            if tr.clips.get(i).ok_or(EditError::NoClip)?.pan_cq8 != pan_cq8 {
+            if let Some(k) = self.set_pankey_piece(&tl, t, i, pan_cq8)? { if let Some(n) = k { tl = n; changed = true; } continue; } if tr.clips.get(i).ok_or(EditError::NoClip)?.pan_cq8 != pan_cq8 { // STRIAPANDRAGPT (SR9112): a keyed clip of the set takes the point at the playhead (file tail)
                 tl = tl.set_pan(t, i, pan_cq8)?;
                 changed = true;
             }
@@ -812,5 +812,46 @@ impl EditorState {
             return Some(Ok(()));
         }
         Some(self.pan_key_at_playhead(Some(Some(pan_cq8))))
+    }
+}
+
+// ---- STRIAPANDRAGPT (LEDGER SR9112): move a pan point; the set road writes keyed points (named tail block) ----
+// `move_pan_key` moves the selected clip's pan point at source tick `s0` to `s1` holding `pan`: SR9050's
+// `Timeline::clear_pan_key` then `set_pan_key` under ONE `commit` (the view's `DragKind::PanPoint` release is its caller).
+// Refused by name: no clip selected `NoClip`; no point at `s0`, or another point already at `s1`, `PanKey`; `s1` outside the
+// clip's source window `OutOfSource`. The point unchanged commits nothing. SR959's set road (`pan_whole_set`) asks
+// `set_pankey_piece` per audio clip: a KEYED clip takes the point at the playhead's source tick (a keyed clip not under the
+// playhead, or already showing that pan there, is left alone), an unkeyed clip keeps the static pan; still one commit.
+impl EditorState {
+    /// The selected clip's pan point at source tick `s0` moved to `s1` with pan `pan` (one commit).
+    pub fn move_pan_key(&mut self, s0: i64, s1: i64, pan: i8) -> Result<(), EditError> {
+        let (track, idx) = self.selection.ok_or(EditError::NoClip)?;
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let p0 = c.pan_keys.points().iter().find(|q| q.0 == s0).ok_or(EditError::PanKey)?.1;
+        if (s1, pan) == (s0, p0) {
+            return Ok(());
+        }
+        if s1 < c.src_in || s1 >= c.src_out {
+            return Err(EditError::OutOfSource);
+        }
+        if s1 != s0 && c.pan_keys.points().iter().any(|q| q.0 == s1) {
+            return Err(EditError::PanKey);
+        }
+        let tl = self.timeline.clear_pan_key(track, idx, s0)?.set_pan_key(track, idx, s1, pan)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// SR959's set road, per audio clip `(t, i)` of `tl`: `None` when the clip has no pan points (the static pan, as before);
+    /// `Some(None)` when it is keyed but the playhead is off it or it already shows `pan` there; else `Some(Some(_))`, `tl`
+    /// with the point at the playhead's source tick set to `pan`.
+    fn set_pankey_piece(&self, tl: &Timeline, t: usize, i: usize, pan: i8) -> Result<Option<Option<Timeline>>, EditError> {
+        let c = *tl.tracks.get(t).ok_or(EditError::NoTrack)?.clips.get(i).ok_or(EditError::NoClip)?;
+        if c.pan_keys.n == 0 {
+            return Ok(None);
+        }
+        if !c.covers(self.playhead) || c.pan_at(self.playhead) == pan {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some(tl.set_pan_key(t, i, c.src_in + (self.playhead - c.at), pan)?)))
     }
 }

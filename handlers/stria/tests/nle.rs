@@ -3839,3 +3839,33 @@ fn striapanautowrite_face_pan_word_writes_the_point_and_reads_it() {
     assert_eq!((face.note.as_deref(), face.last_error.as_deref()), (Some("pan: R 87 keys 1"), None));
     println!("striapanautowrite face: pan- on a keyed clip -> {:?}", face.note);
 }
+
+// ---- STRIAPANDRAGPT (LEDGER SR9112): the face drags a pan point (named tail block) ----
+
+/// On a keyed audio clip a press on its point's plus mark begins a `PanPoint` drag; a y-only move repaints (the hover reports
+/// a change); the release moves the point's pan in ONE undo step and the note reads the pan at the playhead with its keys.
+#[test]
+fn striapandragpt_face_point_drag_one_undo_step() {
+    use timeline_core::view::pan_curve_y;
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let input = |f: &mut Face, v: &str| f.on(&bandy::SMessage::Input { target: stria::nle_face::SURFACE.into(), text: v.into() });
+    face.state.select(1, 1).unwrap();
+    let c = face.state.selected().unwrap();
+    face.state.seek(c.at);
+    assert!(input(&mut face, "pan-key 1"));
+    assert_eq!(face.last_error.take(), None);
+    let l = face.layout();
+    let (x, y) = (l.x_of(c.at) as f64, pan_curve_y(&l, 1, 127) as f64);
+    let d0 = face.state.undo_depth();
+    face.on(&bandy::SMessage::BrowserButton { down: true, x, y, mods: 0, surface: 0 });
+    assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::PanPoint));
+    assert!(face.on(&bandy::SMessage::BrowserMouseMove(x, y - 7.0, 0)), "a y-only move repaints");
+    face.on(&bandy::SMessage::BrowserButton { down: false, x, y: y - 7.0, mods: 0, surface: 0 });
+    let k = face.state.selected().unwrap();
+    assert_eq!((k.pan_keys.points().to_vec(), face.state.undo_depth()), (vec![(c.src_in, 63i8)], d0 + 1));
+    let note = face.note.clone().unwrap_or_default();
+    assert!(note.starts_with("pan: R ") && note.ends_with(" keys 1"), "{note}");
+    assert_eq!(face.last_error, None);
+    println!("striapandragpt face: point drag -> {note}");
+}

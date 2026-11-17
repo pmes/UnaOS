@@ -458,7 +458,7 @@ impl Face {
         let before = (d.delta, d.to_track, d.at, d.guide);
         d.update(&self.state, x, y);
         let changed = match d.kind {
-            DragKind::Marquee => d.at != before.2,
+            DragKind::Marquee | DragKind::PanPoint => d.at != before.2, // STRIAPANDRAGPT (SR9112): a point drag's pan follows the pointer's y
             _ => (d.delta, d.to_track, d.guide) != (before.0, before.1, before.3),
         };
         if d.kind == DragKind::Scrub {
@@ -3151,7 +3151,7 @@ impl Face {
     }
     /// A pan drag ([`DragKind::Pan`], timeline_core's grip) that committed: the note reads the primary's pan ([`pan_line`]).
     fn pan_drag_note(&mut self, kind: DragKind, r: &Result<(), EditError>) {
-        if kind == DragKind::Pan && r.is_ok() {
+        if (kind == DragKind::Pan || kind == DragKind::PanPoint) && r.is_ok() { // STRIAPANDRAGPT (SR9112): a committed point drag reads the pan at the playhead too
             self.note = Some(self.pan_reading()); // STRIAPANAUTOWRITE (SR9084): the pan shown at the playhead (file tail)
         }
     }
