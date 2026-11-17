@@ -10,7 +10,7 @@
 //! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
-//! nle completions bash|zsh|fish
+//! nle completions bash|zsh|fish [--install [<dir>]] [--force]
 //! ```
 //!
 //! `size` (NLESIZEPOLICYUI, LEDGER SR402) sets a reel's size policy through the editor's ONE verb dispatch
@@ -107,7 +107,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); print!("{}", completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish"))); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish")), &args[2..]); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -395,7 +395,7 @@ fn usage_to(w: &mut dyn Write, code: i32) -> ! {
     let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
     let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
     let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
-    let _ = writeln!(w, "       nle completions bash|zsh|fish");
+    let _ = writeln!(w, "       nle completions bash|zsh|fish [--install [<dir>]] [--force]");
     let _ = w.flush();
     std::process::exit(code)
 }
@@ -606,4 +606,96 @@ fn zsh_arg(flag: &str) -> String {
 /// empty otherwise (fish cannot say an optional value for a separate word, so `Opt` is a plain `-l`).
 fn fish_arg(word: &str) -> String {
     if arg_of(word) == Arg::Free { " -x".to_string() } else { String::new() }
+}
+
+// ---- NLECLICOMPLETIONSINSTALL (LEDGER SR1011): nle completions <shell> --install [<dir>] [--force] (named tail block) ----
+/// NLECLICOMPLETIONSINSTALL (SR1011): the `completions` verb's own arm words (not the export loop's: `FLAGS` feeds
+/// `unknown_flag` and every script's word list, so these stay out of it); SR816's pin in tests/cli.rs subtracts them by name.
+const COMPLETIONS_FLAGS: [&str; 2] = ["--install", "--force"];
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): what follows `nle completions <shell>` — nothing prints `script` on stdout (SR821's road,
+/// byte-identical); `--install [<dir>]` writes it through [`install_completions`] and prints `installed <path>` (or
+/// `installed <path> (unchanged)`), zsh a second line naming the fpath step; `--force` overwrites a differing file. An
+/// unknown word is refused by name ([`nearest`] over [`COMPLETIONS_FLAGS`]), every refusal through [`die`], exit 1.
+fn completions_out(shell: &str, script: &str, rest: &[String]) {
+    let (mut install, mut force) = (None::<Option<std::path::PathBuf>>, false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--install" => install = Some(match it.clone().next() { Some(d) if !d.starts_with("--") => { it.next(); Some(std::path::PathBuf::from(d)) } _ => None }),
+            "--force" => force = true,
+            _ => die(match nearest(a, &COMPLETIONS_FLAGS) {
+                Some(f) => format!("completions {shell} {a}: unknown flag; did you mean {f}?"),
+                None => format!("completions {shell} {a}: unknown flag (--install [<dir>] or --force)"),
+            }),
+        }
+    }
+    let Some(dir) = install else {
+        if force {
+            die(format!("completions {shell}: --force needs --install"));
+        }
+        print!("{script}");
+        return;
+    };
+    let done = install_completions(shell, script, dir, force).unwrap_or_else(|e| die(e));
+    println!("installed {}{}", done.path.display(), if done.unchanged { " (unchanged)" } else { "" });
+    if shell == "zsh" {
+        let d = done.dir.display();
+        println!("zsh: add {d} to fpath before compinit, e.g. fpath=({d} $fpath) in ~/.zshrc");
+    }
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): where [`install_completions`] wrote (or found) the script.
+struct Installed {
+    path: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    unchanged: bool,
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): `script` written as [`completion_file`] in `dir` (else [`completion_dir`]): the same
+/// bytes already there is `unchanged` and NOT written (the mtime kept); other bytes are refused without `force`
+/// (`exists <path> (differs; --force to overwrite)`: a hand-edited script is not clobbered); else the dir is created and
+/// the file written.
+fn install_completions(shell: &str, script: &str, dir: Option<std::path::PathBuf>, force: bool) -> Result<Installed, String> {
+    let dir = match dir {
+        Some(d) => d,
+        None => completion_dir(shell)?,
+    };
+    let path = dir.join(completion_file(shell));
+    match std::fs::read(&path) {
+        Ok(b) if b == script.as_bytes() => return Ok(Installed { path, dir, unchanged: true }),
+        Ok(_) if !force => return Err(format!("exists {} (differs; --force to overwrite)", path.display())),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    std::fs::write(&path, script).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Installed { path, dir, unchanged: false })
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): the shell's user completion directory — bash-completion v2's
+/// `${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions`, zsh `${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions`
+/// (zsh has no standard user dir: the fpath line names it), fish `${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions`. An
+/// XDG variable unset, empty or relative is ignored (the XDG spec); HOME unset or relative is refused by name.
+fn completion_dir(shell: &str) -> Result<std::path::PathBuf, String> {
+    let abs = |v: &str| std::env::var_os(v).map(std::path::PathBuf::from).filter(|p| p.is_absolute());
+    let base = |xdg: &str, under_home: &str| {
+        abs(xdg).or_else(|| abs("HOME").map(|h| h.join(under_home))).ok_or_else(|| format!("completions {shell} --install: HOME is not set (give --install <dir>)"))
+    };
+    Ok(match shell {
+        "fish" => base("XDG_CONFIG_HOME", ".config")?.join("fish").join("completions"),
+        "zsh" => base("XDG_DATA_HOME", ".local/share")?.join("zsh").join("site-functions"),
+        _ => base("XDG_DATA_HOME", ".local/share")?.join("bash-completion").join("completions"),
+    })
+}
+
+/// NLECLICOMPLETIONSINSTALL (SR1011): the script's file name in [`completion_dir`] — each shell's own convention (bash the
+/// command's name, zsh `_<command>` for `#compdef`, fish `<command>.fish`).
+fn completion_file(shell: &str) -> &'static str {
+    match shell {
+        "zsh" => "_nle",
+        "fish" => "nle.fish",
+        _ => "nle",
+    }
 }
