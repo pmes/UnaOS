@@ -1641,3 +1641,67 @@ mod striamarkers_tests {
         assert_eq!(t.validate(), Err(EditError::Negative));
     }
 }
+
+// ---- STRIAMARKERRENAME (LEDGER SR895): rename one marker / remove them all (named tail block) ----
+// Two more pure ops on `Timeline::markers` (BP-handlers-14), reached from the editor's `mark <name>` / `unmark all` words
+// through its ONE commit. `Timeline::mark` keeps refusing a taken tick: the EDL reader relies on it (a duplicate tick in a
+// file is a syntax error), so the rename is its own op.
+
+impl Timeline {
+    /// The timeline with the marker at tick `at` renamed `name` (its tick and order kept); `None` when no marker stands
+    /// there or it already carries `name`.
+    pub fn rename_marker(&self, at: i64, name: &str) -> Option<Timeline> {
+        let i = self.markers.binary_search_by_key(&at, |m| m.at).ok()?;
+        if self.markers[i].name == name {
+            return None;
+        }
+        let mut tl = self.clone();
+        tl.markers[i].name = String::from(name);
+        Some(tl)
+    }
+    /// The timeline with no marker; `None` when it has none.
+    pub fn unmark_all(&self) -> Option<Timeline> {
+        if self.markers.is_empty() {
+            return None;
+        }
+        let mut tl = self.clone();
+        tl.markers.clear();
+        Some(tl)
+    }
+}
+
+#[cfg(test)]
+mod striamarkerrename_tests {
+    use super::*;
+
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        tl
+    }
+
+    /// STRIAMARKERRENAME M3: `rename_marker` renames only the marker at that tick (ticks and order kept, `validate` Ok);
+    /// an empty tick and the same name are `None`.
+    #[test]
+    fn striamarkerrename_rename_marker_keeps_the_tick() {
+        let t = tl().mark(2, "A").unwrap().mark(5, "B").unwrap();
+        let r = t.rename_marker(5, "Intro").expect("the marker at 5");
+        assert_eq!(r.markers, alloc::vec![Marker { at: 2, name: "A".into() }, Marker { at: 5, name: "Intro".into() }]);
+        assert_eq!(r.validate(), Ok(()));
+        assert!(t.rename_marker(4, "X").is_none(), "no marker at 4");
+        assert!(t.rename_marker(5, "B").is_none(), "already named B");
+        assert_eq!(t.mark(5, "C"), Err(EditError::Marker), "the pure mark still refuses a taken tick");
+    }
+
+    /// STRIAMARKERRENAME M3: `unmark_all` clears every marker; `None` with none.
+    #[test]
+    fn striamarkerrename_unmark_all() {
+        let t = tl().mark(2, "A").unwrap().mark(5, "B").unwrap();
+        let u = t.unmark_all().expect("two markers");
+        assert!(u.markers.is_empty());
+        assert_eq!(u, tl());
+        assert!(tl().unmark_all().is_none());
+    }
+}

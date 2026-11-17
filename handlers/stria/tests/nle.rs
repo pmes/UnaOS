@@ -3612,3 +3612,56 @@ fn striamarkers_m_key_and_help_row() {
     assert!(HELP.iter().any(|(a, _)| *a == "mark"));
     println!("striamarkers: m marks M1; help row m -> {}", help_phrase("mark"));
 }
+
+// ---- STRIAMARKERRENAME (LEDGER SR895): `mark <name>` on a taken tick renames, `unmark all` clears (named tail block) ----
+
+/// `mark Intro` on M1's tick renames it (ONE commit, `undo` brings M1 back); the same name again is refused by name with no
+/// undo step; bare `mark` there stays refused; the EDL carries the new name.
+#[test]
+fn striamarkerrename_named_mark_on_a_taken_tick_renames() {
+    let mut f = striamarkers_face();
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("marked M1 at 00:00:00:12"));
+    assert!(f.verb("mark Intro"));
+    assert_eq!(f.last_error.take().as_deref(), Some("renamed M1 to Intro at 00:00:00:12"));
+    assert_eq!(f.state.timeline.markers, vec![timeline_core::Marker { at: 12, name: "Intro".into() }]);
+    assert_eq!(f.state.undo_depth(), 2);
+    let edl = edl::write(&f.state.timeline, "T").unwrap();
+    assert!(edl.contains("* UNA MARKER 00:00:00:12 \"Intro\"\n"), "{edl}");
+    assert!(f.verb("mark Intro"));
+    assert_eq!(f.last_error.take().as_deref(), Some("mark: Intro is already at 00:00:00:12"));
+    assert_eq!(f.state.undo_depth(), 2, "the same name is no edit");
+    assert!(f.verb("mark"));
+    assert_eq!(f.last_error.take().as_deref(), Some("mark: Intro is already at 00:00:00:12"), "bare mark stays refused");
+    assert_eq!(f.state.undo_depth(), 2);
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline.marker_at(12).map(|m| m.name.as_str()), Some("M1"), "undo brings M1 back");
+    println!("striamarkerrename: M1 -> Intro at 12 in one commit; same name and bare mark refused");
+}
+
+/// `unmark all` removes every marker in ONE commit (one `undo` brings both back); with none it is refused by name and
+/// pushes no undo step.
+#[test]
+fn striamarkerrename_unmark_all_in_one_commit() {
+    let mut f = striamarkers_face();
+    f.state.seek(12);
+    assert!(f.verb("mark"));
+    f.state.seek(30);
+    assert!(f.verb("mark A"));
+    f.last_error = None;
+    assert_eq!(f.state.undo_depth(), 2);
+    assert!(f.verb("unmark all"));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmarked 2 markers"));
+    assert!(f.state.timeline.markers.is_empty());
+    assert_eq!(f.state.undo_depth(), 3);
+    assert!(f.verb("undo"));
+    assert_eq!(f.state.timeline.markers.len(), 2, "one undo brings both back");
+    assert!(f.verb("redo"));
+    assert!(f.state.timeline.markers.is_empty());
+    let depth = f.state.undo_depth();
+    assert!(f.verb("unmark all"));
+    assert_eq!(f.last_error.take().as_deref(), Some("unmark all: no markers"));
+    assert_eq!(f.state.undo_depth(), depth, "no undo step");
+    println!("striamarkerrename: unmark all -> 2 markers removed in one commit; none -> refused");
+}
