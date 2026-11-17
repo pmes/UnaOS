@@ -62,6 +62,8 @@ pub struct LayoutTree<H: Host> {
     bw_pending: blockwidth::Saved,
     /// AETHERCAPTIONCSSOM (SR686): the boxes whose align-self `place_narrow_blocks` wrote, with the value (undone and re-derived by `rule_align_undo` at each `propagate_text_align`).
     rule_align: NodeMap<taffy::style::AlignSelf>,
+    /// AETHERCENTERRESTYLEITEMS (SR782): the container align_items / justify_content `propagate_text_align` wrote, per field (undone by `rule_items_undo` before each walk; an author fold drops its field in `rule_items_drop`).
+    rule_items: NodeMap<(Option<taffy::style::AlignItems>, Option<taffy::style::JustifyContent>)>,
 }
 
 /// The multicol displacement of box `id` (0, 0 when it is not in a balanced column).
@@ -299,7 +301,7 @@ pub fn build_tree<H: Host>(dom: &H::Node, vw: f32, vh: f32) -> LayoutTree<H> {
         measure_epoch: 0,
         kept_token: 0,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(), rule_align: NodeMap::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(), rule_items: NodeMap::new(),
     }
 }
 
@@ -1195,14 +1197,14 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
                     } else {
                         taffy::style::JustifyContent::END
                     };
-                    changed = true;
+                    changed = true; tree.rule_items.insert(id, (None, Some(st.justify_content)));
                 } else if !row && st.align_items == taffy::style::AlignItems::NORMAL {
                     st.align_items = if matches!(align, 1 | 5) {
                         taffy::style::AlignItems::CENTER
                     } else {
                         taffy::style::AlignItems::END
                     };
-                    changed = true;
+                    changed = true; tree.rule_items.insert(id, (Some(st.align_items), None));
                 }
                 let block = crate::collapse::is_block_container_pub(tree, id, &st) || cell_block_container(tree, id, &st);
                 if changed {
@@ -1218,7 +1220,7 @@ fn propagate_text_align<H: Host>(tree: &mut LayoutTree<H>) {
             walk(tree, k, effective);
         }
     }
-    rule_align_undo(tree); let root = tree.root_node;
+    rule_align_undo(tree); rule_items_undo(tree); let root = tree.root_node;
     walk(tree, root, None);
 }
 
@@ -1620,7 +1622,7 @@ fn computed_font_size<H: Host>(paint: Option<&PaintStyle<H>>, tag: &str, parent:
     match paint.and_then(|p| p.font_size_rel) {
         Some((0, f)) => parent * f,
         Some((1, f)) => root_fs * f,
-        _ => paint.and_then(|p| p.font_size).unwrap_or_else(|| {
+        _ if paint.is_some_and(|p| p.inherits(crate::paint::INHERIT_FONT_SIZE)) => parent, _ => paint.and_then(|p| p.font_size).unwrap_or_else(|| {
             if parent_absolute {
                 default_font_size(tag, parent)
             } else {
@@ -1705,7 +1707,7 @@ pub fn apply_specs<H: Host>(tree: &mut LayoutTree<H>, specs: &[(taffy::NodeId, R
         let node_id = *node_id;
         if let Ok(node_style_ref) = tree.taffy.style(node_id) {
             let mut node_style = node_style_ref.clone();
-            spec.fold_into(&mut node_style); if spec.align_self.is_some() { tree.rule_align.remove(&node_id); }
+            spec.fold_into(&mut node_style); if spec.align_self.is_some() { tree.rule_align.remove(&node_id); } rule_items_drop(tree, node_id, spec, &node_style);
             let _ = tree.taffy.set_style(node_id, node_style);
         }
         match spec.position {
@@ -1858,7 +1860,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
             if let Some(tag) = dom_node.tag() {
                 let tag = tag.as_str();
                 let paint = tree.paint_map.get(&node_id);
-                let own_family = paint.and_then(|p| p.family).unwrap_or_else(|| default_family::<H>(tag, inherited.family));
+                let own_family = paint.and_then(|p| p.family).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_FAMILY, inherited.family, |f| default_family::<H>(tag, f)));
                 size.font_size = computed_font_size(paint, tag, inherited.font_size, inherited.family, own_family, inherited.fs_absolute, root_fs);
                 match paint.and_then(|p| p.font_size_rel) {
                     Some((0, _)) => {}
@@ -1896,12 +1898,12 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                 if let Some(v) = paint.and_then(|p| p.word_spacing) {
                     size.mode.word_spacing = v;
                 }
-                size.family = paint.and_then(|p| p.family).unwrap_or_else(|| default_family::<H>(tag, inherited.family));
+                size.family = paint.and_then(|p| p.family).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_FAMILY, inherited.family, |f| default_family::<H>(tag, f)));
                 size.weight = paint
                     .and_then(|p| p.weight)
                     .map(|w| w.resolve(inherited.weight))
-                    .unwrap_or_else(|| default_weight(tag, inherited.weight));
-                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic)); size.caps = paint.map_or(inherited.caps, |p| p.caps(inherited.caps));
+                    .unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_WEIGHT, inherited.weight, |w| default_weight(tag, w)));
+                size.italic = paint.and_then(|p| p.italic).unwrap_or_else(|| crate::paint::or_tag(paint, crate::paint::INHERIT_ITALIC, inherited.italic, |i| default_italic(tag, i))); size.caps = paint.map_or(inherited.caps, |p| p.caps(inherited.caps));
                 if let Some(st) = paint.and_then(|p| p.stretch) {
                     size.stretch = st;
                 }
@@ -1924,7 +1926,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     };
                     out.media.insert(node_id, (w, h, ratio));
                 }
-                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.and_then(|p| p.family).is_some() { size.family } else { 0 }, size.font_size)) {
+                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.is_some_and(|p| p.family.is_some() || p.inherits(crate::paint::INHERIT_FAMILY)) { size.family } else { 0 }, size.font_size)) {
                     out.imgs.insert(node_id, wh);
                 }
                 if tag == "img" || is_image_input(dom_node) { // AETHERIMAGEINPUTFETCH (SR461): an image input sizes as an img
@@ -2539,7 +2541,7 @@ pub fn retarget<H: Host>(fresh: LayoutTree<H>, kept: &LayoutTree<H>, token: u64,
         measure_epoch: 0,
         kept_token: token,
         measured: NodeMap::new(),
-        bw_pending: Vec::new(), rule_align: NodeMap::new(),
+        bw_pending: Vec::new(), rule_align: NodeMap::new(), rule_items: NodeMap::new(),
     }
 }
 
@@ -2630,7 +2632,7 @@ fn sync<H: Host>(twin: &mut LayoutTree<H>, kept: &mut LayoutTree<H>, prep: &Prep
     kept.col_frags = core::mem::take(&mut twin.col_frags);
     kept.fixed_at = core::mem::take(&mut twin.fixed_at);
     kept.measured = now;
-    kept.bw_pending = Vec::new(); kept.rule_align = core::mem::take(&mut twin.rule_align);
+    kept.bw_pending = Vec::new(); kept.rule_align = core::mem::take(&mut twin.rule_align); kept.rule_items = core::mem::take(&mut twin.rule_items);
     kept.kept_token = 0;
     true
 }
@@ -3732,5 +3734,57 @@ mod img_alt_inline_icon_float_clear_kat {
         assert_eq!(img_alt_measure(&run("aaaa bbbb", 12.0), 80.0, &Mono), (48.0, 24.0), "two 12 px lines beside the icon: 24 > 16 unchanged");
         let long = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty";
         assert_eq!(img_alt_measure(&run(long, 12.0), f32::MAX, &Mono).1, 16.0, "unbounded at 12 px: one line, the icon's 16 px");
+
+
     }
+}
+
+// ---- AETHERCENTERRESTYLEITEMS (LEDGER SR782): the rule's container alignment undone on a restyle (named tail block) ----
+
+/// AETHERCENTERRESTYLEITEMS (SR782): undoes the container alignment `propagate_text_align` wrote on the last run (a
+/// row's `justify_content`, a column's `align_items`, each written only over NORMAL), so the walk that follows
+/// re-derives it from the text-align in force now: a field still holding the value the rule wrote goes back to NORMAL
+/// (the value the rule's guard saw); one that moved since (an author value) keeps it. Every mark is dropped; the walk
+/// marks again what it writes. Its own fn beside SR686's `rule_align_undo`, which returns early on an empty
+/// `rule_align` (a row cell carries a justify mark and no align-self mark).
+fn rule_items_undo<H: Host>(tree: &mut LayoutTree<H>) {
+    if tree.rule_items.is_empty() {
+        return;
+    }
+    let marked = core::mem::take(&mut tree.rule_items);
+    for (&k, &(ai, jc)) in marked.iter() {
+        let Ok(st) = tree.taffy.style(k) else { continue };
+        let mut st = st.clone();
+        let mut changed = false;
+        if ai.is_some_and(|a| st.align_items == a) {
+            st.align_items = taffy::style::AlignItems::NORMAL;
+            changed = true;
+        }
+        if jc.is_some_and(|j| st.justify_content == j) {
+            st.justify_content = taffy::style::JustifyContent::NORMAL;
+            changed = true;
+        }
+        if changed {
+            let _ = tree.taffy.set_style(k, st);
+        }
+    }
+}
+
+/// AETHERCENTERRESTYLEITEMS (SR782): an author fold (`apply_specs`) that rewrote a field the rule marked on box `id`
+/// drops that field's mark, so `rule_items_undo` never resets an author value equal to the rule's. align_items is
+/// rewritten when the spec makes a flex container (`fold_into` resets it to the author value or NORMAL) or sets
+/// align-items on a row box (`fold_into`'s landing condition; on a column block it does not land, so the mark stays);
+/// justify-content always lands. `st` is the folded style.
+fn rule_items_drop<H: Host>(tree: &mut LayoutTree<H>, id: taffy::NodeId, spec: &SpecifiedStyle<H>, st: &Style) {
+    let Some(m) = tree.rule_items.get_mut(&id) else { return };
+    let row = matches!(st.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
+    if spec.flex_container == Some(true) || (spec.align_items.is_some() && row) {
+        m.0 = None;
+    }
+    if spec.justify.is_some() {
+        m.1 = None;
+    }
+    if m.0.is_none() && m.1.is_none() {
+        tree.rule_items.remove(&id);
+}
 }

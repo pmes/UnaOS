@@ -2144,9 +2144,9 @@ impl Face {
             return Err(format!("unknown format {fmt} ({})", VIDEO_NAMES.join("|")));
         }
         self.range_check(&range)?; std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+        let span = range.clone().unwrap_or(0..self.state.timeline.end()); let (done, total, cancel) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(crate::nle_export::export_total(&self.state.timeline, &span))), Arc::new(AtomicBool::new(false))); // NLE5DEXPORTMESSAGEETATOTAL (SR820): the range resolved once, the total seeded before the spawn
         let (d, t, c) = (Arc::clone(&done), Arc::clone(&total), Arc::clone(&cancel));
-        let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), range.clone());
+        let video = fmt.to_string(); let (tl, sources, path, fmt, span) = (self.state.timeline.clone(), Arc::clone(&self.sources), dir.to_path_buf(), fmt.to_string(), span);
         let handle = std::thread::Builder::new()
             .name("nle-export".into())
             .spawn(move || {
@@ -2164,7 +2164,7 @@ impl Face {
                     }
                     Ok(())
                 };
-                export_as_with(&tl, span.unwrap_or(0..tl.end()), &sources, &path, video, audio, Container::Mp4, &mut progress)
+                export_as_with(&tl, span, &sources, &path, video, audio, Container::Mp4, &mut progress)
             })
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         let started = std::time::Instant::now(); self.export = Some(ExportJob { dir: dir.to_path_buf(), done, total, cancel, handle: Some(handle), shown: 0, range, video, audio, started, rate_ema: 0.0, rate_at: (started, 0) });
@@ -2179,7 +2179,7 @@ impl Face {
     pub fn exporting(&self) -> bool {
         self.export.is_some()
     }
-    /// The running export's reading `(frames done, frames total)` (total 0 until the first frame).
+    /// The running export's reading `(frames done, frames total)` (total seeded at the start from `nle_export::export_total`).
     pub fn export_progress(&self) -> Option<(u64, u64)> {
         self.export.as_ref().map(|j| (j.done.load(Relaxed), j.total.load(Relaxed)))
     }
@@ -2943,7 +2943,7 @@ pub fn eta_words(done: u64, total: u64, elapsed: Duration) -> Option<String> {
 // NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
 
 /// A running export as a person reads it: `export: <done> / <total>`, then ` <eta>` when there is one ([`eta_words`]:
-/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (before the export thread's first reading).
+/// `export: 3 / 35 ~12 s`); `export: starting` while `total` is 0 (an export of no frames).
 pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
     if total == 0 {
         return "export: starting".to_string();
@@ -2956,9 +2956,10 @@ pub fn export_line(done: u64, total: u64, eta: Option<String>) -> String {
 
 /// The running job's [`export_line`]: its `done` / `total` reading (as [`Face::export_progress`] reads it) and SR796's
 /// [`eta_words`] over its `started`. A free fn over the job, so [`Face::export_tick`] calls it under its live `&mut` borrow.
+/// A stall past [`STALL_AFTER`] trades the eta word for [`stall_words`] (`export: 3 / 35 stalled 7 s`, NLE5DEXPORTMESSAGEETASTALLWORD SR817).
 fn job_line(j: &ExportJob) -> String {
     let (d, t) = (j.done.load(Relaxed), j.total.load(Relaxed));
-    export_line(d, t, job_eta(j, d, t).map(eta_words_of))
+    export_line(d, t, finishing_words(d, t).or_else(|| stall_words(j.rate_at.0.elapsed(), j.rate_ema)).or_else(|| job_eta(j, d, t).map(eta_words_of)))
 }
 
 // ---- NLE5DEXPORTMESSAGEETASMOOTH (LEDGER SR808): a time-based EMA of the export rate for the eta (named tail block) ----
@@ -3035,6 +3036,68 @@ pub fn eta_words_of(d: Duration) -> String {
         format!("~{}:{:02}", s / 60, s % 60)
     } else {
         format!("~{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+    }
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWORD (LEDGER SR817): a stalled export's line names the stall (named tail block) ----
+// SR811 grows a stalled export's eta, but the line still read like progress (`export: 3 / 35 ~19 s` climbing). THE STALL
+// RULE: `job_line` passes `stall_words(rate_at.0.elapsed(), rate_ema)` in place of the eta word when the time since the last
+// sampled move exceeds max(STALL_AFTER, STALL_FRAMES / rate) for a positive finite EMA rate (a slow-but-moving export is not
+// called stalled), else a flat STALL_AFTER (the mean road, before the EMA has a rate: `rate_at.0` is `started` until the first
+// sampled move, so a first frame that never comes still names its stall). The seconds read SR796's one grammar
+// (`eta_words_of`, half up through `eta_secs`) without the tilde. `export_line`, `job_eta`, `Face::export_eta` and stria-view's
+// `"eta_secs"` are unchanged; the word returns to the eta at the next move. Owed: NLE5D-EXPORT-MESSAGE-ETA-STALL-WITNESS (the
+// stall seconds on stria-view's export JSON), NLE5D-EXPORT-MESSAGE-ETA-STALL-FINALIZE (done == total: name the finalise, not a
+// stall), NLE5D-EXPORT-MESSAGE-ETA-KERNEL, NLE5D-EXPORT-MESSAGE-ETA-TOTAL, NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// The least time since the last sampled move that reads as a stall.
+pub const STALL_AFTER: Duration = Duration::from_secs(5);
+
+/// The frame intervals at the EMA rate that must also pass before a moving-but-slow export reads as stalled.
+pub const STALL_FRAMES: f64 = 10.0;
+
+/// A running export's stall as a person reads it: `stalled 7 s` (`stalled 4:10` past a minute, [`eta_words_of`]'s grammar
+/// without the tilde) when `since_last` (the time since the last sampled move) is strictly over max([`STALL_AFTER`],
+/// [`STALL_FRAMES`] / `rate`), or over a flat [`STALL_AFTER`] while `rate` is not positive and finite; else `None`.
+pub fn stall_words(since_last: Duration, rate: f64) -> Option<String> {
+    stall_since(since_last, rate).map(|d| format!("stalled {}", eta_words_of(d).trim_start_matches('~')))
+}
+
+// ---- NLE5DEXPORTMESSAGEETASTALLWITNESS (LEDGER SR825): the stall rule's predicate for the witness; the finalise named (named tail block) ----
+// SR817 named a stall on the face's line only: stria-view's JSON carried a growing `eta_secs` and no word, and an export whose
+// frames were all in but whose finalise (the mp4 close, the wav header: `export_as_with`'s `sink.finish` after the last
+// `progress(total, total)`) ran past 5 s read `35 / 35 stalled 6 s`. SR817's predicate moves verbatim into `stall_since`;
+// `stall_words` (the word) and `Face::export_stall` (the witness's `"stalled_secs"`) read that ONE rule. `job_line` puts
+// `finishing_words` before the stall word, so done == total (total > 0) reads `export: 35 / 35 finishing` (no eta, no stall)
+// until the job joins and the finished line replaces it; `export_stall` is None there too. Owed:
+// NLE5D-EXPORT-MESSAGE-FINISHING-WITNESS (a `"finishing":true` key if the local session wants it), NLE5D-EXPORT-MESSAGE-ETA-KERNEL,
+// NLE5D-EXPORT-MESSAGE-DURATION-WITNESS (carried).
+
+/// SR817's stall rule as a time: `Some(since_last)` when `since_last` (the time since the last sampled move) is strictly over
+/// max([`STALL_AFTER`], [`STALL_FRAMES`] / `rate`) for a positive finite `rate`, or over a flat [`STALL_AFTER`] otherwise; else
+/// `None`. [`stall_words`] is its word; [`Face::export_stall`] its witness.
+pub fn stall_since(since_last: Duration, rate: f64) -> Option<Duration> {
+    let after = STALL_AFTER.as_secs_f64();
+    let limit = if rate > 0.0 && rate.is_finite() { after.max(STALL_FRAMES / rate) } else { after };
+    (since_last.as_secs_f64() > limit).then_some(since_last)
+}
+
+/// The finalise's word: `finishing` when every frame is in (`done == total`, `total > 0`) and the job has not joined (the mp4
+/// close, the wav header); else `None`. [`job_line`] reads it before the stall word.
+pub fn finishing_words(done: u64, total: u64) -> Option<String> {
+    (total > 0 && done == total).then(|| "finishing".to_string())
+}
+
+impl Face {
+    /// The running export's stall ([`stall_since`] over the job's `rate_at` and `rate_ema`, the rule [`job_line`]'s word reads),
+    /// the sibling of [`Face::export_eta`]; `None` with no export, while not stalled, and while finishing ([`finishing_words`]).
+    pub fn export_stall(&self) -> Option<Duration> {
+        let j = self.export.as_ref()?;
+        let (d, t) = self.export_progress()?;
+        if finishing_words(d, t).is_some() {
+            return None;
+        }
+        stall_since(j.rate_at.0.elapsed(), j.rate_ema)
     }
 }
 
