@@ -341,10 +341,10 @@ impl EditorState {
                 self.zoom = ZOOM_DEFAULT;
                 Ok(())
             }
-            "[" => self.trim(Edge::In, -1),
-            "]" => self.trim(Edge::In, 1),
-            "{" => self.trim(Edge::Out, -1),
-            "}" => self.trim(Edge::Out, 1),
+            "[" => self.key_trim(Edge::In, -1), // STRIACLIPSPEEDTHREE (SR9031): one timeline tick on a fast clip (file tail)
+            "]" => self.key_trim(Edge::In, 1), // STRIACLIPSPEEDTHREE (SR9031): one timeline tick on a fast clip (file tail)
+            "{" => self.key_trim(Edge::Out, -1), // STRIACLIPSPEEDTHREE (SR9031): one timeline tick on a fast clip (file tail)
+            "}" => self.key_trim(Edge::Out, 1), // STRIACLIPSPEEDTHREE (SR9031): one timeline tick on a fast clip (file tail)
             "lift" => self.lift_selected(),
             "mark-in" => match self.selected() {
                 Some(c) => self.trim(Edge::In, c.src_at(ph) - c.src_in), // STRIACLIPSPEED (SR829): the playhead's source tick (1x: ph - at)
@@ -4257,5 +4257,21 @@ impl EditorState {
             self.commit(tl);
         }
         Ok(())
+    }
+}
+
+// ---- STRIACLIPSPEEDTHREE (LEDGER SR9031): the trim keys step one timeline tick on a fast clip (named tail block) ----
+// `[ ] { }` moved the edge one SOURCE tick, which on a clip faster than 1x can leave the drawn edge where it was (2x: half a
+// tick). On such a clip a key goes through THE `trim_by_ticks` (one TIMELINE tick through `src_at`, never 0 source ticks
+// above 1x); at 1x the two are the same and below 1x one source tick stays the step (a timeline tick can round to a hold).
+// `rtrim` keeps its documented source ticks.
+impl EditorState {
+    /// A trim key on the selected clip's `edge` by `d`: timeline ticks ([`EditorState::trim_by_ticks`]) on a clip faster
+    /// than 1x, else source ticks ([`EditorState::trim`]; nothing selected is its `NoClip`).
+    pub fn key_trim(&mut self, edge: Edge, d: i64) -> Result<(), EditError> {
+        match self.selected() {
+            Some(c) if c.rate_q16 > 0x1_0000 => self.trim_by_ticks(edge, d),
+            _ => self.trim(edge, d),
+        }
     }
 }

@@ -1104,7 +1104,7 @@ impl Sources {
 // `eff = round(out_rate * 0x1_0000 / rate_q16)` Hz, so they cover `rate` times the 1x source span (pitch follows speed, as a
 // tape does; going faster is anti-aliased by the sinc's cutoff; `eff` equal to the source's rate is the plain sample copy).
 // The run's start is the layer's exact `src_t` at `eff`, so the < 1 Hz rounding of `eff` never accumulates past a run. A
-// crossfade's UNDER layer and a fade-to-silence tail play their 1x handle (the transition handle rule). The video needs no
+// crossfade's UNDER layer and a fade-to-silence tail play the outgoing's rate (STRIACLIPSPEEDTHREE SR9031: src_at past its end). The video needs no
 // arm: the schedule names `src_at(t)` and `Vid::show` decodes and drops forward (rate > 1) or holds the last frame (rate < 1).
 // A pitch-preserving stretch is owed (NLE-SPEED-PITCH-PRESERVE).
 
