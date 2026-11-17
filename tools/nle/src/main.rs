@@ -48,7 +48,7 @@ use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
-    usage_to(&mut std::io::stderr(), 2) // NLECLIREFUSALSBYNAME (SR801): the five lines in `usage_to` (file tail): stderr, exit 2
+    usage_to(&mut std::io::stderr(), 2, None) // NLECLIREFUSALSBYNAME (SR801): the five lines in `usage_to` (file tail): stderr, exit 2
 }
 
 fn die(msg: String) -> ! {
@@ -98,7 +98,7 @@ fn load(edl_path: &str, fps: u32, srcs: &[(String, String)]) -> (Timeline, Sourc
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect(); if help_asked(&args) { usage_to(&mut std::io::stdout(), 0, Some(args[0].as_str()).filter(|v| !matches!(*v, "help" | "--help"))) }
     if args.first().map(String::as_str) == Some("--make-src") {
         let out = args.get(1).unwrap_or_else(|| usage());
         let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| bad("--make-src", s, &what("--make-src")))).unwrap_or(d); // NLECLIREFUSALSREST (SR814): a bad number by name
@@ -107,7 +107,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, &format!("one of {}", SHELLS.join("|")))), &args[2..]); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, &format!("one of {}", SHELLS.join("|")))), &args[2..]); return; } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -382,20 +382,15 @@ fn num<T: std::str::FromStr>(it: &mut std::slice::Iter<'_, String>, flag: &str) 
 }
 
 /// NLECLIREFUSALSBYNAME (SR801, NLE-CLI-HELP): a person asked for the usage — `nle help`, `nle --help`, or
-/// `nle <schedule|render|export> --help`.
+/// `nle <schedule|render|export|size|--make-src|completions> --help`.
 fn help_asked(args: &[String]) -> bool {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    matches!(a.as_slice(), ["help" | "--help", ..] | ["schedule" | "render" | "export", "--help", ..])
+    matches!(a.as_slice(), ["help" | "--help", ..] | ["schedule" | "render" | "export" | "size" | "--make-src" | "completions", "--help", ..])
 }
 
 /// NLECLIREFUSALSBYNAME (SR801): THE usage text, to `w`, then exit `code` (`usage()`: stderr, 2; the help road: stdout, 0).
-fn usage_to(w: &mut dyn Write, code: i32) -> ! {
-    let _ = writeln!(w, "usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
-    let _ = writeln!(w, "       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
-    let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
-    let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
-    let _ = writeln!(w, "       nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"); // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall
+fn usage_to(w: &mut dyn Write, code: i32, verb: Option<&str>) -> ! {
+    match verb { Some(v) => verb_usage(w, v), None => for (i, (_, line)) in USAGE_LINES.iter().enumerate() { let _ = writeln!(w, "{}{}", if i == 0 { "usage: " } else { "       " }, usage_fill(line)); } } // NLECLIHELPVERB (SR1041): Some(verb) its own section (file tail); None the six lines of USAGE_LINES, bytes unchanged
     let _ = w.flush();
     std::process::exit(code)
 }
@@ -874,4 +869,62 @@ fn fish_completions() -> String {
         }
     }
     s
+}
+
+// ---- NLECLIHELPVERB (LEDGER SR1041): per-verb `--help` from ONE usage table and VERB_FLAGS (named tail block) ----
+/// NLECLIHELPVERB (SR1041): THE usage lines, one per verb shape in the usage's order, without the `usage: ` / indent prefix
+/// ([`usage_to`] adds it). `{video}` / `{audio}` are stria's tables, filled by [`usage_fill`]. The full usage and each
+/// verb's `--help` section ([`verb_usage`]) print from this one table.
+const USAGE_LINES: [(&str, &str); 6] = [
+    ("schedule", "nle schedule <edl|media> [--fps N] --src REEL=<media> ..."),
+    ("render", "nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>"),
+    ("export", "nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {video}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {audio}|aac:KBPS] [--aac] [--mkv] [--png]"),
+    ("--make-src", "nle --make-src <out.mp4> <base> [frames] [fps]"),
+    ("size", "nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]"),
+    ("completions", "nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"),
+];
+
+/// NLECLIHELPVERB (SR1041): `line` with `{video}` / `{audio}` replaced by stria's `VIDEO_NAMES` / `AUDIO_NAMES` joined `|`.
+fn usage_fill(line: &str) -> String {
+    line.replace("{video}", &VIDEO_NAMES.join("|")).replace("{audio}", &stria::nle_export::AUDIO_NAMES.join("|"))
+}
+
+/// NLECLIHELPVERB (SR1041): the value word after the whole-word `flag` in a usage `line` — up to the first space or the first
+/// unmatched `]` at bracket depth 0 (`--scenecut [K]` -> `[K]`, `--pass2 k=v,...]` -> `k=v,...`); empty when the flag is
+/// absent or followed by `]`, `|` or another flag (`--two-pass |`, `[--aac]`, `[--force]`).
+fn flag_word<'a>(line: &'a str, flag: &str) -> &'a str {
+    let whole = |i: usize| (i == 0 || line[..i].ends_with([' ', '['])) && (line[i + flag.len()..].is_empty() || line[i + flag.len()..].starts_with([' ', ']']));
+    let Some(i) = line.match_indices(flag).map(|(i, _)| i).find(|&i| whole(i)) else { return "" };
+    let rest = line[i + flag.len()..].strip_prefix(' ').unwrap_or("");
+    let mut depth = 0usize;
+    let end = rest
+        .char_indices()
+        .find(|&(_, c)| match c {
+            '[' => {
+                depth += 1;
+                false
+            }
+            ']' if depth == 0 => true,
+            ']' => {
+                depth -= 1;
+                false
+            }
+            ' ' => depth == 0,
+            _ => false,
+        })
+        .map_or(rest.len(), |(j, _)| j);
+    let word = &rest[..end];
+    if word.is_empty() || word.starts_with(['|', '-']) || word.starts_with("[-") { "" } else { word }
+}
+
+/// NLECLIHELPVERB (SR1041): `nle <verb> --help` — the verb's [`USAGE_LINES`] line as `usage: <line>`, then one line per
+/// [`VERB_FLAGS`] word in its order, `  <flag>` and its value word cut from that same line ([`flag_word`]) when it has one.
+fn verb_usage(w: &mut dyn Write, verb: &str) {
+    let line = USAGE_LINES.iter().find(|(v, _)| *v == verb).map(|(_, l)| usage_fill(l)).unwrap_or_default();
+    let _ = writeln!(w, "usage: {line}");
+    let flags: &[&str] = VERB_FLAGS.iter().find(|(v, _)| *v == verb).map_or(&[][..], |(_, f)| *f);
+    for f in flags {
+        let word = flag_word(&line, f);
+        let _ = writeln!(w, "  {f}{}", if word.is_empty() { String::new() } else { format!(" {word}") });
+    }
 }

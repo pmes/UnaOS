@@ -241,7 +241,7 @@ fn cli_usage_lists_every_flag() {
 fn cli_help_exits_zero_on_stdout() {
     let usage = usage_text();
     assert_eq!(usage.lines().next(), Some(USAGE_FIRST), "the stderr usage of `nle`");
-    let roads: [&[&str]; 3] = [&["help"], &["--help"], &["export", "--help"]];
+    let roads: [&[&str]; 2] = [&["help"], &["--help"]]; // NLECLIHELPVERB (SR1041): `export --help` is the export section now (cli_help_verb_sections)
     for road in roads {
         let (code, out, err) = nle(road);
         assert_eq!(code, 0, "{road:?}: a person asked for it, exit 0");
@@ -1102,4 +1102,92 @@ fn cli_completions_verb_flags_text() {
     // The dispatch refusal names SHELLS, bytes unchanged.
     let (code, out, err) = nle(&["completions", "tcsh"]);
     assert_eq!((code, out.as_str(), err), (1, "", format!("nle: completions tcsh: one of {}\n", const_words("SHELLS").join("|"))));
+}
+
+// ---- NLECLIHELPVERB (LEDGER SR1041): `nle <verb> --help` prints that verb's section; the full usage frozen (named tail block) ----
+/// NLECLIHELPVERB (SR1041): the full usage as main.rs `usage_to` printed it BEFORE this arc (frozen at 5995ad1cf from its six
+/// writelns, pinned once here): `{video}` / `{audio}` are stria's tables joined `|` (they may grow; the rest may not move).
+const USAGE_FROZEN: [&str; 6] = [
+    "usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...\n",
+    "       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>\n",
+    "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {video}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {audio}|aac:KBPS] [--aac] [--mkv] [--png]\n",
+    "       nle --make-src <out.mp4> <base> [frames] [fps]\n",
+    "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]\n",
+    "       nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]\n",
+];
+
+/// NLECLIHELPVERB (SR1041): [`USAGE_FROZEN`] with stria's tables filled, one text.
+fn usage_frozen() -> String {
+    USAGE_FROZEN.concat().replace("{video}", &VIDEO_NAMES.join("|")).replace("{audio}", &AUDIO_NAMES.join("|"))
+}
+
+/// NLECLIHELPVERB (SR1041): `nle help` / `nle --help` (stdout, 0) and bare `nle` (stderr, 2) are the frozen usage byte for byte.
+#[test]
+fn cli_help_full_usage_frozen() {
+    let want = usage_frozen();
+    for road in [&["help"][..], &["--help"][..]] {
+        let (code, out, err) = nle(road);
+        assert_eq!((code, out.as_str(), err.as_str()), (0, want.as_str(), ""), "nle {road:?}");
+    }
+    assert_eq!(usage_text(), want, "nle (no verb): the stderr usage");
+}
+
+/// NLECLIHELPVERB (SR1041): `nle <verb> --help` for each verb with a usage line: exit 0 on stdout, line 0 `usage: ` + that
+/// verb's line of the full usage, then exactly SR1033's `VERB_FLAGS` row in order, one `  <flag>[ <word>]` per line, the
+/// word cut from the verb's own line (FLAG_ARG `Bare` <=> no word; the table flags' words are the owners' tables).
+#[test]
+fn cli_help_verb_sections() {
+    let full = usage_frozen();
+    let table = verb_flags();
+    let flags = const_words("FLAGS");
+    let kinds = flag_arg_src();
+    assert_eq!(flags.len(), kinds.len(), "FLAG_ARG parallel to FLAGS");
+    let audio: Vec<&str> = AUDIO_NAMES.iter().copied().chain(["aac:KBPS"]).collect();
+    let mut seen = Vec::new();
+    for v in ["schedule", "render", "export", "size", "--make-src", "completions"] {
+        let (code, out, err) = nle(&[v, "--help"]);
+        assert_eq!((code, err.as_str()), (0, ""), "nle {v} --help");
+        let lines: Vec<&str> = out.lines().collect();
+        let line = full.lines().map(|l| l.trim_start_matches("usage: ").trim_start()).find(|l| l.starts_with(&format!("nle {v} "))).unwrap_or_else(|| panic!("{v}: a line of the full usage"));
+        assert_eq!(lines[0], format!("usage: {line}"), "nle {v} --help: the verb's own usage line");
+        let want = &table.iter().find(|(w, _)| *w == v).unwrap_or_else(|| panic!("{v}: a VERB_FLAGS row")).1;
+        let got: Vec<&str> = lines[1..].iter().map(|l| { assert!(l.starts_with("  --"), "{v}: {l:?}"); l[2..].split(' ').next().unwrap() }).collect();
+        assert_eq!(&got, want, "nle {v} --help: VERB_FLAGS' row in order");
+        for l in &lines[1..] {
+            let (f, word) = l[2..].split_once(' ').unwrap_or((&l[2..], ""));
+            if !word.is_empty() {
+                assert!(line.contains(&format!("{f} {word}")), "{v}: {f} {word:?} cut from {line:?}");
+            }
+            if let Some(k) = flags.iter().position(|x| *x == f).map(|i| kinds[i]) {
+                assert_eq!(k == "Bare", word.is_empty(), "{v}: {f} is {k}, word {word:?}");
+            }
+            let joined = |t: &[&str]| t.join("|");
+            match f {
+                "--video" => assert_eq!(word, joined(&VIDEO_NAMES[..]), "--video's word"),
+                "--audio" => assert_eq!(word, joined(&audio), "--audio's word"),
+                "--pass" => assert_eq!(word, joined(&const_words("PASS_WORDS")), "--pass's word"),
+                _ => {}
+            }
+            seen.push(format!("{v} {}", &l[2..]));
+        }
+    }
+    for want in ["size --fps N", "export --fps N", "export --out <dir>", "render --out <stem>", "export --scenecut [K]", "export --stats <file>", "export --src REEL=<media>", "export --pass2 k=v,...", "export --two-pass", "completions --install [<dir>]", "completions --force", "completions --uninstall [<dir>]"] {
+        assert!(seen.iter().any(|x| x == want), "{want:?} in {seen:?}");
+    }
+    let section = |v: &str| nle(&[v, "--help"]).1;
+    assert_eq!(section("size").lines().count(), 2, "size: the line + --fps");
+    assert_eq!(section("completions").lines().count(), 4, "completions: the line + its three flags");
+    assert_eq!(section("export").lines().count(), 1 + flags.len(), "export: the line + every FLAGS word");
+    let ms = section("--make-src");
+    assert_eq!(ms, format!("usage: {}\n", USAGE_FROZEN[3].trim_start().trim_end_matches('\n')), "--make-src: the line alone");
+    assert!(!Path::new(env!("CARGO_MANIFEST_DIR")).join("--help").exists(), "--make-src --help writes no file");
+}
+
+/// NLECLIHELPVERB (SR1041): an unknown verb with `--help` is unchanged (measured at 5995ad1cf): no verb within 2, so `load`
+/// reads `--help` as the EDL path and refuses it, exit 1. Owed NLE-CLI-HELP-UNKNOWN-VERB (the usage, exit 2).
+#[test]
+fn cli_help_unknown_verb_as_today() {
+    let (code, out, err) = nle(&["bogus", "--help"]);
+    assert_eq!((code, out.as_str()), (1, ""), "nle bogus --help: {err}");
+    assert!(err.starts_with("nle: --help: "), "nle bogus --help: {err}");
 }
