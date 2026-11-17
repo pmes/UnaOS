@@ -45,11 +45,12 @@ pub struct EditorState {
     redo: Vec<Timeline>,
     /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
     pub transition: Option<(usize, usize)>,
+    pub clipboard: Vec<(usize, crate::Kind, Clip)>, // STRIACOPYPASTE (SR854): the copied clips as (track, its kind, clip), replaced whole by `copy` / `cut` (file tail)
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new() }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -305,7 +306,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail)
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1312,5 +1313,154 @@ impl EditorState {
             },
             _ => Err(EditError::Transition),
         })
+    }
+}
+
+// ---- STRIACOPYPASTE (LEDGER SR854): copy / cut / paste of the selection at the playhead (named tail block) ----
+// `copy` / `cut` / `paste` ride THE verb dispatch both faces call. The clipboard is a value on the state beside the
+// selection, outside the Timeline: not undone, not in the EDL, not dirtying the document, replaced WHOLE by each `copy` /
+// `cut` (so it holds at most the set's clips; `view::Drag::shown` builds its scratch state through `EditorState::new`,
+// so the clipboard never rides a drag preview). `copy` takes the set's clips (no commit); `cut` takes them then lifts them
+// through `lift_selected` (ONE commit, the holes stay). `paste` keeps the copied layout, its lowest track on the
+// selected clip's track (none selected: where it was copied from) and its earliest clip at the playhead, through
+// `Timeline::paste` (THE `place` road, a paste never overwrites: `EditError::Overlap`) and ONE commit; the pasted clips
+// become the set and the playhead moves to their end, so a repeat appends. Refused by name: nothing selected / an empty
+// clipboard `EditError::NoClip`, `NoTrack`, `Kind`, `Overlap`.
+impl EditorState {
+    /// The set's clips as clipboard entries `(track, its kind, clip)`, in set order.
+    fn copied(&self) -> Result<Vec<(usize, crate::Kind, Clip)>, EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let tl = &self.timeline;
+        self.set.iter().map(|&(t, i)| tl.tracks.get(t).and_then(|tr| Some((t, tr.kind, *tr.clips.get(i)?))).ok_or(EditError::NoClip)).collect()
+    }
+    /// The selected clips onto the clipboard (no edit).
+    pub fn copy_selected(&mut self) -> Result<(), EditError> {
+        self.clipboard = self.copied()?;
+        Ok(())
+    }
+    /// The selected clips onto the clipboard, then lifted (`lift_selected`, ONE commit); the clipboard changes only
+    /// when the lift lands.
+    pub fn cut_selected(&mut self) -> Result<(), EditError> {
+        let c = self.copied()?;
+        self.lift_selected()?;
+        self.clipboard = c;
+        Ok(())
+    }
+    /// The clipboard laid at the playhead on the selected track (see the block comment; ONE commit).
+    pub fn paste(&mut self) -> Result<(), EditError> {
+        let t0 = self.clipboard.iter().map(|e| e.0).min().ok_or(EditError::NoClip)?;
+        let a0 = self.clipboard.iter().map(|e| e.2.at).min().ok_or(EditError::NoClip)?;
+        let base = self.selection.map_or(t0, |p| p.0);
+        let items: Vec<(usize, crate::Kind, Clip)> = self.clipboard.iter().map(|&(t, k, c)| (t - t0 + base, k, Clip { at: c.at - a0 + self.playhead, ..c })).collect();
+        let tl = self.timeline.paste(&items)?;
+        self.commit(tl);
+        self.set.clear();
+        for &(t, _, c) in &items {
+            if let Some(i) = self.timeline.clip_at(t, c.at) {
+                self.set.push((t, i));
+            }
+        }
+        let first = items.first().and_then(|&(t, _, c)| self.timeline.clip_at(t, c.at).map(|i| (t, i)));
+        self.set.sort_unstable();
+        self.selection = first;
+        self.settle();
+        let end = items.iter().map(|e| e.2.end()).max().unwrap_or(self.playhead);
+        self.seek(end);
+        Ok(())
+    }
+    /// The `copy` / `cut` / `paste` words of [`EditorState::verb`]; `None` for any other word.
+    fn clipboard_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match v {
+            "copy" => self.copy_selected(),
+            "cut" => self.cut_selected(),
+            "paste" => self.paste(),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod striacopypaste_tests {
+    use super::*;
+    use crate::{Kind, SourceId};
+
+    /// `verb_tests`' cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25) on V1 and on A1.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        }
+        EditorState::new(tl)
+    }
+
+    #[test]
+    fn striacopypaste_copy_paste_at_the_playhead_one_undo() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("copy"), Some(Ok(())));
+        assert_eq!((st.timeline == tl0, st.undo_depth()), (true, 0), "copy is no edit");
+        assert_eq!(st.clipboard, alloc::vec![(0, Kind::Video, Clip::new(SourceId(1), 0, 10, 10))]);
+        st.seek(35);
+        assert_eq!(st.verb("paste"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips[3], Clip::new(SourceId(1), 0, 10, 35));
+        assert_eq!(st.timeline.tracks[1], tl0.tracks[1], "only the selected track");
+        assert_eq!((st.selection, st.set.clone(), st.playhead), (Some((0, 3)), alloc::vec![(0, 3)], 45));
+        assert_eq!(st.verb("paste"), Some(Ok(())), "a repeat appends");
+        assert_eq!(st.timeline.tracks[0].clips[4], Clip::new(SourceId(1), 0, 10, 45));
+        assert_eq!(st.undo_depth(), 2);
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0, "one undo per paste");
+        assert_eq!(st.clipboard.len(), 1, "the clipboard is not undone");
+    }
+
+    #[test]
+    fn striacopypaste_cut_lifts_and_paste_puts_it_back() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        assert_eq!(st.verb("cut"), Some(Ok(())));
+        assert_eq!(st.timeline, tl0.lift(0, 1).unwrap(), "the hole stays");
+        assert_eq!((st.selection, st.undo_depth()), (None, 1));
+        st.seek(10);
+        assert_eq!(st.verb("paste"), Some(Ok(())), "no selection: the track it was copied from");
+        assert_eq!(st.timeline, tl0);
+        assert_eq!(st.undo_depth(), 2);
+    }
+
+    #[test]
+    fn striacopypaste_set_keeps_its_layout_across_tracks() {
+        let mut st = state();
+        st.select_many(&[(0, 0), (1, 1)], false);
+        assert_eq!(st.verb("copy"), Some(Ok(())));
+        st.seek(35);
+        st.select(0, 2).unwrap();
+        assert_eq!(st.verb("paste"), Some(Ok(())));
+        assert_eq!(st.timeline.tracks[0].clips[3], Clip::new(SourceId(0), 13, 23, 35));
+        assert_eq!(st.timeline.tracks[1].clips[3], Clip::new(SourceId(1), 0, 10, 45));
+        assert_eq!((st.set.clone(), st.playhead), (alloc::vec![(0, 3), (1, 3)], 55));
+    }
+
+    #[test]
+    fn striacopypaste_refusals_by_name_leave_the_state() {
+        let mut st = state();
+        assert_eq!(st.verb("copy"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("cut"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.verb("paste"), Some(Err(EditError::NoClip)), "empty clipboard");
+        st.select(0, 1).unwrap();
+        st.verb("copy").unwrap().unwrap();
+        let tl0 = st.timeline.clone();
+        st.seek(12);
+        assert_eq!(st.verb("paste"), Some(Err(EditError::Overlap)), "a paste never overwrites");
+        st.seek(35);
+        st.select(1, 0).unwrap();
+        assert_eq!(st.verb("paste"), Some(Err(EditError::Kind)));
+        assert_eq!((st.timeline == tl0, st.undo_depth()), (true, 0));
+        assert_eq!(st.verb("copyx"), None);
     }
 }

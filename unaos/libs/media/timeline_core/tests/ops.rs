@@ -505,3 +505,33 @@ fn striaaudiocrossfade_paint_shows_the_bracket() {
     assert_eq!(paint_in(&st, l, Order::Rgba, None, None), before);
     println!("striaaudiocrossfade: bracket {x0}..{x1} x {y0}..{y1}, {moved} px moved");
 }
+
+// ---- STRIACOPYPASTE (LEDGER SR854): paste through place, refused by name, never overwriting (named tail block) ----
+#[test]
+fn striacopypaste_paste_lays_through_place_and_round_trips() {
+    let (tl, a, b) = base(); // V1: A[0,10)@0 B[20,30)@10
+    let items = [(0, Kind::Video, Clip::new(b, 20, 30, 30)), (1, Kind::Audio, Clip::new(a, 0, 10, 5).gained(-600))];
+    let p = tl.paste(&items).unwrap();
+    assert_eq!(p, tl.place(0, items[0].2, Mode::Overwrite).unwrap().place(1, items[1].2, Mode::Overwrite).unwrap());
+    assert_eq!(p.tracks[0].clips, vec![Clip::new(a, 0, 10, 0), Clip::new(b, 20, 30, 10), Clip::new(b, 20, 30, 30)]);
+    assert_eq!(p.tracks[1].clips, vec![Clip::new(a, 0, 10, 5).gained(-600)], "gain rides the clip");
+    let text = timeline_core::edl::write(&p, "PASTE").unwrap();
+    let back = timeline_core::edl::parse(&text, 25).unwrap();
+    let video = |t: &Timeline| t.tracks.iter().find(|k| k.kind == Kind::Video).map(|k| k.clips.clone());
+    assert_eq!((video(&back), timeline_core::edl::write(&back, "PASTE").unwrap()), (video(&p), text));
+}
+
+#[test]
+fn striacopypaste_paste_refusals_by_name() {
+    let (tl, a, b) = base();
+    let before = tl.clone();
+    assert_eq!(tl.paste(&[]), Err(EditError::NoClip));
+    assert_eq!(tl.paste(&[(2, Kind::Video, Clip::new(a, 0, 10, 40))]), Err(EditError::NoTrack));
+    assert_eq!(tl.paste(&[(1, Kind::Video, Clip::new(a, 0, 10, 40))]), Err(EditError::Kind));
+    // meeting a clip by one tick is an overlap; butting is not; the whole paste is refused together
+    assert_eq!(tl.paste(&[(0, Kind::Video, Clip::new(a, 0, 10, 19))]), Err(EditError::Overlap));
+    assert!(tl.paste(&[(0, Kind::Video, Clip::new(a, 0, 10, 20))]).is_ok());
+    assert_eq!(tl.paste(&[(0, Kind::Video, Clip::new(a, 0, 10, 40)), (0, Kind::Video, Clip::new(b, 0, 10, 45))]), Err(EditError::Overlap));
+    assert_eq!(tl.paste(&[(0, Kind::Video, Clip::new(b, 50, 70, 40))]), Err(EditError::OutOfSource), "place's own validate");
+    assert_eq!(tl, before);
+}

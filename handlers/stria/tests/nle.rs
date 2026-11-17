@@ -4949,3 +4949,53 @@ fn striatimecodedisplay_readout_follows_the_playhead() {
     assert_ne!(striatimecodedisplay_halves(&a, m).0, striatimecodedisplay_halves(&b, m).0);
     println!("striatimecodedisplay: playhead 0 -> 30: {ta:?} -> {tb:?}");
 }
+
+// ---- STRIACOPYPASTE (LEDGER SR854): copy / cut / paste through the face's words (named tail block) ----
+
+/// The three words are VERBS before `help`; through `Face::verb` (its fall-through onto timeline_core's ONE dispatch)
+/// copy + paste lays the selected clip at the playhead on its track as ONE undo step, and cut lifts it (the hole stays)
+/// with a paste back into the hole restoring the timeline.
+#[test]
+fn striacopypaste_face_copy_cut_paste() {
+    assert_eq!(VERBS[VERBS.len() - 4..], ["copy", "cut", "paste", "help"]);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("copy"));
+    assert!(!face.dirty(), "copy is no edit");
+    face.state.seek(35);
+    assert!(face.verb("paste"));
+    assert_eq!(face.state.timeline.tracks[0].clips[3], Clip::new(SourceId(1), 0, 10, 35));
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.last_error.clone()), (1, true, None));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("cut"));
+    assert_eq!(face.state.timeline, tl.lift(0, 1).unwrap());
+    face.state.seek(10);
+    assert!(face.verb("paste"));
+    assert_eq!(face.state.timeline, tl, "pasted back into its hole");
+    println!("striacopypaste: copy / paste at 35, cut / paste back at 10; undo depth {}", face.state.undo_depth());
+}
+
+/// Each refusal lands on the message line by the editor's name (`{v}: {e}`); the timeline does not move.
+#[test]
+fn striacopypaste_face_refusals_name_the_error() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("paste"));
+    assert_eq!(face.last_error.take(), Some(format!("paste: {}", EditError::NoClip)));
+    assert!(face.verb("copy"));
+    assert_eq!(face.last_error.take(), Some(format!("copy: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("copy"));
+    face.state.seek(12);
+    assert!(face.verb("paste"));
+    assert_eq!(face.last_error.take(), Some(format!("paste: {}", EditError::Overlap)));
+    face.state.seek(35);
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("paste"));
+    assert_eq!(face.last_error.take(), Some(format!("paste: {}", EditError::Kind)));
+    assert_eq!(face.state.timeline, tl);
+    println!("striacopypaste: paste over a clip -> paste: {}", EditError::Overlap);
+}
