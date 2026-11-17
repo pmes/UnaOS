@@ -1386,7 +1386,7 @@ mod snd {
         /// Top only: this span's second source was opened (`span`) or refused (`cut`: the span is a cut).
         span: bool,
         cut: bool,
-        done: bool,
+        done: bool, pan_w: [i64; 2], // STRIAKPAN (LEDGER SR9015): the playing layer's per-channel pan factor (Q16, timeline_core's pan_mix_q16)
     }
 
     /// A reel's sound: its demuxer share when audio_core plays its audio track, and the track's format.
@@ -1422,7 +1422,7 @@ mod snd {
     }
 
     fn slot(track: usize, under: bool, id: u32, rate: u32, ch: u8, ri: usize) -> Slot {
-        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false }
+        Slot { track, under, id, rate, ch, aud: None, ri, off: 0, set: false, play: false, pend: Vec::new(), span: false, cut: false, done: false, pan_w: [65536; 2] }
     }
 
     /// The EDL's sound (see the section head); a refusal leaves the pictures playing silent.
@@ -1655,7 +1655,7 @@ mod snd {
             }
             let mut play = false;
             if let Some(li) = li {
-                let l = run.layers[li];
+                let l = run.layers[li]; self.slots[i].pan_w = timeline_core::schedule::pan_mix_q16(l.pan_cq8, self.slots[i].ch as usize); // STRIAKPAN (SR9015): the clip's pan, applied in make (file tail)
                 let env = if self.slots[i].cut { [ENV_ONE, ENV_ONE] } else { l.env };
                 let (e0, e1) = (audio_core::ramp::layer_q8(l.gain_cdb, env[0]) as i64, audio_core::ramp::layer_q8(l.gain_cdb, env[1]) as i64);
                 let from = audio_core::ramp::at(e0, e1, s0 as i64, cnt as i64) as u16;
@@ -1764,7 +1764,7 @@ mod snd {
             let got = a.dec.next_i32(&mut buf).unwrap_or(0);
             a.pos += got as u64;
         }
-        sl.pend.reserve(buf.len() * 2);
+        super::snd_pan(&mut buf, sl.pan_w, ch); sl.pend.reserve(buf.len() * 2); // STRIAKPAN (SR9015): the clip's pan per channel (file tail)
         for v in &buf {
             sl.pend.extend_from_slice(&((*v >> 16) as i16).to_le_bytes());
         }
@@ -2664,4 +2664,23 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAKPAN (LEDGER SR9015): the clip's pan on the Player's sound road (named tail block) ----
+// NLE-PAN-KERNEL: `snd::setup` takes the playing layer's factor from timeline_core's ONE rule (`schedule::pan_mix_q16`,
+// Stria's `mix_into` calls the same) and `snd::make` scales each channel's decoded samples by it before the PCM16 cut.
+// Centre and mono are unity and leave the bytes untouched. The mixer's gain ramp comes after the cut, so a hard-panned
+// sample above -3.01 dBFS clips there even under a negative clip gain (the host clamps once, after the gain:
+// NLE-PAN-KERNEL-HEADROOM owed).
+
+/// Slot samples (`ch` interleaved, i32 full scale) x the per-channel pan factor `w` (Q16), clamped.
+#[cfg(any(feature = "uvc", feature = "hda-tone"))]
+fn snd_pan(buf: &mut [i32], w: [i64; 2], ch: usize) {
+    if w == [65536; 2] {
+        return;
+    }
+    let ch = ch.max(1);
+    for (j, v) in buf.iter_mut().enumerate() {
+        *v = ((*v as i64 * w[(j % ch).min(1)]) >> 16).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    }
 }

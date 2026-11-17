@@ -187,7 +187,7 @@ pub struct Layer {
     pub seek: Option<i64>,
     /// The clip's gain, centi-dB.
     pub gain_cdb: i32,
-    pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan (Stria's mix_into applies [`pan_q16`]; the kernel Player plays it centred, NLE-PAN-KERNEL)
+    pub pan_cq8: i8, // STRIAPAN (LEDGER SR861): the clip's pan (Stria's mix_into and the kernel Player's snd apply [`pan_mix_q16`], STRIAKPAN SR9015)
     /// The fade envelope (Q16, [`ENV_ONE`] = full) at the run's first tick and at its end edge; linear between.
     pub env: [u32; 2],
 }
@@ -514,4 +514,19 @@ fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]
 pub fn pan_q16(pan_cq8: i8) -> [u32; 2] {
     let p = ((pan_cq8.max(-127) as i64 + 127) * ENV_ONE as i64 / 254) as u32;
     [qsin(ENV_ONE - p), qsin(p)]
+}
+
+// ---- STRIAKPAN (LEDGER SR9015): the per-channel pan factor both faces apply (named tail block) ----
+
+/// STRIAKPAN: THE per-channel factor (Q16, 65536 = unity) a layer's samples are multiplied by, lifted from Stria's
+/// `nle::pan_mix` so the kernel Player's sound road applies the same rule: on two channels [`pan_q16`] divided by its
+/// centre (the "-3 dB compensated" form: centre exactly unity, so a centred clip mixes byte-identically; hard to one side
+/// +3.01 dB on that channel and silence on the other, still constant power). One channel (no sides) or more than two
+/// (NLE-PAN-SURROUND): unity, pan does nothing.
+pub fn pan_mix_q16(pan_cq8: i8, ch: usize) -> [i64; 2] {
+    if ch != 2 {
+        return [65536; 2];
+    }
+    let (w, c) = (pan_q16(pan_cq8), pan_q16(0)[0] as i64);
+    [w[0] as i64 * 65536 / c, w[1] as i64 * 65536 / c]
 }

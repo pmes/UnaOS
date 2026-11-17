@@ -991,17 +991,11 @@ impl Sources {
 
 // ---- STRIAPAN (LEDGER SR861): the clip's pan in the mix (named tail block) ----
 
-/// STRIAPAN: the per-channel factor (Q16, 65536 = unity) `mix_into` multiplies a layer's gain by: on a stereo project
-/// timeline_core's ONE law ([`timeline_core::schedule::pan_q16`]) divided by its centre (the "-3 dB compensated" form:
-/// centre exactly unity, so a centred clip mixes byte-identically; hard to one side +3.01 dB on that channel and silence on
-/// the other, still constant power; a full-scale clip panned hard can exceed full scale there, and `out_f32`'s clamp catches
-/// it). A mono project (one bus, no sides) or more than two channels (NLE-PAN-SURROUND): unity, pan does nothing.
+/// STRIAPAN: the per-channel factor (Q16, 65536 = unity) `mix_into` multiplies a layer's gain by: timeline_core's ONE rule
+/// [`timeline_core::schedule::pan_mix_q16`] (STRIAKPAN SR9015 lifted it there; the kernel Player calls it too). A
+/// full-scale clip panned hard can exceed full scale on its side, and `out_f32`'s clamp catches it.
 fn pan_mix(pan_cq8: i8, ch: usize) -> [i64; 2] {
-    if ch != 2 {
-        return [65536; 2];
-    }
-    let (w, c) = (timeline_core::schedule::pan_q16(pan_cq8), timeline_core::schedule::pan_q16(0)[0] as i64);
-    [w[0] as i64 * 65536 / c, w[1] as i64 * 65536 / c]
+    timeline_core::schedule::pan_mix_q16(pan_cq8, ch)
 }
 
 #[cfg(test)]
