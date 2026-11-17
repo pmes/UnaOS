@@ -67,12 +67,12 @@ pub struct Opts {
     /// A constant bit rate in kbit/s (h264enc_core's `Config.rate`, CBR; `qp` its starting QP); 0 = constant QP. `crf` (SR383): constant quality 0..=51 (`RateControl::crf`), exclusive with `bitrate`.
     pub bitrate: u32, pub crf: Option<u8>,
     /// NLE6EXPORTAAC (rmbp-ledger B960): the sound as AAC-LC at this many kb/s; 0 = PCM16 `sowt` (the default).
-    pub aac_kbps: u32,
+    pub aac_kbps: u32, pub scenecut: Option<u8>, pub aq: Option<u8>, pub scale: u8, // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): a preset's scene cuts / AQ (h264enc_core's `Config` fields) and frame divisor (1 = the EDL's size) (file tail)
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0, crf: None, aac_kbps: 0 }
+        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0, crf: None, aac_kbps: 0, scenecut: None, aq: None, scale: 1 } // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): no preset, every knob as before
     }
 }
 
@@ -143,7 +143,7 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     if let Ok(Some(why)) = crate::shell::vfs_mount_table().write_veto(out) {
         return Err(alloc::format!("{}: read-only ({})", out, why));
     }
-    let cfg = h264enc_core::Config { qp: opts.qp, gop: opts.gop, bframes: opts.bframes, ..Default::default() };
+    let cfg = h264enc_core::Config { qp: opts.qp, gop: opts.gop, bframes: opts.bframes, scenecut: opts.scenecut, aq: opts.aq, ..Default::default() }; // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): Stria's `with_scenecut` / `with_aq` fields
     let t0 = crate::arch::ms();
     let jid = {
         // armed under the lock across the start, so the job's first `sink` sees its own jid
@@ -194,7 +194,7 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, fit: timeli
             e.rgba.cfg.rate = Some(h264enc_core::RateControl::cbr(e.opts.bitrate, (tb.den as u32, tb.num.max(1) as u32)));
         } else if let Some(c) = e.opts.crf { e.rgba.cfg.rate = Some(h264enc_core::RateControl::crf(c, (tb.den as u32, tb.num.max(1) as u32))); } // SR383: `--crf N`, Stria's `with_quality`
     }
-    let sized = e.sized(w, h, fit); // AV1INBANDSIZE (SR379): the first frame fixes the size; EXPORTSIZESCALE (rmbp-ledger B985): a later frame of another size is letterboxed into it, refused by name past the scaler (file tail)
+    let sized = e.sized(w, h, fit); let fit = e.preset_fit(w, h, fit); // AV1INBANDSIZE (SR379): the first frame fixes the size; EXPORTSIZESCALE (rmbp-ledger B985): a later frame of another size is letterboxed into it, refused by name past the scaler (file tail)
     let r = match sized.and_then(|to| e.push_sized(w, h, to, fit, planes, rgba)) {
         Ok(u) => e.stream_units(u).and_then(|()| e.stream_sound()).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
@@ -313,14 +313,14 @@ pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     crate::shell::vfs_mount_table().put_file(path, body, crate::fs::vfs::KERNEL_PRINCIPAL).map(|n| n as u64).map_err(|e| alloc::format!("write {}: {:?}", path, e))
 }
 
-/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS]`: arm and start; the job prints the progress and the end.
+/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS] [--preset NAME]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS] [--preset NAME]"; // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): THE preset table's names
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
     }
-    let mut o = Opts::default();
+    let mut o = Opts::default(); let mut preset_crf = false; // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): whether the crf is a preset's (a later --bitrate drops it)
     let mut i = 3;
     while i < args.len() {
         let v = args.get(i + 1).and_then(|s| s.parse::<u32>().ok());
@@ -328,8 +328,8 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             ("--qp", Some(n)) => o.qp = n.min(255) as u8,
             ("--gop", Some(n)) => o.gop = n,
             ("--bframes", Some(n)) => o.bframes = n.min(255) as u8,
-            ("--bitrate", Some(n)) => o.bitrate = n, ("--crf", Some(n)) => o.crf = Some(n.min(255) as u8),
-            ("--aac", Some(n)) => o.aac_kbps = n,
+            ("--bitrate", Some(n)) => { o.bitrate = n; if preset_crf { o.crf = None } } ("--crf", Some(n)) => { o.crf = Some(n.min(255) as u8); preset_crf = false } // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): SR948's rule: a --bitrate after a crf preset drops only its crf, an operator's own --crf stays exclusive
+            ("--aac", Some(n)) => o.aac_kbps = n, ("--preset", _) => match apply_preset(&mut o, args.get(i + 1).copied(), &mut preset_crf) { Ok(w) => { serial_println!("[nle] export preset {}", w); } Err(e) => { console.println(&alloc::format!("nle export: refused ({})", e)); return; } }, // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): THE table's row assigns the knobs; the last flag written wins (file tail)
             _ => {
                 console.println(USAGE);
                 return;
@@ -747,7 +747,7 @@ impl Exp {
     /// NLESIZEPOLICY (SR394): by the reel's `fit` — Fill / Stretch say ` fit=<name>` on the line, Adopt is refused by name
     /// (an mp4 track holds one size).
     fn sized(&mut self, w: usize, h: usize, fit: timeline_core::SizePolicy) -> Result<Option<(usize, usize)>, String> {
-        let now = (w as u32, h as u32);
+        let now = (w as u32, h as u32); if let Some(to) = self.preset_scaled(now) { return Ok(Some(to)); } // STRIAEXPORTPRESETSTHREE (LEDGER SR9021): a preset's divided frame (file tail)
         if self.frames == 0 {
             self.size = now;
             SWITCHED.store(0, Ordering::Relaxed);
@@ -789,5 +789,62 @@ impl Exp {
             ));
         };
         self.push(fw, fh, None, move || scaled).map_err(|err| alloc::format!("{}", err))
+    }
+}
+
+// ---- STRIAEXPORTPRESETSTHREE (LEDGER SR9021): `nle export --preset NAME` reads THE preset table (named tail block) ----
+// timeline_core's `export_presets::PRESETS` is the one table (the host's `stria::nle_export` re-exports it): `--preset`
+// assigns the existing knobs from its row, refusing by name what the kernel cannot write (a video word other than h264, an
+// audio word with no AAC rate: `archive`). A preset's `scale` divides the first frame's size ([`Exp::preset_scaled`]) and
+// each frame of the EDL's size reaches the file through `push_sized`'s `fit_rgba` with `SizePolicy::Stretch` (the editor's
+// ONE painter); scale 1 takes neither branch, so every export without a preset is byte-identical.
+// Wire: `[nle] export preset <name>: <video> + <audio> [crf=N] [aq=N] [scenecut=N] [scale=1/N]` before `[nle] export start`.
+
+/// `--preset <word>` into `o`: the row's words (the serial line) or the refusal.
+fn apply_preset(o: &mut Opts, word: Option<&str>, preset_crf: &mut bool) -> Result<String, String> {
+    use timeline_core::export_presets::{preset_named, preset_words};
+    let Some(w) = word else { return Err(alloc::format!("--preset needs one of {}", preset_words())) };
+    let Some(p) = preset_named(w) else { return Err(alloc::format!("unknown preset {} ({})", w, preset_words())) };
+    if p.video != "h264" {
+        return Err(alloc::format!("preset {}: {} is not a kernel export (h264 into .mp4 / .mkv)", p.name, p.video));
+    }
+    let Some(kbps) = p.aac_kbps() else {
+        return Err(alloc::format!("preset {}: audio {} is not a kernel export (aac)", p.name, p.audio));
+    };
+    o.qp = p.qp;
+    o.crf = p.crf;
+    o.bitrate = 0;
+    o.scenecut = p.scenecut;
+    o.aq = p.aq;
+    o.aac_kbps = kbps;
+    o.scale = p.scale.max(1);
+    *preset_crf = p.crf.is_some();
+    Ok(p.words())
+}
+
+impl Exp {
+    /// A preset's divided frame: with `scale` > 1 the first frame fixes the file's size at `scaled_size`, and every frame
+    /// whose divided size is the file's goes to `push_sized` at that size. None (scale 1, or a frame of another size, which
+    /// then takes the existing letterbox switch into the divided size) leaves [`Exp::sized`] as it was.
+    fn preset_scaled(&mut self, now: (u32, u32)) -> Option<(usize, usize)> {
+        if self.opts.scale <= 1 {
+            return None;
+        }
+        let to = timeline_core::export_presets::scaled_size(now.0, now.1, self.opts.scale as u32);
+        if self.frames == 0 {
+            self.size = to;
+            SWITCHED.store(0, Ordering::Relaxed);
+        }
+        (to == self.size).then_some((to.0 as usize, to.1 as usize))
+    }
+
+    /// The fit a frame is scaled with: `Stretch` for a preset's divided frame (the host's `Scaled` samples the same way),
+    /// else the reel's own policy.
+    fn preset_fit(&self, w: usize, h: usize, fit: timeline_core::SizePolicy) -> timeline_core::SizePolicy {
+        if self.opts.scale > 1 && timeline_core::export_presets::scaled_size(w as u32, h as u32, self.opts.scale as u32) == self.size {
+            timeline_core::SizePolicy::Stretch
+        } else {
+            fit
+        }
     }
 }

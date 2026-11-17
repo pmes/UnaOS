@@ -237,3 +237,18 @@ fn nle3eslip_slide_moves_the_clip_and_its_neighbours() {
     assert_eq!(tl.slide(4, 0, 1), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ---- STRIAEXPORTPRESETSTHREE (LEDGER SR9021): THE export preset table lives in the shared core (named tail block) ----
+#[test]
+fn striaexportpresetsthree_table_lives_in_the_core() {
+    use timeline_core::export_presets::{AAC_KBPS, PRESETS, preset_named, preset_words, scaled_size};
+    assert_eq!(preset_words(), "web|archive|proxy");
+    assert_eq!(PRESETS.iter().map(|p| p.words()).collect::<Vec<_>>(), ["web: h264 + aac crf=23 aq=10 scenecut=40", "archive: png + wav", "proxy: h264 + aac:64 crf=32 scale=1/2"]);
+    assert_eq!(preset_named("gif"), None);
+    assert_eq!(AAC_KBPS, 128);
+    let kbps = |n: &str| preset_named(n).unwrap().aac_kbps();
+    assert_eq!((kbps("web"), kbps("proxy"), kbps("archive")), (Some(128), Some(64), None));
+    assert_eq!(scaled_size(1280, 720, 2), (640, 360));
+    assert_eq!(scaled_size(5, 5, 2), (2, 2));
+    assert_eq!(scaled_size(1280, 720, 1), (1280, 720));
+}

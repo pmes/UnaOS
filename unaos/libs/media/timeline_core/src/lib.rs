@@ -1528,3 +1528,78 @@ impl Timeline {
         Ok(tl)
     }
 }
+
+// ---- STRIAEXPORTPRESETSTHREE (LEDGER SR9021): THE export preset table, shared by both rings (named tail block) ----
+/// THE export preset table (SR871's rows, SR989's scale), moved here unchanged so the host export (`stria::nle_export`
+/// re-exports every name) and the kernel's `nle export --preset` (`video/export.rs`) read the same rows.
+pub mod export_presets {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// One export preset: a video word (the host's `VIDEO_NAMES`), an audio word (the host's `audio_named`), the H.264
+    /// knobs it sets and the frame's divisor.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ExportPreset {
+        /// The word after `--preset`.
+        pub name: &'static str,
+        /// A video word (`h264`, `png`, ...).
+        pub video: &'static str,
+        /// An audio word (`aac`, `aac:K`, `wav`, ...).
+        pub audio: &'static str,
+        /// The rate controller's starting QP under a CRF.
+        pub qp: u8,
+        /// Constant quality 0..=51.
+        pub crf: Option<u8>,
+        /// Scene-cut IDR threshold in percent.
+        pub scenecut: Option<u8>,
+        /// Adaptive quantisation strength in tenths.
+        pub aq: Option<u8>,
+        /// The frame's width / height divisor (1 = the timeline's size), applied through [`scaled_size`].
+        pub scale: u8,
+    }
+
+    /// The AAC-LC rate of the bare `aac` word, kb/s (the host's `DEFAULT_AAC_KBPS`).
+    pub const AAC_KBPS: u32 = 128;
+
+    /// THE preset table: `web` (H.264 at CRF 23 with AQ and scene cuts, AAC-LC 128), `archive` (the lossless PNG sequence and
+    /// PCM16 WAV), `proxy` (H.264 at CRF 32, AAC-LC 64, half size).
+    pub const PRESETS: [ExportPreset; 3] = [
+        ExportPreset { name: "web", video: "h264", audio: "aac", qp: 26, crf: Some(23), scenecut: Some(40), aq: Some(10), scale: 1 },
+        ExportPreset { name: "archive", video: "png", audio: "wav", qp: 26, crf: None, scenecut: None, aq: None, scale: 1 },
+        ExportPreset { name: "proxy", video: "h264", audio: "aac:64", qp: 26, crf: Some(32), scenecut: None, aq: None, scale: 2 },
+    ];
+
+    /// The preset named `word`; None for any other word.
+    pub fn preset_named(word: &str) -> Option<&'static ExportPreset> {
+        PRESETS.iter().find(|p| p.name == word)
+    }
+
+    /// The preset names as the usages and refusals spell them: `web|archive|proxy`.
+    pub fn preset_words() -> String {
+        PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join("|")
+    }
+
+    /// The coded size of a `w x h` frame divided by `div`: each side divided, rounded down to even (4:2:0), at least 2.
+    pub fn scaled_size(w: u32, h: u32, div: u32) -> (u32, u32) {
+        let d = div.max(1);
+        (((w / d) & !1).max(2), ((h / d) & !1).max(2))
+    }
+
+    impl ExportPreset {
+        /// The preset's one listing line: `<name>: <video> + <audio>` then ` crf=N` / ` aq=N` / ` scenecut=N` for each set knob,
+        /// and ` scale=1/N` when the frame is divided.
+        pub fn words(&self) -> String {
+            let knobs: String = [("crf", self.crf), ("aq", self.aq), ("scenecut", self.scenecut)].iter().filter_map(|(k, v)| v.map(|v| alloc::format!(" {k}={v}"))).collect();
+            alloc::format!("{}: {} + {}{knobs}{}", self.name, self.video, self.audio, if self.scale > 1 { alloc::format!(" scale=1/{}", self.scale) } else { String::new() })
+        }
+        /// The AAC-LC rate the audio word names: `aac` = [`AAC_KBPS`], `aac:K` = K (K > 0); None for any other word (the kernel's
+        /// export, which has no other audio word a preset can name, refuses it).
+        pub fn aac_kbps(&self) -> Option<u32> {
+            match self.audio.split_once(':') {
+                None => (self.audio == "aac").then_some(AAC_KBPS),
+                Some(("aac", k)) => k.parse::<u32>().ok().filter(|&k| k > 0),
+                Some(_) => None,
+            }
+        }
+    }
+}
