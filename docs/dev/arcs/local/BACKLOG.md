@@ -54,7 +54,7 @@ never add a second parameter), the undo road (whole-timeline snapshot: name it o
 30. STRIARECENTFILES — `~/.config/stria/recent` (5 entries), `open-recent <n>`; stria-view lists them.
 31. STRIAPROJECTBIN — a source bin pane listing the Sources (reel, duration, type) with drag-to-timeline (SR339's split surfaces as the precedent).
 32. STRIAKEYBOARDMAP — `~/.config/stria/keys` remapping the KEYS table (SR744; the owed NLE5D-KEYS-CONFIG in the row: build it).
-33. STRIATIMECODEDISPLAY — a timecode readout at the playhead (SR747's message row, left half); `tc` toggles frames / timecode / seconds.
+33. [SR872 started] STRIATIMECODEDISPLAY — a timecode readout at the playhead (SR747's message row, left half); `tc` toggles frames / timecode / seconds.
 34. STRIAJKLTRANSPORT — J / K / L shuttle (reverse / stop / forward at 1x, 2x, 4x on repeats) through the Player's `set_rate` (media.rs :552 EXISTS).
 35. STRIAHELPSEARCH — `help <word>` filters the help rows (SR744 HELP table) by substring.
 
