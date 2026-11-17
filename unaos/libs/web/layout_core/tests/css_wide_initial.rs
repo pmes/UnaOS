@@ -306,8 +306,8 @@ fn css_wide_bgnone_later_url_wins() {
     assert_eq!(again.paint.bg_image, None, "a merged none overlaid again still clears");
 }
 
-/// `background-image: none` clears the image only: the colour stays; `background: red` after an image keeps the image
-/// (pinned: AETHER-CSS-BACKGROUND-SHORTHAND-RESET owed).
+/// `background-image: none` clears the image only: the colour stays; `background: red` after an image drops the image
+/// (SR1061: the shorthand resets the omitted image; the pin flipped).
 #[test]
 fn css_wide_bgnone_image_only_and_pins() {
     let s = cascade(&[&[("background", "red url(a.png)")], &[("background-image", "none")]]);
@@ -315,7 +315,7 @@ fn css_wide_bgnone_image_only_and_pins() {
     assert_eq!(s.paint.background, Some((255, 0, 0)), "the colour stays");
     assert_eq!(s.paint.bg_alpha, Some(1.0), "still opaque");
     let s = cascade(&[&[("background-image", "url(a.png)")], &[("background", "red")]]);
-    assert_eq!(s.paint.bg_image.as_deref(), Some("a.png"), "background: red keeps the image (pinned, owed)");
+    assert_eq!(s.paint.bg_image.as_deref(), None, "background: red resets the image (SR1061, was pinned kept)");
 }
 
 // ---- AETHERCSSALIGNCONTENTFIELD (LEDGER SR1016): align-content its own field; column-gap an explicit normal (named tail block) ----
@@ -1291,5 +1291,62 @@ fn background_multi_layer_later_rule_replaces_list() {
     let s = cascade(&[ab, &[("background-image", "none")]]);
     assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "none clears every layer");
     let s = cascade(&[ab, &[("background", "red")]]);
-    assert_eq!(bg_more_urls(&s), Some(vec!["b.png".to_string()]), "background: red keeps the list (pinned, SHORTHAND-RESET owed)");
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "background: red resets the list (SR1061, was pinned kept)");
+}
+
+// ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): css-backgrounds-3 §3.10: `background: red` after an image in one block
+/// paints plain red (no image, no list); `background: red` alone is unchanged.
+#[test]
+fn background_shorthand_reset_same_block() {
+    let s = styled(&[("background-image", "url(a.png)"), ("background", "red")]);
+    assert_eq!((s.paint.bg_image.as_deref(), bg_more_urls(&s)), (None, Some(vec![])), "the image goes");
+    assert_eq!((s.paint.background, s.paint.bg_alpha), (Some((255, 0, 0)), Some(1.0)), "the colour is red, opaque");
+    let alone = styled(&[("background", "red")]);
+    assert_eq!((alone.paint.background, alone.paint.bg_alpha, alone.paint.bg_image.as_deref()), (Some((255, 0, 0)), Some(1.0), None), "red alone");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): `background: blue` after `url(a) repeat-x 10px 20px / cover` resets the
+/// image, repeat, position and size to their initials (each as its longhand stores it).
+#[test]
+fn background_shorthand_reset_repeat_position_size() {
+    let first: &[(&str, &str)] = &[("background", "url(a.png) repeat-x 10px 20px / cover")];
+    let before = cascade(&[first]);
+    assert_eq!((before.paint.bg_image.as_deref(), before.paint.bg_repeat), (Some("a.png"), Some(2)), "the earlier image and repeat-x (armed)");
+    let s = cascade(&[first, &[("background", "blue")]]);
+    assert_eq!(s.paint.bg_image, None, "no image");
+    assert_eq!(s.paint.bg_repeat, styled(&[("background-repeat", "repeat")]).paint.bg_repeat, "repeat is initial");
+    assert_eq!(s.paint.bg_position.as_deref(), Some("0% 0%"), "position is initial");
+    assert_eq!(s.paint.bg_size.as_deref(), Some("auto"), "size is initial");
+    assert_eq!(s.paint.background, Some((0, 0, 255)), "the colour is the later blue");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): across rules the merge drops the earlier image (the explicit initial
+/// wins), and `background: url(b)` after `background-color: red` makes the colour transparent.
+#[test]
+fn background_shorthand_reset_across_rules() {
+    let s = cascade(&[&[("background-image", "url(a.png)")], &[("background", "red")]]);
+    assert_eq!(s.paint.bg_image, None, "the earlier rule's image is dropped");
+    assert!(matches!(s.paint.bg_gradient, Some(None)), "the gradient field is cleared too");
+    assert_eq!(cascade(&[&[("background-color", "red")]]).paint.bg_alpha, Some(1.0), "the earlier red is opaque (armed)");
+    let s = cascade(&[&[("background-color", "red")], &[("background", "url(b.png)")]]);
+    assert_eq!(s.paint.bg_image.as_deref(), Some("b.png"), "the later image");
+    assert_eq!(s.paint.bg_alpha, Some(0.0), "background-color is reset to transparent");
+}
+
+/// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): `background: inherit` keeps its road (dropped: the earlier rule stands);
+/// `background: currentcolor` after an image keeps the marker opaque and drops the image; the gradient arm resets too.
+#[test]
+fn background_shorthand_reset_keywords_and_gradient_arm() {
+    use layout_core::paint::CC_BG;
+    let first: &[(&str, &str)] = &[("background", "url(a.png) red")];
+    let s = cascade(&[first, &[("background", "inherit")]]);
+    assert_eq!((s.paint.bg_image.as_deref(), s.paint.background, s.paint.bg_alpha), (Some("a.png"), Some((255, 0, 0)), Some(1.0)), "inherit: unchanged road");
+    let s = styled(&[("background-image", "url(a.png)"), ("background", "currentcolor")]);
+    assert_eq!((s.paint.currentcolor & CC_BG, s.paint.bg_alpha, s.paint.bg_image.as_deref()), (CC_BG, Some(1.0), None), "currentcolor after the reset");
+    let s = styled(&[("background-color", "currentcolor"), ("background", "url(a.png)")]);
+    assert_eq!((s.paint.currentcolor & CC_BG, s.paint.bg_alpha), (0, Some(0.0)), "an omitted colour clears the marker");
+    let s = cascade(&[&[("background-repeat", "no-repeat"), ("background-color", "red")], &[("background", "linear-gradient(red, blue)")]]);
+    assert_eq!((s.paint.bg_repeat, s.paint.bg_alpha), (Some(0), Some(0.0)), "the gradient arm resets repeat and colour");
 }

@@ -4175,8 +4175,8 @@ mod tests {
                 (el.attributes.borrow().get("id") == Some("h")).then(|| t.paint_map.get(id))?
             })
             .expect("the box has a paint entry");
-        assert_eq!(p.bg_position, None, "no position from the colour's inner slash");
-        assert_eq!(p.bg_size, None, "no size from the colour's inner slash");
+        assert_eq!(p.bg_position.as_deref(), Some("0% 0%"), "no position from the colour's inner slash (SR1061: the reset's initial)");
+        assert_eq!(p.bg_size.as_deref(), Some("auto"), "no size from the colour's inner slash (SR1061: the reset's initial)");
         let (w, h) = (100u32, 100u32);
         let mut surface = vec![0u8; (w * h * 4) as usize];
         crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
@@ -8813,5 +8813,35 @@ b</div>
         assert_eq!(css_wide_color_ink(&mut e, "rp", css_wide_red), 0, "the earlier rule's url is replaced");
         assert!(css_wide_color_ink(&mut e, "sh", css_wide_red) > 100, "shorthand: the url layer");
         assert!(css_wide_color_ink(&mut e, "sh", css_wide_blue) > 100, "shorthand: the gradient layer");
+    }
+
+    // ---- AETHERCSSBACKGROUNDSHORTHANDRESET (LEDGER SR1061): the background shorthand resets every omitted longhand (named tail block) ----
+
+    /// AETHERCSSBACKGROUNDSHORTHANDRESET (SR1061): SR1052's 2x2 red checker PNG; `.k` the image alone, `.r` the image then
+    /// `background: rgb(0, 128, 0)` in one block, `.x.y` the image rule then a later shorthand rule. css-backgrounds-3
+    /// §3.10: the shorthand resets the image, so `.r` and `.x.y` paint only green (Chromium: plain green).
+    #[test]
+    fn background_shorthand_reset_paints_colour_only() {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .k { background-image: url(PNG) }
+            .r { background-image: url(PNG); background: rgb(0, 128, 0) }
+            .x { background-image: url(PNG) }
+            .x.y { background: rgb(0, 128, 0) }
+            </style></head><body style="margin:0">
+            <div id="k" class="k"></div>
+            <div id="r" class="r"></div>
+            <div id="xy" class="x y"></div>
+        </body></html>"#
+            .replace("PNG", "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEUlEQVR4nGP4z8AARFAA4gAAI+4D/QU7+oQAAAAASUVORK5CYII=");
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 600));
+        e.load_html("https://example.com/", &html, true);
+        e.render_frame();
+        assert!(css_wide_color_ink(&mut e, "k", css_wide_red) > 100, "the image alone paints its checker (armed)");
+        assert!(css_wide_color_ink(&mut e, "r", css_wide_green) > 100, "one block: the shorthand's green");
+        assert_eq!(css_wide_color_ink(&mut e, "r", css_wide_red), 0, "one block: no checker pixel");
+        assert!(css_wide_color_ink(&mut e, "xy", css_wide_green) > 100, "a later rule: the shorthand's green");
+        assert_eq!(css_wide_color_ink(&mut e, "xy", css_wide_red), 0, "a later rule: the earlier image is reset");
     }
 }
