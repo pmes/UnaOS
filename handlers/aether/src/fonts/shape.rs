@@ -102,12 +102,12 @@ pub struct Advancer {
     pub size: f32,
     pub letter_spacing: f32,
     pub word_spacing: f32,
-    pub dir: Direction,
+    pub dir: Direction, pub small_caps: bool,
 }
 
 impl Advancer {
     pub fn new(sel: FontSel, size: f32, letter_spacing: f32) -> Self {
-        Advancer { sel, size, letter_spacing, word_spacing: 0.0, dir: Direction::Ltr }
+        Advancer { sel, size, letter_spacing, word_spacing: 0.0, dir: Direction::Ltr, small_caps: false }
     }
     pub fn with_word_spacing(mut self, ws: f32) -> Self {
         self.word_spacing = ws;
@@ -134,7 +134,7 @@ impl Advancer {
         if s.is_empty() {
             return 0.0;
         }
-        let mut w = self.shape(s).width * self.size;
+        if self.small_caps && self.dir != Direction::Rtl { return self.small_caps_pieces(s).iter().map(|(t, a)| a.str(t)).sum(); } let mut w = self.shape(s).width * self.size;
         if self.letter_spacing != 0.0 {
             w += self.letter_spacing * font_core::grapheme::clusters(s).len() as f32;
         }
@@ -213,5 +213,33 @@ mod tests {
         let pa = clusters.iter().position(|&c| c == alef).unwrap();
         let pb = clusters.iter().position(|&c| c == bet).unwrap();
         assert!(pb < pa, "bet before alef visually: {clusters:?}");
+    }
+}
+
+// ---- AETHERFONTVARIANTSMALLCAPS (LEDGER SR800): synthesized small capitals, the run split by case (named tail block) ----
+
+impl Advancer {
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): synthesize small capitals (`layout_core::paint::small_caps_synth`): [`Advancer::str`]
+    /// and the painters (`render::draw_shaped` / `draw_text_shadows`) take the run as [`Advancer::small_caps_pieces`].
+    pub fn with_small_caps(mut self, on: bool) -> Self {
+        self.small_caps = on;
+        self
+    }
+
+    /// AETHERFONTVARIANTSMALLCAPS (SR800): `s` as the pieces it is shaped in, left to right: each of
+    /// `layout_core::inline::small_caps_segments`, a small one uppercased with this advancer at
+    /// `size x SMALL_CAPS_SCALE`, the rest as is at the full size; every piece keeps the selection (the same face stack)
+    /// and the spacing in px, with `small_caps` off. LTR only (owed AETHER-FONT-VARIANT-CAPS-BIDI): an RTL advancer
+    /// is one piece, itself unsplit.
+    pub fn small_caps_pieces(&self, s: &str) -> Vec<(String, Advancer)> {
+        let plain = Advancer { small_caps: false, ..*self };
+        if self.dir == Direction::Rtl {
+            return vec![(s.to_string(), plain)];
+        }
+        let small = Advancer { size: self.size * layout_core::inline::SMALL_CAPS_SCALE, ..plain };
+        layout_core::inline::small_caps_segments(s)
+            .into_iter()
+            .map(|(r, lower)| if lower { (s[r].to_uppercase(), small) } else { (s[r].to_string(), plain) })
+            .collect()
     }
 }
