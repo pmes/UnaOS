@@ -1765,7 +1765,7 @@ struct PlayAudio {
     pushed: u64,
     run_base: u64,
     run_pushed: u64,
-    rate: u32, stretch: Option<ShuttleStretch>, rev_next: Option<i64>, // STRIAJKLTRANSPORT (SR873): the shuttle's ONE stretch (file tail); STRIAJKLMORE (SR945): two stages past 4x, and where the last reverse render began (file tail)
+    rate: u32, stretch: Option<ShuttleStretch>, rev_next: Option<i64>, sync: PlaySync, // STRIAJKLNEXT (SR987): the A/V offset against consumed (file tail); STRIAJKLTRANSPORT (SR873): the shuttle's ONE stretch (file tail); STRIAJKLMORE (SR945): two stages past 4x, and where the last reverse render began (file tail)
 }
 
 impl PlayAudio {
@@ -1842,7 +1842,7 @@ impl Face {
         if want == self.play.live {
             return;
         }
-        self.play.live = want;
+        self.play.live = want; self.sync_run(want); // STRIAJKLNEXT (SR987): a heard run starts / ends its A/V measurement (file tail)
         let rate = self.play.rate;
         let Some(o) = self.play.out.as_mut() else { return };
         if want {
@@ -1887,7 +1887,7 @@ impl Face {
                 o.flush();
             }
         }
-        let out = if self.play.live { self.play.out.as_mut() } else { None }; // STRIAJKLTRANSPORT (SR873): live is 1x / 2x / 4x forward
+        self.sync_mark(ph); let out = if self.play.live { self.play.out.as_mut() } else { None }; // STRIAJKLNEXT (SR987): the shown tick against the AudioClock, before its push (file tail); STRIAJKLTRANSPORT (SR873): live is 1x / 2x / 4x forward
         let mut sink = PlaySink { meters: &mut self.meters, out, still: None, pushed: 0, stretch: self.play.stretch.as_mut(), rev: None }; // STRIAJKLTRANSPORT (SR873); STRIAJKLMORE (SR945): forward pushes as it renders
         let r = render(&self.state.timeline, ph..end, &self.sources, &mut sink);
         let (still, pushed) = (sink.still, sink.pushed);
@@ -3579,5 +3579,160 @@ mod striajklmore_tests {
         f.last_error = None;
         key(&mut f, "k");
         assert_eq!(f.message_text(), None);
+    }
+}
+
+// ---- STRIAJKLNEXT (LEDGER SR987): NLEPLAY-SYNC, the face's A/V offset against consumed (named tail block) ----
+// A played tick shows its still as it pushes its sound, so the picture leads by the ring's fill. The face keeps ONE gneiss_pal
+// `avsync::AudioClock` per heard 1x run (the clock media.rs's `MasterClock::Audio` wraps), fed by the device's `consumed` delta,
+// and ONE `DriftMeter` that records each shown tick's pts against it (pts - clock > 0: the picture leads). Measurement only.
+// Seeded at a run's first tick and at every discontinuity (`play.next != Some(ph)`, play_tick's flush test); nothing is
+// recorded on a seed tick; not measured at rate != 1, muted or paused (the clock drops, 1x reseeds). Latency 0 and no wall
+// interpolation (seat ruling): the clock reads exactly what the device consumed. Wire: `[STRIA] :: nle play sync av_max_ms=
+// av_mean_ms= ticks=` once per heard run that recorded a tick; `Face::play_sync`. Owed: NLEPLAY-SYNC-PACE (the picture
+// shown at the clock's tick), NLEPLAY-SYNC-SHUTTLE (measured at 2x..8x / reverse through `set_rate_ppm`).
+
+/// STRIAJKLNEXT (SR987): the heard run's clock (None until seeded), the consumed count it was last fed at, the run's offsets.
+struct PlaySync {
+    clock: Option<gneiss_pal::dsp::avsync::AudioClock>,
+    seen: u64,
+    meter: gneiss_pal::dsp::avsync::DriftMeter,
+}
+
+impl Default for PlaySync {
+    fn default() -> Self {
+        PlaySync { clock: None, seen: 0, meter: gneiss_pal::dsp::avsync::DriftMeter::default() }
+    }
+}
+
+impl Face {
+    /// STRIAJKLNEXT (SR987): a heard run starts (`live`: a fresh clock and meter) or ends (the offsets logged once, the clock
+    /// dropped; the meter stays readable until the next run).
+    fn sync_run(&mut self, live: bool) {
+        if live {
+            self.play.sync = PlaySync::default();
+            return;
+        }
+        self.play.sync.clock = None;
+        let r = self.play.sync.meter.report();
+        if r.av_count > 0 {
+            log::info!("[STRIA] :: nle play sync av_max_ms={} av_mean_ms={:.1} ticks={}", r.av_max_ns / 1_000_000, r.av_mean_ns / 1e6, r.av_count);
+        }
+    }
+    /// STRIAJKLNEXT (SR987): the played forward tick shown at `ph`, before its push: seed the clock at `ph` (the first tick, a
+    /// discontinuity), else feed it the consumed delta and record `ph`'s pts against it. Not at rate != 1, muted or paused.
+    fn sync_mark(&mut self, ph: i64) {
+        let consumed = match self.play.out.as_ref() {
+            Some(o) if self.play.live && self.rate == 1 => o.consumed(),
+            _ => {
+                self.play.sync.clock = None;
+                return;
+            }
+        };
+        let pts = self.state.timeline.tb.to_ns(ph);
+        let jump = self.play.next != Some(ph);
+        let s = &mut self.play.sync;
+        if !jump && s.clock.is_some() {
+            if let Some(c) = s.clock.as_mut() {
+                c.on_played(consumed.saturating_sub(s.seen));
+                s.meter.av_offset(pts, c.media_ns());
+            }
+            s.seen = consumed;
+        } else {
+            let src: std::sync::Arc<dyn gneiss_pal::dsp::avsync::TimeSource> = std::sync::Arc::new(gneiss_pal::dsp::avsync::SystemTime::new());
+            let mut c = gneiss_pal::dsp::avsync::AudioClock::new(src, self.play.rate, 0, 0);
+            c.seek(pts);
+            c.play();
+            s.clock = Some(c);
+            s.seen = consumed;
+        }
+    }
+    /// STRIAJKLNEXT (SR987): the A/V offsets of the current (or last) heard 1x run: each shown tick's pts minus the AudioClock
+    /// fed by the device's `consumed` (max / mean / count).
+    pub fn play_sync(&self) -> gneiss_pal::dsp::avsync::DriftReport {
+        self.play.sync.meter.report()
+    }
+}
+
+#[cfg(test)]
+mod striajklnext_tests {
+    use super::*;
+    use crate::media::AudioOut;
+    use crate::nle::SYNTH_RATE;
+    use std::sync::{Arc, Mutex};
+
+    /// The tests' device: takes every sample; `consumed` lags what was pushed by `lag` frames.
+    struct Out {
+        pushed: Arc<Mutex<u64>>,
+        lag: u64,
+    }
+    impl AudioOut for Out {
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            *self.pushed.lock().unwrap() += (stereo.len() / 2) as u64;
+            stereo.len()
+        }
+        fn consumed(&self) -> u64 {
+            self.pushed.lock().unwrap().saturating_sub(self.lag)
+        }
+    }
+
+    fn face(lag: u64) -> Face {
+        let (tl, src) = synth_fixture();
+        let out = Out { pushed: Arc::new(Mutex::new(0)), lag };
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).with_audio(Box::new(out), SYNTH_RATE)
+    }
+
+    /// STRIAJKLNEXT M3: a device that has played all it was given: three 1x ticks, the first seeds, two offsets, both 0.
+    #[test]
+    fn striajklnext_sync_heard_device() {
+        let mut f = face(0);
+        f.verb("play");
+        for _ in 0..3 {
+            assert!(f.tick());
+        }
+        let r = f.play_sync();
+        assert_eq!((r.av_count, r.av_max_ns), (2, 0), "{r:?}");
+    }
+
+    /// STRIAJKLNEXT M3: a device 960 frames behind (20 ms at 48 kHz): every recorded offset is the picture leading by 20 ms,
+    /// within one frame.
+    #[test]
+    fn striajklnext_sync_reads_ring_lag() {
+        let mut f = face(960);
+        f.verb("play");
+        for _ in 0..3 {
+            assert!(f.tick());
+        }
+        let r = f.play_sync();
+        assert_eq!(r.av_count, 2, "{r:?}");
+        assert!((r.av_max_ns - 20_000_000).abs() <= 21_000, "{r:?}");
+        assert!((r.av_mean_ns - 20_000_000.0).abs() <= 21_000.0, "{r:?}");
+    }
+
+    /// STRIAJKLNEXT M3: a 2x shuttle is not measured: one 1x tick seeds, the 2x ticks drop the clock, nothing is recorded.
+    #[test]
+    fn striajklnext_sync_not_shuttle() {
+        let mut f = face(0);
+        assert!(f.on(&SMessage::BrowserText("l".into())));
+        assert!(f.tick());
+        assert!(f.on(&SMessage::BrowserText("l".into())));
+        assert_eq!(f.rate, 2);
+        for _ in 0..3 {
+            assert!(f.tick());
+        }
+        assert_eq!(f.play_sync().av_count, 0);
+        assert!(f.play.sync.clock.is_none());
+    }
+
+    /// STRIAJKLNEXT M3: no device, nothing measured.
+    #[test]
+    fn striajklnext_sync_muted() {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        f.verb("play");
+        for _ in 0..3 {
+            assert!(f.tick());
+        }
+        assert_eq!(f.play_sync().av_count, 0);
     }
 }
