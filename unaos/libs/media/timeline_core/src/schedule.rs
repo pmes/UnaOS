@@ -43,6 +43,7 @@
 //! (the renderers interpolate linearly between edges); those runs continue their sources (no seek, the same decoder). A
 //! transition TO black fades the outgoing's handle out in the track's gap ([`crate::Timeline::fade_to_silence`]): the
 //! clip's layer continues past its end under the falling weight, on its own slot.
+//! STRIAOPACITY (LEDGER SR868): a winning clip below [`crate::OPAQUE`] carries a Dissolve [`VideoMix`] of the highest video track under it (its clip at its own tick, or black) at `t = opacity / 100`, the outgoing-run slot holding the track below; an opaque winner's step is unchanged, and a stack of more than two layers is refused by name ([`ScheduleError::Opacity`]).
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -99,6 +100,8 @@ pub enum ScheduleError {
     OutOfSource(SourceId),
     /// The source has no stream of the kind its track needs.
     NoKeyframe(SourceId),
+    /// STRIAOPACITY (SR868): a non-opaque clip of this source over a transition or a second non-opaque layer (two layers only).
+    Opacity(SourceId),
 }
 
 impl core::fmt::Display for ScheduleError {
@@ -108,6 +111,7 @@ impl core::fmt::Display for ScheduleError {
             ScheduleError::Invalid(e) => write!(f, "invalid timeline: {e}"),
             ScheduleError::OutOfSource(s) => write!(f, "clip past the end of source {}", s.0),
             ScheduleError::NoKeyframe(s) => write!(f, "source {} has no stream to seek", s.0),
+            ScheduleError::Opacity(s) => write!(f, "source {} is not opaque over a transition or a second non-opaque layer (two layers only)", s.0),
         }
     }
 }
@@ -138,7 +142,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                 (None, Some((ti, ci))) => {
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_at(t); // STRIACLIPSPEED (SR829): the clip's rate (1x: src_in + (t - at))
-                    let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?;
+                    let m0 = m_next; let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?; let vmix = opacity_mix(tl, idx, ti, ci, t, vmix, (v_next, m0), &mut m_next)?; // STRIAOPACITY (SR868): a non-opaque winner mixes the track below (file tail)
                     let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, v_next)?;
                     v_next = Some((c.src, c.src_at(t + 1))); // STRIACLIPSPEED (SR829): a rated clip continues its run (1x: src_t + 1)
                     Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
@@ -501,4 +505,60 @@ fn tail_env(tl: &Timeline, ti: usize, ci: usize, t: i64, end: i64, env: [u32; 2]
         }
         None => env,
     }
+}
+
+// ---- STRIAOPACITY (LEDGER SR868): a non-opaque winner mixes the video track below (named tail block) ----
+
+/// STRIAOPACITY: the video step's mix at tick `t` for the winner, clip `ci` of track `ti`, given `vmix` (its transition's,
+/// from [`vmix_for`]). An opaque clip returns `vmix` untouched, before any run state moves (an opaque timeline schedules
+/// as it did). A non-opaque one is a Dissolve [`VideoMix`] at `opacity / 100` whose outgoing is the highest video track
+/// below with a clip at `t` (its own source tick; black when none): that run continues the mix run when it is the same
+/// source (`prev.1`, the mix run's continuation BEFORE [`vmix_for`] reset it), else the live run (`prev.0`, so the first overlay tick hands the lower track's live run to the mix
+/// slot through [`crate::vmix::take_outgoing`]). Refused by name ([`ScheduleError::Opacity`]): a transition on the
+/// non-opaque clip's own cut, a lower clip that is not opaque or lies in its own transition, and a transition TO black
+/// between the two.
+#[allow(clippy::too_many_arguments)]
+fn opacity_mix(
+    tl: &Timeline,
+    idx: &dyn SourceIndex,
+    ti: usize,
+    ci: usize,
+    t: i64,
+    vmix: Option<VideoMix>,
+    prev: (Option<(SourceId, i64)>, Option<(SourceId, i64)>),
+    m_next: &mut Option<(SourceId, i64)>,
+) -> Result<Option<VideoMix>, ScheduleError> {
+    let c = tl.tracks[ti].clips[ci];
+    if c.opacity == crate::OPAQUE {
+        return Ok(vmix);
+    }
+    if vmix.is_some() {
+        return Err(ScheduleError::Opacity(c.src));
+    }
+    let lower = below(tl, ti, t);
+    if black_over(tl, t, lower.map(|l| l.0)).is_some_and(|(i, _)| i < ti) {
+        return Err(ScheduleError::Opacity(c.src));
+    }
+    let w = Frac { num: c.opacity as i64, den: 100 };
+    let Some((li, lci)) = lower else {
+        *m_next = None;
+        return Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: None, src_t: 0, seek: None, t: w }));
+    };
+    let lc = tl.tracks[li].clips[lci];
+    if lc.opacity != crate::OPAQUE || tl.tracks[li].transitions.iter().any(|x| x.at == lc.at && t < lc.at + x.dur) {
+        return Err(ScheduleError::Opacity(c.src));
+    }
+    let src_t = lc.src_in + (t - lc.at);
+    let prev = match prev.1 {
+        Some(m) if m.0 == lc.src => Some(m),
+        _ => prev.0,
+    };
+    let seek = seek_for(tl, idx, Kind::Video, lc.src, src_t, prev)?;
+    *m_next = Some((lc.src, src_t + 1));
+    Ok(Some(VideoMix { kind: TransitionKind::Dissolve, src: Some(lc.src), src_t, seek, t: w }))
+}
+
+/// STRIAOPACITY: the highest video track below track `ti` with a clip at tick `t`: (track index, clip index).
+fn below(tl: &Timeline, ti: usize, t: i64) -> Option<(usize, usize)> {
+    tl.tracks[..ti].iter().enumerate().rev().filter(|(_, tr)| tr.kind == Kind::Video).find_map(|(i, _)| tl.clip_at(i, t).map(|c| (i, c)))
 }

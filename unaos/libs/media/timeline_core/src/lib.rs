@@ -104,6 +104,8 @@ pub struct Clip {
     /// STRIACLIPSPEED (SR829): the clip's speed, Q16.16 (`0x1_0000` = 1x, the MP4 `elst` media_rate encoding); [`Clip::len`] / [`Clip::src_at`].
     pub rate_q16: u32,
     pub crop: Crop, // STRIACROP (SR867): the per-clip crop, 1/1000 of the frame per side (Crop::NONE = none; file tail)
+    /// STRIAOPACITY (SR868): the video clip's opacity, percent 0..=[`OPAQUE`] (opaque, the default); below it the track underneath shows through.
+    pub opacity: u8,
 }
 
 /// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
@@ -112,7 +114,7 @@ pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0, rate_q16: 0x1_0000, crop: Crop::NONE, opacity: OPAQUE }
     }
     /// The same clip at gain `cdb` (centi-dB).
     pub fn gained(self, cdb: i32) -> Clip {
@@ -394,6 +396,8 @@ pub enum EditError {
     Tracks,
     /// STRIACROP (SR867): a crop side past the frame, `l + r` or `t + b` not under 1000, or a malformed `crop` word.
     Crop,
+    /// STRIAOPACITY (SR868): an opacity above [`OPAQUE`] percent, or a non-opaque clip on an audio track.
+    Opacity,
 }
 
 impl core::fmt::Display for EditError {
@@ -417,6 +421,7 @@ impl core::fmt::Display for EditError {
             EditError::Marker => "one marker per tick (one is already there, or none is there to remove)",
             EditError::Tracks => "nine tracks of a kind at most (V1..V9, A1..A9)",
             EditError::Crop => "crop is l t r b in 1/1000 with l + r and t + b under 1000",
+            EditError::Opacity => "opacity is a percent 0..=100, and video only",
         })
     }
 }
@@ -477,7 +482,7 @@ impl Timeline {
             let mut prev: Option<&Clip> = None;
             for c in &t.clips {
                 let s = self.source(c.src).ok_or(EditError::NoSource)?;
-                if c.at < 0 || c.src_in < 0 {
+                opacity_ok(t.kind, c)?; if c.at < 0 || c.src_in < 0 {
                     return Err(EditError::Negative);
                 }
                 if c.rate_q16 == 0 { return Err(EditError::Rate); } if c.src_in >= c.src_out { // STRIACLIPSPEED (SR829): rate 0 refused by name
@@ -2240,5 +2245,41 @@ impl Timeline {
             tr.clips.iter().find(|c| c.covers(t))
         };
         c.map_or(Crop::NONE, |c| c.crop)
+    }
+}
+
+// ---- STRIAOPACITY (LEDGER SR868): per-clip opacity, the model and its one op (named tail block) ----
+// A video clip's `opacity` (percent) below [`OPAQUE`] lets the highest video track under it show through: the schedule
+// gives that step a Dissolve `VideoMix` of the track below at `opacity / 100` (`schedule::opacity_mix`), the one mix both
+// renderers already run. `* UNA ALPHA <pct>` in the EDL; the editor's `opacity <pct>` word.
+
+/// STRIAOPACITY: full opacity (percent), every clip's default.
+pub const OPAQUE: u8 = 100;
+
+/// STRIAOPACITY: `validate`'s rule: an opacity is at most [`OPAQUE`], and only a video clip is ever below it.
+fn opacity_ok(kind: Kind, c: &Clip) -> Result<(), EditError> {
+    if c.opacity > OPAQUE || (c.opacity != OPAQUE && kind == Kind::Audio) {
+        return Err(EditError::Opacity);
+    }
+    Ok(())
+}
+
+impl Clip {
+    /// STRIAOPACITY: the same clip at opacity `pct` (percent).
+    pub fn with_opacity(self, pct: u8) -> Clip {
+        Clip { opacity: pct, ..self }
+    }
+}
+
+impl Timeline {
+    /// STRIAOPACITY: every clip in `picks` (`(track, index)`) set to opacity `pct` (percent) as ONE edit; refused by name
+    /// (`EditError::Opacity`) above [`OPAQUE`] or on an audio clip.
+    pub fn set_opacity(&self, picks: &[(usize, usize)], pct: u8) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        for &(track, idx) in picks {
+            clip_mut(&mut tl, track, idx)?.opacity = pct;
+        }
+        tl.validate()?;
+        Ok(tl)
     }
 }
