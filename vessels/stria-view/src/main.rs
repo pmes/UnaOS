@@ -557,6 +557,7 @@ fn transport() -> TetraNode {
         button("crop", "Uncrop"), // STRIACROPFACE (SR900): clears the selection's crop (THE `crop` word)
         button("proxy", "Proxy"), // STRIAPROXYMEDIA (SR882): a half-size H.264 of the selected clip's source, beside it; the preview reads it, an export never
         button("pip", "PiP"), // STRIAPOSITIONSCALE (SR879): the selected clip to the bottom-right quarter (THE `pip` verb)
+        button("marker-", "Marker <"), button("marker+", "Marker >"), button("cut-", "Cut <"), button("cut+", "Cut >"), // STRIAMARKERJUMP (SR894): the playhead to the previous / next marker / clip edge (view words)
         button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
