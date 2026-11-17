@@ -47,7 +47,7 @@ pub fn open(mut s: ByteStream) -> Result<Box<dyn Source>> {
 /// VPLAYAUDIO (rmbp B475): the sound [`open_demuxed`] plays for this container and codec.
 pub fn plays(format: DFormat, codec: &DCodec) -> bool {
     match format {
-        DFormat::Mp4 => matches!(codec, DCodec::Aac | DCodec::Mp3 | DCodec::Pcm { .. }),
+        DFormat::Mp4 | DFormat::Wav => matches!(codec, DCodec::Aac | DCodec::Mp3 | DCodec::Pcm { .. }),
         DFormat::Matroska | DFormat::WebM => matches!(codec, DCodec::Opus | DCodec::Vorbis | DCodec::Pcm { .. }),
     }
 }
@@ -60,7 +60,7 @@ pub fn open_demuxed(d: Demuxer) -> Result<Box<dyn Source>> {
         return Ok(Box::new(PcmSource::new(d, i)?)); // NLE6MIXAUDIO (B953): the PCM door (file tail)
     }
     match d.format() {
-        DFormat::Mp4 => open_mp4(d),
+        DFormat::Mp4 | DFormat::Wav => open_mp4(d),
         DFormat::Matroska | DFormat::WebM => open_mkv(d),
     }
 }
@@ -346,7 +346,7 @@ fn pcm_ok(bits: u16, float: bool) -> bool {
 /// Opus or Vorbis one in Matroska/WebM keeps the door it had).
 fn pcm_track(d: &Demuxer) -> Option<usize> {
     let coded = |c: &DCodec| match d.format() {
-        DFormat::Mp4 => matches!(c, DCodec::Aac | DCodec::Mp3),
+        DFormat::Mp4 | DFormat::Wav => matches!(c, DCodec::Aac | DCodec::Mp3),
         DFormat::Matroska | DFormat::WebM => matches!(c, DCodec::Opus | DCodec::Vorbis),
     };
     let ts = d.tracks();

@@ -3648,3 +3648,164 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIAIMPORTWAV (LEDGER SR889): a .wav reel (named tail block) ----
+
+/// STRIAIMPORTWAV (SR889): interleaved sample `i` of the test WAVs (every value names its index).
+fn striaimportwav_sample(i: usize) -> i16 {
+    (((i * 7) % 60_000) as i32 - 30_000) as i16
+}
+
+/// STRIAIMPORTWAV (SR889): a PCM16 WAV of `frames` frames x `ch` at `rate` (the export's own header writer).
+fn striaimportwav_pcm16(rate: u32, ch: u16, frames: usize) -> Vec<u8> {
+    let mut w = stria::nle_export::wav_header(rate, ch, frames as u64).to_vec();
+    for i in 0..frames * ch as usize {
+        w.extend_from_slice(&striaimportwav_sample(i).to_le_bytes());
+    }
+    w
+}
+
+/// STRIAIMPORTWAV (SR889): a float32 (tag 3) WAV of `samples`, mono at `rate`.
+fn striaimportwav_float32(rate: u32, samples: &[f32]) -> Vec<u8> {
+    let data = samples.len() as u32 * 4;
+    let mut w = Vec::new();
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&rate.to_le_bytes());
+    w.extend_from_slice(&(rate * 4).to_le_bytes());
+    w.extend_from_slice(&4u16.to_le_bytes());
+    w.extend_from_slice(&32u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data.to_le_bytes());
+    for s in samples {
+        w.extend_from_slice(&s.to_le_bytes());
+    }
+    w
+}
+
+/// STRIAIMPORTWAV (SR889): every PCM run, any channel count.
+#[derive(Default)]
+struct StriaImportWavSink {
+    rate: u32,
+    ch: u16,
+    pcm: Vec<f32>,
+}
+impl RenderSink for StriaImportWavSink {
+    fn frame(&mut self, _: i64, _: u32, _: u32, _: &[u8]) {}
+    fn pcm(&mut self, _out_t: i64, rate: u32, ch: u16, s: &[f32]) {
+        (self.rate, self.ch) = (rate, ch);
+        self.pcm.extend_from_slice(s);
+    }
+}
+
+/// STRIAIMPORTWAV (SR889): one audio track holding `clip` of a 50-tick reel `bytes` at 25 fps, rendered over `ticks`.
+fn striaimportwav_render(bytes: Vec<u8>, clip: (i64, i64), ticks: i64) -> (Sources, StriaImportWavSink) {
+    let mut tl = Timeline::new(25);
+    let w = tl.add_source("W", 50);
+    let t = tl.add_track(Kind::Audio);
+    tl.tracks[t].clips = vec![Clip::new(w, clip.0, clip.1, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(w, bytes).expect("a PCM16 / float32 WAV is a reel");
+    let mut sink = StriaImportWavSink::default();
+    render(&tl, 0..ticks, &src, &mut sink).expect("the WAV reel renders");
+    (src, sink)
+}
+
+#[test]
+fn striaimportwav_pcm16_reel_renders_sample_exact() {
+    // 2 s of stereo at 48 kHz = 50 ticks at 25 fps (1920 frames a tick); the clip starts 10 ticks in (a seek mid-file).
+    let (src, s) = striaimportwav_render(striaimportwav_pcm16(48_000, 2, 96_000), (10, 30), 20);
+    assert_eq!(timeline_core::SourceIndex::duration(&src, SourceId(0)), Some(50));
+    assert_eq!((s.rate, s.ch), (48_000, 2));
+    assert_eq!(s.pcm.len(), 20 * 1920 * 2);
+    let skip = 10 * 1920 * 2;
+    for (j, got) in s.pcm.iter().enumerate() {
+        assert_eq!(*got, q(striaimportwav_sample(skip + j) as i32), "sample {j}: one layer at 0 dB is bit for bit");
+    }
+    println!("striaimportwav: pcm16 stereo reel {} samples exact from tick 10", s.pcm.len());
+}
+
+#[test]
+fn striaimportwav_float32_reel_renders() {
+    let vals: Vec<f32> = (0..96_000).map(|i| q(striaimportwav_sample(i) as i32)).collect();
+    let (_, s) = striaimportwav_render(striaimportwav_float32(48_000, &vals), (0, 50), 50);
+    assert_eq!((s.rate, s.ch), (48_000, 1));
+    assert_eq!(s.pcm.len(), vals.len());
+    for (j, got) in s.pcm.iter().enumerate() {
+        assert_eq!(*got, vals[j], "sample {j}: k/32768 floats mix to the same integers");
+    }
+}
+
+#[test]
+fn striaimportwav_refusals_by_name() {
+    let refusal = |bytes: Vec<u8>| {
+        let tl = Timeline::new(25);
+        let mut src = Sources::new(&tl);
+        src.add(SourceId(0), bytes).expect_err("refused").to_string()
+    };
+    let good = striaimportwav_pcm16(48_000, 1, 4800);
+    // 8-bit: bits 8, block align 1.
+    let mut eight = good.clone();
+    eight[32..34].copy_from_slice(&1u16.to_le_bytes());
+    eight[34..36].copy_from_slice(&8u16.to_le_bytes());
+    let e = refusal(eight);
+    assert!(e.contains("wav: sample layout (16-bit integer or 32-bit float)"), "{e}");
+    // A compressed tag (2 = MS ADPCM).
+    let mut adpcm = good.clone();
+    adpcm[20..22].copy_from_slice(&2u16.to_le_bytes());
+    let e = refusal(adpcm);
+    assert!(e.contains("wav: compressed format tag"), "{e}");
+    // A data chunk that says more than the file holds.
+    let mut short = stria::nle_export::wav_header(48_000, 1, 4800).to_vec();
+    short.extend_from_slice(&good[44..44 + 2 * 2400]);
+    let e = refusal(short);
+    assert!(e.contains("wav: data chunk runs past the end of the file"), "{e}");
+    // No fmt chunk: RIFF/WAVE straight into data.
+    let mut nofmt = Vec::new();
+    nofmt.extend_from_slice(b"RIFF");
+    nofmt.extend_from_slice(&(4 + 8 + 4u32).to_le_bytes());
+    nofmt.extend_from_slice(b"WAVEdata");
+    nofmt.extend_from_slice(&4u32.to_le_bytes());
+    nofmt.extend_from_slice(&[0, 0, 0, 0]);
+    let e = refusal(nofmt);
+    assert!(e.contains("wav: no fmt chunk"), "{e}");
+    // The Player's road is kept: probe and Demuxer::open stay WAV-blind; only open_wav opens it.
+    assert_eq!(gneiss_pal::dsp::demux::probe(&good), None);
+    assert!(gneiss_pal::dsp::demux::Demuxer::open(good.clone()).is_err());
+    let d = gneiss_pal::dsp::demux::Demuxer::open_wav(good).expect("open_wav");
+    assert_eq!(d.format(), gneiss_pal::dsp::demux::Format::Wav);
+    assert_eq!(d.tracks()[0].codec, gneiss_pal::dsp::demux::Codec::Pcm { bits: 16, float: false, big_endian: false });
+}
+
+#[test]
+fn striaimportwav_channel_mismatch_is_refused() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let w = tl.add_source("W", 50);
+    let (t1, t2) = (tl.add_track(Kind::Audio), tl.add_track(Kind::Audio));
+    tl.tracks[t1].clips = vec![Clip::new(a, 0, 10, 0)];
+    tl.tracks[t2].clips = vec![Clip::new(w, 0, 10, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    src.add(w, striaimportwav_pcm16(SYNTH_RATE, 2, 2 * SYNTH_RATE as usize)).unwrap();
+    let mut sink = StriaImportWavSink::default();
+    assert!(matches!(render(&tl, 0..10, &src, &mut sink), Err(stria::nle::RenderError::Format { .. })));
+}
+
+#[test]
+fn striaimportwav_a_wav_is_its_own_timeline() {
+    let wav = striaimportwav_pcm16(48_000, 2, 96_000);
+    let (tl, src) = Sources::from_media("W", &wav, 25).unwrap().expect("a WAV is media");
+    assert_eq!(tl.tracks.len(), 1);
+    assert_eq!(tl.tracks[0].kind, Kind::Audio);
+    assert_eq!(tl.tracks[0].clips.len(), 1);
+    assert_eq!((tl.tracks[0].clips[0].src_in, tl.tracks[0].clips[0].src_out, tl.tracks[0].clips[0].at), (0, 50, 0));
+    let mut sink = StriaImportWavSink::default();
+    render(&tl, 0..50, &src, &mut sink).unwrap();
+    assert_eq!(sink.pcm.len(), 96_000 * 2);
+    assert!(sink.pcm.iter().enumerate().all(|(j, g)| *g == q(striaimportwav_sample(j) as i32)));
+}

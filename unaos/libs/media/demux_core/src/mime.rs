@@ -116,6 +116,7 @@ pub fn ebml_mime(b: &[u8]) -> Option<&'static str> {
 pub fn mime_of(b: &[u8]) -> Option<&'static str> {
     match crate::probe(b)? {
         crate::Format::Matroska | crate::Format::WebM => ebml_mime(b),
+        crate::Format::Wav => None, // STRIAIMPORTWAV (SR889): unreachable (probe never answers Wav); audio_core's mime_of names a WAV
         crate::Format::Mp4 => {
             let (mut ftyp, mut moov) = (None, None);
             let mut p = 0usize;

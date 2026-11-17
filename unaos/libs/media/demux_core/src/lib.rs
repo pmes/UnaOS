@@ -22,6 +22,7 @@
 //!   ContentCompression), `Cluster` (known or unknown size) → `Timestamp`, `SimpleBlock`,
 //!   `BlockGroup` (`Block`, `BlockDuration`, `ReferenceBlock`); Xiph, fixed and EBML lacing. See
 //!   [`mkv`].
+//! * **RIFF/WAVE** (STRIAIMPORTWAV, SR889): PCM16 / float32 as one PCM track, ONLY through [`Demuxer::open_wav`]. See [`wav`].
 //!
 //! # One API
 //!
@@ -68,6 +69,7 @@ pub mod survey;
 /// AETHERMEDIA2 (SR134): WebVTT for `<track>`.
 pub mod vtt;
 pub mod colour;
+pub mod wav; // STRIAIMPORTWAV (SR889): RIFF/WAVE as a one-track PCM table (Demuxer::open_wav only)
 
 /// Why a file could not be demuxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,8 @@ pub enum Format {
     Mp4,
     Matroska,
     WebM,
+    /// STRIAIMPORTWAV (SR889): RIFF/WAVE, reached only through [`Demuxer::open_wav`]; [`probe`] never answers it.
+    Wav,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,20 +304,21 @@ pub fn probe(data: &[u8]) -> Option<Format> {
 
 impl Demuxer {
     pub fn open(data: Vec<u8>) -> Result<Demuxer, Error> {
-        Demuxer::open_with(data, false)
+        Demuxer::open_with(data, false, false)
     }
 
     /// MP4ONE (rmbp B464): a file cut short (a partial copy, an interrupted download) opens up to its cut —
     /// an MP4 top-level box that runs past the end is clamped to it and the samples past the end are dropped,
     /// where [`Demuxer::open`] refuses the file. A whole file opens exactly as with [`Demuxer::open`].
     pub fn open_partial(data: Vec<u8>) -> Result<Demuxer, Error> {
-        Demuxer::open_with(data, true)
+        Demuxer::open_with(data, true, false)
     }
 
-    fn open_with(data: Vec<u8>, partial: bool) -> Result<Demuxer, Error> {
+    fn open_with(data: Vec<u8>, partial: bool, wav: bool) -> Result<Demuxer, Error> {
         let parsed = match probe(&data) {
             Some(Format::Mp4) => mp4::parse(&data, partial)?,
             Some(_) => mkv::parse(&data)?,
+            None if wav => wav::parse(&data)?, // STRIAIMPORTWAV (SR889): open_wav's door
             None => return Err(Error::UnknownFormat),
         };
         let Parsed { format, mut tracks, mut samples, declared_duration_ns, edits } = parsed;
