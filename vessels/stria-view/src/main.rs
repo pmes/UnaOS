@@ -518,6 +518,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("preset", "Preset"), // STRIAEXPORTPRESETSMORE (SR948): steps the export preset a bare `export` takes (THE `preset` word)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -924,5 +925,36 @@ mod striaexportpresets_tests {
         assert_eq!(t, "web: h264 + aac crf=23 aq=10 scenecut=40\narchive: png + wav\nproxy: h264 + aac:64 crf=32\n");
         assert_eq!(t.lines().count(), stria::nle_export::PRESETS.len());
         assert!(USAGE.contains("[--presets]"), "{USAGE}");
+    }
+}
+
+// ---- STRIAEXPORTPRESETSMORE (LEDGER SR948): the `Preset` transport button picks the face's export preset (named tail block) ----
+
+#[cfg(test)]
+mod striaexportpresetsmore_tests {
+    use super::*;
+
+    /// The button just before `?` is `preset` labelled `Preset`, firing the face's `preset` word; driving it (the `--do`
+    /// road the click takes) steps THE table in order and back to none, each step a note on the message line, no error.
+    #[test]
+    fn striaexportpresetsmore_button_picks_the_preset() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let Some(TetraNode::Button { id, label, action }) = row.iter().rev().nth(1) else { panic!("no button before help") };
+        assert_eq!((id.as_str(), label.as_str()), ("preset", "Preset"));
+        let SMessage::Input { target, text } = action else { panic!("not an Input") };
+        assert_eq!((target.as_str(), text.as_str()), (SURFACE, "preset"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(f.export_preset(), None);
+        for want in ["web", "archive", "proxy"] {
+            let errors = drive(&mut f, text);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(f.export_preset().map(|p| p.name), Some(want));
+            assert!(f.message_text().is_some_and(|m| m.starts_with(&format!("preset {want}: "))), "{:?}", f.message_text());
+        }
+        let errors = drive(&mut f, text);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((f.export_preset(), f.message_text().as_deref()), (None, Some("preset none: export's own words")));
+        println!("striaexportpresetsmore witness: button {id} {label:?} steps web, archive, proxy, none");
     }
 }

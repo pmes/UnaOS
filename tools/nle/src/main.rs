@@ -111,7 +111,7 @@ fn main() {
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
-    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let mut min_keyint = None::<u32>; let mut p2 = Pass2Cli::default(); // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`
+    let mut scenecut = None::<u8>; let mut aq = None::<u8>; let mut two_pass = TwoPass::Off; let (mut pass, mut stats) = (None::<u8>, None::<String>); let mut hrd = false; let mut min_keyint = None::<u32>; let mut p2 = Pass2Cli::default(); let mut preset_crf = false; // H264ENCSCENECUT (SR680): `--scenecut [K]`, h264enc_core's `Config::scenecut`; STRIAEXPORTPRESETSMORE (SR948): `preset_crf` = the crf came from a `--preset`
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -124,9 +124,9 @@ fn main() {
             "--png" => video = "png".to_string(), // ADOPTPNG (SR405): the PNG sequence with its per-frame manifest (png_export, file tail)
             "--qp" => qp = num(&mut it, "--qp"),
             "--gop" => gop = Some(num(&mut it, "--gop")),
-            "--bitrate" => bitrate = Some(num(&mut it, "--bitrate")),
+            "--bitrate" => { bitrate = Some(num(&mut it, "--bitrate")); if preset_crf { crf = None } } // STRIAEXPORTPRESETSMORE (SR948): a `--bitrate` after a crf preset drops the preset's crf (the last flag written wins)
             "--mkv" => container = Container::Mkv,
-            "--crf" => crf = Some(num(&mut it, "--crf")),
+            "--crf" => { crf = Some(num(&mut it, "--crf")); preset_crf = false } // STRIAEXPORTPRESETSMORE (SR948): an operator's own crf stays exclusive with --bitrate
             "--scenecut" => scenecut = Some(match it.clone().next().and_then(|s| s.parse().ok()) { Some(k) => { it.next(); k } None => 40 }),
             "--min-keyint" => min_keyint = Some(num(&mut it, "--min-keyint")), // H264ENCSCENECUTKEYINTMIN (SR757): x264's --min-keyint, h264enc_core's `Config::min_keyint`
             "--two-pass" => two_pass = TwoPass::InProcess, // H264ENCTWOPASS (SR698): two exports, the second planned from the first
@@ -139,7 +139,7 @@ fn main() {
             "--qblur" => p2.qblur_q8 = Some({ let s = value(&mut it, "--qblur"); qblur_of(&s).unwrap_or_else(|| bad("--qblur", &s, "not a number within 0..=16")) }), // H264ENCTWOPASSQBLURCLI (SR766): x264's QP blur of the planned pass (Q8)
             "--qpstep" => p2.qpstep = Some({ let s = value(&mut it, "--qpstep"); qpstep_of(&s).unwrap_or_else(|| bad("--qpstep", &s, "not an integer within 0..=51")) }), // H264ENCTWOPASSQPSTEPCLI (SR773): x264's qpstep of the planned pass
             "--pass2" => p2 = pass2_cli_of(&value(&mut it, "--pass2")).unwrap_or_else(|e| die(format!("--pass2 {e}"))).over(p2), // H264ENCTWOPASSCLITABLE (SR790): any of the four plan knobs in one word, the last flag written winning; NLECLIPASS2VALUE (SR821): a missing value through `value`
-            "--preset" => { let s = value(&mut it, "--preset"); let p = preset_named(&s).unwrap_or_else(|| bad("--preset", &s, &format!("one of {}", preset_words()))); (video, audio, qp, crf, bitrate, scenecut, aq) = (p.video.into(), p.audio.into(), p.qp, p.crf, None, p.scenecut, p.aq); } // STRIAEXPORTPRESETS (SR871): THE preset table assigns the knobs below it; the last flag written wins
+            "--preset" => { let s = value(&mut it, "--preset"); let p = preset_named(&s).unwrap_or_else(|| bad("--preset", &s, &format!("one of {}", preset_words()))); (video, audio, qp, crf, bitrate, scenecut, aq) = (p.video.into(), p.audio.into(), p.qp, p.crf, None, p.scenecut, p.aq); preset_crf = p.crf.is_some(); } // STRIAEXPORTPRESETS (SR871): THE preset table assigns the knobs below it; the last flag written wins; STRIAEXPORTPRESETSMORE (SR948): it records whether the crf is the preset's
             "--src" => {
                 let v = value(&mut it, "--src");
                 let Some((r, p)) = v.split_once('=') else { bad("--src", &v, "REEL=<media> expected") };

@@ -403,3 +403,25 @@ fn cli_export_preset_refused_by_name() {
         assert!(!out.exists(), "{extra:?}: refused before the output dir is made");
     }
 }
+
+// ---- STRIAEXPORTPRESETSMORE (LEDGER SR948): a `--bitrate` after a crf preset drops the preset's crf (named tail block) ----
+#[test]
+fn cli_export_preset_bitrate_overrides_its_crf() {
+    let (dir, edl, srcs) = fixture("preset-bitrate");
+    let (code, preset, err) = export(&edl, &srcs, &dir.join("preset"), &["--preset", "web", "--bitrate", "800"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, knobs, err) = export(&edl, &srcs, &dir.join("knobs"), &["--video", "h264", "--aq", "10", "--scenecut", "40", "--audio", "aac", "--bitrate", "800"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(preset, knobs, "web's aq / scenecut kept, its crf dropped for the explicit bitrate, byte-exact");
+    assert_eq!(std::fs::read(dir.join("preset/movie.mp4")).unwrap(), std::fs::read(dir.join("knobs/movie.mp4")).unwrap(), "the same movie");
+    println!("cli_export_preset_bitrate: {preset}");
+}
+
+#[test]
+fn cli_export_explicit_crf_bitrate_still_exclusive() {
+    let (dir, edl, srcs) = fixture("preset-crf-bitrate");
+    let out = dir.join("refused");
+    let (code, stdout, err) = export(&edl, &srcs, &out, &["--preset", "web", "--crf", "20", "--bitrate", "800"]);
+    assert_eq!((code, err.as_str(), stdout.as_str()), (1, "nle: --bitrate and --crf are exclusive\n", ""));
+    assert!(!out.exists(), "refused before the output dir is made");
+}

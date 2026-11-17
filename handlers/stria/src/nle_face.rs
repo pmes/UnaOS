@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 27] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "preset", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    export_preset: Option<&'static crate::nle_export::ExportPreset>, preset_note: Option<String>, // STRIAEXPORTPRESETSMORE (SR948): the picked entry of THE preset table a bare `export` takes, and the `preset` word's success note (cleared by the next taken input) (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, export_preset: None, preset_note: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -208,7 +209,7 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } self.preset_note = None; if let Some(r) = self.on_preview_resize(msg) { return r; } if let Some(r) = self.help_input(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
@@ -235,7 +236,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
+        if let Some(r) = self.preset_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -2103,7 +2104,7 @@ impl Face {
         if words.next() != Some("export") {
             return None;
         }
-        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, opts) = export_preset_words(args); let (args, audio) = export_audio_word(args);
+        let all = v.split_whitespace().any(|w| w == "--all"); let args: Vec<&str> = words.filter(|w| *w != "--all").collect(); let (args, opts) = export_preset_words(self.picked_preset_words(args)); let (args, audio) = export_audio_word(args);
         if let Some((d, t)) = self.export_progress() {
             self.last_error = Some(format!("export: busy ({d}/{t})"));
             return Some(true);
@@ -2360,7 +2361,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
+        self.last_error.clone().or_else(|| self.preset_note.clone()).or_else(|| self.export.as_ref().map(job_line)).or_else(|| self.reel_line())
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -3120,4 +3121,60 @@ fn export_preset_words(mut args: Vec<&str>) -> (Vec<&str>, Result<H264Opts, Stri
     args.push(p.video);
     args.push(p.audio);
     (args, Ok(p.opts()))
+}
+
+// ---- STRIAEXPORTPRESETSMORE (LEDGER SR948): the face's picked export preset (named tail block) ----
+impl Face {
+    /// The `preset` word (the transport's `Preset` button): bare, it steps the picked preset through THE table
+    /// ([`crate::nle_export::PRESETS`], in order) and back to none; `preset <name>` / `preset none` set it. The success line
+    /// is the face's note (`preset web: h264 + aac crf=23 aq=10 scenecut=40`, `preset none: export's own words`, read by
+    /// [`Face::message_text`] after `last_error`); an unknown name is refused on `last_error` by name, the pick unchanged.
+    /// A view-only word: no undo step, the document untouched.
+    fn preset_verb(&mut self, v: &str) -> Option<bool> {
+        let mut words = v.split_whitespace();
+        if words.next() != Some("preset") {
+            return None;
+        }
+        let presets: &'static [crate::nle_export::ExportPreset] = &crate::nle_export::PRESETS;
+        let next = match (words.next(), words.next()) {
+            (None, _) => match self.export_preset.and_then(|p| presets.iter().position(|q| q == p)) {
+                None => presets.first(),
+                Some(i) => presets.get(i + 1),
+            },
+            (Some("none"), None) => None,
+            (Some(w), None) => match crate::nle_export::preset_named(w) {
+                Some(p) => Some(p),
+                None => {
+                    self.last_error = Some(format!("preset: unknown preset {w} ({})", crate::nle_export::preset_words()));
+                    return Some(true);
+                }
+            },
+            (Some(_), Some(_)) => {
+                self.last_error = Some(format!("preset: usage: preset [none|{}]", crate::nle_export::preset_words()));
+                return Some(true);
+            }
+        };
+        self.export_preset = next;
+        self.preset_note = Some(match next {
+            Some(p) => format!("preset {}", p.words()),
+            None => "preset none: export's own words".to_string(),
+        });
+        Some(true)
+    }
+    /// The `export` verb's words with the picked preset: `--preset <name>` appended ONLY when the words hold no `--preset`
+    /// and at most one word that is not a [`VIDEO_NAMES`] word (`export`, `export <dir>`); any explicit format, audio or
+    /// `--preset` word wins and the words come back untouched. SR871's [`export_preset_words`] then reads them.
+    fn picked_preset_words<'a>(&self, mut args: Vec<&'a str>) -> Vec<&'a str> {
+        let Some(p) = self.export_preset else { return args };
+        if args.contains(&"--preset") || args.len() > 1 || args.first().is_some_and(|w| VIDEO_NAMES.contains(w)) {
+            return args;
+        }
+        args.push("--preset");
+        args.push(p.name);
+        args
+    }
+    /// The picked export preset a bare `export` takes (None: the export's own words).
+    pub fn export_preset(&self) -> Option<&'static crate::nle_export::ExportPreset> {
+        self.export_preset
+    }
 }
