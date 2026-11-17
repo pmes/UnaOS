@@ -347,13 +347,13 @@ fn cli_completions_scripts() {
     }
     // fish: one line per word, a `--name` word as `-l name`, a verb as `-a` at the first word.
     let fish = script("fish");
-    assert_eq!(fish.lines().count(), words.len() + 1, "{fish}"); /* SR847 */ // + the size policy line
+    assert_eq!(fish.lines().count(), words.len() + 2, "{fish}"); /* SR847 */ /* SR1019 */ // + the size policy line + the --install dir line
     for w in &words {
         let line = match w.strip_prefix("--") {
             Some(l) => format!("complete -c nle -l {l}"),
             None => format!("complete -c nle -n __fish_use_subcommand -a {w}"),
         };
-        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa ")) || x == format!("{line} -x")), "fish: {line:?} in {fish}"); /* SR847 */ /* SR1005 */
+        assert!(fish.lines().any(|x| x == line || x.starts_with(&format!("{line} -xa ")) || x == format!("{line} -x") || x == format!("{line} -r -F")), "fish: {line:?} in {fish}"); /* SR847 */ /* SR1005 */ /* SR1019 */
     }
     // Refusals by SR801's grammar, exit 1, nothing on stdout.
     let refused: [(&[&str], &str); 2] = [
@@ -383,6 +383,7 @@ fn completion_values() -> Vec<(&'static str, String)> {
         ("--video", VIDEO_NAMES.join(" ")),
         ("--audio", audio.join(" ")),
         ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect::<Vec<_>>().join(" ")),
+        ("--pass", const_words("PASS_WORDS").join(" ")), /* SR1019 */ // main.rs PASS_WORDS, two_pass_of's own table
     ]
 }
 
@@ -411,7 +412,7 @@ fn cli_completions_values() {
     assert_eq!(fish.lines().filter(|x| x.contains(" -xa ")).count(), table.len() + 1, "{fish}");
     // The size policies, timeline_core's `SizePolicy::ALL`, at `nle size <edl> <reel> _` in each shell.
     assert!(bash.contains(&format!("[[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{size}\"\n")), "{bash}");
-    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else _files; fi}}'")), "{zsh}");
+    assert!(zsh.contains(&format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {size}; else if [[ $words[CURRENT-1] == (--install) ]]; then _files -/; else _files; fi; fi}}'")), "{zsh}"); /* SR1019 */
     assert!(fish.contains(&format!("__fish_seen_subcommand_from size; and test (count (commandline -opc)) -eq 4\" -xa \"{size}\"\n")), "{fish}");
     // Each script parses in its own shell (`-n`: read, not run); zsh / fish skipped by name when the binary is absent.
     let dir = scratch("completions");
@@ -473,6 +474,7 @@ fn cli_completions_free() {
     for ((f, kind), a) in kinds.iter().zip(&arg) {
         let want = match *kind {
             "Required" if valued.contains(f) => "Words",
+            "Required" if const_words("PATH_FLAGS").contains(f) => "Path", /* SR1019 */
             "Required" => "Free",
             k => k,
         };
@@ -482,7 +484,7 @@ fn cli_completions_free() {
     let (free, opt, bare) = (of("Free"), of("Opt"), of("Bare"));
     assert_eq!(
         free,
-        ["--fps", "--out", "--qp", "--gop", "--bitrate", "--crf", "--min-keyint", "--pass", "--stats", "--qcomp", "--cplxblur", "--qblur", "--qpstep", "--src"],
+        ["--fps", "--qp", "--gop", "--bitrate", "--crf", "--min-keyint", "--qcomp", "--cplxblur", "--qblur", "--qpstep"], /* SR1019 */
         "the free-value flags"
     );
     assert_eq!(opt, ["--scenecut", "--aq"], "the optional-K flags");
@@ -494,7 +496,7 @@ fn cli_completions_free() {
     let (bash, zsh, fish) = (script("bash"), script("zsh"), script("fish"));
     // bash: ONE empty arm naming every Free flag; no arm for an Opt or Bare flag (they fall through to the verb / flag words).
     assert_eq!(bash.matches(") w=\"\" ;;").count(), 1, "{bash}");
-    assert!(bash.contains(&format!("        {}) w=\"\" ;;\n", free.join("|"))), "bash: the Free arm in {bash}");
+    assert!(bash.contains(&format!("        {}) compopt +o default; w=\"\" ;;\n", free.join("|"))), "bash: the Free arm in {bash}"); /* SR1019 */
     for f in opt.iter().chain(&bare) {
         assert!(!bash.contains(&format!("{f})")) && !bash.contains(&format!("{f}|")), "bash: no arm for {f} in {bash}");
     }
@@ -652,4 +654,85 @@ fn cli_completions_flags_pin() {
         assert!(!flags.contains(w), "{w}: not in FLAGS {flags:?}");
         assert!(has_word(line, w), "{w}: in the usage line {line:?}");
     }
+}
+
+// ---- NLECLICOMPLETIONSPASSWORDSFILES (LEDGER SR1019): --pass's words from PASS_WORDS; Path / Dir completion in every shell (named tail block) ----
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): `nle completions <shell>`'s stdout.
+fn script_of(shell: &str) -> String {
+    let (code, out, err) = nle(&["completions", shell]);
+    assert_eq!((code, err.as_str()), (0, ""), "completions {shell}");
+    out
+}
+
+#[test]
+fn cli_completions_pass_words() {
+    let words = const_words("PASS_WORDS");
+    assert_eq!(words, ["1", "2"], "main.rs PASS_WORDS");
+    let w = words.join(" ");
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    assert!(bash.contains(&format!("        --pass) w=\"{w}\" ;;\n")), "bash: --pass words in {bash}");
+    assert!(zsh.contains(&format!(" '*--pass:pass:({w})'")), "zsh: --pass words in {zsh}");
+    let fl = format!("complete -c nle -l pass -xa \"{w}\"");
+    assert!(fish.lines().any(|x| x == fl), "fish: {fl:?} in {fish}");
+    // The refusals name the same words (two_pass_of's and what("--pass")'s texts are built from PASS_WORDS).
+    let (dir, edl, srcs) = fixture("pass-words");
+    let st = s(&dir.join("pass.stats"));
+    let or = words.join(" or ");
+    let refused: [(Vec<&str>, String); 2] = [
+        (vec!["--pass", "x"], format!("nle: --pass x: not {or}")),
+        (vec!["--pass", "3", "--stats", st.as_str(), "--bitrate", "40", "--video", "h264"], format!("nle: --pass takes {or}")),
+    ];
+    for (i, (extra, want)) in refused.iter().enumerate() {
+        let (code, out, err) = export(&edl, &srcs, &dir.join(format!("refused{i}")), extra);
+        assert_eq!((code, err, out.as_str()), (1, format!("{want}\n"), ""), "{extra:?}");
+    }
+    // Each word is a pass two_pass_of takes: past the word check, refused only for the missing --bitrate.
+    for p in &words {
+        let (code, out, err) = export(&edl, &srcs, &dir.join(format!("accepted{p}")), &["--pass", *p, "--stats", st.as_str()]);
+        assert_eq!((code, err.as_str(), out.as_str()), (1, "nle: --pass needs --bitrate\n", ""), "--pass {p}");
+    }
+}
+
+#[test]
+fn cli_completions_files() {
+    // PATH_FLAGS is exactly FLAG_ARG's Path words, each a required value by SR1005's arm scan.
+    let paths = const_words("PATH_FLAGS");
+    assert_eq!(paths, ["--out", "--stats", "--src"], "main.rs PATH_FLAGS");
+    let tagged: Vec<&str> = arm_kinds().iter().zip(flag_arg_src()).filter(|(_, a)| *a == "Path").map(|((f, k), _)| {
+        assert_eq!(*k, "Required", "{f}: a Path flag reads a required value");
+        *f
+    }).collect();
+    assert_eq!(tagged, paths, "FLAG_ARG's Path words == PATH_FLAGS");
+    let (bash, zsh, fish) = (script_of("bash"), script_of("zsh"), script_of("fish"));
+    // bash: the numeric Free arm turns readline's filenames off; the Path arm keeps them (-o default); --install directories.
+    let free = bash.lines().find(|l| l.ends_with(") compopt +o default; w=\"\" ;;")).expect("bash: the Free arm");
+    assert!(free.contains("--fps|") && !paths.iter().any(|p| free.contains(&format!("{p}|")) || free.contains(&format!("{p})"))), "bash: Free arm {free:?}");
+    let path_arm = format!("        {}) w=\"\" ;;\n", paths.join("|"));
+    assert!(bash.contains(&path_arm), "bash: {path_arm:?} in {bash}");
+    assert!(bash.contains("        --install) compopt -o dirnames +o default; w=\"\" ;;\n"), "bash: the --install arm in {bash}");
+    assert!(bash.contains("    [[ $COMP_CWORD == 2 && ${COMP_WORDS[1]} != completions && $cur != -* ]] && w=\"\"\n"), "bash: position 2 in {bash}");
+    assert!(bash.contains("    [[ $prev == = || $cur == = ]] && w=\"\"\n"), "bash: after REEL= in {bash}");
+    assert!(bash.ends_with("\ncomplete -o default -F _nle nle\n"), "{bash}");
+    // zsh: the path after the last `=` (else the word) on each Path flag; directories after --install; files at position 2+.
+    for p in &paths {
+        let l = p.trim_start_matches('-');
+        let spec = format!(" '*{p}:{l}:{{compset -P \"*=\"; _files}}'");
+        assert!(zsh.contains(&spec), "zsh: {spec:?} in {zsh}");
+    }
+    let file = "if [[ $words[CURRENT-1] == (--install) ]]; then _files -/; else _files; fi";
+    assert!(zsh.contains(&format!(" '*:file:{{{file}}}'\n")), "zsh: the rest spec in {zsh}");
+    assert!(zsh.contains(&format!("else {file}; fi}}'")), "zsh: the size spec's else in {zsh}");
+    // fish: a Path flag's value is files; --install's directories under the completions verb only.
+    for p in &paths {
+        let line = format!("complete -c nle -l {} -r -F", p.trim_start_matches('-'));
+        assert!(fish.lines().any(|x| x == line), "fish: {line:?} in {fish}");
+    }
+    let install = "complete -c nle -n \"__fish_seen_subcommand_from completions\" -l install -x -a \"(__fish_complete_directories)\"";
+    assert_eq!(fish.lines().filter(|x| *x == install).count(), 1, "fish: {install:?} in {fish}");
+    // bash parses the script (`-n`: read, not run).
+    let dir = scratch("completions-files");
+    let p = dir.join("nle.bash");
+    std::fs::write(&p, &bash).unwrap();
+    let o = Command::new("bash").arg("-n").arg(&p).output().expect("bash runs");
+    assert!(o.status.success(), "bash -n: {}\n{bash}", String::from_utf8_lossy(&o.stderr));
 }
