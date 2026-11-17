@@ -1498,7 +1498,7 @@ impl EditorState {
     }
     /// The `close-gaps` / `gap <n>` words of [`EditorState::verb`]; `None` when `v` is neither.
     fn gap_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        Some(match gap_words(v)? {
+        if v.trim() == "gap" { let s = self.timeline.tb.from_ns(1_000_000_000).max(1); return Some(self.insert_gap(s)); } Some(match gap_words(v)? { // STRIAGAPSBLACK (SR909): a bare `gap` opens one second
             None => self.close_gaps(),
             Some(n) => self.insert_gap(n),
         })

@@ -540,6 +540,7 @@ fn transport() -> TetraNode {
         button("zoom-fit", "Fit"), button("zoom-sel", "Fit Sel"), // STRIAZOOMTOFIT (SR859): fit the timeline / the selection in the window
         button("xfade", "Xfade"), button("tc", "TC"), // STRIATIMECODEDISPLAY (SR872): the playhead readout off / timecode / frames / seconds
         button("copy", "Copy"), button("cut", "Cut"), button("paste", "Paste"), // STRIACOPYPASTE (SR854): the selection onto the clipboard / lifted onto it / laid at the playhead on the selected track
+        button("gap", "Gap"), // STRIAGAPSBLACK (SR909): opens one second of gap at the playhead on the selected clip's track (one undo step)
         button("close-gaps", "Close Gaps"), // STRIAGAPCLOSE (SR857): closes every gap on the selected clip's track (one undo step)
         button("track+ video", "V+"), button("track+ audio", "A+"), button("track-", "Track -"), // STRIATRACKADDREMOVE (SR856): add a video / audio track, remove the selected clip's track
         button("track-gain-", "Track -"), button("track-gain+", "Track +"), button("track-gain", "Track 0 dB"), // STRIATRACKGAINSTEP (SR901): one dB a press on the selected clip's track; STRIATRACKGAIN (SR864): the selected clip's track back to unity (`track-gain:<dB>` on `--do` sets it)
@@ -2053,5 +2054,26 @@ mod striatrackgainstep_tests {
         assert_eq!(drive(&mut face, "track-gain+"), vec!["track-gain: A1 0.0 dB".to_string()]);
         assert_eq!((face.state.timeline.tracks[1].gain_cdb, face.state.undo_depth()), (0, 2));
         println!("striatrackgainstep witness: track-gain- -> A1 -1.0 dB; track-gain+ -> 0.0 dB");
+    }
+}
+
+// ---- STRIAGAPSBLACK (LEDGER SR909): the witness's bare `gap` button word (named tail block) ----
+#[cfg(test)]
+mod striagapsblack_tests {
+    use super::*;
+
+    /// The Gap button sits before Close Gaps (help stays last); its word `gap` (the `--do gap` token) opens one second at the
+    /// playhead: 25 ticks at the synth fixture's 25 fps, the timeline_core op by hand.
+    #[test]
+    fn striagapsblack_gap_button() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        let ids: Vec<String> = row.iter().filter_map(|b| if let TetraNode::Button { id, .. } = b { Some(id.clone()) } else { None }).collect();
+        assert_eq!(&ids[ids.len() - 3..], ["gap".to_string(), "close-gaps".to_string(), "help".to_string()]);
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:0,gap").is_empty());
+        assert_eq!(face.state.timeline, tl0.insert_gap(0, 12, 25).unwrap());
+        println!("striagapsblack witness: gap -> {:?}", face.state.timeline.tracks[0].clips);
     }
 }
