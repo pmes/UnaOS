@@ -1405,3 +1405,33 @@ fn striaopacityface_body_paints_at_its_opacity() {
     assert_eq!(paint(&half.set_opacity(&[(0, 0)], timeline_core::OPAQUE).unwrap()), before, "back to opaque: byte-identical");
     assert_eq!(opacity_colour(reel, ROW[0], timeline_core::OPAQUE), reel);
 }
+
+// ---- STRIAPASTEINSERT (LEDGER SR896): paste_as — SR854's one walk in a mode (named tail block) ----
+#[test]
+fn striapasteinsert_paste_as_insert_and_overwrite_through_place() {
+    let (tl, a, b) = base(); // V1: A[0,10)@0 B[20,30)@10
+    let one = Clip::new(b, 40, 45, 5);
+    assert_eq!(tl.paste_as(&[(0, Kind::Video, one)], Some(Mode::Insert)).unwrap(), tl.place(0, one, Mode::Insert).unwrap());
+    assert_eq!(tl.paste_as(&[(0, Kind::Video, one)], Some(Mode::Overwrite)).unwrap(), tl.place(0, one, Mode::Overwrite).unwrap(), "it carves");
+    assert_eq!(tl.paste_as(&[(0, Kind::Video, one)], None), Err(EditError::Overlap), "None is SR854's never-overwrite paste");
+    assert_eq!(tl.paste(&[(0, Kind::Video, one)]), Err(EditError::Overlap));
+    // two items given out of order walk ascending: the later one never pushes the earlier
+    let (x, y) = (Clip::new(a, 50, 55, 5), Clip::new(b, 0, 5, 12));
+    let p = tl.paste_as(&[(0, Kind::Video, y), (0, Kind::Video, x)], Some(Mode::Insert)).unwrap();
+    assert_eq!(p, tl.place(0, x, Mode::Insert).unwrap().place(0, y, Mode::Insert).unwrap());
+    assert_eq!(p, tl.paste_as(&[(0, Kind::Video, x), (0, Kind::Video, y)], Some(Mode::Insert)).unwrap());
+    assert_eq!((p.tracks[0].clips.iter().any(|c| *c == x), p.tracks[0].clips.iter().any(|c| *c == y)), (true, true), "each lands on its own tick");
+}
+
+#[test]
+fn striapasteinsert_paste_as_refusals_by_name() {
+    let (tl, a, _) = base();
+    let before = tl.clone();
+    for m in [Some(Mode::Insert), Some(Mode::Overwrite)] {
+        assert_eq!(tl.paste_as(&[], m), Err(EditError::NoClip));
+        assert_eq!(tl.paste_as(&[(2, Kind::Video, Clip::new(a, 0, 10, 40))], m), Err(EditError::NoTrack));
+        assert_eq!(tl.paste_as(&[(1, Kind::Video, Clip::new(a, 0, 10, 40))], m), Err(EditError::Kind));
+        assert_eq!(tl.paste_as(&[(0, Kind::Video, Clip::new(a, 90, 110, 40))], m), Err(EditError::OutOfSource), "place's own validate");
+    }
+    assert_eq!(tl, before);
+}

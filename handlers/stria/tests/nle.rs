@@ -4956,7 +4956,7 @@ fn striatimecodedisplay_readout_follows_the_playhead() {
 /// with a paste back into the hole restoring the timeline.
 #[test]
 fn striacopypaste_face_copy_cut_paste() {
-    assert_eq!(VERBS[VERBS.len() - 4..], ["copy", "cut", "paste", "help"]);
+    assert!(["copy", "cut", "paste"].iter().all(|w| VERBS.contains(w)) && VERBS.last() == Some(&"help"));
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
     face.state.select(0, 1).unwrap();
@@ -6403,4 +6403,45 @@ fn striamarkerrename_unmark_all_in_one_commit() {
     assert_eq!(f.last_error.take().as_deref(), Some("unmark all: no markers"));
     assert_eq!(f.state.undo_depth(), depth, "no undo step");
     println!("striamarkerrename: unmark all -> 2 markers removed in one commit; none -> refused");
+}
+
+// ---- STRIAPASTEINSERT (LEDGER SR896): paste-insert / paste-over through the face's words (named tail block) ----
+
+/// The two words are VERBS before `help`; through `Face::verb` a copied clip lands at the playhead rippling its track
+/// (`paste-insert`) or carving what is there (`paste-over`), ONE undo step each.
+#[test]
+fn striapasteinsert_face_insert_and_over() {
+    assert_eq!(VERBS[VERBS.len() - 3..], ["paste-insert", "paste-over", "help"]);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    let (a, b) = (SourceId(0), SourceId(1));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("copy"));
+    face.state.seek(12);
+    assert!(face.verb("paste-insert"));
+    assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 2, 10), Clip::new(b, 0, 10, 12), Clip::new(b, 2, 10, 22), Clip::new(a, 23, 33, 35)]);
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.last_error.clone()), (1, true, None));
+    assert!(face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    face.state.seek(12);
+    assert!(face.verb("paste-over"));
+    assert_eq!(face.state.timeline.tracks[0].clips, vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 2, 10), Clip::new(b, 0, 10, 12), Clip::new(a, 23, 33, 25)]);
+    assert_eq!((face.state.undo_depth(), face.last_error.clone()), (1, None));
+    println!("striapasteinsert: paste-over at 12 carves V1 to {:?}", face.state.timeline.tracks[0].clips.iter().map(|c| c.at).collect::<Vec<_>>());
+}
+
+/// Each refusal lands on the message line by the editor's name; the timeline does not move.
+#[test]
+fn striapasteinsert_face_refusals_name_the_error() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    assert!(face.verb("paste-insert"));
+    assert_eq!(face.last_error.take(), Some(format!("paste-insert: {}", EditError::NoClip)));
+    face.state.select(0, 1).unwrap();
+    assert!(face.verb("copy"));
+    face.state.seek(35);
+    face.state.select(1, 0).unwrap();
+    assert!(face.verb("paste-over"));
+    assert_eq!(face.last_error.take(), Some(format!("paste-over: {}", EditError::Kind)));
+    assert_eq!(face.state.timeline, tl);
 }

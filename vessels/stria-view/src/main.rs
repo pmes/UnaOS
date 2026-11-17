@@ -540,6 +540,7 @@ fn transport() -> TetraNode {
         button("info", "Info"), // STRIASOURCEINFO (SR875): the selected clip's reel line, standing five seconds on the message row
         button("track-up", "Track Up"), button("track-down", "Track Down"), // STRIATRACKREORDER (SR877): the selected clip's track swaps with its same-kind neighbour
         button("meters-reset", "Reset Meters"), button("opacity-", "Opacity -"), button("opacity+", "Opacity +"), // STRIAOPACITYFACE (SR898): the selected clips' opacity 10 % down / up (THE `opacity-` / `opacity+` verbs)
+        button("paste-insert", "Paste Insert"), button("paste-over", "Paste Over"), // STRIAPASTEINSERT (SR896): the clipboard laid at the playhead rippling the track / carving what is there
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade
     ])
 }
@@ -1142,7 +1143,7 @@ mod striacopypaste_tests {
         let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
         let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
         let words: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
-        assert_eq!(words[words.len() - 4..], ["copy", "cut", "paste", "help"]);
+        assert!(["copy", "cut", "paste"].iter().all(|w| words.iter().any(|x| x == w)) && words.last().map(String::as_str) == Some("help"));
         println!("striacopypaste witness: V1 {:?}", v1.last());
     }
 }
@@ -1587,5 +1588,32 @@ mod striaopacityface_tests {
         assert_eq!(errors, vec!["opacity: 60 %".to_string()]);
         assert_eq!(face.state.selected().map(|c| c.opacity), Some(60));
         println!("striaopacityface: buttons {:?}; opacity+ -> {errors:?}", &ids[n - 3..]);
+    }
+}
+
+// ---- STRIAPASTEINSERT (LEDGER SR896): the paste-insert / paste-over buttons and `--do` words (named tail block) ----
+
+#[cfg(test)]
+mod striapasteinsert_tests {
+    use super::*;
+
+    /// `--do at:12:0,copy,ruler:12,paste-insert`: B copied off V1, laid at tick 12 on V1 rippling the rest; the two
+    /// buttons sit before the help button.
+    #[test]
+    fn striapasteinsert_witness_paste_insert_tokens() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,copy,ruler:12,paste-insert");
+        assert!(errors.is_empty(), "{errors:?}");
+        let v1: Vec<(i64, i64, i64)> = face.state.timeline.tracks[0].clips.iter().map(|c| (c.src_in, c.src_out, c.at)).collect();
+        assert!(v1.contains(&(0, 10, 12)) && v1.contains(&(2, 10, 22)), "{v1:?}");
+        assert_eq!(face.state.timeline.tracks[1], tl0.tracks[1]);
+        assert_eq!((face.state.undo_depth(), face.last_error.clone()), (1, None));
+        let TetraNode::VStack(top) = editor_tree() else { panic!("not a VStack") };
+        let TetraNode::HStack(row) = &top[1] else { panic!("no transport row") };
+        let words: Vec<String> = row.iter().filter_map(|b| match b { TetraNode::Button { action: SMessage::Input { text, .. }, .. } => Some(text.clone()), _ => None }).collect();
+        assert_eq!(words[words.len() - 3..], ["paste-insert", "paste-over", "help"]);
+        println!("striapasteinsert witness: V1 {v1:?}");
     }
 }

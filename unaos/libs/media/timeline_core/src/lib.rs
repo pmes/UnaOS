@@ -1972,21 +1972,21 @@ impl Timeline {
 impl Timeline {
     /// Lay `items` (`(track, the kind it was copied from, clip at its landing tick)`) as ONE edit. Refused by name, the
     /// whole paste together: none `EditError::NoClip`; a missing track `NoTrack`; a track of the other kind `Kind`; an
-    /// item meeting a clip already on its track `Overlap`; anything `place` itself refuses.
-    pub fn paste(&self, items: &[(usize, Kind, Clip)]) -> Result<Timeline, EditError> {
+    /// item meeting a clip already on its track `Overlap`; anything `place` itself refuses. STRIAPASTEINSERT (SR896): `mode` None = that never-overwrite paste; `Some(Mode::Insert)` ripples each target track, `Some(Mode::Overwrite)` carves (no `Overlap`); the items walk ascending by `(track, at)`.
+    pub fn paste_as(&self, items: &[(usize, Kind, Clip)], mode: Option<Mode>) -> Result<Timeline, EditError> {
         if items.is_empty() {
             return Err(EditError::NoClip);
         }
-        let mut tl = self.clone();
+        let mut tl = self.clone(); let mut v = items.to_vec(); v.sort_unstable_by_key(|e| (e.0, e.2.at)); let items = &v[..]; // STRIAPASTEINSERT (SR896): ascending per track, so an insert never moves an earlier pasted item
         for &(track, kind, clip) in items {
             let t = tl.tracks.get(track).ok_or(EditError::NoTrack)?;
             if t.kind != kind {
                 return Err(EditError::Kind);
             }
-            if t.clips.iter().any(|c| c.at < clip.end() && clip.at < c.end()) {
+            if mode.is_none() && t.clips.iter().any(|c| c.at < clip.end() && clip.at < c.end()) {
                 return Err(EditError::Overlap);
             }
-            tl = tl.place(track, clip, Mode::Overwrite)?;
+            tl = tl.place(track, clip, mode.unwrap_or(Mode::Overwrite))?;
         }
         Ok(tl)
     }
@@ -2552,5 +2552,15 @@ mod striamarkerrename_tests {
         assert!(u.markers.is_empty());
         assert_eq!(u, tl());
         assert!(tl().unmark_all().is_none());
+    }
+}
+
+// ---- STRIAPASTEINSERT (LEDGER SR896): paste through place in a mode (named tail block) ----
+// SR854's walk took a mode (`Timeline::paste_as`); the plain paste stays THE never-overwrite paste, one walk for all three.
+
+impl Timeline {
+    /// SR854's paste: `paste_as` with no mode (an item meeting a clip is refused `EditError::Overlap`).
+    pub fn paste(&self, items: &[(usize, Kind, Clip)]) -> Result<Timeline, EditError> {
+        self.paste_as(items, None)
     }
 }
