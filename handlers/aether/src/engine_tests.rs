@@ -8716,4 +8716,44 @@ b</div>
         assert!(css_wide_color_ink(&mut e, "x", css_wide_green) > 3, "#x paints green");
         assert_eq!(css_wide_color_ink(&mut e, "x", css_wide_red), 0, "#x paints no red");
     }
+
+    // ---- AETHERLINEHEIGHTCALCNEGATIVECLAMP (LEDGER SR1054): a negative calc() line-height is a zero line box (named tail block) ----
+
+    /// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): two-line divs ("Hello Hello" in 60px) at `calc(-4px)`,
+    /// `calc(0px - 5px)` and the `normal` twin.
+    fn line_height_calc_negative_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div id="c4" style="width:60px;line-height:calc(-4px)">Hello Hello</div>
+            <div id="c5" style="width:60px;line-height:calc(0px - 5px)">Hello Hello</div>
+            <div id="cn" style="width:60px;line-height:normal">Hello Hello</div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): css-values-4 §10.9 clamps a negative calc() to 0, so the two-line block
+    /// is 0 px tall (it laid out as `normal`); the `normal` twin is two lines tall (armed).
+    #[test]
+    fn line_height_calc_negative_box_height() {
+        let mut e = line_height_calc_negative_engine();
+        for id in ["c4", "c5"] {
+            let h = imgalt_rect(&mut e, id).3;
+            assert_eq!(h, 0.0, "#{id}: two zero line boxes");
+        }
+        let h = imgalt_rect(&mut e, "cn").3;
+        assert!(h > 20.0, "#cn: two normal lines ({h})");
+    }
+
+    /// AETHERLINEHEIGHTCALCNEGATIVECLAMP (SR1054): getComputedStyle reads `0px` for a negative calc() (it read `normal`).
+    #[test]
+    fn line_height_calc_negative_cssom() {
+        let mut e = line_height_calc_negative_engine();
+        for id in ["c4", "c5"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "lineHeight"), "0px", "#{id}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "cn", "lineHeight"), "normal");
+    }
 }
