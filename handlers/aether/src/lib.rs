@@ -700,6 +700,7 @@ impl AetherEngine {
             py: (y + self.scroll_y) as f32,
             sx: self.scroll_x as i32 as f32,
             sy: self.scroll_y as i32 as f32,
+            vp: (self.width, self.height),
             top: Vec::new(),
         };
         let all = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
@@ -2107,6 +2108,8 @@ struct HitCtx<'a> {
     /// The scroll offset render paints at (truncated; a fixed box's viewport origin is offset by it).
     sx: f32,
     sy: f32,
+    /// AETHERHITSTICKYORIGIN (SR1141): the viewport size render paints at (the painter's `placed_origin` reads it).
+    vp: (u32, u32),
     /// AETHERFIT (SR189): the top layer's boxes (hit before the document; the document walk skips them).
     top: Vec<taffy::prelude::NodeId>,
 }
@@ -2145,23 +2148,12 @@ fn hit_layered(layout: &layout::LayoutTree, id: taffy::prelude::NodeId) -> bool 
         || render::is_stacking_context(layout, id)
 }
 
-/// `id`'s border-box origin given its parent's: `location` from the parent, or for `position: fixed`
-/// its viewport origin (render's rule — AETHERFIT SR189: layout_core's `fixed_at`, scroll ignored).
+/// `id`'s border-box origin given its parent's, in document space: AETHERHITSTICKYORIGIN (SR1141) the painter's ONE
+/// origin fn (`render::placed_origin`: `location` from the parent, a `position: fixed` box's viewport origin, a stuck
+/// `position: sticky` box's hold), so a box is hit where it is painted.
 fn hit_origin(cx: &HitCtx, id: taffy::prelude::NodeId, parent: (f32, f32)) -> (f32, f32) {
-    let layout = cx.layout;
-    let Ok(l) = layout.taffy.layout(id) else { return parent };
-    let (mut x, mut y) = (parent.0 + l.location.x, parent.1 + l.location.y);
-    if layout.paint_map.get(&id).and_then(|p| p.position_kind) == Some(3) {
-        if let Some(&(fx, fy)) = layout.fixed_at.get(&id) {
-            if let Some(v) = fx {
-                x = cx.sx + v;
-            }
-            if let Some(v) = fy {
-                y = cx.sy + v;
-            }
-        }
-    }
-    (x, y)
+    let Ok(l) = cx.layout.taffy.layout(id) else { return parent };
+    render::placed_origin(cx.layout, id, parent.0, parent.1, l, cx.vp.0, cx.vp.1, cx.sx as i32, cx.sy as i32)
 }
 
 /// The children of `node` (border box at `o`) with the parent origin each is placed from — render's
