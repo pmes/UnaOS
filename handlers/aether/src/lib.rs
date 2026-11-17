@@ -1990,7 +1990,7 @@ impl AetherEngine {
 
         let mut layout_tree = layout::build_tree(&document, self.width as f32, self.height as f32);
         // AETHERPAINTPERF (SR130): a new document's first cascade is whole and records itself for the restyles after it.
-        css::forget_restyle();
+        css::forget_restyle(); layout::forget_scroll(); // AETHERSCROLLBLITNESTEDSCROLLERPIXELS (SR1163): before the first cascade's restore_scroll, so no offset of the last document lands on this one
         css::apply_stylesheets_scoped(&mut layout_tree, &sheets, &[]);
         self.stylesheets = sheets;
         
