@@ -5418,6 +5418,8 @@ mod tests {
         }
         assert_eq!(font_shorthand_cs(&mut e, "ini", "fontStyle"), "normal", "font: initial is upright");
         assert_eq!(font_shorthand_cs(&mut e, "ini", "fontSize"), "16px", "font: initial is medium");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "20px", "SR819: the font: inherit button reads its used 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "ubtn", "fontSize"), "13.333px", "SR819: the plain button reads the control default");
     }
 
     /// AETHERFONTSHORTHANDINHERIT (SR810): the inherit reaches layout and paint: the `font: inherit` and `font: unset`
@@ -5435,8 +5437,8 @@ mod tests {
 
     /// AETHERFONTSHORTHANDINHERIT (SR810): `button { font: inherit }` (every reset sheet's line) takes the parent's
     /// 20px: its box is the `font-size: 20px` twin's, not the 13.333px control default's (armed by the plain button).
-    /// The family stays the control family and cssom reads the raw size (AETHER-CSS-WIDE-LONGHANDS,
-    /// AETHER-CSSOM-FONT-SIZE-REL owed), so the box is the pin.
+    /// The family stays the control family (AETHER-CSS-WIDE-LONGHANDS owed); cssom reads the used size (SR819), so the
+    /// box and fontSize are both pinned.
     #[test]
     fn font_inherit_button_takes_parent_size() {
         let mut e = font_wide_engine();
@@ -5445,5 +5447,65 @@ mod tests {
         let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
         assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
         assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), font_shorthand_cs(&mut e, "pbtn", "fontSize"), "SR819: btn reads the twin's size");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "20px", "SR819: the parent's 20px");
+    }
+
+    // ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): one probe per relative road: em and % of the parent's size, smaller / larger
+    /// (layout_core's /1.2 and x1.2), `font: inherit` and em on a control, a plain control, and nested em.
+    fn font_size_rel_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div style="font-size:10px"><span id="em" style="font-size:2em">Hello</span></div>
+            <div style="font-size:16px"><span id="pct" style="font-size:150%">Hello</span></div>
+            <div style="font-size:10px"><span id="sm" style="font-size:smaller">Hello</span></div>
+            <div style="font-size:10px"><span id="lg" style="font-size:larger">Hello</span></div>
+            <div style="font-size:20px"><button id="fib" style="font:inherit">Go</button></div>
+            <div style="font-size:20px"><button id="plain">Go</button></div>
+            <div style="font-size:10px"><button id="emb" style="font-size:2em">Go</button></div>
+            <div style="font-size:10px"><div style="font-size:2em"><span id="nest" style="font-size:1.5em">Hello</span></div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 400));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `font-size: 2em` under 10px reads 20px and `150%` under 16px reads 24px (the
+    /// specified road read the parent's size: 10px / 16px).
+    #[test]
+    fn font_size_rel_cssom_em_percent() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "em", "fontSize"), "20px", "2em of 10px");
+        assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
+    /// 4-decimal grammar.
+    #[test]
+    fn font_size_rel_cssom_smaller_larger() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
+        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
+    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
+    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
+    #[test]
+    fn font_size_rel_cssom_font_inherit_button() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
+        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
+        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
+    }
+
+    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
+    #[test]
+    fn font_size_rel_cssom_nested_em() {
+        let mut e = font_size_rel_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
     }
 }
