@@ -1170,3 +1170,162 @@ pub fn qpstep_seed(last_any: Option<(Pic, i32)>, want: Pic) -> Option<i32> {
         Pic::B => qp - B_QP_OFFSET,
     })
 }
+
+// ---- H264ENCSCENECUTRCRESET (LEDGER SR834): the rate model across a detected scene cut, measured (named tail block) ----
+// x264 resets nothing at a scenecut IDR beyond its I picture; here the P model (k = bits x Qstep / S' of the last P) is
+// complexity-normalised, so the first P after a cut is predicted from the OLD scene's k times the NEW picture's S'. This module
+// records, per picture around a cut, the model's prediction against the coded bits (fixtures A flat -> texture, B static ->
+// motion, C motion -> static; controls: scenecut None with a GOP-aligned scheduled IDR at the cut, and a scheduled IDR inside a
+// steady scene) and pins the first P's numbers at rich (200 / 400 kbps) and budget-binding (20-100 kbps) rates with an ORACLE QP
+// column (the QP `picture`'s window picks when it knows the picture's true k). MEASURED-NOT-NEEDED: the mispredict is the same at a
+// scheduled IDR in the same place (a detected-only reset is the wrong rule), the binding QP error is PIC_STEP-window-bound (A 20 kbps:
+// the oracle also picks 22 = the stale P QP + PIC_STEP, so no k reseed fixes it) and the first P's k over the I's k spans
+// 0.13..3.18 (no ratio to seed from), so nothing in the rate model changes here. Owed: H264ENC-RC-FIRSTP-IPOFFSET (the first P after
+// any IDR windowed on the I's QP + IP_QP_OFFSET, prediction kept: every rate-controlled pin moves), H264ENC-RC-CBR-IDR-OVERFLOW.
+
+#[cfg(test)]
+mod scenecut_rc_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Config, Yuv420};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use std::println;
+
+    const W: usize = 64;
+    const H: usize = 64;
+    const CUT: usize = 10;
+
+    /// A fixed LCG texture (luma 60..=140) of width 2W, seeded `seed`, windowed at column offset `off` (wrapping): `off` moving
+    /// with t is a scene panning left.
+    fn pattern(seed: u64, off: usize) -> [Vec<u8>; 3] {
+        let mut s = seed;
+        let big: Vec<u8> = (0..2 * W * H)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (60 + (s >> 33) % 81) as u8
+            })
+            .collect();
+        let mut y = vec![0u8; W * H];
+        for r in 0..H {
+            for c in 0..W {
+                y[r * W + c] = big[r * 2 * W + (c + off) % (2 * W)];
+            }
+        }
+        [y, vec![128; W * H / 4], vec![128; W * H / 4]]
+    }
+
+    fn flat(v: u8) -> [Vec<u8>; 3] {
+        [vec![v; W * H], vec![128; W * H / 4], vec![128; W * H / 4]]
+    }
+
+    /// One coded picture: (key, type index, S', the model's prediction at the picked QP (0 when its type was uncoded), the
+    /// coded bits, the QP, the target, the CBR bucket fullness after it, the ORACLE QP: the one `picture`'s window
+    /// ([refq - PIC_STEP, refq + PIC_STEP] in [floor, QP_MAX]) picks when the model knows the picture's true k, i.e. its coded
+    /// bits moved by Qstep (bits x step16(qp) / step16(q)); the picked QP when its type was uncoded).
+    type Row = (bool, usize, u64, u64, u64, i32, i64, i64, i32);
+
+    /// Encode `n` frames of `src` at 64x64 CBR `kbps` at 30 fps, `gop`, `scenecut`: every picture's [`Row`], and the bucket's size.
+    fn run(kbps: u32, gop: u32, sc: Option<u8>, n: usize, src: &dyn Fn(usize) -> [Vec<u8>; 3]) -> (Vec<Row>, i64) {
+        let cfg = Config { width: W as u32, height: H as u32, qp: 26, gop, scenecut: sc, rate: Some(RateControl::cbr(kbps, (30, 1))), ..Default::default() };
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut rows = Vec::new();
+        for t in 0..n {
+            let p = src(t);
+            let before = enc.rc.clone().unwrap();
+            let au = enc.encode(&Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 }).unwrap();
+            let rc = enc.rc.as_ref().unwrap();
+            let m = before.types[rc.t];
+            let pred = if m.coded { m.predict(rc.s, rc.pic_qp) as u64 } else { 0 };
+            let bits = rc.types[rc.t].bits;
+            let oracle = if m.coded {
+                let (lo, hi) = ((m.qp - PIC_STEP).max(before.floor), (m.qp + PIC_STEP).min(QP_MAX));
+                let at = |q: i32| bits as u128 * step16(rc.pic_qp) as u128 / step16(q) as u128;
+                (lo..=hi).find(|&q| at(q) <= rc.target as u128).unwrap_or(hi)
+            } else {
+                rc.pic_qp
+            };
+            rows.push((au.keyframe, rc.t, rc.s, pred, bits, rc.pic_qp, rc.target, rc.full, oracle));
+        }
+        (rows, enc.rc.as_ref().unwrap().buf)
+    }
+
+    /// Print pictures cut-2..=cut+6 and return the first P after the cut's actual / predicted ratio x 100 (0: unpredicted).
+    fn table(name: &str, rows: &[Row]) -> u64 {
+        println!("== {name}");
+        for (t, r) in rows.iter().enumerate().take(CUT + 7).skip(CUT - 2) {
+            println!(
+                "t={t:2} kind={} key={} S'={:6} pred={:6} actual={:6} qp={:2} oracle_qp={:2} target={:6} full={:6}",
+                ["I", "P", "B"][r.1], r.0, r.2, r.3, r.4, r.5, r.8, r.6, r.7
+            );
+        }
+        let p = &rows[CUT + 1];
+        let ratio = if p.3 > 0 { p.4 * 100 / p.3 } else { 0 };
+        println!(
+            "   first P after the cut: actual / pred = {}.{:02}; qp {} vs oracle {}; actual / target = {}/{}",
+            ratio / 100,
+            ratio % 100,
+            p.5,
+            p.8,
+            p.4,
+            p.6
+        );
+        ratio
+    }
+
+    fn fixture(f: char) -> impl Fn(usize) -> [Vec<u8>; 3] {
+        move |t| match f {
+            'A' => if t < CUT { flat(100) } else { pattern(0x2545_f491_4f6c_dd1d, 0) },
+            'B' => if t < CUT { pattern(1, 0) } else { pattern(2, 3 * t) },
+            'C' => if t < CUT { pattern(1, 3 * t) } else { pattern(2, 0) },
+            _ => pattern(2, 3 * t),
+        }
+    }
+
+    /// The measured first P after the IDR at t = 10, per run: (fixture, kbps, scenecut Some(40) at gop 30 (true) or the control
+    /// scenecut None at gop 10 (the scheduled IDR at the same picture), [pred, actual, qp, oracle qp, target], peak bucket fullness).
+    const PINS: [(char, u32, bool, [i64; 5], i64); 21] = [
+        ('A', 200, true, [705, 9856, 16, 16, 19666], 93766),
+        ('A', 200, false, [1104, 13248, 16, 16, 14737], 93766),
+        ('A', 40, true, [1229, 12376, 16, 22, 2828], 28404),
+        ('A', 40, false, [1332, 12880, 16, 22, 1847], 28228),
+        ('A', 20, true, [700, 7736, 22, 22, 799], 20664),
+        ('A', 20, false, [844, 9584, 22, 22, 466], 20912),
+        ('B', 400, true, [918, 3664, 16, 16, 37301], 202811),
+        ('B', 400, false, [918, 3664, 16, 16, 26616], 202811),
+        ('B', 100, true, [3964, 1536, 22, 16, 4334], 65321),
+        ('B', 100, false, [8833, 1248, 26, 20, 2832], 61043),
+        ('B', 50, true, [783, 1672, 23, 28, 1058], 41528),
+        ('B', 50, false, [1765, 552, 32, 32, 264], 37218),
+        ('C', 400, true, [114, 2016, 16, 16, 35412], 202811),
+        ('C', 400, false, [112, 2016, 16, 16, 24762], 202811),
+        ('C', 100, true, [285, 4016, 16, 17, 3704], 68740),
+        ('C', 100, false, [333, 3664, 20, 23, 2740], 61043),
+        ('C', 50, true, [389, 608, 27, 29, 521], 39322),
+        ('C', 50, false, [305, 352, 32, 32, 471], 36534),
+        ('D', 400, false, [1819, 3664, 16, 16, 24694], 203139),
+        ('D', 100, false, [2600, 3576, 21, 24, 2736], 61419),
+        ('D', 50, false, [465, 376, 38, 36, 495], 36750),
+    ];
+
+    /// The measured table (MEASURE SR834): the first P after a detected cut mispredicts 3.99x-17.68x at the 200 / 400 kbps rows
+    /// and by the same at the scheduled IDR in the same place (an any-IDR effect); once the budget binds its QP sits 1-6 off the
+    /// oracle (PIC_STEP-bound), A 40 kbps spends 4.4x its target, and A 20 kbps overflows the bucket (20664 / 20912 > 20000),
+    /// pinned as measured, not asserted away (owed H264ENC-RC-CBR-IDR-OVERFLOW). Every other run stays inside its bucket.
+    #[test]
+    fn scenecut_rc_first_p_table() {
+        let n = CUT + 7;
+        for &(f, kbps, cut, want, peak_want) in PINS.iter() {
+            let (gop, sc) = if cut { (30, Some(40)) } else { (CUT as u32, None) };
+            let (rows, buf) = run(kbps, gop, sc, n, &fixture(f));
+            assert!(rows[CUT].0 && rows[CUT].1 == 0, "{f} {kbps} {cut}: picture {CUT} is an IDR (detected, or the control's scheduled one)");
+            let peak = rows.iter().map(|r| r.7).max().unwrap();
+            table(&alloc::format!("{f} {kbps} kbps, {}", if cut { "scenecut Some(40), gop 30" } else { "control: scenecut None, gop 10" }), &rows);
+            let p = &rows[CUT + 1];
+            assert_eq!(p.1, 1, "{f} {kbps} {cut}: picture {} is a P", CUT + 1);
+            assert_eq!([p.3 as i64, p.4 as i64, p.5 as i64, p.8 as i64, p.6], want, "{f} {kbps} {cut}: the first P after the IDR");
+            assert_eq!(peak, peak_want, "{f} {kbps} {cut}: the peak bucket fullness");
+            assert_eq!(peak > buf, f == 'A' && kbps == 20, "{f} {kbps} {cut}: only A at 20 kbps overflows its bucket (measured)");
+        }
+    }
+}
