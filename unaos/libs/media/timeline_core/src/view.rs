@@ -593,7 +593,7 @@ pub enum DragKind {
     Slip,
     /// NLE3ESLIPDRAG (SR760): the slip modifier on the selected clip's trim handle (`EditorState::slide_selected`).
     Slide,
-    Pan, // STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail)
+    Pan, // STRIAPANNEXT (SR994): the selected AUDIO clip's pan grip (`EditorState::set_selected_pan`; `delta` is the pan change in cq8, not ticks) (file tail) XfadeIn, XfadeOut, // STRIAXFADETHREE (SR9023): the explicit audio crossfade bracket's left / right edge (file tail)
 }
 
 /// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
@@ -718,7 +718,7 @@ impl Drag {
                 st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
                 return Ok(());
             }
-            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st),
+            DragKind::Scrub => return Ok(()), DragKind::TransitionIn | DragKind::TransitionOut => return self.finish_transition(st), DragKind::XfadeIn | DragKind::XfadeOut => return self.finish_xfade(st),
             _ => {}
         }
         if self.toggle { st.select_add(self.track, self.idx)?; } else if st.selection != Some((self.track, self.idx)) { // STRIAMULTISELECTNEXT (SR998): a shift-pressed member becomes primary only now, the set kept
@@ -801,7 +801,7 @@ impl Drag {
         let one = [(self.track, self.idx)];
         let slide_ex: Vec<(usize, usize)>;
         let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
-            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail)
+            DragKind::Marquee | DragKind::Slip => return, DragKind::TransitionIn | DragKind::TransitionOut => return self.snap_transition(st, x), DragKind::TrimIn | DragKind::TrimOut if self.ripple => return self.snap_ripple(st, x), // STRIARIPPLEMORE (SR953): a ripple snaps the edge that moves (file tail) DragKind::XfadeIn | DragKind::XfadeOut => return self.snap_xfade(st, x),
             DragKind::Scrub => {
                 if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
                     self.delta = t - self.origin_tick;
@@ -2184,8 +2184,7 @@ mod ripple_drag_tests {
 fn paint_audio_xfades(c: &mut Canvas, l: Layout, st: &EditorState, labels: &mut Option<&mut dyn Text>) { // STRIAXFADEMORE (SR980): and the painter's labels, for the curve's name
     use crate::schedule::{ENV_ONE, xfade_weight};
     for x in st.timeline.audio_xfades.iter().filter(|x| x.track < l.rows) {
-        let bracket = Transition { at: x.at, kind: TransitionKind::Dissolve, dur: x.dur, from_black: false, to_black: false, ease: crate::Ease::Linear, want: None };
-        let (x0, y0, x1, y1) = l.transition_rect(x.track, &bracket);
+        let (x0, y0, x1, y1) = l.xfade_rect(x); // STRIAXFADETHREE (SR9023): the bracket's one geometry, the hit's too (file tail)
         if x1 <= 0 || x0 >= l.w as i64 {
             continue;
         }
@@ -4495,5 +4494,94 @@ mod striacropthree_tests {
         assert_eq!(CropDrag::begin(&st, l, 160, 90, 80.0, 45.0).map(|d| d.sides), Some(1), "the edge still grabs one side");
         st.timeline = st.timeline.set_crop(0, 0, Crop::NONE).unwrap();
         assert!(CropDrag::begin(&st, l, 160, 90, 160.0, 45.0).is_none(), "an uncropped clip: nothing to move");
+    }
+}
+
+// ---- STRIAXFADETHREE (LEDGER SR9023): the audio crossfade bracket's edge drag (named tail block) ----
+// SR980 owed NLE-XFADE-WIDGET: the explicit audio crossfade's bracket (SR860's `paint_audio_xfades`) had its geometry inline
+// in the painter, so nothing could hit it. `Layout::xfade_rect` is now THE bracket geometry (the painter's and the hit's,
+// on THE transition widget's `transition_rect`), `Layout::xfade_at` the hit. A press within `HANDLE_W` of the drawn left /
+// right edge begins `DragKind::XfadeIn` / `XfadeOut` (the incoming clip, whose head cut it sits on, selected), the sibling
+// of NLETRANSITIONFACE's edge drag: the moving edge (`at` / `at + dur`) snaps through the same `snap_to` / `snap_targets`,
+// and the release is ONE `EditorState::toggle_audio_xfade(Some(dur), Some(curve))` (the curve kept): the right edge gives
+// `dur + delta`, the left `dur - delta` (the record stays anchored at the cut), at least 1; past the incoming clip or the
+// outgoing's handle the model refuses (`Handle`) and nothing changes. The middle of the bracket stays a clip press. The
+// kernel Player names the kinds (vplay.rs `drag_word`) but its press begins only `begin_with` (owed NLE-XFADE-WIDGET-KERNEL).
+
+impl Layout {
+    /// STRIAXFADETHREE (SR9023): THE bracket of an explicit audio crossfade, read by `paint_audio_xfades` and
+    /// [`Layout::xfade_at`]: the transition widget's rect for a dissolve of the record's `dur` on its cut.
+    pub fn xfade_rect(&self, x: &crate::AudioXfade) -> (i64, i64, i64, i64) {
+        let bracket = Transition { at: x.at, kind: TransitionKind::Dissolve, dur: x.dur, from_black: false, to_black: false, ease: crate::Ease::Linear, want: None };
+        self.transition_rect(x.track, &bracket)
+    }
+    /// STRIAXFADETHREE (SR9023): the explicit audio crossfade whose bracket is under `(x, y)`: its index in
+    /// `Timeline::audio_xfades` (a visible row only; the last drawn wins).
+    pub fn xfade_at(&self, tl: &Timeline, x: f64, y: f64) -> Option<usize> {
+        let mut hit = None;
+        for (i, xf) in tl.audio_xfades.iter().enumerate().filter(|(_, xf)| xf.track < self.rows) {
+            let (x0, y0, x1, y1) = self.xfade_rect(xf);
+            if x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64 {
+                hit = Some(i);
+            }
+        }
+        hit
+    }
+}
+
+impl Drag {
+    /// STRIAXFADETHREE (SR9023): a press at `(x, y)` on the edge zone of an explicit audio crossfade's bracket: the edge
+    /// drag (the incoming clip selected; `idx` is that clip); `None` anywhere else (the middle stays a clip press). The left
+    /// zone wins where a narrow bracket's zones overlap.
+    pub fn begin_xfade_edge(st: &mut EditorState, l: Layout, x: f64, y: f64, nosnap: bool) -> Option<Drag> {
+        let xf = *st.timeline.audio_xfades.get(l.xfade_at(&st.timeline, x, y)?)?;
+        let (x0, _, x1, _) = l.xfade_rect(&xf);
+        let hw = HANDLE_W as f64;
+        let kind = if x < x0 as f64 + hw {
+            DragKind::XfadeIn
+        } else if x >= x1 as f64 - hw {
+            DragKind::XfadeOut
+        } else {
+            return None;
+        };
+        let ci = st.timeline.tracks.get(xf.track)?.clips.iter().position(|c| c.at == xf.at)?;
+        st.select(xf.track, ci).ok()?;
+        Some(Drag {
+            kind,
+            track: xf.track,
+            idx: ci,
+            origin_tick: l.tick_at(x),
+            layout: l,
+            delta: 0,
+            to_track: xf.track,
+            origin: (x, y),
+            at: (x, y),
+            snap: !nosnap,
+            additive: false,
+            guide: None,
+        })
+    }
+    /// The record on the head cut of clip `(track, idx)`.
+    fn xfade_of(&self, st: &EditorState) -> Option<crate::AudioXfade> {
+        let at = st.timeline.tracks.get(self.track)?.clips.get(self.idx)?.at;
+        st.timeline.audio_xfades.iter().find(|x| x.track == self.track && x.at == at).copied()
+    }
+    /// The edge drag's ONE commit: the incoming clip selected, then `toggle_audio_xfade` of the pointer's length, curve kept.
+    fn finish_xfade(&self, st: &mut EditorState) -> Result<(), EditError> {
+        let x = self.xfade_of(st).ok_or(EditError::Transition)?;
+        st.select(self.track, self.idx)?;
+        let dur = if self.kind == DragKind::XfadeIn { x.dur - self.delta } else { x.dur + self.delta };
+        st.toggle_audio_xfade(Some(dur.max(1)), Some(x.curve))
+    }
+    /// Snap the moving edge (`at` for the left, `at + dur` for the right) to the nearest clip edge or the playhead within
+    /// [`SNAP_PX`], as the transition edge snaps.
+    fn snap_xfade(&mut self, st: &EditorState, x: f64) {
+        let Some(xf) = self.xfade_of(st) else { return };
+        let e = if self.kind == DragKind::XfadeIn { xf.at } else { xf.at + xf.dur };
+        let ex = self.layout.x_of(e) as f64 + (x - self.origin.0);
+        if let Some(t) = snap_to(&self.layout, &snap_targets(st, &[], true), ex) {
+            self.delta = t - e;
+            self.guide = Some(t);
+        }
     }
 }

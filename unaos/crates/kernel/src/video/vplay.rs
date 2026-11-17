@@ -1903,7 +1903,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 202120192020192022] = [
+const EDIT_KEYS: [(u8, &str); 20212019202019202220] = [ // STRIAXFADETHREE (SR9023): 18 -> 20, `c` / `C` the crossfade words (the host's own keys)
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1934,6 +1934,7 @@ const EDIT_KEYS: [(u8, &str); 202120192020192022] = [
     (b'e', "freeze"), // STRIAKFREEZE (SR9008): the bare `freeze` word at the playhead (file tail)
     (b'Q', "mute"), (b'S', "solo"), // STRIAKMUTE (SR9017): the host's own characters for the track's mute / solo (SR926; file tail)
     (b'v', "gain-"), (b'V', "gain+"), (b':', "track-gain-"), (b'"', "track-gain+"), // STRIAKTRACKGAIN (LEDGER SR9016): the host KEYS' bytes and words for clip / track gain, on the top audio clip at the playhead (file tail)
+    (b'c', "xfade"), (b'C', "xfade-curve"), // STRIAXFADETHREE (SR9023): the host KEYS' c / C, `EditorState::verb` words (SR860 / SR925)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -2319,7 +2320,7 @@ fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
         DragKind::TrimOut => "trim-out",
         DragKind::Move => "move",
         DragKind::Marquee => "marquee",
-        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it)
+        DragKind::Scrub => "scrub", DragKind::TransitionIn => "transition-in", DragKind::TransitionOut => "transition-out", DragKind::Slip => "slip", DragKind::Slide => "slide", DragKind::Pan => "pan", // STRIAPANNEXT (SR994): the pan grip's word (never begun here: edit_press refuses it) DragKind::XfadeIn => "xfade-in", DragKind::XfadeOut => "xfade-out", // STRIAXFADETHREE (SR9023): the audio crossfade bracket's edges (the Player's press never begins them)
     }
 }
 

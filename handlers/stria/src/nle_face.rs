@@ -2449,7 +2449,7 @@ impl Face {
     /// The press began a transition edge drag (`Some(true)`); `None`: not on a widget's edge (Alt / Option: no snap).
     fn press_transition_edge(&mut self, x: f64, y: f64, mods: u8) -> Option<bool> {
         let l = self.layout();
-        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, (mods & bandy::MOD_ALT != 0) != self.snap_off)?;
+        let d = Drag::begin_transition_edge(&mut self.state, l, x, y, (mods & bandy::MOD_ALT != 0) != self.snap_off).or_else(|| Drag::begin_xfade_edge(&mut self.state, l, x, y, mods & bandy::MOD_ALT != 0))?; // STRIAXFADETHREE (SR9023): else an audio crossfade bracket's edge (timeline_core view.rs tail)
         self.drag = Some(d);
         Some(true)
     }
