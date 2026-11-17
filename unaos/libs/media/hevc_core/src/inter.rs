@@ -671,3 +671,65 @@ pub(crate) fn uni_explicit(p: i32, (w0, o0, lwd): (i32, i32, u32)) -> i32 {
 pub(crate) fn bi_explicit(p0: i32, p1: i32, (w0, o0, lwd): (i32, i32, u32), (w1, o1, _): (i32, i32, u32)) -> i32 {
     (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)
 }
+
+// ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): one log2WD per component across both lists (named tail block) ----
+#[cfg(test)]
+mod hevcconcealweightedbimixed_tests {
+    use super::explicit_weight_of;
+    use crate::slice::{PredWeights, WeightList};
+    use alloc::vec;
+
+    /// 7-56 / 8.5.3.3.4.3: log2WD is luma_log2_weight_denom (or ChromaLog2WeightDenom) + shift1 for EITHER list, so
+    /// `bi_explicit` reading L0's log2WD (its L1 triple's `_`) is exact even when the two lists' weights and offsets differ.
+    #[test]
+    fn one_log2wd_per_component_across_both_lists() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 4,
+            l0: WeightList { luma: vec![(48, 5), (64, 0)], chroma: vec![[(20, 3), (12, -2)], [(16, 0), (16, 0)]] },
+            l1: WeightList { luma: vec![(16, -3), (64, 0)], chroma: vec![[(8, -5), (24, 7)], [(16, 0), (16, 0)]] },
+        };
+        for bd in [8u32, 10] {
+            for high in [false, true] {
+                for c in 0..3 {
+                    for r in 0..2i8 {
+                        let (a, b) = (explicit_weight_of(Some(&pw), c, 0, r, bd, high), explicit_weight_of(Some(&pw), c, 1, r, bd, high));
+                        let denom = if c == 0 { 6 } else { 4 };
+                        assert_eq!(a.2, b.2, "bd {bd} high {high} c {c} ref_idx {r}: one log2WD for both lists");
+                        assert_eq!(a.2, denom + (14 - bd).max(2), "bd {bd} high {high} c {c} ref_idx {r}: denom + shift1");
+                        if r == 0 {
+                            assert_ne!((a.0, a.1), (b.0, b.1), "bd {bd} high {high} c {c}: the table's lists really differ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// HEVCCONCEALWEIGHTEDCHROMA (SR776): the chroma arm of `explicit_weight_of` is 7-56 — ChromaOffset = Clip3(-half,
+    /// half - 1, half + delta_chroma_offset - ((half * ChromaWeight) >> ChromaLog2WeightDenom)), half = 128 (or
+    /// 1 << (BitDepthC - 1) with high_precision), shifted by BitDepthC - 8 (0 with high_precision); log2WD = 7 + shift1.
+    /// Hand-computed: Cb (96, delta -12), Cr (160, delta 2) at ref_idx 0; the clip pair (128, +-300) at ref_idx 1.
+    #[test]
+    fn chroma_offset_rule_7_56() {
+        let pw = PredWeights {
+            luma_log2_weight_denom: 6,
+            chroma_log2_weight_denom: 7,
+            l0: WeightList { luma: vec![(64, 0), (64, 0)], chroma: vec![[(96, -12), (160, 2)], [(128, 300), (128, -300)]] },
+            l1: WeightList::default(),
+        };
+        // (bd, high, ref_idx, Cb (w, o, log2WD), Cr (w, o, log2WD))
+        let cases = [
+            (8u32, false, 0i8, (96, 20, 13u32), (160, -30, 13u32)),
+            (8, false, 1, (128, 127, 13), (128, -128, 13)),
+            (10, false, 0, (96, 80, 11), (160, -120, 11)),
+            (8, true, 0, (96, 20, 13), (160, -30, 13)),
+            (10, true, 0, (96, 116, 11), (160, -126, 11)),
+        ];
+        for (bd, high, r, cb, cr) in cases {
+            assert_eq!(explicit_weight_of(Some(&pw), 1, 0, r, bd, high), cb, "Cb bd {bd} high {high} ref_idx {r}");
+            assert_eq!(explicit_weight_of(Some(&pw), 2, 0, r, bd, high), cr, "Cr bd {bd} high {high} ref_idx {r}");
+        }
+    }
+}
+
