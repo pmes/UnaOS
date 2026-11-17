@@ -1287,7 +1287,7 @@ pub fn bin_hit(tl: &Timeline, w: u32, h: u32, x: f64, y: f64) -> Option<usize> {
 
 /// The word a click on bin row `i` sends: SR852's `insert <reel> 0 <duration>` (the reel's whole range at the playhead).
 pub fn bin_word(tl: &Timeline, i: usize) -> Option<alloc::string::String> {
-    tl.sources.get(i).map(|s| alloc::format!("insert {} 0 {}", s.reel, s.duration))
+    bin_range_word(tl, i, None) // STRIABINTHREE (SR9025): the whole reel is the range word's default (file tail)
 }
 
 /// Paint the bin on a `w` x `h` canvas in `order`: [`BG`], one [`ROW`]-striped row per source with its swatch and, through
@@ -1582,6 +1582,130 @@ mod striabinmore_tests {
                 let on = y >= y0 && y < y1;
                 assert_eq!(px(&got, w, w as i64 - 1, y), if on { TICK } else { px(&base, w, w as i64 - 1, y) }, "top {top} y {y}");
                 assert_eq!(px(&got, w, w as i64 - BIN_THUMB_W - 1, y), px(&base, w, w as i64 - BIN_THUMB_W - 1, y), "left of the thumb unchanged");
+            }
+        }
+    }
+}
+
+// ---- STRIABINTHREE (LEDGER SR9025): the bin's row range and the thumb's inverse (named tail block) ----
+// A drag along a bin row picks a source range: the row's strip ([`bin_strip`], right of the swatch, left of SR976's thumb
+// column) maps x to the reel's ticks ([`bin_range`]), and the lay is the SAME word road, [`bin_range_word`] =
+// `insert <reel> <in> <out>` (SR852), whose `None` range is the whole reel ([`bin_word`]). A press on SR976's thumb drags the
+// first shown row through [`bin_thumb_top`], the inverse of [`bin_thumb`], clamped by SR939's `bin_clamp`. While a range
+// drag shows, [`paint_bin_range`] paints a [`HANDLE`] bar under the row; with no drag nothing is painted.
+
+/// The least drag (px) along a row that picks a range; a shorter one is the row's click (the whole reel).
+pub const BIN_RANGE_MIN: i64 = 4;
+
+/// The x span `(x0, x1)` of a bin row's range strip on a canvas `w` px wide: the label's x to the thumb column.
+pub fn bin_strip(w: u32) -> (i64, i64) {
+    (BIN_PAD * 2 + BIN_SWATCH, w as i64 - BIN_THUMB_W)
+}
+
+/// The source range `(in, out)` a drag from `x0` to `x1` along bin row `i` picks: each x clamped to [`bin_strip`] and
+/// mapped to the reel's ticks (rounded), sorted; `None` off the rows, on a strip of no width, or for an empty range.
+pub fn bin_range(tl: &Timeline, w: u32, i: usize, x0: f64, x1: f64) -> Option<(i64, i64)> {
+    let dur = tl.sources.get(i)?.duration;
+    let (lx, rx) = bin_strip(w);
+    let sw = rx - lx;
+    if sw <= 0 || dur <= 0 {
+        return None;
+    }
+    let tick = |x: f64| (((x as i64).clamp(lx, rx) - lx) * dur * 2 + sw) / (2 * sw);
+    let (a, b) = (tick(x0), tick(x1));
+    let (a, b) = (a.min(b), a.max(b));
+    (b > a).then_some((a, b))
+}
+
+/// The word laying bin row `i`'s range: `insert <reel> <in> <out>`, the whole reel (`0 <duration>`) for `None`.
+pub fn bin_range_word(tl: &Timeline, i: usize, range: Option<(i64, i64)>) -> Option<alloc::string::String> {
+    tl.sources.get(i).map(|s| {
+        let (a, b) = range.unwrap_or((0, s.duration));
+        alloc::format!("insert {} {} {}", s.reel, a, b)
+    })
+}
+
+/// The first shown row whose thumb top sits nearest `y0` on a bin canvas `h` px tall (the inverse of [`bin_thumb`]'s
+/// `h * top / n`), clamped by [`bin_clamp`].
+pub fn bin_thumb_top(tl: &Timeline, h: u32, y0: f64) -> usize {
+    let (n, hh) = (tl.sources.len() as i64, h as i64);
+    if hh <= 0 {
+        return 0;
+    }
+    let y = (y0 as i64).max(0);
+    bin_clamp(tl, h, ((y * n * 2 + hh) / (2 * hh)) as usize)
+}
+
+/// `px` (a bin paint of `w` x `h` from first shown row `top`) with a 3 px [`HANDLE`] bar at the bottom of row `row`
+/// between `x0` and `x1`, clamped to [`bin_strip`]: the range a drag picks.
+pub fn paint_bin_range(tl: &Timeline, px: Vec<u8>, (w, h): (u32, u32), top: usize, order: Order, row: usize, (x0, x1): (i64, i64)) -> Vec<u8> {
+    let (lx, rx) = bin_strip(w);
+    let (a, b) = (x0.min(x1).clamp(lx, rx), x0.max(x1).clamp(lx, rx));
+    let y1 = bin_row_y(row) - bin_offset(bin_clamp(tl, h, top)) + BIN_ROW_H as i64;
+    let mut c = Canvas { w, h, order, px };
+    c.rect(a, y1 - 3, b, y1, HANDLE);
+    c.px
+}
+
+#[cfg(test)]
+mod striabinthree_tests {
+    use super::*;
+    use crate::Timeline;
+
+    /// Four sources A..D (48 ticks each) at 25 fps, none on a track.
+    fn tl() -> Timeline {
+        let mut tl = Timeline::new(25);
+        for r in ["A", "B", "C", "D"] {
+            tl.add_source(r, 48);
+        }
+        tl
+    }
+
+    fn px(c: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [c[i], c[i + 1], c[i + 2], c[i + 3]]
+    }
+
+    #[test]
+    fn striabinthree_range_maps_the_strip_to_ticks() {
+        let tl = tl();
+        assert_eq!(bin_strip(120), (20, 116));
+        assert_eq!(bin_range(&tl, 120, 1, 20.0, 68.0), Some((0, 24)));
+        assert_eq!(bin_range(&tl, 120, 1, 116.0, 68.0), Some((24, 48)), "sorted");
+        assert_eq!(bin_range(&tl, 120, 1, 0.0, 500.0), Some((0, 48)), "clamped to the strip");
+        assert_eq!(bin_range(&tl, 120, 1, 22.0, 22.0), None, "empty");
+        assert_eq!(bin_range(&tl, 120, 4, 20.0, 68.0), None, "off the rows");
+        assert_eq!(bin_range(&tl, 24, 0, 20.0, 68.0), None, "a strip of no width");
+        assert_eq!(bin_range_word(&tl, 1, Some((3, 9))).as_deref(), Some("insert B 3 9"));
+        assert_eq!(bin_range_word(&tl, 1, None), bin_word(&tl, 1));
+        assert_eq!(bin_word(&tl, 1).as_deref(), Some("insert B 0 48"));
+        assert_eq!(bin_range_word(&tl, 4, None), None);
+    }
+
+    #[test]
+    fn striabinthree_thumb_top_inverts_the_thumb() {
+        let tl = tl();
+        let h = 2 * BIN_ROW_H;
+        for top in 0..3 {
+            let (y0, _) = bin_thumb(&tl, h, top).unwrap();
+            assert_eq!(bin_thumb_top(&tl, h, y0 as f64), top, "top {top}");
+        }
+        assert_eq!(bin_thumb_top(&tl, h, -5.0), 0);
+        assert_eq!(bin_thumb_top(&tl, h, 500.0), 2, "clamped");
+        assert_eq!(bin_thumb_top(&tl, 0, 9.0), 0);
+    }
+
+    #[test]
+    fn striabinthree_range_bar_paints_only_its_band() {
+        let tl = tl();
+        let (w, h) = (120u32, 2 * BIN_ROW_H);
+        let base = paint_bin_from(&tl, w, h, 1, Order::Rgba, None);
+        let got = paint_bin_range(&tl, base.clone(), (w, h), 1, Order::Rgba, 2, (68, 30));
+        let y1 = BIN_ROW_H as i64 * 2;
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let on = (30..68).contains(&x) && (y1 - 3..y1).contains(&y);
+                assert_eq!(px(&got, w, x, y), if on { HANDLE } else { px(&base, w, x, y) }, "x {x} y {y}");
             }
         }
     }

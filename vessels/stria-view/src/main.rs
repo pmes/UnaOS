@@ -207,7 +207,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| token(face, tok)) } { // STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| binthree_token(face, tok)).or_else(|| token(face, tok)) } { // STRIABINTHREE (SR9025): `binpress` / `binmove` / `binrelease` (file tail); STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -1091,5 +1091,54 @@ mod striabinmore_tests {
         let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
         assert_eq!(drive(&mut plain, "binwheel:1,binsize:9:9"), vec!["bad token binwheel:1".to_string(), "bad token binsize:9:9".to_string()]);
         println!("striabinmore witness: --split --bin --do binsize:320:18,binwheel:1,ruler:15,bin:0 -> B at 15 on V1, bintop 1");
+    }
+}
+
+// ---- STRIABINTHREE (LEDGER SR9025): the bin's pointer tokens (named tail block) ----
+
+/// `binpress:<x>:<y>`, `binmove:<x>:<y>`, `binrelease:<x>:<y>`: a press, move or release on the bin Surface, each a plain
+/// `BrowserButton` / `BrowserMouseMove` stamped with the bin's Surface number into `Face::on` (the face's own bin input:
+/// SR976's thumb drag, a row's range drag). `None` with no bin (a bad token).
+fn binthree_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
+    let parts: Vec<&str> = tok.split(':').collect();
+    let (word, x, y) = match parts.as_slice() {
+        [w @ ("binpress" | "binmove" | "binrelease"), x, y] => (*w, x.parse::<f64>().ok()?, y.parse::<f64>().ok()?),
+        _ => return None,
+    };
+    let n = face.bin()?.n;
+    let msg = match word {
+        "binmove" => SMessage::BrowserMouseMove(x, y, n),
+        w => SMessage::BrowserButton { down: w == "binpress", x, y, mods: 0, surface: n },
+    };
+    face.on(&msg);
+    Some(Vec::new())
+}
+
+#[cfg(test)]
+mod striabinthree_tests {
+    use super::*;
+    use timeline_core::{Clip, Mode, SourceId};
+
+    fn bin_cli() -> Cli {
+        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true }
+    }
+
+    /// `ruler:15,binpress:20:27,binmove:168:27,binrelease:168:27` drags along row B from the strip's start to its middle:
+    /// B 0..25 laid at 15 on V1, one undo step; without a bin the tokens are bad.
+    #[test]
+    fn striabinthree_bin_drag_tokens_lay_a_range() {
+        let c = bin_cli();
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "ruler:15,binpress:20:27,binmove:168:27,binrelease:168:27", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 25, 15), Mode::Insert).unwrap());
+        assert_eq!(face.state.undo_depth(), 1);
+        let (tl, src) = nle_face::synth_fixture();
+        let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut plain, "binpress:20:27"), vec!["bad token binpress:20:27".to_string()]);
+        println!("striabinthree witness: --split --bin --do ruler:15,binpress:20:27,binmove:168:27,binrelease:168:27 -> B 0..25 at 15 on V1");
     }
 }
