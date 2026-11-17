@@ -104,16 +104,14 @@ impl Face {
     }
 }
 
-/// The bytes of a font file, read once and kept for the process.
+/// The bytes of a font file, read once and kept for the process. The first caller of a path reads it under the font-file lock: one read and one leaked slice per path (TEXTHOST-FILE-BYTES-RACE SR1013).
 fn file_bytes(path: &std::path::Path) -> Option<&'static [u8]> {
     use crate::FONT_FILES as FILES; // TEXTHOST-FACE-BYTES-WITNESS (SR1012): the same file cache, hoisted to the file tail so `files_loaded_bytes` reads it
-    let m = FILES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(b) = m.lock().ok()?.get(path) {
-        return *b;
+    let mut g = FILES.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    if let Some(&b) = g.get(path) {
+        return b;
     }
-    let b = std::fs::read(path).ok().map(|v| &*Box::leak(v.into_boxed_slice()));
-    m.lock().ok()?.insert(path.to_path_buf(), b);
-    b
+    *g.entry(path.to_path_buf()).or_insert_with(|| std::fs::read(path).ok().map(|v| &*Box::leak(v.into_boxed_slice()))) // TEXTHOST-FILE-BYTES-RACE (SR1013): ONE guard from the get through the vacant arm, so a racing first reader waits and takes the one slice
 }
 
 type LoadedMap = HashMap<FaceKey, &'static Face>;
@@ -1245,5 +1243,57 @@ mod facebytes_witness_tests {
         assert_eq!(FacesReport::default().line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 0 KB files (0)");
         let r = FacesReport { face_bytes: 511, file_bytes: 512, ..FacesReport::default() };
         assert_eq!(r.line(), "fonts: 0 faces (0 instances, 0 families) in 0 KB + 1 KB files (0)");
+    }
+}
+
+// ---- TEXTHOSTFILEBYTESRACE (LEDGER SR1013): one first reader per font file under the font-file lock (named tail block) ----
+
+#[cfg(test)]
+mod filebytes_race_tests {
+    use super::*;
+
+    /// Inter through a `..` prefix of this block's own (PathBuf equality keeps `..`, so the key is cold for this test).
+    fn inter_via(prefix: &str) -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(prefix).join("fonts/inter/InterVariable.ttf")
+    }
+
+    /// Eight threads first-read ONE cold path at once: the map holds one entry of the file's length, every thread got
+    /// that very slice (address and length), so no copy lives outside the map and `files_of` counts the path once
+    /// (before SR1013 each thread read and leaked its own copy and the last `insert` replaced the others).
+    #[test]
+    fn filebytes_race_cold_one_slice_kat() {
+        let p = inter_via("../../unaos/..");
+        let disk = std::fs::metadata(&p).expect("Inter on disk").len() as usize;
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (p, gate) = (p.clone(), gate.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    file_bytes(&p).map(|b| (b.as_ptr() as usize, b.len()))
+                })
+            })
+            .collect();
+        let got: Vec<(usize, usize)> = threads.into_iter().map(|t| t.join().unwrap().expect("Inter reads")).collect();
+        {
+            let g = FONT_FILES.get().expect("a file was read").lock().unwrap();
+            let kept = g.get(&p).copied().flatten().expect("one entry for the path");
+            assert_eq!(kept.len(), disk, "the kept slice is the file");
+            assert!(got.iter().all(|&a| a == (kept.as_ptr() as usize, disk)), "one slice for every first reader: {got:?}");
+            let (n, bytes) = files_of(&g);
+            assert!(n >= 1 && bytes >= disk);
+        }
+        assert!(files_loaded_bytes() >= disk);
+    }
+
+    /// A warm path is served from the map: the same slice (address and length) as the first read and as the entry.
+    #[test]
+    fn filebytes_race_warm_same_slice() {
+        let p = inter_via("../text_host/../..");
+        let a = file_bytes(&p).expect("Inter reads");
+        let b = file_bytes(&p).expect("Inter warm");
+        assert!(std::ptr::eq(a, b), "a warm call reads nothing new");
+        let g = FONT_FILES.get().expect("a file was read").lock().unwrap();
+        assert!(std::ptr::eq(g.get(&p).copied().flatten().expect("the entry"), a));
     }
 }
