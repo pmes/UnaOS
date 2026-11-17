@@ -1735,7 +1735,7 @@ fn font_size_used(paint: &crate::layout::PaintStyle, specified: f32) -> f32 {
 
 /// AETHERCSSOMLINEHEIGHTUSED (SR824): the resolved `line-height` (CSSOM: `normal` if the computed value is `normal`,
 /// else the used value). `mult` is the inherited `PaintStyle::line_height` in layout_core's sign encoding (css.rs
-/// `line-height` arm: > 0 a <number>, < 0 -(px) for a length / %, 0 `normal`); em and % were already replayed against
+/// `line-height` arm: > 0 a <number>, < 0 -(px) for a length / %, 0 `normal`, LINE_HEIGHT_ZERO an author 0 that reads 0px, SR843); em and % were already replayed against
 /// the element's own used font by `reresolve_font_relative`. `None` is the keyword `normal`; otherwise the px the line
 /// box takes: the layout's own resolver `Fonts::line_height` over SR819's used font size.
 fn line_height_used(paint: &crate::layout::PaintStyle, mult: f32, specified: f32, sel: layout_core::FontSel) -> Option<f32> {

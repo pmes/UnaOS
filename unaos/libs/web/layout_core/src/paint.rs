@@ -1014,3 +1014,23 @@ impl<H: Host> PaintStyle<H> {
         }
     }
 }
+
+// ---- AETHERLINEHEIGHTZERO (LEDGER SR843): the line-height encoding's author zero, apart from normal (named tail block) ----
+
+/// AETHERLINEHEIGHTZERO (SR843): `PaintStyle::line_height` is one f32 in a sign encoding (css.rs `line-height` arm):
+/// > 0 a <number> (x the element's own font size), < 0 -(px) for a length / % (inherited as is), 0.0 `normal` (every
+/// default and literal 0.0 means normal), and this marker an author `0` / `0px` / `0%`: a zero line box (CSS 2.2
+/// §10.8.1; Chromium stacks the lines and reads `0px`). It is negative, so it rides the length road, and != 0.0, so the
+/// `normal` tests read it as a value; the length resolvers read it as exactly 0 px through [`line_height_length_px`].
+pub const LINE_HEIGHT_ZERO: f32 = -f32::MIN_POSITIVE;
+
+/// AETHERLINEHEIGHTZERO (SR843): the px of an encoded length (`mult` < 0): -mult, the author-zero marker exactly 0.0.
+pub fn line_height_length_px(mult: f32) -> f32 {
+    if mult == LINE_HEIGHT_ZERO { 0.0 } else { -mult }
+}
+
+/// AETHERLINEHEIGHTZERO (SR843): the arm's write for an author value: a RAW zero (`0`, `0px`, `0%`) is
+/// [`LINE_HEIGHT_ZERO`], anything else its `encoded` form (a negative keeps today's clamp to 0.0).
+pub fn line_height_zero_or(raw: f32, encoded: f32) -> f32 {
+    if raw == 0.0 { LINE_HEIGHT_ZERO } else { encoded }
+}

@@ -210,7 +210,7 @@ fn metrics<F: Fonts + ?Sized>(fonts: &F, run: &TextRun) -> Metrics {
             let lh = if run.line_height > 0.0 {
                 run.font_size * run.line_height
             } else if run.line_height < 0.0 {
-                -run.line_height
+                crate::paint::line_height_length_px(run.line_height)
             } else {
                 run.font_size * 1.15
             };

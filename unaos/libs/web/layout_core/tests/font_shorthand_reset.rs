@@ -151,7 +151,7 @@ fn font_initial_takes_the_initials() {
     assert_eq!(s.paint.italic, Some(false));
     assert_eq!(s.paint.weight, Some(FontWeight::Abs(400)));
     assert_eq!(s.paint.stretch, Some(100));
-    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal));
+    assert_eq!(s.paint.small_caps, Some(layout_core::paint::Caps::Normal), "font-variant-caps initial");
     assert_eq!(s.paint.line_height, Some(0.0), "line-height normal");
     assert_eq!(s.paint.font_size, Some(16.0), "medium");
     assert_eq!(s.paint.font_size_rel, Some((2, 0.0)), "absolute");

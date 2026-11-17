@@ -418,7 +418,7 @@ pub fn run_faces(sel: &FontSel, text: &str) -> Vec<&'static Face> {
 /// metrics sum.
 pub fn line_height(font: &Face, size: f32, mult: f32) -> f32 {
     if mult < 0.0 {
-        -mult
+        layout_core::paint::line_height_length_px(mult)
     } else if mult > 0.0 {
         size * mult
     } else {
