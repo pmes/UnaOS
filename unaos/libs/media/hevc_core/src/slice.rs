@@ -143,7 +143,7 @@ pub fn peek_pps_id(rbsp: &[u8], nal: &NalHeader) -> Result<u32> {
 
 /// One list of pred_weight_table (7.3.6.3). HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): the flags of an entry `skip` marks (the
 /// current picture) are not present and infer 0 (7.4.7.3: LumaWeight 2^denom, offset 0).
-fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32, skip: &[bool]) -> Result<WeightList> {
+fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32, skip: &[bool], half: (i32, i32)) -> Result<WeightList> {
     let n = n as usize;
     let present = |i: usize| !skip.get(i).copied().unwrap_or(false);
     let mut lf = Vec::with_capacity(n);
@@ -164,7 +164,11 @@ fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, ch
             if !(-128..=127).contains(&d) {
                 return Err(Error::Invalid("delta_luma_weight"));
             }
-            lw = ((1 << luma_denom) + d, r.se());
+            let o = r.se();
+            if !(-half.0..half.0).contains(&o) {
+                return Err(Error::Invalid("luma_offset"));
+            }
+            lw = ((1 << luma_denom) + d, o);
         }
         w.luma.push(lw);
         let mut cw = [(1i32 << chroma_denom, 0i32); 2];
@@ -174,7 +178,11 @@ fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, ch
                 if !(-128..=127).contains(&d) {
                     return Err(Error::Invalid("delta_chroma_weight"));
                 }
-                *c = ((1 << chroma_denom) + d, r.se());
+                let o = r.se();
+                if !(-4 * half.1..4 * half.1).contains(&o) {
+                    return Err(Error::Invalid("delta_chroma_offset"));
+                }
+                *c = ((1 << chroma_denom) + d, o);
             }
         }
         w.chroma.push(cw);
@@ -326,9 +334,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                     return Err(Error::Invalid("delta_chroma_log2_weight_denom"));
                 }
                 let mut w = PredWeights { luma_log2_weight_denom: ld, chroma_log2_weight_denom: cd as u32, ..Default::default() };
-                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32, &skip[0])?;
+                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32, &skip[0], wp_half_ranges(sps))?;
                 if h.slice_type == SliceType::B {
-                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32, &skip[1])?;
+                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32, &skip[1], wp_half_ranges(sps))?;
                 }
                 h.pred_weights = Some(w);
             }
@@ -442,4 +450,15 @@ fn curr_entries(h: &SliceHeader, sps: &Sps) -> Result<[Vec<bool>; 2]> {
     rps.lt_curr = h.long_term.iter().filter(|l| l.used).map(|_| 0).collect();
     let mask = |list0: bool| -> Result<Vec<bool>> { Ok(crate::dpb::list_entries(&rps, h, list0)?.iter().map(|e| e.2).collect()) };
     Ok([mask(true)?, if h.slice_type == SliceType::B { mask(false)? } else { Vec::new() }])
+}
+
+// ---- HEVCWPOFFSETRANGE (LEDGER SR1043): the pred_weight_table offset half ranges of 7.4.7.3 (named tail block) ----
+
+/// HEVCWPOFFSETRANGE (SR1043): (WpOffsetHalfRangeY, WpOffsetHalfRangeC) of the SPS (7.4.3.2.2): 1 << (BitDepth - 1)
+/// under high_precision_offsets_enabled_flag, else 1 << 7 whatever the depth. `pred_weight_list` refuses luma_offset_lX
+/// outside -WpOffsetHalfRangeY..WpOffsetHalfRangeY - 1 and delta_chroma_offset_lX outside -4 * WpOffsetHalfRangeC ..
+/// 4 * WpOffsetHalfRangeC - 1 (7.4.7.3).
+fn wp_half_ranges(sps: &Sps) -> (i32, i32) {
+    let half = |bd: u32| 1i32 << if sps.range_ext.high_precision_offsets_enabled_flag { bd - 1 } else { 7 };
+    (half(sps.bit_depth_luma), half(sps.bit_depth_chroma))
 }
