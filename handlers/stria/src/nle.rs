@@ -1514,3 +1514,15 @@ fn xformed(tl: &Timeline, s: &timeline_core::schedule::Step, a: &[u8], b: &[u8],
     let (top, under) = (b.as_chunks::<4>().0, a.as_chunks::<4>().0);
     Some(timeline_core::xform_frame(top, under, w as usize, h as usize, tl.crop_at(ti, s.out_t, false), reel_fit(tl, src, false), xf, m.t).into_flattened())
 }
+
+// ---- STRIAPROXYOFF (LEDGER SR915): detach a source's proxy (named tail block) ----
+impl Sources {
+    /// Detach source `id`'s proxy (the preview reads the original again); false when none was attached. One retain under
+    /// the slot's lock; a render already running keeps its own `Arc` of the proxy until its run ends.
+    pub fn clear_proxy(&self, id: SourceId) -> bool {
+        let Ok(mut v) = self.proxy.lock() else { return false };
+        let before = v.len();
+        v.retain(|(s, _)| *s != id);
+        v.len() != before
+    }
+}
