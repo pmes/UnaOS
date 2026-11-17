@@ -41,6 +41,7 @@ pub struct EditorState {
     pub playhead: i64,
     /// Pixels per tick, `ZOOM_MIN..=ZOOM_MAX`.
     pub zoom: u32,
+    pub squeeze: u32, // STRIAZOOMFITTHREE (SR9040): ticks per `zoom` px, 1 except below ZOOM_MIN (file tail)
     undo: Vec<Timeline>,
     redo: Vec<Timeline>, hist: UndoNames, // STRIAUNDOHISTORY (SR876): each undo / redo entry's word, moved with the stacks (file tail)
     /// NLE3d (SR302): the selected transition, `(track, index into tracks[track].transitions)`; the face's widget.
@@ -53,7 +54,7 @@ pub struct EditorState {
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0, track_maps: (Vec::new(), Vec::new()), target: None }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, squeeze: 1, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0, track_maps: (Vec::new(), Vec::new()), target: None }
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -154,7 +155,7 @@ impl EditorState {
     }
     /// Double (`step > 0`) or halve (`step < 0`) the zoom, `|step|` times, within `ZOOM_MIN..=ZOOM_MAX`.
     pub fn zoom_by(&mut self, step: i32) {
-        let mut z = self.zoom;
+        if self.squeeze_by(step) { return; } let mut z = self.zoom; // STRIAZOOMFITTHREE (SR9040): below the floor the squeeze steps (file tail)
         for _ in 0..step.unsigned_abs().min(8) {
             z = if step > 0 { z.saturating_mul(2) } else { z / 2 };
         }
@@ -338,7 +339,7 @@ impl EditorState {
                 Ok(())
             }
             "zoom0" => {
-                self.zoom = ZOOM_DEFAULT;
+                self.zoom = ZOOM_DEFAULT; self.squeeze = 1; // STRIAZOOMFITTHREE (SR9040): the default has no squeeze
                 Ok(())
             }
             "[" => self.key_trim(Edge::In, -1), // STRIACLIPSPEEDTHREE (SR9031): one timeline tick on a fast clip (file tail)
@@ -1135,7 +1136,7 @@ mod striainsertoverwrite_tests {
 // ---- STRIAZOOMTOFIT (LEDGER SR859): the fit zoom (named tail block) ----
 // A view change, not an edit: no `commit`, no undo step, the timeline untouched. The range is `0..end` (the whole
 // timeline) or `min at .. max end` over the selection SET; the zoom is the largest integer px-per-tick that puts the
-// range inside `w` px, within `ZOOM_MIN..=ZOOM_MAX`; a range wider than `w` ticks gets ZOOM_MIN (no fractional zoom).
+// range inside `w` px, within `ZOOM_MIN..=ZOOM_MAX`; a range wider than `w` ticks gets ZOOM_MIN and a squeeze (SR9040).
 // The origin (the range's start) is the caller's to anchor: the host face writes it into `Face.view`; the kernel
 // Player's fit is owed (NLE-ZOOMFIT-KERNEL). Nothing to fit (an empty timeline, an empty set): `EditError::NoClip`.
 impl EditorState {
@@ -1147,7 +1148,7 @@ impl EditorState {
         if span < 1 {
             return Err(EditError::NoClip);
         }
-        self.zoom = (w as i64 / span).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32;
+        self.zoom = (w as i64 / span).clamp(ZOOM_MIN as i64, ZOOM_MAX as i64) as u32; self.squeeze = squeeze_of(w, span); // STRIAZOOMFITTHREE (SR9040): the ticks per px a range wider than `w` needs (file tail)
         Ok(start)
     }
     /// The ticks a fit covers: `0..end`, or the selection set's `min at .. max end`.
@@ -4273,5 +4274,44 @@ impl EditorState {
             Some(c) if c.rate_q16 > 0x1_0000 => self.trim_by_ticks(edge, d),
             _ => self.trim(edge, d),
         }
+    }
+}
+
+// ---- STRIAZOOMFITTHREE (LEDGER SR9040): the squeeze, a zoom below one px per tick (named tail block) ----
+// `EditorState.squeeze` is ticks per `zoom` px: 1 at every zoom from ZOOM_MIN up (every geometry then equals the old one),
+// above 1 only at ZOOM_MIN. A fit of a range wider than `w` ticks sets the smallest squeeze that puts it inside `w` px;
+// `zoom-` at ZOOM_MIN doubles it (to [`SQUEEZE_MAX`]), `zoom+` while squeezed halves it, `zoom0` resets it. View state,
+// like the zoom: no undo step, not in the EDL. The Layout copies it (view.rs `Layout.squeeze`).
+
+/// The widest squeeze (ticks per px).
+pub const SQUEEZE_MAX: u32 = 1 << 20;
+
+/// The squeeze a fit of `span` ticks into `w` px needs: 1 when it fits at one px per tick, else ceil(span / w).
+fn squeeze_of(w: u32, span: i64) -> u32 {
+    let w = w.max(1) as i64;
+    if span <= w {
+        return 1;
+    }
+    ((span + w - 1) / w).min(SQUEEZE_MAX as i64) as u32
+}
+
+impl EditorState {
+    /// The zoom step below the floor: true when it moved (or held) the squeeze, false for the old zoom rule.
+    fn squeeze_by(&mut self, step: i32) -> bool {
+        let n = step.unsigned_abs().min(8);
+        if step < 0 && self.zoom <= ZOOM_MIN {
+            self.zoom = ZOOM_MIN;
+            self.squeeze = (self.squeeze.max(1) as u64 * (1u64 << n)).min(SQUEEZE_MAX as u64) as u32;
+            return true;
+        }
+        if step > 0 && self.squeeze > 1 {
+            self.squeeze = (self.squeeze >> n).max(1);
+            return true;
+        }
+        false
+    }
+    /// The view scale `(zoom, squeeze)`: `zoom` px per `squeeze` ticks (what a "zoom changed" test compares).
+    pub fn scale(&self) -> (u32, u32) {
+        (self.zoom, self.squeeze)
     }
 }

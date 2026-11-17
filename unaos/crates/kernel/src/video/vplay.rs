@@ -1894,6 +1894,7 @@ struct Edit {
     st: timeline_core::editor::EditorState,
     said: bool,
     view: Option<(i64, i64)>, // STRIAZOOMFITMORE (SR965): the fit's anchored view `(t0, the playhead it was anchored at)`, the kernel's `Face.view`
+    fit: Option<(bool, (u32, u32), Option<(i64, i64)>)>, // STRIAZOOMFITTHREE (SR9040): the last fit (sel, scale, view), the kernel's `Face.zoom_fit` (file tail)
 }
 
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
@@ -1948,7 +1949,7 @@ fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> ti
         return timeline_core::editor::EditorState::new(e.st.timeline.clone());
     }
     let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
-    *g = Some(Edit { path: String::from(path), st, said: false, view: None });
+    *g = Some(Edit { path: String::from(path), st, said: false, view: None, fit: None });
     fresh
 }
 
@@ -1979,7 +1980,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { edit_fit_mark(&mut e.fit, r.is_some(), verb, st.scale(), e.view); return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if let Some(r) = edit_history(st, verb) { return r; } if !edit_undo_word(verb) { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = flag_targetedit_target(&st.timeline, verb, at, verb); // STRIAKMUTE (SR9017): mute / solo first undo the flag they set, else shown_clip (file tail); KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail); STRIAKTRACKGAIN (LEDGER SR9016): the gain words take the top audio clip (file tail)
             match top {
                 Some((t, i)) => {
@@ -2038,7 +2039,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     if let Some(ms) = pts_ms {
         e.st.seek(tick_of(tb, ms));
     }
-    let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st).anchor(e.view, e.st.playhead); // STRIAZOOMFITMORE (SR965): the fit's anchored view, THE rule the host face applies (file tail)
+    edit_refit(e, &live, w as u32); let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st).anchor(e.view, e.st.playhead); // STRIAZOOMFITTHREE (SR9040): refit on a width change (file tail). STRIAZOOMFITMORE (SR965): the fit's anchored view, THE rule the host face applies (file tail)
     let mut lab = ViewLabels(0);
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
@@ -2057,8 +2058,8 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
 /// face's words); the EDL carries no zoom, so nothing is saved. `Some(ms)`: the playhead for the seek door, which
 /// re-presents the frame and with it the band at the new zoom; `None`: at a bound, unchanged.
 fn edit_zoom(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -> Option<u64> {
-    let z0 = st.zoom;
-    if !matches!(st.verb(verb), Some(Ok(()))) || st.zoom == z0 {
+    let z0 = st.scale(); // STRIAZOOMFITTHREE (SR9040): the scale, so a squeeze step counts
+    if !matches!(st.verb(verb), Some(Ok(()))) || st.scale() == z0 {
         serial_println!("[nle] edit {} at={} unchanged", verb, at);
         return None;
     }
@@ -2747,7 +2748,7 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
 // returns in `Edit.view`, which [`view_band`] applies through timeline_core's ONE anchor rule (`Layout::anchor`, the host
 // face's `Face::layout` rule), so the noted layout a press hits is the anchored one. A view change: no undo step, no save
 // (the EDL carries no zoom). Wire: `[nle] edit <zoom-fit|zoom-sel> at=<tick> zoom=<px> t0=<tick>`, `[nle] edit
-// <zoom-fit|zoom-sel> at=<tick> refused (<why>|no view)`. Owed: NLE-ZOOMFIT-KERNEL-WITNESS, NLE-ZOOMFIT-REFIT-KERNEL.
+// <zoom-fit|zoom-sel> at=<tick> refused (<why>|no view)`. Owed: NLE-ZOOMFIT-KERNEL-WITNESS (the refit: SR9040, file tail).
 
 /// The fit keys on the Player's editor state (the EDIT lock held by [`edit_key`]): `None` for any other verb; else
 /// `Some(Some(ms))`, the playhead for the seek door (which re-presents the band at the fit), or `Some(None)` refused.
@@ -3496,4 +3497,42 @@ fn help_over(px: Vec<u8>, l: timeline_core::view::Layout) -> Vec<u8> {
         x += kw + HELP_KEY_GAP + pw + HELP_COL_GAP;
     }
     c.px
+}
+
+// ---- STRIAZOOMFITTHREE (LEDGER SR9040): the Player refits on a band width change (named tail block) ----
+// handlers.md §5 NLE5b's NLE-ZOOMFIT-REFIT-KERNEL, the host face's SR907 rule (`fit_mark` / `refit_on_resize`) in the
+// Player: a successful `\` / `|` remembers `(sel, scale, view)` in `Edit.fit` ([`edit_fit_mark`]); [`view_band`], before
+// its layout, runs [`edit_refit`]: when the band last painted ([`band_layout`]) had another width and the scale and the
+// view still equal the fit's (a zoom key changes the scale), timeline_core's ONE fit again at the new width, the origin
+// into `Edit.view` anchored at the playhead. The memory is taken first, so a refusal (the set emptied) is said once. The
+// EDIT lock is the caller's; BAND is read by try (EDIT then BAND, the order everywhere). A view change: no undo, no save.
+// Wire: `[nle] edit <zoom-fit|zoom-sel> refit w=<px> zoom=<px> squeeze=<n> t0=<tick>`, `[nle] edit <zoom-fit|zoom-sel>
+// refit w=<px> refused (<why>)`. Owed: NLE-ZOOMFIT-KERNEL-WITNESS (player.rs `tests nle`).
+
+/// After [`edit_fit`] ran `verb`: remember a successful fit's `(sel, scale, view)`; a refused one leaves the memory.
+fn edit_fit_mark(fit: &mut Option<(bool, (u32, u32), Option<(i64, i64)>)>, done: bool, verb: &str, scale: (u32, u32), view: Option<(i64, i64)>) {
+    if done {
+        *fit = Some((verb == "zoom-sel", scale, view));
+    }
+}
+
+/// [`view_band`]'s refit at the band width `w` while the last fit holds (the rule above).
+fn edit_refit(e: &mut Edit, path: &str, w: u32) {
+    let Some((_, prev)) = band_layout(path) else { return };
+    if prev.w == w || e.fit.is_none() {
+        return;
+    }
+    let Some((sel, scale, view)) = e.fit.take() else { return };
+    if scale != e.st.scale() || view != e.view {
+        return;
+    }
+    let verb = if sel { "zoom-sel" } else { "zoom-fit" };
+    match e.st.fit(w, sel) {
+        Ok(t0) => {
+            e.view = Some((t0, e.st.playhead));
+            e.fit = Some((sel, e.st.scale(), e.view));
+            serial_println!("[nle] edit {} refit w={} zoom={} squeeze={} t0={}", verb, w, e.st.zoom, e.st.squeeze, t0);
+        }
+        Err(why) => serial_println!("[nle] edit {} refit w={} refused ({})", verb, w, why),
+    }
 }

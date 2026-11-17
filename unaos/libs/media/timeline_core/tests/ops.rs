@@ -3499,3 +3499,41 @@ fn striagapsthree_editor_keep_one_undo_step() {
     assert_eq!(st.timeline, k);
     assert_eq!(st.verb("close-gaps keep x"), None);
 }
+
+// ---- STRIAZOOMFITTHREE (LEDGER SR9040): the squeeze, a fit below one px per tick (named tail block) ----
+
+/// 35 ticks fit in 20 px at zoom 1 squeeze 2 (the end inside the window); `zoom+` halves the squeeze, `zoom-` at the
+/// floor doubles it, `zoom0` resets it; the ruler visits every tick at squeeze 1 and whole-second strides squeezed; never
+/// an undo step.
+#[test]
+fn striazoomfitthree_fractional_fit() {
+    use timeline_core::editor::{EditorState, ZOOM_DEFAULT, ZOOM_MIN};
+    use timeline_core::view::Layout;
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+    let mut st = EditorState::new(tl.clone());
+    let l = Layout::of(320, 160, &st);
+    assert_eq!(l.squeeze, 1);
+    assert_eq!(l.ruler_ticks(10, 25).collect::<Vec<_>>(), (l.t0..=10).collect::<Vec<_>>(), "squeeze 1: every tick");
+    assert_eq!(st.fit(20, false), Ok(0));
+    assert_eq!(st.scale(), (ZOOM_MIN, 2), "35 ticks in 20 px: 2 ticks per px");
+    let l = Layout::of(20, 160, &st).anchor(Some((0, st.playhead)), st.playhead);
+    assert_eq!((l.squeeze, l.t0, l.page()), (2, 0, 40));
+    assert!(l.x_of(tl.end()) <= l.w as i64, "the end inside the window");
+    assert_eq!((l.x_of(34), l.tick_at(17.0)), (17, 34));
+    assert_eq!(st.verb("zoom+"), Some(Ok(())));
+    assert_eq!(st.scale(), (1, 1), "zoom+ halves the squeeze first");
+    assert_eq!(st.verb("zoom-"), Some(Ok(())));
+    assert_eq!(st.verb("zoom-"), Some(Ok(())));
+    assert_eq!(st.scale(), (1, 4), "zoom- at the floor doubles the squeeze");
+    let l = Layout::of(20, 160, &st);
+    assert_eq!(l.ruler_ticks(200, 25).collect::<Vec<_>>(), vec![0, 50, 100, 150, 200], "squeezed: seconds, 8 px apart");
+    assert_eq!(st.verb("zoom0"), Some(Ok(())));
+    assert_eq!(st.scale(), (ZOOM_DEFAULT, 1));
+    assert_eq!(st.fit(320, false), Ok(0));
+    assert_eq!(st.scale(), (9, 1), "a fit that fits has no squeeze");
+    assert_eq!((st.undo_depth(), &st.timeline), (0, &tl), "a view change, not an edit");
+}

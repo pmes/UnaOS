@@ -214,7 +214,7 @@ pub struct Face {
     snap_off: bool, // STRIASNAPTOGGLE (SR892): the drag snap default is off (the `snap` word flips it; Alt at the press inverts it) (file tail)
     autosave: Autosave, // STRIAAUTOSAVE (SR883): what `<stem>.autosave.edl` holds and the edits / ticks since it was written (file tail)
     keymap: Keymap, // STRIAKEYBOARDMAP (SR886): the key overlay over KEYS, consulted first ([`Face::with_keys`], file tail)
-    zoom_fit: Option<(bool, u32, Option<(i64, i64)>)>, // STRIAZOOMFITKEYS (SR907): the last fit (sel, zoom, view); a resize refits while it still holds (file tail)
+    zoom_fit: Option<(bool, (u32, u32), Option<(i64, i64)>)>, // STRIAZOOMFITKEYS (SR907): the last fit (sel, zoom, view); STRIAZOOMFITTHREE (SR9040): the zoom is the scale `(zoom, squeeze)`; a resize refits while it still holds (file tail)
     pcache: PreviewCache, // STRIAPERFPREVIEWCACHE (SR918): the preview still's key and the reel summaries (file tail)
     laid: Option<String>, // STRIAINSERTMARKSKEYS (SR924): the last laid insert's line (file tail)
     lcache: LabelCache, // STRIAPERFLABELSHAPE (SR935): the shaped label lines by text (file tail)
@@ -554,12 +554,12 @@ impl Face {
     /// Zoom by `step` ([`EditorState::zoom_by`]) keeping the tick under `x` under `x` (the view is anchored there).
     pub fn zoom_at(&mut self, step: i32, x: f64) -> bool {
         let t = self.layout().tick_at(x);
-        let z0 = self.state.zoom;
+        let z0 = self.state.scale(); // STRIAZOOMFITTHREE (SR9040): the scale, so a squeeze step counts
         self.state.zoom_by(step);
-        if self.state.zoom == z0 {
+        if self.state.scale() == z0 {
             return false;
         }
-        let t0 = (t - x.max(0.0) as i64 / self.state.zoom as i64).max(0);
+        let t0 = (t - x.max(0.0) as i64 * self.state.squeeze.max(1) as i64 / self.state.zoom as i64).max(0); // STRIAZOOMFITTHREE (SR9040): the squeezed px -> ticks
         self.view = Some((t0, self.state.playhead));
         true
     }
@@ -5823,12 +5823,12 @@ mod striatcset_tests {
 impl Face {
     /// Remember the fit word `v` just applied, with the zoom and the view it set.
     fn fit_mark(&mut self, v: &str) {
-        self.zoom_fit = Some((v == "zoom-sel", self.state.zoom, self.view));
+        self.zoom_fit = Some((v == "zoom-sel", self.state.scale(), self.view)); // STRIAZOOMFITTHREE (SR9040): the scale
     }
     /// After a tracks resize: fit again at the new width when the last view word was a fit (its zoom and view still hold).
     fn refit_on_resize(&mut self) {
         let Some((sel, zoom, view)) = self.zoom_fit.take() else { return };
-        if zoom != self.state.zoom || view != self.view {
+        if zoom != self.state.scale() || view != self.view { // STRIAZOOMFITTHREE (SR9040): the scale
             return;
         }
         self.fit_verb(if sel { "zoom-sel" } else { "zoom-fit" });
