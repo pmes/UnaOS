@@ -72,6 +72,7 @@ pub trait RenderSink {
     }
     /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
     fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
+    fn proxy(&self) -> bool { false } // STRIAPROXYMEDIA (SR882): true = a source's attached proxy decodes its video (the preview's sinks); an export's sink never (file tail)
 }
 
 /// What a render did.
@@ -195,11 +196,12 @@ pub struct Sources {
     /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
     /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
     stand_in: std::sync::Mutex<Vec<SourceId>>,
+    proxy: std::sync::Mutex<Vec<(SourceId, Arc<Media>)>>, // STRIAPROXYMEDIA (SR882): each source's attached preview proxy, locked for one find or one push (file tail)
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default(), proxy: Default::default() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -517,7 +519,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     }
     let (w, h) = (r.width, r.height);
     let black: Vec<u8> = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
-    let tol = tl.tb.to_ns(1) / 2;
+    let tol = tl.tb.to_ns(1) / 2; let proxy = sink.proxy(); // STRIAPROXYMEDIA (SR882): the sink says whether an attached proxy decodes (file tail)
     let mut vmix_run: Option<Vid> = None; // NLE3: a transition's outgoing run
     let mut vid: Option<Vid> = None;
     // NLE4: one audio decoder per track; the k-th audio step is the k-th mix run.
@@ -529,16 +531,16 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, None) => {
                 vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
                 match s.vmix {
-                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &black, w, h, tol, &mut r)?),
+                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &black, w, h, tol, &mut r, proxy)?),
                     None => sink.frame(s.out_t, w, h, &black),
                 }
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
-                let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
+                let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r, proxy)?;
                 let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
-                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
+                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r, proxy)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -679,6 +681,7 @@ fn vid_frame(
     seek: Option<i64>,
     tol: i64,
     r: &mut RenderReport,
+    proxy: bool, // STRIAPROXYMEDIA (SR882): open on the source's attached proxy when one is (the preview's render)
 ) -> Result<Frame, RenderError> {
     let target = tl.tb.to_ns(src_t);
     if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) {
@@ -686,7 +689,7 @@ fn vid_frame(
             Some(k) => k,
             None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
         };
-        *run = None; *run = Some(Vid::open(sources.get(src)?, src, key)?); // SWAPBACK-NLECACHE-SHARED (SR397): the outgoing run parks before the new open takes the reel's slot
+        *run = None; *run = Some(match sources.proxied(src, proxy) { Some(p) => Vid::open(&p, src, key).map(|mut v| { v.size = Some((v.track.width, v.track.height)); v })?, None => Vid::open(sources.get(src)?, src, key)? }); // STRIAPROXYMEDIA (SR882): the attached proxy's run, its size seeded (no size-switch line per paint); SWAPBACK-NLECACHE-SHARED (SR397): the outgoing run parks before the new open takes the reel's slot
         r.seeks += 1;
     }
     let f = run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames);
@@ -716,11 +719,12 @@ fn vmix_frame(
     h: u32,
     tol: i64,
     r: &mut RenderReport,
+    proxy: bool, // STRIAPROXYMEDIA (SR882): handed to the outgoing source's vid_frame
 ) -> Result<Vec<u8>, RenderError> {
     let Some(m) = s.vmix else { return Ok(b.to_vec()) };
     let a = match m.src {
         Some(src) => {
-            let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
+            let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r, proxy)?;
             reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
@@ -885,8 +889,8 @@ impl Sources {
 /// COLOURONE (LEDGER SR328): a frame of source `src` as RGBA, converted by its reel's colour (`Track::colour`, the
 /// container's else the bitstream's) through `dsp::video::Frame::to_rgba_colour`. Both of the render's frame -> RGBA
 /// lines (a step's own source and a transition's outgoing source) call it. AV1PLAYERCOLOUR (SR347): by the reel track's `chroma_of`.
-fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
-    let track = sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]));
+fn src_rgba(sources: &Sources, src: SourceId, f: &Frame, run: Option<&Track>) -> Vec<u8> {
+    let track = run.or_else(|| sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]))); // STRIAPROXYMEDIA (SR882): the run's own track (a proxy's colour; the same track for an original)
     f.to_rgba_colour(track.and_then(|t| t.colour.as_ref()), track.map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of))
 }
 
@@ -903,14 +907,14 @@ fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
 fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32, fit: SizePolicy) -> Result<(Vec<u8>, u32, u32), RenderError> {
     let now = (f.width, f.height);
     let reel = sources.get(src).ok().and_then(|m| m.video.map(|i| (m.demux.tracks()[i].width, m.demux.tracks()[i].height))).filter(|&(rw, rh)| rw > 0 && rh > 0).unwrap_or(now);
-    let last = run.as_mut().and_then(|v| v.size.replace(now));
+    let last = run.as_mut().and_then(|v| v.size.replace(now)); let rt = run.as_ref().map(|v| &v.track); // STRIAPROXYMEDIA (SR882): the run's track converts its frame
     if now == (w, h) {
-        return Ok((src_rgba(sources, src, f), w, h));
+        return Ok((src_rgba(sources, src, f, rt), w, h));
     }
     if reel != (w, h) {
         return Err(RenderError::Size { src, width: now.0, height: now.1 });
     }
-    let rgba = src_rgba(sources, src, f);
+    let rgba = src_rgba(sources, src, f, rt);
     if fit == SizePolicy::Adopt {
         if last != Some(now) {
             log::info!("[STRIA] :: nle size switch reel={} {}x{} adopted", src.0, now.0, now.1);
@@ -986,5 +990,77 @@ impl Sources {
         let a = m.audio.map(|i| &m.demux.tracks()[i]); // STRIAINFOREELAUDIO (SR761): the reel's audio track, as the Player's first audio track
         let (adec, arate) = a.map_or(("", String::new()), |t| (crate::media::track_audio_decoder(t, &m.demux), crate::media::track_audio_bitrate(t, Some(&m.demux))));
         Some(crate::media::summary_parts(codec, w, h, &profile, &rate, adec, &arate)).filter(|s| !s.is_empty())
+    }
+}
+
+// ---- STRIAPROXYMEDIA (LEDGER SR882): a source's preview proxy (named tail block) ----
+/// STRIAPROXYMEDIA (LEDGER SR882): why [`Sources::set_proxy`] refused a proxy. Each refusal by name; the face prints it
+/// after `proxy: <reel>: `.
+#[derive(Debug)]
+pub enum ProxyError {
+    /// The proxy's bytes did not open (or the original `id` is not a source: `RenderError::NoSource`).
+    Open(RenderError),
+    /// The proxy has no video stream.
+    NoVideo,
+    /// The proxy's video length (whole ticks) differs from the original's by more than one tick.
+    Stale { proxy: i64, source: i64 },
+}
+
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyError::Open(e) => write!(f, "proxy open: {e}"),
+            ProxyError::NoVideo => write!(f, "no video stream"),
+            ProxyError::Stale { proxy, source } => write!(f, "stale (proxy {proxy} ticks, source {source})"),
+        }
+    }
+}
+impl std::error::Error for ProxyError {}
+
+/// STRIAPROXYMEDIA (LEDGER SR882): a source may carry ONE attached proxy (a smaller encode of the same frames at the same
+/// source times). [`render`] opens a video run on it only when its sink says [`RenderSink::proxy`] (the face's preview and
+/// played still); an export's sink never does, so an export reads the original. The slot is `&self` behind a Mutex (the
+/// face's `Arc<Sources>` is shared with a running export), locked for one find + clone or one push, never across a decode.
+impl Sources {
+    /// Attach `bytes` as source `id`'s proxy (replacing any earlier one). Refused by name: an unknown `id` or bytes that do not
+    /// open ([`ProxyError::Open`]), no video stream ([`ProxyError::NoVideo`]), a video length off the original's by more
+    /// than one tick ([`ProxyError::Stale`]).
+    pub fn set_proxy(&self, id: SourceId, bytes: Vec<u8>) -> Result<(), ProxyError> {
+        let source = self.video_ticks(id).ok_or(ProxyError::Open(RenderError::NoSource(id)))?;
+        let m = Media::open(bytes).map_err(ProxyError::Open)?;
+        let proxy = self.media_video_ticks(&m).ok_or(ProxyError::NoVideo)?;
+        if (proxy - source).abs() > 1 {
+            return Err(ProxyError::Stale { proxy, source });
+        }
+        if let Ok(mut v) = self.proxy.lock() {
+            v.retain(|(s, _)| *s != id);
+            v.push((id, Arc::new(m)));
+        }
+        Ok(())
+    }
+    /// Source `id` has an attached proxy.
+    pub fn has_proxy(&self, id: SourceId) -> bool {
+        self.proxy.lock().map(|v| v.iter().any(|(s, _)| *s == id)).unwrap_or(false)
+    }
+    /// Source `id`'s video stream length in whole ticks (the span a proxy of it renders); `None` without a video stream.
+    pub fn video_ticks(&self, id: SourceId) -> Option<i64> {
+        self.media_video_ticks(self.get(id).ok()?)
+    }
+    /// The byte length of source `id`'s file as it was opened.
+    pub fn byte_len(&self, id: SourceId) -> Option<u64> {
+        Some(self.get(id).ok()?.demux.bytes().len() as u64)
+    }
+    /// `m`'s video track duration in whole ticks ([`SourceIndex::duration`]'s rounding, the video stream alone).
+    fn media_video_ticks(&self, m: &Media) -> Option<i64> {
+        let ns = m.demux.tracks()[m.video?].duration_ns;
+        Some(((ns as i128 + 1_000) * self.tb.den as i128 / (self.tb.num.max(1) as i128 * 1_000_000_000)) as i64)
+    }
+    /// The run [`vid_frame`] opens for `id`: its attached proxy when `want` (the sink's [`RenderSink::proxy`]) and one is
+    /// attached, else `None` (the original through `get`).
+    fn proxied(&self, id: SourceId, want: bool) -> Option<Arc<Media>> {
+        if !want {
+            return None;
+        }
+        self.proxy.lock().ok()?.iter().find(|(s, _)| *s == id).map(|(_, m)| Arc::clone(m))
     }
 }

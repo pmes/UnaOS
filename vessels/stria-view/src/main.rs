@@ -290,7 +290,7 @@ fn main() {
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
     if c.script.is_some() || c.out.is_some() || c.two || !windowed {
-        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)));
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_reel_paths(c.srcs.iter().map(|(r, p)| (r.clone(), p.into())).collect()));
         std::process::exit(witness(&c, face));
     }
 
@@ -300,7 +300,7 @@ fn main() {
     let mut engine: Option<Box<dyn std::any::Any>> = None; // NLEPLAYAUDIO (SR676): the audio engine, held for the process life
     {
         let rx = synapse.subscribe();
-        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new))));
+        let face = play_audio(&c, &mut engine, route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).with_doc(c.edl.as_deref().map(std::path::Path::new)).with_reel_paths(c.srcs.iter().map(|(r, p)| (r.clone(), p.into())).collect())));
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("proxy", "Proxy"), // STRIAPROXYMEDIA (SR882): a half-size H.264 of the selected clip's source, beside it; the preview reads it, an export never
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }

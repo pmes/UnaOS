@@ -3648,3 +3648,107 @@ fn nle5dexportmessageetastallwitness_paused_face_export_stall() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("nle5dexportmessageetastallwitness: paused face export_stall {stall:?}, line \"{line}\"");
 }
+
+// ---- STRIAPROXYMEDIA (LEDGER SR882): a source's preview proxy — the preview reads it, the export the original (named tail block) ----
+
+/// The preview (its sink asks for the proxy) shows an attached proxy's frame; the export's render (its sink never asks)
+/// reads the original: its fnv is the un-proxied export's.
+#[test]
+fn striaproxymedia_preview_reads_the_proxy_export_the_original() {
+    use stria::nle_export::{AudioOut, export, video_named};
+    use stria::nle_face::preview;
+    let (tl, src) = synth_fixture();
+    let (a, b) = (tl.sources[0].id, tl.sources[1].id);
+    let mut alt = Sources::new(&tl);
+    alt.add(a, synth_source(5000, 50, 25)).unwrap();
+    alt.add(b, synth_source(1000, 50, 25)).unwrap();
+    let dir = common::scratch_dir("striaproxymedia", "export");
+    std::fs::create_dir_all(&dir).unwrap();
+    let before = export(&tl, 0..tl.end(), &src, &dir, video_named("png", tl.tb).unwrap(), AudioOut::None).unwrap();
+    let orig = preview(&tl, &src, 3).unwrap().expect("A's frame at 3");
+    assert!(!src.has_proxy(a));
+    src.set_proxy(a, synth_source(5000, 50, 25)).unwrap();
+    assert!(src.has_proxy(a) && !src.has_proxy(b));
+    let shown = preview(&tl, &src, 3).unwrap().expect("the proxy's frame at 3");
+    let want = preview(&tl, &alt, 3).unwrap().expect("the 5000 reel's frame at 3");
+    assert_eq!((shown.width, shown.height), (64, 48));
+    assert!(shown.rgba == want.rgba && shown.rgba != orig.rgba, "the preview reads the proxy");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let after = export(&tl, 0..tl.end(), &src, &dir, video_named("png", tl.tb).unwrap(), AudioOut::None).unwrap();
+    assert_eq!((after.fnv, after.frames), (before.fnv, before.frames), "the export reads the original");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxymedia: preview at 3 = the proxy's frame; export fnv {:016x} unchanged", after.fnv);
+}
+
+/// `Sources::set_proxy` refuses by name: a proxy of another length (`Stale`), an unknown source and bytes that do not open
+/// (`Open`); nothing is attached.
+#[test]
+fn striaproxymedia_set_proxy_refusals() {
+    use stria::nle::{ProxyError, RenderError};
+    let (tl, src) = synth_fixture();
+    let a = tl.sources[0].id;
+    let e = src.set_proxy(a, synth_source(5000, 30, 25)).unwrap_err();
+    assert!(matches!(e, ProxyError::Stale { proxy: 30, source: 50 }), "{e}");
+    assert_eq!(e.to_string(), "stale (proxy 30 ticks, source 50)");
+    assert!(matches!(src.set_proxy(SourceId(9), synth_source(5000, 50, 25)), Err(ProxyError::Open(RenderError::NoSource(_)))));
+    assert!(matches!(src.set_proxy(a, vec![0u8; 64]), Err(ProxyError::Open(_))));
+    assert!(!src.has_proxy(a));
+    println!("striaproxymedia refusals: {e}");
+}
+
+/// The verb over reels written beside each other: `proxy` builds `A.proxy.mp4` (half size, every frame) off the face's
+/// thread and attaches it; again reuses it; a stamp that no longer matches the source is stale and rebuilt. View-only.
+#[test]
+fn striaproxymedia_verb_builds_reuses_and_rebuilds() {
+    let dir = common::scratch_dir("striaproxymedia", "verb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (pa, pb) = (dir.join("A.mp4"), dir.join("B.mp4"));
+    std::fs::write(&pa, synth_source(0, 50, 25)).unwrap();
+    std::fs::write(&pb, synth_source(1000, 50, 25)).unwrap();
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false).with_reel_paths(vec![("A".into(), pa.clone()), ("B".into(), pb.clone())]);
+    face.state.select(0, 0).unwrap();
+    let (proxy, stamp, work) = stria::nle_face::proxy_paths(&pa);
+    assert_eq!(proxy, dir.join("A.proxy.mp4"));
+    assert!(face.verb("proxy"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: building (new) -> {}", proxy.display())));
+    assert!(face.proxying());
+    assert!(face.verb("proxy") && face.last_error.take().is_some_and(|l| l.starts_with("proxy: busy (")), "one job at a time");
+    assert!(face.wait_proxy());
+    assert!(!face.proxying());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: 50 frames -> {}", proxy.display())));
+    assert!(proxy.is_file() && !work.exists() && stria::nle_face::proxy_fresh(&pa));
+    let d = gneiss_pal::dsp::demux::Demuxer::open(std::fs::read(&proxy).unwrap()).unwrap();
+    let v = d.tracks().iter().position(|t| t.kind == gneiss_pal::dsp::demux::TrackKind::Video).expect("a video track");
+    assert_eq!((d.tracks()[v].width, d.tracks()[v].height, d.track_samples(v).count()), (32, 24, 50));
+    assert!(face.verb("proxy"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: reused {}", proxy.display())));
+    std::fs::write(&stamp, "0 0\n").unwrap();
+    assert!(!stria::nle_face::proxy_fresh(&pa));
+    assert!(face.verb("proxy"));
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: building (stale) -> {}", proxy.display())));
+    assert!(face.wait_proxy());
+    assert_eq!(face.last_error.take(), Some(format!("proxy: A: 50 frames -> {}", proxy.display())));
+    assert!(stria::nle_face::proxy_fresh(&pa));
+    assert_eq!(face.state.timeline, tl, "view-only: the timeline is untouched");
+    assert!(!face.dirty(), "view-only: the document stays clean");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("striaproxymedia verb: built 32x24 x 50, reused, rebuilt when stale");
+}
+
+/// Refusals by name on the message line, and `proxy` is the VERBS word right before `help`.
+#[test]
+fn striaproxymedia_verb_refusals() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("proxy"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: no clip selected"));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("proxy"));
+    assert_eq!(face.last_error.take().as_deref(), Some("proxy: A: no source path"));
+    assert!(!face.proxying() && !face.dirty());
+    assert_eq!(VERBS[VERBS.len() - 2], "proxy");
+    assert_eq!(VERBS.last(), Some(&"help"));
+    println!("striaproxymedia refusals: no clip selected; A: no source path; VERBS[{}] = proxy", VERBS.len() - 2);
+}
