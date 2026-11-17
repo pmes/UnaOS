@@ -5601,7 +5601,7 @@ pub struct BinSurface {
     pub n: u32,
     pub canvas: (u32, u32),
     buttons: bool,
-    pub top: usize, wheel: i64, // STRIABINSCROLL (SR939): the first shown row and the wheel's notch remainder in thousandths of dy (file tail)
+    pub top: usize, wheel: i64, grab: Option<BinGrab>, // STRIABINSCROLL (SR939): the first shown row and the wheel's notch remainder in thousandths of dy (file tail); STRIABINTHREE (SR9025): the press's thumb or row drag (file tail)
 }
 
 impl Face {
@@ -5610,7 +5610,7 @@ impl Face {
     pub fn with_bin(mut self, n: u32) -> Face {
         let Some(s) = self.split else { return self };
         let rows = self.state.timeline.sources.len().max(1) as u32;
-        self.split = Some(Split { bin: Some(BinSurface { n, canvas: (self.canvas.0, view::BIN_ROW_H * rows), buttons: false, top: 0, wheel: 0 }), ..s }); // STRIABINSCROLL (SR939): the first shown row and the wheel's remainder
+        self.split = Some(Split { bin: Some(BinSurface { n, canvas: (self.canvas.0, view::BIN_ROW_H * rows), buttons: false, top: 0, wheel: 0, grab: None }), ..s }); // STRIABINSCROLL (SR939): the first shown row and the wheel's remainder; STRIABINTHREE (SR9025): no drag
         self
     }
     /// The bin's Surface, when the face has one.
@@ -5635,14 +5635,14 @@ impl Face {
                 }
                 changed
             }
-            SMessage::BrowserButton { down: true, .. } => {
+            SMessage::BrowserButton { down: true, x, y, .. } => { // STRIABINTHREE (SR9025): the press's point
                 set(self, BinSurface { buttons: true, ..b });
-                false
+                self.bin_press(x, y) // STRIABINTHREE (SR9025): a press grabs the thumb or arms a row's range (file tail)
             }
-            SMessage::BrowserButton { down: false, x, y, .. } => self.bin_click(x, y),
+            SMessage::BrowserButton { down: false, x, y, .. } => self.bin_release(x, y), // STRIABINTHREE (SR9025): a drag's end, else the click (file tail)
             SMessage::BrowserClick(x, y, _) if !b.buttons => self.bin_click(x, y),
             SMessage::BrowserScroll(_, dy, _) => self.bin_scroll(dy), // STRIABINSCROLL (SR939): the wheel scrolls the rows (file tail)
-            _ => false,
+            SMessage::BrowserMouseMove(x, y, _) => self.bin_move(x, y), _ => false, // STRIABINTHREE (SR9025): a move drives the press's drag (file tail)
         })
     }
     /// A click on the bin at `(x, y)`: the row's word (`view::bin_hit` -> `view::bin_word`) through [`Face::verb`];
@@ -5650,14 +5650,13 @@ impl Face {
     fn bin_click(&mut self, x: f64, y: f64) -> bool {
         let Some(b) = self.bin() else { return false };
         let tl = &self.state.timeline;
-        let Some(i) = view::bin_hit_from(tl, b.canvas.0, b.canvas.1, b.top, x, y) else { return false }; if let Some(r) = self.bin_unused(i) { return r; } let Some(word) = view::bin_word(&self.state.timeline, i) else { return false }; // STRIABINSCROLL (SR939): the hit shifted by the bin's first shown row; a reel on no track laid by its media's kind (file tail)
-        self.verb(&word)
+        let Some(i) = view::bin_hit_from(tl, b.canvas.0, b.canvas.1, b.top, x, y) else { return false }; self.bin_lay(i, None) // STRIABINSCROLL (SR939): the hit shifted by the bin's first shown row; a reel on no track laid by its media's kind (file tail); STRIABINTHREE (SR9025): the whole reel through the one lay fn (file tail)
     }
     /// The bin's pixels (`Role::Bin`): timeline_core view's `paint_bin`, the labels through [`Labels`].
     fn paint_bin(&self) -> Vec<u8> {
         let (w, h) = self.bin().map(|b| b.canvas).unwrap_or(self.canvas);
         let mut lab = self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache)));
-        view::paint_bin_thumb(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text)) // STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail); STRIABINMORE (SR976): the scroll thumb on overflow (view.rs tail)
+        self.bin_range_paint(view::paint_bin_thumb(&self.state.timeline, w, h, self.bin().map_or(0, |b| b.top), vo(self.order), lab.as_mut().map(|t| t as &mut dyn view::Text))) // STRIABINTHREE (SR9025): a row drag's range bar (file tail); STRIABINSCROLL (SR939): the rows from the first shown one (timeline_core view.rs tail); STRIABINMORE (SR976): the scroll thumb on overflow (view.rs tail)
     }
     /// [`Face::frames`]' blits, with the bin's appended when the face has one.
     fn bin_blit(&mut self, mut v: Vec<SMessage>) -> Vec<SMessage> {
@@ -6847,7 +6846,7 @@ impl Face {
     /// A click on bin row `i` whose reel sits on no track: laid at the playhead on the first track of a kind its media
     /// holds (`Some(true)`; no such track: the word's refusal by name on the message line). `None` for a reel on a track
     /// or one with no media opened (the word road decides).
-    fn bin_unused(&mut self, i: usize) -> Option<bool> {
+    fn bin_unused(&mut self, i: usize, range: Option<(i64, i64)>) -> Option<bool> { // STRIABINTHREE (SR9025): the source range (None: the whole reel)
         let r = view::bin_rows(&self.state.timeline).into_iter().nth(i)?;
         if r.kind != view::BinKind::Unused {
             return None;
@@ -6856,9 +6855,9 @@ impl Face {
         if held.is_empty() {
             return None;
         }
-        let word = view::bin_word(&self.state.timeline, i)?;
+        let word = view::bin_range_word(&self.state.timeline, i, range)?; // STRIABINTHREE (SR9025): the range's word (view.rs tail)
         let tracks: Vec<usize> = held.iter().filter_map(|k| self.state.timeline.tracks.iter().position(|t| t.kind == *k)).collect(); // STRIABINMORE (SR976): every held kind's first track (NLE-BIN-AVLINK)
-        let res = self.state.place_tracks_at_playhead(&tracks, r.src, 0, r.duration, timeline_core::Mode::Insert); // STRIABINMORE (SR976): all of them in ONE commit (timeline_core editor.rs tail)
+        let res = self.state.place_tracks_at_playhead(&tracks, r.src, range.map_or(0, |p| p.0), range.map_or(r.duration, |p| p.1), timeline_core::Mode::Insert); // STRIABINTHREE (SR9025): the range; STRIABINMORE (SR976): all of them in ONE commit (timeline_core editor.rs tail)
         if let Err(e) = res {
             self.last_error = Some(format!("{word}: {e}"));
         }
@@ -9222,5 +9221,195 @@ impl Face {
             self.proxy_queue.extend(queue);
             self.proxy_next();
         }
+    }
+}
+
+// ---- STRIABINTHREE (LEDGER SR9025): the bin's thumb drag and row range drag (named tail block) ----
+// A press on the bin (a Surface that sends `BrowserButton`) starts ONE drag, [`BinGrab`]: on SR976's thumb (its column, only
+// when the rows overflow) the moves set the first shown row through timeline_core view's `bin_thumb_top` (the thumb's own
+// geometry inverted, clamped by SR939's `bin_clamp`) and the release lays nothing; on a row the moves show a range bar
+// (view's `paint_bin_range`) and a release at least `view::BIN_RANGE_MIN` px away lays the source range `view::bin_range`
+// through [`Face::bin_lay`], the ONE lay road the click also takes (an unused reel by its media's kinds, else SR852's
+// `insert <reel> <in> <out>` through `Face::verb`: ONE commit, one undo step). A shorter drag is the click (the whole reel).
+// No grab paints nothing; a Surface that sends only clicks keeps the click.
+
+/// The bin press's drag: the thumb (`off` px below the thumb's top) or a range along `row` from `x0` to `x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinGrab {
+    Thumb { off: i64 },
+    Range { row: usize, x0: i64, x: i64 },
+}
+
+impl Face {
+    /// A press on the bin at `(x, y)`: in the thumb column of an overflowing bin, grab the thumb (off it: jump so it centres
+    /// on `y`); on a row, arm its range. True only when the first shown row moved.
+    fn bin_press(&mut self, x: f64, y: f64) -> bool {
+        let Some(s) = self.split else { return false };
+        let Some(b) = s.bin else { return false };
+        let (w, h) = b.canvas;
+        let tl = &self.state.timeline;
+        let col = x >= (w as i64 - view::BIN_THUMB_W) as f64 && x < w as f64;
+        let (grab, top) = match view::bin_thumb(tl, h, b.top).filter(|_| col) {
+            Some((y0, y1)) => {
+                let off = if (y as i64) >= y0 && (y as i64) < y1 { y as i64 - y0 } else { (y1 - y0) / 2 };
+                (BinGrab::Thumb { off }, view::bin_thumb_top(tl, h, y - off as f64))
+            }
+            None => match view::bin_hit_from(tl, w, h, b.top, x, y) {
+                Some(row) => (BinGrab::Range { row, x0: x as i64, x: x as i64 }, b.top),
+                None => return false,
+            },
+        };
+        let moved = top != view::bin_clamp(tl, h, b.top);
+        self.split = Some(Split { bin: Some(BinSurface { grab: Some(grab), top, ..b }), ..s });
+        moved
+    }
+    /// A move over the bin: the thumb drag sets the first shown row, the range drag its end x. True when either changed.
+    fn bin_move(&mut self, x: f64, y: f64) -> bool {
+        let Some(s) = self.split else { return false };
+        let Some(b) = s.bin else { return false };
+        let Some(g) = b.grab else { return false };
+        let h = b.canvas.1;
+        let tl = &self.state.timeline;
+        let (grab, top) = match g {
+            BinGrab::Thumb { off } => (g, view::bin_thumb_top(tl, h, y - off as f64)),
+            BinGrab::Range { row, x0, .. } => (BinGrab::Range { row, x0, x: x as i64 }, b.top),
+        };
+        let changed = top != view::bin_clamp(tl, h, b.top) || grab != g;
+        self.split = Some(Split { bin: Some(BinSurface { grab: Some(grab), top, ..b }), ..s });
+        changed
+    }
+    /// The release on the bin: the drag ends. A thumb drag lays nothing (true: the grab's paint goes); a range drag of at
+    /// least `view::BIN_RANGE_MIN` px lays its row's range; anything else is the click at `(x, y)`.
+    fn bin_release(&mut self, x: f64, y: f64) -> bool {
+        let Some(s) = self.split else { return false };
+        let Some(b) = s.bin else { return false };
+        self.split = Some(Split { bin: Some(BinSurface { grab: None, ..b }), ..s });
+        match b.grab {
+            Some(BinGrab::Thumb { .. }) => true,
+            Some(BinGrab::Range { row, x0, .. }) if (x as i64 - x0).abs() >= view::BIN_RANGE_MIN => match view::bin_range(&self.state.timeline, b.canvas.0, row, x0 as f64, x) {
+                Some(range) => self.bin_lay(row, Some(range)),
+                None => self.bin_click(x, y),
+            },
+            _ => self.bin_click(x, y),
+        }
+    }
+    /// THE bin lay: source row `i`'s range (`None`: the whole reel) — an unused reel on the first track of every kind its
+    /// media holds ([`Face::bin_unused`]), else the word `view::bin_range_word` through [`Face::verb`]. One commit either way.
+    fn bin_lay(&mut self, i: usize, range: Option<(i64, i64)>) -> bool {
+        if let Some(r) = self.bin_unused(i, range) {
+            return r;
+        }
+        let Some(word) = view::bin_range_word(&self.state.timeline, i, range) else { return false };
+        self.verb(&word)
+    }
+    /// `px` with the range bar of a live row drag of at least `view::BIN_RANGE_MIN` px; unchanged otherwise.
+    fn bin_range_paint(&self, px: Vec<u8>) -> Vec<u8> {
+        match self.bin() {
+            Some(b) => match b.grab {
+                Some(BinGrab::Range { row, x0, x }) if (x - x0).abs() >= view::BIN_RANGE_MIN => view::paint_bin_range(&self.state.timeline, px, b.canvas, b.top, vo(self.order), row, (x0, x)),
+                _ => px,
+            },
+            None => px,
+        }
+    }
+}
+
+#[cfg(test)]
+mod striabinthree_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    fn button(down: bool, (x, y): (f64, f64)) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods: 0, surface: 2 }
+    }
+
+    fn mv((x, y): (f64, f64)) -> SMessage {
+        SMessage::BrowserMouseMove(x, y, 2)
+    }
+
+    /// The fixture (A, B on V1 / A1) plus reel C (synth media: video and audio) on no track, the bin on Surface 2.
+    fn with_unused() -> (Face, SourceId) {
+        let (mut tl, mut src) = synth_fixture();
+        let c = tl.add_source("C", 50);
+        src.add(c, synth_source(2000, 50, 25)).expect("synthetic source opens");
+        (Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surfaces(0, 1).with_bin(2), c)
+    }
+
+    /// On a one-row bin a press on the thumb and a move down scroll the rows through `bin_thumb_top`; the release lays
+    /// nothing; a press in the column of a bin whose rows fit is a row's press.
+    #[test]
+    fn striabinthree_thumb_drag_scrolls_and_lays_nothing() {
+        let (mut f, _) = with_unused();
+        assert!(f.on(&SMessage::BrowserResize(320, view::BIN_ROW_H, 2)));
+        let tl0 = f.state.timeline.clone();
+        let h = view::BIN_ROW_H;
+        let (y0, _) = view::bin_thumb(&f.state.timeline, h, 0).unwrap();
+        f.on(&button(true, (319.0, y0 as f64 + 1.0)));
+        assert_eq!(f.bin().unwrap().top, 0, "a press on the thumb itself does not move it");
+        assert!(f.on(&mv((319.0, y0 as f64 + 1.0 + 12.0))));
+        let want = view::bin_thumb_top(&f.state.timeline, h, y0 as f64 + 12.0);
+        assert_eq!(f.bin().unwrap().top, want);
+        assert!(want > 0);
+        assert!(f.on(&button(false, (319.0, y0 as f64 + 13.0))));
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0), "the thumb lays nothing");
+        assert!(!f.on(&mv((319.0, 2.0))), "no grab after the release");
+        assert_eq!(f.bin().unwrap().top, want);
+    }
+
+    /// A drag along row B from the strip's start to its middle lays `insert B 0 25` at the playhead on V1: one undo step;
+    /// the range bar paints only while the drag shows.
+    #[test]
+    fn striabinthree_row_drag_lays_the_range() {
+        let (mut f, _) = with_unused();
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        let y = view::bin_point(1).1;
+        let rest = f.paint_role(Role::Bin);
+        f.on(&button(true, (20.0, y)));
+        assert_eq!(f.paint_role(Role::Bin), rest, "a press alone paints nothing");
+        assert!(f.on(&mv((168.0, y))));
+        let (w, h) = f.bin().unwrap().canvas;
+        assert_eq!(f.paint_role(Role::Bin), view::paint_bin_range(&f.state.timeline, rest.clone(), (w, h), 0, Order::Rgba, 1, (20, 168)));
+        assert_eq!(view::bin_range(&f.state.timeline, w, 1, 20.0, 168.0), Some((0, 25)));
+        assert!(f.on(&button(false, (168.0, y))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 25, 15), Mode::Insert).unwrap());
+        assert_eq!(f.state.undo_depth(), 1);
+        assert_eq!(f.bin().unwrap().grab, None);
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0);
+    }
+
+    /// A drag shorter than `BIN_RANGE_MIN` is the click: the whole reel.
+    #[test]
+    fn striabinthree_short_drag_is_the_click() {
+        let (mut f, _) = with_unused();
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        let y = view::bin_point(1).1;
+        f.on(&button(true, (40.0, y)));
+        f.on(&mv((42.0, y)));
+        assert!(f.on(&button(false, (42.0, y))));
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap());
+        assert_eq!(f.state.undo_depth(), 1);
+    }
+
+    /// A range drag on the unused AV reel C lays that range on V1 and A1 in ONE commit.
+    #[test]
+    fn striabinthree_unused_reel_range_lays_video_and_audio() {
+        let (mut f, c) = with_unused();
+        let tl0 = f.state.timeline.clone();
+        f.state.deselect();
+        f.state.seek(15);
+        let y = view::bin_point(2).1;
+        f.on(&button(true, (168.0, y)));
+        f.on(&mv((316.0, y)));
+        assert!(f.on(&button(false, (316.0, y))));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        let laid = Clip::new(c, 25, 50, 15);
+        assert_eq!(f.state.timeline, tl0.place(0, laid, Mode::Insert).unwrap().place(1, laid, Mode::Insert).unwrap());
+        assert_eq!(f.state.undo_depth(), 1);
     }
 }
