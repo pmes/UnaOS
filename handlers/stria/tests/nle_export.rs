@@ -775,7 +775,7 @@ fn h264enctwopassqcompcli_table_plans_with_the_cli_options() {
     let ninth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((3, 5)), Some(20))).unwrap(), &refr.frames);
     assert_eq!(ninth, NLE5DCLITABLE_BEFORE[7], "set 9: qcomp 0.6 + cplxblur 20 are x264's defaults, set 8's bytes");
     assert_eq!(ninth, nle5dclitable_fnv(Box::new(chain(Pass2Opts::default())), &refr.frames), "set 9: the knob's chain");
-    let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: false, ..Pass2Opts::default() };
+    let raw = Pass2Opts { cplxblur: 0, qblur_q8: 0, i_from_gop: false, qpstep: 0, ..Pass2Opts::default() }; // H264ENCTWOPASSQPSTEP (SR763): RAW keeps SR698's plan
     assert_eq!(nle5dclitable_fnv(Box::new(chain(raw)), &refr.frames), 0x4f03_dbed_36e4_72d6, "RAW plans SR698's QPs: SR718's pin before SR736");
     let tenth = nle5dclitable_fnv(video_named_with("h264", tl.tb, opts(Some((1, 1)), None)).unwrap(), &refr.frames);
     let knob = nle5dclitable_fnv(Box::new(chain(Pass2Opts { qcomp: (1, 1), ..Pass2Opts::default() })), &refr.frames);

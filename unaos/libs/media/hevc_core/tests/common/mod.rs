@@ -852,6 +852,8 @@ pub struct SliceCfg {
     /// pred_weight_table (P with weighted_pred_flag): luma_log2_weight_denom, chroma denom delta 0, and per l0 entry
     /// Some((delta_luma_weight, luma_offset)) or None; chroma flags all 0.
     pub weights: Option<(u32, Vec<Option<(i32, i32)>>)>,
+    /// HEVCCONCEALWEIGHTEDBIMIXED (SR768): a B slice's l1 entries (weighted_bipred_flag), as `weights`; chroma flags all 0.
+    pub weights_l1: Option<Vec<Option<(i32, i32)>>>,
     pub five_minus_max_num_merge_cand: u32,
     pub deblocking_disabled: bool,
 }
@@ -949,6 +951,7 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
                 b.se(*dw);
                 b.se(*off);
             }
+            if c.slice_type == 0 { if let Some(w1) = &c.weights_l1 { pred_weight_l1(&mut b, w1); } }
         }
         b.ue(c.five_minus_max_num_merge_cand);
         if let Some(v) = s.use_integer_mv {
@@ -1160,5 +1163,21 @@ impl CabacEnc {
                 }
             }
         }
+    }
+}
+
+// ---- HEVCCONCEALWEIGHTEDBIMIXED (LEDGER SR768): the L1 pred_weight_table of a B slice (named tail block) ----
+/// HEVCCONCEALWEIGHTEDBIMIXED (SR768): 7.3.6.3's l1 half of pred_weight_table (slice_type B): luma_weight_l1_flag per
+/// entry, chroma_weight_l1_flag 0 per entry, then (delta_luma_weight_l1, luma_offset_l1) of each `Some` entry.
+pub fn pred_weight_l1(b: &mut BitWriter, ws: &[Option<(i32, i32)>]) {
+    for w in ws {
+        b.flag(w.is_some());
+    }
+    for _ in ws {
+        b.bit(0); // chroma_weight_l1_flag
+    }
+    for (dw, off) in ws.iter().flatten() {
+        b.se(*dw);
+        b.se(*off);
     }
 }
