@@ -5597,6 +5597,8 @@ mod tests {
         let (_, _, uw, uh) = imgalt_rect(&mut e, "ubtn");
         assert!((w - pw).abs() <= 0.5 && (h - ph).abs() <= 0.5, "btn {w}x{h} is the 20px twin's {pw}x{ph}");
         assert!((h - uh).abs() > 0.5 || (w - uw).abs() > 0.5, "the plain button {uw}x{uh} differs (armed)");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), font_shorthand_cs(&mut e, "pbtn", "fontSize"), "SR819: btn reads the twin's size");
+        assert_eq!(font_shorthand_cs(&mut e, "btn", "fontSize"), "20px", "SR819: the parent's 20px");
     }
 
     // ---- AETHERCSSWIDELONGHANDS (LEDGER SR815): an explicit inherit beats an earlier rule and the tag default (named tail block) ----
@@ -6059,5 +6061,76 @@ mod tests {
             assert_eq!(css_wide_color_ink(&mut e, id, css_wide_blue), 0, "#{id} paints no blue");
             assert_eq!(font_shorthand_cs(&mut e, id, "color"), "rgb(0, 160, 0)", "#{id}: cssom");
         }
+    }
+
+    // ---- AETHERLINEHEIGHTZERO (LEDGER SR843): line-height 0 / 0px / 0% is a zero line box, apart from normal (named tail block) ----
+
+    /// AETHERLINEHEIGHTZERO (SR843): two-line divs ("Hello Hello" in 60px) at line-height 0 / 0px / 0% and normal, a span
+    /// under a zero and under a normal parent, and two paint probes in 100px wrappers (40px top padding): `p2` the two-line
+    /// div at 0, `p1` a one-line "Hello" at 0.
+    fn line_height_zero_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
+            <div id="z0" style="width:60px;line-height:0">Hello Hello</div>
+            <div id="zpx" style="width:60px;line-height:0px">Hello Hello</div>
+            <div id="zpct" style="width:60px;line-height:0%">Hello Hello</div>
+            <div id="nrm" style="width:60px;line-height:normal">Hello Hello</div>
+            <div style="line-height:0"><span id="i0">Hello</span></div>
+            <div style="line-height:normal"><span id="inrm">Hello</span></div>
+            <div id="w2" style="height:100px"><div id="p2" style="width:60px;padding-top:40px;line-height:0">Hello Hello</div></div>
+            <div id="w1" style="height:100px"><div id="p1" style="width:60px;padding-top:40px;line-height:0">Hello</div></div>
+        </body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERLINEHEIGHTZERO (SR843): a zero line-height gives zero line boxes, so the two-line block is 0 px tall
+    /// (Chromium); the `normal` twin is two lines tall (armed).
+    #[test]
+    fn line_height_zero_box_height() {
+        let mut e = line_height_zero_engine();
+        for id in ["z0", "zpx", "zpct"] {
+            let h = imgalt_rect(&mut e, id).3;
+            assert_eq!(h, 0.0, "#{id}: two zero line boxes");
+        }
+        let h = imgalt_rect(&mut e, "nrm").3;
+        assert!(h > 20.0, "#nrm: two normal lines ({h})");
+    }
+
+    /// AETHERLINEHEIGHTZERO (SR843): getComputedStyle reads `0px` for 0 / 0px / 0% (it read `normal`), `normal` stays.
+    #[test]
+    fn line_height_zero_cssom() {
+        let mut e = line_height_zero_engine();
+        for id in ["z0", "zpx", "zpct"] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "lineHeight"), "0px", "#{id}");
+        }
+        assert_eq!(font_shorthand_cs(&mut e, "nrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERLINEHEIGHTZERO (SR843): a zero inherits as the zero (`0px`), `normal` as `normal`.
+    #[test]
+    fn line_height_zero_inherit() {
+        let mut e = line_height_zero_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "i0", "lineHeight"), "0px");
+        assert_eq!(font_shorthand_cs(&mut e, "inrm", "lineHeight"), "normal");
+    }
+
+    /// AETHERLINEHEIGHTZERO (SR843): the two lines of `p2` paint at one y: row by row, its inked rows are the one-line
+    /// twin `p1`'s (the same "Hello" twice on top of itself), and some rows are inked (armed).
+    #[test]
+    fn line_height_zero_lines_overlap() {
+        let mut e = line_height_zero_engine();
+        let t2 = imgalt_rect(&mut e, "w2").1.round() as usize;
+        let t1 = imgalt_rect(&mut e, "w1").1.round() as usize;
+        let mut inked = 0;
+        for k in 0..100 {
+            let a = imgalt_ink(&e, 0, 60, t2 + k, t2 + k + 1) > 0;
+            let b = imgalt_ink(&e, 0, 60, t1 + k, t1 + k + 1) > 0;
+            assert_eq!(a, b, "row {k}: the two-line probe inks where the one-line twin does");
+            inked += a as usize;
+        }
+        assert!(inked > 0, "the probes paint");
     }
 }

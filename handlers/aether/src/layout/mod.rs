@@ -545,7 +545,7 @@ impl layout_core::Fonts for HostFonts {
     fn line_height(&self, sel: FontSel, size: f32, mult: f32) -> f32 {
         match crate::fonts::face(&sel_of(sel)) {
             Some(f) => crate::fonts::line_height(f, size, mult),
-            None if mult < 0.0 => -mult,
+            None if mult < 0.0 => layout_core::paint::line_height_length_px(mult),
             None if mult > 0.0 => size * mult,
             None => size,
         }
