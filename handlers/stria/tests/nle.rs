@@ -7924,7 +7924,7 @@ fn striazoomfitkeys_resize_refits_only_after_a_fit() {
 fn striatrackgainstep_face_steps_and_line() {
     let (tl, src) = synth_fixture();
     let mut face = nlefaceexport_face(tl.clone(), src);
-    assert_eq!(&VERBS[VERBS.len() - 7..], &["track-gain-", "track-gain+", "env", "env-", "env+", "env-del", "help"]); // STRIAGAINENVELOPE (SR9047): the env words sit between the track gain words and help
+    assert_eq!(&VERBS[VERBS.len() - 8..], &["track-gain-", "track-gain+", "env", "env-", "env+", "env-del", "env-curve", "help"]); // STRIAGAINENVELOPE (SR9047): the env words sit between the track gain words and help; STRIAGAINENVCURVE (SR9083): env-curve before help
     assert!(face.verb("track-gain-"));
     assert_eq!(face.last_error.take(), Some(format!("track-gain-: {}", EditError::NoTrack)));
     face.state.select(1, 0).unwrap();
@@ -14496,4 +14496,68 @@ fn striakdur_host_words_keys_note() {
     assert_eq!(face.note, None);
     assert_eq!(face.state.timeline, before);
     assert_eq!(face.state.undo_depth(), 2);
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the envelope curve and the crossfade's under layer through the render, the face's word (named tail block) ----
+/// One audio track of `clips` over source S0 (50 ticks), the explicit crossfades `xf`, rendered over `0..ticks`.
+fn striagainenvcurve_mix(clips: Vec<Clip>, xf: &[(i64, i64)], ticks: i64) -> Pcm {
+    let mut tl = Timeline::new(25);
+    tl.add_source("S0", 50);
+    let t = tl.add_track(Kind::Audio);
+    tl.tracks[t].clips = clips;
+    for &(at, dur) in xf {
+        tl.audio_xfades.push(timeline_core::AudioXfade { track: t, at, dur, curve: timeline_core::Curve::Linear });
+    }
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), synth_source(0, 50, 25)).unwrap();
+    src.set_audio_rate(0);
+    let mut sink = Pcm::default();
+    render(&tl, 0..ticks, &src, &mut sink).unwrap();
+    sink
+}
+
+/// M3: an equal-power ramp from -6 dB (source tick 10) to 0 dB (14) is the -6 dB render before it and the plain one
+/// after it, and differs from the linear ramp inside it; a crossfade whose OUTGOING clip ramps on its handle is the held
+/// -6 dB render before the cut and a different one inside the crossfade (the under layer follows the envelope).
+#[test]
+fn striagainenvcurve_render() {
+    let env = |pts: &[(i64, i32)]| pts.iter().fold(timeline_core::GainEnv::EMPTY, |e, &(t, v)| e.with(t, v).unwrap());
+    let c = Clip::new(SourceId(0), 0, 20, 0);
+    let lin = env(&[(10, -600), (14, 0)]);
+    let eq = lin.curved(timeline_core::Curve::EqualPower);
+    let (_, l) = mix(&[0], vec![vec![Clip { gain_env: lin, ..c }]], 20, 0);
+    let (_, e) = mix(&[0], vec![vec![Clip { gain_env: eq, ..c }]], 20, 0);
+    assert_eq!(&e.pcm[..10 * PER], &l.pcm[..10 * PER], "before the ramp: the same");
+    assert_eq!(&e.pcm[14 * PER..], &l.pcm[14 * PER..], "after it: the same");
+    assert_ne!(&e.pcm[11 * PER..13 * PER], &l.pcm[11 * PER..13 * PER], "inside: the curve");
+    let o = Clip::new(SourceId(0), 0, 10, 0);
+    let i = Clip::new(SourceId(0), 20, 30, 10);
+    let ramp = striagainenvcurve_mix(vec![Clip { gain_env: lin, ..o }, i], &[(10, 4)], 20);
+    let held = striagainenvcurve_mix(vec![Clip { gain_env: env(&[(10, -600)]), ..o }, i], &[(10, 4)], 20);
+    assert_eq!(&ramp.pcm[..10 * PER], &held.pcm[..10 * PER], "the body: -6 dB both");
+    assert_ne!(&ramp.pcm[10 * PER..14 * PER], &held.pcm[10 * PER..14 * PER], "the handle follows the ramp");
+    assert_eq!(&ramp.pcm[14 * PER..], &held.pcm[14 * PER..], "past the crossfade: the incoming alone");
+    println!("striagainenvcurve render: equal-power ramp differs inside 10..14; the crossfade's under layer follows its ramp");
+}
+
+/// M3: `env-curve` on the selected A1 clip with a point flips the curve in one undo step, its line on the NOTE, the EDL
+/// carries `GENV EQUAL`; with no point it is refused on last_error; undo restores.
+#[test]
+fn striagainenvcurve_face_word() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select(1, 0).unwrap();
+    face.state.seek(5);
+    assert!(face.verb("env-curve"));
+    assert_eq!(face.last_error.take(), Some(format!("env-curve: {}", EditError::Gain)));
+    assert!(face.verb("env -6"));
+    assert!(face.verb("env-curve"));
+    assert_eq!((face.last_error.as_deref(), face.note.as_deref()), (None, Some("env curve: equal-power, 1 points")));
+    assert_eq!(face.state.undo_depth(), 2);
+    assert!(edl::write(&face.state.timeline, "T").unwrap().contains("* UNA GENV EQUAL 00:00:00:18 -600\n"));
+    assert!(face.verb("env-curve linear"));
+    assert_eq!(face.note.as_deref(), Some("env curve: linear, 1 points"));
+    assert!(face.verb("undo") && face.verb("undo") && face.verb("undo"));
+    assert_eq!(face.state.timeline, tl);
+    println!("striagainenvcurve face: env-curve -> equal-power, GENV EQUAL; no point -> {}", EditError::Gain);
 }

@@ -311,7 +311,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.title_step_verb(v) { return Some(r); } if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.source_verb(v) { return Some(r); } if let Some(r) = self.env_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } if let Some(r) = self.pankey_verb(v) { return Some(r); } if let Some(r) = self.transition_step_verb(v) { return Some(r); } if let Some(r) = self.reverse_verb(v) { return Some(r); } // STRIASPEEDREVERSE (SR9067): `reverse` (file tail); STRIAPANAUTOMATION (SR9050): `pan-key [<x>]` / `pan-unkey` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (file tail); STRIAGAINENVELOPE (SR9047): the `env` words (file tail); STRIATITLESTYLEFACE (SR9077): the title step words (file tail)
+        if let Some(r) = self.title_step_verb(v) { return Some(r); } if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.source_verb(v) { return Some(r); } if let Some(r) = self.env_curve_verb(v) { return Some(r); } if let Some(r) = self.env_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } if let Some(r) = self.pankey_verb(v) { return Some(r); } if let Some(r) = self.transition_step_verb(v) { return Some(r); } if let Some(r) = self.reverse_verb(v) { return Some(r); } // STRIASPEEDREVERSE (SR9067): `reverse` (file tail); STRIAPANAUTOMATION (SR9050): `pan-key [<x>]` / `pan-unkey` (file tail); STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (file tail); STRIAGAINENVELOPE (SR9047): the `env` words (file tail); STRIATITLESTYLEFACE (SR9077): the title step words (file tail); STRIAGAINENVCURVE (SR9083): `env-curve` (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -5702,5 +5702,95 @@ impl EditorState {
         if verb == "dur-" || verb == "dur+" {
             self.transition = self.black_at(at);
         }
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the selected clip's envelope curve through the one commit (named tail block) ----
+// `env-curve` toggles the selected clip's gain envelope between linear and equal-power; `env-curve linear` / `env-curve
+// equal` set it. ONE commit through `set_selected_gain_env`; the same curve commits nothing. Refused: no selected clip
+// `NoClip`; an envelope with no point (it is always linear), an unknown or extra word `Gain`. The playhead plays no part.
+impl EditorState {
+    /// The `env-curve` word of [`EditorState::verb`]; `None` for any other word.
+    fn env_curve_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        w.next().filter(|w| *w == "env-curve")?;
+        let (arg, extra) = (w.next(), w.next());
+        Some(self.env_curve_word(arg, extra.is_some()))
+    }
+    fn env_curve_word(&mut self, arg: Option<&str>, extra: bool) -> Result<(), EditError> {
+        let e = self.selected().ok_or(EditError::NoClip)?.gain_env;
+        if extra || e.is_empty() {
+            return Err(EditError::Gain);
+        }
+        let c = match arg {
+            None if e.curve() == crate::Curve::Linear => crate::Curve::EqualPower,
+            None => crate::Curve::Linear,
+            Some("linear") => crate::Curve::Linear,
+            Some("equal") => crate::Curve::EqualPower,
+            Some(_) => return Err(EditError::Gain),
+        };
+        self.set_selected_gain_env(e.curved(c))
+    }
+}
+
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+    use crate::{Curve, Kind};
+
+    /// A1: A 10..30 at tick 5, selected, one point at the playhead (source tick 15) and one at source tick 25.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 10, 30, 5)];
+        let mut st = EditorState::new(tl);
+        st.select(0, 0).unwrap();
+        st.seek(10);
+        assert_eq!(st.verb("env -6"), Some(Ok(())));
+        st.seek(20);
+        assert_eq!(st.verb("env 0"), Some(Ok(())));
+        st
+    }
+
+    fn curve(st: &EditorState) -> Curve {
+        st.timeline.tracks[0].clips[0].gain_env.curve()
+    }
+
+    /// M3: bare toggles, the words set, one undo step each, the same curve commits nothing; undo restores.
+    #[test]
+    fn striagainenvcurve_words() {
+        let mut st = state();
+        let (tl0, d0) = (st.timeline.clone(), st.undo_depth());
+        assert_eq!(st.verb("env-curve"), Some(Ok(())));
+        assert_eq!((curve(&st), st.undo_depth()), (Curve::EqualPower, d0 + 1));
+        assert_eq!(st.verb("env-curve equal"), Some(Ok(())));
+        assert_eq!(st.undo_depth(), d0 + 1, "the same curve commits nothing");
+        assert_eq!(st.verb("env-curve"), Some(Ok(())));
+        assert_eq!(curve(&st), Curve::Linear);
+        assert_eq!(st.verb("env-curve equal"), Some(Ok(())));
+        assert_eq!(st.verb("env-curve linear"), Some(Ok(())));
+        assert_eq!((curve(&st), st.undo_depth()), (Curve::Linear, d0 + 4));
+        for _ in 0..4 {
+            st.undo();
+        }
+        assert_eq!(st.timeline, tl0);
+    }
+
+    /// M3: refusals by name leave the state; other words are not this one.
+    #[test]
+    fn striagainenvcurve_refusals() {
+        let mut st = state();
+        let (tl0, d0) = (st.timeline.clone(), st.undo_depth());
+        for w in ["env-curve x", "env-curve equal 1"] {
+            assert_eq!(st.verb(w), Some(Err(EditError::Gain)), "{w}");
+        }
+        assert_eq!(st.verb("env-clear"), Some(Ok(())));
+        assert_eq!(st.verb("env-curve"), Some(Err(EditError::Gain)), "no point: always linear");
+        st.undo();
+        st.deselect();
+        assert_eq!(st.verb("env-curve"), Some(Err(EditError::NoClip)));
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, d0));
+        assert_eq!(st.verb("env-curves"), None);
     }
 }

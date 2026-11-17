@@ -586,7 +586,7 @@ fn transport() -> TetraNode {
         button("rspeed", "Ripple Speed"), // STRIACLIPSPEEDTHREE (SR9031): the selected clip 1x -> 2x -> 4x -> 1x with the rest of its track following (THE `rspeed` verb)
         button("headers", "Hdr"), button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
         button("pan-key", "Pan Key"), button("pan-unkey", "Pan Unkey"), // STRIAPANAUTOMATION (SR9050): set / clear the selected clip's pan point at the playhead
-        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), // STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
+        button("env", "Env"), button("env-", "Env -"), button("env+", "Env +"), button("env-del", "Env Del"), button("env-curve", "Env Curve"), // STRIAGAINENVCURVE (SR9083): the selected clip's envelope curve linear / equal-power; STRIAGAINENVELOPE (SR9047): a gain point at the playhead on the selected clip, one dB a press, removed
         button("title-size-", "Title -"), button("title-size+", "Title +"), button("title-align", "Align"), button("title-ink", "Ink"), // STRIATITLESTYLEFACE (SR9077): the selected title's size step, alignment and ink cycle (the title step words)
         button("goto", "Go To"), // STRIADROPFRAMEFACE (SR9078): the bare press names `goto <timecode|frames>` (the witness: `goto=<tc>`)
         button("reverse", "Reverse"), // STRIASPEEDREVERSE (SR9067): the selected clip plays backwards / forwards (THE `reverse` verb)
@@ -3518,5 +3518,28 @@ mod striaspeedreverse_tests {
         assert_eq!(face.state.verb("reverse"), Some(Ok(())));
         assert_eq!(reverse_json(&face), ",\"reverse\":true");
         println!("striaspeedreverse witness: {}", reverse_json(&face));
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the Env Curve button (named tail block) ----
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+
+    /// M3: the Env Curve button is on the row (help still last); `at:12:1,env:-6,env-curve` makes the selected clip's
+    /// envelope equal-power with no error line; `env-curve` again puts it back.
+    #[test]
+    fn striagainenvcurve_witness_button() {
+        let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
+        assert!(row.iter().any(|b| matches!(b, TetraNode::Button { id, .. } if id == "env-curve")));
+        assert!(matches!(row.last(), Some(TetraNode::Button { id, .. }) if id == "help"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "at:12:1,env:-6,env-curve").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.curve(), timeline_core::Curve::EqualPower);
+        assert_eq!(face.note.as_deref(), Some("env curve: equal-power, 1 points"));
+        assert!(drive(&mut face, "env-curve").is_empty());
+        assert_eq!(face.state.selected().unwrap().gain_env.curve(), timeline_core::Curve::Linear);
+        println!("striagainenvcurve witness: at:12:1,env:-6,env-curve -> equal-power; env-curve -> linear");
     }
 }

@@ -239,7 +239,7 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
                 tl.clip_at(ti, t).map(|ci| {
                     let c = &tl.tracks[ti].clips[ci];
                     let seg = if t < c.at + c.fade_in { 0 } else if t >= c.end() - c.fade_out { 2 } else { 1 };
-                    (ci, seg, env_piece(c, t, xpiece(xfade(ti, ci, t), t)))
+                    (ci, seg, under_piece(tl, ti, ci, t, env_piece(c, t, xpiece(xfade(ti, ci, t), t)))) // STRIAGAINENVCURVE (SR9083): the outgoing's envelope breaks the run too (file tail)
                 }).or_else(|| black_key(tl, ti, t))
             })
             .collect()
@@ -386,7 +386,7 @@ fn under_layer(
     *xnext = Some((o.src, o.src_at(end))); // STRIACLIPSPEEDTHREE (SR9031): the outgoing's handle at its rate, src_at past its end (1x: src_t + (end - t))
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| (xfade_weight(x.curve, ENV_ONE - ramp_q16(x, e)) as i64 * tail / ENV_ONE as i64) as u32;
-    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_at(t), pan_to: o.pan_at(end + o.gain_env.at(src_t)), env: [fall(t), fall(end)] }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: tl.heard_cdb(ti, o.gain_cdb), pan_cq8: o.pan_at(t), pan_to: o.pan_at(end + o.gain_env.peak()), env: genv_scale(o, t, end, [fall(t), fall(end)]) }) // STRIATRACKGAIN (SR864): the outgoing's gain plus its track's // STRIAPANAUTOMATION (SR9050): the pan at both edges
 }
 
 /// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
@@ -499,7 +499,7 @@ fn black_key(tl: &Timeline, ti: usize, t: i64) -> Option<(usize, u8, i64)> {
     let tr = &tl.tracks[ti];
     let ci = tr.clips.iter().rposition(|c| c.end() <= t)?;
     let x = tl.fade_to_silence(ti, ci).filter(|x| x.at <= t && t < x.at + x.dur)?;
-    Some((ci, 3, xpiece(Some(x), t)))
+    Some((ci, 3, env_piece(&tr.clips[ci], t, xpiece(Some(x), t)))) // STRIAGAINENVCURVE (SR9083): the tail breaks per tick in a ramp
 }
 
 /// A run `t..end` of clip `ci` on track `ti` lying past the clip's end (a fade to silence): its envelope `env` scaled down
@@ -673,7 +673,7 @@ fn pan_piece(tl: &Timeline, tracks: &[usize], t: i64) -> Vec<Option<i8>> {
 // down by `cdb_q16(at(edge) - peak)` (<= ENV_ONE). Inside a RAMPING segment (two neighbouring points of different value)
 // the run key breaks at every tick, as an equal-power span does, so every edge carries the exact dB value; a flat stretch
 // stays one run. An empty envelope keys and scales nothing: the runs are byte-identical. The under layer of a crossfade
-// holds the envelope at each run's first tick, and a fade-to-silence tail is not broken per tick (NLE-GAIN-ENV-HANDLE owed).
+// and a fade-to-silence tail follow the envelope per tick through the same piece rule and scaling (SR9083).
 
 /// The run key's fade word with clip `c`'s envelope: `t + 1` (one run per tick) inside a ramping segment, else `xp`.
 fn env_piece(c: &crate::Clip, t: i64, xp: i64) -> i64 {
@@ -848,5 +848,77 @@ impl AudioRun {
             return None;
         }
         tl.clip_at(l.track, self.out_t).map(|ci| tl.tracks[l.track].clips[ci]).filter(|c| c.src == l.src)
+    }
+}
+
+// ---- STRIAGAINENVCURVE (LEDGER SR9083): the crossfade's under layer follows the outgoing's envelope (named tail block) ----
+// Inside a crossfade with a clip partner the run key breaks at every tick where the OUTGOING clip's envelope ramps at its
+// handle tick (`src_tick(t)`: the outgoing ends at the cut), the same piece rule as [`env_piece`]; `under_layer` hears it at
+// `gain_cdb + peak` with each edge through [`genv_scale`]. An empty envelope never breaks a run.
+
+/// The run key's fade word `xp` at tick `t` of clip `ci` on track `ti`: `t + 1` inside a crossfade whose outgoing clip's
+/// envelope ramps at that tick, else `xp`.
+fn under_piece(tl: &Timeline, ti: usize, ci: usize, t: i64, xp: i64) -> i64 {
+    let x = tl.crossfade_at(ti, ci).filter(|x| x.partner == crate::Partner::Clip && t < x.at + x.dur);
+    match x {
+        Some(_) if tl.tracks[ti].clips[ci - 1].gain_env.ramps(tl.tracks[ti].clips[ci - 1].src_tick(t)) => t + 1,
+        _ => xp,
+    }
+}
+
+#[cfg(test)]
+mod striagainenvcurve_tests {
+    use super::*;
+    use crate::{AudioXfade, Clip, Curve, GainEnv, Timeline};
+
+    struct Idx;
+    impl SourceIndex for Idx {
+        fn duration(&self, _: SourceId) -> Option<i64> {
+            Some(100)
+        }
+        fn keyframe_ns(&self, _: SourceId, _: Kind, ns: i64) -> Option<i64> {
+            Some(ns)
+        }
+    }
+
+    /// A1: `o` at 0..10 (source 0..10), `i` at 10..20 (source 50..60), a linear explicit crossfade of 4 on the cut.
+    fn xf(env: GainEnv) -> Timeline {
+        let mut tl = Timeline::new(25);
+        let s = tl.add_source("A", 100);
+        let a = tl.add_track(Kind::Audio);
+        tl.tracks[a].clips = alloc::vec![Clip { gain_env: env, ..Clip::new(s, 0, 10, 0) }, Clip::new(s, 50, 60, 10)];
+        tl.audio_xfades.push(AudioXfade { track: a, at: 10, dur: 4, curve: Curve::Linear });
+        tl
+    }
+
+    /// M3: an equal-power ramp keys per tick with each edge the curve's dB value; the outgoing's ramp on its handle
+    /// (source ticks 10..14) breaks the crossfade per tick and the under layer carries the exact value at both edges under
+    /// a gain of the peak; with no point the runs are the plain ones.
+    #[test]
+    fn striagainenvcurve_runs() {
+        let mut tl = Timeline::new(25);
+        let s = tl.add_source("A", 100);
+        let a = tl.add_track(Kind::Audio);
+        let q = GainEnv::EMPTY.with(10, -600).unwrap().with(14, 0).unwrap().curved(Curve::EqualPower);
+        tl.tracks[a].clips.push(Clip { gain_env: q, ..Clip::new(s, 0, 20, 0) });
+        let r = audio_runs(&tl, 0..20, &Idx).unwrap();
+        let spans: Vec<(i64, i64)> = r.iter().map(|x| (x.out_t, x.len)).collect();
+        assert_eq!(spans, [(0, 10), (10, 1), (11, 1), (12, 1), (13, 1), (14, 6)]);
+        assert_eq!(r[2].layers[0].env, [cdb_q16(q.at(11)), cdb_q16(q.at(12))]);
+        assert!(q.at(11) > -450, "equal-power rises faster than linear");
+
+        let plain = audio_runs(&xf(GainEnv::EMPTY), 0..20, &Idx).unwrap();
+        assert_eq!(plain.iter().map(|x| (x.out_t, x.len)).collect::<Vec<_>>(), [(0, 10), (10, 4), (14, 6)]);
+        let ramp = GainEnv::EMPTY.with(10, -600).unwrap().with(14, 0).unwrap();
+        let h = audio_runs(&xf(ramp), 0..20, &Idx).unwrap();
+        assert_eq!(h.iter().map(|x| (x.out_t, x.len)).collect::<Vec<_>>(), [(0, 10), (10, 1), (11, 1), (12, 1), (13, 1), (14, 6)]);
+        let under = h[2].layers[0];
+        assert!(h[2].under(0));
+        let fall = |e: i64| ENV_ONE - ((e - 10) * ENV_ONE as i64 / 4) as u32;
+        let k = |v: u32, cdb: i32| (v as u64 * cdb_q16(cdb) as u64 / ENV_ONE as u64) as u32;
+        assert_eq!((under.gain_cdb, under.env), (0, [k(fall(11), -450), k(fall(12), -300)]));
+        assert_eq!(h[0].layers[0].env, [cdb_q16(-600), cdb_q16(-600)], "the body before the handle: held");
+        let inc = h[2].layers[1];
+        assert_eq!((inc.gain_cdb, inc.env), (0, [ENV_ONE / 4, ENV_ONE / 2]), "the incoming: its linear rise, untouched");
     }
 }
