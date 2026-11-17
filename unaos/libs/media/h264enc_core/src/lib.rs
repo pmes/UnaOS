@@ -744,7 +744,7 @@ impl Encoder {
                     self.note_mb(mbx, mby, &code); intra += matches!(code.kind, Kind::I4 | Kind::I16) as u32;
                     match &mut cw {
                         Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic),
-                        None => self.write_mb(&mut w, mbx, mby, &code, false),
+                        None => self.write_mb(&mut w, mbx, mby, &code, 0),
                     }
                 } else {
                     let code = if bpic { self.b_mb(mbx, mby) } else { self.inter_mb(mbx, mby) };
@@ -756,7 +756,7 @@ impl Encoder {
                     } else {
                         w.ue(run); // mb_skip_run
                         run = 0;
-                        self.write_mb(&mut w, mbx, mby, &code, true);
+                        self.write_mb(&mut w, mbx, mby, &code, if bpic { 23 } else { 5 });
                     }
                 }
             }
@@ -909,8 +909,8 @@ impl Encoder {
     // macroblock_layer (7.3.5) and residual (7.3.5.3), CAVLC
     // -----------------------------------------------------------------------------------------
 
-    fn write_mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize, code: &MbCode, p_slice: bool) {
-        let off = if p_slice { 5 } else { 0 }; // intra mb_type follows the 5 P types in a P slice
+    fn write_mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize, code: &MbCode, intra_off: u32) {
+        let off = intra_off; // intra mb_type follows the 5 P types in a P slice, the 23 B types in a B slice (Table 7-14; H264ENCPINTRA SR759)
         match code.kind {
             Kind::I4 => {
                 w.ue(off);
@@ -934,8 +934,7 @@ impl Encoder {
                 w.ue(cbp_code(&CBP_INTRA, code.cbp));
             }
             Kind::I16 => {
-                let luma = if code.cbp & 15 != 0 { 12 } else { 0 };
-                w.ue(off + 1 + code.i16_mode as u32 + 4 * (code.cbp >> 4) as u32 + luma);
+                w.ue(off + code.i_type()); // Table 7-11 through MbCode::i_type (H264ENCPINTRA SR759: the P / B intra cost reads it too)
                 w.ue(code.chroma_mode as u32);
             }
             Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi => {
