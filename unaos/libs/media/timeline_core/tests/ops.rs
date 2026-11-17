@@ -447,3 +447,68 @@ mod striatracksmore {
         assert_eq!(st.timeline, tl);
     }
 }
+
+// ---- STRIATRACKSTHREE (LEDGER SR9038): the opt-in track header column through THE layout (named tail block) ----
+mod striatracksthree {
+    use super::base;
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::{self, Canvas, HEADER_W, Hit, Layout, Order};
+
+    /// Off is the layout and the pixels as before: `with_headers(false)` changes nothing, and `Layout::of` sets no column.
+    #[test]
+    fn striatracksthree_headers_off_is_identity() {
+        let (tl, _, _) = base();
+        let st = EditorState::new(tl);
+        let l = Layout::of(320, 160, &st);
+        assert_eq!((l.with_headers(false, &st), l.left), (l, 0));
+        let px = view::paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(view::paint_in(&st, l.with_headers(false, &st), Order::Rgba, None, None), px);
+        assert_ne!(view::paint_in(&st, l.with_headers(true, &st), Order::Rgba, None, None), px, "on paints the column");
+        let narrow = Layout::of(2 * HEADER_W, 160, &st);
+        assert_eq!(narrow.with_headers(true, &st), narrow, "too narrow for a column: unchanged");
+    }
+
+    /// On: tick t0 sits at the column's right edge, the two maps stay inverse, a press in the column is a header (the
+    /// row) and no hit, and the clip right of it is the clip it was.
+    #[test]
+    fn striatracksthree_header_inset_geometry() {
+        let (tl, _, _) = base();
+        let st = EditorState::new(tl);
+        let l = Layout::of(320, 160, &st).with_headers(true, &st);
+        assert_eq!((l.left, l.x_of(l.t0)), (HEADER_W, HEADER_W as i64));
+        for t in l.t0..l.t0 + 20 {
+            assert_eq!(l.tick_at(l.x_of(t) as f64), t, "tick {t}");
+        }
+        let y1 = l.row_y(1) as f64 + 1.0;
+        assert_eq!((l.header_at(5.0, y1), l.hit(&st.timeline, 5.0, y1)), (Some(1), Hit::None));
+        assert_eq!(l.header_at(5.0, l.ruler_y as f64 + 1.0), None, "the ruler's corner is no header");
+        assert_eq!(l.header_at(HEADER_W as f64, y1), None, "right of the column");
+        let (x, y) = (l.x_of(2) as f64 + 0.5, l.row_y(0) as f64 + 1.0);
+        assert_eq!(l.hit(&st.timeline, x, y), Hit::Clip(0, 0, 2));
+        assert_eq!(Layout::of(320, 160, &st).header_at(5.0, y1), None, "no column, no header");
+    }
+
+    /// The label hook as a recorder: every `(text, x, clip)` call.
+    struct Rec(Vec<(String, f32, (i32, i32))>);
+    impl view::Text for Rec {
+        fn text(&mut self, _c: &mut Canvas, s: &str, x: f32, _baseline: f32, clip: (i32, i32)) {
+            self.0.push((s.to_string(), x, clip));
+        }
+    }
+
+    /// Each row's channel word goes through the Text hook at x 4, clipped to the column; off, no call has that clip.
+    #[test]
+    fn striatracksthree_header_labels() {
+        let (tl, _, _) = base();
+        let st = EditorState::new(tl);
+        let col = (0, HEADER_W as i32 - 1);
+        let words = |l: Layout| {
+            let mut rec = Rec(Vec::new());
+            view::paint_in(&st, l, Order::Rgba, Some(&mut rec as &mut dyn view::Text), None);
+            rec.0.into_iter().filter(|r| r.2 == col).map(|r| (r.0, r.1)).collect::<Vec<_>>()
+        };
+        let l = Layout::of(320, 160, &st);
+        assert_eq!(words(l.with_headers(true, &st)), vec![("V".to_string(), 4.0), ("A".to_string(), 4.0)]);
+        assert_eq!(words(l), vec![]);
+    }
+}

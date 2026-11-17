@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 29] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "track+ video", "track+ audio", "track-", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail)
+pub const VERBS: [&str; 30] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "track+ video", "track+ audio", "track-", "headers", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIATRACKSTHREE (SR9038): the header column (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -167,6 +167,7 @@ pub struct Face {
     still: Option<Still>,
     pub last_error: Option<String>,
     pub note: Option<String>, // STRIATRACKSMORE (SR955): a success line, read by `message_text` after `last_error`, cleared by the next taken input (`Face::on`)
+    headers: Option<Option<usize>>, // STRIATRACKSTHREE (SR9038): the header column: None off; Some(the track bare `track-` targets) on (file tail)
     /// The shuttle rate in frames per clock tick (J/K/L; 1 for play).
     pub rate: i64,
     drag: Option<Drag>,
@@ -201,7 +202,7 @@ impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, note: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, headers: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -236,7 +237,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail)
+        if let Some(r) = self.headers_verb(v) { return r; } if let Some(r) = self.transition_verb(v) { return r; } if let Some(r) = self.save_verb(v) { return r; } if let Some(r) = self.export_verb(v) { return r; } if let Some(r) = self.mark_verb(v) { return r; } if let Some(r) = self.track_remove_verb(v) { return r; } // NLEHOSTSAVE (SR677): the save verb (file tail); STRIATRACKADDREMOVE (SR856): `track-` names what went (file tail); STRIATRACKSTHREE (SR9038): `headers` (file tail)
         let r = match v {
             "play" => {
                 self.playing = !self.playing;
@@ -258,7 +259,7 @@ impl Face {
     /// A click on the surface (buffer pixels): the ruler scrubs, a clip is selected and scrubbed to, an empty track
     /// spot scrubs and deselects.
     fn click(&mut self, x: f64, y: f64) -> bool {
-        if let Some(r) = self.pick_transition(x, y) { return r; }
+        if let Some(r) = self.pick_header(x, y) { return r; } if let Some(r) = self.pick_transition(x, y) { return r; } // STRIATRACKSTHREE (SR9038): a header names bare `track-`'s track (file tail)
         let l = self.layout();
         match l.hit(&self.state.timeline, x, y) {
             Hit::Ruler(t) => self.state.seek(t),
@@ -399,9 +400,9 @@ impl Face {
     /// was anchored or inside that view (else the page holding the playhead).
     pub fn layout(&self) -> Layout {
         let (w, h) = self.canvas;
-        let mut l = Layout::of_role(self.pointer_role(), w, h, &self.state);
+        let mut l = Layout::of_role(self.pointer_role(), w, h, &self.state).with_headers(self.headers.is_some(), &self.state); // STRIATRACKSTHREE (SR9038): the header column when on (timeline_core view.rs tail)
         if let Some((t0, at)) = self.view {
-            let per = (w / l.zoom).max(1) as i64;
+            let per = ((w - l.left) / l.zoom).max(1) as i64;
             let ph = self.state.playhead;
             if ph == at || (t0..t0 + per).contains(&ph) {
                 l.t0 = t0;
@@ -485,7 +486,7 @@ impl Face {
         if self.state.zoom == z0 {
             return false;
         }
-        let t0 = (t - x.max(0.0) as i64 / self.state.zoom as i64).max(0);
+        let t0 = (t - (x - self.layout().left as f64).max(0.0) as i64 / self.state.zoom as i64).max(0);
         self.view = Some((t0, self.state.playhead));
         true
     }
@@ -3107,7 +3108,7 @@ impl Face {
 impl Face {
     /// A `track-` word through THE dispatch, its removal named on the message line; `None` for any other word.
     fn track_remove_verb(&mut self, v: &str) -> Option<bool> {
-        let target = self.state.track_minus_target(v)?;
+        let v = &self.headed(v); let target = self.state.track_minus_target(v)?; // STRIATRACKSTHREE (SR9038): bare `track-` names the header's track (file tail)
         let tl = &self.state.timeline;
         let named = target.ok().and_then(|t| Some((tl.track_word(t)?, tl.tracks.get(t)?.clips.len())));
         match (self.state.verb(v)?, named) {
@@ -3116,5 +3117,44 @@ impl Face {
             (Err(e), _) => self.last_error = Some(format!("{v}: {e}")),
         }
         Some(true)
+    }
+}
+
+// ---- STRIATRACKSTHREE (LEDGER SR9038): the track header column on the face (named tail block) ----
+// NLE-TRACK-HEADER: the `headers` word toggles timeline_core's header column (`Layout::with_headers`, THE layout the face
+// paints and hits); it is view-only (no commit, the document stays clean). While it shows, a click on a row's header
+// (`Layout::header_at`) makes that track the target of bare `track-` and says so on the face's note; any other click
+// clears the target, and so does any `track…` word (a track add or remove moves the rows). Bare `track-` with a target is
+// the explicit `track- <ch>` THE verb already takes; nothing else reads the target. Off by default: no column, no target.
+impl Face {
+    /// The `headers` word: the column on / off (off drops the target); `None` for any other word.
+    fn headers_verb(&mut self, v: &str) -> Option<bool> {
+        if v != "headers" {
+            return None;
+        }
+        self.headers = if self.headers.is_some() { None } else { Some(None) };
+        Some(true)
+    }
+    /// A click on a header while the column shows: that track is bare `track-`'s target (`Some(true)`); any other click
+    /// clears the target and goes on (`None`).
+    fn pick_header(&mut self, x: f64, y: f64) -> Option<bool> {
+        let target = self.headers.as_mut()?;
+        *target = None;
+        let row = self.layout().header_at(x, y)?;
+        let word = self.state.timeline.track_word(row)?;
+        self.headers = Some(Some(row));
+        self.note = Some(format!("headers: track- targets {word}"));
+        Some(true)
+    }
+    /// The word the track road runs: any `track…` word takes the header target; bare `track-` with one names its track.
+    fn headed(&mut self, v: &str) -> String {
+        if !v.starts_with("track") {
+            return v.to_string();
+        }
+        let target = self.headers.as_mut().and_then(|t| t.take());
+        match target.and_then(|t| self.state.timeline.track_word(t)) {
+            Some(word) if v.trim() == "track-" => format!("track- {word}"),
+            _ => v.to_string(),
+        }
     }
 }

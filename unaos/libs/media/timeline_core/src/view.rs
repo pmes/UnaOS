@@ -49,6 +49,7 @@ pub struct Layout {
     pub t0: i64,
     pub message_y: u32, // STRIAINFOREELSTRIP (SR747): the message row's top (0 with no row: [`Layout::with_message`])
     pub message_h: u32, // STRIAINFOREELSTRIP (SR747): the message row's height (0: no row)
+    pub left: u32, // STRIATRACKSTHREE (SR9038): the header column's width (0: none; [`Layout::with_headers`])
 }
 
 /// What a point on the canvas is.
@@ -70,15 +71,15 @@ impl Layout {
         let zoom = st.zoom.max(1);
         let per_page = (w / zoom).max(1) as i64;
         let t0 = st.playhead.max(0) / per_page * per_page;
-        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0, message_y: 0, message_h: 0 }
+        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0, message_y: 0, message_h: 0, left: 0 }
     }
     /// The x of tick `t`'s left edge.
     pub fn x_of(&self, t: i64) -> i64 {
-        (t - self.t0) * self.zoom as i64
+        self.left as i64 + (t - self.t0) * self.zoom as i64
     }
     /// The tick under x.
     pub fn tick_at(&self, x: f64) -> i64 {
-        self.t0 + (x.max(0.0) as i64) / self.zoom as i64
+        self.t0 + ((x - self.left as f64).max(0.0) as i64) / self.zoom as i64
     }
     /// The y of track row `row`'s top.
     pub fn row_y(&self, row: usize) -> i64 {
@@ -89,7 +90,7 @@ impl Layout {
         (self.x_of(t) as f64 + self.zoom as f64 / 2.0, self.row_y(row) as f64 + ROW_H as f64 / 2.0)
     }
     pub fn hit(&self, tl: &Timeline, x: f64, y: f64) -> Hit {
-        if x < 0.0 || y < 0.0 || x >= self.w as f64 || y >= self.h as f64 || y < self.ruler_y as f64 {
+        if x < 0.0 || y < 0.0 || x >= self.w as f64 || y >= self.h as f64 || y < self.ruler_y as f64 || x < self.left as f64 {
             return Hit::None;
         }
         let t = self.tick_at(x);
@@ -350,7 +351,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_transitions(&mut c, l, st);
+    paint_transitions(&mut c, l, st); paint_headers(&mut c, l, st, labels.as_deref_mut()); // STRIATRACKSTHREE (SR9038): the header column, nothing while `left` is 0 (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -1187,5 +1188,56 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIATRACKSTHREE (LEDGER SR9038): the track header column (named tail block) ----
+// NLE-TRACK-HEADER, opt-in: a face that asks for it ([`Layout::with_headers`]) gets a column [`HEADER_W`] px wide at the
+// left of the ruler and the rows; `left` moves every clip's x right by that width through THE two maps (`x_of` /
+// `tick_at`), so the ruler, clips, selection, transitions, drags, snap and the playhead all carry it. `hit` finds nothing
+// in the column; [`Layout::header_at`] is the header press (a separate pure query: `Hit` keeps its arms). [`paint_headers`]
+// names each row by its channel word (`Timeline::track_word`) through the Text hook. `left` is 0 by default (`Layout::of`),
+// the kernel never sets it, and then nothing here paints: every golden is byte-identical.
+
+/// The header column's width (px): room for `V9` / `A9` at the label size.
+pub const HEADER_W: u32 = 32;
+
+impl Layout {
+    /// STRIATRACKSTHREE (SR9038): this layout with the header column when `on` and the canvas is wider than two columns:
+    /// `left` = [`HEADER_W`] and the page holding the playhead re-cut for the narrower track area (`Layout::of`'s rule).
+    /// Off, too narrow, or a column already cut: unchanged.
+    pub fn with_headers(mut self, on: bool, st: &EditorState) -> Layout {
+        if on && self.left == 0 && self.w > 2 * HEADER_W {
+            self.left = HEADER_W;
+            let per = ((self.w - self.left) / self.zoom.max(1)).max(1) as i64;
+            self.t0 = st.playhead.max(0) / per * per;
+        }
+        self
+    }
+    /// STRIATRACKSTHREE (SR9038): the track row whose header is under `(x, y)`; `None` with no column or off the column.
+    pub fn header_at(&self, x: f64, y: f64) -> Option<usize> {
+        if self.left == 0 || x < 0.0 || x >= self.left as f64 || y < self.tracks_y as f64 || y >= self.h as f64 {
+            return None;
+        }
+        let row = ((y - self.tracks_y as f64) / ROW_H as f64) as usize;
+        (row < self.rows).then_some(row)
+    }
+}
+
+/// STRIATRACKSTHREE (SR9038): the header column over whatever ran left of the page: the ruler's corner, one header per row
+/// with a one-pixel edge, and the row's channel word. Nothing at all while `l.left` is 0.
+fn paint_headers(c: &mut Canvas, l: Layout, st: &EditorState, mut labels: Option<&mut dyn Text>) {
+    if l.left == 0 {
+        return;
+    }
+    let left = l.left as i64;
+    c.rect(0, l.ruler_y as i64, left, l.tracks_y as i64, RULER);
+    for row in 0..st.timeline.tracks.len().min(l.rows) {
+        let (y0, y1) = (l.row_y(row), l.row_y(row) + ROW_H as i64);
+        c.rect(0, y0, left, y1, RULER);
+        c.rect(left - 1, y0, left, y1, TICK);
+        if let (Some(text), Some(word)) = (labels.as_mut(), st.timeline.track_word(row)) {
+            text.text(c, &word, 4.0, y0 as f32 + 15.0, (0, (left - 1) as i32));
+        }
     }
 }
