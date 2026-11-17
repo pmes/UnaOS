@@ -12439,4 +12439,51 @@ b</div>
         e.render_frame();
         assert_eq!(font_shorthand_cs(&mut e, "u", "textUnderlinePosition"), "under");
     }
+
+    // ---- AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (LEDGER SR1121): the text-decoration-line column reads the element's own underline / line-through / both (named tail block) ----
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): `#lt` a strike-through, `#ul` both lines, `#u` an underline, `#n` none,
+    /// `#del` the UA line-through, `#pd` an underlined div holding the undecorated span `#ps`.
+    fn text_decoration_line_column_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <div id="lt" style="text-decoration: line-through">a</div>
+            <div id="ul" style="text-decoration-line: underline line-through">b</div>
+            <div id="u" style="text-decoration-line: underline">c</div>
+            <div id="n" style="text-decoration: none">d</div>
+            <div><del id="del">e</del></div>
+            <div id="pd" style="text-decoration: underline"><span id="ps">f</span></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        e
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): textDecorationLine reads the own line set in canonical order (before
+    /// SR1121: `#lt` and `#del` read `none`, `#ul` read `underline`; `#u`, `#n`, `#pd` kept).
+    #[test]
+    fn text_decoration_line_column_words() {
+        let mut e = text_decoration_line_column_engine();
+        for (id, want) in [("lt", "line-through"), ("ul", "underline line-through"), ("u", "underline"), ("n", "none"), ("del", "line-through"), ("pd", "underline")] {
+            assert_eq!(font_shorthand_cs(&mut e, id, "textDecorationLine"), want, "#{id} textDecorationLine");
+        }
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): text-decoration-line is not inherited: the undecorated span inside an
+    /// underlined div reads `none` as Chromium does (before SR1121: the inherited flag read `underline`; the paint still propagates).
+    #[test]
+    fn text_decoration_line_column_own_not_inherited() {
+        let mut e = text_decoration_line_column_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "ps", "textDecorationLine"), "none");
+    }
+
+    /// AETHERCSSOMTEXTDECORATIONLINECOLUMNMULTI (SR1121): SR1113's composer reads the column, so the shorthand carries the real
+    /// line set (before SR1121: `none solid rgb(0, 0, 0)` and `underline solid rgb(0, 0, 0)`).
+    #[test]
+    fn text_decoration_line_column_shorthand() {
+        let mut e = text_decoration_line_column_engine();
+        assert_eq!(font_shorthand_cs(&mut e, "lt", "textDecoration"), "line-through solid rgb(0, 0, 0)");
+        assert_eq!(font_shorthand_cs(&mut e, "ul", "textDecoration"), "underline line-through solid rgb(0, 0, 0)");
+    }
 }
