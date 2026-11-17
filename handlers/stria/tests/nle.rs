@@ -10645,8 +10645,8 @@ fn striaslipviewmore_slide_drag_shows_the_moving_cut_frames() {
     let (_, src) = synth_fixture();
     let last_a = preview(&twin.timeline, &src, 10 + d.1 - 1).unwrap().expect("A's new last frame");
     let pair = face.slip_view().cloned().expect("a pair during the slide");
-    assert_eq!((pair.width, pair.height), (last_a.width * 2, last_a.height));
-    let (left, right) = striaslipview_halves(&pair);
+    assert_eq!((pair.width, pair.height), (last_a.width * 4, last_a.height)); // STRIASLIPVIEWTHREE (SR9036): a slide shows four cells
+    let [left, _, _, right] = striaslipviewthree_quarters(&pair); // STRIASLIPVIEWTHREE (SR9036): the outer cells are the moving frames
     assert_eq!(left, last_a.rgba, "left = the previous clip's new last frame");
     assert_eq!(right, striaslipviewmore_field(last_a.width, last_a.height), "right = FIELD: no butted next clip");
     assert_eq!(face.state.timeline, tl, "nothing committed during the drag");
@@ -10672,7 +10672,7 @@ fn striaslipviewmore_slide_word_both_neighbours() {
     face.paint();
     assert_eq!(twin.verb("slide 1"), Some(Ok(())));
     let (prev, next) = striaslipview_frames(&twin.timeline, 10, 21);
-    assert_eq!(striaslipview_halves(face.slip_view().expect("the slide's pair")), (prev.rgba, next.rgba));
+    { let [q0, _, _, q3] = striaslipviewthree_quarters(face.slip_view().expect("the slide's pair")); assert_eq!((q0, q3), (prev.rgba, next.rgba)); } // STRIASLIPVIEWTHREE (SR9036): the outer cells of four
     assert!(face.slip_held());
     println!("striaslipviewmore: slide+ with both cuts butted -> frames at 10 and 21");
 }
@@ -12952,4 +12952,80 @@ fn striaripplethree_tool_on_shift_drag_ripples_every_track() {
     assert_eq!(face.state.timeline, tl.ripple_trim_out(0, 0, 20).unwrap());
     assert_eq!(face.state.timeline.tracks[1], tl.tracks[1], "tool off: A1 does not move");
     println!("striaripplethree: tool on, Shift-drag -3 = ripple_all_out; tool off = ripple_trim_out");
+}
+
+// ---- STRIASLIPVIEWTHREE (LEDGER SR9036): a slide's four cells, each cell's source timecode (named tail block) ----
+
+/// The four cells of a slide's composite, left to right.
+fn striaslipviewthree_quarters(s: &Still) -> [Vec<u8>; 4] {
+    let (w, row) = (s.width as usize / 4 * 4, s.width as usize * 4);
+    let mut q: [Vec<u8>; 4] = Default::default();
+    for y in 0..s.height as usize {
+        for (i, cell) in q.iter_mut().enumerate() {
+            cell.extend_from_slice(&s.rgba[y * row + i * w..y * row + (i + 1) * w]);
+        }
+    }
+    q
+}
+
+/// Rule: a Ctrl Slide on B (SR737's pair: A butted to B, A@25 not butted) shows four cells: A's new last frame, B's own
+/// first and last frame at its slid ticks, FIELD for the missing next clip; each cell carries its source timecode (A's
+/// at `22 + d`, B's 0 and 9), the FIELD cell none.
+#[test]
+fn striaslipviewthree_slide_drag_shows_four_cells() {
+    let (mut face, mut twin, _tl) = nle3eslipface_pair();
+    let l = face.layout();
+    let (x, y) = (l.x_of(10) as f64 + 1.0, l.point(0, 15).1);
+    striaslipview_press_move(&mut face, x, y, 16.0, bandy::MOD_CONTROL);
+    let d = face.dragging().map(|d| (d.kind, d.delta)).expect("a live drag");
+    assert_eq!(d.0, DragKind::Slide);
+    face.paint();
+    assert_eq!(twin.verb(&format!("slide {}", d.1)), Some(Ok(())));
+    let (_, src) = synth_fixture();
+    let frame = |t: i64| preview(&twin.timeline, &src, t).unwrap().expect("a frame");
+    let (last_a, first_b, last_b) = (frame(10 + d.1 - 1), frame(10 + d.1), frame(19 + d.1));
+    let pair = face.slip_view().cloned().expect("four cells during the slide");
+    assert_eq!((pair.width, pair.height), (last_a.width * 4, last_a.height));
+    let field = timeline_core::view::FIELD.repeat((last_a.width * last_a.height) as usize);
+    assert_eq!(striaslipviewthree_quarters(&pair), [last_a.rgba, first_b.rgba, last_b.rgba, field]);
+    let tcs = face.slip_timecodes().expect("the cells' timecodes").to_vec();
+    assert_eq!(tcs, vec![Some(edl::timecode(22 + d.1, 25)), Some("00:00:00:00".to_string()), Some("00:00:00:09".to_string()), None]);
+    println!("striaslipviewthree: Ctrl slide {} on B -> four cells, timecodes {:?}", d.1, tcs);
+}
+
+/// Rule: the word `slide+` on a clip butted on both sides shows four twin frames (prev's last at 10, B at 11 and 20, the
+/// next clip's first at 21).
+#[test]
+fn striaslipviewthree_slide_word_four_twin_frames() {
+    let (mut tl, src) = synth_fixture();
+    tl.tracks[0].clips[2].at = 20;
+    let mut face = Face::new(EditorState::new(tl.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    face.state.select_at(0, 12).unwrap();
+    let mut twin = EditorState::new(tl);
+    twin.select_at(0, 12).unwrap();
+    assert!(face.verb("slide+"));
+    face.paint();
+    assert_eq!(twin.verb("slide 1"), Some(Ok(())));
+    let (_, src) = synth_fixture();
+    let frame = |t: i64| preview(&twin.timeline, &src, t).unwrap().expect("a frame").rgba;
+    assert_eq!(striaslipviewthree_quarters(face.slip_view().expect("four cells")), [frame(10), frame(11), frame(20), frame(21)]);
+    assert_eq!(face.slip_timecodes().map(|t| t.len()), Some(4));
+    println!("striaslipviewthree: slide+ both butted -> four frames at 10, 11, 20, 21");
+}
+
+/// Rule: a word slip keeps two cells, their timecodes the slipped clip's new source in and last frame (B slipped 1: src
+/// 1 and 10 at 25 fps); no pair, no timecodes.
+#[test]
+fn striaslipviewthree_slip_word_timecodes() {
+    let (mut face, _twin, _tl) = nle3eslipface_pair();
+    face.paint();
+    assert_eq!(face.slip_timecodes(), None, "no pair: no timecodes");
+    assert!(face.verb("slip+"));
+    face.paint();
+    let s = face.slip_view().cloned().expect("the word's pair");
+    let tcs = face.slip_timecodes().expect("two timecodes").to_vec();
+    assert_eq!(tcs, vec![Some("00:00:00:01".to_string()), Some("00:00:00:10".to_string())]);
+    let (w, h) = (s.width / 2, s.height);
+    assert_eq!(striaslipview_halves(&s).0.len(), (w * h * 4) as usize, "still two cells");
+    println!("striaslipviewthree: slip+ -> {:?}", tcs);
 }

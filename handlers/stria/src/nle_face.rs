@@ -1669,7 +1669,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.slip_view().or(self.still.as_ref()) }; // STRIASLIPVIEW (SR858): the pair replaces the playhead frame while it shows
-        let px = self.paint_message(view::paint_crop_drag(paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), still, Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail)
+        let px = self.paint_message(self.slipthree_paint_tc(view::paint_crop_drag(paint_labelled(st, l, self.order, self.labels.as_ref().map(|s| Labels(s, Some(&self.lcache))), still, Some(&self.peaks as &dyn view::PeakSource)), l, vo(self.order), self.crop_drag.as_ref().filter(|_| role != Role::Tracks)), l, role), l, role); // STRIACROPMORE (SR960): the dragged crop rect over the preview picture; STRIASLIPVIEWTHREE (SR9036): each cell's source timecode over the pair (file tail); STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail); STRIAPERFLABELSHAPE (SR935): labels through the face's cache (file tail)
         if role == Role::Preview {
             return paint_meter_clips(paint_meters(px, l, self.order, &self.meter_levels()), l, self.order, self.meter_hold.clipped());
         }
@@ -3868,6 +3868,7 @@ struct SlipView {
     ended: std::time::Instant,
     took: Duration,
     due: bool,
+    tcs: Vec<Option<String>>, // STRIASLIPVIEWTHREE (SR9036): each cell's source timecode, a FIELD cell None (file tail)
 }
 
 impl SlipView {
@@ -3906,12 +3907,12 @@ impl Face {
             }
         }
         let t0 = std::time::Instant::now();
-        let Some(cells) = slip_cells(tl, key.0, key.1, slipmore_slide(self.drag, self.slip_hold.as_ref())) else { // STRIASLIPVIEWMORE (SR946): a slip's two ticks or a slide's two neighbour edges (file tail)
+        let Some(cells) = slip_cells(tl, key.0, key.1, slipmore_slide(self.drag, self.slip_hold.as_ref())).map(|c| slipthree_cells(tl, key.0, key.1, slipmore_slide(self.drag, self.slip_hold.as_ref()), c)) else { // STRIASLIPVIEWMORE (SR946): a slip's two ticks or a slide's two neighbour edges (file tail); STRIASLIPVIEWTHREE (SR9036): a slide's four cells (file tail)
             self.slip_view = None;
             return;
         };
-        let mut pair: [Option<Still>; 2] = [None, None];
-        for (i, (one, t)) in cells.into_iter().enumerate().filter_map(|(i, c)| c.map(|c| (i, c))) { // STRIASLIPVIEWMORE (SR946): a missing side stays FIELD
+        let mut pair: Vec<Option<Still>> = vec![None; cells.len()]; // STRIASLIPVIEWTHREE (SR9036): two cells or a slide's four
+        for (i, (one, t)) in cells.iter().enumerate().filter_map(|(i, c)| c.as_ref().map(|(one, t)| (i, (one, *t)))) { // STRIASLIPVIEWTHREE (SR9036): borrowed, the timecodes read the cells after; STRIASLIPVIEWMORE (SR946): a missing side stays FIELD
             pair[i] = match preview(&one, &self.sources, t) {
                 Ok(s) => s,
                 Err(e) => {
@@ -3920,9 +3921,9 @@ impl Face {
                 }
             };
         }
-        let still = slip_split(pair[0].as_ref(), pair[1].as_ref());
+        let still = slipthree_split(&pair); // STRIASLIPVIEWTHREE (SR9036): SR858's split, twice nested for four cells (file tail)
         let ended = std::time::Instant::now();
-        self.slip_view = Some(SlipView { key, still, ended, took: ended - t0, due: false });
+        self.slip_view = Some(SlipView { key, still, ended, took: ended - t0, due: false, tcs: slipthree_tcs(&cells) }); // STRIASLIPVIEWTHREE (SR9036): the cells' source timecodes (file tail)
     }
     /// STRIASLIPVIEW (SR858): the pair the preview shows during a Slip drag (left the new first frame, right the new last).
     pub fn slip_view(&self) -> Option<&Still> {
@@ -9520,5 +9521,166 @@ impl Face {
     /// The tool's line for [`Face::message_text`] while it is on.
     fn ripple_all_note(&self) -> Option<String> {
         self.ripple_all.then(|| RIPPLE_ALL_NOTE.to_string())
+    }
+}
+
+// ---- STRIASLIPVIEWTHREE (LEDGER SR9036): a slide's four cells, each cell's source timecode (named tail block) ----
+// Two additions to SR858's ONE pair (`Face::slip_refresh`: its render through `preview`, its cache, its throttle and the
+// serve clock unchanged). A slide (a Ctrl / Cmd Slide drag or a held `slide` word) shows FOUR cells: the butted previous
+// clip's new last frame | the slid clip's own first | its own last | the butted next clip's new first (a side with no
+// butted neighbour FIELD; neither butted: no pair, SR946's rule), composed by SR858's `slip_split` nested twice. Each cell
+// carries the SOURCE timecode of the frame it shows (`edl::timecode` of the cell clip's `src_in + t - at`), painted with
+// labels on at the cell's foot inside the letterbox rect `paint_in` uses (THE geometry `SizePolicy::Letterbox.place`), so
+// the text keeps its size whatever the pair's scale; with labels off not a pixel changes. Owed: NLE3E-SLIP-VIEW-ASYNC,
+// NLE3E-SLIP-VIEW-KERNEL.
+
+/// STRIASLIPVIEWTHREE (SR9036): the cells SR858's loop renders. A slip: SR946's two cells as they are. A slide: the
+/// previous clip's cell, the slid clip's own first (`at`) and last (`end - 1`) frame, the next clip's cell.
+fn slipthree_cells(tl: &Timeline, track: usize, idx: usize, slide: bool, two: [Option<(Timeline, i64)>; 2]) -> Vec<Option<(Timeline, i64)>> {
+    let [prev, next] = two;
+    if !slide {
+        return vec![prev, next];
+    }
+    match slip_clip_timeline(tl, track, idx) {
+        Some((own, c)) => vec![prev, Some((own.clone(), c.at)), Some((own, c.end() - 1)), next],
+        None => vec![prev, next],
+    }
+}
+
+/// STRIASLIPVIEWTHREE (SR9036): the cells side by side through SR858's ONE [`slip_split`]: two cells as SR858 did; four
+/// as two halves (each a `slip_split` pair) split again, so each half lands 1:1 in its outer cell.
+fn slipthree_split(cells: &[Option<Still>]) -> Option<Still> {
+    let at = |i: usize| cells.get(i).and_then(|c| c.as_ref());
+    if cells.len() == 4 {
+        let (l, r) = (slip_split(at(0), at(1)), slip_split(at(2), at(3)));
+        return slip_split(l.as_ref(), r.as_ref());
+    }
+    slip_split(at(0), at(1))
+}
+
+/// STRIASLIPVIEWTHREE (SR9036): each cell's source timecode: the cell clip's source tick at the shown tick
+/// (`src_in + t - at`) as `HH:MM:SS:FF` at the timeline's fps (25 when it has none); a FIELD cell `None`.
+fn slipthree_tcs(cells: &[Option<(Timeline, i64)>]) -> Vec<Option<String>> {
+    cells
+        .iter()
+        .map(|c| {
+            c.as_ref().and_then(|(one, t)| {
+                let clip = one.tracks.first()?.clips.first()?;
+                Some(timeline_core::edl::timecode(clip.src_in + (*t - clip.at), one.fps().unwrap_or(25)))
+            })
+        })
+        .collect()
+}
+
+/// STRIASLIPVIEWTHREE (SR9036): where each of `n` cells' timecode goes when a `sw` x `sh` composite is letterboxed into the
+/// `w` x `h` preview band (THE geometry `SizePolicy::Letterbox.place`, the rect `paint_in`'s `blit_fit` fills): per cell
+/// `(x, baseline, clip)` = the cell's left + 4, the rect's foot - 4, the cell's columns. Any size 0 or no cell: none.
+pub fn slip_tc_spots(sw: u32, sh: u32, w: u32, h: u32, n: usize) -> Vec<(f32, f32, (i32, i32))> {
+    if sw == 0 || sh == 0 || w == 0 || h == 0 || n == 0 {
+        return Vec::new();
+    }
+    let d = timeline_core::SizePolicy::Letterbox.place(sw as usize, sh as usize, w as usize, h as usize).dst;
+    (0..n)
+        .map(|i| {
+            let (x0, x1) = (d.x + i * d.w / n, d.x + (i + 1) * d.w / n);
+            (x0 as f32 + 4.0, (d.y + d.h) as f32 - 4.0, (x0 as i32, x1 as i32))
+        })
+        .collect()
+}
+
+impl Face {
+    /// STRIASLIPVIEWTHREE (SR9036): the cells' timecodes over a painted canvas (one line per cell at [`slip_tc_spots`],
+    /// through [`Labels`]); unchanged with labels off, on the tracks Surface, or with no pair showing.
+    fn slipthree_paint_tc(&self, px: Vec<u8>, l: Layout, role: Role) -> Vec<u8> {
+        let Some(style) = self.labels.as_ref() else { return px };
+        if role == Role::Tracks {
+            return px;
+        }
+        let Some(v) = self.slip_view.as_ref() else { return px };
+        let Some(s) = v.still.as_ref() else { return px };
+        let spots = slip_tc_spots(s.width, s.height, l.w, l.preview_h, v.tcs.len());
+        let mut c = Canvas { w: l.w, h: l.h, order: vo(self.order), px };
+        for (tc, (x, baseline, clip)) in v.tcs.iter().zip(spots) {
+            if let Some(tc) = tc {
+                view::Text::text(&mut Labels(style), &mut c, tc, x, baseline, clip);
+            }
+        }
+        c.px
+    }
+    /// STRIASLIPVIEWTHREE (SR9036): the shown pair's cells' source timecodes, left to right (a FIELD cell `None`).
+    pub fn slip_timecodes(&self) -> Option<&[Option<String>]> {
+        self.slip_view.as_ref().filter(|v| v.still.is_some()).map(|v| v.tcs.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod striaslipviewthree_tests {
+    use super::*;
+
+    /// A `w` x `h` still of one byte value.
+    fn px(w: u32, h: u32, v: u8) -> Still {
+        Still { width: w, height: h, rgba: vec![v; (w * h * 4) as usize] }
+    }
+
+    /// Rule: a slip keeps SR946's two cells; a slide's four are [previous clip's last, own first, own last, next's first].
+    #[test]
+    fn striaslipviewthree_cells_kats() {
+        let (tl, _src) = synth_fixture();
+        let (a, b) = (tl.tracks[0].clips[0], tl.tracks[0].clips[1]);
+        let tick = |c: &Option<(Timeline, i64)>| c.as_ref().map(|(one, t)| (one.tracks[0].clips[0], *t));
+        let s = slipthree_cells(&tl, 0, 1, false, slip_cells(&tl, 0, 1, false).unwrap());
+        assert_eq!(s.iter().map(tick).collect::<Vec<_>>(), vec![Some((b, 10)), Some((b, 19))]);
+        let s = slipthree_cells(&tl, 0, 1, true, slip_cells(&tl, 0, 1, true).unwrap());
+        assert_eq!(s.iter().map(tick).collect::<Vec<_>>(), vec![Some((a, 9)), Some((b, 10)), Some((b, 19)), None]);
+        assert_eq!(slipthree_tcs(&s), vec![Some("00:00:00:22".to_string()), Some("00:00:00:00".to_string()), Some("00:00:00:09".to_string()), None]);
+    }
+
+    /// Rule: four cells land as exact quarters (each half 1:1 in its outer cell); a missing cell is FIELD; two cells are
+    /// SR858's `slip_split`.
+    #[test]
+    fn striaslipviewthree_split_kats() {
+        let s = slipthree_split(&[Some(px(2, 1, 1)), Some(px(2, 1, 2)), Some(px(2, 1, 3)), None]).unwrap();
+        assert_eq!((s.width, s.height), (8, 1));
+        let mut want = [vec![1u8; 8], vec![2u8; 8], vec![3u8; 8]].concat();
+        want.extend(FIELD.repeat(2));
+        assert_eq!(s.rgba, want);
+        assert_eq!(slipthree_split(&[Some(px(2, 1, 1)), Some(px(2, 1, 2))]), slip_split(Some(&px(2, 1, 1)), Some(&px(2, 1, 2))));
+        assert_eq!(slipthree_split(&[None, None]), None);
+    }
+
+    /// Rule: the spots sit at each cell's left + 4 and the letterbox rect's foot - 4, clipped to the cell's columns.
+    #[test]
+    fn striaslipviewthree_tc_spots_kats() {
+        assert_eq!(slip_tc_spots(160, 50, 320, 100, 2), vec![(4.0, 96.0, (0, 160)), (164.0, 96.0, (160, 320))]);
+        assert_eq!(slip_tc_spots(160, 50, 320, 100, 4).iter().map(|s| s.0).collect::<Vec<_>>(), vec![4.0, 84.0, 164.0, 244.0]);
+        assert_eq!(slip_tc_spots(100, 100, 320, 100, 1), vec![(114.0, 96.0, (110, 210))], "pillarbox");
+        assert_eq!(slip_tc_spots(320, 50, 320, 100, 1), vec![(4.0, 71.0, (0, 320))], "letterbox");
+        assert!(slip_tc_spots(0, 50, 320, 100, 2).is_empty() && slip_tc_spots(160, 50, 320, 100, 0).is_empty());
+    }
+
+    /// Rule: with labels off the timecodes paint nothing (byte-equal without them); with labels on they change pixels
+    /// only inside the pair's letterbox rect of the preview band.
+    #[test]
+    fn striaslipviewthree_timecodes_paint_only_with_labels() {
+        for labels in [false, true] {
+            let (tl, src) = synth_fixture();
+            let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, labels);
+            face.state.select_at(0, 12).unwrap();
+            assert!(face.verb("slip+"));
+            let with = face.paint();
+            assert!(face.slip_timecodes().is_some_and(|t| t.len() == 2 && t.iter().all(|c| c.is_some())));
+            let (sw, sh) = face.slip_view().map(|s| (s.width, s.height)).unwrap();
+            face.slip_view.as_mut().unwrap().tcs = vec![None, None];
+            let without = face.paint();
+            if !labels {
+                assert_eq!(with, without, "labels off: not a pixel");
+                continue;
+            }
+            let l = face.layout_for(Role::Whole).with_message(true);
+            let d = timeline_core::SizePolicy::Letterbox.place(sw as usize, sh as usize, l.w as usize, l.preview_h as usize).dst;
+            let diff: Vec<(usize, usize)> = (0..with.len() / 4).filter(|&i| with[i * 4..i * 4 + 4] != without[i * 4..i * 4 + 4]).map(|i| (i % l.w as usize, i / l.w as usize)).collect();
+            assert!(!diff.is_empty(), "labels on: the timecodes paint");
+            assert!(diff.iter().all(|&(x, y)| x >= d.x && x < d.x + d.w && y >= d.y && y < d.y + d.h), "only inside the pair's rect");
+        }
     }
 }
