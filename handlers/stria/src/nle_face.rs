@@ -194,13 +194,14 @@ pub struct Face {
     /// NLE5DKEYSHELP (SR744): the keys help overlay is shown over the timeline band ([`Face::paint_help`]).
     help: bool,
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
+    pcache: PreviewCache, // STRIAPERFPREVIEWCACHE (SR918): the preview still's key and the reel summaries (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, pcache: PreviewCache::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -1590,11 +1591,11 @@ impl Face {
         let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
         let st = shown.as_ref().unwrap_or(&self.state);
-        if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
+        if role != Role::Tracks && !self.pcache.taken(self.play.take_still(&mut self.still, st.playhead, shown.is_none())) && !self.pcache.hit(&st.timeline, st.playhead) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIAPERFPREVIEWCACHE (SR918): an unchanged (timeline, playhead) keeps the still (file tail)
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.last_error = Some(format!("preview: {e}"));
+                    self.pcache.miss(); self.last_error = Some(format!("preview: {e}")); // STRIAPERFPREVIEWCACHE (SR918): an error is never cached (file tail)
                     None
                 }
             };
@@ -2354,7 +2355,7 @@ impl Face {
     /// selected or a reel with nothing to say.
     pub fn reel_line(&self) -> Option<String> {
         let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
-        let s = self.sources.summary(c.src)?;
+        let s = self.pcache.summary(&self.sources, c.src)?; // STRIAPERFPREVIEWCACHE (SR918): read once per reel (file tail)
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
         Some(format!("{name}: {s}"))
     }
@@ -3095,5 +3096,167 @@ impl Face {
             return None;
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
+    }
+}
+
+// ---- STRIAPERFPREVIEWCACHE (LEDGER SR918): the preview still and the reel summaries cached by key (named tail block) ----
+// SR890 measured the paint's hot spot: `paint_role` re-rendered `preview` on every paint a played tick did not feed (a select, a
+// hover tick, a message, a help toggle each re-decoded the unchanged playhead frame), and `reel_line` re-read
+// `Sources::summary` every paint. The still is now kept by key like `trans_still`: (the timeline as painted, the playhead); a
+// paint with the same key renders nothing and shows the still a render would give (render is deterministic per
+// (timeline, sources, t); the face's `Arc<Sources>` is fixed after `Face::new`), so every golden is byte-identical. A played
+// still drops the key (the next idle paint renders once, as before); a preview error drops it (an error re-reports every paint,
+// as before). A reel's summary is read once per SourceId. Owed: NLE-PERF-PREVIEW-CACHE-AUDIO, NLE-PERF-PREVIEW-PLAYED-KEY,
+// NLE-PERF-MESSAGE-SHAPE.
+
+use timeline_core::SourceId;
+
+/// STRIAPERFPREVIEWCACHE (SR918): the key of the face's preview still, the count of `preview` renders the paint made, and the
+/// reel summaries read so far with their count (locked only for a lookup or a push, never across a summary).
+#[derive(Default)]
+struct PreviewCache {
+    key: Option<(Timeline, i64)>,
+    renders: u64,
+    summaries: std::sync::Mutex<(Vec<(SourceId, Option<String>)>, u64)>,
+}
+
+impl PreviewCache {
+    /// `taken`: a played tick's still was taken; it drops the key. Returns `taken`.
+    fn taken(&mut self, taken: bool) -> bool {
+        if taken {
+            self.key = None;
+        }
+        taken
+    }
+    /// True when the still was rendered for `(tl, t)`; otherwise the key becomes `(tl, t)`, one render is counted, and the
+    /// caller renders `preview`.
+    fn hit(&mut self, tl: &Timeline, t: i64) -> bool {
+        if self.key.as_ref().is_some_and(|(k, kt)| *kt == t && k == tl) {
+            return true;
+        }
+        self.key = Some((tl.clone(), t));
+        self.renders += 1;
+        false
+    }
+    /// The render failed: no key (the next paint renders again).
+    fn miss(&mut self) {
+        self.key = None;
+    }
+    /// Source `id`'s `Sources::summary`, read once per id.
+    fn summary(&self, src: &Sources, id: SourceId) -> Option<String> {
+        if let Some((_, s)) = self.summaries.lock().unwrap_or_else(|e| e.into_inner()).0.iter().find(|(i, _)| *i == id) {
+            return s.clone();
+        }
+        let s = src.summary(id);
+        let mut g = self.summaries.lock().unwrap_or_else(|e| e.into_inner());
+        g.0.push((id, s.clone()));
+        g.1 += 1;
+        s
+    }
+}
+
+impl Face {
+    /// STRIAPERFPREVIEWCACHE (SR918): how many `preview` renders the paint has made (one per changed key).
+    pub fn preview_renders(&self) -> u64 {
+        self.pcache.renders
+    }
+    /// STRIAPERFPREVIEWCACHE (SR918): how many `Sources::summary` reads the message row has made (one per reel).
+    pub fn summary_reads(&self) -> u64 {
+        self.pcache.summaries.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+
+#[cfg(test)]
+mod striaperfpreviewcache_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = synth_fixture();
+        let mut f = Face::new(EditorState::new(tl), src, (320, 240), PixelOrder::Rgba, false);
+        f.state.playhead = 3;
+        f
+    }
+
+    fn pixels(blits: Vec<SMessage>) -> Vec<u8> {
+        match blits.into_iter().last() {
+            Some(SMessage::SurfaceBlit { pixels, .. }) => pixels,
+            _ => panic!("a blit"),
+        }
+    }
+
+    /// STRIAPERFPREVIEWCACHE M3: a help toggle, a message and a select with the playhead and timeline unchanged decode nothing.
+    #[test]
+    fn striaperfpreviewcache_same_key_decodes_once() {
+        let mut f = face();
+        f.frames();
+        assert_eq!(f.preview_renders(), 1);
+        assert!(f.verb("help"));
+        f.frames();
+        assert!(f.verb("help"));
+        f.frames();
+        f.last_error = Some("a message".into());
+        f.frames();
+        f.state.select(0, 0).expect("clip 0 on V1");
+        f.frames();
+        assert_eq!(f.state.playhead, 3);
+        assert_eq!(f.preview_renders(), 1, "same (timeline, playhead): no second render");
+        let want = preview(&f.state.timeline, &f.sources, 3).expect("renders");
+        assert_eq!(f.still().cloned(), want);
+    }
+
+    /// STRIAPERFPREVIEWCACHE M3: a playhead move, an edit and its undo each render once; split, the tracks Surface renders none.
+    #[test]
+    fn striaperfpreviewcache_key_change_renders() {
+        let mut f = face();
+        f.frames();
+        f.state.playhead = 14;
+        f.frames();
+        assert_eq!(f.preview_renders(), 2);
+        f.state.select(0, 1).expect("reel B clip under tick 14");
+        f.frames();
+        assert_eq!(f.preview_renders(), 2, "a select keeps the key");
+        assert_eq!(f.state.verb("split"), Some(Ok(())));
+        f.frames();
+        assert_eq!(f.preview_renders(), 3);
+        assert_eq!(f.state.verb("undo"), Some(Ok(())));
+        f.frames();
+        f.frames();
+        assert_eq!(f.preview_renders(), 4, "the cache holds one key");
+        let mut s = face().on_surfaces(1, 2);
+        assert_eq!(s.frames().len(), 2);
+        assert_eq!(s.frames().len(), 2);
+        assert_eq!(s.preview_renders(), 1, "split: one render per key");
+    }
+
+    /// STRIAPERFPREVIEWCACHE M3: a paint from the cached still is byte-identical to a fresh face's paint of the same state.
+    #[test]
+    fn striaperfpreviewcache_bytes_identical() {
+        let mut a = face();
+        a.frames();
+        assert!(a.verb("help"));
+        assert!(a.verb("help"));
+        let cached = pixels(a.frames());
+        assert_eq!(a.preview_renders(), 1);
+        let mut b = face();
+        assert_eq!(cached, pixels(b.frames()));
+    }
+
+    /// STRIAPERFPREVIEWCACHE M3: the message row reads a reel's summary once.
+    #[test]
+    fn striaperfpreviewcache_summary_once_per_reel() {
+        let mut f = face();
+        let (a, b) = (f.state.timeline.tracks[0].clips[0].src, f.state.timeline.tracks[0].clips[1].src);
+        f.state.select(0, 0).expect("reel A clip");
+        let line = f.reel_line();
+        assert_eq!(f.reel_line(), line);
+        assert_eq!(f.reel_line(), line);
+        assert_eq!(f.summary_reads(), 1);
+        assert_eq!(line, f.sources.summary(a).map(|s| format!("A: {s}")));
+        f.state.select(0, 1).expect("reel B clip");
+        assert_eq!(f.reel_line(), f.sources.summary(b).map(|s| format!("B: {s}")));
+        assert_eq!(f.summary_reads(), 2);
+        f.state.select(0, 0).expect("reel A clip");
+        assert_eq!(f.reel_line(), line);
+        assert_eq!(f.summary_reads(), 2);
     }
 }
