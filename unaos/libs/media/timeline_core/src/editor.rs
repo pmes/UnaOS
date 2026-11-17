@@ -731,11 +731,11 @@ impl EditorState {
         let fps = self.timeline.fps().unwrap_or(25);
         let ph = self.playhead;
         match (word, arg) {
-            ("gain-", None) => self.set_selected_gain(c.gain_cdb.saturating_sub(GAIN_STEP_CDB)),
-            ("gain+", None) => self.set_selected_gain(c.gain_cdb.saturating_add(GAIN_STEP_CDB)),
-            ("gain", None) => self.set_selected_gain(0),
+            ("gain-", None) => self.gain_set(|g| g.saturating_sub(GAIN_STEP_CDB)), // STRIAMULTISELECT (SR853): every clip of the selection steps by its own gain (file tail)
+            ("gain+", None) => self.gain_set(|g| g.saturating_add(GAIN_STEP_CDB)), // STRIAMULTISELECT (SR853): the whole selection (file tail)
+            ("gain", None) => self.gain_set(|_| 0), // STRIAMULTISELECT (SR853): the whole selection (file tail)
             ("gain", Some(db)) => match cdb_of(db) {
-                Some(cdb) => self.set_selected_gain(cdb),
+                Some(cdb) => self.gain_set(|_| cdb), // STRIAMULTISELECT (SR853): the whole selection (file tail)
                 None => Err(refused),
             },
             ("fade-in", None) => self.set_selected_fades(ph - c.at, c.fade_out),
@@ -1158,5 +1158,88 @@ impl EditorState {
         }
         let clips = self.set.iter().filter_map(|&(t, i)| self.timeline.tracks.get(t)?.clips.get(i));
         clips.fold(None, |r, c| Some(r.map_or((c.at, c.end()), |(a, b): (i64, i64)| (a.min(c.at), b.max(c.end())))))
+    }
+}
+
+// ---- STRIAMULTISELECT (LEDGER SR853): gain over the whole selection (named tail block) ----
+// NLE2c's set already carries shift-click (`select_add`), the marquee (`select_many` over `view::Layout::crossing`), move
+// (`move_set`) and delete (`ripple_delete` / `lift_selected` over the set ops). Gain joins them: [`EditorState::gain_set`]
+// folds the existing per-clip `Timeline::set_gain` (its own `validate`) over every clip of `set` and lands as ONE `commit`;
+// any clip refused (`EditError::Gain`) refuses the whole edit and leaves the state, and a map that changes no clip commits
+// nothing. The set and its primary stay (no clip moves). SR838's `gain-` / `gain+` / `gain [<dB>]` words call it.
+impl EditorState {
+    /// Every selected clip's gain set to `gain(its own gain_cdb)` (ONE commit; refused whole; no change commits nothing).
+    pub fn gain_set(&mut self, gain: impl Fn(i32) -> i32) -> Result<(), EditError> {
+        self.selection.ok_or(EditError::NoClip)?;
+        let mut tl = self.timeline.clone();
+        let mut changed = false;
+        for &(t, i) in &self.set {
+            let c = tl.tracks.get(t).and_then(|tr| tr.clips.get(i)).copied().ok_or(EditError::NoClip)?;
+            let g = gain(c.gain_cdb);
+            if g != c.gain_cdb {
+                tl = tl.set_gain(t, i, g)?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.commit(tl);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod striamultiselect_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// V1: A 0..10 at 0, B 0..10 at 10; A1: A 0..20 at 0 at -3 dB. The set: V1's B (primary) and A1's clip.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10).gained(200)];
+        tl.tracks[1].clips = alloc::vec![Clip::new(a, 0, 20, 0).gained(-300)];
+        let mut st = EditorState::new(tl);
+        st.select(1, 0).unwrap();
+        st.select_add(0, 1).unwrap();
+        st
+    }
+    fn gains(st: &EditorState) -> [i32; 3] {
+        let g = |t: usize, i: usize| st.timeline.tracks[t].clips[i].gain_cdb;
+        [g(0, 0), g(0, 1), g(1, 0)]
+    }
+
+    #[test]
+    fn striamultiselect_gain_steps_every_clip_of_the_set() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("gain+"), Some(Ok(())));
+        assert_eq!(gains(&st), [0, 300, -200], "each selected clip by its own gain; the unselected clip stays");
+        assert_eq!(st.undo_depth(), 1, "ONE commit for the whole set");
+        assert_eq!((st.selection, st.set.clone()), (Some((0, 1)), alloc::vec![(0, 1), (1, 0)]));
+        assert_eq!(edl::parse(&edl::write(&st.timeline, "T").unwrap(), 25).unwrap(), st.timeline, "the EDL carries every gain");
+        assert_eq!(st.verb("gain -6"), Some(Ok(())));
+        assert_eq!(gains(&st), [0, -600, -600]);
+        assert_eq!(st.verb("gain"), Some(Ok(())));
+        assert_eq!(gains(&st), [0, 0, 0]);
+        assert_eq!(st.undo_depth(), 3);
+        assert!(st.undo() && st.undo() && st.undo());
+        assert_eq!(st.timeline, tl0, "one undo per word");
+    }
+
+    #[test]
+    fn striamultiselect_gain_refused_whole() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.gain_set(|g| g + crate::GAIN_MAX_CDB - 100), Err(EditError::Gain), "B lands over the max");
+        assert_eq!((&st.timeline, st.undo_depth()), (&tl0, 0), "nothing of the set changed");
+        assert_eq!(st.gain_set(|g| g), Ok(()));
+        assert_eq!(st.undo_depth(), 0, "no change commits nothing");
+        st.deselect();
+        assert_eq!(st.gain_set(|_| 0), Err(EditError::NoClip));
+        assert_eq!(st.verb("gain+"), Some(Err(EditError::NoClip)));
     }
 }
