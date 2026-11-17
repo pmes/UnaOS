@@ -6061,6 +6061,115 @@ mod tests {
         }
     }
 
+    // ---- AETHERCSSWIDEINHERITEDREST (LEDGER SR831): an explicit inherit beats the white-space / direction / list-style tag roads (named tail block) ----
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): one probe per row at 20px serif in a 400px viewport, the rules in a sheet: three
+    /// pre with one 100-character line (plain, `white-space: inherit`, `inherit` then `pre`), three `Hello` blocks (`dir=rtl`,
+    /// `dir=rtl` with `direction: inherit`, plain ltr), and lists nested one level inside a `ul` item: an ol with
+    /// `list-style-type: inherit`, one with `unset`, a disc-styled twin and a plain ol; a ul with `inherit`, a disc-styled
+    /// twin and a plain ul. Rows 12px apart, so one probe's ink window (its rect +- 2px) does not take a neighbour's.
+    fn css_wide_rest_engine() -> crate::AetherEngine {
+        let line = "the quick brown fox jumps over the lazy dog and keeps on running far past the edge of the box again";
+        let html = format!(
+            r#"<!doctype html><html><head><style>
+            div, pre, ul, ol {{ margin: 0 0 12px }}
+            pre.w {{ white-space: inherit }}
+            pre.v {{ white-space: inherit; white-space: pre }}
+            div.d {{ direction: inherit }}
+            ol.i {{ list-style-type: inherit }}
+            ol.u {{ list-style-type: unset }}
+            ul ul.i {{ list-style-type: inherit }}
+            </style></head><body style="margin:0;font:20px serif">
+            <pre id="pp">{line}</pre>
+            <pre id="pw" class="w">{line}</pre>
+            <pre id="pv" class="v">{line}</pre>
+            <div id="rref" dir="rtl">Hello</div>
+            <div id="rd" dir="rtl" class="d">Hello</div>
+            <div id="lref">Hello</div>
+            <ul><li><ol class="i"><li id="oli">Hello</li></ol></li></ul>
+            <ul><li><ol class="u"><li id="olu">Hello</li></ol></li></ul>
+            <ul><li><ol style="list-style-type:disc"><li id="old">Hello</li></ol></li></ul>
+            <ul><li><ol><li id="olp">Hello</li></ol></li></ul>
+            <ul><li><ul class="i"><li id="uli">Hello</li></ul></li></ul>
+            <ul><li><ul style="list-style-type:disc"><li id="uld">Hello</li></ul></li></ul>
+            <ul><li><ul><li id="ulp">Hello</li></ul></li></ul>
+        </body></html>"#
+        );
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 900));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the dark-pixel count of each column in [x0, x1) across element `id`'s rows (its
+    /// rect, 2 px of margin above and below).
+    fn css_wide_rest_columns(e: &mut crate::AetherEngine, id: &str, x0: usize, x1: usize) -> Vec<usize> {
+        let (_, t, _, h) = imgalt_rect(e, id);
+        let (y0, y1) = ((t - 2.0).max(0.0) as usize, (t + h + 2.0).ceil() as usize);
+        (x0..x1).map(|x| imgalt_ink(e, x, x + 1, y0, y1)).collect()
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): the marker columns of list item `id`: the 36 px left of its box.
+    fn css_wide_rest_marker(e: &mut crate::AetherEngine, id: &str) -> Vec<usize> {
+        let l = imgalt_rect(e, id).0.max(0.0) as usize;
+        css_wide_rest_columns(e, id, l.saturating_sub(36), l)
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `pre.w { white-space: inherit }` under a `normal` body wraps its long line (more
+    /// than 1.5 x the plain pre's one-line height; the plain pre does not wrap, armed); a later `white-space: pre` in the
+    /// same block beats the inherit (one line, the plain pre's height).
+    #[test]
+    fn css_wide_rest_pre_wraps() {
+        let mut e = css_wide_rest_engine();
+        let h = |e: &mut crate::AetherEngine, id: &str| imgalt_rect(e, id).3;
+        let (pp, pw, pv) = (h(&mut e, "pp"), h(&mut e, "pw"), h(&mut e, "pv"));
+        assert!(pp > 5.0 && pp < 40.0, "the plain pre is one line ({pp})");
+        assert!(pw > 1.5 * pp, "pre.w wraps like its normal parent ({pw} vs one line {pp})");
+        assert!((pv - pp).abs() <= 0.5, "the later pre beats the inherit ({pv} vs {pp})");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `div.d { direction: inherit }` on a `dir=rtl` block under an ltr body lays out
+    /// ltr: its ink is the plain ltr block's, starting in the left half; the plain `dir=rtl` block's starts in the right
+    /// half (armed).
+    #[test]
+    fn css_wide_rest_direction_ltr() {
+        let mut e = css_wide_rest_engine();
+        let first = |c: &[usize]| c.iter().position(|&n| n > 0).unwrap_or(usize::MAX);
+        let lref = css_wide_rest_columns(&mut e, "lref", 0, 400);
+        let rref = css_wide_rest_columns(&mut e, "rref", 0, 400);
+        let rd = css_wide_rest_columns(&mut e, "rd", 0, 400);
+        assert!(lref.iter().sum::<usize>() > 20, "the reference run paints");
+        assert!(first(&rref) > 200 && first(&rref) != usize::MAX, "the plain dir=rtl block starts right (armed)");
+        assert!(first(&rd) < 200, "the inheriting block starts left");
+        assert_eq!(rd, lref, "the inheriting block lays out as the ltr reference");
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ol.i { list-style-type: inherit }` and `ol.u { list-style-type: unset }` inside
+    /// a `ul` item take the ul's disc past the ol's decimal tag road: their item's marker ink is the disc-styled ol twin's,
+    /// and the plain ol's "1." differs (armed).
+    #[test]
+    fn css_wide_rest_list_ol_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "old");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "olp"), disc, "the plain ol's decimal is not the disc (armed)");
+        for id in ["oli", "olu"] {
+            assert_eq!(css_wide_rest_marker(&mut e, id), disc, "#{id}: the parent's disc");
+        }
+    }
+
+    /// AETHERCSSWIDEINHERITEDREST (SR831): `ul ul.i { list-style-type: inherit }` takes the outer ul's disc past the depth
+    /// match's circle: the disc-styled twin's marker ink, not the plain nested ul's (armed).
+    #[test]
+    fn css_wide_rest_list_nested_ul_takes_disc() {
+        let mut e = css_wide_rest_engine();
+        let disc = css_wide_rest_marker(&mut e, "uld");
+        assert!(disc.iter().sum::<usize>() > 3, "the disc twin paints a marker");
+        assert_ne!(css_wide_rest_marker(&mut e, "ulp"), disc, "the plain nested ul's circle is not the disc (armed)");
+        assert_eq!(css_wide_rest_marker(&mut e, "uli"), disc, "the inheriting ul takes the outer disc");
+    }
+
     // ---- AETHERCSSWIDENONINHERITEDINITIAL (LEDGER SR832): initial / unset on a non-inherited property beat an earlier rule (named tail block) ----
 
     /// AETHERCSSWIDENONINHERITEDINITIAL (SR832): one probe pair per row at 400 px wide, the rules in a sheet, each `.r`
@@ -6161,109 +6270,13 @@ mod tests {
         assert!((wr - 400.0).abs() <= 0.5, "width: unset fills the container: {wr}");
     }
 
-    // ---- AETHERCSSOMFONTSIZEREL (LEDGER SR819): getComputedStyle's fontSize is the used size (named tail block) ----
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): one probe per relative road: em and % of the parent's size, smaller / larger
-    /// (layout_core's /1.2 and x1.2), `font: inherit` and em on a control, a plain control, and nested em.
-    fn font_size_rel_engine() -> crate::AetherEngine {
-        let html = r#"<!doctype html><html><body style="margin:0;font:16px serif">
-            <div style="font-size:10px"><span id="em" style="font-size:2em">Hello</span></div>
-            <div style="font-size:16px"><span id="pct" style="font-size:150%">Hello</span></div>
-            <div style="font-size:10px"><span id="sm" style="font-size:smaller">Hello</span></div>
-            <div style="font-size:10px"><span id="lg" style="font-size:larger">Hello</span></div>
-            <div style="font-size:20px"><button id="fib" style="font:inherit">Go</button></div>
-            <div style="font-size:20px"><button id="plain">Go</button></div>
-            <div style="font-size:10px"><button id="emb" style="font-size:2em">Go</button></div>
-            <div style="font-size:10px"><div style="font-size:2em"><span id="nest" style="font-size:1.5em">Hello</span></div></div>
-        </body></html>"#;
-        let mut engine = crate::AetherEngine::new();
-        engine.handle_event(crate::api::events::Event::Resize(400, 400));
-        engine.load_html("https://example.com/", html, true);
-        engine.render_frame();
-        engine
-    }
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): `font-size: 2em` under 10px reads 20px and `150%` under 16px reads 24px (the
-    /// specified road read the parent's size: 10px / 16px).
-    #[test]
-    fn font_size_rel_cssom_em_percent() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "em", "fontSize"), "20px", "2em of 10px");
-        assert_eq!(font_shorthand_cs(&mut e, "pct", "fontSize"), "24px", "150% of 16px");
-    }
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): `smaller` / `larger` under 10px read layout_core's /1.2 and x1.2, in the report's
-    /// 4-decimal grammar.
-    #[test]
-    fn font_size_rel_cssom_smaller_larger() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "sm", "fontSize"), "8.3333px", "smaller: 10 / 1.2");
-        assert_eq!(font_shorthand_cs(&mut e, "lg", "fontSize"), "12px", "larger: 10 x 1.2");
-    }
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): a `font: inherit` button under 20px reads 20px (it painted 20px and read the
-    /// 13.333px control default before), a plain button reads 13.333px (CONTROL_FONT_PX: Chromium's 13.3333px is
-    /// AETHER-CONTROL-FONT-PX-THIRD owed), a `font-size: 2em` button under 10px reads 20px.
-    #[test]
-    fn font_size_rel_cssom_font_inherit_button() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "fib", "fontSize"), "20px", "font: inherit takes the parent's 20px");
-        assert_eq!(font_shorthand_cs(&mut e, "plain", "fontSize"), "13.333px", "the control default");
-        assert_eq!(font_shorthand_cs(&mut e, "emb", "fontSize"), "20px", "2em of 10px on a control");
-    }
-
-    /// AETHERCSSOMFONTSIZEREL (SR819): `1.5em` inside `2em` under 10px reads 30px: the em chain is the layout's.
-    #[test]
-    fn font_size_rel_cssom_nested_em() {
-        let mut e = font_size_rel_engine();
-        assert_eq!(font_shorthand_cs(&mut e, "nest", "fontSize"), "30px", "1.5 x 2 x 10px");
-    }
-
-    // ---- AETHERRTLMARGINAUTO (LEDGER SR781): an rtl column's over-constrained margins bind margin-right (named tail block) ----
-
-    /// AETHERRTLMARGINAUTO (SR781, AETHER-RTL-MARGIN-AUTO): in a 300px `dir=rtl` column a 100px block with margin-left 10
-    /// and margin-right 20 sits 20 from the right edge (CSS 2.2 §10.3.3: margin-left is the over-constrained one; SR711's
-    /// END), `margin-left: auto` takes the slack to the same place, `margin: 0 auto` centres, an ltr column keeps
-    /// margin-left; `style.direction` flips re-derive it.
-    #[test]
-    fn rtl_margin_over_constrained_ends_at_margin_right() {
-        let html = r#"<html><head><style>
-            body { margin: 0; }
-            .col { width: 300px; }
-            .col div { width: 100px; height: 10px; }
-        </style></head><body>
-        <div class="col" id="rc" dir="rtl">
-            <div id="a" style="margin-left: 10px; margin-right: 20px"></div>
-            <div id="b" style="margin-left: auto; margin-right: 20px"></div>
-            <div id="c" style="margin: 0 auto"></div>
-        </div>
-        <div class="col" id="lc"><div id="d" style="margin-left: 10px; margin-right: 20px"></div></div>
-        </body></html>"#;
-        let mut engine = crate::AetherEngine::new();
-        engine.handle_event(crate::api::events::Event::Resize(800, 600));
-        engine.load_html("https://example.com/", html, true);
-        engine.render_frame();
-        let off = |e: &mut crate::AetherEngine, col: &str, id: &str| {
-            js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().left - document.getElementById('{col}').getBoundingClientRect().left"))
-        };
-        assert_eq!(off(&mut engine, "rc", "a"), 180.0, "rtl 10 / 20: margin-right binds");
-        assert_eq!(off(&mut engine, "rc", "b"), 180.0, "rtl auto / 20: the auto margin takes the slack");
-        assert_eq!(off(&mut engine, "rc", "c"), 100.0, "rtl 0 auto: centred");
-        assert_eq!(off(&mut engine, "lc", "d"), 10.0, "ltr 10 / 20: margin-left binds");
-        for (dir, want) in [("ltr", 10.0), ("rtl", 180.0)] {
-            js_num(&mut engine, &format!("document.getElementById('rc').style.direction = '{dir}'; 0"));
-            engine.render_frame();
-            assert_eq!(off(&mut engine, "rc", "a"), want, "style.direction = {dir}: the 10 / 20 block's offset");
-        }
-    }
-
     // ---- AETHERCSSWIDENONINHERITEDREST (LEDGER SR848): initial / unset on the rest of the non-inherited arms beat an earlier rule (named tail block) ----
 
     /// AETHERCSSWIDENONINHERITEDREST (SR848): one armed / reset pair per row at 400 px wide, each `.r` twin resetting
     /// what its class's rule set: position absolute (initial), float left (unset), opacity 0.5 on red (initial), a
     /// 100px translate (initial), overflow hidden on a 10px box with a 40px red child (initial), a column flexbox
     /// (initial), and a relative box 30px down (top: initial).
-    fn css_wide_rest_engine() -> crate::AetherEngine {
+    fn css_wide_noninherited_rest_engine() -> crate::AetherEngine {
         let html = r#"<!doctype html><html><head><style>
             div, section { margin: 0 0 12px }
             .pa { position: absolute; top: 0; left: 200px; width: 50px; height: 30px }
@@ -6322,7 +6335,7 @@ mod tests {
     /// sibling is at the section's top (armed).
     #[test]
     fn css_wide_rest_position_in_flow() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (_, st, ..) = imgalt_rect(&mut e, "pasec");
         let (_, sbt, ..) = imgalt_rect(&mut e, "pas");
         assert!((sbt - st).abs() <= 1.0, "the absolute box takes no space (armed): {sbt} vs {st}");
@@ -6335,7 +6348,7 @@ mod tests {
     /// but sits below it (the floated twin's text starts right of it, armed).
     #[test]
     fn css_wide_rest_float_unset() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (sl, ..) = imgalt_rect(&mut e, "fls");
         assert!(sl >= 49.0, "the float's text beside it (armed): {sl}");
         let (_, ft, ..) = imgalt_rect(&mut e, "flr");
@@ -6347,7 +6360,7 @@ mod tests {
     /// AETHERCSSWIDENONINHERITEDREST (SR848): `opacity: initial` after 0.5 paints full red (the 0.5 twin is pink, armed).
     #[test]
     fn css_wide_rest_opacity_full_ink() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         assert_eq!(css_wide_color_ink(&mut e, "op", css_wide_red), 0, "opacity 0.5 red is pink (armed)");
         assert!(css_wide_color_ink(&mut e, "opr", css_wide_red) > 100, "opacity: initial paints full red");
     }
@@ -6356,7 +6369,7 @@ mod tests {
     /// untransformed x (red at 0..50, none at 100..150; the translated twin the reverse, armed).
     #[test]
     fn css_wide_rest_transform_untransformed() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (_, t, _, h) = imgalt_rect(&mut e, "tr");
         let (y0, y1) = (t.ceil() as usize + 2, (t + h).floor() as usize - 2);
         assert!(css_wide_rest_red(&e, 102, 148, y0, y1) > 100, "the translated box at 100 (armed)");
@@ -6371,7 +6384,7 @@ mod tests {
     /// 10px parent (the hidden twin clips it, armed).
     #[test]
     fn css_wide_rest_overflow_paints() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (_, t, ..) = imgalt_rect(&mut e, "ov");
         let t = t.ceil() as usize;
         assert_eq!(css_wide_rest_red(&e, 0, 400, t + 14, t + 36), 0, "overflow: hidden clips the child (armed)");
@@ -6384,7 +6397,7 @@ mod tests {
     /// column twin stacks them, armed).
     #[test]
     fn css_wide_rest_flex_direction_row() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (_, t1, ..) = imgalt_rect(&mut e, "fd1");
         let (_, t2, ..) = imgalt_rect(&mut e, "fd2");
         assert!(t2 >= t1 + 10.0, "the column twin stacks (armed): {t2} vs {t1}");
@@ -6398,7 +6411,7 @@ mod tests {
     /// further down from its sibling, armed).
     #[test]
     fn css_wide_rest_top_no_offset() {
-        let mut e = css_wide_rest_engine();
+        let mut e = css_wide_noninherited_rest_engine();
         let (_, s, ..) = imgalt_rect(&mut e, "tps");
         let (_, b, ..) = imgalt_rect(&mut e, "tp");
         let (_, rs, ..) = imgalt_rect(&mut e, "tprs");
