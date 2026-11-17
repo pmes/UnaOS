@@ -350,7 +350,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
-    paint_transitions(&mut c, l, st);
+    paint_grade_badges(&mut c, l, st); paint_transitions(&mut c, l, st); // STRIAGRADEFACE (SR899): a graded clip's badge, nothing at identity (file tail)
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -1187,5 +1187,81 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAGRADEFACE (LEDGER SR899): a graded clip's badge on its body (named tail block) ----
+// Every clip whose SR869 grade is not identity carries a small badge: three 2 x 6 px stripes (R, G, B) at the body's top
+// right, inside the end trim handle. A clip too narrow for it, or off the canvas, shows none; an identity grade paints no
+// pixel, so every golden is byte-identical. The kernel Player refuses a graded timeline at open (`grade-unsupported`).
+
+/// The badge's three stripes, left to right.
+pub const GRADE_BADGE: [[u8; 4]; 3] = [[0xff, 0x50, 0x50, 255], [0x50, 0xe0, 0x50, 255], [0x50, 0x90, 0xff, 255]];
+
+/// The badge's left edge and top for a clip body `x0..x1` on row top `y0`; `None` when the body is too narrow.
+fn grade_badge_at(x0: i64, x1: i64, y0: i64) -> Option<(i64, i64)> {
+    let bx = x1 - 1 - HANDLE_W - 7;
+    if bx < x0 + 1 + HANDLE_W {
+        return None;
+    }
+    Some((bx, y0 + 3))
+}
+
+/// [`paint_in`]'s badges: one per non-identity-graded clip on the layout's rows.
+fn paint_grade_badges(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, tr) in st.timeline.tracks.iter().enumerate().take(l.rows) {
+        for clip in tr.clips.iter().filter(|c| c.grade != crate::Grade::IDENTITY) {
+            let (x0, x1) = (l.x_of(clip.at), l.x_of(clip.end()));
+            if x1 <= 0 || x0 >= l.w as i64 {
+                continue;
+            }
+            let Some((bx, by)) = grade_badge_at(x0, x1, l.row_y(row)) else { continue };
+            for (i, k) in GRADE_BADGE.iter().enumerate() {
+                let x = bx + 2 * i as i64;
+                c.rect(x, by, x + 2, by + 6, *k);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod striagradeface_tests {
+    use super::*;
+    use crate::{Clip, Grade, Kind, Timeline};
+
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 100);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 10, 0), Clip::new(a, 10, 20, 10)];
+        EditorState::new(tl)
+    }
+
+    /// The badge paints only on a graded clip: graded-then-cleared paints byte-identical to never graded; graded, the
+    /// canvas differs ONLY inside the badge's 6 x 6 rect, and each stripe carries its colour.
+    #[test]
+    fn striagradeface_badge_only_when_graded() {
+        let (w, h) = (320u32, 160u32);
+        let st = state();
+        let plain = paint(&st, w, h, Order::Rgba, None, None);
+        let g = Grade { brightness: 50, ..Grade::IDENTITY };
+        let graded = EditorState::new(st.timeline.set_grade(0, 1, g).unwrap());
+        let cleared = EditorState::new(graded.timeline.set_grade(0, 1, Grade::IDENTITY).unwrap());
+        assert_eq!(paint(&cleared, w, h, Order::Rgba, None, None), plain);
+        let px = paint(&graded, w, h, Order::Rgba, None, None);
+        let l = Layout::of(w, h, &graded);
+        let clip = graded.timeline.tracks[0].clips[1];
+        let (bx, by) = grade_badge_at(l.x_of(clip.at), l.x_of(clip.end()), l.row_y(0)).expect("room for the badge");
+        let at = |x: i64, y: i64| (y as usize * w as usize + x as usize) * 4;
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let i = at(x, y);
+                if (bx..bx + 6).contains(&x) && (by..by + 6).contains(&y) {
+                    assert_eq!(&px[i..i + 4], &GRADE_BADGE[((x - bx) / 2) as usize][..], "({x},{y})");
+                } else {
+                    assert_eq!(&px[i..i + 4], &plain[i..i + 4], "({x},{y})");
+                }
+            }
+        }
     }
 }

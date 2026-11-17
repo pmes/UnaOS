@@ -154,7 +154,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 26] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "help"]; // NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
+pub const VERBS: [&str; 32] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "help"]; // STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -2356,7 +2356,7 @@ impl Face {
         let c = self.hover_dwelt().and_then(|(t, i)| self.state.timeline.tracks.get(t)?.clips.get(i).copied()).or_else(|| self.state.selected())?;
         let s = self.sources.summary(c.src)?;
         let name = self.state.timeline.source(c.src).map_or_else(|| c.src.0.to_string(), |x| x.reel.clone());
-        Some(format!("{name}: {s}"))
+        Some(format!("{name}: {s}{}", grade_note(c.grade))) // STRIAGRADEFACE (SR899): the clip's grade while not identity (file tail)
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
@@ -3096,4 +3096,14 @@ impl Face {
         }
         stall_since(j.rate_at.0.elapsed(), j.rate_ema)
     }
+}
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the message row reads the clip's grade (named tail block) ----
+/// STRIAGRADEFACE (SR899): what [`Face::reel_line`] appends for a clip graded `g` (SR869's grade, the `bright` / `contrast`
+/// / `sat` words' three values in 1/1000): `"  bright <b> contrast <c> sat <s>"`; empty at identity (every line unchanged).
+pub fn grade_note(g: timeline_core::Grade) -> String {
+    if g == timeline_core::Grade::IDENTITY {
+        return String::new();
+    }
+    format!("  bright {} contrast {} sat {}", g.brightness, g.contrast, g.saturation)
 }

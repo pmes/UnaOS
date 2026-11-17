@@ -517,6 +517,7 @@ fn transport() -> TetraNode {
         button("in", "Range In"), button("out", "Range Out"), // NLE5DEXPORTRANGE (SR717): the export range's marks at the playhead
         button("kind", "Kind"), button("ease", "Ease"), // NLETRANSITIONFACE (SR691): the selected transition's kind / ease cycle
         button("slip-", "Slip -"), button("slip+", "Slip +"), button("slide-", "Slide -"), button("slide+", "Slide +"), // NLE3ESLIPFACE (SR737): one-frame slip / slide of the selected clip
+        button("bright-", "Bright -"), button("bright+", "Bright +"), button("contrast-", "Contrast -"), button("contrast+", "Contrast +"), button("sat-", "Sat -"), button("sat+", "Sat +"), // STRIAGRADEFACE (SR899): step the selected clip's grade (timeline_core's words)
         button("help", "?"), // NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`)
     ])
 }
@@ -934,5 +935,24 @@ mod striacolorlift_tests {
         assert!(drive(&mut face, "undo").is_empty());
         assert_eq!(color_json(&face), "");
         println!("striacolorlift witness: color:0:0:-1000 -> \"color\":[0,0,-1000]");
+    }
+}
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the grade step buttons (named tail block) ----
+#[cfg(test)]
+mod striagradeface_tests {
+    use super::*;
+
+    /// M3: `at:12:0` selects B; `bright+` and `sat-` are the transport buttons' words (one undo step each) and the
+    /// witness's `color` field reads the stepped grade.
+    #[test]
+    fn striagradeface_witness_buttons() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        let errors = drive(&mut face, "at:12:0,bright+,sat-");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(color_json(&face), r#","color":[50,0,-50]"#);
+        assert_eq!(face.state.undo_depth(), 2);
+        println!("striagradeface witness: bright+,sat- -> \"color\":[50,0,-50]");
     }
 }

@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead; if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIACOLORLIFT (SR869): `color` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
+        let ph = self.playhead; if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } // STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -691,5 +691,38 @@ impl EditorState {
             (3, Some(x)) => self.set_grade(crate::Grade { brightness: x[0], contrast: x[1], saturation: x[2] }),
             _ => Err(EditError::Grade),
         })
+    }
+}
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the grade step words (named tail block) ----
+// `bright-` / `bright+`, `contrast-` / `contrast+`, `sat-` / `sat+` step the selected clip's brightness / contrast /
+// saturation by [`GRADE_STEP`] (1/1000) through SR869's `EditorState::set_grade` (ONE commit per press). Refused by name:
+// nothing selected `EditError::NoClip`; a step past -1000..=1000 `EditError::Grade` (validate; not clamped); an audio
+// clip `EditError::Kind`. The face's buttons fire these words (stria `nle_face::VERBS`).
+
+/// The step of one grade word, in 1/1000.
+pub const GRADE_STEP: i16 = 50;
+
+impl EditorState {
+    /// The grade step words of [`EditorState::verb`]; `None` when `v` is not one.
+    fn grade_step_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let (field, d) = match v {
+            "bright-" => (0, -GRADE_STEP),
+            "bright+" => (0, GRADE_STEP),
+            "contrast-" => (1, -GRADE_STEP),
+            "contrast+" => (1, GRADE_STEP),
+            "sat-" => (2, -GRADE_STEP),
+            "sat+" => (2, GRADE_STEP),
+            _ => return None,
+        };
+        let Some(c) = self.selected() else { return Some(Err(EditError::NoClip)) };
+        let mut g = c.grade;
+        let f = match field {
+            0 => &mut g.brightness,
+            1 => &mut g.contrast,
+            _ => &mut g.saturation,
+        };
+        *f = f.saturating_add(d);
+        Some(self.set_grade(g))
     }
 }

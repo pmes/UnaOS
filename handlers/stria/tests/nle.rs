@@ -3734,3 +3734,53 @@ fn striacolorlift_face_word_grades_the_preview() {
     assert!(face.on(&input("undo")));
     assert_eq!(stria::nle_face::preview(&face.state.timeline, &src2, 12).unwrap().unwrap().rgba, before);
 }
+
+// ---- STRIAGRADEFACE (LEDGER SR899): the grade step words on the face and the message row's grade (named tail block) ----
+
+/// The six grade words are transport VERBS right before `help` (still the last); with nothing selected each is taken by
+/// `Face::verb` and refused on the message line by EditError::NoClip's name, the timeline unchanged.
+#[test]
+fn striagradeface_verbs_before_help() {
+    let words = ["bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+"];
+    assert_eq!(VERBS.last(), Some(&"help"));
+    assert_eq!(&VERBS[VERBS.len() - 7..VERBS.len() - 1], &words[..]);
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    for v in words {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take(), Some(format!("{v}: {}", EditError::NoClip)));
+    }
+    assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl, 0));
+}
+
+/// The message row's idle line is the reel line; stepping B's grade appends its three values (one undo step per word),
+/// a step past the range is refused by EditError::Grade's name, and undo gives the plain line back.
+#[test]
+fn striagradeface_message_row_reads_the_grade() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.state.select(0, 1).unwrap();
+    let plain = face.message_text().expect("B's reel line");
+    assert_eq!(face.reel_line().as_deref(), Some(plain.as_str()));
+    for v in ["bright+", "contrast-", "sat+"] {
+        assert!(face.verb(v), "{v}");
+        assert!(face.last_error.is_none(), "{v}: {:?}", face.last_error);
+    }
+    assert_eq!(face.state.undo_depth(), 3);
+    assert_eq!(face.message_text(), Some(format!("{plain}  bright 50 contrast -50 sat 50")));
+    for _ in 0..19 {
+        assert!(face.verb("sat+"));
+    }
+    assert_eq!(face.state.timeline.tracks[0].clips[1].grade.saturation, 1000);
+    let depth = face.state.undo_depth();
+    assert!(face.verb("sat+"));
+    assert_eq!(face.last_error.take(), Some(format!("sat+: {}", EditError::Grade)));
+    assert_eq!(face.state.undo_depth(), depth);
+    for _ in 0..depth {
+        assert!(face.verb("undo"));
+    }
+    assert_eq!(face.state.timeline, tl);
+    assert_eq!(face.message_text(), Some(plain.clone()));
+    println!("striagradeface: message row {plain:?} + \"  bright 50 contrast -50 sat 50\"");
+}
+
