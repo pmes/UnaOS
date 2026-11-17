@@ -10297,3 +10297,71 @@ fn strialoudnessmore_band_follows_the_measure() {
     println!("strialoudnessmore: band fraction {f:.3} while running, none after");
 }
 
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail, decoded on the heads' budget (named tail block) ----
+
+/// STRIATHUMBNAILSMORE (SR949): the synth fixture at zoom 16 on a 640 px canvas (each V1 body 158 px, over two 48 px heads):
+/// painted until no tile is pending, clip 0 (A[13,23)@0) shows A@13 at its left, A@16 (48 px / 16 px per tick = 3 ticks in)
+/// next to it and A@22 (src_out - 1) right-aligned, each box the preview road's frame scaled; three clips x three stills =
+/// nine decodes, and a further paint decodes none.
+#[test]
+fn striathumbnailsmore_face_filmstrip_and_tail() {
+    let (tl, src) = synth_fixture();
+    let want = [13i64, 16, 22].map(|t| striathumbnails_expected(&tl, &src, SourceId(0), t));
+    let mut st = EditorState::new(tl);
+    st.zoom = 16;
+    let mut face = Face::new(st, src, (640, 160), PixelOrder::Rgba, false);
+    let mut buf = face.paint();
+    let mut paints = 1;
+    while face.thumbs_pending() && paints < 10 {
+        buf = face.paint();
+        paints += 1;
+    }
+    assert!(!face.thumbs_pending(), "every visible tile decoded within {paints} paints");
+    assert_eq!(face.thumb_decodes(), 9, "three clips: head, one middle, tail each");
+    let c = face.state.timeline.tracks[0].clips[0];
+    let l = face.layout();
+    let (x0, x1, y0) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1, l.row_y(0) + 2);
+    assert_eq!(x1 - x0, 158);
+    for (i, (bx, t)) in [(x0, 13i64), (x0 + 48, 16), (x1 - 48, 22)].into_iter().enumerate() {
+        assert_eq!(face.thumb(SourceId(0), t), Some(&want[i]), "A@{t} cached");
+        let got = striathumbnails_box(&buf, l.w, bx, y0, want[i].width, want[i].height);
+        assert_eq!(got, want[i].rgba, "the box at x {bx} is A@{t}");
+    }
+    let again = face.paint();
+    assert_eq!(face.thumb_decodes(), 9, "a further paint decodes nothing");
+    assert_eq!(again, buf, "the strip never changes the picture between paints");
+    println!("striathumbnailsmore: filmstrip A@13 / A@16 / A@22 decodes={} paints={paints}", face.thumb_decodes());
+}
+
+/// STRIATHUMBNAILSMORE (SR949): heads first: four wide clips (zoom 16, 158 px bodies) on a 640 px canvas: the first paint's
+/// THUMBS_PER_PAINT (4) decodes are the four heads and leaves the tiles pending; the next paints fill every middle and tail.
+#[test]
+fn striathumbnailsmore_heads_before_tiles() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let v = tl.add_track(Kind::Video);
+    tl.tracks[v].clips = (0..5).map(|i| Clip::new(a, i * 10, i * 10 + 10, i * 10)).collect();
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let mut st = EditorState::new(tl);
+    st.zoom = 16;
+    let mut face = Face::new(st, src, (640, 160), PixelOrder::Rgba, false);
+    let _ = face.paint();
+    assert_eq!(face.thumb_decodes(), 4, "THUMBS_PER_PAINT");
+    assert!(face.thumbs_pending(), "tiles left");
+    for i in 0..4i64 {
+        assert!(face.thumb(a, i * 10).is_some(), "head {i} first");
+        assert!(face.thumb(a, i * 10 + 3).is_none() && face.thumb(a, i * 10 + 9).is_none(), "no tile of clip {i} before every head");
+    }
+    let mut paints = 1;
+    while face.thumbs_pending() && paints < 10 {
+        let _ = face.paint();
+        paints += 1;
+    }
+    assert_eq!(face.thumb_decodes(), 12, "four visible clips x (head, middle, tail); clip 4 is off the canvas");
+    for i in 0..4i64 {
+        assert!(face.thumb(a, i * 10 + 3).is_some() && face.thumb(a, i * 10 + 9).is_some(), "clip {i}'s middle and tail");
+    }
+    println!("striathumbnailsmore: heads first, decodes=12 after {paints} paints");
+}

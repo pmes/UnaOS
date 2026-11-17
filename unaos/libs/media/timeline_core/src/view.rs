@@ -328,7 +328,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, opacity_colour(clip_colour(clip.src.0, track.kind), ROW[row % 2], clip.opacity));
             if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
-            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_head(&mut c, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail) paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_strip(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left; STRIATHUMBNAILSMORE (SR949): a wide body's filmstrip and tail (file tail) // STRIAOPACITYFACE (SR898): the body at its opacity (file tail) pan_tick(&mut c, track.kind, clip, x0, x1, y0); // STRIAPANFACE (SR897): the audio clip's pan tick, nothing at centre (file tail) paint_crop_badge(&mut c, clip.crop, x0, x1, y0); // STRIACROPFACE (SR900): a cropped clip's badge (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &opacity_label(label, clip.opacity), x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32)); // STRIAOPACITYMORE (SR958): the label names a non-opaque clip's percent (file tail)
@@ -1887,7 +1887,7 @@ mod head_tests {
     fn head_box_shows_the_still_and_the_bar_continues() {
         let still = pattern();
         let hook = Hook(Some(still.clone()), None);
-        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 2));
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 11, 2)); // STRIATHUMBNAILSMORE (SR949): an 86 px body (< 2 heads): head-only, the bar right of it
         let l = Layout::of(320, 160, &st);
         let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
         let (bx, by) = (l.x_of(2) + 1, l.row_y(0) + 2);
@@ -3088,4 +3088,171 @@ pub fn opacity_label(label: alloc::string::String, pct: u8) -> alloc::string::St
         return label;
     }
     alloc::format!("{label} {pct}%")
+}
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail (named tail block) ----
+// A video clip body at least two heads wide shows more than its head: [`head_tiles`] (THE tile rule, read by BOTH this
+// painter and the face's fill, Stria's `Thumbs::fill_strip`) lays the head (`src_in`) at the body's left, the TAIL
+// (`src_out - 1`) right-aligned, and between them a FILMSTRIP: a still every head-width px, each the frame under the tile's
+// left column (anchored to the clip, so a scroll keeps the keys; a zoom changes them). The gap left of the tail stays the
+// colour bar. A narrower body is SR839's head exactly. [`paint_strip`] blits every tile through SR839's unchanged
+// [`paint_head`] (Fill, the crop, the off-canvas refusal per tile) via the same `thumb(src, src_tick)` hook; a tile whose
+// still is not decoded yet keeps the bar. No hook or no head still: nothing (every golden and the kernel band unchanged).
+// Owed: NLE-THUMBNAILS-RATE (with STRIACLIPSPEED SR829 the middle tick becomes `clip.src_at(clip.at + k * sw / zoom)`, the
+// one line in `head_tiles`), NLE-THUMBNAILS-STRIP-CACHE (more visible tiles than the face's THUMB_CACHE re-decode each paint).
+
+/// THE tile rule: the stills `(x, w, src_tick)` of a video clip body `x0..x1` whose head still is `sw` px wide at `zoom` px
+/// per tick. `sw <= 0` or an empty body: none. A body narrower than `2 * sw`: the head alone, `(x0, min(sw, bw), src_in)`.
+/// Otherwise the head `(x0, sw, src_in)`, middles `(x0 + k * sw, sw, src_in + min(k * sw / zoom, len - 1))` for k = 1.. while
+/// the tile ends at or before the tail's left, and the tail `(x1 - sw, sw, src_out - 1)`.
+pub fn head_tiles(x0: i64, x1: i64, sw: i64, zoom: u32, clip: &crate::Clip) -> Vec<(i64, i64, i64)> {
+    let bw = x1 - x0;
+    if sw <= 0 || bw <= 0 {
+        return Vec::new();
+    }
+    if bw < 2 * sw {
+        return vec![(x0, sw.min(bw), clip.src_in)];
+    }
+    let (z, last) = (zoom.max(1) as i64, (clip.len() - 1).max(0));
+    let mut tiles = vec![(x0, sw, clip.src_in)];
+    let mut k = 1i64;
+    while x0 + (k + 1) * sw <= x1 - sw {
+        tiles.push((x0 + k * sw, sw, clip.src_in + (k * sw / z).min(last)));
+        k += 1;
+    }
+    tiles.push((x1 - sw, sw, clip.src_out - 1));
+    tiles
+}
+
+/// The video body's stills: the head still's width sets the tiles ([`head_tiles`] at the layout's zoom), each tile blitted by
+/// [`paint_head`] into its own `x..x + w` slice of `body` with the clip's `src_in` set to the tile's tick. No head still: nothing.
+pub fn paint_strip(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, src: &dyn PeakSource) {
+    let Some(sw) = src.thumb(clip.src, clip.src_in).map(|s| s.width as i64) else { return };
+    let (x0, y0, x1, y1) = body;
+    for (x, w, tick) in head_tiles(x0, x1, sw, l.zoom, clip) {
+        paint_head(c, (x, y0, x + w, y1), &crate::Clip { src_in: tick, ..*clip }, src);
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+    use alloc::collections::BTreeMap;
+
+    /// A test hook: one distinct still per source tick (none for a tick it does not hold).
+    struct PerTick(BTreeMap<i64, Still>);
+    impl PeakSource for PerTick {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            None
+        }
+        fn gain_q16(&self, _cdb: i32) -> i64 {
+            65536
+        }
+        fn thumb(&self, _src: SourceId, src_tick: i64) -> Option<&Still> {
+            self.0.get(&src_tick)
+        }
+    }
+
+    /// A 48 x 36 still marked by `tick` in its blue channel.
+    fn marked(tick: i64) -> Still {
+        let (w, h) = (48u32, 36u32);
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 5) as u8, (y * 7) as u8, (0x40 + tick) as u8, 255]);
+            }
+        }
+        Still { width: w, height: h, rgba }
+    }
+
+    fn one_clip(clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    fn box_is(buf: &[u8], w: u32, bx: i64, by: i64, s: &Still) -> bool {
+        (0..s.height as i64).all(|y| (0..s.width as i64).all(|x| {
+            let i = ((y * s.width as i64 + x) * 4) as usize;
+            px(buf, w, bx + x, by + y) == [s.rgba[i], s.rgba[i + 1], s.rgba[i + 2], s.rgba[i + 3]]
+        }))
+    }
+
+    #[test]
+    fn strip_tiles_narrow_one_head_and_filmstrip() {
+        let c = Clip::new(SourceId(0), 5, 55, 0);
+        assert_eq!(head_tiles(10, 30, 48, 8, &c), alloc::vec![(10, 20, 5)], "narrower than the head: the cropped head");
+        assert_eq!(head_tiles(10, 100, 48, 8, &c), alloc::vec![(10, 48, 5)], "under two heads: the head alone");
+        assert!(head_tiles(10, 100, 0, 8, &c).is_empty() && head_tiles(10, 10, 48, 8, &c).is_empty());
+        let mut want = alloc::vec![(17, 48, 5)];
+        for k in 1..=6 {
+            want.push((17 + 48 * k, 48, 5 + 6 * k));
+        }
+        want.push((367, 48, 54));
+        assert_eq!(head_tiles(17, 415, 48, 8, &c), want, "head, six middles every 48 px (6 ticks), the tail at src_out - 1");
+        // a 3-tick clip at zoom 1 over 300 px: the middle ticks clamp to the clip's last frame
+        let short = Clip::new(SourceId(0), 0, 3, 0);
+        let t = head_tiles(0, 300, 48, 1, &short);
+        assert_eq!(t.len(), 6);
+        assert!(t[1..].iter().all(|e| e.2 == 2), "middles and tail clamp to src_out - 1");
+    }
+
+    #[test]
+    fn strip_paints_head_middles_tail_inside_the_body() {
+        let mut m = BTreeMap::new();
+        for t in [0i64, 6, 12, 18, 24, 30, 36, 49] {
+            m.insert(t, marked(t));
+        }
+        let hook = PerTick(m);
+        // a 50-tick clip at tick 2, zoom 8, on a 480 px canvas: body 17..415
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 2));
+        let l = Layout::of(480, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (x0, x1) = (l.x_of(2) + 1, l.x_of(52) - 1);
+        let (y0, y1) = (l.row_y(0) + 2, l.row_y(0) + ROW_H as i64 - 2);
+        assert_eq!((x0, x1), (17, 415));
+        assert!(box_is(&buf, l.w, x0, y0, &marked(0)), "the head is src_in's still");
+        assert!(box_is(&buf, l.w, x0 + 48, y0, &marked(6)), "the first middle is the frame 6 ticks in");
+        assert!(box_is(&buf, l.w, x0 + 6 * 48, y0, &marked(36)), "the sixth middle");
+        assert!(box_is(&buf, l.w, x1 - 48, y0, &marked(49)), "the tail is src_out - 1");
+        let bar = clip_colour(0, Kind::Video);
+        for y in y0..y1 {
+            assert_eq!(px(&buf, l.w, x1 - 49, y), bar, "the gap left of the tail is the colour bar");
+        }
+        for y in 0..l.h as i64 {
+            for x in 0..l.w as i64 {
+                if !(x >= x0 && x < x1 && y >= y0 && y < y1) {
+                    assert_eq!(px(&buf, l.w, x, y), px(&none, l.w, x, y), "a strip pixel at {x},{y} outside the body");
+                }
+            }
+        }
+        std::println!("striathumbnailsmore: body {x0}..{x1} head + 6 middles + tail, fnv={:016x}", fnv1a(&buf));
+    }
+
+    #[test]
+    fn strip_missing_tiles_keep_the_bar_and_no_head_paints_nothing() {
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 2));
+        let l = Layout::of(480, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let mut m = BTreeMap::new();
+        m.insert(49i64, marked(49));
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&PerTick(m))), none, "no head still: nothing, the tail neither");
+        let mut m = BTreeMap::new();
+        m.insert(0i64, marked(0));
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&PerTick(m)));
+        let (x0, x1, y0) = (l.x_of(2) + 1, l.x_of(52) - 1, l.row_y(0) + 2);
+        assert!(box_is(&buf, l.w, x0, y0, &marked(0)));
+        let bar = clip_colour(0, Kind::Video);
+        assert!((x0 + 48..x1).all(|x| px(&buf, l.w, x, y0 + 10) == bar), "undecoded middles and tail keep the bar");
+    }
 }
