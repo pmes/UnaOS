@@ -144,6 +144,8 @@ pub struct Track {
     pub muted: bool,
     /// STRIATRACKMUTESOLO (SR837): the track is soloed (when any track is, only the solo tracks are active).
     pub solo: bool,
+    /// STRIATRACKGAIN (SR864): the track's audio gain in centi-dB (0 = unity; the clip range), added to each clip's in the mix.
+    pub gain_cdb: i32,
 }
 
 /// An edge wipe's SMPTE pattern (CMX 3600 `W<nnn>`): the incoming source enters behind a moving edge.
@@ -431,7 +433,7 @@ impl Timeline {
     }
     /// Add an empty track (builder); returns its index.
     pub fn add_track(&mut self, kind: Kind) -> usize {
-        self.tracks.push(Track { kind, clips: Vec::new(), transitions: Vec::new(), muted: false, solo: false });
+        self.tracks.push(Track { kind, clips: Vec::new(), transitions: Vec::new(), muted: false, solo: false, gain_cdb: 0 });
         self.tracks.len() - 1
     }
     pub fn source(&self, id: SourceId) -> Option<&Source> {
@@ -456,7 +458,7 @@ impl Timeline {
 
     /// Check every invariant (see the crate docs).
     pub fn validate(&self) -> Result<(), EditError> {
-        for t in &self.tracks {
+        for t in &self.tracks { if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&t.gain_cdb) { return Err(EditError::Gain); } // STRIATRACKGAIN (SR864): a track's gain in the clip range
             let mut prev: Option<&Clip> = None;
             for c in &t.clips {
                 let s = self.source(c.src).ok_or(EditError::NoSource)?;
@@ -1634,5 +1636,55 @@ mod striatrackmutesolo_tests {
         mute = mute.set_track_flags(v1, true, false).unwrap().set_track_flags(v2, true, false).unwrap();
         assert!(video(&mute).iter().all(|&v| v == (None, None)), "every video track muted: black steps, one per tick");
         assert_eq!(video(&mute).len(), 10);
+    }
+}
+
+// ---- STRIATRACKGAIN (LEDGER SR864): the per-track gain and the one heard-gain sum (named tail block) ----
+// `Track::gain_cdb` is a plain field of the Timeline value (undo, `dirty`, save follow), in the clip range
+// (`GAIN_MIN_CDB..=GAIN_MAX_CDB`, `validate`'s `EditError::Gain`). THE RULE: a layer is heard at its clip's gain PLUS its
+// track's ([`Timeline::heard_cdb`]: centi-dB add = linear gains multiply; no clamp, the sum is the true product).
+// `schedule::audio_runs` builds every `Layer.gain_cdb` through it (both of its Layer sites), so Stria's render, preview,
+// meters and export (`mix_run` / `mix_into`) AND the kernel Player's EDL mode (`vplay.rs` `layer_q8`) follow with no mix
+// edit; a track at 0 dB gives the runs it gave before.
+impl Timeline {
+    /// The timeline with track `track`'s gain set to `cdb` centi-dB (`EditError::NoTrack` for no such track,
+    /// `EditError::Gain` outside the clip range).
+    pub fn set_track_gain(&self, track: usize, cdb: i32) -> Result<Timeline, EditError> {
+        if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&cdb) {
+            return Err(EditError::Gain);
+        }
+        let mut tl = self.clone();
+        tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?.gain_cdb = cdb;
+        Ok(tl)
+    }
+    /// The gain a clip of gain `clip_cdb` on track `track` is heard at: the clip's plus the track's (0 for no such track).
+    pub fn heard_cdb(&self, track: usize, clip_cdb: i32) -> i32 {
+        clip_cdb + self.tracks.get(track).map_or(0, |t| t.gain_cdb)
+    }
+}
+
+#[cfg(test)]
+mod striatrackgain_tests {
+    use super::*;
+
+    /// M3: set_track_gain sets one track; refused NoTrack / Gain by name (the state untouched); validate refuses a raw
+    /// out-of-range field; heard_cdb is the sum.
+    #[test]
+    fn striatrackgain_set_and_refusals() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let t = tl.add_track(Kind::Audio);
+        tl.tracks[t].clips = alloc::vec![Clip::new(a, 0, 10, 0).gained(-300)];
+        assert_eq!(tl.tracks[t].gain_cdb, 0);
+        let g = tl.set_track_gain(t, -602).unwrap();
+        assert_eq!((g.tracks[t].gain_cdb, g.tracks[t].clips.clone(), g.heard_cdb(t, -300)), (-602, tl.tracks[t].clips.clone(), -902));
+        assert_eq!(tl.set_track_gain(1, -602), Err(EditError::NoTrack));
+        assert_eq!(tl.set_track_gain(t, GAIN_MAX_CDB + 1), Err(EditError::Gain));
+        assert_eq!(tl.set_track_gain(t, GAIN_MIN_CDB - 1), Err(EditError::Gain));
+        assert!(tl.set_track_gain(t, GAIN_MIN_CDB).is_ok() && tl.set_track_gain(t, GAIN_MAX_CDB).is_ok());
+        let mut raw = tl.clone();
+        raw.tracks[t].gain_cdb = GAIN_MAX_CDB + 1;
+        assert_eq!(raw.validate(), Err(EditError::Gain));
+        assert_eq!(tl.heard_cdb(7, -300), -300, "no such track: the clip's own");
     }
 }
