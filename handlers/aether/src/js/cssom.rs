@@ -427,23 +427,10 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
                 "inset" => "top",
                 _ => "border-top-width",
             };
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_length_token(lp, c)).collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
+            plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token(lp, c))
         }
-        "border-style" => {
-            let vals: Option<Vec<String>> = split_values(v)
-                .iter()
-                .map(|c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|i| BORDER_STYLES.contains(&i.as_str())))
-                .collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
-        }
-        "border-color" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_color(std::slice::from_ref(c))).collect();
-            let vals = four(&vals.ok_or(())?).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().zip(vals).collect())
-        }
+        "border-style" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|i| BORDER_STYLES.contains(&i.as_str()))),
+        "border-color" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_color(std::slice::from_ref(c))),
         "border-top" | "border-right" | "border-bottom" | "border-left" | "border" => {
             let (w, s, c) = parse_border_side(v, "border-top-width").ok_or(())?;
             let sides: Vec<&str> = if prop == "border" { SIDES.to_vec() } else { vec![&prop[7..]] };
@@ -469,27 +456,9 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             let (w, s, c) = parse_border_side(v, "outline-width").ok_or(())?;
             Ok(vec![("outline-color".into(), c), ("outline-style".into(), s), ("outline-width".into(), w)])
         }
-        "gap" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| normalize_length_token("row-gap", c)).collect();
-            let vals = vals.ok_or(())?;
-            match vals.len() {
-                1 => Ok(vec![("row-gap".into(), vals[0].clone()), ("column-gap".into(), vals[0].clone())]),
-                2 => Ok(vec![("row-gap".into(), vals[0].clone()), ("column-gap".into(), vals[1].clone())]),
-                _ => Err(()),
-            }
-        }
-        "overflow" => {
-            let vals: Option<Vec<String>> = split_values(v).iter().map(|c| ident_of(c).map(|i| i.to_ascii_lowercase())).collect();
-            let vals = vals.ok_or(())?;
-            if !vals.iter().all(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay")) {
-                return Err(());
-            }
-            match vals.len() {
-                1 => Ok(vec![("overflow-x".into(), vals[0].clone()), ("overflow-y".into(), vals[0].clone())]),
-                2 => Ok(vec![("overflow-x".into(), vals[0].clone()), ("overflow-y".into(), vals[1].clone())]),
-                _ => Err(()),
-            }
-        }
+        "gap" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("row-gap", c)),
+        "overflow" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase()).filter(|x| matches!(x.as_str(), "visible" | "hidden" | "clip" | "scroll" | "auto" | "overlay"))),
+        "place-content" | "place-items" | "place-self" => plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| ident_of(c).map(|i| i.to_ascii_lowercase())),
         "flex" => {
             let parts = split_values(v);
             let num_of = |c: &CV| match c {
@@ -520,12 +489,8 @@ fn expand(prop: &str, v: &[CV]) -> Result<Vec<(String, String)>, ()> {
             Ok(vec![("flex-grow".into(), g), ("flex-shrink".into(), sh), ("flex-basis".into(), b)])
         }
         "border-radius" => {
-            let parts = split_values(v);
-            if parts.len() != 1 {
-                return Ok(vec![(prop.to_string(), serialize_generic(prop, v))]);
-            }
-            let x = normalize_length_token("border-top-left-radius", &parts[0]).ok_or(())?;
-            Ok(longhands(prop).unwrap().into_iter().map(|p| (p, x.clone())).collect())
+            if tv.iter().any(|c| matches!(c, CV::Token(Token::Delim('/')))) { return Ok(vec![(prop.to_string(), serialize_generic(prop, v))]); } // the `/` form stays opaque (owed AETHER-CSSOM-BORDER-RADIUS-SLASH)
+            plain_expand(prop, plain_n(prop).ok_or(())?, tv, |c| normalize_length_token("border-top-left-radius", c))
         }
         "background" => match normalize_color(tv) {
             Some(c) => Ok(longhands("background")
@@ -614,10 +579,8 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             parts.join(" ")
         }
     };
+    if let Some(&(_, n)) = PLAIN_N.iter().find(|(s, _)| *s == sh) { return Some((plain_serialize(n, &vals), important)); }
     let s = match sh {
-        "margin" | "padding" | "inset" | "border-width" | "border-style" | "border-color" => {
-            four_serialize([vals[0], vals[1], vals[2], vals[3]])
-        }
         "border-top" | "border-right" | "border-bottom" | "border-left" => side(vals[0], vals[1], vals[2]),
         "border" => {
             // widths 0..4, styles 4..8, colors 8..12
@@ -627,23 +590,9 @@ fn serialize_shorthand(block: &Block, sh: &str) -> Option<(String, bool)> {
             }
             side(vals[0], vals[4], vals[8])
         }
-        "gap" | "overflow" => {
-            if vals[0] == vals[1] {
-                vals[0].to_string()
-            } else {
-                format!("{} {}", vals[0], vals[1])
-            }
-        }
         "flex" => format!("{} {} {}", vals[0], vals[1], vals[2]),
         "font-synthesis" => font_synthesis_words(&vals)?,
         "outline" => side(vals[2], vals[1], vals[0]),
-        "border-radius" => {
-            if vals.iter().all(|v| *v == vals[0]) {
-                vals[0].to_string()
-            } else {
-                four_serialize([vals[0], vals[1], vals[2], vals[3]])
-            }
-        }
         "background" => {
             let color = vals[8];
             let rest_initial = ls.iter().zip(vals.iter()).take(8).all(|(l, v)| bg_initial(l) == *v);
@@ -1141,7 +1090,7 @@ fn initial_value(p: &str) -> &'static str {
         "z-index" | "width" | "height" | "top" | "left" | "right" | "bottom" | "flex-basis" | "cursor" => "auto",
         "float" | "clear" | "transform" | "box-shadow" | "text-shadow" | "max-width" | "max-height" | "filter"
         | "animation-name" | "text-transform" | "background-image" | "list-style-image" => "none",
-        "overflow" | "overflow-x" | "overflow-y" => "visible",
+        "overflow-x" | "overflow-y" => "visible",
         "box-sizing" => "content-box",
         "vertical-align" => "baseline",
         "background-repeat" => "repeat",
@@ -1151,12 +1100,12 @@ fn initial_value(p: &str) -> &'static str {
         "justify-content" | "align-content" | "align-items" | "align-self" | "justify-items" | "justify-self" => "normal",
         "direction" => "ltr", "unicode-bidi" => "normal",
         "pointer-events" => "auto",
-        "letter-spacing" | "word-spacing" => "normal",
-        "font-synthesis" => "weight style small-caps", "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
-        "min-width" | "min-height" => "0px",
-        "margin-right" | "margin-bottom" | "margin-left" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
-        "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
-        "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
+        "letter-spacing" | "word-spacing" | "row-gap" | "column-gap" => "normal",
+        "font-synthesis-weight" | "font-synthesis-style" | "font-synthesis-small-caps" => "auto", "font-variant" | "font-variant-caps" => "normal",
+        "min-width" | "min-height" | "border-top-left-radius" | "border-top-right-radius" | "border-bottom-right-radius" | "border-bottom-left-radius" => "0px",
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => "0px",
+        "border-top-width" | "border-right-width" | "border-bottom-width" | "border-left-width" => "0px",
+        "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => "none",
         _ => "",
     }
 }
@@ -1200,7 +1149,7 @@ pub fn computed_value(el: usize, prop: &str) -> String {
         return inline;
     }
     crate::ledger::record_css(&format!("getComputedStyle-initial-not-cascaded:{prop}"));
-    initial_value(prop).to_string()
+    shorthand_computed(el, prop).unwrap_or_else(|| initial_value(prop).to_string())
 }
 
 thread_local! {
@@ -1247,7 +1196,7 @@ fn cascaded_value(el: usize, prop: &str) -> Option<String> {
     let parent = || with_doc(|d| d.parent_element(NodeId(el)).map(|p| p.0)).filter(|p| with_doc(|d| d.element(NodeId(*p)).is_some()));
     let inherits = css_core::container::inherited_property(prop);
     let from_parent = || parent().map(|p| computed_value(p, prop)).filter(|v| !v.is_empty());
-    let initial = || Some(initial_value(prop).to_string()).filter(|v| !v.is_empty());
+    let initial = || Some(initial_of(prop)).filter(|v| !v.is_empty());
     match declared.as_deref() {
         Some("inherit") => from_parent(),
         Some("initial") => initial(),
@@ -1896,12 +1845,7 @@ fn caption_side_computed(el: usize) -> String {
 /// `weight`, `style`, `none`): an element that declares only `font-synthesis-weight: none` reads `style`, not the
 /// shorthand its parent computes.
 fn font_synthesis_computed(el: usize) -> String {
-    let mut b = Block::default();
-    for l in longhands("font-synthesis").unwrap_or_default() {
-        let value = computed_value(el, &l);
-        b.decls.push(Decl { name: l, value, important: false });
-    }
-    serialize_shorthand(&b, "font-synthesis").map(|x| x.0).unwrap_or_default()
+    shorthand_computed(el, "font-synthesis").unwrap_or_default()
 }
 
 // ---- AETHERFONTSYNTHESISSMALLCAPS (LEDGER SR772): the font-synthesis shorthand serialized over its three longhands (named tail block) ----
@@ -1974,6 +1918,9 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
             "background-repeat", "background-attachment", "background-origin", "background-clip", "background-color",
         ],
     ),
+    ("place-content", &["align-content", "justify-content"]),
+    ("place-items", &["align-items", "justify-items"]),
+    ("place-self", &["align-self", "justify-self"]),
 ];
 
 #[cfg(test)]
@@ -2102,11 +2049,11 @@ top>inset";
                 old_of.insert(p, shs.split(' ').collect());
             }
         }
-        assert_eq!(keys, SHORTHANDS.len(), "every old shorthand is a table row and no more");
+        assert_eq!(keys + PLACE_SHORTHANDS.len(), SHORTHANDS.len(), "every old shorthand is a table row, plus SR1087's three place-* rows (19 + 3 = 22)");
         let names = universe();
         assert_eq!(names.len(), 243) /* SR800 fold: + font-variant-caps */;
         for p in &names {
-            let want = if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
+            let want = if let Some(sh) = PLACE_SHORTHANDS.iter().find(|sh| longhands(sh).unwrap().contains(p)) { vec![*sh] /* SR1087: a place-* longhand maps to its place row */ } else if FIXED.contains(&p.as_str()) { Vec::new() } else { old_of.get(p.as_str()).cloned().unwrap_or_default() };
             assert_eq!(shorthands_of(p), want, "shorthands_of({p})");
         }
         for p in FIXED {
@@ -2453,4 +2400,589 @@ mod border_image_tests {
         assert_eq!(b.get("border"), "");
         assert_eq!(b.serialize(), "border-width: 1px; border-style: solid; border-color: red; border-image: url(\"a.png\") 30;");
     }
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLESERIALIZE (LEDGER SR1078): the plain n-value serialization rules as table data (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLESERIALIZE (SR1078): the shorthands whose serialization is the plain n-value collapse —
+/// n = 4 (top right bottom left: 4 -> 1-4 values through [`four_serialize`]) or n = 2 (2 -> 1-2 values). Each name is a
+/// [`SHORTHANDS`] row with exactly n longhands; every other row has a grammar arm in [`serialize_shorthand`]. The
+/// `shorthand_table_serialize_*` tests pin both, so a new 2- or 4-longhand row cannot silently read "".
+const PLAIN_N: &[(&str, u8)] = &[
+    ("margin", 4),
+    ("padding", 4),
+    ("inset", 4),
+    ("border-width", 4),
+    ("border-style", 4),
+    ("border-color", 4),
+    ("border-radius", 4),
+    ("gap", 2),
+    ("overflow", 2),
+    ("place-content", 2),
+    ("place-items", 2),
+    ("place-self", 2),
+];
+
+/// The plain n-value serialization of a [`PLAIN_N`] shorthand's longhand values (in [`SHORTHANDS`] order).
+fn plain_serialize(n: u8, vals: &[&str]) -> String {
+    match n {
+        4 => four_serialize([vals[0], vals[1], vals[2], vals[3]]),
+        2 if vals[0] == vals[1] => vals[0].to_string(),
+        2 => format!("{} {}", vals[0], vals[1]),
+        _ => vals.join(" "),
+    }
+}
+
+#[cfg(test)]
+mod shorthand_table_serialize_tests {
+    use super::*;
+
+    /// The rows whose serialization is a hand-written grammar arm in [`serialize_shorthand`].
+    const GRAMMAR: [&str; 10] = [
+        "border", "border-image", "border-top", "border-right", "border-bottom", "border-left", "font-synthesis", "flex",
+        "outline", "background",
+    ];
+
+    fn get(css: &str, sh: &str) -> String {
+        Block::parse(css).get(sh)
+    }
+
+    #[test]
+    fn shorthand_table_serialize_plain_rows_are_table_rows() {
+        for (i, (sh, n)) in PLAIN_N.iter().enumerate() {
+            assert!(PLAIN_N[..i].iter().all(|(s, _)| s != sh), "{sh} is one PLAIN_N row");
+            assert!(*n == 2 || *n == 4, "{sh}: n is 2 or 4");
+            assert_eq!(longhands(sh).map(|ls| ls.len()), Some(*n as usize), "{sh} has {n} longhands");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_serialize_every_row_has_a_road() {
+        for (sh, ls) in SHORTHANDS {
+            let plain = PLAIN_N.iter().any(|(s, _)| s == sh);
+            let grammar = GRAMMAR.contains(sh);
+            assert!(plain != grammar, "{sh} is in exactly one of PLAIN_N / GRAMMAR");
+            if (ls.len() == 2 || ls.len() == 4) && !grammar {
+                assert!(plain, "{sh}: a 2/4-longhand row with no grammar arm is PLAIN_N");
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_table_serialize_margin() {
+        assert_eq!(get("margin: 1px 2px 3px 4px", "margin"), "1px 2px 3px 4px");
+        assert_eq!(get("margin: 1px 2px 1px 2px", "margin"), "1px 2px");
+        assert_eq!(get("margin: 1px 2px 3px", "margin"), "1px 2px 3px");
+        assert_eq!(get("margin: 3px 3px 3px 3px", "margin"), "3px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_gap() {
+        assert_eq!(get("gap: 5px 5px", "gap"), "5px");
+        assert_eq!(get("gap: 5px 10px", "gap"), "5px 10px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_overflow() {
+        assert_eq!(get("overflow: hidden hidden", "overflow"), "hidden");
+        assert_eq!(get("overflow: hidden auto", "overflow"), "hidden auto");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_border_radius() {
+        assert_eq!(get("border-radius: 4px", "border-radius"), "4px");
+        let css = "border-top-left-radius: 1px; border-top-right-radius: 2px; border-bottom-right-radius: 1px; border-bottom-left-radius: 2px";
+        assert_eq!(get(css, "border-radius"), "1px 2px");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_grammar_unmoved() {
+        assert_eq!(get("border: 1px solid red", "border"), "1px solid red");
+        assert_eq!(get("outline: red solid 1px", "outline"), "1px solid red");
+        assert_eq!(get("flex: 1 2 10px", "flex"), "1 2 10px");
+        assert_eq!(get("background: red", "background"), "red");
+    }
+
+    #[test]
+    fn shorthand_table_serialize_missing_longhand() {
+        assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px", "margin"), "");
+        assert_eq!(get("margin-top: 1px; margin-right: 1px; margin-bottom: 1px; margin-left: 1px !important", "margin"), "");
+        assert_eq!(get("gap: 5px; column-gap: 6px !important", "gap"), "");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLEEXPAND (LEDGER SR1083): the plain n-value expansion through PLAIN_N (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLEEXPAND (SR1083): a [`PLAIN_N`] shorthand's n (SR1078's serialize lookup as a fn).
+fn plain_n(sh: &str) -> Option<u8> {
+    PLAIN_N.iter().find(|(s, _)| *s == sh).map(|&(_, n)| n)
+}
+
+/// The plain n-value expansion of a [`PLAIN_N`] shorthand: every token through the shorthand's own validator `one`
+/// (any refusal refuses the declaration), 1-4 values through [`four`] (n = 4) or the 1-2 collapse (n = 2), zipped
+/// with its [`SHORTHANDS`] longhands.
+fn plain_expand(prop: &str, n: u8, toks: &[CV], one: impl Fn(&CV) -> Option<String>) -> Result<Vec<(String, String)>, ()> {
+    let vals: Vec<String> = split_values(toks).iter().map(|c| one(c)).collect::<Option<Vec<String>>>().ok_or(())?;
+    let vals: Vec<String> = match (n, vals.len()) {
+        (4, _) => four(&vals).ok_or(())?.to_vec(),
+        (2, 1) => vec![vals[0].clone(), vals[0].clone()],
+        (2, 2) => vals,
+        _ => return Err(()),
+    };
+    Ok(longhands(prop).ok_or(())?.into_iter().zip(vals).collect())
+}
+
+#[cfg(test)]
+mod shorthand_table_expand_tests {
+    use super::*;
+
+    /// Four distinct valid tokens of a [`PLAIN_N`] shorthand (the first n are used).
+    fn sample(sh: &str) -> [&'static str; 4] {
+        match sh {
+            "border-style" => ["solid", "dotted", "dashed", "double"],
+            "border-color" => ["red", "lime", "blue", "yellow"],
+            "gap" => ["5px", "10px", "", ""],
+            "overflow" => ["hidden", "auto", "", ""],
+            "place-content" | "place-items" | "place-self" => ["center", "start", "", ""],
+            _ => ["1px", "2px", "3px", "4px"],
+        }
+    }
+
+    fn values(sh: &str, k: usize) -> String {
+        sample(sh)[..k].join(" ")
+    }
+
+    fn expand_str(prop: &str, value: &str) -> Result<Vec<(String, String)>, ()> {
+        expand(prop, &css_core::parser::parse_component_values(value))
+    }
+
+    fn pairs(prop: &str, value: &str) -> Vec<(String, String)> {
+        expand_str(prop, value).unwrap_or_else(|_| panic!("{prop}: {value} expands"))
+    }
+
+    fn get(p: &[(String, String)], name: &str) -> String {
+        p.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn shorthand_table_expand_every_row_one_and_n() {
+        for &(sh, n) in PLAIN_N {
+            let n = n as usize;
+            let want = longhands(sh).unwrap();
+            let one = pairs(sh, sample(sh)[0]);
+            assert_eq!(one.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), want, "{sh}: one value names");
+            assert!(one.iter().all(|(_, v)| *v == one[0].1), "{sh}: one value is every longhand");
+            let all = pairs(sh, &values(sh, n));
+            assert_eq!(all.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), want, "{sh}: n values names");
+            for (i, (_, v)) in all.iter().enumerate() {
+                assert!(all[..i].iter().all(|(_, w)| w != v), "{sh}: n values are distinct");
+            }
+            assert_eq!(all.len(), n, "{sh}: n longhands");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_margin_two() {
+        let p = pairs("margin", "1px 2px");
+        assert_eq!((get(&p, "margin-top"), get(&p, "margin-bottom")), ("1px".to_string(), "1px".to_string()));
+        assert_eq!((get(&p, "margin-left"), get(&p, "margin-right")), ("2px".to_string(), "2px".to_string()));
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_style_two() {
+        let p = pairs("border-style", "solid none");
+        let got: Vec<&str> = p.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(got, ["solid", "none", "solid", "none"]);
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_color_three() {
+        let p = pairs("border-color", "red lime blue");
+        assert_eq!(p.len(), 4);
+        assert_eq!(get(&p, "border-left-color"), get(&p, "border-right-color"));
+        assert_ne!(get(&p, "border-top-color"), get(&p, "border-bottom-color"));
+        assert_ne!(get(&p, "border-top-color"), get(&p, "border-right-color"));
+    }
+
+    #[test]
+    fn shorthand_table_expand_gap_overflow_two() {
+        let p = pairs("gap", "5px 10px");
+        assert_eq!((get(&p, "row-gap"), get(&p, "column-gap")), ("5px".to_string(), "10px".to_string()));
+        let p = pairs("overflow", "hidden auto");
+        assert_eq!((get(&p, "overflow-x"), get(&p, "overflow-y")), ("hidden".to_string(), "auto".to_string()));
+    }
+
+    #[test]
+    fn shorthand_table_expand_border_radius_four() {
+        let p = pairs("border-radius", "1px 2px 3px 4px");
+        let got: Vec<(&str, &str)> = p.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                ("border-top-left-radius", "1px"),
+                ("border-top-right-radius", "2px"),
+                ("border-bottom-right-radius", "3px"),
+                ("border-bottom-left-radius", "4px"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shorthand_table_expand_bad_token_refuses() {
+        for &(sh, n) in PLAIN_N {
+            let n = n as usize;
+            for bad in 0..n {
+                let mut toks: Vec<&str> = sample(sh)[..n].to_vec();
+                toks[bad] = "7";
+                let value = toks.join(" ");
+                let mut b = Block::parse("color: red");
+                let before = b.serialize();
+                assert!(!b.set(sh, &css_core::parser::parse_component_values(&value), false), "{sh}: {value} refused");
+                assert_eq!(b.serialize(), before, "{sh}: {value} leaves the block unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_too_many_refused() {
+        for &(sh, n) in PLAIN_N {
+            let s = sample(sh);
+            let value = if n == 4 { format!("{} {}", s.join(" "), s[0]) } else { format!("{} {} {}", s[0], s[1], s[0]) };
+            assert!(expand_str(sh, &value).is_err(), "{sh}: {value} refused");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_round_trip() {
+        for &(sh, n) in PLAIN_N {
+            let value = values(sh, n as usize);
+            let first = pairs(sh, &value);
+            let mut b = Block::default();
+            assert!(b.set(sh, &css_core::parser::parse_component_values(&value), false), "{sh}: {value} sets");
+            let s = b.get(sh);
+            assert_eq!(pairs(sh, &s), first, "{sh}: {value} -> {s} -> expand is identity");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_expand_radius_slash_opaque() {
+        let p = pairs("border-radius", "1px / 2px");
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].0, "border-radius");
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDTABLEINITIAL (LEDGER SR1086): a shorthand's initial derived from its longhands' initials (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDTABLEINITIAL (SR1086): a [`SHORTHANDS`] row's initial value, DERIVED: a [`Block`] of the row's
+/// longhands each at its own [`initial_value`], serialized by [`serialize_shorthand`] — so a shorthand's initial and
+/// its longhands' rows cannot disagree. None for a name that is not a row, for a row with a longhand that has no
+/// initial row (its value is the report's or has no static form), and for a row whose grammar does not serialize at
+/// initial (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS). Built on SR1092's [`shorthand_from`].
+fn shorthand_initial(sh: &str) -> Option<String> {
+    shorthand_from(sh, |l| initial_value(l).to_string())
+}
+
+/// The initial value of `prop` as getComputedStyle serializes it: a shorthand's derived through
+/// [`shorthand_initial`], else the longhand's [`initial_value`] row ("" for a property with neither).
+fn initial_of(prop: &str) -> String {
+    shorthand_initial(prop).unwrap_or_else(|| initial_value(prop).to_string())
+}
+
+#[cfg(test)]
+mod shorthand_table_initial_tests {
+    use super::*;
+
+    /// The rows whose longhands have no static initial row (colours resolve currentcolor per element; border-image-*
+    /// and most background-* have no `initial_value` row), so they read "" (owed AETHER-CSSOM-INITIAL-GRAMMAR-ROWS).
+    const NOT_DERIVED: [&str; 9] =
+        ["border", "border-image", "border-color", "border-top", "border-right", "border-bottom", "border-left", "outline", "background"];
+
+    #[test]
+    fn shorthand_table_initial_rows_derive() {
+        for (sh, _) in SHORTHANDS {
+            let got = shorthand_initial(sh);
+            if NOT_DERIVED.contains(sh) {
+                assert_eq!(got, None, "{sh}: a named non-deriving row");
+            } else {
+                assert!(got.as_deref().is_some_and(|v| !v.is_empty()), "{sh}: derives a non-empty initial, got {got:?}");
+            }
+        }
+        for sh in NOT_DERIVED {
+            assert!(SHORTHANDS.iter().any(|(s, _)| *s == sh), "{sh} is a SHORTHANDS row");
+        }
+    }
+
+    /// SR1092: no shorthand row is kept — `overflow` reads `visible` through `computed_value`'s fallback composing its two
+    /// longhands (`shorthand_computed`), so the exception SR1086 kept is gone.
+    #[test]
+    fn shorthand_table_initial_no_shorthand_in_initial_value() {
+        for (sh, _) in SHORTHANDS {
+            assert_eq!(initial_value(sh), "", "{sh}: no hand-written shorthand row in initial_value");
+        }
+    }
+
+    #[test]
+    fn shorthand_table_initial_byte_identity() {
+        // The two literals initial_value carried before SR1086.
+        assert_eq!(initial_of("font-synthesis"), "weight style small-caps");
+        assert_eq!(initial_of("overflow"), "visible");
+    }
+
+    #[test]
+    fn shorthand_table_initial_pins() {
+        for (prop, want) in [
+            ("gap", "normal"),
+            ("margin", "0px"),
+            ("padding", "0px"),
+            ("overflow", "visible"),
+            ("border-radius", "0px"),
+            ("inset", "auto"),
+            ("flex", "0 1 auto"),
+            ("border-width", "0px"),
+            ("border-style", "none"),
+            ("opacity", "1"),
+            ("overflow-x", "visible"),
+            ("bogus", ""),
+        ] {
+            assert_eq!(initial_of(prop), want, "{prop}: initial");
+        }
+    }
+
+    /// getComputedStyle through `cascaded_value`'s `initial` closure: a declared CSS-wide `initial` on a shorthand reads
+    /// the derived initial. SR1092: an undeclared shorthand composes from its longhands' computed values at
+    /// `computed_value`'s fallback (`shorthand_computed`), so #a's undeclared gap reads `normal` (was "").
+    #[test]
+    fn shorthand_table_initial_computed_gap() {
+        let html = r#"<!doctype html><html><body><div id="a"></div><div id="g" style="gap: initial"></div><div id="r" style="border-radius: initial"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for (id, prop, want) in [("g", "gap", "normal"), ("r", "border-radius", "0px"), ("a", "gap", "normal")] {
+            let got = engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle(document.getElementById('{id}')).getPropertyValue('{prop}')"))
+                .unwrap();
+            assert_eq!(got, want, "#{id}: computed {prop}");
+        }
+    }
+}
+
+// ---- AETHERCSSOMPLACEEXPAND (LEDGER SR1087): place-* as PLAIN_N n = 2 rows (named tail block) ----
+
+/// AETHERCSSOMPLACEEXPAND (SR1087): css-align-3 §6.4 / §7.4 / §8.3's two-longhand shorthands (align-* then justify-*),
+/// the [`SHORTHANDS`] rows past SR786's capture; each is a [`PLAIN_N`] n = 2 row expanded through [`plain_expand`].
+#[cfg(test)]
+const PLACE_SHORTHANDS: [&str; 3] = ["place-content", "place-items", "place-self"];
+
+#[cfg(test)]
+mod cssom_place_tests {
+    use super::*;
+
+    fn cv(value: &str) -> Vec<CV> {
+        css_core::parser::parse_component_values(value)
+    }
+
+    #[test]
+    fn cssom_place_items_one_value_sets_both() {
+        let b = Block::parse("place-items: center");
+        assert_eq!(b.get("align-items"), "center");
+        assert_eq!(b.get("justify-items"), "center");
+        assert_eq!(b.get("place-items"), "center");
+    }
+
+    #[test]
+    fn cssom_place_content_two_values() {
+        let b = Block::parse("place-content: start end");
+        assert_eq!(b.get("align-content"), "start");
+        assert_eq!(b.get("justify-content"), "end");
+        assert_eq!(b.get("place-content"), "start end");
+    }
+
+    #[test]
+    fn cssom_place_self_two_values() {
+        let b = Block::parse("place-self: center start");
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("center".to_string(), "start".to_string()));
+        assert_eq!(b.get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_camel_case_setter_expands() {
+        assert_eq!(prop_from_attr("placeSelf"), "place-self");
+        assert_eq!(prop_from_attr("placeItems"), "place-items");
+        assert_eq!(prop_from_attr("placeContent"), "place-content");
+        let mut b = Block::default();
+        assert!(b.set(&prop_from_attr("placeSelf"), &cv("auto"), false));
+        assert_eq!((b.get("align-self"), b.get("justify-self")), ("auto".to_string(), "auto".to_string()));
+        assert_eq!(b.get("place-self"), "auto");
+    }
+
+    #[test]
+    fn cssom_place_remove_removes_both() {
+        let mut b = Block::parse("place-content: center; color: red");
+        assert!(b.remove("place-content"));
+        assert_eq!(b.get("align-content"), "");
+        assert_eq!(b.get("justify-content"), "");
+        assert_eq!(b.serialize(), "color: red;");
+    }
+
+    #[test]
+    fn cssom_place_three_values_refused() {
+        let mut b = Block::parse("color: red");
+        let before = b.serialize();
+        assert!(!b.set("place-items", &cv("center start end"), false));
+        assert_eq!(b.serialize(), before);
+    }
+
+    /// No alignment keyword list on the align-* longhand road (normalize_value stores any identifier), so an unknown
+    /// identifier is stored to both longhands, as `align-items: bogus` is; a non-identifier token refuses.
+    #[test]
+    fn cssom_place_ident_only_validator() {
+        let b = Block::parse("place-items: bogus");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("bogus".to_string(), "bogus".to_string()));
+        let mut b = Block::default();
+        assert!(!b.set("place-items", &cv("10px"), false));
+        assert!(!b.set("place-self", &cv("center 7"), false));
+        assert_eq!(b.serialize(), "");
+    }
+
+    #[test]
+    fn cssom_place_css_wide_and_case() {
+        let b = Block::parse("place-items: inherit");
+        assert_eq!((b.get("align-items"), b.get("justify-items")), ("inherit".to_string(), "inherit".to_string()));
+        assert_eq!(b.get("place-items"), "inherit");
+        assert_eq!(Block::parse("place-self: CENTER Start").get("place-self"), "center start");
+    }
+
+    #[test]
+    fn cssom_place_css_text_round_trip() {
+        assert_eq!(Block::parse("align-items: center; justify-items: center").serialize(), "place-items: center;");
+        assert_eq!(Block::parse("place-self: auto start").serialize(), "place-self: auto start;");
+        assert_eq!(Block::parse("align-items: center").serialize(), "align-items: center;");
+        assert_eq!(Block::parse("place-content: center; justify-content: end").serialize(), "place-content: center end;");
+    }
+
+    #[test]
+    fn cssom_place_table_pins() {
+        assert_eq!(SHORTHANDS.len(), 22);
+        assert_eq!(PLAIN_N.len(), 12);
+        for (sh, a, j) in [
+            ("place-content", "align-content", "justify-content"),
+            ("place-items", "align-items", "justify-items"),
+            ("place-self", "align-self", "justify-self"),
+        ] {
+            assert!(PLACE_SHORTHANDS.contains(&sh));
+            assert_eq!(plain_n(sh), Some(2), "{sh}");
+            assert_eq!(longhands(sh), Some(vec![a.to_string(), j.to_string()]), "{sh}");
+            assert_eq!(shorthands_of(a), vec![sh]);
+            assert_eq!(shorthands_of(j), vec![sh]);
+        }
+    }
+}
+
+// ---- AETHERCSSOMSHORTHANDCOMPUTED (LEDGER SR1092): a shorthand's computed value from its longhands' computed values (named tail block) ----
+
+/// AETHERCSSOMSHORTHANDCOMPUTED (SR1092): the ONE shorthand builder — a [`Block`] of the [`SHORTHANDS`] row's longhands
+/// each at `value_of(longhand)`, serialized by [`serialize_shorthand`]. None for a name that is not a row, for a row with
+/// a longhand whose value is "" (SR1086's None-on-empty rule), and for a row whose grammar does not serialize those
+/// values. [`shorthand_initial`] passes [`initial_value`], [`shorthand_computed`] passes [`computed_value`].
+fn shorthand_from(sh: &str, value_of: impl Fn(&str) -> String) -> Option<String> {
+    let mut b = Block::default();
+    for name in longhands(sh)? {
+        let value = value_of(name.as_str());
+        if value.is_empty() {
+            return None;
+        }
+        b.decls.push(Decl { name, value, important: false });
+    }
+    serialize_shorthand(&b, sh).map(|x| x.0)
+}
+
+/// AETHERCSSOMSHORTHANDCOMPUTED (SR1092): a shorthand's computed value is the serialization of its longhands' computed
+/// values (each through [`computed_value`]: report column, cascaded, inherited or initial on its own) — the SR764
+/// `font_synthesis_computed` road generalised. `computed_value` takes it at its fallback, so an undeclared or partly
+/// declared shorthand (`margin-top: 5px` alone) composes (`5px 0px 0px`) and a fully declared one keeps its cascaded
+/// read. None where a longhand has no computed value or the grammar does not serialize (border with no colour row;
+/// owed AETHER-CSSOM-BORDER-COMPUTED).
+fn shorthand_computed(el: usize, sh: &str) -> Option<String> {
+    if sh == "outline" { return outline_computed(el); } shorthand_from(sh, |l| computed_value(el, l))
+}
+
+#[cfg(test)]
+mod shorthand_computed_tests {
+    use super::*;
+
+    /// The derived initials SR1086 pinned, through the shared builder (byte-identical after the refactor).
+    #[test]
+    fn shorthand_computed_initial_unchanged() {
+        for (prop, want) in [
+            ("font-synthesis", "weight style small-caps"),
+            ("overflow", "visible"),
+            ("gap", "normal"),
+            ("margin", "0px"),
+            ("place-items", "normal"),
+            ("border", ""),
+        ] {
+            assert_eq!(initial_of(prop), want, "{prop}: initial");
+        }
+        assert_eq!(initial_value("overflow"), "", "SR1092: the overflow exception is gone from initial_value");
+    }
+
+    #[test]
+    fn shorthand_computed_reads() {
+        let html = r#"<!doctype html><html><body><div id="a"></div><div id="m" style="margin-top:5px"></div><div id="o" style="overflow-x:hidden"></div><div id="f" style="margin: 1em"></div><div id="p" style="align-items:center; justify-items:center"></div><div id="s" style="font-synthesis-weight:none"></div></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 300));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let mut read = |target: &str, prop: &str| {
+            engine
+                .js_engine
+                .as_mut()
+                .unwrap()
+                .eval_string(&format!("getComputedStyle({target}).getPropertyValue('{prop}')"))
+                .unwrap()
+        };
+        let by_id = |id: &str| format!("document.getElementById('{id}')");
+        for (id, prop, want) in [
+            ("m", "margin", "5px 0px 0px"),
+            ("a", "margin", "0px"),
+            ("a", "padding", "0px"),
+            ("a", "gap", "normal"),
+            ("a", "overflow", "visible"),
+            ("a", "border-radius", "0px"),
+            ("a", "inset", "auto"),
+            ("a", "flex", "0 1 auto"),
+            ("a", "border-width", "0px"),
+            ("a", "border-style", "none"),
+            // Owed AETHER-CSSOM-BORDER-COMPUTED / AETHER-CSSOM-INITIAL-GRAMMAR-ROWS: border / outline / background still
+            // have a longhand with no computed row, so they read "".
+            ("a", "border", ""),
+            ("a", "border-color", "rgb(0, 0, 0)"), // SR1104: the four colour longhands are report columns, so border-color composes
+            ("a", "outline", "rgb(0, 0, 0) none 0px"), // SR1124: the three outline longhands are report columns; Chromium's computed form
+            ("a", "background", ""),
+            ("o", "overflow", "hidden visible"),
+            // A fully declared shorthand keeps the cascaded road (the composition sits at the fallback).
+            ("f", "margin", "1em"),
+            ("p", "place-items", "center"),
+            ("s", "font-synthesis", "style small-caps"),
+        ] {
+            assert_eq!(read(&by_id(id), prop), want, "#{id}: computed {prop}");
+        }
+        // AETHERCSSOMBOXSIDECOLUMNS (SR1096): every margin side has a report column, so the UA body margin composes as
+        // Chromium reads it (it read `8px 0px 0px` while only margin-top had a column).
+        assert_eq!(read("document.body", "margin"), "8px", "body: computed margin");
+    }
+}
+
+// ---- AETHERCSSOMOUTLINECOLUMNS (LEDGER SR1124): the computed `outline` in Chromium's form (named tail block) ----
+
+/// AETHERCSSOMOUTLINECOLUMNS (SR1124): getComputedStyle's `outline` is its three longhands' computed values in the
+/// [`SHORTHANDS`] row's order (color style width), every one written (Chromium: `rgb(0, 0, 0) none 0px` unset), never
+/// [`serialize_shorthand`]'s declared-block grammar, which drops medium / none / currentcolor and puts the width first.
+fn outline_computed(el: usize) -> Option<String> {
+    Some(longhands("outline")?.iter().map(|l| computed_value(el, l)).collect::<Vec<_>>().join(" "))
 }
