@@ -129,7 +129,7 @@ pub fn inspect(engine: &AetherEngine, id: usize) -> Option<Inspection> {
     let e = n.as_element()?;
     let attributes = e.attributes.borrow().map.iter().map(|(_, a)| (a.local.clone(), a.value.clone())).collect();
     let report = engine.layout_tree.as_ref().map(crate::css::computed_report).unwrap_or_default();
-    let computed = match report.get(&html_core::NodeId(id)) {
+    let computed = match report.get(&html_core::NodeId(id)).filter(|v| v[0] != "none") { // SR1012 fold: a display: none node now keeps a report row (its taffy node is visited); the panel still shows display: none alone
         Some(values) => crate::css::REPORT_PROPS.iter().copied().zip(values.iter().cloned()).collect(),
         None => vec![("display", "none".to_string())],
     };
