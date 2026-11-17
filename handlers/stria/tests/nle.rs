@@ -3769,3 +3769,86 @@ fn striaundohistorydrag_history_count() {
         assert_eq!((face.state.timeline == tl1, face.state.undo_depth(), face.dirty()), (true, depth, dirty), "{v}");
     }
 }
+
+// ---- STRIAUNDOJUMP (LEDGER SR934): `undo <n>` / `redo <n>` name their landing; `h` keys the history (named tail block) ----
+
+/// SR912's three named commits (split, delete, slip+) on the export face: (the face, the post-split timeline, the
+/// post-slip+ timeline).
+fn striaundojump_face() -> (Face, Timeline, Timeline) {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    let split = face.state.timeline.clone();
+    assert!(face.verb("delete"));
+    face.state.select(0, 0).unwrap();
+    assert!(face.verb("slip+"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert_eq!(face.state.undo_depth(), 3);
+    let top = face.state.timeline.clone();
+    (face, split, top)
+}
+
+/// `undo 2` steps two entries and names the oldest it undid; each step stays its own entry so `redo 2` returns exactly
+/// and names the newest it redid; `undo 3` lands back on the opened timeline (clean).
+#[test]
+fn striaundojump_steps_and_returns() {
+    let (mut face, split, top) = striaundojump_face();
+    assert!(face.verb("undo 2"));
+    assert_eq!(face.last_error.take().as_deref(), Some("undo 2: back to before \"delete\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (1, 2));
+    assert_eq!(face.state.timeline, split);
+    assert!(face.verb("history"));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 split"));
+    assert!(face.verb("redo 2"));
+    assert_eq!(face.last_error.take().as_deref(), Some("redo 2: forward to after \"slip+\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (3, 0));
+    assert_eq!(face.state.timeline, top);
+    assert!(face.verb("undo 3"));
+    let line = face.last_error.take();
+    assert_eq!(line.as_deref(), Some("undo 3: back to before \"split\""));
+    assert_eq!((face.state.undo_depth(), face.state.redo_depth()), (0, 3));
+    assert!(!face.dirty(), "undo 3 lands on the opened timeline");
+    println!("striaundojump: {line:?}");
+}
+
+/// A count of 0, past the depth or not a number is refused by name; an empty stack says so; nothing moves. Plain `undo`
+/// still puts nothing on the message line.
+#[test]
+fn striaundojump_refusals() {
+    let (mut face, _split, top) = striaundojump_face();
+    let dirty = face.dirty();
+    for (v, want) in [
+        ("undo 4", "undo: \"4\" is not a count 1..=3"),
+        ("undo 0", "undo: \"0\" is not a count 1..=3"),
+        ("undo x", "undo: \"x\" is not a count 1..=3"),
+        ("redo 1", "redo: nothing to redo"),
+    ] {
+        assert!(face.verb(v), "{v}");
+        assert_eq!(face.last_error.take().as_deref(), Some(want), "{v}");
+        assert_eq!((face.state.timeline == top, face.state.undo_depth(), face.state.redo_depth(), face.dirty()), (true, 3, 0, dirty), "{v}");
+    }
+    assert!(face.verb("undo"));
+    assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    assert!(face.verb("redo 2"));
+    assert_eq!(face.last_error.take().as_deref(), Some("redo: \"2\" is not a count 1..=1"));
+}
+
+/// `h` (text) is the history key: a KEYS row onto SR876's `history` word with its HELP phrase; it lists the steps and
+/// commits nothing. A one-character BrowserKey alone is not taken.
+#[test]
+fn striaundojump_history_key() {
+    assert!(KEYS.contains(&("h", "history")));
+    assert_eq!(help_phrase("history"), "list the last undo steps");
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl, src);
+    face.state.select(0, 1).unwrap();
+    face.state.seek(15);
+    assert!(face.verb("split"));
+    let (tl1, dirty) = (face.state.timeline.clone(), face.dirty());
+    assert!(!face.on(&bandy::SMessage::BrowserKey("h".into())));
+    assert!(face.on(&bandy::SMessage::BrowserText("h".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("history: 1 split"));
+    assert_eq!((face.state.timeline == tl1, face.state.undo_depth(), face.dirty()), (true, 1, dirty));
+}

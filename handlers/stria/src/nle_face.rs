@@ -386,7 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
-    ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
+    ("h", "history"), ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail); STRIAUNDOJUMP (SR934): `h` lists the undo history
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -2602,7 +2602,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
-    ("help", "show / hide this help"),
+    ("history", "list the last undo steps"), ("help", "show / hide this help"), // STRIAUNDOJUMP (SR934)
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).
 const HELP_PAD: f32 = 4.0;
@@ -3107,7 +3107,7 @@ impl Face {
 impl Face {
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
-        if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
+        if let Some(r) = self.undo_jump_verb(v) { return r; } if let Some(r) = self.history_rows_verb(v) { return r; } if v == "history" {
             self.last_error = Some(self.state.history_line(timeline_core::editor::HISTORY_N));
             return true;
         }
@@ -3131,6 +3131,50 @@ impl Face {
             Ok(n) if (1..=max).contains(&n) => self.state.history_line(n),
             _ => format!("history: {arg:?} is not a count 1..={max}"),
         });
+        Some(true)
+    }
+}
+
+// ---- STRIAUNDOJUMP (LEDGER SR934): `undo <n>` / `redo <n>` and the landing line (named tail block) ----
+// `undo <n>` / `redo <n>` step the core's ONE `undo` / `redo` n times (n in 1..=the stack's depth), so every step stays its
+// own entry and `redo <n>` returns exactly. The message line names where it landed through SR876's names: the oldest of
+// the n entries undone (`history(n)` read BEFORE stepping), or the newest entry after a redo (`history(1)`); an unnamed
+// step reads `(unnamed)`. Any other count is refused by name and nothing moves. Plain `undo` / `redo` are unchanged.
+impl Face {
+    /// `undo <n>` / `redo <n>`: the steps and the landing line, or the refusal; `None` for any other word.
+    fn undo_jump_verb(&mut self, v: &str) -> Option<bool> {
+        let (back, arg) = match (v.strip_prefix("undo "), v.strip_prefix("redo ")) {
+            (Some(a), _) => (true, a.trim()),
+            (_, Some(a)) => (false, a.trim()),
+            _ => return None,
+        };
+        let (word, depth) = if back { ("undo", self.state.undo_depth()) } else { ("redo", self.state.redo_depth()) };
+        let n = match arg.parse::<usize>() {
+            Ok(n) if depth > 0 && (1..=depth).contains(&n) => n,
+            _ if depth == 0 => {
+                self.last_error = Some(format!("{word}: nothing to {word}"));
+                return Some(true);
+            }
+            _ => {
+                self.last_error = Some(format!("{word}: {arg:?} is not a count 1..={depth}"));
+                return Some(true);
+            }
+        };
+        let name = |w: Option<&str>| w.map_or_else(|| "(unnamed)".to_string(), |w| format!("{w:?}"));
+        let line = if back {
+            let at = name(self.state.history(n).last().and_then(|&(_, w)| w));
+            for _ in 0..n {
+                self.state.undo();
+            }
+            format!("undo {n}: back to before {at}")
+        } else {
+            for _ in 0..n {
+                self.state.redo();
+            }
+            let at = name(self.state.history(1).first().and_then(|&(_, w)| w));
+            format!("redo {n}: forward to after {at}")
+        };
+        self.last_error = Some(line);
         Some(true)
     }
 }
