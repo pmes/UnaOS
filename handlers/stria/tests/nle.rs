@@ -3782,3 +3782,33 @@ fn striazoomfitmore_face_layout_is_the_anchor() {
     }
     println!("striazoomfitmore: face layout == Layout::anchor at 5 playheads");
 }
+
+// ---- STRIAZOOMFITTHREE (LEDGER SR9040): the face fits a range wider than the window (named tail block) ----
+
+/// A 20 px window fits the 35-tick fixture at zoom 1 squeeze 2 with the end inside the window; a resize refits through
+/// the scale (640 px: 18, no squeeze; back to 20: squeeze 2); a wheel step out of the squeeze ends the fit; `zoom-` at the
+/// floor zooms further out; never an undo step, never dirty.
+#[test]
+fn striazoomfitthree_face_fits_wide_and_refits() {
+    let (tl, src) = synth_fixture();
+    let mut face = nlefaceexport_face(tl.clone(), src);
+    face.canvas = (20, 160);
+    assert!(face.verb("zoom-fit"));
+    assert_eq!(face.last_error, None);
+    assert_eq!(face.state.scale(), (1, 2));
+    let l = face.layout();
+    assert_eq!((l.squeeze, l.t0), (2, 0));
+    assert!(l.x_of(tl.end()) <= l.w as i64, "the end inside the window");
+    assert!(striazoomfitkeys_resize(&mut face, 640));
+    assert_eq!(face.state.scale(), (18, 1), "640 / 35, no squeeze");
+    assert!(striazoomfitkeys_resize(&mut face, 20));
+    assert_eq!(face.state.scale(), (1, 2), "the refit squeezes again");
+    assert!(face.zoom_at(1, 0.0), "a wheel step halves the squeeze");
+    assert_eq!(face.state.scale(), (1, 1));
+    assert!(striazoomfitkeys_resize(&mut face, 640));
+    assert_eq!(face.state.scale(), (1, 1), "a wheel step ended the fit");
+    assert!(face.verb("zoom-"));
+    assert_eq!(face.state.scale(), (1, 2), "zoom- at the floor zooms further out");
+    assert_eq!((face.state.undo_depth(), face.dirty(), face.state.timeline == tl), (0, false, true));
+    println!("striazoomfitthree: 20 px fit 1/2; refit 640 -> 18, 20 -> 1/2; wheel ends it; zoom- squeezes");
+}

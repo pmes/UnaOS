@@ -46,6 +46,7 @@ pub struct Layout {
     pub tracks_y: u32,
     pub rows: usize,
     pub zoom: u32,
+    pub squeeze: u32, // STRIAZOOMFITTHREE (SR9040): ticks per `zoom` px, the editor state's (1: one tick per `zoom` px) (file tail)
     pub t0: i64,
     pub message_y: u32, // STRIAINFOREELSTRIP (SR747): the message row's top (0 with no row: [`Layout::with_message`])
     pub message_h: u32, // STRIAINFOREELSTRIP (SR747): the message row's height (0: no row)
@@ -67,18 +68,18 @@ impl Layout {
         let rows = st.timeline.tracks.len();
         let below = RULER_H + rows as u32 * ROW_H;
         let preview_h = h.saturating_sub(below);
-        let zoom = st.zoom.max(1);
-        let per_page = (w / zoom).max(1) as i64;
+        let zoom = st.zoom.max(1); let squeeze = st.squeeze.max(1); // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
+        let per_page = (w as i64 * squeeze as i64 / zoom as i64).max(1); // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
         let t0 = st.playhead.max(0) / per_page * per_page;
-        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, t0, message_y: 0, message_h: 0 }
+        Layout { w, h, preview_h, ruler_y: preview_h, tracks_y: preview_h + RULER_H, rows, zoom, squeeze, t0, message_y: 0, message_h: 0 }
     }
     /// The x of tick `t`'s left edge.
     pub fn x_of(&self, t: i64) -> i64 {
-        (t - self.t0) * self.zoom as i64
+        ((t - self.t0) * self.zoom as i64).div_euclid(self.squeeze.max(1) as i64) // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
     }
     /// The tick under x.
     pub fn tick_at(&self, x: f64) -> i64 {
-        self.t0 + (x.max(0.0) as i64) / self.zoom as i64
+        self.t0 + (x.max(0.0) as i64) * self.squeeze.max(1) as i64 / self.zoom as i64 // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
     }
     /// The y of track row `row`'s top.
     pub fn row_y(&self, row: usize) -> i64 {
@@ -86,7 +87,7 @@ impl Layout {
     }
     /// The centre of tick `t` on track row `row` (what a click on that clip sends).
     pub fn point(&self, row: usize, t: i64) -> (f64, f64) {
-        (self.x_of(t) as f64 + self.zoom as f64 / 2.0, self.row_y(row) as f64 + ROW_H as f64 / 2.0)
+        (self.x_of(t) as f64 + self.zoom as f64 / (2.0 * self.squeeze.max(1) as f64), self.row_y(row) as f64 + ROW_H as f64 / 2.0)
     }
     pub fn hit(&self, tl: &Timeline, x: f64, y: f64) -> Hit {
         if x < 0.0 || y < 0.0 || x >= self.w as f64 || y >= self.h as f64 || y < self.ruler_y as f64 {
@@ -309,11 +310,11 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
     let (ry, ty) = (l.ruler_y as i64, l.tracks_y as i64);
     c.rect(0, ry, w as i64, ty, RULER);
     let t_end = l.tick_at(w as f64) + 1;
-    for t in l.t0..=t_end {
+    for t in l.ruler_ticks(t_end, fps) { // STRIAZOOMFITTHREE (SR9040): every tick, or whole seconds when squeezed (file tail)
         let x = l.x_of(t);
         if t % fps == 0 {
             c.rect(x, ry + RULER_H as i64 / 2, x + 1, ty, TICK);
-            if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60) {
+            if let Some(text) = labels.as_mut().filter(|_| l.zoom as i64 * fps >= 60 * l.squeeze.max(1) as i64) {
                 text.text(&mut c, &edl::timecode(t, fps as u32), x as f32 + 2.0, ry as f32 + 9.0, (x as i32, w as i32));
             }
         } else if l.zoom >= 4 {
@@ -740,7 +741,7 @@ impl Drag {
         s.selection = st.selection;
         s.set = st.set.clone();
         s.playhead = st.playhead;
-        s.zoom = st.zoom;
+        s.zoom = st.zoom; s.squeeze = st.squeeze; // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
         self.finish(&mut s).ok()?;
         Some(s)
     }
@@ -1198,11 +1199,41 @@ impl Layout {
     /// This layout with the view `view` anchored, by the rule above.
     pub fn anchor(mut self, view: Option<(i64, i64)>, playhead: i64) -> Layout {
         if let Some((t0, at)) = view {
-            let per = (self.w / self.zoom.max(1)).max(1) as i64;
+            let per = self.page(); // STRIAZOOMFITTHREE (SR9040): the squeeze, ticks per `zoom` px (file tail)
             if playhead == at || (t0..t0 + per).contains(&playhead) {
                 self.t0 = t0;
             }
         }
         self
+    }
+}
+
+// ---- STRIAZOOMFITTHREE (LEDGER SR9040): the squeezed Layout's page and ruler (named tail block) ----
+// `Layout.squeeze` (the editor state's ticks per `zoom` px) is read by every geometry (`x_of`, `tick_at`, `point`, the page
+// `Layout::of` and `anchor` hold); at squeeze 1 each expression equals the unsqueezed one, so every golden is unchanged.
+// The ruler visits every tick at squeeze 1; squeezed, only the multiples of the smallest `fps * 2^k` ticks whose marks
+// stand at least [`RULER_STEP_MIN`] px apart (never a loop over every tick of a long timeline at a far zoom).
+
+/// The closest two squeezed ruler marks may stand (px).
+pub const RULER_STEP_MIN: i64 = 8;
+
+impl Layout {
+    /// The ticks one window width shows (at least 1).
+    pub fn page(&self) -> i64 {
+        (self.w as i64 * self.squeeze.max(1) as i64 / self.zoom.max(1) as i64).max(1)
+    }
+    /// The ticks the ruler visits from `t0` through `t_end`: every one at squeeze 1, else whole seconds (`fps` ticks) in
+    /// a power-of-two stride wide enough on screen.
+    pub fn ruler_ticks(&self, t_end: i64, fps: i64) -> core::iter::StepBy<core::ops::RangeInclusive<i64>> {
+        let sq = self.squeeze.max(1) as i64;
+        if sq == 1 {
+            return (self.t0..=t_end).step_by(1);
+        }
+        let mut s = fps.max(1);
+        while s * (self.zoom.max(1) as i64) < RULER_STEP_MIN * sq {
+            s *= 2;
+        }
+        let start = -((-self.t0).div_euclid(s)) * s;
+        (start..=t_end).step_by(s as usize)
     }
 }
