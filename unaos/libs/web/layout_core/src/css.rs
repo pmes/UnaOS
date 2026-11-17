@@ -1892,25 +1892,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.border = Some(sides);
             }
         }
-        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => { if split_top_level(value).len() > 1 { return border_color_sides::<H>(value, &mut style.paint); } sys_border_slot(&mut style.paint, crate::paint::CC_SIDES, value);
-            // `transparent` (or a fully transparent rgba) is how a page
-            // says "keep the box, drop the stroke" — the UA control border
-            // must go with it, or every quiet button paints an empty frame.
-            let v = value.trim().to_ascii_lowercase();
-            if border_transparent::<H>(&v) {
-                style.paint.border = Some([None; 4]);
-                return;
-            }
-            if let Some(c) = border_color_of::<H>(&mut style.paint, value) {
-                style.paint.border_alpha = Some(color_alpha::<H>(value));
-                let Some(mut sides) = border_color_pend(&mut style.paint, c) else { return };
-                for side in sides.iter_mut() {
-                    let Some((w, _)) = *side else { continue };
-                    *side = Some((w, c));
-                }
-                style.paint.border = Some(sides);
-            }
-        }
+        "border-top-color" | "border-right-color" | "border-bottom-color" | "border-left-color" => { sys_border_slot(&mut style.paint, 1 << side_index(prop.trim_end_matches("-color")), value); side_color_of::<H>(side_index(prop.trim_end_matches("-color")), value, &mut style.paint) } "border-color" => border_color_sides::<H>(value, &mut style.paint),
         "border-width" => {
             if let Some(r) = parse_sides(value, |v| line_width(v, cx)) { for (i, w) in [r.top, r.right, r.bottom, r.left].into_iter().enumerate() { border_width_store(&mut style.paint, 1 << i, Some(w)); } }
         }
@@ -4412,21 +4394,6 @@ fn border_pending_create<H: Host>(paint: &mut PaintStyle<H>, mask: u8) {
     paint.border = Some(border_create_sides(paint, mask, true));
 }
 
-/// AETHERCSSBORDERCOLORSTORED (SR1058): the `border-color` arm's colour `c` (from `border_color_of`, which set or
-/// cleared all four currentcolor bits) is pended for all four sides; the answer is the sides the arm recolours: this
-/// block's entries, created first for the absent sides when the block declared a style (`border-style: solid;
-/// border-color: red`), else as they are (an absent side stays absent: css-backgrounds-3 §3.2 style none paints
-/// nothing). None (no border in this block, no style) = the arm writes nothing: the colour waits in the store, and
-/// `merge_border_pending` lays it on an earlier rule's sides.
-fn border_color_pend<H: Host>(paint: &mut PaintStyle<H>, c: (u8, u8, u8)) -> Option<[Option<(f32, (u8, u8, u8))>; 4]> {
-    let cc = paint.currentcolor & 1 != 0;
-    paint.border_pending = Some([Some((c, cc)); 4]);
-    if paint.border_style.is_some() {
-        return Some(border_create_sides(paint, crate::paint::CC_SIDES, false));
-    }
-    paint.border
-}
-
 /// AETHERCSSBORDERCOLORSTORED (SR1058): `side_color_of`'s side with no entry: the colour is pended for that side (its
 /// currentcolor answer in the entry, the four live bits put back as they were), not dropped. `transparent` forgets the
 /// side's pending entry (AETHER-CSS-BORDER-PENDING-TRANSPARENT owed); an invalid value is recorded as before.
@@ -4561,12 +4528,16 @@ fn line_width(value: &str, cx: &ParseCx) -> Option<f32> {
 // ---- AETHERCSSBORDERCOLORSIDES (LEDGER SR1085): border-color takes 1-4 colours through the per-side road (named tail block) ----
 
 /// AETHERCSSBORDERCOLORSIDES (SR1085): css-backgrounds-3 §3.2 `border-color: <color>{1,4}` in the top / right / bottom /
-/// left order. ONE colour keeps the `border-color` arm's own road unchanged; 2-4 colours (before SR1085 dropped whole:
+/// left order. SR1098: THE one road for 1-4 colours (the arm is one call); 2-4 colours (before SR1085 dropped whole:
 /// `parse_color_str` reads no multi-token value) expand through [`parse_sides`] (token indices into `split_top_level`)
 /// and each side goes through the `border-<side>-color` arm's two writers, `sys_border_slot` (cleared first, so an
 /// earlier keyword does not block the join; SR1046's one slot keeps the first keyword) and `side_color_of` (a side with
 /// no entry pends, `transparent` drops or forgets the side). `border_alpha` stays ONE frame value: the first
 /// non-transparent token's (AETHER-CSS-BORDER-ALPHA-PER-SIDE owed). Five values or a bad token drop the declaration.
+/// AETHERCSSBORDERCOLORONEROAD (SR1098): css-backgrounds-3 §3.2 sets all four colour longhands, so every side's pending
+/// entry is written (`side_color_pend`, also on a present side: one value and the value four times end with ONE store);
+/// a colour creates no side (§4.3: the old one-value road re-created a side made None while `border_style` was Some);
+/// four transparent tokens drop the frame whole (`Some([None; 4])`, so an earlier rule's or the UA control's frame goes).
 fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
     let (toks, n) = (split_top_level(value), core::cell::Cell::new(0usize));
     let ok = |v: &str| parse_color_str::<H>(v).is_some() || v.eq_ignore_ascii_case("currentcolor") || border_transparent::<H>(v);
@@ -4581,11 +4552,12 @@ fn border_color_sides<H: Host>(value: &str, paint: &mut PaintStyle<H>) {
     paint.sys_border = None;
     for (i, tok) in sides.into_iter().enumerate() {
         sys_border_slot(paint, 1 << i, tok);
-        side_color_of::<H>(i, tok, paint);
+        side_color_of::<H>(i, tok, paint); side_color_pend::<H>(i, tok, paint);
     }
     if let Some(t) = sides.into_iter().find(|t| !border_transparent::<H>(t)) {
         paint.border_alpha = Some(color_alpha::<H>(t));
     }
+    if sides.iter().all(|t| border_transparent::<H>(t)) { paint.border = Some([None; 4]); }
 }
 
 // ---- AETHERCSSOMWHITESPACELONGHANDSWRITE (LEDGER SR1044): white-space-collapse / text-wrap-mode / text-wrap write the one white-space code (named tail block) ----
