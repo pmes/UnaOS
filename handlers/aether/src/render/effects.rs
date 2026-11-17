@@ -559,11 +559,11 @@ pub fn paint_shadows(
         let (bx0, by0) = (x0 + s.dx - s.spread, y0 + s.dy - s.spread);
         let (bx1, by1) = (x0 + w + s.dx + s.spread, y0 + h + s.dy + s.spread);
         let r = radii.map(|v| if v > 0.0 { (v + s.spread).max(0.0) } else { 0.0 });
-        let reach = s.blur + 1.0;
-        let sx0 = (bx0 - reach).floor().max(0.0) as u32;
-        let sy0 = (by0 - reach).floor().max(0.0) as u32;
-        let sx1 = ((bx1 + reach).ceil().max(0.0) as u32).min(screen_w);
-        let sy1 = ((by1 + reach).ceil().max(0.0) as u32).min(screen_h);
+        let e = shadow_extent(s, x0, y0, w, h);
+        let sx0 = e.0.floor().max(0.0) as u32;
+        let sy0 = e.1.floor().max(0.0) as u32;
+        let sx1 = (e.2.ceil().max(0.0) as u32).min(screen_w);
+        let sy1 = (e.3.ceil().max(0.0) as u32).min(screen_h);
         for py in sy0..sy1 {
             for px in sx0..sx1 {
                 let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
@@ -686,4 +686,15 @@ mod tests {
         assert!(i.len() == 1 && i[0].inset && i[0].blur == 3.0);
         assert!((erf(1.0) - 0.842_700_8).abs() < 1e-5);
     }
+}
+
+// ---- AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (LEDGER SR1145): an outer box shadow's painted extent (named tail block) ----
+/// The screen rect (x0, y0, x1, y1) one outer shadow layer `s` of the border box (x0, y0, w, h) paints: its shape (the
+/// box offset by (dx, dy) and grown by the spread) grown by the blur's reach. `paint_shadows` loops over exactly this
+/// rect, so no shadow pixel lands outside it; the paint index (render `ink_element`) records it as the box's ink.
+pub(crate) fn shadow_extent(s: &Shadow, x0: f32, y0: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let (bx0, by0) = (x0 + s.dx - s.spread, y0 + s.dy - s.spread);
+    let (bx1, by1) = (x0 + w + s.dx + s.spread, y0 + h + s.dy + s.spread);
+    let reach = s.blur + 1.0;
+    (bx0 - reach, by0 - reach, bx1 + reach, by1 + reach)
 }

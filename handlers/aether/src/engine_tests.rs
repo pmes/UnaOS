@@ -10269,4 +10269,103 @@ b</div>
         assert_eq!(hit_sticky_origin_id(&e, 10.0, 10.0), "f", "#f stays at the viewport's top-left");
         assert_ne!(hit_sticky_origin_id(&e, 10.0, 50.0), "f", "below #f's 30px");
     }
+
+    // ---- AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (LEDGER SR1145): a box shadow's ink is its painted extent, not unbounded (named tail block) ----
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): SR1139's fixed 100x20 header with `extra` in its style, on a 2000px page.
+    fn shadow_holder_body(extra: &str) -> String {
+        format!(
+            r#"<div style="position:fixed;top:0;left:0;width:100px;height:20px;background-color:rgb(255, 0, 0);{extra}"></div>
+        <div style="height:2000px"></div>"#
+        )
+    }
+
+    const SHADOW_HOLDER: &str = "box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5)";
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): the shadowed header's ink is its border box grown by the shadow's
+    /// reach (blur 4 + 1 around the shape offset 2 down): (-5, -3, 105, 27). A +50 scroll damages the strip and that rect
+    /// (its ghost off-screen); at 100 a -50 scroll damages the strip, the header and its ghost 50 rows lower (apart) —
+    /// not the viewport (armed: the shadow made the ink unbounded and the damage the viewport).
+    #[test]
+    fn scroll_damage_shadow_holder_damage_is_header_plus_reach() {
+        let mut e = damage_rects_engine(&shadow_holder_body(SHADOW_HOLDER));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 105, 27)], "+50: the strip and the shadowed header (armed)");
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        e.render_frame();
+        e.handle_event(crate::api::events::Event::Scroll(0.0, -50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 50), (0, 0, 105, 27), (0, 47, 105, 30)], "-50: the strip, the header, its ghost");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): THE pin: +50, +50, -30 with the shadowed header over coloured rows:
+    /// after each blitted frame the whole surface equals a control engine scrolled there and repainted whole (no
+    /// clipped shadow rows), and the damage was not the viewport.
+    #[test]
+    fn scroll_damage_shadow_holder_pixels_match_full_repaint() {
+        let mut body = shadow_holder_body(SHADOW_HOLDER);
+        for i in 0..20 {
+            body.push_str(&format!(r#"<div style="height:40px;background-color:rgb({}, {}, 200)"></div>"#, (i * 37) % 256, (i * 91) % 256));
+        }
+        let mut e = damage_rects_engine(&body);
+        for (dy, at) in [(50.0, 50), (50.0, 100), (-30.0, 70)] {
+            e.handle_event(crate::api::events::Event::Scroll(0.0, dy));
+            assert!(!e.damage_rects.contains(&(0, 0, 400, 300)), "scroll to {at}: the blit is kept");
+            e.render_frame();
+            let mut c = damage_rects_engine(&body);
+            c.handle_event(crate::api::events::Event::Scroll(0.0, at as f64));
+            c.damage_rects.push((0, 0, 400, 300));
+            c.render_frame();
+            assert_eq!(e.scroll_y, at as f64, "scrolled to {at}");
+            assert!(e.surface() == c.surface(), "scroll to {at}: the blitted frame equals a full repaint");
+        }
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): the shadowed header's subtree ink is finite and holds every pixel of a
+    /// full repaint that differs from the page background (header and shadow): the extent is the painter's.
+    #[test]
+    fn scroll_damage_shadow_holder_ink_contains_painted() {
+        let e = damage_rects_engine(&shadow_holder_body(SHADOW_HOLDER));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(holders.len(), 1, "one holder: the header");
+        let (ink, _) = crate::render::subtree_ink(&holders);
+        let ink = ink.expect("a box shadow alone leaves the ink finite");
+        let s = e.surface();
+        let px = |x: usize, y: usize| { let i = (y * 400 + x) * 4; (s[i], s[i + 1], s[i + 2]) };
+        let bg = px(399, 299);
+        let mut painted = 0;
+        for y in 0..300usize {
+            for x in 0..400usize {
+                if px(x, y) != bg {
+                    painted += 1;
+                    assert!(
+                        (x as f32) + 1.0 > ink.0 && (x as f32) < ink.2 && (y as f32) + 1.0 > ink.1 && (y as f32) < ink.3,
+                        "pixel ({x}, {y}) lies outside the ink {ink:?}"
+                    );
+                }
+            }
+        }
+        assert!(painted > 100 * 20, "the header and its shadow painted ({painted})");
+        assert!(px(50, 23) != bg, "the shadow shows below the header");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): a transformed shadowed fixed header: the transform group's ink stays
+    /// unbounded, so the scroll damages the viewport (SR1135's net).
+    #[test]
+    fn scroll_damage_shadow_holder_transform_falls_back() {
+        let mut e = damage_rects_engine(&shadow_holder_body(&format!("{SHADOW_HOLDER};transform:translateX(10px)")));
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 0, 400, 300)], "the viewport alone (unbounded kept)");
+    }
+
+    /// AETHERSCROLLDAMAGEUNBOUNDEDHOLDER (SR1145): an inset shadow paints inside the padding box: the ink is the plain
+    /// element ink (-2, -2, 102, 22) and the +50 damage is SR1139's header rect.
+    #[test]
+    fn scroll_damage_shadow_holder_inset_adds_nothing() {
+        let mut e = damage_rects_engine(&shadow_holder_body("box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5)"));
+        let holders = crate::scroll_holders(e.layout_tree.as_ref());
+        assert_eq!(crate::render::subtree_ink(&holders).0, Some((-2.0, -2.0, 102.0, 22.0)), "the inset shadow adds nothing");
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 50.0));
+        assert_eq!(e.damage_rects, vec![(0, 250, 400, 50), (0, 0, 102, 22)], "+50: the strip and the header");
+    }
 }
