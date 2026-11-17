@@ -10,7 +10,7 @@
 //! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264|i420|y4m] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio wav|aac[:KBPS]|mp4|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
-//! nle completions bash|zsh|fish [--install [<dir>]] [--force]
+//! nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]
 //! ```
 //!
 //! `size` (NLESIZEPOLICYUI, LEDGER SR402) sets a reel's size policy through the editor's ONE verb dispatch
@@ -48,7 +48,7 @@ use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
-    usage_to(&mut std::io::stderr(), 2) // NLECLIREFUSALSBYNAME (SR801): the five lines in `usage_to` (file tail): stderr, exit 2
+    usage_to(&mut std::io::stderr(), 2, None) // NLECLIREFUSALSBYNAME (SR801): the five lines in `usage_to` (file tail): stderr, exit 2
 }
 
 fn die(msg: String) -> ! {
@@ -98,7 +98,7 @@ fn load(edl_path: &str, fps: u32, srcs: &[(String, String)]) -> (Timeline, Sourc
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect(); if help_asked(&args) { usage_to(&mut std::io::stdout(), 0, Some(args[0].as_str()).filter(|v| !matches!(*v, "help" | "--help"))) }
     if args.first().map(String::as_str) == Some("--make-src") {
         let out = args.get(1).unwrap_or_else(|| usage());
         let num = |i: usize, d: u32| args.get(i).map(|s| s.parse().unwrap_or_else(|_| bad("--make-src", s, &what("--make-src")))).unwrap_or(d); // NLECLIREFUSALSREST (SR814): a bad number by name
@@ -107,7 +107,7 @@ fn main() {
         return;
     }
     if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
-    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, "one of bash|zsh|fish")), &args[2..]); return; } if help_asked(&args) { usage_to(&mut std::io::stdout(), 0) } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
+    if args.first().map(String::as_str) == Some("completions") { let sh = value(&mut args[1..].iter(), "completions"); completions_out(&sh, &completions(&sh).unwrap_or_else(|| bad("completions", &sh, &format!("one of {}", SHELLS.join("|")))), &args[2..]); return; } verb_hint(&args); let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() }; // NLECLIREFUSALSBYNAME (SR801): `nle help` / `--help` / `<verb> --help` print the usage on stdout, exit 0 (file tail); NLECLIPASS2VALUE (SR821): `nle completions <shell>` prints the script on stdout, exit 0 (file tail); NLECLICOMPLETIONSINSTALL (SR1011): `--install [<dir>] [--force]` writes it into the shell's user completion dir (file tail)
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
@@ -313,7 +313,7 @@ fn two_pass_of(two_pass: TwoPass, pass: Option<u8>, stats: Option<String>, bitra
         (_, Some(_), None) => die("--pass needs --stats <file>".into()),
         (_, Some(1), Some(f)) => TwoPass::Pass1(f),
         (_, Some(2), Some(f)) => TwoPass::Pass2(f),
-        (_, Some(_), Some(_)) => die("--pass takes 1 or 2".into()),
+        (_, Some(_), Some(_)) => die(format!("--pass takes {}", PASS_WORDS.join(" or "))),
     };
     match mode {
         TwoPass::InProcess if !bitrate => die("--two-pass needs --bitrate".into()),
@@ -367,7 +367,7 @@ fn value(it: &mut std::slice::Iter<'_, String>, flag: &str) -> String {
 fn what(flag: &str) -> String {
     match flag {
         "--qp" | "--crf" => format!("not a whole number within 0..={}", u8::MAX),
-        "--pass" => "not 1 or 2".to_string(),
+        "--pass" => format!("not {}", PASS_WORDS.join(" or ")),
         "render --out" => "--out <stem> is required".to_string(), // NLECLIREFUSALSREST (SR814): the missing flag, by verb
         "export --out" => "--out <dir> is required".to_string(),
         _ => format!("not a whole number within 0..={}", u32::MAX),
@@ -382,20 +382,15 @@ fn num<T: std::str::FromStr>(it: &mut std::slice::Iter<'_, String>, flag: &str) 
 }
 
 /// NLECLIREFUSALSBYNAME (SR801, NLE-CLI-HELP): a person asked for the usage — `nle help`, `nle --help`, or
-/// `nle <schedule|render|export> --help`.
+/// `nle <schedule|render|export|size|--make-src|completions> --help`.
 fn help_asked(args: &[String]) -> bool {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    matches!(a.as_slice(), ["help" | "--help", ..] | ["schedule" | "render" | "export", "--help", ..])
+    matches!(a.as_slice(), ["help" | "--help", ..] | ["schedule" | "render" | "export" | "size" | "--make-src" | "completions", "--help", ..])
 }
 
 /// NLECLIREFUSALSBYNAME (SR801): THE usage text, to `w`, then exit `code` (`usage()`: stderr, 2; the help road: stdout, 0).
-fn usage_to(w: &mut dyn Write, code: i32) -> ! {
-    let _ = writeln!(w, "usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
-    let _ = writeln!(w, "       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    let _ = writeln!(w, "       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {}|aac:KBPS] [--aac] [--mkv] [--png]", VIDEO_NAMES.join("|"), stria::nle_export::AUDIO_NAMES.join("|"));
-    let _ = writeln!(w, "       nle --make-src <out.mp4> <base> [frames] [fps]");
-    let _ = writeln!(w, "       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
-    let _ = writeln!(w, "       nle completions bash|zsh|fish [--install [<dir>]] [--force]");
+fn usage_to(w: &mut dyn Write, code: i32, verb: Option<&str>) -> ! {
+    match verb { Some(v) => verb_usage(w, v), None => for (i, (_, line)) in USAGE_LINES.iter().enumerate() { let _ = writeln!(w, "{}{}", if i == 0 { "usage: " } else { "       " }, usage_fill(line)); } } // NLECLIHELPVERB (SR1041): Some(verb) its own section (file tail); None the six lines of USAGE_LINES, bytes unchanged
     let _ = w.flush();
     std::process::exit(code)
 }
@@ -485,19 +480,16 @@ fn completions(shell: &str) -> Option<String> {
     Some(match shell {
         "bash" => bash_script(&words().collect::<Vec<_>>().join(" ")),
         "zsh" => {
-            let mut s = format!("#compdef nle\n_arguments '1:verb:({})'", VERBS.join(" "));
-            for f in FLAGS {
-                s.push_str(&format!(" '*{f}{}'", zsh_value(f)));
-            }
-            s.push_str(&format!("{} '*:file:_files'\n", zsh_size()));
+            let mut s = format!("#compdef nle\n{}_arguments '1:verb:({})' $flags", zsh_verbs(), VERBS.join(" ")); // NLECLICOMPLETIONSVERBFLAGS (SR1033): each verb's flag specs in `$flags` (zsh_verbs, file tail)
+            s.push_str(&format!("{}{} '*:file:{{{}}}'\n", zsh_shells(), zsh_size(), zsh_file()));
             s
         }
         "fish" => words()
             .map(|w| match w.strip_prefix("--") {
-                Some(l) => format!("complete -c nle -l {l}{}\n", fish_value(w)),
+                Some(l) => format!("complete -c nle{} -l {l}{}\n", fish_when(w), fish_value(w)),
                 None => format!("complete -c nle -n __fish_use_subcommand -a {w}\n"),
             })
-            .chain(std::iter::once(fish_size())).collect(),
+            .chain([fish_size(), fish_dirs(), fish_completions()]).collect(),
         _ => return None,
     })
 }
@@ -506,7 +498,7 @@ fn completions(shell: &str) -> Option<String> {
 /// NLECLICOMPLETIONSVALUES (SR847): THE value table of `nle completions` — each valued flag with the words its parse takes,
 /// read from the parser's own tables (stria's `VIDEO_NAMES` / `AUDIO_NAMES` + `aac:` for `aac:KBPS` / `PASS2_KEYS` as `k=`),
 /// so a new codec / audio / pass2 word reaches every script with no second list.
-fn flag_values() -> [(&'static str, Vec<String>); 3] {
+fn flag_values() -> [(&'static str, Vec<String>); 4] {
     let own = |t: &[&str]| t.iter().map(|w| w.to_string()).collect::<Vec<String>>();
     let mut audio = own(&stria::nle_export::AUDIO_NAMES[..]);
     audio.push("aac:".to_string());
@@ -514,6 +506,7 @@ fn flag_values() -> [(&'static str, Vec<String>); 3] {
         ("--video", own(&VIDEO_NAMES[..])),
         ("--audio", audio),
         ("--pass2", stria::nle_export::PASS2_KEYS.iter().map(|k| format!("{k}=")).collect()),
+        ("--pass", own(&PASS_WORDS[..])), // NLECLICOMPLETIONSPASSWORDSFILES (SR1019): two_pass_of's words
     ]
 }
 
@@ -531,12 +524,12 @@ fn values_of(flag: &str) -> Option<String> {
 /// flags by default, a valued flag's words after it, the size policies at `nle size <edl> <reel> _`; filenames still when
 /// nothing matches (`-o default`).
 fn bash_script(words: &str) -> String {
-    let mut s = format!("_nle() {{\n    local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} w=\"{words}\"\n    case $prev in\n");
+    let mut s = format!("_nle() {{\n    local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}} w=\"{words}\"\n{}    case $prev in\n", bash_verbs());
     for (f, v) in flag_values() {
         s.push_str(&format!("        {f}) w=\"{}\" ;;\n", v.join(" ")));
     }
-    s.push_str(&bash_free()); s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
-    s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
+    s.push_str(&bash_free()); s.push_str(&bash_paths()); s.push_str(&format!("    esac\n    [[ ${{COMP_WORDS[1]}} == size && $COMP_CWORD == 4 ]] && w=\"{}\"\n", size_words()));
+    s.push_str(&bash_after()); s.push_str(&bash_shells()); s.push_str("    COMPREPLY=($(compgen -W \"$w\" -- \"$cur\"))\n}\ncomplete -o default -F _nle nle\n");
     s
 }
 
@@ -547,7 +540,7 @@ fn zsh_value(flag: &str) -> String {
 
 /// NLECLICOMPLETIONSVALUES (SR847): zsh's fourth positional — the size policies after `nle size <edl> <reel>`, files otherwise.
 fn zsh_size() -> String {
-    format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {}; else _files; fi}}'", size_words())
+    format!(" '4:policy:{{if [[ $words[2] == size ]]; then compadd -- {}; else {}; fi}}'", size_words(), zsh_file())
 }
 
 /// NLECLICOMPLETIONSVALUES (SR847): fish's ` -xa "<words>"` on a valued `-l` line (a value required, these words); empty for any other.
@@ -570,13 +563,17 @@ enum Arg {
     Free,
     Opt,
     Words,
+    /// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): a required value that is a path ([`PATH_FLAGS`]): files in every shell.
+    Path,
+    /// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): a directory (`completions --install [<dir>]`, [`COMPLETIONS_ARG`]).
+    Dir,
 }
 
 /// NLECLICOMPLETIONSFREE (SR1005): THE kind of each [`FLAGS`] word, in FLAGS order (FLAGS stays the one word list). tests/cli.rs
 /// `cli_completions_free` pins it to each arm's own read (`value(&mut it, ..)` / `num(&mut it, ..)` / `it.clone().next()`).
 const FLAG_ARG: [Arg; 24] = [
-    Arg::Free, Arg::Free, Arg::Words, Arg::Words, Arg::Bare, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Bare, Arg::Free, Arg::Opt,
-    Arg::Free, Arg::Bare, Arg::Free, Arg::Free, Arg::Opt, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Free, Arg::Words, Arg::Free,
+    Arg::Free, Arg::Path, Arg::Words, Arg::Words, Arg::Bare, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Bare, Arg::Free, Arg::Opt,
+    Arg::Free, Arg::Bare, Arg::Words, Arg::Path, Arg::Opt, Arg::Bare, Arg::Free, Arg::Free, Arg::Free, Arg::Free, Arg::Words, Arg::Path,
 ];
 
 /// NLECLICOMPLETIONSFREE (SR1005): `flag`'s [`Arg`] by its place in [`FLAGS`]; `Bare` for a word not in it.
@@ -588,7 +585,7 @@ fn arg_of(flag: &str) -> Arg {
 /// gives readline's filenames); empty when no flag is `Free`.
 fn bash_free() -> String {
     let free: Vec<&str> = FLAGS.iter().copied().filter(|f| arg_of(f) == Arg::Free).collect();
-    if free.is_empty() { String::new() } else { format!("        {}) w=\"\" ;;\n", free.join("|")) }
+    if free.is_empty() { String::new() } else { format!("        {}) compopt +o default; w=\"\" ;;\n", free.join("|")) } // NLECLICOMPLETIONSPASSWORDSFILES (SR1019): a numeric value offers no filenames
 }
 
 /// NLECLICOMPLETIONSFREE (SR1005): zsh's argument of a flag with no word table — `Free` `:<name>: ` (a space action: the
@@ -598,37 +595,49 @@ fn zsh_arg(flag: &str) -> String {
     match arg_of(flag) {
         Arg::Free => format!(":{name}: "),
         Arg::Opt => format!("::{name}: "),
-        Arg::Bare | Arg::Words => String::new(),
+        Arg::Path => format!(":{name}:{{compset -P \"*=\"; _files}}"), // NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the path after the last `=` (`--src REEL=<media>`), else the word
+        Arg::Bare | Arg::Words | Arg::Dir => String::new(),
     }
 }
 
 /// NLECLICOMPLETIONSFREE (SR1005): fish's ` -x` on a `Free` flag's `-l` line (a value required, no files, no `-a` words);
 /// empty otherwise (fish cannot say an optional value for a separate word, so `Opt` is a plain `-l`).
 fn fish_arg(word: &str) -> String {
-    if arg_of(word) == Arg::Free { " -x".to_string() } else { String::new() }
+    (match arg_of(word) { Arg::Free => " -x", Arg::Path => " -r -F", _ => "" }).to_string() // NLECLICOMPLETIONSPASSWORDSFILES (SR1019): a Path flag's value is files
 }
 
 // ---- NLECLICOMPLETIONSINSTALL (LEDGER SR1011): nle completions <shell> --install [<dir>] [--force] (named tail block) ----
 /// NLECLICOMPLETIONSINSTALL (SR1011): the `completions` verb's own arm words (not the export loop's: `FLAGS` feeds
 /// `unknown_flag` and every script's word list, so these stay out of it); SR816's pin in tests/cli.rs subtracts them by name.
-const COMPLETIONS_FLAGS: [&str; 2] = ["--install", "--force"];
+const COMPLETIONS_FLAGS: [&str; 3] = ["--install", "--force", "--uninstall"]; // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall
 
 /// NLECLICOMPLETIONSINSTALL (SR1011): what follows `nle completions <shell>` — nothing prints `script` on stdout (SR821's road,
 /// byte-identical); `--install [<dir>]` writes it through [`install_completions`] and prints `installed <path>` (or
 /// `installed <path> (unchanged)`), zsh a second line naming the fpath step; `--force` overwrites a differing file. An
 /// unknown word is refused by name ([`nearest`] over [`COMPLETIONS_FLAGS`]), every refusal through [`die`], exit 1.
 fn completions_out(shell: &str, script: &str, rest: &[String]) {
-    let (mut install, mut force) = (None::<Option<std::path::PathBuf>>, false);
+    let (mut install, mut force, mut uninstall) = (None::<Option<std::path::PathBuf>>, false, None::<Option<std::path::PathBuf>>); // NLECLICOMPLETIONSUNINSTALL (SR1025): uninstall
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--install" => install = Some(match it.clone().next() { Some(d) if !d.starts_with("--") => { it.next(); Some(std::path::PathBuf::from(d)) } _ => None }),
+            "--uninstall" => uninstall = Some(match it.clone().next() { Some(d) if !d.starts_with("--") => { it.next(); Some(std::path::PathBuf::from(d)) } _ => None }), // NLECLICOMPLETIONSUNINSTALL (SR1025)
             "--force" => force = true,
             _ => die(match nearest(a, &COMPLETIONS_FLAGS) {
                 Some(f) => format!("completions {shell} {a}: unknown flag; did you mean {f}?"),
-                None => format!("completions {shell} {a}: unknown flag (--install [<dir>] or --force)"),
+                None => format!("completions {shell} {a}: unknown flag (--install [<dir>], --uninstall [<dir>] or --force)"), // NLECLICOMPLETIONSUNINSTALL (SR1025)
             }),
         }
+    }
+    // NLECLICOMPLETIONSUNINSTALL (SR1025): `--uninstall [<dir>]` removes what `--install [<dir>]` writes (before the
+    // `--force needs --install` refusal: `--uninstall --force` removes a file that is not ours).
+    if let Some(dir) = uninstall {
+        if install.is_some() {
+            die(format!("completions {shell}: --install and --uninstall together (one at a time)"));
+        }
+        let (path, absent) = uninstall_completions(shell, dir, force, script).unwrap_or_else(|e| die(e));
+        println!("removed {}{}", path.display(), if absent { " (absent)" } else { "" });
+        return;
     }
     let Some(dir) = install else {
         if force {
@@ -657,17 +666,11 @@ struct Installed {
 /// (`exists <path> (differs; --force to overwrite)`: a hand-edited script is not clobbered); else the dir is created and
 /// the file written.
 fn install_completions(shell: &str, script: &str, dir: Option<std::path::PathBuf>, force: bool) -> Result<Installed, String> {
-    let dir = match dir {
-        Some(d) => d,
-        None => completion_dir(shell)?,
-    };
-    let path = dir.join(completion_file(shell));
-    match std::fs::read(&path) {
-        Ok(b) if b == script.as_bytes() => return Ok(Installed { path, dir, unchanged: true }),
-        Ok(_) if !force => return Err(format!("exists {} (differs; --force to overwrite)", path.display())),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+    let (dir, path, found) = completions_target(shell, dir, script)?; // NLECLICOMPLETIONSUNINSTALL (SR1025): the path + compare lifted
+    match found {
+        Some(true) => return Ok(Installed { path, dir, unchanged: true }),
+        Some(false) if !force => return Err(format!("exists {} (differs; --force to overwrite)", path.display())),
+        _ => {}
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     std::fs::write(&path, script).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -697,5 +700,231 @@ fn completion_file(shell: &str) -> &'static str {
         "zsh" => "_nle",
         "fish" => "nle.fish",
         _ => "nle",
+    }
+}
+
+// ---- NLECLICOMPLETIONSPASSWORDSFILES (LEDGER SR1019): --pass's words from ONE table; Path / Dir completion kinds (named tail block) ----
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): THE words `--pass` takes (`two_pass_of`'s `Some(1)` / `Some(2)` arms): read by
+/// `two_pass_of`'s refusal, `what("--pass")` and [`flag_values`], so the completion words and the refusal cannot drift.
+const PASS_WORDS: [&str; 2] = ["1", "2"];
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the [`FLAGS`] words whose value is a path (`--out <stem|dir>`, `--stats <file>`,
+/// `--src REEL=<media>`); [`FLAG_ARG`] tags them `Path` and stays the table the generators read; tests/cli.rs
+/// `cli_completions_files` pins this list equal to FLAG_ARG's Path words, each a required value by the arm scan.
+#[allow(dead_code)] // read from the source by tests/cli.rs (the named witness of FLAG_ARG's Path tags)
+const PATH_FLAGS: [&str; 3] = ["--out", "--stats", "--src"];
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the kind of each [`COMPLETIONS_FLAGS`] word, in its order (FLAG_ARG's shape):
+/// `--install [<dir>]` a directory, `--force` nothing.
+const COMPLETIONS_ARG: [Arg; 3] = [Arg::Dir, Arg::Bare, Arg::Dir]; // NLECLICOMPLETIONSUNINSTALL (SR1025): --uninstall [<dir>]
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): the completions verb's words that take a directory ([`COMPLETIONS_ARG`] `Dir`).
+fn dir_words() -> Vec<&'static str> {
+    COMPLETIONS_FLAGS.iter().zip(COMPLETIONS_ARG).filter(|(_, a)| *a == Arg::Dir).map(|(f, _)| *f).collect()
+}
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): bash's `case $prev` arms of the `Path` flags (an empty list: `-o default`
+/// gives readline's filenames) and the `Dir` words (`compopt -o dirnames +o default`: directories only).
+fn bash_paths() -> String {
+    let path: Vec<&str> = FLAGS.iter().copied().filter(|f| arg_of(f) == Arg::Path).collect();
+    let mut s = String::new();
+    if !path.is_empty() {
+        s.push_str(&format!("        {}) w=\"\" ;;\n", path.join("|")));
+    }
+    let dirs = dir_words();
+    if !dirs.is_empty() {
+        s.push_str(&format!("        {}) compopt -o dirnames +o default; w=\"\" ;;\n", dirs.join("|")));
+    }
+    s
+}
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): bash's lines after `esac` — the positional `<edl|media>` (and `size <edl>`,
+/// `--make-src <out>`) at word 2 offers files, not the verb / flag words; after a `=` (`--src REEL=`: COMP_WORDS splits
+/// at it, and readline's default word breaks there too) no words, so `-o default` completes the path.
+fn bash_after() -> String {
+    "    [[ $COMP_CWORD == 2 && ${COMP_WORDS[1]} != completions && $cur != -* ]] && w=\"\"\n    [[ $prev == = || $cur == = ]] && w=\"\"\n".to_string()
+}
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): zsh's file action of the rest spec and the size spec's else — directories
+/// after a `Dir` word (`--install`), files otherwise (whether or not `_arguments` counts `--install` as a positional).
+fn zsh_file() -> String {
+    format!("if [[ $words[CURRENT-1] == ({}) ]]; then _files -/; else _files; fi", dir_words().join("|"))
+}
+
+/// NLECLICOMPLETIONSPASSWORDSFILES (SR1019): fish's line per `Dir` word — the option declared under the completions verb
+/// only (fish completes an option's argument only for a declared option), its value directories.
+fn fish_dirs() -> String {
+    dir_words()
+        .iter()
+        .map(|w| format!("complete -c nle -n \"__fish_seen_subcommand_from completions\" -l {} -x -a \"(__fish_complete_directories)\"\n", w.trim_start_matches('-')))
+        .collect()
+}
+
+// ---- NLECLICOMPLETIONSUNINSTALL (LEDGER SR1025): nle completions <shell> --uninstall [<dir>] [--force] (named tail block) ----
+/// NLECLICOMPLETIONSUNINSTALL (SR1025): THE target of `--install` and `--uninstall` — the dir (`dir`, else [`completion_dir`]),
+/// the file ([`completion_file`] in it) and what is there now, by ONE read: `None` nothing, `Some(true)` exactly `script`'s
+/// bytes (ours), `Some(false)` other bytes (a hand-written script); a read error other than NotFound is `<path>: <error>`.
+/// Lifted verbatim from SR1011's `install_completions` head, so the two roads cannot name different files.
+fn completions_target(shell: &str, dir: Option<std::path::PathBuf>, script: &str) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<bool>), String> {
+    let dir = match dir {
+        Some(d) => d,
+        None => completion_dir(shell)?,
+    };
+    let path = dir.join(completion_file(shell));
+    let found = match std::fs::read(&path) {
+        Ok(b) => Some(b == script.as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    Ok((dir, path, found))
+}
+
+/// NLECLICOMPLETIONSUNINSTALL (SR1025): remove the file `--install [<dir>]` would write ([`completions_target`]): nothing
+/// there is `(path, true)` (absent: idempotent); bytes that are not `script`'s are refused without `force`
+/// (`<path>: not nle's completion script (use --force)`: a hand-written `_nle` is never deleted silently); else the file
+/// is removed, `(path, false)`. The dir is left in place (it is the shell's, not nle's).
+fn uninstall_completions(shell: &str, dir: Option<std::path::PathBuf>, force: bool, script: &str) -> Result<(std::path::PathBuf, bool), String> {
+    let (_, path, found) = completions_target(shell, dir, script)?;
+    match found {
+        None => Ok((path, true)),
+        Some(false) if !force => Err(format!("{}: not nle's completion script (use --force)", path.display())),
+        Some(_) => {
+            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((path, false))
+        }
+    }
+}
+
+// ---- NLECLICOMPLETIONSVERBFLAGS (LEDGER SR1033): each verb's own flag words in every completion script (named tail block) ----
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): THE shells `nle completions <shell>` writes a script for ([`completions`]' three
+/// arms): main's dispatch refusal names them and every script offers them at `nle completions _`.
+const SHELLS: [&str; 3] = ["bash", "zsh", "fish"];
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): THE flag words each [`VERBS`] word takes, in VERBS order. schedule / render / export
+/// share ONE option loop, so each lists the FLAGS whose loop variable it READS (`load`'s `fps` / `srcs` for all three,
+/// render's `out`, export every one); `size` its one `--fps` literal; `--make-src` / `help` / `--help` none; `completions`
+/// its own [`COMPLETIONS_FLAGS`]. tests/cli.rs `cli_completions_verb_flags_scan` pins it to those reads both ways.
+const VERB_FLAGS: [(&str, &[&str]); 8] = [
+    ("schedule", &["--fps", "--src"]),
+    ("render", &["--fps", "--out", "--src"]),
+    ("export", &FLAGS),
+    ("size", &["--fps"]),
+    ("--make-src", &[]),
+    ("completions", &COMPLETIONS_FLAGS),
+    ("help", &[]),
+    ("--help", &[]),
+];
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): the verbs whose [`VERB_FLAGS`] list holds `flag`, in VERBS order.
+fn verbs_of(flag: &str) -> Vec<&'static str> {
+    VERB_FLAGS.iter().filter(|(_, f)| f.contains(&flag)).map(|(v, _)| *v).collect()
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): bash's verb case before `case $prev` — `f` the verb's flag words (a name of its own,
+/// so SR847 / SR1005's `) w="` arms stay the only ones), taken as `w` past the verb's own word (word 1 keeps the verbs).
+fn bash_verbs() -> String {
+    let mut s = String::from("    local f=\"\"\n    case ${COMP_WORDS[1]} in\n");
+    for (v, flags) in VERB_FLAGS {
+        s.push_str(&format!("        {v}) f=\"{}\" ;;\n", flags.join(" ")));
+    }
+    s.push_str("    esac\n    (( COMP_CWORD > 1 )) && w=$f\n");
+    s
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): bash's [`SHELLS`] at `nle completions _` (SR847's size-line shape).
+fn bash_shells() -> String {
+    format!("    [[ ${{COMP_WORDS[1]}} == completions && $COMP_CWORD == 2 ]] && w=\"{}\"\n", SHELLS.join(" "))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): zsh's `flags` array per verb (`case $words[2]`), each spec SR847 / SR1005 / SR1019's
+/// [`zsh_value`]; `_arguments` reads `$flags` (empty before a verb and for a verb with none).
+fn zsh_verbs() -> String {
+    let mut s = String::from("local -a flags\ncase $words[2] in\n");
+    for (v, flags) in VERB_FLAGS {
+        let specs: String = flags.iter().map(|f| format!(" '*{f}{}'", zsh_value(f))).collect();
+        s.push_str(&format!("    {v}) flags=({specs} ) ;;\n"));
+    }
+    s.push_str("esac\n");
+    s
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): zsh's second positional — [`SHELLS`] after `nle completions`, else SR1019's file
+/// action ([`zsh_size`]'s shape).
+fn zsh_shells() -> String {
+    format!(" '2:shell:{{if [[ $words[2] == completions ]]; then compadd -- {}; else {}; fi}}'", SHELLS.join(" "), zsh_file())
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): fish's condition on a flag's `-l` line — the verbs that take it ([`fish_dirs`]' shape).
+fn fish_when(flag: &str) -> String {
+    format!(" -n \"__fish_seen_subcommand_from {}\"", verbs_of(flag).join(" "))
+}
+
+/// NLECLICOMPLETIONSVERBFLAGS (SR1033): fish's [`SHELLS`] line at `nle completions _` ([`fish_size`]'s count test) and a line
+/// per non-`Dir` [`COMPLETIONS_FLAGS`] word (`--force`; the `Dir` words are [`fish_dirs`]' lines).
+fn fish_completions() -> String {
+    let mut s = format!("complete -c nle -n \"__fish_seen_subcommand_from completions; and test (count (commandline -opc)) -eq 2\" -xa \"{}\"\n", SHELLS.join(" "));
+    for (w, a) in COMPLETIONS_FLAGS.iter().zip(COMPLETIONS_ARG) {
+        if a != Arg::Dir {
+            s.push_str(&format!("complete -c nle{} -l {}\n", fish_when(w), w.trim_start_matches('-')));
+        }
+    }
+    s
+}
+
+// ---- NLECLIHELPVERB (LEDGER SR1041): per-verb `--help` from ONE usage table and VERB_FLAGS (named tail block) ----
+/// NLECLIHELPVERB (SR1041): THE usage lines, one per verb shape in the usage's order, without the `usage: ` / indent prefix
+/// ([`usage_to`] adds it). `{video}` / `{audio}` are stria's tables, filled by [`usage_fill`]. The full usage and each
+/// verb's `--help` section ([`verb_usage`]) print from this one table.
+const USAGE_LINES: [(&str, &str); 6] = [
+    ("schedule", "nle schedule <edl|media> [--fps N] --src REEL=<media> ..."),
+    ("render", "nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>"),
+    ("export", "nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video {video}] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--scenecut [K]] [--min-keyint N] [--aq [K]] [--two-pass | --pass 1|2 --stats <file>] [--qcomp F] [--cplxblur N] [--qblur F] [--qpstep N] [--pass2 k=v,...] [--hrd] [--audio {audio}|aac:KBPS] [--aac] [--mkv] [--png]"),
+    ("--make-src", "nle --make-src <out.mp4> <base> [frames] [fps]"),
+    ("size", "nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]"),
+    ("completions", "nle completions bash|zsh|fish [--install [<dir>] | --uninstall [<dir>]] [--force]"),
+];
+
+/// NLECLIHELPVERB (SR1041): `line` with `{video}` / `{audio}` replaced by stria's `VIDEO_NAMES` / `AUDIO_NAMES` joined `|`.
+fn usage_fill(line: &str) -> String {
+    line.replace("{video}", &VIDEO_NAMES.join("|")).replace("{audio}", &stria::nle_export::AUDIO_NAMES.join("|"))
+}
+
+/// NLECLIHELPVERB (SR1041): the value word after the whole-word `flag` in a usage `line` — up to the first space or the first
+/// unmatched `]` at bracket depth 0 (`--scenecut [K]` -> `[K]`, `--pass2 k=v,...]` -> `k=v,...`); empty when the flag is
+/// absent or followed by `]`, `|` or another flag (`--two-pass |`, `[--aac]`, `[--force]`).
+fn flag_word<'a>(line: &'a str, flag: &str) -> &'a str {
+    let whole = |i: usize| (i == 0 || line[..i].ends_with([' ', '['])) && (line[i + flag.len()..].is_empty() || line[i + flag.len()..].starts_with([' ', ']']));
+    let Some(i) = line.match_indices(flag).map(|(i, _)| i).find(|&i| whole(i)) else { return "" };
+    let rest = line[i + flag.len()..].strip_prefix(' ').unwrap_or("");
+    let mut depth = 0usize;
+    let end = rest
+        .char_indices()
+        .find(|&(_, c)| match c {
+            '[' => {
+                depth += 1;
+                false
+            }
+            ']' if depth == 0 => true,
+            ']' => {
+                depth -= 1;
+                false
+            }
+            ' ' => depth == 0,
+            _ => false,
+        })
+        .map_or(rest.len(), |(j, _)| j);
+    let word = &rest[..end];
+    if word.is_empty() || word.starts_with(['|', '-']) || word.starts_with("[-") { "" } else { word }
+}
+
+/// NLECLIHELPVERB (SR1041): `nle <verb> --help` — the verb's [`USAGE_LINES`] line as `usage: <line>`, then one line per
+/// [`VERB_FLAGS`] word in its order, `  <flag>` and its value word cut from that same line ([`flag_word`]) when it has one.
+fn verb_usage(w: &mut dyn Write, verb: &str) {
+    let line = USAGE_LINES.iter().find(|(v, _)| *v == verb).map(|(_, l)| usage_fill(l)).unwrap_or_default();
+    let _ = writeln!(w, "usage: {line}");
+    let flags: &[&str] = VERB_FLAGS.iter().find(|(v, _)| *v == verb).map_or(&[][..], |(_, f)| *f);
+    for f in flags {
+        let word = flag_word(&line, f);
+        let _ = writeln!(w, "  {f}{}", if word.is_empty() { String::new() } else { format!(" {word}") });
     }
 }
