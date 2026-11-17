@@ -50,11 +50,12 @@ pub struct EditorState {
     commits: usize, // STRIAAUTOSAVECAP (SR913): every timeline change (commit, undo, redo), monotonic past UNDO_MAX; read by `commits()` (file tail)
     track_maps: (Vec<Option<TrackMap>>, Vec<Option<TrackMap>>), // STRIATRACKSMORE (SR955): the undo / redo entries' track maps, in lock-step with `undo` / `redo` (file tail)
     pub target: Option<usize>, // STRIAINSERTMARKSKEYSNEXT (SR985): the insert words' target track, session state like `selection` (file tail)
+    pub source: Option<SourceMon>, // STRIASOURCEVIEWER (SR9045): the loaded source monitor, session state (file tail)
 }
 
 impl EditorState {
     pub fn new(timeline: Timeline) -> EditorState {
-        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, squeeze: 1, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0, track_maps: (Vec::new(), Vec::new()), target: None }
+        EditorState { timeline, selection: None, set: Vec::new(), playhead: 0, zoom: ZOOM_DEFAULT, squeeze: 1, undo: Vec::new(), redo: Vec::new(), transition: None, clipboard: Vec::new(), hist: UndoNames::default(), commits: 0, track_maps: (Vec::new(), Vec::new()), target: None, source: None } // STRIASOURCEVIEWER (SR9045): no source loaded
     }
     /// Open a CMX 3600 EDL (`fps` when it carries no `* UNA FPS` line).
     pub fn open(text: &str, fps: u32) -> Result<EditorState, edl::EdlError> {
@@ -310,7 +311,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     fn verb_unnamed(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail)
+        if let Some(r) = self.title_style_verb(v) { return Some(r); } if let Some(r) = self.retitle_verb(v) { return Some(r); } if let Some(r) = self.freeze_verb(v) { return Some(r); } if let Some(r) = self.crop_face_verb(v) { return Some(r); } let ph = self.playhead; if let Some(r) = self.opacity_key_verb(v) { return Some(r); } if let Some(r) = self.crop_verb(v) { return Some(r); } if let Some(r) = self.opacity_verb(v) { return Some(r); } if let Some(r) = self.xform_verb(v) { return Some(r); } if let Some(r) = self.link_verb(v) { return Some(r); } if let Some(r) = self.grade_step_verb(v) { return Some(r); } if let Some(r) = self.grade_verb(v) { return Some(r); } if let Some(r) = self.alone_verb(v) { return Some(r); } if let Some(r) = self.target_verb(v) { return Some(r); } if let Some(r) = self.source_verb(v) { return Some(r); } if let Some(r) = self.size_verb(v) { return Some(r); } if let Some(r) = self.look_verb(v) { return Some(r); } if let Some(r) = self.gain_verb(v) { return Some(r); } if let Some(r) = self.track_verb(v) { return Some(r); } if let Some(r) = self.track_ch_verb(v) { return Some(r); } if let Some(r) = self.marker_verb(v) { return Some(r); } if let Some(r) = self.roll_verb(v) { return Some(r); } if let Some(r) = self.insert_verb(v) { return Some(r); } if let Some(r) = self.transition_dur_verb(v) { return Some(r); } if let Some(r) = self.xfade_verb(v) { return Some(r); } if let Some(r) = self.clipboard_verb(v) { return Some(r); } if let Some(r) = self.gap_verb(v) { return Some(r); } if let Some(r) = self.tracks_verb(v) { return Some(r); } if let Some(r) = self.track_gain_ch_verb(v) { return Some(r); } if let Some(r) = self.track_gain_verb(v) { return Some(r); } if let Some(r) = self.pan_verb(v) { return Some(r); } if let Some(r) = self.track_order_verb(v) { return Some(r); } if let Some(r) = self.paste_mode_verb(v) { return Some(r); } if let Some(r) = self.jump_verb(v) { return Some(r); } if let Some(r) = self.track_gain_step_verb(v) { return Some(r); } if let Some(r) = self.xfade_cycle_verb(v) { return Some(r); } if let Some(r) = self.rspeed_verb(v) { return Some(r); } if let Some(r) = self.rtrim_all_verb(v) { return Some(r); } if let Some(w) = slipslide_word(v) { return Some(self.slipslide_verb(&w)); } if let Some(r) = self.marker_style_verb(v) { return Some(r); } if let Some(r) = self.marker_marks_verb(v) { return Some(r); } // STRIACLIPGAINFACE (SR838): the gain / fade words (file tail); STRIATRANSITIONLENGTH (SR870): `dur <n>` (file tail); STRIAOPACITYKEYS (SR9048): `opacity-key` / `opacity-unkey` (file tail); STRIAOPACITY (SR868): `opacity <pct>` (file tail); STRIACLIPLINK (SR863): `link` / `unlink` (file tail); STRIAGRADEFACE (SR899): the six grade step words (file tail); STRIACOLORLIFT (SR869): `color` (file tail); STRIAPAN (SR861): `pan <x>` (file tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` (file tail); STRIAPOSITIONSCALE (SR879): `pip` / `scale` (file tail); STRIACLIPSPEEDMORE (SR951): `rspeed <q>` (file tail); STRIARIPPLEMORE (SR953): `rtrim-all` (file tail); STRIALINKMORE (SR967): `alone` (file tail); STRIAKSLIP (SR9002): the faces' slip / slide step words `slip-` .. `slide+10` (file tail); STRIAMARKERRANGES (SR9052): `marker marks` (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour` / `marker range` (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` (file tail); NLESIZEPOLICYUI (SR402): the `size` words (file tail); STRIATRACKMUTESOLO (SR837): `mute` / `solo` (file tail); STRIAROLLEDIT (SR851): the `roll` words (file tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite (file tail); STRIACOPYPASTE (SR854): copy / cut / paste (file tail); STRIAGAPCLOSE (SR857): `close-gaps` / `gap <n>` (file tail); STRIATRACKADDREMOVE (SR856): `track+` / `track-` (file tail); STRIATRACKGAIN (SR864): `track-gain` (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (file tail); STRIAFREEZEFRAME (SR880): `freeze` (file tail); STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` (file tail); STRIAFREEZEMORE (SR970): `retitle` (file tail); STRIATRACKGAINKEYSNEXT (SR983): `mute <ch>` / `solo <ch>` (file tail); STRIAINSERTMARKSKEYSNEXT (SR985): `target` (file tail); STRIATRACKGAINTHREE (SR9024): `track-gain <ch> [<dB>]` / `track-gain- <ch>` / `track-gain+ <ch>` (file tail); STRIAFREEZETHREE (SR9029): `title-style` (file tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -1001,7 +1002,7 @@ impl EditorState {
     fn insert_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let Some((mode, range)) = insert_words(v, self.timeline.fps()) else { return self.marked_verb(v); }; // STRIAINSERTMARKS (SR905): else the marked words, a malformed insert shape refused by name (file tail)
         Some(match range {
-            None => self.insert_selected(mode),
+            None => self.insert_source(mode).unwrap_or_else(|| self.insert_selected(mode)), // STRIASOURCEVIEWER (SR9045): a loaded source's marked range first (file tail)
             Some((reel, a, b)) => self.insert_reel(reel, a, b, mode),
         })
     }
@@ -4626,5 +4627,281 @@ impl EditorState {
             }),
             _ => None,
         }
+    }
+}
+
+// ---- STRIASOURCEVIEWER (LEDGER SR9045): the source monitor, session state, and the three-point edit from it (named tail block) ----
+// A source is LOADED into [`EditorState::source`] ([`SourceMon`]: the reel, its own source playhead and its own in / out
+// marks, out exclusive like the timeline's): SESSION state, never the document's (no commit, no undo step, no dirty, no
+// EDL line; `Timeline::marks` stays the export range). The words ride THE dispatch both faces call: `source <reel>` (at 0),
+// bare `source` (the selected clip's reel at the source tick under the playhead: match frame), `unload`, `src-prev` /
+// `src-next` (one tick, clamped to the reel), `src-in` / `src-out` (at the source playhead, keeping the other; in not before
+// out: `EditError::Marks`; nothing loaded: `EditError::NoSource`). With a source loaded, bare `insert` / `overwrite` lay its
+// marked range (in or 0 .. out or the duration) at the TIMELINE playhead through SR976's `place_tracks_at_playhead` (ONE
+// commit): on each of its kinds' first track holding the reel, else that kind's first track. The source stays loaded.
+// The host face previews it through its one frame road over [`EditorState::source_view`] (a one-clip timeline).
+
+/// A loaded source: the reel, the source playhead (`0..duration`), its own in / out marks and the track kinds an insert
+/// lays it on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceMon {
+    pub src: crate::SourceId,
+    pub at: i64,
+    pub marks: (Option<i64>, Option<i64>),
+    pub kinds: Vec<crate::Kind>,
+}
+
+impl EditorState {
+    /// Load source `src` at its tick 0, no marks. `kinds`: the kinds an insert lays it on (empty: the kinds of the tracks
+    /// its clips sit on). Unknown `src`: `EditError::NoSource`. Pushes nothing.
+    pub fn load_source(&mut self, src: crate::SourceId, kinds: &[crate::Kind]) -> Result<(), EditError> {
+        self.load_source_at(src, 0, kinds)
+    }
+    /// [`EditorState::load_source`] at source tick `at` (clamped to the reel).
+    fn load_source_at(&mut self, src: crate::SourceId, at: i64, kinds: &[crate::Kind]) -> Result<(), EditError> {
+        let dur = self.timeline.source(src).ok_or(EditError::NoSource)?.duration;
+        let kinds: Vec<crate::Kind> = if kinds.is_empty() {
+            [crate::Kind::Video, crate::Kind::Audio].into_iter().filter(|k| self.timeline.tracks.iter().any(|t| t.kind == *k && t.clips.iter().any(|c| c.src == src))).collect()
+        } else {
+            kinds.to_vec()
+        };
+        self.source = Some(SourceMon { src, at: at.clamp(0, (dur - 1).max(0)), marks: (None, None), kinds });
+        Ok(())
+    }
+    /// The tracks a loaded source's insert lays on: for each of its kinds, the first track of that kind holding a clip of
+    /// the reel, else the first track of that kind (deduped, in kind order). Empty when nothing is loaded.
+    pub fn source_tracks(&self) -> Vec<usize> {
+        let Some(m) = self.source.as_ref() else { return Vec::new() };
+        let tracks = &self.timeline.tracks;
+        let mut out = Vec::new();
+        for k in &m.kinds {
+            let holding = tracks.iter().position(|t| t.kind == *k && t.clips.iter().any(|c| c.src == m.src));
+            if let Some(t) = holding.or_else(|| tracks.iter().position(|t| t.kind == *k)) {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+    /// The loaded source's marked range laid at the playhead (ONE commit through `place_tracks_at_playhead`); `None` when
+    /// nothing is loaded (SR852's selected-clip road decides). No track for its kinds: `EditError::NoTrack`.
+    pub fn insert_source(&mut self, mode: crate::Mode) -> Option<Result<(), EditError>> {
+        let m = self.source.clone()?;
+        let Some(dur) = self.timeline.source(m.src).map(|s| s.duration) else { return Some(Err(EditError::NoSource)) };
+        let (a, b) = (m.marks.0.unwrap_or(0), m.marks.1.unwrap_or(dur));
+        let tracks = self.source_tracks();
+        Some(self.place_tracks_at_playhead(&tracks, m.src, a, b, mode))
+    }
+    /// The loaded source as a one-clip timeline: one video track showing source tick `at` at tick 0 (the face's frame road
+    /// renders its tick 0). `None` when nothing is loaded or the reel is gone.
+    pub fn source_view(&self) -> Option<Timeline> {
+        let m = self.source.as_ref()?;
+        self.timeline.source(m.src)?;
+        let mut v = self.timeline.clone();
+        v.tracks.clear();
+        v.audio_xfades.clear();
+        v.marks = (None, None);
+        let t = v.add_track(crate::Kind::Video);
+        v.tracks[t].clips.push(Clip::new(m.src, m.at, m.at + 1, 0));
+        Some(v)
+    }
+    /// The face's standing line while a source is loaded: `source A 00:00:00:12  in 00:00:00:05  out --` (ticks when the
+    /// timebase is not a whole fps).
+    pub fn source_line(&self) -> Option<alloc::string::String> {
+        let m = self.source.as_ref()?;
+        let reel = self.timeline.source(m.src).map_or_else(|| alloc::format!("{}", m.src.0), |s| s.reel.clone());
+        let fps = self.timeline.fps();
+        let tc = |t: Option<i64>| -> alloc::string::String {
+            match (t, fps) {
+                (None, _) => alloc::string::String::from("--"),
+                (Some(t), Some(f)) => edl::timecode(t, f),
+                (Some(t), None) => alloc::format!("{t}"),
+            }
+        };
+        Some(alloc::format!("source {reel} {}  in {}  out {}", tc(Some(m.at)), tc(m.marks.0), tc(m.marks.1)))
+    }
+    /// The selected clip's reel loaded at the source tick under the playhead (clamped into the clip).
+    fn load_selected(&mut self) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let at = c.src_in + (self.playhead - c.at).clamp(0, (c.src_out - c.src_in - 1).max(0));
+        self.load_source_at(c.src, at, &[])
+    }
+    /// The source playhead stepped `dt` ticks, clamped to the reel.
+    fn source_step(&mut self, dt: i64) -> Result<(), EditError> {
+        let src = self.source.as_ref().ok_or(EditError::NoSource)?.src;
+        let dur = self.timeline.source(src).ok_or(EditError::NoSource)?.duration;
+        let m = self.source.as_mut().ok_or(EditError::NoSource)?;
+        m.at = (m.at + dt).clamp(0, (dur - 1).max(0));
+        Ok(())
+    }
+    /// The source's `edge` mark set at the source playhead, keeping the other; in not before out: `EditError::Marks`.
+    fn source_mark(&mut self, edge: Edge) -> Result<(), EditError> {
+        let m = self.source.as_mut().ok_or(EditError::NoSource)?;
+        let marks = match edge {
+            Edge::In => (Some(m.at), m.marks.1),
+            Edge::Out => (m.marks.0, Some(m.at)),
+        };
+        if let (Some(a), Some(b)) = marks {
+            if a >= b {
+                return Err(EditError::Marks);
+            }
+        }
+        m.marks = marks;
+        Ok(())
+    }
+    /// The source monitor's words of [`EditorState::verb`]; `None` for any other word or shape.
+    fn source_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        Some(match source_words(v)? {
+            ("source", Some(reel)) => match self.timeline.source_by_reel(reel).map(|s| s.id) {
+                Some(id) => self.load_source(id, &[]),
+                None => Err(EditError::NoSource),
+            },
+            ("source", None) => self.load_selected(),
+            ("unload", None) => {
+                self.source = None;
+                Ok(())
+            }
+            ("src-prev", None) => self.source_step(-1),
+            ("src-next", None) => self.source_step(1),
+            ("src-in", None) => self.source_mark(Edge::In),
+            ("src-out", None) => self.source_mark(Edge::Out),
+            _ => return None,
+        })
+    }
+}
+
+/// `source [<reel>]`, `unload`, `src-prev`, `src-next`, `src-in`, `src-out` -> `(word, argument)`; any other word, or more
+/// than one argument, is not this verb.
+fn source_words(v: &str) -> Option<(&str, Option<&str>)> {
+    let mut w = v.split_ascii_whitespace();
+    let head = w.next()?;
+    let arg = w.next();
+    if w.next().is_some() || !matches!(head, "source" | "unload" | "src-prev" | "src-next" | "src-in" | "src-out") {
+        return None;
+    }
+    Some((head, arg))
+}
+
+#[cfg(test)]
+mod striasourceviewer_tests {
+    use super::*;
+    use crate::{Kind, Mode, SourceId};
+
+    /// A 13..23 at 0 on V1 and A1; B and C (50 ticks each) on no track.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        tl.add_source("B", 50);
+        tl.add_source("C", 50);
+        tl.add_track(Kind::Video);
+        tl.add_track(Kind::Audio);
+        for t in 0..2 {
+            tl.tracks[t].clips = alloc::vec![Clip::new(a, 13, 23, 0)];
+        }
+        EditorState::new(tl)
+    }
+
+    fn words(st: &mut EditorState, vs: &[&str]) {
+        for v in vs {
+            assert_eq!(st.verb(v), Some(Ok(())), "{v}");
+        }
+    }
+
+    /// Loading, stepping and marking push nothing: the timeline, undo, redo and playhead stay; the step clamps to the reel.
+    #[test]
+    fn striasourceviewer_load_step_mark_push_nothing() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("source A"), Some(Ok(())));
+        assert_eq!(st.source, Some(SourceMon { src: SourceId(0), at: 0, marks: (None, None), kinds: alloc::vec![Kind::Video, Kind::Audio] }));
+        words(&mut st, &["src-next", "src-next", "src-in", "src-next", "src-next", "src-next", "src-out", "src-prev"]);
+        assert_eq!(st.source.as_ref().map(|m| (m.at, m.marks)), Some((4, (Some(2), Some(5)))));
+        assert_eq!((st.timeline.clone(), st.undo_depth(), st.redo_depth(), st.playhead), (tl0, 0, 0, 0));
+        words(&mut st, &["source C", "src-prev"]);
+        assert_eq!(st.source.as_ref().map(|m| (m.src, m.at, m.marks, m.kinds.len())), Some((SourceId(2), 0, (None, None), 0)), "C on no track: no kinds");
+        for _ in 0..60 {
+            words(&mut st, &["src-next"]);
+        }
+        assert_eq!(st.source.as_ref().map(|m| m.at), Some(49), "clamped to the reel's last tick");
+        words(&mut st, &["unload", "unload"]);
+        assert_eq!(st.source, None);
+    }
+
+    /// With a source loaded, bare insert / overwrite lay its marked range at the timeline playhead on V1 and A1 in ONE
+    /// commit; the source stays loaded with its marks; one undo restores.
+    #[test]
+    fn striasourceviewer_insert_lays_the_marked_range() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.load_source(SourceId(2), &[Kind::Video, Kind::Audio]), Ok(()));
+        for _ in 0..10 {
+            words(&mut st, &["src-next"]);
+        }
+        words(&mut st, &["src-in"]);
+        for _ in 0..10 {
+            words(&mut st, &["src-next"]);
+        }
+        words(&mut st, &["src-out"]);
+        st.seek(5);
+        assert_eq!(st.verb("insert"), Some(Ok(())));
+        let c = Clip::new(SourceId(2), 10, 20, 5);
+        assert_eq!(st.timeline, tl0.place(0, c, Mode::Insert).unwrap().place(1, c, Mode::Insert).unwrap());
+        assert_eq!((st.undo_depth(), st.playhead, st.selected()), (1, 15, Some(c)));
+        assert_eq!(st.source.as_ref().map(|m| m.marks), Some((Some(10), Some(20))), "the source stays loaded, marks kept");
+        assert!(st.undo());
+        assert_eq!(st.timeline, tl0);
+        let mut o = state();
+        assert_eq!(o.load_source(SourceId(1), &[Kind::Video]), Ok(()));
+        o.seek(2);
+        assert_eq!(o.verb("overwrite"), Some(Ok(())));
+        assert_eq!(o.timeline, state().timeline.place(0, Clip::new(SourceId(1), 0, 50, 2), Mode::Overwrite).unwrap(), "no marks: the whole reel, V1 only");
+    }
+
+    /// Refusals by name, each changing nothing; a malformed shape is not this verb.
+    #[test]
+    fn striasourceviewer_refusals() {
+        let mut st = state();
+        for v in ["src-in", "src-out", "src-prev", "src-next"] {
+            assert_eq!(st.verb(v), Some(Err(EditError::NoSource)), "{v}");
+        }
+        assert_eq!(st.verb("source Z"), Some(Err(EditError::NoSource)));
+        assert_eq!(st.verb("source A B"), None);
+        words(&mut st, &["source A", "src-next", "src-next", "src-next", "src-next", "src-next", "src-out", "src-next", "src-next", "src-next"]);
+        assert_eq!(st.verb("src-in"), Some(Err(EditError::Marks)));
+        assert_eq!(st.source.as_ref().map(|m| m.marks), Some((None, Some(5))));
+        words(&mut st, &["source B"]);
+        let tl0 = st.timeline.clone();
+        assert_eq!(st.verb("insert"), Some(Err(EditError::NoTrack)), "B sits on no track and names no kind");
+        assert_eq!((st.timeline.clone(), st.undo_depth()), (tl0, 0));
+    }
+
+    /// Bare `source` is match frame: the selected clip's reel at the source tick under the playhead; none selected: NoClip.
+    #[test]
+    fn striasourceviewer_bare_source_matches_the_frame() {
+        let mut st = state();
+        assert_eq!(st.verb("source"), Some(Err(EditError::NoClip)));
+        assert_eq!(st.select(0, 0), Ok(()));
+        st.seek(4);
+        assert_eq!(st.verb("source"), Some(Ok(())));
+        assert_eq!(st.source.as_ref().map(|m| (m.src, m.at)), Some((SourceId(0), 17)));
+    }
+
+    /// The one-clip view and the standing line follow the source; nothing loaded: neither.
+    #[test]
+    fn striasourceviewer_view_and_line() {
+        let mut st = state();
+        assert_eq!((st.source_view(), st.source_line()), (None, None));
+        words(&mut st, &["source A", "src-next", "src-next", "src-next"]);
+        let mut want = st.timeline.clone();
+        want.tracks.clear();
+        want.audio_xfades.clear();
+        want.marks = (None, None);
+        want.add_track(Kind::Video);
+        want.tracks[0].clips = alloc::vec![Clip::new(SourceId(0), 3, 4, 0)];
+        assert_eq!(st.source_view(), Some(want));
+        assert_eq!(st.source_line().as_deref(), Some("source A 00:00:00:03  in --  out --"));
+        words(&mut st, &["src-in"]);
+        assert_eq!(st.source_line().as_deref(), Some("source A 00:00:00:03  in 00:00:00:03  out --"));
     }
 }

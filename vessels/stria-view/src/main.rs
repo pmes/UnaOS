@@ -67,7 +67,7 @@ struct Cli {
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media|dir/frame_%04d.png> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split [--bin]] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, bin:ROW, freeze:LEN, freeze-all:LEN, title:TEXT, retitle:TEXT, binsize:W:H, binwheel:N)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media|dir/frame_%04d.png> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split [--bin]] [--mute] [--presets] [--keys MAP]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, tick:N, aux:TOKEN, bin:ROW, freeze:LEN, freeze-all:LEN, title:TEXT, retitle:TEXT, binsize:W:H, binwheel:N, source:REEL, binload:ROW)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -224,7 +224,7 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
         let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
-        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| nudge_token(tok)).or_else(|| binthree_token(face, tok)).or_else(|| token(face, tok)).or_else(|| word_token(tok)) } { // STRIABINTHREE (SR9025): `binpress` / `binmove` / `binrelease` (file tail); STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIANUDGEMORE (SR944): the nudge words (file tail); STRIAFREEZEMORE (SR970): `freeze:<len>` / `title:<text>` ... (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail)
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { tick_token(face, tok).or_else(|| recent_token(tok)).or_else(|| bin_token(face, tok)).or_else(|| binmore_token(face, tok)).or_else(|| source_token(face, tok)).or_else(|| nudge_token(tok)).or_else(|| binthree_token(face, tok)).or_else(|| token(face, tok)).or_else(|| word_token(tok)) } { // STRIABINTHREE (SR9025): `binpress` / `binmove` / `binrelease` (file tail); STRIAINFOREELHOVERDELAY (SR789): `tick:<n>` steps the face clock n times (file tail); STRIAPROJECTBIN (SR885): `bin:<row>` clicks the bin (file tail); STRIANUDGEMORE (SR944): the nudge words (file tail); STRIAFREEZEMORE (SR970): `freeze:<len>` / `title:<text>` ... (file tail); STRIABINMORE (SR976): `binsize:<w>:<h>` / `binwheel:<n>` (file tail); STRIASOURCEVIEWER (SR9045): `source:<reel>` / `binload:<row>` (file tail)
             Some(ms) => {
                 for mut m in ms {
                     if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
@@ -273,7 +273,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}{}\"", c.at, c.src_in, c.src_out, if c.rate_q16 == 0x1_0000 { String::new() } else { format!(":{}", c.rate_q16) })).unwrap_or_else(|| "null".into()); // STRIACLIPSPEED (SR829): `:<rate_q16>` only at a rate other than 1x
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face) + &help_json(&face) + &snap_json(&face) + &note_json(&face) + &tc_json(&face) + &help_search_json(&face) + &info_json(&face) + &clipped_json(&face) + &autosaved_json(&face) + &held_json(&face) + &slip_json(&face) + &note_json(&face); // STRIAAUTOSAVECAP (SR913): `"autosaved":true` while this session's autosave stands (file tail); STRIASLIPVIEWMORE (SR946): `"slip":"WxH"` while a slip / slide pair shows (file tail); STRIAPANNEXT (SR994): `"note":"<text>"` while a note stands (file tail); NLE5DKEYSHELP (SR744): `"help":true` while the keys help shows (file tail); STRIASNAPMORE (SR952): `"snap":false` while the drag snap default is off (file tail)
-    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail)
+    let presses = presses_json(c, &presses); let export = export_json(&face) + &range_json(&face) + &reel_json(&face) + &note_json(&face) + &queued_json(&face) + &bin_json(c, &face) + &bin_top_json(c, &face) + &source_json(&face) + &recent_json(c) + &frame_json(&face) + &markers_json(&face) + &color_json(&face) + &paint + &proxy_json(&face); // STRIACOLORLIFT (SR869): the selected clip's grade (file tail); STRIAPROXYBUTTONS (SR930): the reels with an attached proxy (file tail); NLEFACEEXPORT (SR694): the running export's reading (file tail); NLE5DEXPORTRANGE (SR717): the marks' range (file tail); STRIAINFOREEL (SR743): the selected reel (file tail); STRIAEXPORTFRAME (SR830): the saved frame (file tail); STRIAMARKERS (SR835): the markers (file tail); STRIAPROJECTBIN (SR885): the bin's rows with --bin (file tail); STRIAEXPORTQUEUEMORE (SR971): the waiting count (file tail); STRIASOURCEVIEWER (SR9045): the loaded source (file tail)
     println!(
         "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{},\"dirty\":{}{meters}{presses}{fnvs}{export}{}}}",
         st.playhead,
@@ -581,7 +581,8 @@ fn transport() -> TetraNode {
         button("marker colour", "Marker Colour"), button("marker range", "Marker Range"), button("marker marks", "Marker Marks"), // STRIAMARKERRANGES (SR9052): the export marks to the playhead's marker's range; STRIAMARKERJUMPKEYSNEXT (SR984): the playhead's marker's next colour / its range to the playhead
         button("ripple-all", "Ripple All"), // STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (a Shift-drag on a clip edge ripples every track)
         button("rspeed", "Ripple Speed"), // STRIACLIPSPEEDTHREE (SR9031): the selected clip 1x -> 2x -> 4x -> 1x with the rest of its track following (THE `rspeed` verb)
-        button("headers", "Hdr"), button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
+        button("headers", "Hdr"), button("source", "Source"), button("src-prev", "Src <"), button("src-next", "Src >"), button("src-in", "Src In"), button("src-out", "Src Out"), button("unload", "Unload"), // STRIASOURCEVIEWER (SR9045): the source monitor (load the selected clip's reel, step, mark, unload)
+        button("help", "?"), // STRIAUNDOHISTORY (SR876): the undo history on the message line; STRIATRACKSTHREE (SR9038): the track header column on / off; NLE5DKEYSHELPBUTTON (SR765): the keys help overlay on / off (THE `help` verb, like `?`); STRIAAUDIOCROSSFADE (SR860): Xfade puts / takes the selected audio clip's head crossfade; STRIAXFADECURVEBUTTON (SR925): Curve swaps its curve linear / equal; STRIAHELPMORE (SR977): the help query field before it
     ])
 }
 
@@ -1086,7 +1087,7 @@ mod striainsertoverwrite_tests {
     fn striainsertoverwrite_buttons_and_token() {
         let TetraNode::HStack(row) = transport() else { panic!("no transport row") };
         let ids: Vec<String> = row.iter().map(|b| match b { TetraNode::Button { id, .. } => id.clone(), _ => panic!("not a button") }).collect();
-        assert_eq!(ids[ids.len() - 8..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "help"]); // STRIAINSERTMARKS (SR905); STRIAINSERTMARKSKEYSNEXT (SR985)
+        assert_eq!(ids[ids.len() - 89..], ["insert", "overwrite", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "help"]); // STRIAINSERTMARKS (SR905); STRIAINSERTMARKSKEYSNEXT (SR985) // STRIASOURCEVIEWER (SR9045): the source monitor's six buttons before help
         let mut f = face();
         let a1 = f.state.timeline.tracks[1].clone();
         let errors = drive(&mut f, "at:12:0,ruler:15,insert");
@@ -3275,5 +3276,72 @@ mod striaxformkeys_tests {
         assert_eq!(face.state.selected().map(|c| c.xkeys.len()), Some(0));
         assert_eq!(drive(&mut face, "pip:unkey"), vec![format!("pip unkey: {}", timeline_core::EditError::XKey)]);
         assert_eq!(face.state.undo_depth(), 3);
+    }
+}
+
+// ---- STRIASOURCEVIEWER (LEDGER SR9045): the source monitor's tokens and the witness's loaded source (named tail block) ----
+
+/// `source:<reel>` is the face's word `source <reel>` (load that reel); `binload:<row>` is a Shift release on that bin
+/// row, stamped with the bin's Surface number into `Face::on` (the bin's load), as `bin_token` does. `None` for any other
+/// token, and `binload` with no bin (a bad token). The six bare words are VERBS (`token`).
+fn source_token(face: &mut Face, tok: &str) -> Option<Vec<SMessage>> {
+    let parts: Vec<&str> = tok.split(':').collect();
+    match parts.as_slice() {
+        ["source", reel] => Some(vec![SMessage::Input { target: SURFACE.into(), text: format!("source {reel}") }]),
+        ["binload", row] => {
+            let row = row.parse::<usize>().ok()?;
+            let b = face.bin()?;
+            let (x, y) = timeline_core::view::bin_point(row);
+            face.on(&SMessage::BrowserButton { down: false, x, y, mods: bandy::MOD_SHIFT, surface: b.n });
+            Some(Vec::new())
+        }
+        _ => None,
+    }
+}
+
+/// The witness's `"source"` while a source is loaded: its reel, source playhead and marks (`null` when unset); nothing
+/// otherwise (the default line is unchanged).
+fn source_json(face: &Face) -> String {
+    let Some(m) = face.state.source.as_ref() else { return String::new() };
+    let tl = &face.state.timeline;
+    let reel = tl.source(m.src).map_or_else(|| m.src.0.to_string(), |s| s.reel.replace('"', "'"));
+    let mark = |t: Option<i64>| t.map_or_else(|| "null".to_string(), |t| t.to_string());
+    format!(",\"source\":{{\"reel\":\"{reel}\",\"at\":{},\"in\":{},\"out\":{}}}", m.at, mark(m.marks.0), mark(m.marks.1))
+}
+
+#[cfg(test)]
+mod striasourceviewer_tests {
+    use super::*;
+    use timeline_core::{Clip, Mode, SourceId};
+
+    fn bin_cli() -> Cli {
+        Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true, mute: false, bin: true }
+    }
+
+    /// `binload:1` loads B, the words step and mark it, `ruler:15,insert` lays B 1..3 at 15 on V1 and A1 (one undo step);
+    /// `"source"` reads the monitor until `unload`; `source:A` is the face's word; `binload` without a bin is bad.
+    #[test]
+    fn striasourceviewer_binload_marks_insert_and_json() {
+        let c = bin_cli();
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        assert_eq!(source_json(&face), "");
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "binload:1,src-next,src-in,src-next,src-next,src-out,ruler:15,insert", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        let b = Clip::new(SourceId(1), 1, 3, 15);
+        assert_eq!(face.state.timeline, tl0.place(0, b, Mode::Insert).unwrap().place(1, b, Mode::Insert).unwrap());
+        assert_eq!(face.state.undo_depth(), 1);
+        assert_eq!(source_json(&face), r#","source":{"reel":"B","at":3,"in":1,"out":3}"#);
+        assert!(drive_on(&mut face, "unload", Some((1, 0)), &mut presses).is_empty());
+        assert_eq!(source_json(&face), "");
+        assert!(matches!(source_token(&mut face, "source:A").as_deref(), Some([SMessage::Input { text, .. }]) if text == "source A"));
+        let (tl, src) = nle_face::synth_fixture();
+        let mut plain = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(drive(&mut plain, "binload:1"), vec!["bad token binload:1".to_string()]);
+        assert!(drive(&mut plain, "source:B,src-next").is_empty());
+        assert_eq!(source_json(&plain), r#","source":{"reel":"B","at":1,"in":null,"out":null}"#);
+        println!("striasourceviewer witness: --split --bin --do binload:1,src-next,src-in,src-next,src-next,src-out,ruler:15,insert -> B 1..3 at 15 on V1 + A1, undo 1");
     }
 }

@@ -157,7 +157,7 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
 /// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
 /// NLEHOSTSAVE (SR677): `save` writes the timeline to the document's path through timeline_core's ONE writer.
-pub const VERBS: [&str; 121] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "pip left", "pip right", "pip up", "pip down", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail)
+pub const VERBS: [&str; 127] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size", "save", "export", "frame", "in", "out", "kind", "ease", "slip-", "slip+", "slide-", "slide+", "ripple-all", "close-sync", "close-all", "preset", "export-skip", "export-clear", "export-list", "gap", "pip", "crop", "history", "recover", "snap", "meters-reset", "track-up", "track-down", "info", "loudness", "link", "unlink", "track+ video", "track+ audio", "track-", "headers", "close-gaps", "copy", "cut", "paste", "paste-insert", "paste-over", "tc", "xfade", "zoom-fit", "zoom-sel", "insert", "overwrite", "roll-", "roll+", "roll-tool", "mark", "unmark", "speed", "mute", "solo", "title", "gain-", "gain+", "gain", "fade-in", "fade-out", "track-gain", "opacity-", "opacity+", "bright-", "bright+", "contrast-", "contrast+", "sat-", "sat+", "normalize", "freeze", "pan-", "pan", "pan+", "proxy", "marker-", "marker+", "cut-", "cut+", "insert-marked", "overwrite-marked", "insert-all", "insert-marked-all", "target", "track-gain-", "track-gain+", "unlink-all", "link-av", "freeze-all", "xfade-curve", "proxy-off", "proxy-all", "scale-", "scale+", "pip left", "pip right", "pip up", "pip down", "unmark all", "alone", "marker colour", "marker range", "rspeed", "marker marks", "source", "src-prev", "src-next", "src-in", "src-out", "unload", "help"]; // STRIATRACKGAINSTEP (SR901): `track-gain-` / `track-gain+` step the selected clip's track one dB (timeline_core's verb; the message line in the file tail); STRIATRACKGAIN (SR864): `track-gain [<dB>]` the selected clip's track (timeline_core's `EditorState::verb`; bare = unity); STRIANORMALIZE (SR878): the selected clip's gain to its exact peak (file tail); STRIACLIPGAINFACE (SR838): the selected clip's gain / fades (timeline_core's `EditorState::verb`; file tail); STRIAOPACITYFACE (SR898): `opacity-` / `opacity+` step the selection's opacity 10 % (file tail); STRIAGRADEFACE (SR899): the six grade step words (timeline_core editor.rs tail); STRIAPANFACE (SR897): `pan-` / `pan` / `pan+` step / centre the selected clip's pan (file tail); STRIAPROXYBUTTONS (SR930): `proxy-off` / `proxy-all` are the buttons' words for `proxy off` / `proxy all` (file tail); STRIAPROXYMEDIA (SR882): `proxy` renders the selected clip's source at half size once and previews from it (file tail); STRIAMARKERRANGES (SR9052): `marker marks` sets the export marks to the playhead's marker's range (file tail); STRIAMARKERJUMPKEYSNEXT (SR984): `marker colour [<name>]` / `marker range` style the playhead's marker (file tail); NLEFACEEXPORT (SR694): `export [<dir>] [h264|png|i420|y4m|raw]` off the face's thread (file tail); NLETRANSITIONFACE (SR691): `kind` / `ease` cycle the selected transition (file tail); NLE5DEXPORTRANGE (SR717): `in` / `out` mark the export range (file tail); NLE3ESLIPFACE (SR737): one-frame slip / slide (file tail); NLE5DKEYSHELPBUTTON (SR765): help (file tail); STRIAEXPORTFRAME (SR830): `frame [<path>]` the playhead frame as a PNG (file tail); STRIATITLECLIP (SR828): title (file tail); STRIATRACKMUTESOLO (SR837): mute / solo the selected clip's track (timeline_core's verb), before help; STRIACLIPSPEED (SR829): speed (file tail); STRIAMARKERS (SR835): `mark [<name>]` / `unmark` at the playhead (file tail); STRIAROLLEDIT (SR851): one-frame roll of the cut at the selected clip's out edge (timeline_core editor tail); STRIAINSERTOVERWRITE (SR852): insert / overwrite at the playhead (timeline_core); STRIAZOOMTOFIT (SR859): zoom-fit / zoom-sel (file tail); STRIAAUDIOCROSSFADE (SR860): xfade puts / takes the selected audio clip's head crossfade (timeline_core editor.rs tail); STRIATIMECODEDISPLAY (SR872): `tc` cycles the playhead readout (file tail); STRIACOPYPASTE (SR854): copy / cut / paste of the selection at the playhead (timeline_core editor.rs); STRIAGAPCLOSE (SR857): `close-gaps` closes every gap on the selected track (timeline_core `EditorState::verb`; `gap <n>` an argument word, no button); STRIATRACKADDREMOVE (SR856): track add / remove (timeline_core's verb; file tail); STRIACLIPLINK (SR863): `link` / `unlink` the selection's clip group (timeline_core editor.rs tail); STRIATRACKREORDER (SR877): `track-up` / `track-down` swap the selected clip's track with its same-kind neighbour (timeline_core editor.rs file tail); STRIAMETERCLIPVERB (SR902): meters-reset clears every clip latch and peak hold (file tail); STRIAPASTEINSERT (SR896): paste-insert / paste-over (timeline_core editor.rs); STRIASNAPTOGGLE (SR892): snap flips the drag snap default (file tail); STRIAAUTOSAVE (SR883): `recover` loads the autosave (file tail); STRIAUNDOHISTORY (SR876): history (file tail); STRIAFREEZEFRAME (SR880): freeze (timeline_core `EditorState::verb`); STRIACROPFACE (SR900): `crop` clears the selection's crop (timeline_core editor.rs file tail); STRIAPOSITIONSCALE (SR879): `pip` (timeline_core editor.rs tail); STRIAMARKERJUMP (SR894): `marker-` / `marker+` / `cut-` / `cut+` jump the playhead to the previous / next marker / clip edge (timeline_core editor.rs tail); STRIAINSERTMARKS (SR905): insert / overwrite into the in / out marks (timeline_core); STRIALINKAUTO (SR911): `unlink-all` parts every link (timeline_core editor.rs tail); STRIAGAPSBLACK (SR909): bare `gap` opens one second at the playhead (before `close-gaps`; timeline_core `EditorState::verb`); STRIAEXPORTQUEUESKIP (SR914): export-skip / export-clear (file tail); STRIAFREEZELEN (SR916): `freeze [<len>]` / `freeze-all [<len>]` (every track ripples; timeline_core `freeze_words`); STRIAXFADECURVEBUTTON (SR925): xfade-curve swaps that crossfade's curve (timeline_core editor.rs tail); STRIALINKAUTOFUZZ (SR928): `link-av` links the V1 / A1 pairs, near ones too (timeline_core editor.rs tail); STRIAEXPORTQUEUELIST (SR932): export-list (file tail); STRIAXFORMPRESETS (SR938): `scale-` / `scale+` (timeline_core editor.rs tail); STRIAEXPORTPRESETSMORE (SR948): `preset` picks the face's export preset (file tail); STRIAROLLMORE (SR954): the roll tool on / off (file tail); STRIAMARKERSMORE (SR966): `unmark all` (file tail); STRIAGAPSMORE (SR969): `close-all` the Close All button's word for `close-gaps all` (before `gap`; file tail); STRIAINSERTMARKSKEYSNEXT (SR985): the all-tracks inserts and the target track (timeline_core); STRIAGAPSTHREE (SR9028): `close-sync` the Close Sync button's word for `close-gaps sync` (before `close-all`; file tail); STRIARIPPLETHREE (SR9034): the ripple-all tool on / off (file tail); STRIACLIPSPEEDTHREE (SR9031): rspeed (file tail); STRIATRACKSTHREE (SR9038): the header column (file tail); STRIAXFORMTHREE (SR9033): `pip left` / `pip right` / `pip up` / `pip down`, SR975's nudge words (timeline_core editor.rs tail); STRIASOURCEVIEWER (SR9045): the source monitor's words (timeline_core)
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
@@ -1662,7 +1662,7 @@ impl Face {
         let shown = self.drag_shown.get(self.drag.as_ref(), &self.state); // STRIAPERFDRAGSHOWN (SR936): the drag preview replayed only when the drag or the state it reads changes (timeline_core view.rs tail) self.slip_refresh(role, shown.as_ref()).or_else(|| self.crop_drag.as_ref().and_then(|d| d.shown(&self.state))).or_else(|| self.xform_drag.as_ref().and_then(|d| d.shown(&self.state))); // STRIASLIPVIEW (SR858): a Slip drag's first / last frame pair (file tail) // STRIACROPMORE (SR960): a live crop drag shows its clip uncropped (timeline_core view.rs tail) // STRIAXFORMTHREE (SR9033): a live placement drag shows its clip at the dragged rect (timeline_core view.rs tail)
         let st = shown.as_deref().unwrap_or(&self.state); self.peaks.thumbs.fill(&st.timeline, &self.sources, l); // STRIATHUMBNAILS (SR839): the visible video heads decoded before the paint, THUMBS_PER_PAINT / THUMB_BUDGET_MS at most (file tail)
         if role != Role::Tracks && !self.pcache.taken(self.play.take_still(&mut self.still, st.playhead, shown.is_none() || scrubbing(&self.drag)) && self.slip_view().is_none()) && !self.pcache.hit(&st.timeline, st.playhead) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render; STRIAAUDIOSCRUB (SR865): and a scrub step's, under its live Scrub drag; STRIAPERFPREVIEWCACHE (SR918): an unchanged (timeline, playhead) keeps the still (file tail)
-            self.still = match preview(&st.timeline, &self.sources, st.playhead) {
+            self.still = match preview_shown(st, &self.sources) { // STRIASOURCEVIEWER (SR9045): a loaded source shows through the same frame road (file tail)
                 Ok(s) => s,
                 Err(e) => {
                     self.pcache.miss(); self.last_error = Some(format!("preview: {e}")); // STRIAPERFPREVIEWCACHE (SR918): an error is never cached (file tail)
@@ -2431,7 +2431,7 @@ impl Face {
     }
     /// The face's message line: the last error while one stands, else [`Face::reel_line`].
     pub fn message_text(&self) -> Option<String> {
-        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on
+        self.last_error.clone().or_else(|| self.info_text()).or_else(|| self.xform_note.clone()).or_else(|| self.preset_note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.note.clone()).or_else(|| self.export.as_ref().map(|j| job_line(j) + &self.waiting_note())).or_else(|| self.laid.clone()).or_else(|| self.shuttle_line()).or_else(|| self.roll_tool_note()).or_else(|| self.ripple_all_note()).or_else(|| self.state.source_line()).or_else(|| self.reel_line()) // STRIAXFORMPRESETS (SR938): the placement line after a pip / scale word (file tail) // STRIAJKLMORE (SR945): the shuttle rate after the export line (file tail) // STRIAEXPORTQUEUEMORE (SR971): the running row names the waiting count (file tail).or_else(|| self.picked_line()) // STRIAEXPORTPRESETSNEXT (SR989): the picked preset as the last fallback (file tail) // STRIAOPACITYNEXT (SR993): a standing note after the error (file tail) // STRIAGAPSTHREE (SR9028): the face note after the error (file tail) // STRIARIPPLETHREE (SR9034): the tool's line while it is on // STRIASOURCEVIEWER (SR9045): the loaded source's standing line (timeline_core editor.rs tail)
     }
     /// The message over a painted canvas: one line at x 4, baseline the message row's foot - 4, clipped to the canvas width, through
     /// [`Labels`]; unchanged with labels off, on the tracks Surface, or a band under [`MESSAGE_H`].
@@ -10177,5 +10177,112 @@ impl Face {
             Err(e) => self.last_error = Some(format!("{word}: {e}")),
         }
         Some(true)
+    }
+}
+
+// ---- STRIASOURCEVIEWER (LEDGER SR9045): the source monitor's preview and the bin's load (named tail block) ----
+// A source loaded into timeline_core's `EditorState::source` (session state: its own playhead and in / out marks) shows
+// in the preview through THE one frame road, [`preview`], over `EditorState::source_view` (a one-clip timeline at its tick
+// 0); nothing loaded paints exactly as before. Playback stays the timeline's transport (its played stills show) and a live
+// drag paints the timeline (`Drag::shown` carries no source). Shift on the bin's release loads that row's reel with the
+// kinds its media holds (`Sources::holds`); a plain click still lays it. The words and the three-point insert are
+// timeline_core's (`EditorState::verb`); the message line reads `EditorState::source_line`.
+
+/// The frame the preview shows: the loaded source's one-clip view at its tick 0, else the timeline at the playhead.
+fn preview_shown(st: &EditorState, sources: &Sources) -> Result<Option<Still>, RenderError> {
+    match st.source_view() {
+        Some(v) => preview(&v, sources, 0),
+        None => preview(&st.timeline, sources, st.playhead),
+    }
+}
+
+impl Face {
+    /// A Shift release on the bin at `(x, y)`: that row's reel loaded into the source monitor (the kinds its media holds;
+    /// none opened: the kinds of the tracks it sits on); false under the last row. Pushes nothing.
+    fn bin_load(&mut self, x: f64, y: f64) -> bool {
+        let Some(b) = self.bin() else { return false };
+        let Some(i) = view::bin_hit_from(&self.state.timeline, b.canvas.0, b.canvas.1, b.top, x, y) else { return false };
+        let Some(src) = self.state.timeline.sources.get(i).map(|s| s.id) else { return false };
+        let kinds: Vec<Kind> = [Kind::Video, Kind::Audio].into_iter().filter(|k| self.sources.holds(src, *k)).collect();
+        if let Err(e) = self.state.load_source(src, &kinds) {
+            self.last_error = Some(format!("source: {e}"));
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod striasourceviewer_tests {
+    use super::*;
+    use timeline_core::{Mode, SourceId};
+
+    fn plain() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// A loaded source paints its own frame through the one frame road; stepping and `unload` push nothing and dirty
+    /// nothing; unloaded, the preview is the timeline's again.
+    #[test]
+    fn striasourceviewer_preview_shows_the_loaded_source() {
+        let mut f = plain();
+        f.paint();
+        let timeline = preview(&f.state.timeline, &f.sources, 0).unwrap();
+        assert_eq!(f.still().cloned(), timeline);
+        for v in ["source B", "src-next", "src-next", "src-next"] {
+            assert!(f.verb(v), "{v}");
+        }
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        f.paint();
+        let want = preview(&f.state.source_view().unwrap(), &f.sources, 0).unwrap();
+        assert!(want.is_some(), "B's frame 3");
+        assert_eq!(f.still().cloned(), want);
+        assert_ne!(f.still().cloned(), timeline, "the source, not the timeline");
+        assert!(f.verb("unload"));
+        f.paint();
+        assert_eq!(f.still().cloned(), timeline);
+        assert_eq!((f.state.undo_depth(), f.dirty()), (0, false));
+    }
+
+    /// Shift on the bin's release loads the row's reel (no edit); a plain click still lays; with marks, `insert` lays the
+    /// marked range at the timeline playhead on V1 and A1 in one undo step.
+    #[test]
+    fn striasourceviewer_bin_shift_release_loads_then_insert_lays() {
+        let mut f = plain().on_surfaces(0, 1).with_bin(2);
+        let tl0 = f.state.timeline.clone();
+        let (x, y) = view::bin_point(1);
+        assert!(f.on(&SMessage::BrowserButton { down: false, x, y, mods: bandy::MOD_SHIFT, surface: 2 }));
+        assert_eq!(f.state.source.as_ref().map(|m| (m.src, m.at, m.kinds.clone())), Some((SourceId(1), 0, vec![Kind::Video, Kind::Audio])));
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0), "loading lays nothing");
+        for v in ["src-next", "src-in", "src-next", "src-next", "src-out"] {
+            assert!(f.verb(v), "{v}");
+        }
+        f.state.deselect();
+        f.state.seek(15);
+        assert!(f.verb("insert"));
+        assert!(f.last_error.is_none(), "{:?}", f.last_error);
+        let c = Clip::new(SourceId(1), 1, 3, 15);
+        assert_eq!(f.state.timeline, tl0.place(0, c, Mode::Insert).unwrap().place(1, c, Mode::Insert).unwrap());
+        assert_eq!((f.state.undo_depth(), f.state.playhead), (1, 17));
+        assert!(f.verb("undo"));
+        assert_eq!(f.state.timeline, tl0);
+        assert!(f.verb("unload"));
+        f.state.seek(15);
+        assert!(f.on(&SMessage::BrowserClick(x, y, 2)), "a plain click is SR852's insert word, as before");
+        assert_eq!(f.state.timeline, tl0.place(0, Clip::new(SourceId(1), 0, 50, 15), Mode::Insert).unwrap());
+    }
+
+    /// The message line reads the loaded source after a standing error; a src word with nothing loaded is refused by name.
+    #[test]
+    fn striasourceviewer_message_line_reads_the_source() {
+        let mut f = plain();
+        assert!(f.verb("src-in"));
+        assert_eq!(f.last_error.take(), Some(format!("src-in: {}", EditError::NoSource)));
+        for v in ["source B", "src-next", "src-next", "src-next", "src-in"] {
+            assert!(f.verb(v), "{v}");
+        }
+        assert_eq!(f.message_text().as_deref(), Some("source B 00:00:00:03  in 00:00:00:03  out --"));
+        assert!(f.verb("src-out"));
+        assert_eq!(f.message_text(), Some(format!("src-out: {}", EditError::Marks)), "the error first");
     }
 }
