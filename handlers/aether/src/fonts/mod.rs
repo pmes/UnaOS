@@ -118,6 +118,17 @@ pub fn parse_family_list(value: &str) -> Option<Vec<Family>> {
             out.push(Family::Named(unescape_css(inner)));
             continue;
         }
+        // css-fonts-4 §2.1: an unquoted name is a sequence of identifiers; a word that is not one (`12px`, `#x`, `2`)
+        // makes the whole declaration invalid (AETHERCSSOMFONTFAMILYUSED SR1024: it used to intern as a name)
+        let ident = |w: &str| {
+            let b = w.strip_prefix('-').unwrap_or(w);
+            !b.is_empty()
+                && !b.starts_with(|c: char| c.is_ascii_digit())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '\\' || !c.is_ascii())
+        };
+        if !item.split_whitespace().all(ident) {
+            return None;
+        }
         let words: Vec<String> = item.split_whitespace().map(unescape_css).collect();
         if words.len() == 1 {
             let g = match words[0].to_ascii_lowercase().as_str() {
