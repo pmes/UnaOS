@@ -7700,4 +7700,50 @@ mod tests {
         let (ml, ..) = imgalt_rect(&mut e, "mr");
         assert!((ml - 20.0).abs() <= 0.5, "margin-left: revert is dropped (owed): {ml}");
     }
+
+    // ---- AETHERTEXTALIGNJUSTIFY (LEDGER SR1057): css-text-3 §7.1 text-align: justify (named tail block) ----
+
+    /// AETHERTEXTALIGNJUSTIFY (SR1057): getComputedStyle reads `justify` back (its own code, not start); the start twin
+    /// reads `start`.
+    #[test]
+    fn text_align_justify_reads_back() {
+        let html = r#"<!doctype html><html><body style="margin:0">
+            <p id="j" style="text-align: justify">a b</p><p id="s" style="text-align: start">a b</p>
+            <div style="text-align: justify"><p id="i">a b</p></div>
+        </body></html>"#;
+        let mut e = crate::AetherEngine::new();
+        e.handle_event(crate::api::events::Event::Resize(400, 300));
+        e.load_html("https://example.com/", html, true);
+        e.render_frame();
+        assert_eq!(font_shorthand_cs(&mut e, "j", "textAlign"), "justify", "text-align: justify reads back");
+        assert_eq!(font_shorthand_cs(&mut e, "s", "textAlign"), "start", "the start twin");
+        assert_eq!(font_shorthand_cs(&mut e, "i", "textAlign"), "justify", "justify is inherited");
+    }
+
+    /// AETHERTEXTALIGNJUSTIFY (SR1057): a justified monospace paragraph over three lines: every line but the last ends
+    /// flush at the 100px box (± 0.5), the last is start (ragged); the start twin's first line is ragged.
+    #[test]
+    fn text_align_justify_monospace_flush() {
+        use crate::layout::inline::Frag;
+        if crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::MONO, 400, false)).is_none() {
+            return;
+        }
+        let css = "body{margin:0} p{margin:0;font:10px monospace;line-height:2;width:100px}";
+        let edges = |ta: &str| -> Vec<f32> {
+            let t = laid_out(&format!(r#"<html><body><p id=p style="text-align:{ta}">ab cd ef gh ij kl mn op qr st uv wx</p></body></html>"#), css);
+            let il = &t.inline[&node_by_id(&t, "p").unwrap()];
+            il.lines
+                .iter()
+                .map(|l| il.frags.iter().filter_map(|f| match f { Frag::Text { x, width, baseline, .. } if *baseline == l.2 => Some(x + width), _ => None }).fold(0.0f32, f32::max))
+                .collect()
+        };
+        let j = edges("justify");
+        assert!(j.len() >= 2, "the paragraph wraps: {j:?}");
+        for e in &j[..j.len() - 1] {
+            assert!((e - 100.0).abs() <= 0.5, "a justified line ends flush at 100: {j:?}");
+        }
+        assert!(*j.last().unwrap() < 99.0, "the last line is start: {j:?}");
+        let s = edges("start");
+        assert!(s[0] < 99.5, "the start twin is ragged: {s:?}");
+    }
 }

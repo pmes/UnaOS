@@ -358,7 +358,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     let mut forced = false;
     // css-text-3 §6.1: start/end resolve against the paragraph direction → 0 left, 1 center, 2 right.
     let align = match (root_run.text_align, root_run.mode.rtl) {
-        (1, _) => 1,
+        (1, _) => 1, (8, rtl) => 3 + rtl as u8, // AETHERTEXTALIGNJUSTIFY (SR1057): 3 justify ltr, 4 justify rtl
         (2, _) | (0, true) | (3, false) => 2,
         _ => 0,
     };
@@ -487,10 +487,10 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
                 _ => break,
             }
         }
-        let free = (right - left - content_w).max(0.0);
+        let free = (right - left - content_w).max(0.0); let (free, content_w) = justify_line(ctx, default_run, &mut pcs, align, forced, free, content_w);
         let dx = left + match align {
             1 => free / 2.0,
-            2 => free,
+            2 | 4 => free,
             _ => 0.0,
         };
         // Box fragment extents: from the box's open on this line (or the line
@@ -792,7 +792,7 @@ pub(crate) fn layout_root<H: Host, F: Fonts + ?Sized>(tree: &LayoutTree<H>, ctx:
     let (left, right) = edges(&floats, y);
     finish_line(
         tree, ctx, root, root_m, &default_run, &shift, &mut pieces, &line_open, &stack, cur_x, has_content, forced,
-        left, right, align, &mut y, &mut out,
+        left, right, justify_last(align), &mut y, &mut out,
     );
     for (f, side) in pending_floats.drain(..) {
         place_float(&mut floats, &mut out, f, side, y);
@@ -1140,5 +1140,93 @@ mod caps_all_tests {
         assert_eq!(small_caps_segments("Hello World", true), vec![(0..5, true), (5..6, false), (6..11, true)]);
         assert_eq!(small_caps_segments("ABC 123", true), vec![(0..3, true), (3..7, false)]);
         assert_eq!(small_caps_segments("Hello", false), vec![(0..1, false), (1..5, true)]);
+    }
+}
+
+// ---- AETHERTEXTALIGNJUSTIFY (LEDGER SR1057): css-text-3 §7.1 text-align: justify stretches a line's word gaps (named tail block) ----
+
+/// AETHERTEXTALIGNJUSTIFY (SR1057): css-text-3 §7.1 — under `text-align: justify` (local align 3 ltr / 4 rtl) a line
+/// that did not end at a forced break is stretched to the line box: its free space is divided over its word gaps
+/// (U+0020). A `Piece::Text` holds a whole line chunk of one text node, so each one is first split into word pieces
+/// (the space stays on the preceding word, so a node's frags still concatenate to its text; x from the run's own
+/// advancer); every piece after the k-th gap moves by k * free / N. A line with no gap is left as start. Returns the
+/// free space left for `dx` and the stretched content width. The paragraph's last line comes in as start through
+/// [`justify_last`].
+fn justify_line<F: Fonts + ?Sized>(
+    ctx: &Ctx<F>,
+    default_run: &TextRun,
+    pcs: &mut Vec<Piece>,
+    align: u8,
+    forced: bool,
+    free: f32,
+    content_w: f32,
+) -> (f32, f32) {
+    if !matches!(align, 3 | 4) || forced || free <= 0.0 {
+        return (free, content_w);
+    }
+    let mut split: Vec<Piece> = Vec::with_capacity(pcs.len());
+    for p in pcs.drain(..) {
+        let Piece::Text { node, parent, text, x, w } = p else {
+            split.push(p);
+            continue;
+        };
+        let adv = run_of(ctx, node, default_run).advancer();
+        let mut start = 0;
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b' ' {
+                while i < b.len() && b[i] == b' ' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    let px = if start == 0 { 0.0 } else { ctx.fonts.measure(&text[..start], &adv) };
+                    split.push(Piece::Text { node, parent, text: text[start..i].to_string(), x: x + px, w: ctx.fonts.measure(&text[start..i], &adv) });
+                    start = i;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if start == 0 {
+            split.push(Piece::Text { node, parent, text, x, w });
+        } else {
+            let px = ctx.fonts.measure(&text[..start], &adv);
+            split.push(Piece::Text { node, parent, text: text[start..].to_string(), x: x + px, w: (w - px).max(0.0) });
+        }
+    }
+    let last = split.iter().rposition(|p| match p {
+        Piece::Text { text, .. } => !text.trim_end_matches(' ').is_empty(),
+        Piece::Atomic { .. } => true,
+        _ => false,
+    });
+    let is_gap = |i: usize, p: &Piece| matches!(p, Piece::Text { text, .. } if text.ends_with(' ')) && last.is_some_and(|l| i < l);
+    let n = split.iter().enumerate().filter(|(i, p)| is_gap(*i, p)).count();
+    if n == 0 {
+        *pcs = split;
+        return (free, content_w);
+    }
+    let per = free / n as f32;
+    let mut acc = 0.0f32;
+    for i in 0..split.len() {
+        let gap = is_gap(i, &split[i]);
+        match &mut split[i] {
+            Piece::Open { x, .. } | Piece::Close { x, .. } | Piece::Text { x, .. } | Piece::Atomic { x, .. } => *x += acc,
+        }
+        if gap {
+            acc += per;
+        }
+    }
+    *pcs = split;
+    (0.0, content_w + free)
+}
+
+/// AETHERTEXTALIGNJUSTIFY (SR1057): the paragraph's last line is not justified (text-align-last auto): justify ltr
+/// (3) places it at the left, justify rtl (4) at the right; every other code is unchanged.
+fn justify_last(align: u8) -> u8 {
+    match align {
+        3 => 0,
+        4 => 2,
+        a => a,
     }
 }
