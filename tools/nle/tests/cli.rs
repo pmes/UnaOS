@@ -1147,7 +1147,7 @@ fn cli_help_verb_sections() {
     for v in ["schedule", "render", "export", "size", "--make-src", "completions"] {
         let (code, out, err) = nle(&[v, "--help"]);
         assert_eq!((code, err.as_str()), (0, ""), "nle {v} --help");
-        let lines: Vec<&str> = out.lines().collect();
+        let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with("example: ")).collect(); /* SR1049 */ // NLECLIHELPUNKNOWNEXAMPLES (SR1049): the trailing example line is cli_help_examples_end_sections'
         let line = full.lines().map(|l| l.trim_start_matches("usage: ").trim_start()).find(|l| l.starts_with(&format!("nle {v} "))).unwrap_or_else(|| panic!("{v}: a line of the full usage"));
         assert_eq!(lines[0], format!("usage: {line}"), "nle {v} --help: the verb's own usage line");
         let want = &table.iter().find(|(w, _)| *w == v).unwrap_or_else(|| panic!("{v}: a VERB_FLAGS row")).1;
@@ -1174,7 +1174,7 @@ fn cli_help_verb_sections() {
     for want in ["size --fps N", "export --fps N", "export --out <dir>", "render --out <stem>", "export --scenecut [K]", "export --stats <file>", "export --src REEL=<media>", "export --pass2 k=v,...", "export --two-pass", "completions --install [<dir>]", "completions --force", "completions --uninstall [<dir>]"] {
         assert!(seen.iter().any(|x| x == want), "{want:?} in {seen:?}");
     }
-    let section = |v: &str| nle(&[v, "--help"]).1;
+    let section = |v: &str| nle(&[v, "--help"]).1.lines().filter(|l| !l.starts_with("example: ")).map(|l| format!("{l}\n")).collect::<String>(); /* SR1049 */ // NLECLIHELPUNKNOWNEXAMPLES (SR1049): minus the example line
     assert_eq!(section("size").lines().count(), 2, "size: the line + --fps");
     assert_eq!(section("completions").lines().count(), 4, "completions: the line + its three flags");
     assert_eq!(section("export").lines().count(), 1 + flags.len(), "export: the line + every FLAGS word");
@@ -1183,11 +1183,74 @@ fn cli_help_verb_sections() {
     assert!(!Path::new(env!("CARGO_MANIFEST_DIR")).join("--help").exists(), "--make-src --help writes no file");
 }
 
-/// NLECLIHELPVERB (SR1041): an unknown verb with `--help` is unchanged (measured at 5995ad1cf): no verb within 2, so `load`
-/// reads `--help` as the EDL path and refuses it, exit 1. Owed NLE-CLI-HELP-UNKNOWN-VERB (the usage, exit 2).
+/// NLECLIHELPVERB (SR1041), flipped by NLECLIHELPUNKNOWNEXAMPLES (SR1049, NLE-CLI-HELP-UNKNOWN-VERB): an unknown verb with
+/// `--help` is the usage on stderr, exit 2 (main.rs `verb_hint`), never `load` reading `--help` as the EDL path (exit 1
+/// before SR1049); a word near a verb keeps SR816's hint first.
 #[test]
 fn cli_help_unknown_verb_as_today() {
+    let usage = usage_frozen(); /* SR1049 */
     let (code, out, err) = nle(&["bogus", "--help"]);
-    assert_eq!((code, out.as_str()), (1, ""), "nle bogus --help: {err}");
-    assert!(err.starts_with("nle: --help: "), "nle bogus --help: {err}");
+    assert_eq!((code, out.as_str(), err.as_str()), (2, "", usage.as_str()), "nle bogus --help"); /* SR1049 */
+    let (code, out, err) = nle(&["expot", "--help"]);
+    assert_eq!((code, out.as_str(), err), (2, "", format!("nle: expot: unknown verb; did you mean export?\n{usage}")), "nle expot --help"); /* SR1049 */
+    assert!(!Path::new(env!("CARGO_MANIFEST_DIR")).join("--help").exists(), "no file named --help"); /* SR1049 */
+}
+
+// ---- NLECLIHELPUNKNOWNEXAMPLES (LEDGER SR1049): each verb's `--help` ends with its example; every example runs (named tail block) ----
+/// NLECLIHELPUNKNOWNEXAMPLES (SR1049): main.rs `USAGE_EXAMPLES` as (verb, line) pairs, read from the source.
+fn examples() -> Vec<(&'static str, &'static str)> {
+    let w = const_words("USAGE_EXAMPLES");
+    assert!(!w.is_empty() && w.len() % 2 == 0, "USAGE_EXAMPLES read from main.rs: {w:?}");
+    w.chunks(2).map(|p| (p[0], p[1])).collect()
+}
+
+/// NLECLIHELPUNKNOWNEXAMPLES (SR1049): USAGE_EXAMPLES is keyed like USAGE_LINES (same verbs, same order); `nle <verb> --help`
+/// (stdout, 0) ends with exactly one `example: <line>`, the line opens `nle <verb> `; the full usage carries none.
+#[test]
+fn cli_help_examples_end_sections() {
+    let ex = examples();
+    let keys: Vec<&str> = const_words("USAGE_LINES").chunks(2).map(|p| p[0]).collect();
+    assert_eq!(ex.iter().map(|(v, _)| *v).collect::<Vec<_>>(), keys, "USAGE_EXAMPLES keys == USAGE_LINES keys, in order");
+    for (v, e) in &ex {
+        let (code, out, err) = nle(&[*v, "--help"]);
+        assert_eq!((code, err.as_str()), (0, ""), "nle {v} --help");
+        assert_eq!(out.lines().last(), Some(format!("example: {e}").as_str()), "nle {v} --help: the example last");
+        assert_eq!(out.lines().filter(|l| l.starts_with("example: ")).count(), 1, "nle {v} --help: one example");
+        assert!(e.starts_with(&format!("nle {v} ")), "{v}: the example is the verb's: {e}");
+    }
+    let (code, out, _) = nle(&["help"]);
+    assert_eq!((code, out.as_str()), (0, usage_frozen().as_str()), "nle help: the frozen usage");
+    assert!(!out.contains("example: "), "nle help: no example");
+}
+
+/// NLECLIHELPUNKNOWNEXAMPLES (SR1049): every example RUNS — its words (the leading `nle` dropped) in a fresh [`fixture`] dir as
+/// cwd and HOME (XDG unset): exit 0, no usage / unknown-word refusal on stderr, and the verb's artefact.
+#[test]
+fn cli_help_examples_run() {
+    for (v, e) in examples() {
+        let name = format!("example-{}", v.trim_start_matches('-'));
+        let (dir, _, _) = fixture(&name);
+        let words: Vec<&str> = e.split(' ').collect();
+        assert_eq!(words[0], "nle", "{v}: {e}");
+        let edl_before = std::fs::read(dir.join("cut.edl")).unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_nle")).args(&words[1..]).current_dir(&dir).env("HOME", &dir).env_remove("XDG_DATA_HOME").env_remove("XDG_CONFIG_HOME").output().expect("the built nle runs");
+        let (code, out, err) = (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned());
+        assert_eq!(code, 0, "{e}: {err}");
+        assert!(!err.lines().any(|l| l.starts_with("usage:") || l.contains("unknown flag") || l.contains("unknown verb")), "{e}: refused: {err}");
+        match v {
+            "schedule" => assert!(out.lines().any(|l| l.starts_with("out=")), "{e}: the steps: {out}"),
+            "render" => assert!(std::fs::metadata(dir.join("frame.rgba")).unwrap().len() > 0, "{e}: frame.rgba"),
+            "export" => assert!(std::fs::metadata(dir.join("out").join("video.mp4")).unwrap().len() > 0, "{e}: out/video.mp4"),
+            "--make-src" => assert!(std::fs::metadata(dir.join("a.mp4")).unwrap().len() > 0, "{e}: a.mp4"),
+            "size" => {
+                assert!(out.starts_with("nle: size A letterbox -> "), "{e}: {out}");
+                assert_ne!(std::fs::read(dir.join("cut.edl")).unwrap(), edl_before, "{e}: cut.edl rewritten");
+            }
+            "completions" => {
+                let p = dir.join(".local/share/bash-completion/completions/nle");
+                assert_eq!(std::fs::read_to_string(&p).unwrap_or_default(), completion_script("bash"), "{e}: {}", p.display());
+            }
+            _ => panic!("{v}: an example with no artefact row here: measure it and add one"),
+        }
+    }
 }
