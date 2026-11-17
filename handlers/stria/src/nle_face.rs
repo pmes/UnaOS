@@ -89,14 +89,14 @@ impl view::Text for Labels<'_> {
 /// Paint the editor on a `w` x `h` canvas in `order` (see the module docs). `labels` names the clips (and the
 /// seconds on the ruler) through text_host; `preview` is the frame at the playhead.
 pub fn paint(st: &EditorState, w: u32, h: u32, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
-    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+    paint_in(st, Layout::of(w, h, st), order, labels, preview, None)
 }
 
 /// [`paint`] in a given layout (the face's view, which a wheel zoom anchors at the pointer: [`Face::layout`]): timeline_core's
 /// `view::paint_in`, the labels through [`Labels`].
-pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>) -> Vec<u8> {
+pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&TextStyle>, preview: Option<&Still>, peaks: Option<&dyn view::PeakSource>) -> Vec<u8> {
     let mut lab = labels.map(Labels);
-    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview)
+    view::paint_in(st, l, vo(order), lab.as_mut().map(|t| t as &mut dyn view::Text), preview, peaks)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -198,13 +198,14 @@ pub struct Face {
     hover_ticks: Option<((usize, usize), u16)>, // STRIAINFOREELHOVERDELAY (SR789): the hovered clip and the face ticks it has stood (file tail)
     pub note: Option<String>, // STRIAPANNEXT (SR994): a success line, read by message_text after last_error, cleared by the next taken input (file tail)
     watched: Vec<(String, String)>, // STRIAPROXYTHREE (SR9026): each reel's file stamp as last opened (file tail)
+    peaks: WavePeaks, // STRIAWAVEFORM (SR827): each audio source's peak table, scanned once at the first paint that shows it (file tail)
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new(), proxy_queue: Vec::new(), proxy_hold: None, note: None, watched: Vec::new() }
+        Face { clean: state.timeline.clone(), doc_path: None, state, sources: std::sync::Arc::new(sources), export: None, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None, play: PlayAudio::default(), help: false, hover_ticks: None, proxy: None, reel_paths: Vec::new(), proxy_queue: Vec::new(), proxy_hold: None, note: None, watched: Vec::new(), peaks: WavePeaks::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -308,7 +309,7 @@ impl Face {
 /// Serve one editor face on the bus: the first frame, then every surface / button message through [`Face::on`] and a
 /// fresh blit after each change; while playing, a clock at the timeline's frame rate steps the playhead.
 pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessage>, mut face: Face) {
-    use tokio::sync::broadcast::error::RecvError;
+    use tokio::sync::broadcast::error::RecvError; face.decode_off_thread(); // STRIATHUMBNAILSNEXT (SR997): the served face decodes heads and peak tables off its thread (file tail)
     for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
     let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64)); clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // STRIAINFOREELHOVERDELAY (SR789): a clock idle under its guard skips the missed ticks (no catch-up burst)
@@ -326,8 +327,8 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => break,
             },
-            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.proxying() => { // STRIAPROXYMEDIA (SR882): and a running proxy job; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
-                if face.tick() | face.export_tick() | face.proxy_tick() { // STRIAPROXYMEDIA (SR882): a finished proxy attaches and repaints
+            _ = clock.tick(), if face.playing || face.exporting() || face.hover_pending() || face.proxying() || face.thumbs_pending() => { // STRIATHUMBNAILS (SR839): and heads left undecoded; STRIAPROXYMEDIA (SR882): and a running proxy job; STRIAINFOREELHOVERDELAY (SR789): and a counting hover dwell; NLEFACEEXPORT (SR694): the clock also paints a running export's band
+                if face.tick() | face.export_tick() | face.proxy_tick() | face.thumbs_pending() { // STRIAPROXYMEDIA (SR882): a finished proxy attaches and repaints; STRIATHUMBNAILS (SR839): an idle face paints its remaining heads on the clock
                     for m in face.frames() { bus.fire(m); }
                 }
             }
@@ -1591,9 +1592,9 @@ impl Face {
     /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
     /// tracks Surface's).
     pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
-        let l = self.layout_for(role).with_message(self.labels.is_some()); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
+        let l = self.layout_for(role).with_message(self.labels.is_some()); self.wave_fill(); // STRIAINFOREELSTRIP (SR747): the message row of its own (timeline_core view.rs tail)
         let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
-        let st = shown.as_ref().unwrap_or(&self.state);
+        let st = shown.as_ref().unwrap_or(&self.state); self.peaks.thumbs.fill(&st.timeline, &self.sources, l); // STRIATHUMBNAILS (SR839): the visible video heads decoded before the paint, THUMBS_PER_PAINT / THUMB_BUDGET_MS at most (file tail)
         if role != Role::Tracks && !self.play.take_still(&mut self.still, st.playhead, shown.is_none()) { // NLEPLAYAUDIO (SR676): a played tick's paint shows its own render
             self.still = match preview(&st.timeline, &self.sources, st.playhead) {
                 Ok(s) => s,
@@ -1604,7 +1605,7 @@ impl Face {
             };
         }
         let still = if role == Role::Tracks { None } else { self.still.as_ref() };
-        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
+        let px = self.paint_message(paint_in(st, l, self.order, self.labels.as_ref(), still, Some(&self.peaks as &dyn view::PeakSource)), l, role); // STRIAINFOREEL (SR743): the message line at the preview band's foot (file tail)
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
@@ -3567,5 +3568,439 @@ impl Face {
             self.proxy_queue.extend(queue);
             self.proxy_next();
         }
+    }
+}
+
+// ---- STRIAWAVEFORM (LEDGER SR827): the face's peak tables, scanned once per source (named tail block) ----
+// An audio clip's body shows its waveform (timeline_core view.rs `paint_peaks`, through `paint_in`'s `PeakSource` hook). The
+// tables live here, beside `sources`, never in the EDL. LAZY: `paint_role`'s first line calls `wave_fill`, which scans each
+// source on an audio track the first time a paint sees it (`nle::scan_peaks`, the render's own decoder) and never again: the
+// tables are immutable, so no paint invalidates them. The scan runs on the face's thread, so the first paint that shows a long
+// source waits for its whole decode (owed NLE-WAVEFORM-SCAN-THREAD). A source that fails to scan stays flat (logged at debug,
+// never in `last_error`, so no message row changes).
+
+/// STRIAWAVEFORM (SR827): every scanned source's table (`None`: scanned, no audio or refused) and the scans made.
+#[derive(Default)]
+pub struct WavePeaks {
+    map: std::collections::BTreeMap<timeline_core::SourceId, Option<view::Peaks>>,
+    scans: u32,
+    thumbs: Thumbs, // STRIATHUMBNAILS (SR839): each video clip head's still, decoded once per (source, src_in) (file tail)
+}
+
+impl view::PeakSource for WavePeaks {
+    fn peaks(&self, src: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.map.get(&src).and_then(|p| p.as_ref())
+    }
+    /// The mix's ONE gain curve (nle.rs `mix_into`'s).
+    fn gain_q16(&self, cdb: i32) -> i64 {
+        gneiss_pal::dsp::audio::ramp::gain_q16(cdb)
+    }
+    /// STRIATHUMBNAILS (SR839): the head still the face decoded for `(src, src_tick)`.
+    fn thumb(&self, src: timeline_core::SourceId, src_tick: i64) -> Option<&Still> {
+        self.thumbs.get(src, src_tick)
+    }
+}
+
+impl Face {
+    /// STRIAWAVEFORM (SR827): scan every audio-track source not scanned yet (once per source for the face's life).
+    fn wave_fill(&mut self) {
+        let mut want: Vec<timeline_core::SourceId> = Vec::new(); self.peaks.drain_bg(false); // STRIATHUMBNAILSNEXT (SR997): the worker's finished heads and tables land first (file tail)
+        for tr in self.state.timeline.tracks.iter().filter(|tr| tr.kind == Kind::Audio) {
+            for c in &tr.clips {
+                if !self.peaks.map.contains_key(&c.src) && !want.contains(&c.src) {
+                    want.push(c.src);
+                }
+            }
+        }
+        for id in want { if self.peaks.thumbs.ask_scan(id) { self.peaks.map.insert(id, None); continue; } // STRIATHUMBNAILSNEXT (SR997): a served face queues the scan, the placeholder keeps the body flat (file tail)
+            let p = match crate::nle::scan_peaks(&self.sources, id, view::PEAKS_PER_SEC) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("[nle-face] waveform {id:?}: {e}");
+                    None
+                }
+            };
+            self.peaks.map.insert(id, p);
+            self.peaks.scans += 1;
+        }
+    }
+    /// STRIAWAVEFORM (SR827): the peak scans this face has made.
+    pub fn wave_scans(&self) -> u32 {
+        self.peaks.scans
+    }
+    /// STRIAWAVEFORM (SR827): source `id`'s peak table, once a paint has scanned it.
+    pub fn wave_peaks(&self, id: timeline_core::SourceId) -> Option<&view::Peaks> {
+        self.peaks.map.get(&id).and_then(|p| p.as_ref())
+    }
+}
+
+// ---- STRIATHUMBNAILS (LEDGER SR839): each video clip head's still, decoded once and cached (named tail block) ----
+// A video clip's body shows its head (timeline_core view.rs `paint_head`, through SR827's `PeakSource` hook, its `thumb`
+// method). The stills live in `Face.peaks` (`WavePeaks.thumbs`), beside the peak tables, never in the EDL. LAZY: `paint_role`
+// calls `Thumbs::fill` once the drag's shown timeline exists (a slip drag's new head fills live) and before `paint_in`. RULES:
+// * fill walks VIDEO tracks only, rows on the canvas, clips whose body left `x_of(at) + 1` lies in `0..w` (paint_head's rule)
+//   and whose body is at least THUMB_MIN_W px wide, not yet keyed; it always decodes the first wanted head, then stops once
+//   THUMBS_PER_PAINT heads are decoded or the fill has spent more than THUMB_BUDGET_MS; `pending` says a wanted head was left,
+//   and `serve`'s clock runs while it is set, so an idle face fills its heads at the timeline's frame rate.
+// * thumb_for keys `(src, src_in)` (a trim or slip changes the key; an entry never changes). A source `Sources` holds no media
+//   for (`SourceIndex::duration` none: a titled source (STRIATITLECLIP SR828) or a reel that failed to open) caches `None` with
+//   no decode; otherwise ONE `preview` of a one-clip timeline at tick 0 (the preview band's road: keyframe, run-up, colour,
+//   size policy, stand-in), scaled by `view::head_still`. A refusal is logged at debug (never `last_error`) and cached `None`.
+// * EVICTION: at THUMB_CACHE entries the OLDEST decoded (smallest insertion seq) goes before the insert; a hit refreshes nothing.
+// The decode runs on the face's thread (owed NLE-THUMBNAILS-BACKGROUND): on a long-GOP source one head costs a run-up of up
+// to one GOP, and the budget makes that one head per paint.
+
+/// STRIATHUMBNAILS (SR839): the most head stills a face keeps.
+pub const THUMB_CACHE: usize = 256;
+/// STRIATHUMBNAILS (SR839): the most heads one paint decodes.
+pub const THUMBS_PER_PAINT: u32 = 4;
+/// STRIATHUMBNAILS (SR839): a paint's fill stops past this many ms (after its first head).
+pub const THUMB_BUDGET_MS: u64 = 100;
+/// STRIATHUMBNAILS (SR839): a clip body narrower than this (px) asks for no head.
+pub const THUMB_MIN_W: i64 = 8;
+
+/// STRIATHUMBNAILS (SR839): the head stills by `(source, src_in)` (`None`: asked, no picture), each with its insertion seq.
+#[derive(Default)]
+pub struct Thumbs {
+    map: std::collections::BTreeMap<(timeline_core::SourceId, i64), (u64, Option<Still>)>,
+    seq: u64,
+    decodes: u32,
+    pending: bool,
+    bg: Option<Bg>, // STRIATHUMBNAILSNEXT (SR997): the served face's decode worker (None: decode on the face's thread) (file tail)
+}
+
+impl Thumbs {
+    fn get(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        self.map.get(&(src, src_in)).and_then(|e| e.1.as_ref())
+    }
+    /// The visible video heads not keyed yet, decoded within this paint's bounds (see the block's RULES).
+    fn fill(&mut self, tl: &Timeline, sources: &Sources, l: Layout) {
+        let t0 = std::time::Instant::now();
+        let mut done = 0u32;
+        self.pending = false;
+        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
+            let y = l.row_y(row);
+            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
+                continue;
+            }
+            for c in &tr.clips {
+                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+                if x0 < 0 || x0 >= l.w as i64 || x1 - x0 < THUMB_MIN_W || self.map.contains_key(&(c.src, c.src_in)) {
+                    continue;
+                }
+                if done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS)) {
+                    self.pending = true;
+                    return;
+                }
+                let _ = self.thumb_for(tl, sources, c.src, c.src_in);
+                done += 1;
+            }
+        } self.fill_strip(tl, sources, l, t0, done); // STRIATHUMBNAILSMORE (SR949): every head wanted is decoded: the wide bodies' filmstrip and tail on the same budget (file tail)
+    }
+    /// The head of `src` at `src_in`: cached, else decoded once (see the block's RULES).
+    fn thumb_for(&mut self, tl: &Timeline, sources: &Sources, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        use timeline_core::SourceIndex as _; if self.ask_head(tl, src, src_in) { return None; } // STRIATHUMBNAILSNEXT (SR997): a served face queues the head, a None placeholder holds the bar (file tail)
+        if !self.map.contains_key(&(src, src_in)) {
+            let still = if sources.duration(src).is_none() {
+                None
+            } else {
+                self.decodes += 1;
+                let mut one = tl.clone();
+                one.tracks.clear();
+                let v = one.add_track(Kind::Video);
+                one.tracks[v].clips.push(Clip::new(src, src_in, src_in + 1, 0));
+                match preview(&one, sources, 0) {
+                    Ok(f) => f.and_then(|f| view::head_still(&f)),
+                    Err(e) => {
+                        log::debug!("[nle-face] head {src:?}@{src_in}: {e}");
+                        None
+                    }
+                }
+            };
+            self.insert((src, src_in), still);
+        }
+        self.get(src, src_in)
+    }
+    /// Key `k` takes `v`, the oldest entry dropped first at THUMB_CACHE.
+    fn insert(&mut self, k: (timeline_core::SourceId, i64), v: Option<Still>) {
+        if !self.map.contains_key(&k) && self.map.len() >= THUMB_CACHE {
+            if let Some(old) = self.map.iter().min_by_key(|e| (e.1).0).map(|e| *e.0) {
+                self.map.remove(&old);
+            }
+        }
+        self.seq += 1;
+        self.map.insert(k, (self.seq, v));
+    }
+}
+
+impl Face {
+    /// STRIATHUMBNAILS (SR839): the head decodes (`preview` calls) this face has made.
+    pub fn thumb_decodes(&self) -> u32 {
+        self.peaks.thumbs.decodes
+    }
+    /// STRIATHUMBNAILS (SR839): the head still of `(src, src_in)`, once a paint has decoded it.
+    pub fn thumb(&self, src: timeline_core::SourceId, src_in: i64) -> Option<&Still> {
+        self.peaks.thumbs.get(src, src_in)
+    }
+    /// STRIATHUMBNAILS (SR839): the last paint's fill left a wanted head undecoded (`serve`'s clock runs while it is true).
+    pub fn thumbs_pending(&self) -> bool {
+        self.peaks.thumbs.pending || self.peaks.thumbs.bg_busy() // STRIATHUMBNAILSNEXT (SR997): and while the worker holds a job (file tail)
+    }
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+
+    #[test]
+    fn thumb_cache_drops_the_oldest() {
+        let mut t = Thumbs::default();
+        let s = Still { width: 1, height: 1, rgba: vec![1, 2, 3, 255] };
+        for i in 0..=THUMB_CACHE as i64 {
+            t.insert((timeline_core::SourceId(0), i), Some(s.clone()));
+        }
+        assert_eq!(t.map.len(), THUMB_CACHE);
+        assert!(t.get(timeline_core::SourceId(0), 0).is_none(), "the first key went");
+        assert!(t.get(timeline_core::SourceId(0), 1).is_some() && t.get(timeline_core::SourceId(0), THUMB_CACHE as i64).is_some());
+        println!("striathumbnails: cache {} entries after {} inserts, oldest dropped", t.map.len(), THUMB_CACHE + 1);
+    }
+}
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail stills (named tail block) ----
+// timeline_core view.rs `head_tiles` is THE tile rule (the painter `paint_strip` reads it too): a body two heads wide shows
+// its head, a filmstrip still every head width and its tail (`src_out - 1`). `Thumbs::fill_strip` decodes those tiles' keys
+// into the SAME map through the SAME `thumb_for` (one `preview`, `head_still`), continuing `fill`'s count and clock, so the
+// THUMBS_PER_PAINT / THUMB_BUDGET_MS rule spans both and `pending` keeps `serve`'s clock filling. ORDER: `fill` calls it only
+// once every visible head is decoded (heads first). A body starting left of the canvas (the head pass skips it) whose visible
+// part is at least THUMB_MIN_W px decodes its head key first, since the head still's width sets the tiles. Tiles left of the
+// canvas or right of it ask nothing (paint_head paints neither). Owed: NLE-THUMBNAILS-STRIP-CACHE (more visible tiles than
+// THUMB_CACHE re-decode every paint), NLE-THUMBNAILS-RATE (STRIACLIPSPEED SR829's `src_at` in `head_tiles`).
+
+impl Thumbs {
+    /// STRIATHUMBNAILSMORE (SR949): the visible tiles beyond each head, decoded within the paint's bounds (the block's rules).
+    fn fill_strip(&mut self, tl: &Timeline, sources: &Sources, l: Layout, t0: std::time::Instant, mut done: u32) {
+        let spent = |done: u32| done >= THUMBS_PER_PAINT || (done > 0 && t0.elapsed() > Duration::from_millis(THUMB_BUDGET_MS));
+        for (row, tr) in tl.tracks.iter().enumerate().filter(|(_, tr)| tr.kind == Kind::Video) {
+            let y = l.row_y(row);
+            if y >= l.h as i64 || y + ROW_H as i64 <= 0 {
+                continue;
+            }
+            for c in &tr.clips {
+                let (x0, x1) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1);
+                if x1 <= 0 || x0 >= l.w as i64 || x1.min(l.w as i64) - x0.max(0) < THUMB_MIN_W {
+                    continue;
+                }
+                if !self.map.contains_key(&(c.src, c.src_in)) {
+                    if x0 >= 0 {
+                        continue; // the head pass's rule left it (a body under THUMB_MIN_W): no strip either
+                    }
+                    if spent(done) {
+                        self.pending = true;
+                        return;
+                    }
+                    let _ = self.thumb_for(tl, sources, c.src, c.src_in);
+                    done += 1;
+                }
+                let Some(sw) = self.get(c.src, c.src_in).map(|s| s.width as i64) else { continue };
+                for (x, _, tick) in view::head_tiles(x0, x1, sw, l.zoom, c).into_iter().skip(1) {
+                    if x < 0 || x >= l.w as i64 || self.map.contains_key(&(c.src, tick)) {
+                        continue;
+                    }
+                    if spent(done) {
+                        self.pending = true;
+                        return;
+                    }
+                    let _ = self.thumb_for(tl, sources, c.src, tick);
+                    done += 1;
+                }
+            }
+        }
+    }
+}
+
+// ---- STRIATHUMBNAILSNEXT (LEDGER SR997): heads and peak tables decoded off the face's thread (named tail block) ----
+// SR839's heads (`Thumbs::thumb_for`) and SR827's peak tables (`nle::scan_peaks`) were decoded on the face's thread inside the
+// paint: a long-GOP head held a paint for its run-up, a long source's first paint for its whole audio decode. `serve` (the
+// windowed face; its only caller is stria-view's window) now calls `Face::decode_off_thread`, which starts ONE worker thread
+// holding a clone of the face's `Arc<Sources>` (already shared with the export thread). RULES:
+// * ASK: with a worker, `thumb_for` sends a `BgJob::Head` for an absent key and caches a `None` placeholder (the body keeps its
+//   bar; `fill`'s `contains_key` asks once); `wave_fill` sends a `BgJob::Scan` and caches `None` (the body stays flat). The
+//   THUMBS_PER_PAINT / THUMB_BUDGET_MS rules are unchanged: they bound the requests one paint makes.
+// * DECODE: the worker runs THE SAME roads: `thumb_for` on a scratch `Thumbs` (no worker: synchronous) and `scan_peaks`.
+// * TAKE: `WavePeaks::drain_bg`, at `wave_fill`'s start (every paint), moves each finished job into the face's maps (a head
+//   through `Thumbs::insert`, overwriting its placeholder; `decodes` / `scans` counted as they land).
+// * WAKE: `thumbs_pending` is also true while a job is out, so `serve`'s existing clock repaints until the results land.
+// * LOST: a worker gone (its channel disconnected) is dropped and its in-flight keys are removed, so the face's own thread asks
+//   again. A face not served (the witness, every test) never starts a worker and stays synchronous (its frames unchanged).
+// No lock: the maps stay the face thread's; the results move by channel. Owed: NLE-THUMBNAILS-BG-WAKE (a repaint per clock
+// tick while a job is out, not only on arrival), NLE-THUMBNAILS-BG-CANCEL (a queued job for a key scrolled away still runs; a
+// dropped face's running job finishes).
+
+/// STRIATHUMBNAILSNEXT (SR997): one job for the decode worker.
+enum BgJob {
+    /// A head: the face's timeline with its tracks cleared (`thumb_for` builds its one-clip timeline from it) and the key.
+    Head(Timeline, timeline_core::SourceId, i64),
+    /// A source's peak table.
+    Scan(timeline_core::SourceId),
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): one finished job (a head with the worker's decode count; a table).
+enum BgDone {
+    Head((timeline_core::SourceId, i64), Option<Still>, u32),
+    Scan(timeline_core::SourceId, Option<view::Peaks>),
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): the decode worker's channel ends and the jobs in flight.
+struct Bg {
+    tx: std::sync::mpsc::Sender<BgJob>,
+    rx: std::sync::mpsc::Receiver<BgDone>,
+    out: u32,
+    heads: Vec<(timeline_core::SourceId, i64)>,
+    scans: Vec<timeline_core::SourceId>,
+}
+
+impl Bg {
+    /// The worker thread over `sources`; it ends when the face's job sender drops. A refused spawn: `None` (synchronous).
+    fn start(sources: Arc<Sources>) -> Option<Bg> {
+        let (tx, jobs) = std::sync::mpsc::channel::<BgJob>();
+        let (done, rx) = std::sync::mpsc::channel::<BgDone>();
+        let spawned = std::thread::Builder::new().name("nle-face-decode".into()).spawn(move || {
+            for job in jobs {
+                let d = match job {
+                    BgJob::Head(tl, src, src_in) => {
+                        let mut t = Thumbs::default();
+                        let s = t.thumb_for(&tl, &sources, src, src_in).cloned();
+                        BgDone::Head((src, src_in), s, t.decodes)
+                    }
+                    BgJob::Scan(id) => {
+                        let p = match crate::nle::scan_peaks(&sources, id, view::PEAKS_PER_SEC) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::debug!("[nle-face] waveform {id:?}: {e}");
+                                None
+                            }
+                        };
+                        BgDone::Scan(id, p)
+                    }
+                };
+                if done.send(d).is_err() {
+                    break;
+                }
+            }
+        });
+        match spawned {
+            Ok(_) => Some(Bg { tx, rx, out: 0, heads: Vec::new(), scans: Vec::new() }),
+            Err(e) => {
+                log::warn!("[nle-face] decode worker: {e} (decoding on the face's thread)");
+                None
+            }
+        }
+    }
+}
+
+impl Thumbs {
+    /// STRIATHUMBNAILSNEXT (SR997): with a worker and `(src, src_in)` not keyed, queue its head and cache the `None`
+    /// placeholder (true); otherwise false (the synchronous road runs).
+    fn ask_head(&mut self, tl: &Timeline, src: timeline_core::SourceId, src_in: i64) -> bool {
+        if self.map.contains_key(&(src, src_in)) {
+            return false;
+        }
+        let sent = match self.bg.as_mut() {
+            None => false,
+            Some(bg) => {
+                let mut one = tl.clone();
+                one.tracks.clear();
+                let ok = bg.tx.send(BgJob::Head(one, src, src_in)).is_ok();
+                if ok {
+                    bg.out += 1;
+                    bg.heads.push((src, src_in));
+                }
+                ok
+            }
+        };
+        if sent {
+            self.insert((src, src_in), None);
+        }
+        sent
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): with a worker, queue source `id`'s peak scan (true: the caller caches the placeholder).
+    fn ask_scan(&mut self, id: timeline_core::SourceId) -> bool {
+        match self.bg.as_mut() {
+            None => false,
+            Some(bg) => {
+                let ok = bg.tx.send(BgJob::Scan(id)).is_ok();
+                if ok {
+                    bg.out += 1;
+                    bg.scans.push(id);
+                }
+                ok
+            }
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): a job is out on the worker.
+    fn bg_busy(&self) -> bool {
+        self.bg.as_ref().is_some_and(|b| b.out > 0)
+    }
+}
+
+impl WavePeaks {
+    /// STRIATHUMBNAILSNEXT (SR997): every finished job into the face's maps; `block`: wait until no job is out.
+    fn drain_bg(&mut self, block: bool) {
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            let Some(bg) = self.thumbs.bg.as_mut() else { return };
+            if bg.out == 0 {
+                return;
+            }
+            let got = if block { bg.rx.recv().map_err(|_| TryRecvError::Disconnected) } else { bg.rx.try_recv() };
+            match got {
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.bg_lost();
+                    return;
+                }
+                Ok(BgDone::Head(k, s, n)) => {
+                    bg.out = bg.out.saturating_sub(1);
+                    bg.heads.retain(|h| *h != k);
+                    self.thumbs.decodes += n;
+                    self.thumbs.insert(k, s);
+                }
+                Ok(BgDone::Scan(id, p)) => {
+                    bg.out = bg.out.saturating_sub(1);
+                    bg.scans.retain(|x| *x != id);
+                    self.map.insert(id, p);
+                    self.scans += 1;
+                }
+            }
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): the worker is gone: drop it and its in-flight placeholders (the face's thread asks again).
+    fn bg_lost(&mut self) {
+        if let Some(bg) = self.thumbs.bg.take() {
+            log::warn!("[nle-face] decode worker gone: {} jobs back on the face's thread", bg.out);
+            for k in &bg.heads {
+                self.thumbs.map.remove(k);
+            }
+            for id in &bg.scans {
+                self.map.remove(id);
+            }
+        }
+    }
+}
+
+impl Face {
+    /// STRIATHUMBNAILSNEXT (SR997): decode heads and peak tables on one worker thread from now on (`serve` calls it once).
+    pub fn decode_off_thread(&mut self) {
+        if self.peaks.thumbs.bg.is_none() {
+            self.peaks.thumbs.bg = Bg::start(self.sources.clone());
+        }
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): wait until the worker holds no job, every result in the face's maps.
+    pub fn bg_settle(&mut self) {
+        self.peaks.drain_bg(true);
+    }
+    /// STRIATHUMBNAILSNEXT (SR997): the face decodes off its thread.
+    pub fn bg_running(&self) -> bool {
+        self.peaks.thumbs.bg.is_some()
     }
 }

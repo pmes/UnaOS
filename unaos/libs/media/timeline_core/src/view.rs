@@ -290,11 +290,11 @@ pub trait Text {
 /// Paint the editor on a `w` x `h` canvas in `order`. `labels` names the clips (and the seconds on the ruler); `preview`
 /// is the frame at the playhead.
 pub fn paint(st: &EditorState, w: u32, h: u32, order: Order, labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
-    paint_in(st, Layout::of(w, h, st), order, labels, preview)
+    paint_in(st, Layout::of(w, h, st), order, labels, preview, None)
 }
 
 /// [`paint`] in a given layout (a face's view, which a wheel zoom anchors at the pointer, or a Surface's role).
-pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>) -> Vec<u8> {
+pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&mut dyn Text>, preview: Option<&Still>, peaks: Option<&dyn PeakSource>) -> Vec<u8> {
     let (w, h) = (l.w, l.h);
     let tl = &st.timeline;
     let mut c = Canvas::new(w, h, order);
@@ -331,6 +331,8 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
                 continue;
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Audio) { paint_peaks(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, tl.tb, p); } // STRIAWAVEFORM (SR827): the clip's peaks over its body (file tail)
+            if let Some(p) = peaks.filter(|_| track.kind == Kind::Video) { paint_strip(&mut c, &l, (x0 + 1, y0 + 2, x1 - 1, y1 - 2), clip, p); } // STRIATHUMBNAILS (SR839): the clip's src_in frame at its body's left; STRIATHUMBNAILSMORE (SR949): a wide body's filmstrip and tail (file tail)
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
                 let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
                 text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
@@ -489,7 +491,7 @@ mod tests {
         st.seek(8);
         let l = Layout::of_role(Role::Tracks, 320, 56, &st);
         assert_eq!((l.ruler_y, l.tracks_y, l.t0), (0, RULER_H, 0));
-        let px = paint_in(&st, l, Order::Rgba, None, None);
+        let px = paint_in(&st, l, Order::Rgba, None, None, None);
         let at = |x: usize, y: usize| &px[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
         assert_eq!(at(64, 30), PLAYHEAD, "the playhead at tick 8");
         assert_eq!(at(66, 30), HANDLE, "the right half's in handle");
@@ -510,7 +512,7 @@ mod tests {
     fn keys_labels(st: &EditorState) -> (Vec<(alloc::string::String, f32, f32, (i32, i32))>, u64) {
         let l = Layout::of_role(Role::Tracks, 320, 56, st);
         let mut rec = Rec(Vec::new());
-        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None, None);
         (rec.0, fnv1a(&px))
     }
 
@@ -953,10 +955,10 @@ mod snap_tests {
             [px[i], px[i + 1], px[i + 2], px[i + 3]]
         };
         let yi = y as i64;
-        let before = paint_in(&st, l, Order::Rgba, None, None);
+        let before = paint_in(&st, l, Order::Rgba, None, None, None);
         assert_eq!(at(&before, l.x_of(25), yi), ROW[0], "committed: nothing at tick 25");
         let shown = d.shown(&st).unwrap();
-        let px = paint_drag(paint_in(&shown, l, Order::Rgba, None, None), l, Order::Rgba, Some(&d));
+        let px = paint_drag(paint_in(&shown, l, Order::Rgba, None, None, None), l, Order::Rgba, Some(&d));
         assert_eq!(at(&px, l.x_of(25), yi), clip_colour(a.0, Kind::Video), "the preview's moved clip");
         assert_eq!(at(&px, l.x_of(30), yi), GUIDE, "the guide line");
         assert_eq!(at(&px, l.x_of(30), l.ruler_y as i64), GUIDE, "the guide from the ruler down");
@@ -1095,7 +1097,7 @@ mod message_row_tests {
         assert_eq!(m.hit(&st.timeline, 10.0, 55.0), Hit::None);
         assert_eq!(m.hit(&st.timeline, 10.0, 70.0), l.hit(&st.timeline, 10.0, 70.0));
         assert_eq!(m.hit(&st.timeline, 10.0, 100.0), l.hit(&st.timeline, 10.0, 100.0));
-        let (a, b) = (paint_in(&st, l, Order::Rgba, None, None), paint_in(&st, m, Order::Rgba, None, None));
+        let (a, b) = (paint_in(&st, l, Order::Rgba, None, None, None), paint_in(&st, m, Order::Rgba, None, None, None));
         let at = |px: &[u8], x: usize, y: usize| [px[(y * 320 + x) * 4], px[(y * 320 + x) * 4 + 1], px[(y * 320 + x) * 4 + 2], px[(y * 320 + x) * 4 + 3]];
         assert_eq!(at(&b, 10, 49), FIELD);
         assert_eq!(at(&b, 10, 50), BG);
@@ -1187,5 +1189,585 @@ mod slipdrag_tests {
         assert!(d.shown(&st).is_none());
         assert_eq!(d.finish(&mut st), Err(EditError::OutOfSource));
         assert_eq!((&st.timeline, st.undo_depth()), (&tl, 0));
+    }
+}
+
+// ---- STRIAWAVEFORM (LEDGER SR827): an audio clip's peaks in its body (named tail block) ----
+// An audio clip's body shows its waveform: a per-source PEAK TABLE ([`Peaks`], one u8 per bucket: max |sample| over the
+// bucket, every channel folded by max) reduced by THE ONE [`peaks_of`], painted by THE ONE [`paint_peaks`] from
+// [`paint_in`]'s clip-body arm through the optional [`PeakSource`] hook (the [`Text`] shape). The bars are the audible
+// result: the clip gain through the hook's `gain_q16` (the mix's ONE curve, audio_core `ramp::gain_q16`, which this core
+// does not link: the face answers it) and the fades through `schedule::env_q16` (the mix's envelope). No hook, no table or
+// an empty table: the body exactly as before (every golden byte-identical). The table is the face's (the EDL carries no
+// pixels); Stria's `nle::scan_peaks` builds it through the render's own audio decoder. Owed: NLE-WAVEFORM-STEREO,
+// NLE-WAVEFORM-ZOOM-LOD, NLE-WAVEFORM-KERNEL, NLE-WAVEFORM-CACHE-FILE, NLE-WAVEFORM-ENV-SUBTICK, NLE-WAVEFORM-SCAN-THREAD.
+
+/// The peak table's resolution: buckets per source second (a 10 ms bucket; an hour-long source is 360 000 bytes).
+pub const PEAKS_PER_SEC: u32 = 100;
+/// The waveform's ink: the audio clip's body colour lifted by this much per channel (saturating), the body under it.
+pub const WAVE_LIFT: u8 = 0x30;
+
+/// One source's peak table: `buckets[b]` is the max |sample| (0..=255 for 0.0..=1.0) over source time
+/// `b / per_sec .. (b + 1) / per_sec` s.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Peaks {
+    pub per_sec: u32,
+    pub buckets: Vec<u8>,
+}
+
+/// The waveform hook: a source's peak table (none: the body stays flat) and the clip gain's Q16 factor by the mix's ONE
+/// curve (audio_core `ramp::gain_q16`; the face that links it answers).
+pub trait PeakSource {
+    fn peaks(&self, src: crate::SourceId) -> Option<&Peaks>;
+    fn gain_q16(&self, cdb: i32) -> i64;
+    /// STRIATHUMBNAILS (SR839): the head still of `src` at source tick `src_tick` ([`head_still`]-sized; none: no head).
+    fn thumb(&self, _src: crate::SourceId, _src_tick: i64) -> Option<&Still> { None }
+}
+
+/// THE ONE reduction: `interleaved` (`channels` per frame at `rate` Hz) to `ceil(frames * per_sec / rate)` buckets, bucket
+/// `b` the frames `floor(b * rate / per_sec) .. floor((b + 1) * rate / per_sec)` (so whole seconds fed one after another
+/// give the same bytes as one call), its value `round(min(max |x|, 1) * 255)` over every channel (NaN ignored).
+/// `rate` or `per_sec` 0: no buckets.
+pub fn peaks_of(rate: u32, channels: u16, interleaved: &[f32], per_sec: u32) -> Peaks {
+    let ch = channels.max(1) as usize;
+    let frames = interleaved.len() / ch;
+    if rate == 0 || per_sec == 0 {
+        return Peaks { per_sec, buckets: Vec::new() };
+    }
+    let (r, p) = (rate as u64, per_sec as u64);
+    let n = (frames as u64 * p).div_ceil(r) as usize;
+    let mut buckets = Vec::with_capacity(n);
+    for b in 0..n as u64 {
+        let (f0, f1) = ((b * r / p) as usize, (((b + 1) * r / p) as usize).min(frames));
+        let m = interleaved[f0 * ch..f1 * ch].iter().fold(0.0f32, |m, &x| {
+            let a = if x < 0.0 { -x } else { x };
+            if a > m { a } else { m }
+        });
+        buckets.push((m.min(1.0) * 255.0 + 0.5) as u8);
+    }
+    Peaks { per_sec, buckets }
+}
+
+/// THE ONE waveform painter: inside `body` (`x0, y0, x1, y1`, the clip body rect [`paint_in`] filled) a vertical bar per
+/// canvas column, centred on the body's midline: the max of the buckets the column covers ([`Layout::x_of`] inverted at
+/// sub-tick precision, source tick = `src_in + (t - at)`, seconds through `tb`), x the clip gain (`src.gain_q16`) x the
+/// fade envelope at the column's tick (`schedule::env_q16`, the mix's), half-height `round(v * (body_h / 2) / 255)`,
+/// inked in the audio clip colour + [`WAVE_LIFT`]. No table for the clip's source (or an empty one): nothing painted.
+pub fn paint_peaks(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, tb: crate::Timebase, src: &dyn PeakSource) {
+    let Some(p) = src.peaks(clip.src) else { return };
+    if p.buckets.is_empty() || p.per_sec == 0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = body;
+    let half = (y1 - y0) / 2;
+    if half <= 0 {
+        return;
+    }
+    let mid = y0 + half;
+    let g = src.gain_q16(clip.gain_cdb);
+    let base = clip_colour(clip.src.0, Kind::Audio);
+    let ink = [base[0].saturating_add(WAVE_LIFT), base[1].saturating_add(WAVE_LIFT), base[2].saturating_add(WAVE_LIFT), 255];
+    let z = l.zoom.max(1) as i64;
+    let at_x = l.x_of(clip.at);
+    let (k, d) = (tb.num as i128 * p.per_sec as i128, tb.den.max(1) as i128 * z as i128);
+    let bucket = |dx: i64| ((clip.src_in as i128 * z as i128 + dx as i128) * k).div_euclid(d);
+    let len = p.buckets.len() as i128;
+    for x in x0.max(0)..x1.min(c.w as i64) {
+        let dx = x - at_x;
+        let b0 = bucket(dx);
+        let b1 = bucket(dx + 1).max(b0 + 1);
+        let (b0, b1) = (b0.clamp(0, len) as usize, b1.clamp(0, len) as usize);
+        if b0 >= b1 {
+            continue;
+        }
+        let peak = p.buckets[b0..b1].iter().copied().max().unwrap_or(0) as i64;
+        let e = crate::schedule::env_q16(clip, clip.at + dx.max(0) / z) as i64;
+        let v = ((((peak * g) >> 16) * e) >> 16).clamp(0, 255);
+        let hh = (v * half + 127) / 255;
+        if hh > 0 {
+            c.rect(x, mid - hh, x + 1, mid + hh, ink);
+        }
+    }
+}
+
+#[cfg(test)]
+mod waveform_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// A test hook: one table for every source; the gain by ramp.rs's formula (`round(10^(cdb / 2000) * 65536)`).
+    struct Fixed(Peaks);
+    impl PeakSource for Fixed {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            Some(&self.0)
+        }
+        fn gain_q16(&self, cdb: i32) -> i64 {
+            if cdb == 0 { 65536 } else { libm::round(libm::pow(10.0, cdb as f64 / 2000.0) * 65536.0) as i64 }
+        }
+    }
+
+    /// 25 fps, one track of `kind` holding `clip` (a 2-s source), the playhead at 0.
+    fn one_clip(kind: Kind, clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    /// The clip body rect of row 0 (x clipped to the canvas, the playhead column 0 left out).
+    fn body(l: &Layout) -> (i64, i64, i64, i64) {
+        let y0 = l.row_y(0);
+        (1, y0 + 2, l.w as i64, y0 + ROW_H as i64 - 2)
+    }
+
+    fn colours(buf: &[u8], l: &Layout) -> usize {
+        let (x0, y0, x1, y1) = body(l);
+        let mut seen: Vec<[u8; 4]> = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let c = px(buf, l.w, x, y);
+                if !seen.contains(&c) {
+                    seen.push(c);
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// The inked pixels of column `x` inside the body.
+    fn bar(buf: &[u8], l: &Layout, x: i64) -> i64 {
+        let (_, y0, _, y1) = body(l);
+        let b = clip_colour(0, Kind::Audio);
+        let ink = [b[0] + WAVE_LIFT, b[1] + WAVE_LIFT, b[2] + WAVE_LIFT, 255];
+        (y0..y1).filter(|&y| px(buf, l.w, x, y) == ink).count() as i64
+    }
+
+    #[test]
+    fn peaks_of_sine_silence_click_stereo() {
+        let sine: Vec<f32> = (0..48_000).map(|i| 0.5 * libm::sinf(2.0 * core::f32::consts::PI * 1000.0 * i as f32 / 48_000.0)).collect();
+        let p = peaks_of(48_000, 1, &sine, PEAKS_PER_SEC);
+        assert_eq!((p.per_sec, p.buckets.len()), (100, 100));
+        assert!(p.buckets.iter().all(|&b| (127..=129).contains(&b)), "{:?}", p.buckets);
+        let silence = alloc::vec![0.0f32; 48_000];
+        assert_eq!(peaks_of(48_000, 1, &silence, PEAKS_PER_SEC).buckets, alloc::vec![0u8; 100]);
+        let mut click = silence.clone();
+        click[4810] = 1.0;
+        let c = peaks_of(48_000, 1, &click, PEAKS_PER_SEC).buckets;
+        assert_eq!(c[10], 255);
+        assert_eq!(c.iter().filter(|&&b| b != 0).count(), 1, "one bucket holds the click");
+        let stereo: Vec<f32> = (0..9_600).map(|i| if i % 2 == 0 { 0.25 } else { -0.75 }).collect();
+        assert!(peaks_of(48_000, 2, &stereo, PEAKS_PER_SEC).buckets.iter().all(|&b| b == 191), "stereo folds by max");
+        assert_eq!(peaks_of(48_000, 1, &silence[..4_801], PEAKS_PER_SEC).buckets.len(), 11);
+        assert!(peaks_of(0, 1, &silence, PEAKS_PER_SEC).buckets.is_empty());
+        // whole seconds one after another == one call (the scan's streaming)
+        let two: Vec<f32> = sine.iter().chain(click.iter()).copied().collect();
+        let mut fed = peaks_of(48_000, 1, &two[..48_000], PEAKS_PER_SEC).buckets;
+        fed.extend(peaks_of(48_000, 1, &two[48_000..], PEAKS_PER_SEC).buckets);
+        assert_eq!(fed, peaks_of(48_000, 1, &two, PEAKS_PER_SEC).buckets);
+        let rate_441: Vec<f32> = (0..44_100 * 2).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut fed = peaks_of(44_100, 1, &rate_441[..44_100], PEAKS_PER_SEC).buckets;
+        fed.extend(peaks_of(44_100, 1, &rate_441[44_100..], PEAKS_PER_SEC).buckets);
+        assert_eq!(fed, peaks_of(44_100, 1, &rate_441, PEAKS_PER_SEC).buckets);
+    }
+
+    #[test]
+    fn waveform_body_not_flat_and_video_unchanged() {
+        let ramp = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() });
+        let empty = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: Vec::new() });
+        let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let flat = paint_in(&st, l, Order::Rgba, None, None, None);
+        let wave = paint_in(&st, l, Order::Rgba, None, None, Some(&ramp));
+        let (cf, cw) = (colours(&flat, &l), colours(&wave, &l));
+        assert_eq!(cf, 1, "no hook: one body colour");
+        assert!(cw > 1, "the peaks paint over the body: {cw} colours");
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&empty)), flat, "an empty table paints the flat body");
+        let v = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 0));
+        assert_eq!(paint_in(&v, l, Order::Rgba, None, None, Some(&ramp)), paint_in(&v, l, Order::Rgba, None, None, None), "video bodies have no peaks");
+        let bgra = paint_in(&st, l, Order::Bgra, None, None, Some(&ramp));
+        assert!(wave.chunks(4).zip(bgra.chunks(4)).all(|(a, b)| a == [b[2], b[1], b[0], b[3]]), "the BGRA paint is the same picture");
+        std::println!("striawaveform: golden fnv={:016x} body_colours flat={cf} wave={cw}", fnv1a(&wave));
+        assert_eq!(alloc::format!("{:016x}", fnv1a(&wave)), GOLDEN_WAVE);
+    }
+
+    /// `waveform_body_not_flat_and_video_unchanged`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA
+    /// paint of a 2-s audio clip under a ramp table).
+    const GOLDEN_WAVE: &str = "923f68ef86d1a44d";
+
+    #[test]
+    fn waveform_gain_minus_6db_halves_the_bars() {
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let at = |cdb: i32| {
+            let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).gained(cdb));
+            let l = Layout::of(320, 160, &st);
+            bar(&paint_in(&st, l, Order::Rgba, None, None, Some(&full)), &l, 160)
+        };
+        let (h0, h6, h12) = (at(0), at(-600), at(-1200));
+        std::println!("striawaveform: bar_full={h0} bar_minus6db={h6} bar_minus12db={h12}");
+        assert_eq!(h0, 36, "a full-scale bar fills the body");
+        assert_eq!(h6, 18, "-6 dB halves");
+        assert!((h12 - 9).abs() <= 1, "-12 dB quarters: {h12}");
+    }
+
+    #[test]
+    fn waveform_fade_in_tapers() {
+        let full = Fixed(Peaks { per_sec: PEAKS_PER_SEC, buckets: alloc::vec![255; 200] });
+        let st = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0).faded(25, 0));
+        let l = Layout::of(320, 160, &st);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&full));
+        let z = l.zoom as i64;
+        let (q1, q3) = (bar(&buf, &l, l.x_of(12) + z / 2), bar(&buf, &l, l.x_of(37) + z / 2));
+        std::println!("striawaveform: fade_in=25/50 bar25={q1} bar75={q3} first={}", bar(&buf, &l, 1));
+        assert!(q1 < q3, "the fade tapers the first half: {q1} vs {q3}");
+        assert_eq!(q3, 36);
+        assert_eq!(bar(&buf, &l, 1), 0, "silent at the clip's first tick");
+    }
+}
+
+// ---- STRIATHUMBNAILS (LEDGER SR839): a video clip's head frame (named tail block) ----
+// A video clip's body shows its HEAD: the frame at `src_in`, scaled to the body's height in the frame's own aspect
+// ([`head_still`], [`SizePolicy::Fill`](crate::SizePolicy::Fill) through THE scaler `Canvas::blit_policy`), blitted at the
+// body's left edge by [`paint_head`] from [`paint_in`]'s clip-body arm through SR827's optional [`PeakSource`] hook (its
+// `thumb` method, default `None`). The box is `min(still width, body width)` wide, so a clip narrower than the still shows the
+// still's centre columns and no pixel leaves the body; the colour bar continues to the right; the labels paint over it. A head
+// whose body starts left of the canvas paints nothing. No hook or no still: the body exactly as before (every golden and the
+// kernel view band byte-identical). The stills are the face's (Stria's `nle_face::Thumbs`, decoded through `preview`).
+// Owed: NLE-THUMBNAILS-FILMSTRIP, NLE-THUMBNAILS-TAIL, NLE-THUMBNAILS-BACKGROUND, NLE-THUMBNAILS-KERNEL.
+
+/// The head still's height: the clip body's ([`paint_in`] fills `y0 + 2 .. y1 - 2` of a [`ROW_H`] row).
+pub const HEAD_H: u32 = ROW_H - 4;
+/// The widest head still (a 32:9 frame at [`HEAD_H`]).
+pub const HEAD_MAX_W: u32 = 128;
+
+/// A `w` x `h` frame's head size: `(round(w * HEAD_H / h)` clamped to `1..=HEAD_MAX_W`, `HEAD_H)`; `None` for an empty frame.
+pub fn head_size(w: u32, h: u32) -> Option<(u32, u32)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let tw = ((w as u64 * HEAD_H as u64 + h as u64 / 2) / h as u64).clamp(1, HEAD_MAX_W as u64) as u32;
+    Some((tw, HEAD_H))
+}
+
+/// `full` scaled to its [`head_size`] by [`Canvas::blit_policy`] with `Fill` (the frame's own aspect, no bars); `None` for
+/// an empty frame.
+pub fn head_still(full: &Still) -> Option<Still> {
+    let (tw, th) = head_size(full.width, full.height)?;
+    let mut c = Canvas::new(tw, th, Order::Rgba);
+    c.blit_policy(full, 0, 0, tw, th, crate::SizePolicy::Fill);
+    Some(Still { width: tw, height: th, rgba: c.px })
+}
+
+/// THE ONE head painter: `src`'s still for `(clip.src, clip.src_in)` into `body` (`x0, y0, x1, y1`, the clip body rect
+/// [`paint_in`] filled) at its left edge, `min(still width, body width)` x body height, by `Fill` (1:1 at full width, the
+/// still's centre columns when narrower). No still, a body starting left of the canvas, or an empty body: nothing.
+pub fn paint_head(c: &mut Canvas, body: (i64, i64, i64, i64), clip: &crate::Clip, src: &dyn PeakSource) {
+    let Some(s) = src.thumb(clip.src, clip.src_in) else { return };
+    let (x0, y0, x1, y1) = body;
+    let bw = (s.width as i64).min(x1 - x0);
+    let bh = y1 - y0;
+    if x0 < 0 || y0 < 0 || bw <= 0 || bh <= 0 || x0 >= c.w as i64 {
+        return;
+    }
+    c.blit_policy(s, x0 as u32, y0 as u32, bw as u32, bh as u32, crate::SizePolicy::Fill);
+}
+
+#[cfg(test)]
+mod head_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+
+    /// A test hook: one head still for every key, and optionally one peak table (the waveform's ramp).
+    struct Hook(Option<Still>, Option<Peaks>);
+    impl PeakSource for Hook {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            self.1.as_ref()
+        }
+        fn gain_q16(&self, cdb: i32) -> i64 {
+            if cdb == 0 { 65536 } else { libm::round(libm::pow(10.0, cdb as f64 / 2000.0) * 65536.0) as i64 }
+        }
+        fn thumb(&self, _src: SourceId, _src_tick: i64) -> Option<&Still> {
+            self.0.as_ref()
+        }
+    }
+
+    /// A 48 x 36 still whose every pixel is distinct from its neighbours and from the clip colours.
+    fn pattern() -> Still {
+        let (w, h) = (48u32, 36u32);
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 5) as u8, (y * 7) as u8, 0x11, 255]);
+            }
+        }
+        Still { width: w, height: h, rgba }
+    }
+
+    fn one_clip(kind: Kind, clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(kind);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn head_size_and_still() {
+        assert_eq!(head_size(64, 48), Some((48, 36)));
+        assert_eq!(head_size(1920, 1080), Some((64, 36)));
+        assert_eq!(head_size(0, 48), None);
+        assert_eq!(head_size(64, 0), None);
+        assert_eq!(head_size(10_000, 10), Some((HEAD_MAX_W, HEAD_H)));
+        let s = head_still(&pattern()).expect("a head");
+        assert_eq!((s.width, s.height, s.rgba.len()), (48, 36, 48 * 36 * 4));
+        assert_eq!(s, pattern(), "a still already head-sized scales 1:1");
+    }
+
+    #[test]
+    fn head_box_shows_the_still_and_the_bar_continues() {
+        let still = pattern();
+        let hook = Hook(Some(still.clone()), None);
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 11, 2)); // STRIATHUMBNAILSMORE (SR949): an 86 px body (< 2 heads): head-only, the bar right of it
+        let l = Layout::of(320, 160, &st);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (bx, by) = (l.x_of(2) + 1, l.row_y(0) + 2);
+        let mut matched = 0;
+        for y in 0..36 {
+            for x in 0..48 {
+                let i = ((y * 48 + x) * 4) as usize;
+                assert_eq!(px(&buf, l.w, bx + x, by + y), [still.rgba[i], still.rgba[i + 1], still.rgba[i + 2], still.rgba[i + 3]], "head pixel {x},{y}");
+                matched += 1;
+            }
+        }
+        let bar = clip_colour(0, Kind::Video);
+        for y in by..by + 36 {
+            assert_eq!(px(&buf, l.w, bx + 48, y), bar, "the colour bar continues right of the box");
+        }
+        let bgra = paint_in(&st, l, Order::Bgra, None, None, Some(&hook));
+        assert!(buf.chunks(4).zip(bgra.chunks(4)).all(|(a, b)| a == [b[2], b[1], b[0], b[3]]), "the BGRA paint is the same picture");
+        std::println!("striathumbnails: head box 48x36 matched={matched} fnv={:016x}", fnv1a(&buf));
+    }
+
+    #[test]
+    fn head_none_and_audio_unchanged() {
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 50, 0));
+        let l = Layout::of(320, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&Hook(None, None))), none, "no still: the body as before");
+        // the audio body under a hook holding BOTH a still and SR827's ramp table is SR827's golden: no head on audio
+        let ramp = Peaks { per_sec: PEAKS_PER_SEC, buckets: (0..200u32).map(|i| (i * 37 % 256) as u8).collect() };
+        let a = one_clip(Kind::Audio, Clip::new(SourceId(0), 0, 50, 0));
+        let la = Layout::of(320, 160, &a);
+        let wave = paint_in(&a, la, Order::Rgba, None, None, Some(&Hook(Some(pattern()), Some(ramp))));
+        assert_eq!(alloc::format!("{:016x}", fnv1a(&wave)), "923f68ef86d1a44d", "the audio body equals the STRIAWAVEFORM golden");
+    }
+
+    #[test]
+    fn head_narrow_clip_stays_inside_its_body() {
+        let hook = Hook(Some(pattern()), None);
+        // a 3-tick clip at zoom 8: a 22 px body, narrower than the 48 px still
+        let st = one_clip(Kind::Video, Clip::new(SourceId(0), 0, 3, 4));
+        let l = Layout::of(320, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (x0, x1) = (l.x_of(4) + 1, l.x_of(7) - 1);
+        let (y0, y1) = (l.row_y(0) + 2, l.row_y(0) + ROW_H as i64 - 2);
+        let mut inside = 0;
+        for y in 0..l.h as i64 {
+            for x in 0..l.w as i64 {
+                let (a, b) = (px(&buf, l.w, x, y), px(&none, l.w, x, y));
+                if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                    inside += (a != b) as usize;
+                } else {
+                    assert_eq!(a, b, "a head pixel at {x},{y} outside the body");
+                }
+            }
+        }
+        assert_eq!(inside as i64, (x1 - x0) * (y1 - y0), "the whole narrow body is the head");
+        // the body shows the still's centre columns (Fill's centred crop)
+        let still = pattern();
+        let c0 = ((48 - (x1 - x0)) / 2) as usize;
+        let i = c0 * 4;
+        assert_eq!(px(&buf, l.w, x0, y0), [still.rgba[i], still.rgba[i + 1], still.rgba[i + 2], still.rgba[i + 3]], "the centre crop");
+        std::println!("striathumbnails: narrow body {}x{} px all head, none outside", x1 - x0, y1 - y0);
+    }
+}
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail (named tail block) ----
+// A video clip body at least two heads wide shows more than its head: [`head_tiles`] (THE tile rule, read by BOTH this
+// painter and the face's fill, Stria's `Thumbs::fill_strip`) lays the head (`src_in`) at the body's left, the TAIL
+// (`src_out - 1`) right-aligned, and between them a FILMSTRIP: a still every head-width px, each the frame under the tile's
+// left column (anchored to the clip, so a scroll keeps the keys; a zoom changes them). The gap left of the tail stays the
+// colour bar. A narrower body is SR839's head exactly. [`paint_strip`] blits every tile through SR839's unchanged
+// [`paint_head`] (Fill, the crop, the off-canvas refusal per tile) via the same `thumb(src, src_tick)` hook; a tile whose
+// still is not decoded yet keeps the bar. No hook or no head still: nothing (every golden and the kernel band unchanged).
+// Owed: NLE-THUMBNAILS-RATE (with STRIACLIPSPEED SR829 the middle tick becomes `clip.src_at(clip.at + k * sw / zoom)`, the
+// one line in `head_tiles`), NLE-THUMBNAILS-STRIP-CACHE (more visible tiles than the face's THUMB_CACHE re-decode each paint).
+
+/// THE tile rule: the stills `(x, w, src_tick)` of a video clip body `x0..x1` whose head still is `sw` px wide at `zoom` px
+/// per tick. `sw <= 0` or an empty body: none. A body narrower than `2 * sw`: the head alone, `(x0, min(sw, bw), src_in)`.
+/// Otherwise the head `(x0, sw, src_in)`, middles `(x0 + k * sw, sw, src_in + min(k * sw / zoom, len - 1))` for k = 1.. while
+/// the tile ends at or before the tail's left, and the tail `(x1 - sw, sw, src_out - 1)`.
+pub fn head_tiles(x0: i64, x1: i64, sw: i64, zoom: u32, clip: &crate::Clip) -> Vec<(i64, i64, i64)> {
+    let bw = x1 - x0;
+    if sw <= 0 || bw <= 0 {
+        return Vec::new();
+    }
+    if bw < 2 * sw {
+        return vec![(x0, sw.min(bw), clip.src_in)];
+    }
+    let (z, last) = (zoom.max(1) as i64, (clip.len() - 1).max(0));
+    let mut tiles = vec![(x0, sw, clip.src_in)];
+    let mut k = 1i64;
+    while x0 + (k + 1) * sw <= x1 - sw {
+        tiles.push((x0 + k * sw, sw, clip.src_in + (k * sw / z).min(last)));
+        k += 1;
+    }
+    tiles.push((x1 - sw, sw, clip.src_out - 1));
+    tiles
+}
+
+/// The video body's stills: the head still's width sets the tiles ([`head_tiles`] at the layout's zoom), each tile blitted by
+/// [`paint_head`] into its own `x..x + w` slice of `body` with the clip's `src_in` set to the tile's tick. No head still: nothing.
+pub fn paint_strip(c: &mut Canvas, l: &Layout, body: (i64, i64, i64, i64), clip: &crate::Clip, src: &dyn PeakSource) {
+    let Some(sw) = src.thumb(clip.src, clip.src_in).map(|s| s.width as i64) else { return };
+    let (x0, y0, x1, y1) = body;
+    for (x, w, tick) in head_tiles(x0, x1, sw, l.zoom, clip) {
+        paint_head(c, (x, y0, x + w, y1), &crate::Clip { src_in: tick, ..*clip }, src);
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    extern crate std;
+    use super::*;
+    use crate::{Clip, Kind, SourceId, Timeline};
+    use alloc::collections::BTreeMap;
+
+    /// A test hook: one distinct still per source tick (none for a tick it does not hold).
+    struct PerTick(BTreeMap<i64, Still>);
+    impl PeakSource for PerTick {
+        fn peaks(&self, _src: SourceId) -> Option<&Peaks> {
+            None
+        }
+        fn gain_q16(&self, _cdb: i32) -> i64 {
+            65536
+        }
+        fn thumb(&self, _src: SourceId, src_tick: i64) -> Option<&Still> {
+            self.0.get(&src_tick)
+        }
+    }
+
+    /// A 48 x 36 still marked by `tick` in its blue channel.
+    fn marked(tick: i64) -> Still {
+        let (w, h) = (48u32, 36u32);
+        let mut rgba = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 5) as u8, (y * 7) as u8, (0x40 + tick) as u8, 255]);
+            }
+        }
+        Still { width: w, height: h, rgba }
+    }
+
+    fn one_clip(clip: Clip) -> EditorState {
+        let mut tl = Timeline::new(25);
+        tl.add_source("A", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![clip];
+        EditorState::new(tl)
+    }
+
+    fn px(buf: &[u8], w: u32, x: i64, y: i64) -> [u8; 4] {
+        let i = (y as usize * w as usize + x as usize) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    fn box_is(buf: &[u8], w: u32, bx: i64, by: i64, s: &Still) -> bool {
+        (0..s.height as i64).all(|y| (0..s.width as i64).all(|x| {
+            let i = ((y * s.width as i64 + x) * 4) as usize;
+            px(buf, w, bx + x, by + y) == [s.rgba[i], s.rgba[i + 1], s.rgba[i + 2], s.rgba[i + 3]]
+        }))
+    }
+
+    #[test]
+    fn strip_tiles_narrow_one_head_and_filmstrip() {
+        let c = Clip::new(SourceId(0), 5, 55, 0);
+        assert_eq!(head_tiles(10, 30, 48, 8, &c), alloc::vec![(10, 20, 5)], "narrower than the head: the cropped head");
+        assert_eq!(head_tiles(10, 100, 48, 8, &c), alloc::vec![(10, 48, 5)], "under two heads: the head alone");
+        assert!(head_tiles(10, 100, 0, 8, &c).is_empty() && head_tiles(10, 10, 48, 8, &c).is_empty());
+        let mut want = alloc::vec![(17, 48, 5)];
+        for k in 1..=6 {
+            want.push((17 + 48 * k, 48, 5 + 6 * k));
+        }
+        want.push((367, 48, 54));
+        assert_eq!(head_tiles(17, 415, 48, 8, &c), want, "head, six middles every 48 px (6 ticks), the tail at src_out - 1");
+        // a 3-tick clip at zoom 1 over 300 px: the middle ticks clamp to the clip's last frame
+        let short = Clip::new(SourceId(0), 0, 3, 0);
+        let t = head_tiles(0, 300, 48, 1, &short);
+        assert_eq!(t.len(), 6);
+        assert!(t[1..].iter().all(|e| e.2 == 2), "middles and tail clamp to src_out - 1");
+    }
+
+    #[test]
+    fn strip_paints_head_middles_tail_inside_the_body() {
+        let mut m = BTreeMap::new();
+        for t in [0i64, 6, 12, 18, 24, 30, 36, 49] {
+            m.insert(t, marked(t));
+        }
+        let hook = PerTick(m);
+        // a 50-tick clip at tick 2, zoom 8, on a 480 px canvas: body 17..415
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 2));
+        let l = Layout::of(480, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&hook));
+        let (x0, x1) = (l.x_of(2) + 1, l.x_of(52) - 1);
+        let (y0, y1) = (l.row_y(0) + 2, l.row_y(0) + ROW_H as i64 - 2);
+        assert_eq!((x0, x1), (17, 415));
+        assert!(box_is(&buf, l.w, x0, y0, &marked(0)), "the head is src_in's still");
+        assert!(box_is(&buf, l.w, x0 + 48, y0, &marked(6)), "the first middle is the frame 6 ticks in");
+        assert!(box_is(&buf, l.w, x0 + 6 * 48, y0, &marked(36)), "the sixth middle");
+        assert!(box_is(&buf, l.w, x1 - 48, y0, &marked(49)), "the tail is src_out - 1");
+        let bar = clip_colour(0, Kind::Video);
+        for y in y0..y1 {
+            assert_eq!(px(&buf, l.w, x1 - 49, y), bar, "the gap left of the tail is the colour bar");
+        }
+        for y in 0..l.h as i64 {
+            for x in 0..l.w as i64 {
+                if !(x >= x0 && x < x1 && y >= y0 && y < y1) {
+                    assert_eq!(px(&buf, l.w, x, y), px(&none, l.w, x, y), "a strip pixel at {x},{y} outside the body");
+                }
+            }
+        }
+        std::println!("striathumbnailsmore: body {x0}..{x1} head + 6 middles + tail, fnv={:016x}", fnv1a(&buf));
+    }
+
+    #[test]
+    fn strip_missing_tiles_keep_the_bar_and_no_head_paints_nothing() {
+        let st = one_clip(Clip::new(SourceId(0), 0, 50, 2));
+        let l = Layout::of(480, 160, &st);
+        let none = paint_in(&st, l, Order::Rgba, None, None, None);
+        let mut m = BTreeMap::new();
+        m.insert(49i64, marked(49));
+        assert_eq!(paint_in(&st, l, Order::Rgba, None, None, Some(&PerTick(m))), none, "no head still: nothing, the tail neither");
+        let mut m = BTreeMap::new();
+        m.insert(0i64, marked(0));
+        let buf = paint_in(&st, l, Order::Rgba, None, None, Some(&PerTick(m)));
+        let (x0, x1, y0) = (l.x_of(2) + 1, l.x_of(52) - 1, l.row_y(0) + 2);
+        assert!(box_is(&buf, l.w, x0, y0, &marked(0)));
+        let bar = clip_colour(0, Kind::Video);
+        assert!((x0 + 48..x1).all(|x| px(&buf, l.w, x, y0 + 10) == bar), "undecoded middles and tail keep the bar");
     }
 }

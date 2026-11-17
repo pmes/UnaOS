@@ -4146,3 +4146,333 @@ fn striaproxythree_busy_waits_unreadable_and_pointer() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("striaproxythree busy: waited, reloaded, refused \"{line}\"");
 }
+
+// ---- STRIAWAVEFORM (LEDGER SR827): the peak scan rides the audio road; the face scans once (named tail block) ----
+
+/// STRIAWAVEFORM (SR827): `scan_peaks` over `synth_source(0, 50, 25)` (2 s of mono PCM16 at 48 kHz) gives 200 buckets at
+/// 100 / s, non-flat, equal (within 1 per bucket) to timeline_core's `peaks_of` over the PCM `render` mixes for one 0 dB
+/// clip covering the whole source (the mix passes one unfaded layer through bit for bit): the same decoder road. An
+/// unknown source is refused. The test line carries the scan's measured time (NLE-WAVEFORM-SCAN-THREAD owed).
+#[test]
+fn striawaveform_scan_peaks_reads_the_audio_road() {
+    use timeline_core::view::{PEAKS_PER_SEC, peaks_of};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let ti = tl.add_track(Kind::Audio);
+    tl.tracks[ti].clips = vec![Clip::new(a, 0, 50, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let t0 = std::time::Instant::now();
+    let p = stria::nle::scan_peaks(&src, a, PEAKS_PER_SEC).unwrap().expect("the synth reel has audio");
+    let took = t0.elapsed();
+    assert_eq!((p.per_sec, p.buckets.len()), (100, 200));
+    let max = p.buckets.iter().copied().max().unwrap();
+    assert!(max > 0 && p.buckets.iter().any(|&b| b != max), "a non-flat table: {:?}", &p.buckets[..10]);
+    let mut sink = Collect::default();
+    render(&tl, 0..50, &src, &mut sink).unwrap();
+    assert_eq!(sink.pcm.len(), 2 * SYNTH_RATE as usize);
+    let mixed = peaks_of(SYNTH_RATE, 1, &sink.pcm, PEAKS_PER_SEC);
+    assert_eq!(mixed.buckets.len(), p.buckets.len());
+    assert!(mixed.buckets.iter().zip(&p.buckets).all(|(m, s)| (*m as i32 - *s as i32).abs() <= 1), "the scan and the mix agree");
+    assert!(stria::nle::scan_peaks(&src, SourceId(9), PEAKS_PER_SEC).is_err(), "an unknown source is refused");
+    println!("striawaveform: scan buckets={} per_sec={} max={max} scan_ms={:.3} (2-s synth source, on the calling thread)", p.buckets.len(), p.per_sec, took.as_secs_f64() * 1e3);
+}
+
+/// STRIAWAVEFORM (SR827): the synth fixture's face scans each audio source once (reels A and B, both on A1) across three
+/// paints; reel A's table is 200 buckets; the A1 row's first clip body shows more than one colour (the peaks over the body).
+#[test]
+fn striawaveform_face_scans_once_across_three_paints() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert_eq!(face.wave_scans(), 0, "Face::new scans nothing");
+    let first = face.paint();
+    assert_eq!(face.wave_scans(), 2, "the first paint scans A and B");
+    let _ = face.paint();
+    let third = face.paint();
+    assert_eq!(face.wave_scans(), 2, "three paints, two scans");
+    assert_eq!(first, third, "the tables never change the picture between paints");
+    let a = face.state.timeline.tracks[1].clips[0];
+    assert_eq!(face.wave_peaks(a.src).map(|p| p.buckets.len()), Some(200));
+    let l = face.layout();
+    let (y0, y1) = (l.row_y(1) + 2, l.row_y(1) + stria::nle_face::ROW_H as i64 - 2);
+    let (x0, x1) = (l.x_of(a.at) + 1, l.x_of(a.end()) - 1);
+    let mut seen: Vec<[u8; 4]> = Vec::new();
+    for y in y0..y1 {
+        for x in x0.max(1)..x1.min(l.w as i64) {
+            let i = (y as usize * l.w as usize + x as usize) * 4;
+            let c = [third[i], third[i + 1], third[i + 2], third[i + 3]];
+            if !seen.contains(&c) {
+                seen.push(c);
+            }
+        }
+    }
+    assert!(seen.len() > 1, "the audio body shows its peaks");
+    println!("striawaveform: face scans={} after 3 paints body_colours={}", face.wave_scans(), seen.len());
+}
+
+// ---- STRIATHUMBNAILS (LEDGER SR839): a video clip's head is its src_in frame, decoded once per key (named tail block) ----
+
+/// STRIATHUMBNAILS (SR839): the head still the face should hold for `(src, src_in)`: `preview` of a one-clip timeline at tick 0,
+/// scaled by `view::head_still` (the face's own road, re-walked here).
+fn striathumbnails_expected(tl: &Timeline, src: &Sources, id: SourceId, src_in: i64) -> timeline_core::view::Still {
+    let mut one = tl.clone();
+    one.tracks.clear();
+    let v = one.add_track(Kind::Video);
+    one.tracks[v].clips.push(Clip::new(id, src_in, src_in + 1, 0));
+    let full = stria::nle_face::preview(&one, src, 0).unwrap().expect("a frame");
+    timeline_core::view::head_still(&full).expect("a head")
+}
+
+/// STRIATHUMBNAILS (SR839): the box `(x0, y0)`, `w` x `h` of an RGBA canvas `w_canvas` wide, as bytes.
+fn striathumbnails_box(buf: &[u8], w_canvas: u32, x0: i64, y0: i64, w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for y in 0..h as i64 {
+        let i = ((y0 + y) as usize * w_canvas as usize + x0 as usize) * 4;
+        out.extend_from_slice(&buf[i..i + w as usize * 4]);
+    }
+    out
+}
+
+/// STRIATHUMBNAILS (SR839): the synth fixture's face: V1 clip 0 (reel A, src_in 13) shows its src_in frame at the body's left
+/// (the box == the cached head == the preview road's frame scaled), the box's dominant colour is the source frame's, the colour
+/// bar continues to the right; three paints decode the three video heads once (the audio clips none). The line carries the
+/// measured decode time per head (on the face's thread).
+#[test]
+fn striathumbnails_face_head_is_the_src_in_frame_decoded_once() {
+    use timeline_core::view::{HEAD_H, clip_colour};
+    let (tl, src) = synth_fixture();
+    let expect = striathumbnails_expected(&tl, &src, SourceId(0), 13);
+    // the decode cost of one head: the face's road (`preview` of a one-clip timeline + `head_still`), timed over the 3 heads
+    let t0 = std::time::Instant::now();
+    for (id, at) in [(SourceId(0), 13), (SourceId(1), 0), (SourceId(0), 23)] {
+        let _ = striathumbnails_expected(&tl, &src, id, at);
+    }
+    let per_head = t0.elapsed() / 3;
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert_eq!(face.thumb_decodes(), 0, "Face::new decodes nothing");
+    let t0 = std::time::Instant::now();
+    let first = face.paint();
+    let took = t0.elapsed(); // the whole first paint: the preview band, SR827's two peak scans and the three heads
+    assert_eq!(face.thumb_decodes(), 3, "the first paint decodes the three video heads");
+    assert!(!face.thumbs_pending());
+    let head = face.thumb(SourceId(0), 13).expect("A@13 decoded").clone();
+    assert_eq!((head.width, head.height), (48, HEAD_H));
+    assert_eq!(head, expect, "the head is the preview road's src_in frame");
+    let c = face.state.timeline.tracks[0].clips[0];
+    let l = face.layout();
+    let (bx, by) = (l.x_of(c.at) + 1, l.row_y(0) + 2);
+    let got = striathumbnails_box(&first, l.w, bx, by, head.width, head.height);
+    assert_eq!(got, head.rgba, "the head box shows the cached still 1:1");
+    // the box's dominant colour is the frame's (the bars)
+    let dominant = |px: &[u8]| {
+        let mut n: Vec<([u8; 4], usize)> = Vec::new();
+        for p in px.chunks(4) {
+            let p = [p[0], p[1], p[2], p[3]];
+            match n.iter_mut().find(|e| e.0 == p) {
+                Some(e) => e.1 += 1,
+                None => n.push((p, 1)),
+            }
+        }
+        n.into_iter().max_by_key(|e| e.1).map(|e| e.0)
+    };
+    assert_eq!(dominant(&got), dominant(&expect.rgba));
+    let bar = clip_colour(c.src.0, Kind::Video);
+    let i = ((by + 10) as usize * l.w as usize + (bx + head.width as i64) as usize) * 4;
+    assert_eq!(&first[i..i + 4], &bar, "the colour bar continues right of the box");
+    let _ = face.paint();
+    let third = face.paint();
+    assert_eq!(face.thumb_decodes(), 3, "three paints, three decodes");
+    assert_eq!(first, third, "the heads never change the picture between paints");
+    println!("striathumbnails: head={}x{} box_match=1 decodes after 3 paints={} thumb_us={} per head first_paint_us={} (synth 64x48, face thread)", head.width, head.height, face.thumb_decodes(), per_head.as_micros(), took.as_micros());
+}
+
+/// STRIATHUMBNAILS (SR839): trimming V1 clip 0's in by 5 frames changes its key (A@13 -> A@18): the next paint decodes the new
+/// head once and the box shows it.
+#[test]
+fn striathumbnails_trim_in_changes_the_head() {
+    let (tl, src) = synth_fixture();
+    let expect = striathumbnails_expected(&tl, &src, SourceId(0), 18);
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    let before = face.paint();
+    let l = face.layout();
+    let c = face.state.timeline.tracks[0].clips[0];
+    let old_box = striathumbnails_box(&before, l.w, l.x_of(c.at) + 1, l.row_y(0) + 2, 48, 36);
+    face.state.select(0, 0).unwrap();
+    face.state.trim(stria::nle_face::Edge::In, 5).unwrap();
+    face.state.deselect(); // the selection outline and trim handles paint over a body (the painter's order): off for the box read
+    let c = face.state.timeline.tracks[0].clips[0];
+    assert_eq!(c.src_in, 18);
+    let after = face.paint();
+    assert_eq!(face.thumb_decodes(), 4, "one more decode: the new key");
+    assert_eq!(face.thumb(SourceId(0), 18), Some(&expect));
+    let l = face.layout();
+    // the trimmed body (5 ticks at zoom 8: 38 px) is narrower than the 48 px head: the box is the head's centre 38 columns
+    let bw = (l.x_of(c.end()) - 1 - (l.x_of(c.at) + 1)) as u32;
+    assert_eq!(bw, 38);
+    let new_box = striathumbnails_box(&after, l.w, l.x_of(c.at) + 1, l.row_y(0) + 2, bw, 36);
+    let c0 = ((48 - bw) / 2) as usize;
+    let crop: Vec<u8> = expect.rgba.chunks(48 * 4).flat_map(|row| row[c0 * 4..(c0 + bw as usize) * 4].to_vec()).collect();
+    assert_eq!(new_box, crop, "the box shows the frame at the new src_in, clipped to the body");
+    assert_ne!(new_box, old_box[..].chunks(48 * 4).flat_map(|row| row[c0 * 4..(c0 + bw as usize) * 4].to_vec()).collect::<Vec<u8>>(), "the head changed with src_in");
+    println!("striathumbnails: trim in +5 -> head A@{} decodes={}", c.src_in, face.thumb_decodes());
+}
+
+/// STRIATHUMBNAILS (SR839): ten 5-frame video clips (zoom 4, all on the canvas): the first paint decodes THUMBS_PER_PAINT (4),
+/// the second 8, the third all 10; `thumbs_pending` (what keeps `serve`'s clock running on an idle face) is true until then.
+#[test]
+fn striathumbnails_ten_clips_fill_over_three_paints() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let v = tl.add_track(Kind::Video);
+    tl.tracks[v].clips = (0..10).map(|i| Clip::new(a, i * 5, i * 5 + 5, i * 5)).collect();
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let mut st = EditorState::new(tl);
+    st.zoom = 4;
+    let mut face = Face::new(st, src, (320, 160), PixelOrder::Rgba, false);
+    let mut seen = Vec::new();
+    let mut pending = Vec::new();
+    for _ in 0..3 {
+        let _ = face.paint();
+        seen.push(face.thumb_decodes());
+        pending.push(face.thumbs_pending());
+    }
+    assert_eq!(seen, vec![4, 8, 10], "THUMBS_PER_PAINT per paint");
+    assert_eq!(pending, vec![true, true, false], "pending until every visible head is decoded");
+    assert_eq!(stria::nle_face::THUMBS_PER_PAINT, 4);
+    let _ = face.paint();
+    assert_eq!(face.thumb_decodes(), 10, "a fourth paint decodes nothing");
+    println!("striathumbnails: ten clips decodes={}/{}/{} pending={pending:?}", seen[0], seen[1], seen[2]);
+}
+
+// ---- STRIATHUMBNAILSMORE (LEDGER SR949): a wide video clip's filmstrip and tail, decoded on the heads' budget (named tail block) ----
+
+/// STRIATHUMBNAILSMORE (SR949): the synth fixture at zoom 16 on a 640 px canvas (each V1 body 158 px, over two 48 px heads):
+/// painted until no tile is pending, clip 0 (A[13,23)@0) shows A@13 at its left, A@16 (48 px / 16 px per tick = 3 ticks in)
+/// next to it and A@22 (src_out - 1) right-aligned, each box the preview road's frame scaled; three clips x three stills =
+/// nine decodes, and a further paint decodes none.
+#[test]
+fn striathumbnailsmore_face_filmstrip_and_tail() {
+    let (tl, src) = synth_fixture();
+    let want = [13i64, 16, 22].map(|t| striathumbnails_expected(&tl, &src, SourceId(0), t));
+    let mut st = EditorState::new(tl);
+    st.zoom = 16;
+    let mut face = Face::new(st, src, (640, 160), PixelOrder::Rgba, false);
+    let mut buf = face.paint();
+    let mut paints = 1;
+    while face.thumbs_pending() && paints < 10 {
+        buf = face.paint();
+        paints += 1;
+    }
+    assert!(!face.thumbs_pending(), "every visible tile decoded within {paints} paints");
+    assert_eq!(face.thumb_decodes(), 9, "three clips: head, one middle, tail each");
+    let c = face.state.timeline.tracks[0].clips[0];
+    let l = face.layout();
+    let (x0, x1, y0) = (l.x_of(c.at) + 1, l.x_of(c.end()) - 1, l.row_y(0) + 2);
+    assert_eq!(x1 - x0, 158);
+    for (i, (bx, t)) in [(x0, 13i64), (x0 + 48, 16), (x1 - 48, 22)].into_iter().enumerate() {
+        assert_eq!(face.thumb(SourceId(0), t), Some(&want[i]), "A@{t} cached");
+        let got = striathumbnails_box(&buf, l.w, bx, y0, want[i].width, want[i].height);
+        assert_eq!(got, want[i].rgba, "the box at x {bx} is A@{t}");
+    }
+    let again = face.paint();
+    assert_eq!(face.thumb_decodes(), 9, "a further paint decodes nothing");
+    assert_eq!(again, buf, "the strip never changes the picture between paints");
+    println!("striathumbnailsmore: filmstrip A@13 / A@16 / A@22 decodes={} paints={paints}", face.thumb_decodes());
+}
+
+/// STRIATHUMBNAILSMORE (SR949): heads first: four wide clips (zoom 16, 158 px bodies) on a 640 px canvas: the first paint's
+/// THUMBS_PER_PAINT (4) decodes are the four heads and leaves the tiles pending; the next paints fill every middle and tail.
+#[test]
+fn striathumbnailsmore_heads_before_tiles() {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let v = tl.add_track(Kind::Video);
+    tl.tracks[v].clips = (0..5).map(|i| Clip::new(a, i * 10, i * 10 + 10, i * 10)).collect();
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 50, 25)).unwrap();
+    let mut st = EditorState::new(tl);
+    st.zoom = 16;
+    let mut face = Face::new(st, src, (640, 160), PixelOrder::Rgba, false);
+    let _ = face.paint();
+    assert_eq!(face.thumb_decodes(), 4, "THUMBS_PER_PAINT");
+    assert!(face.thumbs_pending(), "tiles left");
+    for i in 0..4i64 {
+        assert!(face.thumb(a, i * 10).is_some(), "head {i} first");
+        assert!(face.thumb(a, i * 10 + 3).is_none() && face.thumb(a, i * 10 + 9).is_none(), "no tile of clip {i} before every head");
+    }
+    let mut paints = 1;
+    while face.thumbs_pending() && paints < 10 {
+        let _ = face.paint();
+        paints += 1;
+    }
+    assert_eq!(face.thumb_decodes(), 12, "four visible clips x (head, middle, tail); clip 4 is off the canvas");
+    for i in 0..4i64 {
+        assert!(face.thumb(a, i * 10 + 3).is_some() && face.thumb(a, i * 10 + 9).is_some(), "clip {i}'s middle and tail");
+    }
+    println!("striathumbnailsmore: heads first, decodes=12 after {paints} paints");
+}
+
+// ---- STRIATHUMBNAILSNEXT (LEDGER SR997): heads and peak tables decoded off the face's thread (named tail block) ----
+
+/// STRIATHUMBNAILSNEXT (SR997): a face decoding off its thread paints its first frame with no head (the jobs queued, the face
+/// pending); once the worker settles it holds the three heads (the preview road's frames) and its next paint is a synchronous
+/// face's first paint, byte for byte.
+#[test]
+fn striathumbnailsnext_heads_decode_off_the_face_thread() {
+    let (tl, src) = synth_fixture();
+    let expect = striathumbnails_expected(&tl, &src, SourceId(0), 13);
+    let (tl2, src2) = synth_fixture();
+    let mut sync = Face::new(EditorState::new(tl2), src2, (320, 160), PixelOrder::Rgba, false);
+    let want = sync.paint();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.decode_off_thread();
+    assert!(face.bg_running());
+    let first = face.paint();
+    assert_eq!(face.thumb_decodes(), 0, "the first paint decodes no head on the face's thread");
+    assert!(face.thumb(SourceId(0), 13).is_none(), "the placeholder holds the bar");
+    assert!(face.thumbs_pending(), "jobs out: serve's clock keeps running");
+    face.bg_settle();
+    assert_eq!(face.thumb_decodes(), 3, "the worker decoded the three heads once");
+    assert_eq!(face.thumb(SourceId(0), 13), Some(&expect), "the worker's head is the preview road's src_in frame");
+    let second = face.paint();
+    assert!(!face.thumbs_pending());
+    assert_ne!(first, second, "the heads and peaks landed");
+    assert_eq!(second, want, "the settled face paints the synchronous face's frame");
+    println!("striathumbnailsnext: first paint decodes=0 pending=1, settled decodes={} second==sync", face.thumb_decodes());
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): the peak scans go to the worker too: none after the first paint, then the synchronous face's
+/// scans and tables once settled.
+#[test]
+fn striathumbnailsnext_peaks_scan_off_the_face_thread() {
+    let (tl2, src2) = synth_fixture();
+    let mut sync = Face::new(EditorState::new(tl2), src2, (320, 160), PixelOrder::Rgba, false);
+    let _ = sync.paint();
+    assert!(sync.wave_scans() > 0);
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    face.decode_off_thread();
+    let _ = face.paint();
+    assert_eq!(face.wave_scans(), 0, "no scan on the face's thread");
+    assert!(face.wave_peaks(SourceId(0)).is_none());
+    face.bg_settle();
+    assert_eq!(face.wave_scans(), sync.wave_scans());
+    for id in [SourceId(0), SourceId(1)] {
+        assert_eq!(face.wave_peaks(id), sync.wave_peaks(id), "source {id:?}'s table");
+    }
+    println!("striathumbnailsnext: settled scans={}", face.wave_scans());
+}
+
+/// STRIATHUMBNAILSNEXT (SR997): a face nobody serves starts no worker and decodes inside the paint as before.
+#[test]
+fn striathumbnailsnext_unserved_face_stays_synchronous() {
+    let (tl, src) = synth_fixture();
+    let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(!face.bg_running());
+    let _ = face.paint();
+    assert_eq!(face.thumb_decodes(), 3);
+    assert!(!face.thumbs_pending());
+    face.bg_settle();
+    assert_eq!(face.thumb_decodes(), 3, "settling a face with no worker is a no-op");
+}
