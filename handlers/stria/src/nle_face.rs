@@ -386,6 +386,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Meta+Shift+less", "slide-10"),
     ("Ctrl+Shift+greater", "slide+10"),
     ("Meta+Shift+greater", "slide+10"),
+    ("y", "link-av"), ("Y", "unlink"), ("Ctrl+l", "link"), ("Meta+l", "link"), ("Ctrl+Shift+L", "unlink-all"), ("Shift+Meta+L", "unlink-all"), // STRIALINKAUTOTHREE (SR9039): the four link words' keys (text y / Y, the Player's letters; GTK orders a chord Ctrl, Alt, Shift, Meta)
     ("?", "help"), // NLE5DKEYSHELP (SR744): `?` (Shift+/, text) shows the keys help over the timeline band (file tail)
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
@@ -2602,6 +2603,7 @@ pub const HELP: &[(&str, &str)] = &[
     ("slip+10", "slip the clip 10 frames on"),
     ("slide-10", "slide the clip 10 frames earlier"),
     ("slide+10", "slide the clip 10 frames later"),
+    ("link-av", "link each picture to its sound"), ("unlink", "unlink the selected clips"), ("link", "link the selected clips"), ("unlink-all", "unlink every clip"), // STRIALINKAUTOTHREE (SR9039): the link keys' phrases
     ("help", "show / hide this help"),
 ];
 /// NLE5DKEYSHELP (SR744): the help's inset from the band's top and left (px).

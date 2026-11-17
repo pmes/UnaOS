@@ -3732,3 +3732,57 @@ fn strialinkautofuzz_edl_document_links_by_word() {
     assert_ne!(st.timeline, back, "the word linked the V1 / A1 pairs");
     assert_eq!((st.timeline.clone(), st.undo_depth()), (back.link_av(), 1), "one commit");
 }
+
+// ---- STRIALINKAUTOTHREE (LEDGER SR9039): the link words' keys (named tail block) ----
+const STRIALINKAUTOTHREE_KEYS: [(&str, &str); 6] = [("y", "link-av"), ("Y", "unlink"), ("Ctrl+l", "link"), ("Meta+l", "link"), ("Ctrl+Shift+L", "unlink-all"), ("Shift+Meta+L", "unlink-all")];
+
+/// The six KEYS rows name the four link words; each word's help row carries its keys and its phrase.
+#[test]
+fn strialinkautothree_keys_name_the_link_words() {
+    let rows = help_rows();
+    for (k, w) in STRIALINKAUTOTHREE_KEYS {
+        assert!(KEYS.contains(&(k, w)), "{k} -> {w}");
+        assert!(VERBS.contains(&w), "{w} is a VERBS word");
+        assert!(HELP.iter().any(|(a, _)| *a == w), "no phrase for {w}");
+        let row = rows.iter().find(|(_, p)| *p == help_phrase(w)).expect("the word's help row");
+        assert!(row.0.split(" / ").any(|x| x == k), "{k:?} not in {:?}", row.0);
+    }
+    assert_eq!(help_phrase("link-av"), "link each picture to its sound");
+    assert_eq!(help_phrase("unlink-all"), "unlink every clip");
+    println!("strialinkautothree: {} link keys, help rows={}", STRIALINKAUTOTHREE_KEYS.len(), rows.len());
+}
+
+/// The keys drive the words through `Face::verb`: `y` links the V1 / A1 pairs, `Y` parts the selection's pair, Ctrl+l
+/// links the selection, Ctrl+Shift+L parts every link; one undo step each. A one-char key as BrowserKey is not taken.
+#[test]
+fn strialinkautothree_keys_drive_the_link_words() {
+    let (tl, src) = synth_fixture();
+    let tl0 = tl.clone();
+    let mut face = nlefaceexport_face(tl, src);
+    assert!(!face.on(&bandy::SMessage::BrowserKey("y".into())), "a one-char BrowserKey alone is not taken");
+    assert_eq!(face.state.timeline, tl0);
+    assert!(face.on(&bandy::SMessage::BrowserText("y".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl0.link_av(), 1), "y: every pair linked, one step");
+    face.state.select(0, 0).unwrap();
+    assert_eq!(face.state.set, vec![(0, 0), (1, 0)], "the picture takes its sound");
+    let linked = face.state.timeline.clone();
+    assert!(face.on(&bandy::SMessage::BrowserText("Y".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (linked.set_group(&[(0, 0), (1, 0)], 0).unwrap(), 2), "Y: the pair parted");
+    face.state.deselect();
+    face.state.select(0, 0).unwrap();
+    face.state.select_add(1, 0).unwrap();
+    let before = face.state.timeline.clone();
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+l".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (before.set_group(&[(0, 0), (1, 0)], before.next_group()).unwrap(), 3), "Ctrl+l: one fresh group");
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+Shift+L".into())));
+    assert_eq!(face.last_error.take(), None);
+    assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl0.clone(), 4), "Ctrl+Shift+L: every link parted");
+    face.state.deselect();
+    assert!(face.on(&bandy::SMessage::BrowserKey("Ctrl+l".into())));
+    assert_eq!(face.last_error.take().as_deref(), Some("link: no such clip"), "nothing selected, on the message row");
+    assert_eq!(face.state.undo_depth(), 4);
+    println!("strialinkautothree: y, Y, Ctrl+l, Ctrl+Shift+L: four steps");
+}
