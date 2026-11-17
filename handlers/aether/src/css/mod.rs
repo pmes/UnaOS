@@ -1317,7 +1317,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
         if r == r.trunc() { format!("{}", r as i64) } else { format!("{r}") }
     }
     let px = |v: f32| format!("{}px", num(v));
-    let rgb = |c: (u8, u8, u8)| format!("rgb({}, {}, {})", c.0, c.1, c.2);
+    let rgb = |c: (u8, u8, u8)| rgba(c, 1.0); // AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): every report colour through ONE alpha-aware serializer
     let lp = |v: LengthPercentage| {
         use taffy::style::ExpandedLengthPercentage as E;
         match v.expand() {
@@ -1452,7 +1452,7 @@ pub fn computed_report(tree: &LayoutTree) -> std::collections::HashMap<html_core
                 sstyle(1), sstyle(2), sstyle(3), // SR1103
                 scolor(0), scolor(1), scolor(2), // SR1104
                 layout_core::css::text_decoration_style_word(paint.decoration_style.unwrap_or(0)).to_string(), paint.decoration_thickness.flatten().map(px).unwrap_or_else(|| "auto".to_string()),
-                me.ul_offset.map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), rgb(me.caret.map_or(me.color, |c| (c.0, c.1, c.2))), // SR1108
+                me.ul_offset.map(px).unwrap_or_else(|| "auto".to_string()), layout_core::css::underline_position_word(me.ul_pos).to_string(), me.caret.map_or_else(|| rgb(me.color), |c| rgba((c.0, c.1, c.2), c.3 as f32 / 255.0)), // SR1108
             ];
             out.insert(id, values);
             inh.insert(id, me);
@@ -1979,4 +1979,13 @@ pub(crate) fn line_height_used_px(paint: &crate::layout::PaintStyle, mult: f32, 
 /// [`computed_report`] reads margin / padding for every side through one expression.
 fn rect_side<T: Copy>(r: &taffy::geometry::Rect<T>, i: usize) -> T {
     [r.top, r.right, r.bottom, r.left][i]
+}
+
+// ---- AETHERCSSOMBORDERSIDEALPHAREAD (LEDGER SR1115): the report's colour columns serialize alpha (named tail block) ----
+
+/// AETHERCSSOMBORDERSIDEALPHAREAD (SR1115): [`computed_report`]'s ONE colour serializer: `c` at alpha `a` through
+/// css_core's [`css_core::color::Rgba::serialize`] (the tree's one: `rgb(r, g, b)` at a >= 1, else `rgba(r, g, b, a)` with
+/// a through 8 bits as the shortest round-tripping decimal), so a half-alpha border side reads `rgba(255, 0, 0, 0.5)`.
+fn rgba(c: (u8, u8, u8), a: f32) -> String {
+    css_core::color::Rgba { r: c.0 as f64, g: c.1 as f64, b: c.2 as f64, a: a as f64 }.serialize()
 }
