@@ -2792,9 +2792,9 @@ fn frame_walk(
                     // layer of an intrinsically-sized sheet).
                     if let Some(img) = layer.url().and_then(crate::images::get) {
                         let g = resolve_bg_geometry(
-                            spec.bg_size.as_deref(),
-                            spec.bg_position.as_deref(),
-                            spec.bg_repeat,
+                            layer.size,
+                            layer.position,
+                            layer.repeat,
                             bw,
                             bh,
                             img.width() as f32,

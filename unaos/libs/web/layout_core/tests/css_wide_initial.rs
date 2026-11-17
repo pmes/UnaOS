@@ -1032,3 +1032,81 @@ fn background_shorthand_reset_keywords_and_gradient_arm() {
     let s = cascade(&[&[("background-repeat", "no-repeat"), ("background-color", "red")], &[("background", "linear-gradient(red, blue)")]]);
     assert_eq!((s.paint.bg_repeat, s.paint.bg_alpha), (Some(0), Some(0.0)), "the gradient arm resets repeat and colour");
 }
+
+// ---- AETHERCSSBACKGROUNDLAYERPROPS (LEDGER SR1070): background-repeat / -position / -size are per-layer lists (named tail block) ----
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): each layer's (url, repeat, position, size) as the painter reads them through
+/// `bg_layers_bottom_up`, TOP layer first.
+fn bg_layer_props(s: &SpecifiedStyle<TH>) -> Vec<(Option<String>, Option<u8>, Option<String>, Option<String>)> {
+    let mut v: Vec<_> = s
+        .paint
+        .bg_layers_bottom_up()
+        .iter()
+        .map(|l| (l.url().map(str::to_string), l.repeat, l.position.map(str::to_string), l.size.map(str::to_string)))
+        .collect();
+    v.reverse();
+    v
+}
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): `background-repeat: no-repeat, repeat` over two image layers is layer 0
+/// no-repeat and layer 1 repeat (it was dropped whole: armed), position / size lists the same by index.
+#[test]
+fn background_layer_props_longhand_list_by_index() {
+    let s = styled(&[
+        ("background-image", "url(a.png), url(b.png)"),
+        ("background-repeat", "no-repeat, repeat"),
+        ("background-position", "center, 0 0"),
+        ("background-size", "2px 2px, auto"),
+    ]);
+    assert_eq!((s.paint.bg_repeat, s.paint.bg_repeat_more.clone()), (Some(1), Some(vec![0])), "the repeat list is stored");
+    let p = bg_layer_props(&s);
+    assert_eq!(p[0], (Some("a.png".to_string()), Some(1), Some("center".to_string()), Some("2px 2px".to_string())), "layer 0");
+    assert_eq!(p[1], (Some("b.png".to_string()), Some(0), Some("0 0".to_string()), Some("auto".to_string())), "layer 1");
+    assert_eq!(styled(&[("background-repeat", "no-repeat, bogus")]).paint.bg_repeat, None, "an unparsable item drops the list");
+}
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): a shorter list repeats cyclically (§2.3): `background-size: cover` covers
+/// all three layers, `no-repeat, repeat-x` alternates.
+#[test]
+fn background_layer_props_shorter_list_cycles() {
+    let s = styled(&[
+        ("background-image", "url(a.png), url(b.png), url(c.png)"),
+        ("background-size", "cover"),
+        ("background-repeat", "no-repeat, repeat-x"),
+    ]);
+    let p = bg_layer_props(&s);
+    assert_eq!(p.len(), 3, "three layers");
+    assert!(p.iter().all(|l| l.3.as_deref() == Some("cover")), "every layer covers: {p:?}");
+    assert_eq!(p.iter().map(|l| l.1).collect::<Vec<_>>(), vec![Some(1), Some(2), Some(1)], "the repeat list cycles");
+}
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): the shorthand's words are scanned per comma layer: the logo layer keeps its
+/// `no-repeat center / 50% auto`, the texture layer its `repeat` and the initials (armed: the old scan let the last
+/// repeat word win for both and took `50% auto,` across the comma).
+#[test]
+fn background_layer_props_shorthand_per_layer() {
+    let s = styled(&[("background", "url(a.png) no-repeat center / 50% auto, url(b.png) repeat")]);
+    let p = bg_layer_props(&s);
+    assert_eq!(p[0], (Some("a.png".to_string()), Some(1), Some("center".to_string()), Some("50% auto".to_string())), "the top layer");
+    assert_eq!(p[1], (Some("b.png".to_string()), Some(0), Some("0% 0%".to_string()), Some("auto".to_string())), "the bottom layer");
+    let one = styled(&[("background", "url(a.png) no-repeat 0 -304px / 100%")]);
+    assert_eq!((one.paint.bg_repeat, one.paint.bg_position.as_deref(), one.paint.bg_size.as_deref()), (Some(1), Some("0 -304px"), Some("100%")), "one layer as before");
+}
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): across rules a later `background-size` list replaces the whole earlier list,
+/// the `background` shorthand resets the lists, and a repeat list from one rule survives a later `background-image`
+/// list (four independent longhands).
+#[test]
+fn background_layer_props_cascade() {
+    let imgs: &[(&str, &str)] = &[("background-image", "url(a.png), url(b.png)")];
+    let s = cascade(&[imgs, &[("background-size", "10px, 20px")]]);
+    assert_eq!(bg_layer_props(&s).iter().map(|l| l.3.clone()).collect::<Vec<_>>(), vec![Some("10px".to_string()), Some("20px".to_string())], "the list (armed)");
+    let s = cascade(&[imgs, &[("background-size", "10px, 20px")], &[("background-size", "30px")]]);
+    assert_eq!(s.paint.bg_size_more, Some(vec![]), "the later one-value list replaces the earlier tail");
+    assert!(bg_layer_props(&s).iter().all(|l| l.3.as_deref() == Some("30px")), "both layers take the later size");
+    let s = cascade(&[&[("background-repeat", "no-repeat, repeat-x")], &[("background", "red")]]);
+    assert_eq!((s.paint.bg_repeat, s.paint.bg_repeat_more.clone()), (Some(0), Some(vec![])), "the shorthand resets the list");
+    assert_eq!((s.paint.bg_position_more.clone(), s.paint.bg_size_more.clone()), (Some(vec![]), Some(vec![])), "and the other two");
+    let s = cascade(&[&[("background-repeat", "no-repeat, repeat-x")], imgs]);
+    assert_eq!(bg_layer_props(&s).iter().map(|l| l.1).collect::<Vec<_>>(), vec![Some(1), Some(2)], "the repeat list survives a later image list");
+}

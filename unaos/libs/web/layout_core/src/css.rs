@@ -1244,7 +1244,7 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         }
         "background" if value.to_ascii_lowercase().contains("-gradient(") => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // A gradient layer (css-images-3 §3.1, §3.2) plus any colour outside it.
-            bg_image_layers::<H>(&mut style.paint, value);
+            bg_image_layers::<H>(&mut style.paint, value); bg_shorthand_layer_props::<H>(&mut style.paint, value);
             let lower = value.to_ascii_lowercase();
             let start = ["repeating-linear-gradient(", "repeating-radial-gradient(", "linear-gradient(", "radial-gradient("]
                 .iter()
@@ -1288,41 +1288,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         "background" => { bg_shorthand_reset::<H>(&mut style.paint, value); bg_currentcolor::<H>(&mut style.paint, value);
             // Shorthand: a color and/or an image url, plus the repeat
             // keyword and a `position / size` pair when present.
-            bg_shorthand_none::<H>(&mut style.paint, value); if extract_css_url(value).is_some() {
+            bg_shorthand_none::<H>(&mut style.paint, value); bg_shorthand_layer_props::<H>(&mut style.paint, value); if extract_css_url(value).is_some() {
                 bg_image_layers::<H>(&mut style.paint, value);
-            }
-            // Components outside url(...) — the url may itself hold slashes
-            // and keywords, so scan only what is left after removing it.
-            let outside = strip_css_urls(value);
-            // AETHERCSSSPLITAUDIT (SR426): the components, the position / size `/` and the size pair at paren depth 0
-            // (`rgb(0 0 0 / 50%)`, `calc(10px + 5px) 0 / calc(50% - 2px) auto` stay whole).
-            for part in split_top_level(&outside) {
-                if let Some(r) = parse_repeat(part) {
-                    style.paint.bg_repeat = Some(r);
-                }
-            }
-            if let (pos, Some(size)) = split_top_level_slash(&outside) {
-                let pos: String = split_top_level(pos)
-                    .into_iter()
-                    .filter(|t| is_position_token(t))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !pos.is_empty() {
-                    style.paint.bg_position = Some(pos);
-                }
-                let size = split_top_level(size).into_iter().take(2).collect::<Vec<_>>().join(" ");
-                if !size.is_empty() {
-                    style.paint.bg_size = Some(size);
-                }
-            } else {
-                let pos: String = split_top_level(&outside)
-                    .into_iter()
-                    .filter(|t| is_position_token(t))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !pos.is_empty() {
-                    style.paint.bg_position = Some(pos);
-                }
             }
             let mut got_color = false;
             for part in split_top_level(value) {
@@ -1668,17 +1635,17 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
         },
         "background-size" => {
             if !is_neutral_keyword(value) {
-                style.paint.bg_size = Some(value.to_string());
+                if let Some((first, more)) = bg_layer_prop_list(value, |v| Some(v.to_string())) { style.paint.bg_size = Some(first); style.paint.bg_size_more = Some(more); }
             }
         }
         "background-position" => {
             if !is_neutral_keyword(value) {
-                style.paint.bg_position = Some(value.to_string());
+                if let Some((first, more)) = bg_layer_prop_list(value, |v| Some(v.to_string())) { style.paint.bg_position = Some(first); style.paint.bg_position_more = Some(more); }
             }
         }
         "background-repeat" => {
-            if let Some(r) = parse_repeat(value) {
-                style.paint.bg_repeat = Some(r);
+            if let Some((r, more)) = bg_layer_prop_list(value, parse_repeat) {
+                style.paint.bg_repeat = Some(r); style.paint.bg_repeat_more = Some(more);
             }
         }
         // Replaced-content fitting (CSS Images 3 §5.5–5.6): how a <video>
@@ -2610,7 +2577,7 @@ pub fn merge_paint<H: Host>(dst: &mut PaintStyle<H>, src: &PaintStyle<H>) {
         }
     }
     merge_bg_image_none(dst, src); merge_bg_layers(dst, src); clone!(pct_math, bg_gradient, shadows);
-    clone!(bg_image, bg_more, bg_size, bg_position, mask_image, mask_size, mask_position, object_position);
+    clone!(bg_image, bg_more, bg_size, bg_position, bg_repeat_more, bg_position_more, bg_size_more, mask_image, mask_size, mask_position, object_position);
 }
 
 
@@ -4252,5 +4219,73 @@ fn bg_shorthand_reset<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
     paint.currentcolor &= !crate::paint::CC_BG;
     paint.bg_repeat = parse_repeat("repeat");
     paint.bg_position = Some("0% 0%".to_string());
-    paint.bg_size = Some("auto".to_string());
+    paint.bg_size = Some("auto".to_string()); paint.bg_repeat_more = Some(Vec::new()); paint.bg_position_more = Some(Vec::new()); paint.bg_size_more = Some(Vec::new());
+}
+
+// ---- AETHERCSSBACKGROUNDLAYERPROPS (LEDGER SR1070): background-repeat / -position / -size are per-layer lists (named tail block) ----
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): css-backgrounds-3 §2.3: `background-repeat` / `-position` / `-size` are comma
+/// layer lists matched to the image layers. The value splits at depth-0 commas (`anim::split_commas`, SR1052's
+/// splitter); the first value goes to the first layer's field, the rest to its `_more` list (Some even when empty, so
+/// `merge_paint` replaces an earlier block's whole list). Any empty or unparsable item drops the declaration (None).
+fn bg_layer_prop_list<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<(T, Vec<T>)> {
+    let mut items = crate::anim::split_commas(value)
+        .into_iter()
+        .map(|v| if v.is_empty() { None } else { parse(v) })
+        .collect::<Option<Vec<T>>>()?
+        .into_iter();
+    let first = items.next()?;
+    Some((first, items.collect()))
+}
+
+/// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): the `background` shorthand's repeat / position / size, per comma layer (moved
+/// from the url arm, where it scanned every layer's words as one: the last repeat word won for all layers, the size
+/// took the next layer's word). Each layer's components outside `url(...)` and any `-gradient(...)` (the url may hold
+/// slashes and keywords) are scanned the way that arm scanned them. AETHERCSSSPLITAUDIT (SR426): the components, the
+/// position / size `/` and the size pair at paren depth 0 (`rgb(0 0 0 / 50%)`, `calc(10px + 5px) 0 / calc(50% - 2px)
+/// auto` stay whole). The first layer writes only the parts present (`bg_shorthand_reset` wrote the initials; an
+/// `inherit` value writes nothing); with more than one layer, layers 2..n take their part or the initial
+/// (repeat / `0% 0%` / auto) into the `_more` lists.
+fn bg_shorthand_layer_props<H: Host>(paint: &mut PaintStyle<H>, value: &str) {
+    let layers = crate::anim::split_commas(value);
+    let (mut repeats, mut positions, mut sizes) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, layer) in layers.iter().enumerate() {
+        let stripped = strip_css_urls(layer);
+        let outside = split_top_level(&stripped)
+            .into_iter()
+            .filter(|t| !t.to_ascii_lowercase().contains("-gradient("))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let repeat = split_top_level(&outside).into_iter().filter_map(parse_repeat).last();
+        let (pos_part, size_part) = split_top_level_slash(&outside);
+        let pos: String = split_top_level(pos_part)
+            .into_iter()
+            .filter(|t| is_position_token(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let size = size_part
+            .map(|sz| split_top_level(sz).into_iter().take(2).collect::<Vec<_>>().join(" "))
+            .filter(|sz| !sz.is_empty());
+        let pos = Some(pos).filter(|p| !p.is_empty());
+        if i == 0 {
+            if repeat.is_some() {
+                paint.bg_repeat = repeat;
+            }
+            if pos.is_some() {
+                paint.bg_position = pos;
+            }
+            if size.is_some() {
+                paint.bg_size = size;
+            }
+        } else {
+            repeats.push(repeat.unwrap_or(0));
+            positions.push(pos.unwrap_or_else(|| "0% 0%".to_string()));
+            sizes.push(size.unwrap_or_else(|| "auto".to_string()));
+        }
+    }
+    if layers.len() > 1 {
+        paint.bg_repeat_more = Some(repeats);
+        paint.bg_position_more = Some(positions);
+        paint.bg_size_more = Some(sizes);
+    }
 }

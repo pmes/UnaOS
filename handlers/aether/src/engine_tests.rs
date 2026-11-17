@@ -8055,4 +8055,48 @@ mod tests {
         assert!(css_wide_color_ink(&mut e, "xy", css_wide_green) > 100, "a later rule: the shorthand's green");
         assert_eq!(css_wide_color_ink(&mut e, "xy", css_wide_red), 0, "a later rule: the earlier image is reset");
     }
+
+    // ---- AETHERCSSBACKGROUNDLAYERPROPS (LEDGER SR1070): background-repeat / -position / -size are per-layer lists (named tail block) ----
+
+    /// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): 400x20 rows 12px apart; G is a 1x1 opaque green PNG, B a 1x1 opaque blue
+    /// one. `.lh` the longhand lists, `.sh` the shorthand (a logo over a texture), `.one` G alone repeating (control).
+    fn background_layer_props_engine() -> crate::AetherEngine {
+        let html = r#"<!doctype html><html><head><style>
+            div { margin: 0 0 12px; height: 20px }
+            .lh { background-image: url(G), url(B); background-repeat: no-repeat, repeat; background-position: center, 0 0;
+                  background-size: 2px 2px, auto }
+            .sh { background: url(G) no-repeat center / 2px 2px, url(B) repeat }
+            .one { background: url(G) }
+            </style></head><body style="margin:0">
+            <div id="lh" class="lh"></div>
+            <div id="sh" class="sh"></div>
+            <div id="one" class="one"></div>
+        </body></html>"#
+            .replace("url(G)", "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgOMHwHwADXAHInah2ygAAAABJRU5ErkJggg==)")
+            .replace("url(B)", "url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==)");
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 600));
+        engine.load_html("https://example.com/", &html, true);
+        engine.render_frame();
+        engine
+    }
+
+    /// AETHERCSSBACKGROUNDLAYERPROPS (SR1070): the top layer `no-repeat` at `center / 2px 2px` paints its green ONCE at
+    /// the box centre and the repeating bottom layer tiles blue everywhere else, for the longhand lists and the
+    /// shorthand alike (before: the repeat list was dropped / the last repeat word won, so green tiled the whole box and
+    /// hid the blue); the one-layer repeating twin paints green across the box (armed control).
+    #[test]
+    fn background_layer_props_top_once_bottom_tiles() {
+        let mut e = background_layer_props_engine();
+        assert!(css_wide_color_ink(&mut e, "one", css_wide_green) > 1000, "a repeating G tiles the whole box (armed)");
+        for id in ["lh", "sh"] {
+            let green = css_wide_color_ink(&mut e, id, css_wide_green);
+            assert!((1..=9).contains(&green), "{id}: the top layer paints once, about 2x2 px, got {green} green px");
+            assert!(css_wide_color_ink(&mut e, id, css_wide_blue) > 1000, "{id}: the bottom layer tiles the box");
+            let (l, t, w, h) = imgalt_rect(&mut e, id);
+            let (cx, cy) = ((l + w / 2.0) as usize, (t + h / 2.0) as usize);
+            assert!(css_wide_green(imgalt_px(&e, cx, cy)), "{id}: the centre pixel is the top layer's green");
+            assert!(css_wide_blue(imgalt_px(&e, l as usize + 2, t as usize + 2)), "{id}: a corner pixel is the bottom layer's blue");
+        }
+    }
 }
