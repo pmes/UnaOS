@@ -4761,6 +4761,7 @@ name = "stria-view"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "principia",
  "quartzite",
  "stria",
  "timeline_core",

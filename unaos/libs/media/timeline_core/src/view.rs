@@ -5728,14 +5728,7 @@ pub fn title_size(tl: &Timeline, steps: &[crate::schedule::Step], size: impl Fn(
 /// descent)` drawn at `px`. The line is `h / 10` px (8 at least), shrunk once to 90% of the width when wider (1 px at
 /// least), centred: returns `(px, x, baseline)`, `x` and `baseline` rounded.
 pub fn title_fit(w: u32, h: u32, measure: &mut dyn FnMut(f32) -> (f32, f32, f32)) -> (f32, f32, f32) {
-    let mut px = (h as f32 / 10.0).max(8.0);
-    let mut m = measure(px);
-    let room = w as f32 * 0.9;
-    if m.0 > room {
-        px = (px * room / m.0).max(1.0);
-        m = measure(px);
-    }
-    (px, libm::roundf((w as f32 - m.0) / 2.0), libm::roundf((h as f32 + m.1 - m.2) / 2.0))
+    title_fit_styled(w, h, 10, 0, measure) // STRIAKTITLESTYLE (LEDGER SR9100): the default style through the one styled fit (file tail)
 }
 
 #[cfg(test)]
@@ -6872,5 +6865,83 @@ mod striagainenvdrag_tests {
         let (hx, hy) = on_line(&l, &c, 0);
         assert!(Drag::begin_gain_env(&s, l, hx, hy).is_none(), "the in handle's zone");
         assert_eq!(Drag::begin_with(&mut s, l, x, y + 10.0, false, false, false).map(|d| d.kind), Some(DragKind::Move));
+    }
+}
+
+// ---- STRIAKTITLESTYLE (LEDGER SR9100): a title's style through the one fit, both faces' (named tail block) ----
+// handlers.md §5 NLE5b NLE-TITLE-KERNEL-SIZE. A title's look is (size, alignment, ink): `size` the text height in percent
+// of the frame height (10 = a tenth, the look before), `align` -1 left (5% in) / 0 centre / 1 right (5% in), `ink` RGB.
+// `title_look` is THE one place a title's style is read (the default today: `Source` carries no style at this cut; at the
+// fold with STRIAFREEZETHREE SR9029 its body reads `Source::title_style`), and `title_fit_styled` is THE one fit both faces
+// place a line by (`title_fit` is its default-style call, byte-identical: size 10 is a factor of exactly 1.0).
+
+/// STRIAKTITLESTYLE: the default title look, `(size, align, ink)`: a tenth of the frame height, centred, [`TITLE_INK`]'s RGB.
+pub const TITLE_LOOK: (u8, i8, [u8; 3]) = (10, 0, [TITLE_INK[0], TITLE_INK[1], TITLE_INK[2]]);
+
+/// STRIAKTITLESTYLE: title source `id`'s look `(size percent of the frame height, align -1 / 0 / 1, RGB ink)` — today
+/// [`TITLE_LOOK`] for every id (no style on `Source` at this cut).
+pub fn title_look(_tl: &Timeline, _id: crate::SourceId) -> (u8, i8, [u8; 3]) {
+    TITLE_LOOK
+}
+
+/// STRIAKTITLESTYLE: where a title's one line sits on a `w` x `h` card at `size` (percent of `h`) and `align` (-1 left,
+/// 0 centre, 1 right) — `measure(px)` is the line's `(width, ascent, descent)` at `px`. The line is `h / 10 * (size / 10)`
+/// px (8 at least), shrunk once to 90% of the width when wider (1 px at least); `x` is `w * 0.05` (left), `(w - width) / 2`
+/// (centre) or `w * 0.95 - width` (right); returns `(px, x, baseline)`, `x` and `baseline` rounded.
+pub fn title_fit_styled(w: u32, h: u32, size: u8, align: i8, measure: &mut dyn FnMut(f32) -> (f32, f32, f32)) -> (f32, f32, f32) {
+    let mut px = (h as f32 / 10.0 * (size as f32 / 10.0)).max(8.0);
+    let mut m = measure(px);
+    let room = w as f32 * 0.9;
+    if m.0 > room {
+        px = (px * room / m.0).max(1.0);
+        m = measure(px);
+    }
+    let x = match align {
+        a if a < 0 => w as f32 * 0.05,
+        0 => (w as f32 - m.0) / 2.0,
+        _ => w as f32 * 0.95 - m.0,
+    };
+    (px, libm::roundf(x), libm::roundf((h as f32 + m.1 - m.2) / 2.0))
+}
+
+#[cfg(test)]
+mod striaktitlestyle_tests {
+    use super::*;
+
+    #[test]
+    fn striaktitlestyle_title_look_default() {
+        let mut tl = Timeline::new(25);
+        let t = tl.add_source("T1", 125);
+        tl.sources[0].title = Some(alloc::string::String::from("Hello"));
+        assert_eq!(title_look(&tl, t), (10, 0, [255, 255, 255]));
+        assert_eq!(title_look(&tl, crate::SourceId(9)), TITLE_LOOK, "an unknown id reads the default");
+    }
+
+    #[test]
+    fn striaktitlestyle_fit_default_is_title_fit() {
+        for (w, h) in [(1000, 100), (100, 100), (1280, 720), (1000, 40)] {
+            let a = title_fit(w, h, &mut |px: f32| (px * 10.0, px * 0.8, px * 0.2));
+            let b = title_fit_styled(w, h, 10, 0, &mut |px: f32| (px * 10.0, px * 0.8, px * 0.2));
+            assert_eq!(a, b, "{w}x{h}");
+        }
+    }
+
+    /// A line 10 px wide per px of size: 1000 x 100 at the default size is 10 px, 100 wide.
+    #[test]
+    fn striaktitlestyle_fit_aligns_left_right() {
+        let mut lin = |px: f32| (px * 10.0, px * 0.8, px * 0.2);
+        assert_eq!(title_fit_styled(1000, 100, 10, -1, &mut lin), (10.0, 50.0, 53.0), "left: 5% in");
+        assert_eq!(title_fit_styled(1000, 100, 10, 0, &mut lin), (10.0, 450.0, 53.0), "centre");
+        assert_eq!(title_fit_styled(1000, 100, 10, 1, &mut lin), (10.0, 850.0, 53.0), "right: 5% in, 950 - 100");
+    }
+
+    #[test]
+    fn striaktitlestyle_fit_size_scales_px() {
+        let mut lin = |px: f32| (px * 10.0, 0.0, 0.0);
+        // 2000 x 200: size 20 asks 200 / 10 * 2 = 40 px (400 wide, fits); size 1 floors at 8 px.
+        assert_eq!(title_fit_styled(2000, 200, 20, 0, &mut lin).0, 40.0);
+        assert_eq!(title_fit_styled(2000, 200, 1, 0, &mut lin).0, 8.0);
+        // size 50 on 1000 x 1000: 500 px is 5000 wide > 900: shrunk once to 90 px.
+        assert_eq!(title_fit_styled(1000, 1000, 50, 0, &mut lin).0, 90.0);
     }
 }

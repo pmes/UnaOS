@@ -4121,3 +4121,16 @@ fn striaopacitykeysface_curve_paints_on_the_selected_clip() {
     let i = (by as usize * w as usize + bx as usize) * 4;
     assert_eq!([px[i], px[i + 1], px[i + 2], px[i + 3]], opacity_colour(clip_colour(a.0, Kind::Video), ROW[0], 50), "the body at its curve at the playhead");
 }
+
+// ---- STRIAKTITLESTYLE (LEDGER SR9100): a title contributes no colour to the export's pair (named tail block) ----
+#[test]
+fn striaktitlestyle_reels_colour_skips_titles() {
+    use demux_core::colour::Colour;
+    let col = |p: u8, t: u8| Colour { primaries: p, transfer: t, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    let (mut tl, a, b) = base(); // V1: A then B
+    tl.sources[b.0 as usize].title = Some(String::from("Hello")); // B is a generated title: no file, no colour
+    let by = move |id: SourceId| if id == a { Some(col(9, 16)) } else { None };
+    assert_eq!(tl.reels_colour(by), (9, 16), "the media reel's pair; the title is skipped");
+    tl.tracks[0].clips.retain(|c| c.src == b);
+    assert_eq!(tl.reels_colour(by), (2, 2), "a title-only EDL states no pair");
+}
