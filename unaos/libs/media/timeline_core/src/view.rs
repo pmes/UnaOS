@@ -3556,3 +3556,20 @@ mod ripple_more_tests {
         assert_eq!(st.timeline, tl.ripple_trim_in(0, 1, 13).unwrap());
     }
 }
+
+// ---- STRIAZOOMFITMORE (LEDGER SR965): the view anchor rule (named tail block) ----
+// THE rule both faces apply to a stored view origin (the host face's `Face.view`, the kernel Player's `Edit.view`: a
+// wheel zoom's or a fit's `(t0, the playhead it was anchored at)`): the layout keeps that `t0` while the playhead is where
+// it was anchored or inside the anchored view, else [`Layout::of`]'s page holding the playhead. `None`: unchanged.
+impl Layout {
+    /// This layout with the view `view` anchored, by the rule above.
+    pub fn anchor(mut self, view: Option<(i64, i64)>, playhead: i64) -> Layout {
+        if let Some((t0, at)) = view {
+            let per = (self.w / self.zoom.max(1)).max(1) as i64;
+            if playhead == at || (t0..t0 + per).contains(&playhead) {
+                self.t0 = t0;
+            }
+        }
+        self
+    }
+}

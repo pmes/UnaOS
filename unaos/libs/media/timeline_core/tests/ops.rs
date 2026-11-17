@@ -2751,3 +2751,35 @@ fn strialinkautomore_near_needs_src_in() {
     tl.validate().unwrap();
     assert_eq!(strialinkautofuzz_groups(&tl.link_av()), vec![vec![1, 2], vec![1, 2]], "src_in within one tick: linked");
 }
+
+// ---- STRIAZOOMFITMORE (LEDGER SR965): the view anchor rule both faces apply (named tail block) ----
+
+/// `Layout::anchor`: a stored origin `(t0, at)` holds while the playhead is `at` or inside the anchored view, else the
+/// page holding the playhead; `None` leaves `Layout::of`'s page; a fit's origin anchored puts the range's start at x 0.
+#[test]
+fn striazoomfitmore_anchor_rule() {
+    use timeline_core::editor::EditorState;
+    use timeline_core::view::Layout;
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+    let mut st = EditorState::new(tl);
+    st.select(0, 1).unwrap();
+    let t0 = st.fit(320, true).unwrap();
+    assert_eq!((t0, st.zoom), (10, 32)); // 10 ticks per 320 px page
+    let view = Some((t0, st.playhead));
+    let l = Layout::of(320, 160, &st);
+    assert_eq!(l.t0, 0, "the page holding the playhead");
+    assert_eq!(l.anchor(None, st.playhead), l, "no view: unchanged");
+    let anchored = l.anchor(view, st.playhead);
+    assert_eq!((anchored.t0, anchored.x_of(10)), (10, 0), "at the anchor: the fit's range starts at x 0");
+    assert_eq!(anchored.x_of(20), 320, "and ends at the window's right edge");
+    st.seek(19);
+    assert_eq!(Layout::of(320, 160, &st).anchor(view, st.playhead).t0, 10, "inside the view: kept");
+    st.seek(5);
+    assert_eq!(Layout::of(320, 160, &st).anchor(view, st.playhead).t0, 0, "outside, away from the anchor: the page");
+    st.seek(25);
+    assert_eq!(Layout::of(320, 160, &st).anchor(view, st.playhead).t0, 20, "outside: the page holding the playhead");
+}

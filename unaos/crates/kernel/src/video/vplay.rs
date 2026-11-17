@@ -1836,6 +1836,7 @@ struct Edit {
     path: String,
     st: timeline_core::editor::EditorState,
     said: bool,
+    view: Option<(i64, i64)>, // STRIAZOOMFITMORE (SR965): the fit's anchored view `(t0, the playhead it was anchored at)`, the kernel's `Face.view`
 }
 
 static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
@@ -1845,7 +1846,7 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
 /// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
 /// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
-const EDIT_KEYS: [(u8, &str); 18] = [
+const EDIT_KEYS: [(u8, &str); 20] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1864,6 +1865,7 @@ const EDIT_KEYS: [(u8, &str); 18] = [
     (b'-', "zoom-"),
     (b'0', "zoom0"),
     (b'f', "size"),
+    (b'\\', "zoom-fit"), (b'|', "zoom-sel"), // STRIAZOOMFITMORE (SR965): the host's `\` / `|` fit the timeline / the selection (file tail)
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1877,7 +1879,7 @@ fn edit_seed(jid: u32, path: &str, st: timeline_core::editor::EditorState) -> ti
         return timeline_core::editor::EditorState::new(e.st.timeline.clone());
     }
     let fresh = timeline_core::editor::EditorState::new(st.timeline.clone());
-    *g = Some(Edit { path: String::from(path), st, said: false });
+    *g = Some(Edit { path: String::from(path), st, said: false, view: None });
     fresh
 }
 
@@ -1908,7 +1910,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
+        if let Some(r) = edit_fit(&mut e.view, st, path, verb, at) { return r; } if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = shown_clip(&st.timeline, at); // KERNELPRESENTPOLICY (rmbp-ledger B997): the ONE shown-clip rule, the present's too (file tail)
             match top {
                 Some((t, i)) => {
@@ -1967,7 +1969,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize
     if let Some(ms) = pts_ms {
         e.st.seek(tick_of(tb, ms));
     }
-    let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
+    let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st).anchor(e.view, e.st.playhead); // STRIAZOOMFITMORE (SR965): the fit's anchored view, THE rule the host face applies (file tail)
     let mut lab = ViewLabels(0);
     let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
     let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
@@ -2667,4 +2669,36 @@ fn adopt_rows(dst: &mut [u32], w: usize, vh: usize, f: &Frame) -> Option<(usize,
         dst[d..d + dw].copy_from_slice(&px[s..s + dw]);
     }
     Some((dw, dh))
+}
+
+// ---- STRIAZOOMFITMORE (LEDGER SR965): the Player's fit and its keys (named tail block) ----
+// handlers.md §5 NLE5b's NLE-ZOOMFIT-KERNEL and NLE-ZOOMFIT-KEYS-KERNEL. `\` / `|` in [`EDIT_KEYS`] name the host face's
+// `zoom-fit` / `zoom-sel` (SR859 / SR907), which are not `EditorState::verb` words: [`edit_fit`] runs timeline_core's ONE
+// fit (`EditorState::fit`) at the width of the band [`view_band`] last painted ([`band_layout`]) and keeps the origin it
+// returns in `Edit.view`, which [`view_band`] applies through timeline_core's ONE anchor rule (`Layout::anchor`, the host
+// face's `Face::layout` rule), so the noted layout a press hits is the anchored one. A view change: no undo step, no save
+// (the EDL carries no zoom). Wire: `[nle] edit <zoom-fit|zoom-sel> at=<tick> zoom=<px> t0=<tick>`, `[nle] edit
+// <zoom-fit|zoom-sel> at=<tick> refused (<why>|no view)`. Owed: NLE-ZOOMFIT-KERNEL-WITNESS, NLE-ZOOMFIT-REFIT-KERNEL.
+
+/// The fit keys on the Player's editor state (the EDIT lock held by [`edit_key`]): `None` for any other verb; else
+/// `Some(Some(ms))`, the playhead for the seek door (which re-presents the band at the fit), or `Some(None)` refused.
+fn edit_fit(view: &mut Option<(i64, i64)>, st: &mut timeline_core::editor::EditorState, path: &str, verb: &str, at: i64) -> Option<Option<u64>> {
+    if verb != "zoom-fit" && verb != "zoom-sel" {
+        return None;
+    }
+    let Some((_, l)) = band_layout(path) else {
+        serial_println!("[nle] edit {} at={} refused (no view)", verb, at);
+        return Some(None);
+    };
+    match st.fit(l.w, verb == "zoom-sel") {
+        Ok(t0) => {
+            *view = Some((t0, at));
+            serial_println!("[nle] edit {} at={} zoom={} t0={}", verb, at, st.zoom, t0);
+            Some(Some((st.timeline.tb.to_ns(at).max(0) as u64) / 1_000_000))
+        }
+        Err(why) => {
+            serial_println!("[nle] edit {} at={} refused ({})", verb, at, why);
+            Some(None)
+        }
+    }
 }
